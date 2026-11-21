@@ -1,0 +1,189 @@
+From 8914589fde925ce125c0107a53c44907d0fc87f1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 06:07:27 +0000
+Subject: [PATCH] [daveey] Wait for the complete Bot overflow-refusal receipt
+
+The retry marker is not the terminal receipt: refresh_receipt can observe a
+pending admission, then its off-loop settlement commits before _maybe_retry
+checks eligibility. The refusal write preserves the old pending projection;
+the later terminal write supplies failed/context_overflow. The test broke on
+refusal alone and indexed a reason not yet published.
+
+Wait with tests.waiting.async_wait_until for refusal + failed + reason presence,
+then retain exact open_user_tail, context_overflow and admission-count checks.
+No production retry policy, budgets or receipt contract changes.
+
+Detection: parameterize the original test over ordinary execution and a gated
+real refresh/settlement/refusal-write schedule. The reader sees the actual
+intermediate file before the writer may publish its terminal projection;
+all owned refresh/watcher work is released and joined even on RED.
+
+Proof (canonical run_tests.sh, Python 3.14.9, HERMES_TEST_FILE_RETRIES=0):
+- incident head 84930ce773: old whole file 6 passed; old exact ID 1 passed
+- identical incident/main writer and fixture bytes before fix
+- controlled old wait on incident and main: KeyError 'reason'
+- fixed incident/main whole file: 7 passed each; exact ID: 2 passed each
+- wrong production refusal and wrong failure reason mutants: 2 failed each,
+  at the retained exact assertions; source restored and final 7/2 green
+- scripts/check --base origin/main: 21 checks green (without runtime override)
+
+Recurrence: occurrence 67, run 44837707834 job 136638624934, PR #3844.
+The original CI's exact thread schedule is not recoverable; controlled proof
+establishes the concrete publication race without attributing CPU starvation.
+Card: t_eeeeee0000000037
+---
+ tests/gateway/bot_retry_interleaving.py | 95 +++++++++++++++++++++++++
+ tests/gateway/test_session_bot_retry.py | 21 ++++--
+ 2 files changed, 110 insertions(+), 6 deletions(-)
+ create mode 100644 tests/gateway/bot_retry_interleaving.py
+
+diff --git a/tests/gateway/bot_retry_interleaving.py b/tests/gateway/bot_retry_interleaving.py
+new file mode 100644
+index 0000000000..9df5416e0c
+--- /dev/null
++++ b/tests/gateway/bot_retry_interleaving.py
+@@ -0,0 +1,95 @@
++"""Controlled receipt publication schedule for the Bot retry regression."""
++import asyncio
++
++import pytest_asyncio
++
++
++@pytest_asyncio.fixture(params=['ordinary', 'refusal_before_projection'])
++async def receipt_interleaving(bot, monkeypatch, request):
++    if request.param == 'ordinary':
++        yield
++        return
++
++    from gateway import session_bot, session_finite
++    from tests.waiting import async_wait_until
++    from tools import bot_live_delivery
++
++    key = 'e' * 32
++    run_error, published, observed, refresh_done = (asyncio.Event() for _ in range(4))
++    loop = asyncio.get_running_loop()
++    execute = session_finite.execute_finite_admission
++    deliver = session_bot.deliver
++    maybe_retry = session_bot._maybe_retry
++    write = session_bot.write_receipt
++    read = bot_live_delivery.read_delivery_result
++    record_reply = session_bot._record_reply
++    refreshes = []
++
++    async def held_execution(authority, ref, row):
++        if row['request_id'] == 'bot:' + key:
++            await run_error.wait()
++        return await execute(authority, ref, row)
++
++    async def held_watcher(authority, home, delivery_id, future):
++        if delivery_id == key:
++            await refresh_done.wait()
++        return await record_reply(authority, home, delivery_id, future)
++
++    async def retry_after_settlement(authority, home, path, record):
++        if record['delivery_id'] == key and record['status'] in {'queued', 'claimed'}:
++            # refresh_receipt has read the pending projection. The physical settlement can
++            # commit on its worker thread before _maybe_retry reads retry eligibility.
++            run_error.set()
++            await async_wait_until(
++                lambda: all(row['status'] == 'terminal' for row in _rows(bot)),
++                what='the original overflow admission to commit')
++        return await maybe_retry(authority, home, path, record)
++
++    async def held_write(home, record, **kwargs):
++        result = await write(home, record, **kwargs)
++        if (record['delivery_id'] == key and (record.get('retry') or {}).get('refused')
++                and 'reason' not in record):
++            published.set()
++            await observed.wait()
++        return result
++
++    def observed_read(home, delivery_id):
++        record = read(home, delivery_id)
++        if delivery_id == key and (record or {}).get('retry', {}).get('refused'):
++            loop.call_soon_threadsafe(observed.set)
++        return record
++
++    async def refresh(authority, home):
++        try:
++            await session_bot.refresh_receipt(authority, home, key)
++        finally:
++            refresh_done.set()
++
++    async def scheduled_deliver(connection, params):
++        result = await deliver(connection, params)
++        if params['id'] == key:
++            refreshes.append(asyncio.create_task(refresh(connection.authority, bot.home)))
++            await asyncio.wait_for(published.wait(), 10)
++        return result
++
++    monkeypatch.setattr(session_finite, 'execute_finite_admission', held_execution)
++    monkeypatch.setattr(session_bot, '_record_reply', held_watcher)
++    monkeypatch.setattr(session_bot, '_maybe_retry', retry_after_settlement)
++    monkeypatch.setattr(session_bot, 'write_receipt', held_write)
++    monkeypatch.setattr(session_bot, 'deliver', scheduled_deliver)
++    monkeypatch.setattr(bot_live_delivery, 'read_delivery_result', observed_read)
++    try:
++        yield
++    finally:
++        run_error.set()
++        observed.set()
++        refresh_done.set()
++        for task in refreshes:
++            await asyncio.wait_for(task, 10)
++        from tests.gateway.test_session_bot_retry import _settle_quietly
++        await _settle_quietly(bot)
++
++
++def _rows(bot):
++    from hermes_state_runtime import list_session_admissions
++    return list_session_admissions(bot.authority.db, session_id=bot.chat, pending_only=False)
+diff --git a/tests/gateway/test_session_bot_retry.py b/tests/gateway/test_session_bot_retry.py
+index 81dd54f5a0..c8992b65d9 100644
+--- a/tests/gateway/test_session_bot_retry.py
++++ b/tests/gateway/test_session_bot_retry.py
+@@ -16,6 +16,10 @@ import pytest_asyncio
+ from gateway.session_contract import SessionActor
+ from hermes_state_runtime import list_session_admissions
+ 
++from tests.gateway import bot_retry_interleaving
++
++receipt_interleaving = bot_retry_interleaving.receipt_interleaving
++
+ KEY = 'c' * 32
+ 
+ 
+@@ -138,7 +142,7 @@ async def test_retry_that_fails_again_and_non_transient_failures_are_never_repla
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_context_overflow_retries_once_unless_the_failed_dm_is_still_an_open_tail(bot):
++async def test_context_overflow_retries_once_unless_the_failed_dm_is_still_an_open_tail(bot, receipt_interleaving):
+     """Main re-ran an overflowed delivery once (compress-then-resume: the re-run's own preflight
+     compaction does the compress). The owner retry keeps that for an overflow that left no open DM
+     row, and refuses (recorded, typed) when the DM is still the durable tail: the owner execution has
+@@ -154,11 +158,16 @@ async def test_context_overflow_retries_once_unless_the_failed_dm_is_still_an_op
+     bot.errors[:] = ["This model's maximum context length is 200000 tokens"]
+     bot.authority.db.append_message(bot.chat, 'user', content='overflowed dm')
+     await deliver(bot.connection, dict(id=other, profile='default', message='overflowed dm'))
+-    for _ in range(100):
+-        await asyncio.sleep(0.02)
+-        record = (await asyncio.to_thread(read_delivery_result, bot.home, other))
+-        if (record.get('retry') or {}).get('refused'):
+-            break
++    from tests.waiting import async_wait_until
++
++    async def complete_refusal():
++        record = await asyncio.to_thread(read_delivery_result, bot.home, other)
++        # Refusal is published before refresh_receipt's terminal projection. It can still
++        # carry the earlier queued/claimed status and no failure reason at that boundary.
++        return record if (record and (record.get('retry') or {}).get('refused')
++                          and record.get('status') == 'failed' and 'reason' in record) else None
++
++    record = await async_wait_until(complete_refusal, what='the complete overflow refusal receipt')
+     assert record['retry']['refused'] == 'open_user_tail' and len(_admissions(bot)) == 3
+     assert (record['status'], record['reason']) == ('failed', 'context_overflow'), record
+ 
+-- 
+2.43.0
+

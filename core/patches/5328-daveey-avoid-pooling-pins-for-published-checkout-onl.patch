@@ -1,0 +1,199 @@
+From 8fcd8d906a78548fae749a800a3e7f805e7f233d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:34:06 +0000
+Subject: [PATCH] [daveey] avoid pooling pins for published checkout-only
+ deletions
+
+The owning clone in worker-a1 t_eeeeee0000000034 had 22,692 staged D-space deletions and an empty index, not the initially reported unstaged space-D pattern (card evidence comment 18532). HEAD was contained in its upstream; its real published PR worktree was clean. A generic dirty verdict pinned the pooled card to one worker.
+
+Recognize only uniform unstaged deletions, or uniform staged deletions with an empty index. Require a symbolic branch with upstream containing HEAD, no hidden index edits, hardened Git probes and the existing shared deadline. Mixed edits, partial staged deletion, missing upstream, local commits and unknown checks still pin. Keep child scanning and removal dirty checks unchanged.
+
+Proof: RED four acceptance cases on main, GREEN 26 focused tests; all 24 move/park/unpin consumers and subprocess guard files pass (2067 tests). Five safety-condition mutants killed; scripts/check --base origin/main: 21 checks OK.
+---
+ hermes_cli/kanban_checkout_deletions.py       |  50 +++++++++
+ hermes_cli/kanban_move_pool.py                |   3 +
+ .../test_kanban_checkout_deletions.py         | 101 ++++++++++++++++++
+ 3 files changed, 154 insertions(+)
+ create mode 100644 hermes_cli/kanban_checkout_deletions.py
+ create mode 100644 tests/hermes_cli/test_kanban_checkout_deletions.py
+
+diff --git a/hermes_cli/kanban_checkout_deletions.py b/hermes_cli/kanban_checkout_deletions.py
+new file mode 100644
+index 0000000000..bec8f4f461
+--- /dev/null
++++ b/hermes_cli/kanban_checkout_deletions.py
+@@ -0,0 +1,50 @@
++"""Narrow checkout-deletion exception for card placement, never for tree removal. [daveey]"""
++from __future__ import annotations
++
++import subprocess
++
++
++def published_checkout_deletions(tree: str, budget) -> bool:
++    """Only missing checkout files, with HEAD contained in its branch's upstream.
++
++    Permit uniform unstaged deletions, or uniform staged deletions with an entirely
++    empty index (the owning-clone shape observed on a pool worker). Partial staged
++    deletions, hidden edits and every unknown/error retain the existing pin.
++    """
++    from hermes_cli._subprocess_compat import noninteractive_repo_git_env
++    from hermes_cli.git_budget import timed_out, timeout_for
++    from hermes_cli.worktree_archive import ArchiveError
++    from hermes_cli.worktree_ops import _git
++    from hermes_cli.worktree_retention import hidden_index_edits
++
++    try:
++        env = noninteractive_repo_git_env(tree, budget=budget)
++        if env is None:
++            return False
++
++        def probe(args):
++            result = _git(args, tree, timeout=timeout_for(budget, 10), stdin=subprocess.DEVNULL, env=env)
++            if result.returncode != 0 or result.stderr.strip():
++                return None
++            return result.stdout
++
++        status = probe(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
++        if status is None:
++            return False
++        entries = [entry for entry in status.split("\0") if entry]
++        if not entries:
++            return False
++        unstaged = all(entry.startswith(" D ") for entry in entries)
++        staged = all(entry.startswith("D  ") for entry in entries)
++        if not unstaged and not (staged and probe(["ls-files", "-z"]) == ""):
++            return False
++        branch = probe(["symbolic-ref", "-q", "HEAD"])
++        if not branch or not branch.strip().startswith("refs/heads/"):
++            return False
++        if probe(["merge-base", "--is-ancestor", "HEAD", "@{upstream}"]) is None:
++            return False
++        return not hidden_index_edits(tree, env=env, budget=budget)
++    except subprocess.TimeoutExpired:
++        raise timed_out(budget) from None
++    except (ArchiveError, OSError, subprocess.SubprocessError, ValueError):
++        return False
+diff --git a/hermes_cli/kanban_move_pool.py b/hermes_cli/kanban_move_pool.py
+index b3bb80de06..96d2cea6e4 100644
+--- a/hermes_cli/kanban_move_pool.py
++++ b/hermes_cli/kanban_move_pool.py
+@@ -305,6 +305,9 @@ def tree_state(trees: Iterable[str], *, budget: float = STATE_BUDGET_S,
+             continue
+         try:
+             if _worktree_is_dirty(tree, tree, timeout=10, budget=timeouts):
++                from hermes_cli.kanban_checkout_deletions import published_checkout_deletions
++                if published_checkout_deletions(tree, timeouts):
++                    continue
+                 return f"{_DIRTY}{tree}"
+             if _commit_less(tree, timeouts):
+                 continue
+diff --git a/tests/hermes_cli/test_kanban_checkout_deletions.py b/tests/hermes_cli/test_kanban_checkout_deletions.py
+new file mode 100644
+index 0000000000..0432725cd7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_checkout_deletions.py
+@@ -0,0 +1,101 @@
++"""Published checkout-only deletions hold no card state; mixed/unknown state still pins."""
++from __future__ import annotations
++
++import subprocess
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_move_pool as kmp
++from hermes_cli import kanban_park_pin as kpp
++from tests.hermes_cli import test_kanban_pool_queue as pq
++
++svc = pq.svc
++w2 = pq.w2
++
++
++def _checkout(tmp_path, *, empty_index=False):
++    ws = tmp_path / "ws"
++    ws.mkdir()
++    repo = pq._pushed_clone(tmp_path, ws / "repo")
++    pq._commit(repo, "b.txt")
++    pq._commit(repo, "hidden.txt")
++    pq._git(repo, "push", "-qu", "origin", "HEAD:wt/x")
++    pq._git(repo, "worktree", "add", "-qb", "pr", str(ws / "polyworld"))
++    pq._git(ws / "polyworld", "push", "-qu", "origin", "HEAD:pr")
++    if empty_index:
++        pq._git(repo, "rm", "-q", "a.txt", "b.txt", "hidden.txt")
++    else:
++        (repo / "a.txt").unlink()
++    return ws, repo
++
++
++@pytest.mark.parametrize("empty_index", [False, True])
++def test_published_checkout_deletions_do_not_pin(w2, tmp_path, monkeypatch, empty_index):
++    ws, repo = _checkout(tmp_path, empty_index=empty_index)
++    assert set(kmp.card_trees(None, str(ws))) == {str(repo), str(ws / "polyworld")}
++    tid = kb.create_task(w2.conn, title="published PR with owning clone", assignee="default", runs_on=[pq.POOL])
++    with kb.write_txn(w2.conn):
++        w2.conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(ws), tid))
++    pq._run(w2, monkeypatch, tid)
++    assert kpp.plan(w2.conn, tid, "waiting on CI") is None
++
++
++@pytest.mark.parametrize("change", ["modified", "untracked", "unpushed", "staged", "hidden-assume", "hidden-skip",
++                                   "no-upstream", "detached", "mixed", "empty-unpushed"])
++def test_other_checkout_state_still_pins(w2, tmp_path, monkeypatch, change):
++    ws, repo = _checkout(tmp_path)
++    if change == "modified":
++        (repo / "b.txt").write_text("work\n")
++    elif change == "untracked":
++        (repo / "new.txt").write_text("work\n")
++        pq._git(repo, "config", "status.showUntrackedFiles", "no")
++    elif change in {"unpushed", "empty-unpushed"}:
++        pq._commit(repo, "local.txt")
++        if change == "empty-unpushed":
++            pq._git(repo, "rm", "-q", "-f", "a.txt", "b.txt", "hidden.txt", "local.txt")
++    elif change == "staged":
++        pq._git(repo, "add", "-u")
++    elif change.startswith("hidden-"):
++        flag = "--assume-unchanged" if change == "hidden-assume" else "--skip-worktree"
++        pq._git(repo, "update-index", flag, "hidden.txt")
++        (repo / "hidden.txt").write_text("hidden work\n")
++    elif change == "no-upstream":
++        pq._git(repo, "branch", "--unset-upstream")
++    elif change == "detached":
++        pq._git(repo, "checkout", "-q", "--detach")
++    elif change == "mixed":
++        pq._git(repo, "rm", "-q", "b.txt")
++    tid = kb.create_task(w2.conn, title="clone with private state", assignee="default", runs_on=[pq.POOL])
++    with kb.write_txn(w2.conn):
++        w2.conn.execute("UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(ws), tid))
++    pq._run(w2, monkeypatch, tid)
++    step = kpp.plan(w2.conn, tid)
++    assert step is not None and step["op"] == "pin" and str(repo) in step["state"]
++
++
++@pytest.mark.parametrize("empty_index", [False, True])
++def test_upstream_may_be_ahead(tmp_path, empty_index):
++    ws, repo = _checkout(tmp_path, empty_index=empty_index)
++    pr = ws / "polyworld"
++    pq._commit(pr, "ahead.txt")
++    pq._git(pr, "push", "-q", "origin", "HEAD:wt/x")
++    assert kmp.tree_state([str(repo)]) is None
++
++
++@pytest.mark.parametrize("probe_name", ["status", "symbolic-ref", "merge-base", "ls-files"])
++@pytest.mark.parametrize("failure", ["exit", "stderr", "timeout"])
++def test_unknown_probe_still_pins(tmp_path, monkeypatch, probe_name, failure):
++    from hermes_cli import worktree_ops
++    _ws, repo = _checkout(tmp_path, empty_index=True)
++    real = worktree_ops._git
++
++    def git(args, *a, **kw):
++        if args[0] == probe_name and (probe_name != "status" or "--porcelain=v1" in args):
++            if failure == "timeout":
++                raise subprocess.TimeoutExpired(args, 10)
++            return subprocess.CompletedProcess(args, 128 if failure == "exit" else 0, "", "warning: unknown")
++        return real(args, *a, **kw)
++
++    monkeypatch.setattr(worktree_ops, "_git", git)
++    assert kmp.tree_state([str(repo)]) is not None
+-- 
+2.43.0
+

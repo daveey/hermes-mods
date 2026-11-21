@@ -1,0 +1,590 @@
+From e0395ef6fa634a554c5f6ddc3ebdd4a6c6599921 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 06:07:48 +0000
+Subject: [PATCH] fix(nix): vendor patchelf repair and retain stable cache
+ outputs [daveey]
+
+Problem: main Nix jobs repeatedly fail fetching the patchelf patch with
+HTTP 503 or time out while rehydrating its compiler closure (44634702886,
+44649483747, 44660246200, 44668661423, 44673995106, 44676428709).
+Why: pm tools depend on unreleased patched patchelf, fetched from GitHub.
+Its output is not a runtime dependency of those tools, so unrooted store
+GC can discard it before saving; immutable primary-key hits then never
+update that cache. Upstream availability remains on every run's path.
+Root (happened): stable build outputs were not retained at the GC boundary.
+Root (not caught): step timing/green streaks did not observe actual fetches.
+Recurrence: prior cache-save repair restored upload but not retention.
+
+Vendor the upstream src-only change and share the derivation with a GC root
+containing the PM runtime tools, patchelf, Python environment and pnpm deps.
+Root before the cache action's post-job GC, report the measured closure,
+and reject roots over the existing 5 GiB limit. Do not expand cache quota.
+Always summarize substituter copies and HTTPS fetches; warn on a main
+primary-key hit that still copies more than ten paths. tee preserves
+failures through pipefail, and missing logs still allow failure summaries.
+
+Proof:
+- Before implementation, six new behavioral cases failed (missing helpers).
+- Final canonical runner: 1541 tests pass across six files.
+- All ten warning/budget/count/missing-input mutants killed.
+- scripts/check --base origin/main: all 21 checks pass.
+- Real nix build .#ci-cache and root_nix_cache.sh succeeded: patched
+  patchelf built with only src/patchelf.cc and src/patchelf.h changed;
+  rooted closure 3,082,839,480 bytes < 5,368,709,120 bytes.
+- Local Nix lacks sandbox namespaces; required PR Nix CI must prove the
+  existing sandbox checks. Main two-run warm-cache acceptance follows land.
+---
+ .github/workflows/nix.yml                     |  17 +-
+ nix/packages.nix                              |   9 +
+ nix/patchelf-fixed.nix                        |  14 ++
+ ...f-fix-executable-header-load-overlap.patch | 237 ++++++++++++++++++
+ nix/pm-packages.nix                           |  19 +-
+ scripts/ci/nix_cache_budget.py                |  26 ++
+ scripts/ci/nix_cache_summary.py               |  29 +++
+ scripts/ci/root_nix_cache.sh                  |   7 +
+ tests/ci/test_nix_cache_observations.py       |  93 +++++++
+ 9 files changed, 433 insertions(+), 18 deletions(-)
+ create mode 100644 nix/patchelf-fixed.nix
+ create mode 100644 nix/patches/patchelf-fix-executable-header-load-overlap.patch
+ create mode 100644 scripts/ci/nix_cache_budget.py
+ create mode 100644 scripts/ci/nix_cache_summary.py
+ create mode 100644 scripts/ci/root_nix_cache.sh
+ create mode 100644 tests/ci/test_nix_cache_observations.py
+
+diff --git a/.github/workflows/nix.yml b/.github/workflows/nix.yml
+index ef43af8b6e..97b11df309 100644
+--- a/.github/workflows/nix.yml
++++ b/.github/workflows/nix.yml
+@@ -156,6 +156,7 @@ jobs:
+       # February 2025 with the GitHub cache API that it was built on. This
+       # action uses the current API and needs no account and no secret.
+       - name: Restore and save the Nix store
++        id: nix-cache
+         uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+         with:
+           # The closure changes when the flake inputs change or when the
+@@ -205,7 +206,21 @@ jobs:
+         # Fail before the job deadline: runner deadlines report cancelled,
+         # hiding red main from failure watchers. Reserve time for setup and
+         # cache post steps; GNU timeout exits 124 (or 137 after forced kill).
+-        run: timeout --kill-after=30s 40m nix flake check "${{ inputs.release == true && format('path:{0}/release-source?rev={1}', runner.temp, env.CANDIDATE_COMMIT) || '.' }}" --print-build-logs
++        shell: bash
++        run: |
++          set -o pipefail
++          timeout --kill-after=30s 40m nix flake check "${{ inputs.release == true && format('path:{0}/release-source?rev={1}', runner.temp, env.CANDIDATE_COMMIT) || '.' }}" --print-build-logs 2>&1 | tee "$RUNNER_TEMP/nix-flake-check.log"
++
++      - name: Root stable Nix outputs before cache GC
++        run: |
++          set -o pipefail
++          timeout --kill-after=30s 5m bash scripts/ci/root_nix_cache.sh 2>&1 | tee "$RUNNER_TEMP/nix-cache-roots.log"
++
++      - name: Summarize Nix cache effectiveness
++        if: always()
++        env:
++          NIX_CACHE_HIT: ${{ steps.nix-cache.outputs.hit-primary-key }}
++        run: python3 scripts/ci/nix_cache_summary.py "$RUNNER_TEMP/nix-flake-check.log" "$RUNNER_TEMP/nix-cache-roots.log"
+ 
+       - name: Verify release package runtime identity
+         if: inputs.release == true
+diff --git a/nix/packages.nix b/nix/packages.nix
+index eac42cba41..be86590e74 100644
+--- a/nix/packages.nix
++++ b/nix/packages.nix
+@@ -78,6 +78,15 @@
+     in
+     {
+       packages = {
++        # GC root for the expensive tool outputs and shared runtime dependencies.
++        # The build inputs alone do not keep patchelf alive after GC.
++        ci-cache = pkgs.writeText "hermes-ci-cache" (lib.concatStringsSep "\n" (
++          map toString ((lib.attrVals [ "npm" "pnpm" "ripgrep" "ffmpeg" "node" "python" "uv" "just" ] pmPackages) ++ [
++            (pkgs.callPackage ./patchelf-fixed.nix { })
++            full.hermesVenv
++            full.hermesNpmLib.pnpmDeps
++          ])
++        ));
+         node-gyp =
+           (pkgs.callPackage ./lib.nix {
+             inherit pmPackages;
+diff --git a/nix/patchelf-fixed.nix b/nix/patchelf-fixed.nix
+new file mode 100644
+index 0000000000..6211840131
+--- /dev/null
++++ b/nix/patchelf-fixed.nix
+@@ -0,0 +1,14 @@
++{ patchelf }:
++# patchelf 0.19.2 corrupts executables whose headers it must move: running
++# --set-interpreter before --set-rpath (autoPatchelf's order) leaves a
++# read-only LOAD overlapping the RW one, so ld.so faults on .dynamic and
++# node segfaults on start (NixOS/patchelf#674). Fixed upstream by #672, not
++# yet released; drop this once nixpkgs ships a patchelf that contains it.
++# Vendored src/* diff from NixOS/patchelf commit
++# 59acc3d98b4961cfddf02090d9426ac735603218 (the former fetchpatch includes).
++# Builds must not depend on github.com's patch endpoint being available.
++patchelf.overrideAttrs (old: {
++  patches = (old.patches or [ ]) ++ [
++    ./patches/patchelf-fix-executable-header-load-overlap.patch
++  ];
++})
+diff --git a/nix/patches/patchelf-fix-executable-header-load-overlap.patch b/nix/patches/patchelf-fix-executable-header-load-overlap.patch
+new file mode 100644
+index 0000000000..0153118215
+--- /dev/null
++++ b/nix/patches/patchelf-fix-executable-header-load-overlap.patch
+@@ -0,0 +1,237 @@
++diff --git a/src/patchelf.cc b/src/patchelf.cc
++index 234ae6ce..05d81909 100644
++--- a/src/patchelf.cc
+++++ b/src/patchelf.cc
++@@ -543,7 +543,7 @@ void ElfFile<ElfFileParamNames>::shiftFile(unsigned int extraPages, size_t start
++     for (int i = 0; i < rdi(hdr()->e_phnum); ++i) {
++         Elf_Off p_start = rdi(phdrs.at(i).p_offset);
++ 
++-        if (p_start <= startOffset && p_start + rdi(phdrs.at(i).p_filesz) > startOffset && rdi(phdrs.at(i).p_type) == PT_LOAD) {
+++        if (p_start < startOffset && p_start + rdi(phdrs.at(i).p_filesz) > startOffset && rdi(phdrs.at(i).p_type) == PT_LOAD) {
++             assert(splitIndex == -1);
++ 
++             splitIndex = i;
++@@ -576,7 +576,10 @@ void ElfFile<ElfFileParamNames>::shiftFile(unsigned int extraPages, size_t start
++         }
++     }
++ 
++-    assert(splitIndex != -1);
+++    /* If no LOAD crosses startOffset, the existing header LOAD can grow
+++       without splitting the LOAD that starts at the first reserved section. */
+++    if (splitIndex == -1)
+++        return;
++ 
++     /* Add another PT_LOAD segment loading the data we've split above. */
++     phdrs.resize(rdi(hdr()->e_phnum) + 1);
++@@ -1013,6 +1016,54 @@ void ElfFile<ElfFileParamNames>::rewriteSectionsLibrary()
++ 
++ static bool noSort = false;
++ 
+++template<ElfFileParams>
+++Elf_Phdr * ElfFile<ElfFileParamNames>::findLoadSegmentByOffset(Elf_Off offset)
+++{
+++    for (auto & phdr : phdrs)
+++        if (rdi(phdr.p_type) == PT_LOAD && rdi(phdr.p_offset) <= offset &&
+++            rdi(phdr.p_offset) + rdi(phdr.p_filesz) > offset)
+++            return &phdr;
+++    return nullptr;
+++}
+++
+++
+++template<ElfFileParams>
+++void ElfFile<ElfFileParamNames>::trimLoadSegments(Elf_Off startOffset, size_t headerIndex)
+++{
+++    /* Sections before startOffset are being relocated into the header LOAD.
+++       Trim old LOADs so they cannot overwrite the header page permissions.
+++
+++       File offsets: 0                 startOffset
+++                     | moved sections | reserved sections
+++       Before:       [header LOAD...]
+++                              [old LOAD..................]
+++       After:        [header LOAD....][old LOAD...........]
+++
+++       Growth may move the header LOAD backwards in virtual memory; the
+++       reserved sections keep their addresses. Walk backwards through phdrs
+++       so erasing a LOAD does not change indices still to visit. */
+++    for (size_t i = phdrs.size(); i != 0;) {
+++        auto & phdr = phdrs[--i];
+++        Elf_Off offset = rdi(phdr.p_offset);
+++        if (i == headerIndex || rdi(phdr.p_type) != PT_LOAD || offset >= startOffset)
+++            continue;
+++
+++        Elf_Off skipped = startOffset - offset;
+++        if (rdi(phdr.p_filesz) <= skipped && rdi(phdr.p_memsz) <= skipped) {
+++            phdrs.erase(phdrs.begin() + i);
+++            continue;
+++        }
+++        wri(phdr.p_offset, startOffset);
+++        wri(phdr.p_vaddr, rdi(phdr.p_vaddr) + skipped);
+++        wri(phdr.p_paddr, rdi(phdr.p_paddr) + skipped);
+++        /* Preserve any zero-filled tail even if no file bytes remain. */
+++        wri(phdr.p_filesz, rdi(phdr.p_filesz) > skipped ? rdi(phdr.p_filesz) - skipped : 0);
+++        wri(phdr.p_memsz, rdi(phdr.p_memsz) > skipped ? rdi(phdr.p_memsz) - skipped : 0);
+++    }
+++    wri(hdr()->e_phnum, phdrs.size());
+++}
+++
+++
++ template<ElfFileParams>
++ void ElfFile<ElfFileParamNames>::rewriteSectionsExecutable()
++ {
++@@ -1092,6 +1143,16 @@ void ElfFile<ElfFileParamNames>::rewriteSectionsExecutable()
++ 
++     normalizeNoteSegments();
++ 
+++    Elf_Off headerEnd = sizeof(Elf_Ehdr) + phdrs.size() * sizeof(Elf_Phdr);
+++    bool reuseHeaderLoad = false;
+++    Elf_Addr originalHeaderBase = firstPage;
+++    unsigned int originalHeaderFlags = 0;
+++    if (auto headerLoad = findLoadSegmentByOffset(headerEnd)) {
+++        originalHeaderBase = rdi(headerLoad->p_vaddr) - rdi(headerLoad->p_offset);
+++        originalHeaderFlags = rdi(headerLoad->p_flags);
+++        reuseHeaderLoad = rdi(headerLoad->p_offset) + rdi(headerLoad->p_filesz) <= startOffset;
+++        trimLoadSegments(startOffset, headerLoad - phdrs.data());
+++    }
++ 
++     /* Compute the total space needed for the replaced sections, the
++        ELF header, and the program headers. */
++@@ -1109,45 +1170,42 @@ void ElfFile<ElfFileParamNames>::rewriteSectionsExecutable()
++             return (rdi(findSectionHeader(i.first).sh_flags) & SHF_WRITE) != 0;
++         });
++ 
++-    /* If that area sits in an executable LOAD segment, marking it writable
++-       would create a W+X segment. Prefer to grow the file instead, so shiftFile
++-       splits the reserved area into its own R/W segment and leaves the
++-       executable one untouched. Growing adds one program header and one page;
++-       only take this path when both fit (otherwise the underrun check below
++-       would abort), else fall back to marking the segment writable (W+X). */
++-    bool growForWritable = false;
++-    if (needWritable && neededSpace + sizeof(Elf_Phdr) <= startOffset
++-        && firstPage >= getPageSize()) {
++-        Elf_Off hdrOff = sizeof(Elf_Ehdr) + phdrs.size() * sizeof(Elf_Phdr);
++-        for (const auto & phdr : phdrs)
++-            if (rdi(phdr.p_type) == PT_LOAD &&
++-                rdi(phdr.p_offset) <= hdrOff &&
++-                rdi(phdr.p_offset) + rdi(phdr.p_filesz) > hdrOff)
++-            {
++-                growForWritable = (rdi(phdr.p_flags) & PF_X) != 0;
++-                break;
++-            }
+++    unsigned int neededPages = 0;
+++    if (reuseHeaderLoad) {
+++        /* strip may remove file padding while leaving a virtual gap.
+++           File growth keeps the replacement before startOffset. Virtual
+++           growth moves the header base down so its end stays below the page
+++           containing the first reserved section. Use the larger requirement. */
+++        Elf_Addr reservedPage = startAddr - startAddr % getPageSize();
+++        size_t fileGrowth = neededSpace > startOffset ? neededSpace - startOffset : 0;
+++        size_t virtualGrowth = originalHeaderBase + neededSpace > reservedPage
+++            ? originalHeaderBase + neededSpace - reservedPage : 0;
+++        size_t growth = std::max(fileGrowth, virtualGrowth);
+++        if (growth != 0)
+++            neededPages = roundUp(growth, getPageSize()) / getPageSize();
+++    } else if (neededSpace > startOffset ||
+++        (needWritable && (originalHeaderFlags & PF_X) != 0 &&
+++         neededSpace + sizeof(Elf_Phdr) <= startOffset && firstPage >= getPageSize()))
+++    {
+++        /* Split the header area into its own R/W LOAD when more space is
+++           needed, or to avoid making an executable LOAD writable. For the
+++           latter, fall back to W+X if the extra header or page cannot fit. */
+++        neededSpace += sizeof(Elf_Phdr);
+++        /* The loader rounds the remaining LOAD down to the page containing
+++           startOffset, so the new header LOAD must end below that page. */
+++        size_t startPage = startOffset - startOffset % getPageSize();
+++        size_t growth = neededSpace > startPage ? neededSpace - startPage : 0;
+++        neededPages = roundUp(growth, getPageSize()) / getPageSize();
++     }
++ 
++-    /* If we need more space at the start of the file, then grow the
++-       file by the minimum number of pages and adjust internal
++-       offsets. */
++-    if (neededSpace > startOffset || growForWritable) {
++-        /* We also need an additional program header, so adjust for that. */
++-        neededSpace += sizeof(Elf_Phdr);
+++    if (neededPages != 0) {
++         debug("needed space is %d\n", neededSpace);
++-
++-        /* Calculate how many bytes are needed out of the additional pages. */
++-        size_t extraSpace = neededSpace > startOffset ? neededSpace - startOffset : 0;
++-        /* The loader rounds the split-off LOAD down to the page containing
++-           startOffset, so the new LOAD has to end below that page. */
++-        size_t startPage = startOffset - startOffset % getPageSize();
++-        size_t overlap = neededSpace > startPage ? neededSpace - startPage : 0;
++-        unsigned int neededPages = roundUp(overlap, getPageSize()) / getPageSize();
++         debug("needed pages is %d\n", neededPages);
++-        if (neededPages * getPageSize() > firstPage)
+++        if (neededPages * getPageSize() > firstPage ||
+++            (reuseHeaderLoad && neededPages * getPageSize() > originalHeaderBase))
++             error("virtual address space underrun!");
++ 
+++        size_t extraSpace = neededSpace > startOffset ? neededSpace - startOffset : 0;
++         shiftFile(neededPages, startOffset, extraSpace);
++ 
++         firstPage -= neededPages * getPageSize();
++@@ -1157,33 +1215,21 @@ void ElfFile<ElfFileParamNames>::rewriteSectionsExecutable()
++     Elf_Off curOff = sizeof(Elf_Ehdr) + phdrs.size() * sizeof(Elf_Phdr);
++     Elf_Addr headerBase = firstPage;
++ 
++-    /* Ensure PHDR is covered by a LOAD segment.
++-
++-       Because PHDR is supposed to have been covered by such section before, in
++-       here we assume that we don't have to create any new section, but rather
++-       extend the existing one. */
++-    for (auto& phdr : phdrs)
++-        if (rdi(phdr.p_type) == PT_LOAD &&
++-            rdi(phdr.p_offset) <= curOff &&
++-            rdi(phdr.p_offset) + rdi(phdr.p_filesz) > curOff)
++-        {
++-            /* strip can drop file padding between LOADs, so this LOAD's
++-               address-to-offset mapping may differ from firstPage. */
++-            headerBase = rdi(phdr.p_vaddr) - rdi(phdr.p_offset);
++-            if (rdi(phdr.p_filesz) < neededSpace) {
++-                wri(phdr.p_filesz, neededSpace);
++-                wri(phdr.p_memsz, neededSpace);
++-            }
++-            /* The segment may already be large enough (e.g. with a large page
++-               size), so set this regardless of whether it was extended. If a
++-               grow happened above this is the new R/W segment shiftFile created
++-               and the flag is already set; otherwise we set it here, which for
++-               an executable segment is the W+X fallback when growing was not
++-               possible. */
++-            if (needWritable)
++-                wri(phdr.p_flags, rdi(phdr.p_flags) | PF_W);
++-            break;
++-        }
+++    /* Extend the LOAD covering PHDR to include all relocated sections. */
+++    if (auto headerLoad = findLoadSegmentByOffset(curOff)) {
+++        /* strip can drop file padding between LOADs, so this LOAD's
+++           address-to-offset mapping may differ from firstPage. */
+++        headerBase = rdi(headerLoad->p_vaddr) - rdi(headerLoad->p_offset);
+++        if (rdi(headerLoad->p_filesz) < neededSpace) {
+++            wri(headerLoad->p_filesz, neededSpace);
+++            wri(headerLoad->p_memsz, neededSpace);
+++        }
+++        /* Set write access even if the LOAD was already large enough. A new
+++           LOAD from shiftFile is R/W; an unsplit executable LOAD uses the
+++           W+X fallback when an extra header or page could not fit. */
+++        if (needWritable)
+++            wri(headerLoad->p_flags, rdi(headerLoad->p_flags) | PF_W);
+++    }
++ 
++     /* Clear out the free space. startOffset is taken from an sh_offset in
++        the input, so must be bounded before being used as a write extent. */
++diff --git a/src/patchelf.h b/src/patchelf.h
++index 0700b9d3..3049d91e 100644
++--- a/src/patchelf.h
+++++ b/src/patchelf.h
++@@ -131,6 +131,10 @@ class ElfFile
++ 
++     void rewriteSectionsLibrary();
++ 
+++    Elf_Phdr * findLoadSegmentByOffset(Elf_Off offset);
+++
+++    void trimLoadSegments(Elf_Off startOffset, size_t headerIndex);
+++
++     void rewriteSectionsExecutable();
++ 
++     void normalizeNoteSegments();
+diff --git a/nix/pm-packages.nix b/nix/pm-packages.nix
+index ddde985c48..777a381979 100644
+--- a/nix/pm-packages.nix
++++ b/nix/pm-packages.nix
+@@ -4,8 +4,7 @@
+   fetchurl,
+   unzip,
+   autoPatchelfHook,
+-  patchelf,
+-  fetchpatch,
++  callPackage,
+ }:
+ # The thin translation layer: pm/lock.json -> one fetched, unpacked
+ # derivation per package for this nix system. Nothing here knows versions,
+@@ -52,21 +51,7 @@ let
+   originRpath = name: stdenv.hostPlatform.isLinux && name == "python";
+   patchElf = name: stdenv.hostPlatform.isLinux && name != "python";
+ 
+-  # patchelf 0.19.2 corrupts executables whose headers it must move: running
+-  # --set-interpreter before --set-rpath (autoPatchelf's order) leaves a
+-  # read-only LOAD overlapping the RW one, so ld.so faults on .dynamic and
+-  # node segfaults on start (NixOS/patchelf#674). Fixed upstream by #672, not
+-  # yet released; drop this once nixpkgs ships a patchelf that contains it.
+-  patchelfFixed = patchelf.overrideAttrs (old: {
+-    patches = (old.patches or [ ]) ++ [
+-      (fetchpatch {
+-        name = "patchelf-fix-executable-header-load-overlap.patch";
+-        url = "https://github.com/NixOS/patchelf/commit/59acc3d98b4961cfddf02090d9426ac735603218.patch";
+-        includes = [ "src/*" ];
+-        hash = "sha256-rQWWZlCa4IRrcPcxMD2xrTTD4nLOsWfdZLOk9UoIOIs=";
+-      })
+-    ];
+-  });
++  patchelfFixed = callPackage ./patchelf-fixed.nix { };
+ 
+   # pnpm pins the @pnpm/exe executable and the `pnpm` launcher package, and both
+   # archives wrap their tree in package/. Unpacked over one another, the
+diff --git a/scripts/ci/nix_cache_budget.py b/scripts/ci/nix_cache_budget.py
+new file mode 100644
+index 0000000000..270d886371
+--- /dev/null
++++ b/scripts/ci/nix_cache_budget.py
+@@ -0,0 +1,26 @@
++#!/usr/bin/env python3
++"""Enforce the existing 5 GiB store budget without expanding repository quota."""
++
++import json
++import os
++from pathlib import Path
++import sys
++
++
++def main():
++    info = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8-sig"))
++    # Nix 2.19 uses a list; current Nix keys records by store path.
++    records = info.values() if isinstance(info, dict) else info
++    size = sum(item["closureSize"] for item in records)
++    report = f"Stable rooted closure: {size} bytes (limit: 5368709120 bytes)\n"
++    print(report)
++    with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
++        summary.write(report)
++    if size > 5368709120:
++        print("::error::Stable Nix roots exceed the 5 GiB store-cache budget")
++        return 1
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/scripts/ci/nix_cache_summary.py b/scripts/ci/nix_cache_summary.py
+new file mode 100644
+index 0000000000..6802371f57
+--- /dev/null
++++ b/scripts/ci/nix_cache_summary.py
+@@ -0,0 +1,29 @@
++#!/usr/bin/env python3
++"""Report cache effectiveness from tee'd Nix output, even on build failure."""
++
++import os
++from pathlib import Path
++import re
++import sys
++
++
++def main():
++    lines = []
++    for name in sys.argv[1:]:
++        path = Path(name)
++        if path.exists():
++            lines.extend(path.read_text(encoding="utf-8-sig", errors="replace").splitlines())
++    copies = sum(bool(re.match(r"^copying path '/nix/store/[^']+' from '", line)) for line in lines)
++    fetches = sum(bool(re.match(r"^[^\s>]+> trying https://", line)) for line in lines)
++    report = f"Paths copied from substituters: {copies}\n\nHTTPS source fetches: {fetches}\n"
++    print(report)
++    with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
++        summary.write("## Nix cache effectiveness\n\n" + report)
++    if (os.environ.get("GITHUB_EVENT_NAME") == "push"
++            and os.environ.get("GITHUB_REF") == "refs/heads/main"
++            and os.environ.get("NIX_CACHE_HIT") == "true" and copies > 10):
++        print(f"::warning::Nix primary-key hit still copied {copies} paths (budget: 10)")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/ci/root_nix_cache.sh b/scripts/ci/root_nix_cache.sh
+new file mode 100644
+index 0000000000..23044bbc4d
+--- /dev/null
++++ b/scripts/ci/root_nix_cache.sh
+@@ -0,0 +1,7 @@
++#!/usr/bin/env bash
++# Keep stable outputs alive through cache-nix-action's post-job GC.
++set -euo pipefail
++mkdir -p "$RUNNER_TEMP/nix-cache-roots"
++nix build .#ci-cache --out-link "$RUNNER_TEMP/nix-cache-roots/stable" --print-build-logs
++nix path-info --json --closure-size "$RUNNER_TEMP/nix-cache-roots/stable" > "$RUNNER_TEMP/nix-cache-size.json"
++python3 scripts/ci/nix_cache_budget.py "$RUNNER_TEMP/nix-cache-size.json"
+diff --git a/tests/ci/test_nix_cache_observations.py b/tests/ci/test_nix_cache_observations.py
+new file mode 100644
+index 0000000000..df72b96812
+--- /dev/null
++++ b/tests/ci/test_nix_cache_observations.py
+@@ -0,0 +1,93 @@
++"""Exercise cache summaries and the root budget at their CI entry points."""
++
++import os
++from pathlib import Path
++import subprocess
++
++import pytest
++from ruamel.yaml import YAML
++
++ROOT = Path(__file__).resolve().parents[2]
++
++
++@pytest.mark.parametrize(('event', 'ref', 'hit', 'copies', 'warn'), [
++    ('push', 'refs/heads/main', 'true', 11, True),
++    ('push', 'refs/heads/main', 'true', 10, False),
++    ('push', 'refs/heads/main', 'false', 11, False),
++    ('pull_request', 'refs/heads/main', 'true', 11, False),
++    ('push', 'refs/heads/topic', 'true', 11, False),
++])
++def test_summary_counts_real_log_lines(tmp_path, event, ref, hit, copies, warn):
++    log = tmp_path / 'build.log'
++    log.write_text(
++        "copying path '/nix/store/a' from 'https://cache.nixos.org'...\n" * copies
++        + 'source> trying https://example.com/source.tar.gz\n'
++        + 'echo "copying path /nix/store/quoted"\n'
++    )
++    summary = tmp_path / 'summary'
++    env = dict(os.environ, GITHUB_EVENT_NAME=event, GITHUB_REF=ref,
++               NIX_CACHE_HIT=hit, GITHUB_STEP_SUMMARY=str(summary))
++    result = subprocess.run(
++        ['python3', str(ROOT / 'scripts/ci/nix_cache_summary.py'), str(log), str(tmp_path / 'missing.log')],
++        env=env, capture_output=True, text=True, encoding='utf-8', check=False,
++    )
++    assert result.returncode == 0, result.stderr
++    assert f'Paths copied from substituters: {copies}' in summary.read_text()
++    assert 'HTTPS source fetches: 1' in summary.read_text()
++    assert ('::warning::' in result.stdout) is warn
++
++
++@pytest.mark.parametrize('shape', ['list', 'dict'])
++@pytest.mark.parametrize(('size', 'success'), [(1024, True), (5368709120, True), (5368709121, False)])
++def test_root_budget_is_enforced_after_realization(tmp_path, size, success, shape):
++    nix = tmp_path / 'nix'
++    nix.write_text('''#!/usr/bin/env bash
++printf '%s\\n' "$*" >> "$RUNNER_TEMP/calls"
++if [ "$1" = build ]; then
++  while [ "$1" != --out-link ]; do shift; done
++  ln -s /nix/store/stable-tools "$2"
++else
++  if [ "$SHAPE" = dict ]; then
++    printf '{"/nix/store/stable-tools":{"closureSize":%s}}\\n' "$SIZE"
++  else
++    printf '[{"path":"/nix/store/stable-tools","closureSize":%s}]\\n' "$SIZE"
++  fi
++fi
++''')
++    nix.chmod(0o755)
++    summary = tmp_path / 'summary'
++    env = dict(os.environ, PATH=f'{tmp_path}:{os.environ["PATH"]}',
++               RUNNER_TEMP=str(tmp_path), GITHUB_STEP_SUMMARY=str(summary), SIZE=str(size), SHAPE=shape)
++    result = subprocess.run(
++        ['bash', str(ROOT / 'scripts/ci/root_nix_cache.sh')], env=env,
++        capture_output=True, text=True, encoding='utf-8', check=False,
++    )
++    assert (result.returncode == 0) is success, result.stderr
++    assert (tmp_path / 'nix-cache-roots/stable').is_symlink()
++    assert 'build .#ci-cache --out-link' in (tmp_path / 'calls').read_text()
++    assert str(size) in summary.read_text()
++    assert ('::error::' in result.stdout) is not success
++
++
++def test_workflow_tee_retains_failure_and_summary_is_always_run(tmp_path):
++    doc = YAML(typ='safe').load((ROOT / '.github/workflows/nix.yml').read_text())
++    steps = doc['jobs']['flake-check']['steps']
++    build = next(s for s in steps if s.get('name') == 'nix flake check')
++    summary = next(s for s in steps if s.get('name') == 'Summarize Nix cache effectiveness')
++    assert summary['if'] == 'always()'
++    assert summary['env']['NIX_CACHE_HIT'] == '${{ steps.nix-cache.outputs.hit-primary-key }}'
++    assert any(s.get('id') == 'nix-cache' for s in steps)
++    nix = tmp_path / 'nix'
++    nix.write_text('#!/usr/bin/env bash\necho "source> trying https://example.com/file" >&2\nexit 42\n')
++    nix.chmod(0o755)
++    command = build['run']
++    start = command.index('${{')
++    end = command.index('}}', start) + 2
++    command = command[:start] + '.' + command[end:]
++    result = subprocess.run(
++        ['bash', '-e', '-c', command],
++        env=dict(os.environ, PATH=f'{tmp_path}:{os.environ["PATH"]}', RUNNER_TEMP=str(tmp_path)),
++        capture_output=True, text=True, encoding='utf-8', check=False,
++    )
++    assert result.returncode == 42
++    assert 'source> trying https://' in (tmp_path / 'nix-flake-check.log').read_text()
+-- 
+2.43.0
+

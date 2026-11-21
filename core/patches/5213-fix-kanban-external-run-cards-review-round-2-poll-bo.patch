@@ -1,0 +1,403 @@
+From dab02eba6811506f68f6ce0751f0ddc4a2982dd3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:32:55 +0000
+Subject: [PATCH] fix(kanban): external-run cards, review round 2: poll bound
+ to its park, terminal recovery clears the outage, shell Retry-After delays
+ the probe [daveey]
+
+Review 5991116946 of PR #3745 at 3c8f438b found three behaviour defects. Each is red on 3c8f438b with the
+reviewer's repro (tests/hermes_cli/test_kanban_external_review2.py starts from that file) and green here.
+
+1. An old CI response woke a replacement park. The sweep captured the park id in `_due` but `_record_watch`
+   reloaded the latest park and `apply_poll` checked only `status == scheduled`. A card woken and parked again
+   while the GitHub read was in flight took the old run's result. `apply_poll` now takes the `park_id` and `ref`
+   the poll was read for and checks both inside its write transaction, before recording, asserting or clearing
+   a blocker, or waking. Covered for a replacement on another run and for a new park on the same ref.
+2. A healthy read whose job had finished returned before `_clear_blocker`, so an outage whose first recovery
+   read was a finished run stayed open with no scheduled card left to clear it. The blocker is now cleared on
+   any ok/degraded read before the terminal wake. Covered for a succeeded and a failed job.
+3. A shell probe's `HERMES_WATCH {"service":"rate_limited","retry_after":N}` delayed only the displayed record:
+   `task_wake_checks.next_at` stayed at now + every. `note_probe` now returns the delay and `_after_probe` uses
+   max(every, delay). The generation is untouched and an in-flight expedite (next_at moved before the claim's
+   slot) still wins. `retry_after` is ignored unless the service is rate_limited and never shortens the cadence.
+
+Proof: 11 tests in test_kanban_external_review2.py; 4 reviewer cases red on 3c8f438b, all green now. Seven
+mutants (park-id check, ref check, missing-park check, terminal clear, rate_limited condition, max(every, delay),
+expedite branch) each fail at least one test.
+---
+ hermes_cli/kanban_ci_progress.py              |   8 +-
+ hermes_cli/kanban_external_watch.py           |  53 +++++--
+ hermes_cli/kanban_wake_check.py               |  16 +-
+ .../test_kanban_external_review2.py           | 145 ++++++++++++++++++
+ 4 files changed, 200 insertions(+), 22 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_external_review2.py
+
+diff --git a/hermes_cli/kanban_ci_progress.py b/hermes_cli/kanban_ci_progress.py
+index 9ce34151cc..5cf3d1c3cb 100644
+--- a/hermes_cli/kanban_ci_progress.py
++++ b/hermes_cli/kanban_ci_progress.py
+@@ -684,7 +684,8 @@ _JITTER: dict[tuple[str, str], tuple[Any, float]] = {}  # (db, task) -> (park ev
+ 
+ 
+ def _record_watch(conn: sqlite3.Connection, task_id: str, watched, wall: float,
+-                  rand: Optional[float] = None) -> Optional[str]:
++                  rand: Optional[float] = None, park_id: Optional[int] = None,
++                  ref: Optional[str] = None) -> Optional[str]:
+     """[daveey] Write the poll as the card's external-watch record (and wake / assert / clear as it says). A failure
+     to record never fails the sweep. Returns the wake event kind or None."""
+     from hermes_cli import kanban_external_watch as kew
+@@ -694,7 +695,7 @@ def _record_watch(conn: sqlite3.Connection, task_id: str, watched, wall: float,
+         declared = ctx["payload"].get("watch") if isinstance(ctx["payload"].get("watch"), dict) else {}
+         return kew.apply_poll(conn, task_id, watched.poll, now=wall, adapter=watched.adapter, scope=watched.scope,
+                               every=clamp_every(declared.get("every"), DEFAULT_CI_EVERY),
+-                              service_name=watched.service_name, rand=rand)
++                              service_name=watched.service_name, rand=rand, park_id=park_id, ref=ref)
+     except (sqlite3.Error, OSError, ValueError, KeyError, TypeError):
+         logger.warning("kanban external watch: could not record the poll of %s", task_id, exc_info=True)
+         return None
+@@ -786,7 +787,8 @@ def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None,
+             if p.state == NOT_STARTING and apply(conn, task_id, ref, p):
+                 woken.append(task_id)
+                 continue
+-            if watched is not None and watched.poll is not None and _record_watch(conn, task_id, watched, wall, rand):
++            if watched is not None and watched.poll is not None and _record_watch(
++                    conn, task_id, watched, wall, rand, park_id, ref):
+                 woken.append(task_id)
+     except Exception:
+         logger.warning("kanban ci run progress sweep failed", exc_info=True)
+diff --git a/hermes_cli/kanban_external_watch.py b/hermes_cli/kanban_external_watch.py
+index cb517b7891..5f760124ed 100644
+--- a/hermes_cli/kanban_external_watch.py
++++ b/hermes_cli/kanban_external_watch.py
+@@ -274,22 +274,30 @@ def _result(rec: dict, derived: dict) -> dict:
+ 
+ def apply_poll(conn: sqlite3.Connection, task_id: str, poll: dict, *, now: float, adapter: str, scope: str = "",
+                every: Any = None, service_name: Optional[str] = None, rand: Optional[float] = None,
+-               cmd: str = "", terminal: Optional[bool] = None) -> Optional[str]:
++               cmd: str = "", terminal: Optional[bool] = None, park_id: Optional[int] = None,
++               ref: Optional[str] = None) -> Optional[str]:
+     """Record one poll for a scheduled card and act on it: a finished job wakes the card with ``external_result``
+     (``condition_met``; a FAILED job wakes too and is not an outage); a service gone red asserts the shared
+-    blocker; an ok poll clears it. Returns the event kind that woke the card, else None. Opens its own write txn."""
++    blocker; an ok poll clears it (a finished job's read included). Returns the event kind that woke the card,
++    else None. Opens its own write txn. ``park_id`` / ``ref`` are the park the caller read the poll for: a card
++    parked again while the read was in flight (another ref, or the same ref anew) drops the poll untouched."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_wake_check as kwc
+     with kb.write_txn(conn):
+         status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+         if status is None or status[0] != "scheduled":
+             return None
++        if not _same_park(conn, task_id, park_id, ref):
++            return None
+         got = record_poll(conn, task_id, poll, now=now, adapter=adapter, scope=scope, every=every,
+                           service_name=service_name, rand=rand)
+         if got is None:
+             return None
+         derived, rec = got["derived"], got["rec"]
+         finished = poll.get("terminal") if terminal is None else terminal
++        health = derived["health"]
++        if health in ("ok", "degraded") and scope:
++            _clear_blocker(conn, rec)  # before a finished job's wake returns: this may be the scope's last card
+         if finished or derived.get("wake"):
+             kwc.episode.reset(conn, task_id)
+             woke = kwc._wake(conn, task_id, kwc.CONDITION_MET_EVENT, {
+@@ -298,18 +306,27 @@ def apply_poll(conn: sqlite3.Connection, task_id: str, poll: dict, *, now: float
+             if woke:
+                 kb.add_comment(conn, task_id, AUTHOR, _finished_note(rec, derived))
+             return woke
+-        health = derived["health"]
+         if derived["state"] == ks.DOWN and health in SERVICE_HEALTHS and scope and not poll.get("host_only"):
+             if _scope_answers(conn, task_id, rec):
+                 return _wake_ref_broken(conn, task_id, rec, derived, cmd)
+             return _assert_blocker(conn, task_id, rec, derived)
+         if derived["state"] == ks.DOWN and health == "probe_broken" and adapter != "shell":
+             return _wake_ref_broken(conn, task_id, rec, derived, cmd)
+-        if health in ("ok", "degraded") and scope:
+-            _clear_blocker(conn, rec)
+         return None
+ 
+ 
++def _same_park(conn: sqlite3.Connection, task_id: str, park_id: Optional[int], ref: Optional[str]) -> bool:
++    """The card's latest park is still the one a poll was read for. In the caller's write txn."""
++    if park_id is None and ref is None:
++        return True
++    ctx = park_context(conn, task_id)
++    if ctx is None:
++        return False
++    if park_id is not None and ctx["event_id"] != int(park_id):
++        return False
++    return ref is None or str((ctx["awaiting"] or {}).get("ref") or "") == ref
++
++
+ def _rand() -> float:
+     """Where in ±JITTER the next poll lands; the seam tests pin."""
+     return random.random()
+@@ -395,7 +412,16 @@ def _clear_blocker(conn: sqlite3.Connection, rec: dict) -> None:
+ 
+ def note_probe_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out: str, now: float,
+                       every: Any) -> Optional[dict]:
+-    """A legacy wake-check probe's result as a watch record (``kanban_external_adapters.shell``), for a scheduled
++    """:func:`note_probe` without the retry delay."""
++    return note_probe(conn, task_id, cmd, rc, out, now, every)[0]
++
++
++def note_probe(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out: str, now: float,
++               every: Any) -> tuple[Optional[dict], int]:
++    """Returns ``(external_result, delay)``; ``delay`` is the seconds a rate-limited service asked the probe to
++    stay away (``HERMES_WATCH`` ``retry_after``; 0 = none), which the caller puts into the probe's ``next_at``.
++
++    A legacy wake-check probe's result as a watch record (``kanban_external_adapters.shell``), for a scheduled
+     ci/deploy/external park. In the caller's write txn; never raises. Returns the ``external_result`` to carry on
+     a wake (exit 0 or a ``HERMES_WATCH`` line with a terminal job), else None. A GitHub run/PR park is also
+     recorded by the CI sweep (the richer adapter); the later record wins."""
+@@ -403,17 +429,20 @@ def note_probe_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any,
+     try:
+         ctx = park_context(conn, task_id)
+         if ctx is None or (ctx["awaiting"] or {}).get("kind") not in ks.EXTERNAL_KINDS:
+-            return None
++            return None, 0
+         if (plan(conn, task_id, ctx) or {}).get("adapter") != "shell":
+-            return None  # a GitHub run/PR park is recorded by the CI sweep's richer adapter
++            return None, 0  # a GitHub run/PR park is recorded by the CI sweep's richer adapter
+         poll = shell.poll(rc, out)
+         got = record_poll(conn, task_id, poll, now=now, adapter="shell", scope="", every=every,
+                           service_name=poll.get("service_name"), rand=0.5)  # a probe runs every ``every``: no jitter
+     except (sqlite3.Error, ValueError, KeyError, TypeError):
+         logger.warning("kanban external watch: could not record the probe result of %s", task_id, exc_info=True)
+-        return None
+-    if got is None or not poll.get("terminal"):
+-        return None
++        return None, 0
++    if got is None:
++        return None, 0
++    delay = int(got["rec"].get("retry_after") or 0) if got["rec"].get("service") == "rate_limited" else 0
++    if not poll.get("terminal"):
++        return None, delay
+     result = _result(got["rec"], got["derived"])
+     result["outcome"] = poll.get("outcome") or result["outcome"]
+-    return result
++    return result, delay
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 10cee7e70a..56368b5a29 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -807,7 +807,7 @@ def producer_note(hit: dict) -> str:
+             "`--from <that status>`. Those statuses count as met, so without it the probe passes at once.")
+ 
+ 
+-def _after_probe(state: dict, claimed_next_at: Optional[int], now: int) -> int:
++def _after_probe(state: dict, claimed_next_at: Optional[int], now: int, delay: int = 0) -> int:
+     """next_at after a probe that did not wake the card. [daveey] The claim parked next_at at its slot
+     (``claimed_next_at``). A wait-comment or status expedite that committed while the probe ran moved it earlier
+     (due now): that earlier slot is kept, so the next tick re-probes and sees the change instead of this older
+@@ -815,7 +815,7 @@ def _after_probe(state: dict, claimed_next_at: Optional[int], now: int) -> int:
+     held = state.get("next_at")
+     if claimed_next_at is not None and held is not None and int(held) < int(claimed_next_at):
+         return int(held)
+-    return now + int(state["every"])
++    return now + max(int(state["every"]), int(delay or 0))  # delay: a rate-limited HERMES_WATCH retry_after
+ 
+ 
+ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict, now: Optional[int], generation: str,
+@@ -895,7 +895,7 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+             if rc != 0:
+                 kb._append_event(conn, task_id, "wake_episode_reset")
+         from hermes_cli import kanban_external_watch as kew  # [daveey] external-run card record + HERMES_WATCH
+-        ext_result = kew.note_probe_result(conn, task_id, cmd, rc, out, float(now), state["every"])
++        ext_result, delay = kew.note_probe(conn, task_id, cmd, rc, out, float(now), state["every"])
+         if rc == 0 or (ext_result and ext_result.get("outcome") in ("succeeded", "failed", "cancelled")):
+             return _wake(conn, task_id, CONDITION_MET_EVENT, {
+                 "wake_check": cmd, "output": tail, **({"diagnostics": diagnostics} if diagnostics else {}),
+@@ -938,7 +938,7 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+             unproven.note_check(conn, task_id, cmd, tail, now, passive_policy=passive_policy, threshold=notice_interval)
+             conn.execute(
+                 "UPDATE task_wake_checks SET last_at = ?, last_rc = 1, last_out = ?, fails = 0, "
+-                "next_at = ? WHERE task_id = ?", (now, tail, _after_probe(state, claimed_next_at, now), task_id))
++                "next_at = ? WHERE task_id = ?", (now, tail, _after_probe(state, claimed_next_at, now, delay), task_id))
+             _note_alive(conn, task_id, cmd, now)
+             return None
+         age = stale_age(rc, out)
+@@ -958,7 +958,8 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+             # Not broken: the gateway is just offline. Keep any real-failure streak from before as it was.
+             conn.execute(
+                 "UPDATE task_wake_checks SET last_at = ?, last_rc = ?, last_out = ?, "
+-                "next_at = ? WHERE task_id = ?", (now, rc, tail, _after_probe(state, claimed_next_at, now), task_id))
++                "next_at = ? WHERE task_id = ?",
++                (now, rc, tail, _after_probe(state, claimed_next_at, now, delay), task_id))
+             _note_alive(conn, task_id, cmd, now)
+             return None
+         gw = source_unknown(rc, out)
+@@ -978,7 +979,8 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+             # Same unchanged source state, already escalated: keep any real-failure streak as it was.
+             conn.execute(
+                 "UPDATE task_wake_checks SET last_at = ?, last_rc = ?, last_out = ?, "
+-                "next_at = ? WHERE task_id = ?", (now, rc, tail, _after_probe(state, claimed_next_at, now), task_id))
++                "next_at = ? WHERE task_id = ?",
++                (now, rc, tail, _after_probe(state, claimed_next_at, now, delay), task_id))
+             _note_alive(conn, task_id, cmd, now)
+             return None
+         fails = int(state["fails"] or 0) + 1
+@@ -991,7 +993,7 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+         conn.execute(
+             "UPDATE task_wake_checks SET last_at = ?, last_rc = ?, last_out = ?, fails = ?, "
+             "next_at = ? WHERE task_id = ?",
+-            (now, rc_col, tail, fails, _after_probe(state, claimed_next_at, now), task_id))
++            (now, rc_col, tail, fails, _after_probe(state, claimed_next_at, now, delay), task_id))
+         _note_alive(conn, task_id, cmd, now)
+         return None
+ 
+diff --git a/tests/hermes_cli/test_kanban_external_review2.py b/tests/hermes_cli/test_kanban_external_review2.py
+new file mode 100644
+index 0000000000..97c53ab028
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_external_review2.py
+@@ -0,0 +1,145 @@
++"""Review round 2 of the external-run cards (PR #3745 @3c8f438b): a poll read for a park the card has since
++left, an outage whose first healthy read is a finished job, and a shell probe's Retry-After. Disposable fixture
++boards, a fake GitHub and the public lifecycle APIs only. The first four cases are the reviewer's repro file."""
++import pytest
++
++from hermes_cli import kanban_ci_progress as kcp
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_external_watch as kew
++from hermes_cli import kanban_shared_blockers as ksb
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli import test_kanban_external_watch as h
++
++kanban_home, gh, clock = h.kanban_home, h.gh, h.clock
++
++
++# --- an outage clears on the first healthy read, a finished job's included -----------------------------------
++
++@pytest.mark.parametrize("conclusion", ["success", "failure"])
++def test_terminal_recovery_clears_outage(kanban_home, gh, clock, conclusion):
++    with kbc.connect_closing() as conn:
++        tids = [h.park(conn, 8001), h.park(conn, 8002)]
++        gh.mode = "5xx"
++        h.tick(conn, gh, clock)
++        probe = h.tick(conn, gh, clock)
++        assert len(probe) == 1
++        bid = kew.blocker_id("github_run", h.REPO)
++        assert ksb.blocker_states(conn)[bid].is_open
++        gh.mode = None
++        gh.job, gh.conclusion = "completed", conclusion
++        (other,) = [t for t in tids if t not in probe]
++        assert h.tick(conn, gh, clock) == [other]
++        assert not ksb.blocker_states(conn)[bid].is_open
++        woke = h.events(conn, other, kwc.CONDITION_MET_EVENT)[-1]["external_result"]  # the wake is kept
++        assert woke["outcome"] == ("succeeded" if conclusion == "success" else "failed")
++
++
++# --- a poll belongs to the park it was read for ---------------------------------------------------------------
++
++def _repark(conn, tid, run):
++    """An ordinary wake, claim and re-park, as another actor commits while a remote read is in flight."""
++    st = kwc.get_state(conn, tid)
++    assert kwc.apply_result(conn, tid, st["cmd"], 0, "", generation=st["generation"])
++    assert kb.claim_task(conn, tid, claimer="worker")
++    assert kb.schedule_task(conn, tid, reason="replacement run", wake_check="false", check_every=900,
++                            awaiting={"kind": "ci", "ref": h.url(run), "why": "replacement"})
++
++
++@pytest.mark.parametrize("replacement", [8102, 8101], ids=["another_run", "same_ref_new_park"])
++def test_sweep_discards_result_from_previous_park(kanban_home, gh, clock, replacement):
++    with kbc.connect_closing() as conn:
++        tid = h.park(conn, 8101)
++        reads = []
++
++        def fetch(repo, run_id):
++            if not reads:
++                _repark(conn, tid, replacement)
++                gh.job, gh.conclusion = "completed", "success"
++            reads.append(str(run_id))
++            return gh.fetch(repo, run_id)
++
++        assert kcp.sweep(conn, fetch=fetch, fetch_run=gh.fetch_run, fetch_runners=lambda repo: []) == []
++        assert h.status(conn, tid) == "scheduled"
++        assert not h.events(conn, tid, kew.WATCH_EVENT)
++        # The replacement park is read on its own: the next sweep wakes it with its own run's result.
++        clock.set(clock.now + h.EVERY)
++        kcp._LAST_CHECK.clear()
++        assert kcp.sweep(conn, fetch=fetch, fetch_run=gh.fetch_run, fetch_runners=lambda repo: []) == [tid]
++        assert reads == ["8101", str(replacement)]
++        assert h.status(conn, tid) == "ready"
++
++
++def _finished():
++    return {"job": "succeeded", "service": "ok", "detail": "done", "url": h.url(8201), "retry_after": None,
++            "terminal": True}
++
++
++def test_apply_poll_checks_the_park_id_and_the_ref_separately(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = h.park(conn, 8201)
++        park_id = kew.park_context(conn, tid)["event_id"]
++        kw = {"now": h.T0, "adapter": "github_run", "scope": h.REPO}
++        assert kew.apply_poll(conn, tid, _finished(), park_id=park_id - 1, ref=h.url(8201), **kw) is None
++        assert kew.apply_poll(conn, tid, _finished(), park_id=park_id, ref=h.url(8299), **kw) is None
++        assert kew.apply_poll(conn, tid, _finished(), park_id=None, ref=h.url(8299), **kw) is None
++        assert h.status(conn, tid) == "scheduled" and not h.events(conn, tid, kew.WATCH_EVENT)
++        assert kew.apply_poll(conn, tid, _finished(), park_id=park_id, ref=h.url(8201), **kw)
++        assert h.status(conn, tid) == "ready"
++
++
++def test_a_card_with_no_park_matches_no_poll(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="never parked", assignee="worker")
++        assert kew._same_park(conn, tid, 1, None) is False
++        assert kew._same_park(conn, tid, None, None) is True  # a caller that names no park is not checked
++
++
++# --- a shell probe's Retry-After moves the real next probe ----------------------------------------------------
++
++def _probe(conn, tid, out, rc=1, **kw):
++    st = kwc.get_state(conn, tid)
++    now = int(h.T0)
++    assert kwc.apply_result(conn, tid, st["cmd"], rc, out, generation=st["generation"], now=now, **kw) is None
++    after = kwc.get_state(conn, tid)
++    assert after["generation"] == st["generation"]
++    return after["next_at"] - now
++
++
++def _external(conn):
++    return h.park(conn, kind="external", ref="remote job", wake_check="probe.sh")
++
++
++def test_shell_retry_after_controls_real_next_probe(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _external(conn)
++        assert _probe(conn, tid, 'HERMES_WATCH {"service":"rate_limited","retry_after":3600}') == 3600
++
++
++def test_shell_retry_after_applies_to_a_could_not_tell_exit(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _external(conn)
++        assert _probe(conn, tid, 'HERMES_WATCH {"service":"rate_limited","retry_after":3600}', rc=3) == 3600
++
++
++def test_shell_retry_after_never_shortens_the_cadence(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _external(conn)
++        assert _probe(conn, tid, 'HERMES_WATCH {"service":"rate_limited","retry_after":60}') == 900
++
++
++def test_shell_retry_after_is_ignored_unless_rate_limited(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _external(conn)
++        assert _probe(conn, tid, 'HERMES_WATCH {"service":"ok","job":"running","retry_after":3600}') == 900
++
++
++def test_shell_retry_after_keeps_an_expedite(kanban_home):
++    """A wait expedite that committed while the probe ran (next_at moved before the claim's slot) still wins."""
++    with kbc.connect_closing() as conn:
++        tid = _external(conn)
++        now = int(h.T0)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_wake_checks SET next_at = ? WHERE task_id = ?", (now - 5, tid))
++        assert _probe(conn, tid, 'HERMES_WATCH {"service":"rate_limited","retry_after":3600}',
++                      claimed_next_at=now + 900) == -5
+-- 
+2.43.0
+

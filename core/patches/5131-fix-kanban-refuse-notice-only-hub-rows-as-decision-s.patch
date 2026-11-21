@@ -1,0 +1,185 @@
+From 14e1eba3e06fe1f5342f0e1b430f114efb1447ba Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 09:27:20 +0000
+Subject: [PATCH] fix(kanban): refuse notice-only hub rows as decision
+ subscribers [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Review 5990038078 of #3730 @487100b0: has_chat_subscriber accepted every
+well-formed platform=hub row, so a card whose only hub sub was touch or
+send_refused parked and posted decision_requested. hermes-hub collect_tasks
+and _counted_sub_clause exclude those UNCOUNTED_SUB_REASONS, so _linked_chats
+was empty and the origin chat got 0 wakes.
+
+Problem: a creator ask on a notice-only hub row parked silently with no
+wakeable session.
+Why 1: the hub branch returned True on a 3-part chat_id — evidence: review
+probe on 487100b0 (scheduled, 1 decision_requested, sessions=[], 0 wakes).
+Why 2: this PR admitted hub destinations without the publisher's counted
+predicate — evidence: kanban_db_notify.UNCOUNTED_SUB_REASONS and
+hermes_hub._task_subscriptions counted clause.
+Why 3: the existing hub eligibility test seeded reason=shepherd only.
+Root (happened): decision eligibility did not share the collector's
+counted-sub predicate.
+Root (not caught): no schedule-tool test whose only hub row was
+send_refused or touch.
+Recurrence: second fail-open in this PR (rollout re-notify was the first).
+
+Countermeasures:
+- symptom: hub branch of has_chat_subscriber skips touch/send_refused
+- detection: test_notice_only_hub_row_is_not_a_decision_subscriber (RED on
+  487100b0, 2 failed; GREEN after, 2 passed). Focused 9 files 215 passed.
+  scripts/check --base origin/main 21 ok.
+- cosmetics from the same review: drop the dead drop_mark(task) is None
+  conjunct (ask envelopes are scheduled; drop_mark needs blocked) and the
+  unused _terminal_states helper.
+
+Mixed-version (an operator instruction point 2): INCOMPLETE. The hub notify row has
+no advertised receiver core version or "reads ask_notice" capability
+(chat_id is only gw/profile/session; replica meta has gateway/cursor/head).
+No handshake added. A mixed-version window can still park unseen until the
+receiver updates.
+
+No change to who may answer an ask. Genuine human_request stays
+user-directed.
+---
+ hermes_cli/kanban_awaiting.py                 | 27 ++++++++++++-------
+ .../test_kanban_origin_decision_wake.py       | 24 +++++++++++++++++
+ tui_gateway/kanban_remote_notice_state.py     |  3 +--
+ tui_gateway/kanban_remote_notices.py          |  2 +-
+ tui_gateway/kanban_remote_observations.py     |  5 ----
+ 5 files changed, 43 insertions(+), 18 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 2898912c52..f4a447881c 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -593,23 +593,30 @@ def has_chat_subscriber(conn: sqlite3.Connection, task_id: str) -> bool:
+     """A subscribed chat that ``decision_requested`` can wake.
+ 
+     A reachable local TUI chat, a wake-enabled messaging row, or a fully
+-    qualified hub relay destination (current asks travel in the owner snapshot).
++    qualified hub relay destination the publisher would count (not
++    ``touch``/``send_refused``). Current asks travel in the owner snapshot.
+     Plain notify messaging rows are not agent wakes.
+     """
+     try:
+-        rows = conn.execute("SELECT platform, chat_id, delivery_mode FROM kanban_notify_subs WHERE task_id = ?",
+-                            (task_id,)).fetchall()
++        rows = conn.execute(
++            "SELECT platform, chat_id, delivery_mode, delivery_metadata FROM kanban_notify_subs WHERE task_id = ?",
++            (task_id,)).fetchall()
+     except sqlite3.OperationalError:
+         return False
+-    for platform, chat_id, mode in rows:
++    from hermes_cli.kanban_db_notify import UNCOUNTED_SUB_REASONS, _decode_notify_delivery_metadata
++    from hermes_cli.kanban_restore_chat_subs import _safe
++    for platform, chat_id, mode, meta in rows:
+         platform = (platform or "").lower()
+         if platform == "hub":
+-            # The owner collector publishes current asks with the origin link.
+-            # Reject malformed destinations rather than silently parking them.
+-            from hermes_cli.kanban_restore_chat_subs import _safe
+-            if isinstance(chat_id, str) and len(chat_id.split('/')) == 3 and all(_safe(p) for p in chat_id.split('/')):
+-                return True
+-            continue
++            # Same counted predicate as hermes-hub collect_tasks / _counted_sub_clause:
++            # notice-only hub rows never appear in the card's sessions.
++            if not (isinstance(chat_id, str) and len(chat_id.split('/')) == 3
++                    and all(_safe(p) for p in chat_id.split('/'))):
++                continue
++            reason = _decode_notify_delivery_metadata(meta).get("reason") or ""
++            if reason in UNCOUNTED_SUB_REASONS:
++                continue
++            return True
+         if platform == "tui":
+             if chat_id and tui_chat_reachable(chat_id):
+                 return True
+diff --git a/tests/hermes_cli/test_kanban_origin_decision_wake.py b/tests/hermes_cli/test_kanban_origin_decision_wake.py
+index cdd231709d..3458700274 100644
+--- a/tests/hermes_cli/test_kanban_origin_decision_wake.py
++++ b/tests/hermes_cli/test_kanban_origin_decision_wake.py
+@@ -4,7 +4,10 @@ import time
+ 
+ import pytest
+ 
++from hermes_cli import kanban_awaiting as kaw
++from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
+ from hermes_cli.kanban_origin_creation import adopt_with_origin
+ from hermes_cli.kanban_origin_ledger import observe_owner_task
+ from tests.hermes_cli import test_kanban_decision_ask as helpers
+@@ -150,3 +153,24 @@ def test_own_comment_wait_excludes_named_producers(cmd, want):
+     from hermes_cli.kanban_remote_ask import own_comment_wait
+     assert own_comment_wait(cmd, 't_x') is want
+ 
++
++@pytest.mark.parametrize('reason', ['send_refused', 'touch'])
++def test_notice_only_hub_row_is_not_a_decision_subscriber(kanban_home, monkeypatch, reason):
++    """Review of #3730: the hub collector never publishes touch/send_refused rows as sessions."""
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        kbn.add_notify_sub(
++            conn, task_id=tid, platform='hub',
++            chat_id=f'macbook/default/{remote.CHAT}', notifier_profile='default',
++            delivery_metadata={'reason': reason})
++        helpers._as_worker(monkeypatch, conn, tid)
++        out = helpers._tool('schedule', {
++            'reason': 'Decide premise A/B/C; waiting on the next reply.',
++            'wake_check': f'hermes kanban wait-comment {tid} --after-id 0 --skip-system',
++            'awaiting': {'kind': 'chat', 'why': 'Decide premise A/B/C.', 'ref': 'origin session'},
++        })
++        assert kaw.NO_CHAT_SUBSCRIBER in (out.get('code') or '') + out.get('error', ''), out
++        task = kb.get_task(conn, tid)
++        assert task is not None and task.status == 'running'
++        assert not [e for e in kb.list_events(conn, tid) if e.kind == 'decision_requested']
++
+diff --git a/tui_gateway/kanban_remote_notice_state.py b/tui_gateway/kanban_remote_notice_state.py
+index a724a56403..a56afb8f4e 100644
+--- a/tui_gateway/kanban_remote_notice_state.py
++++ b/tui_gateway/kanban_remote_notice_state.py
+@@ -7,8 +7,7 @@ def state(task: dict) -> str:
+     if notice is not None:
+         return f"request_withdrawn@{notice['event_id']}"
+     from hermes_cli.kanban_remote_ask import envelope as ask_envelope
+-    from tui_gateway.kanban_remote_notices import drop_mark
+-    if (ask := ask_envelope(task)) is not None and drop_mark(task) is None:
++    if (ask := ask_envelope(task)) is not None:
+         return f"{ask['kind']}@{ask['event_id']}"
+     from tui_gateway.kanban_remote_notices import _terminal_at
+     at = _terminal_at(task) if task.get("status") in ("done", "blocked") else None
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index fc9b893bfa..b6cc65d360 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -373,7 +373,7 @@ def _shared_key(owner: str, key: str, task: dict, profile: str, sid: str) -> str
+     notice = task.get("completion_notice")
+     if task.get("status") == "done" and isinstance(notice, dict) and "event_id" in notice:
+         return _event_key(owner, key, notice)
+-    if (ask := _ask(task)) is not None and drop_mark(task) is None:
++    if (ask := _ask(task)) is not None:
+         return f"remote:{owner}:{key}:{ask['kind']}:{ask['event_id']}"
+     at = _terminal_at(task)
+     return f"remote:{owner}:{key}:{task.get('status')}@{int(at) if at else 0}:{profile}:{sid}"
+diff --git a/tui_gateway/kanban_remote_observations.py b/tui_gateway/kanban_remote_observations.py
+index 63395f88c1..96066adb35 100644
+--- a/tui_gateway/kanban_remote_observations.py
++++ b/tui_gateway/kanban_remote_observations.py
+@@ -77,11 +77,6 @@ def _summary(task) -> dict | None:
+             "completion_notice": {"created_at": notice.get("created_at")}}
+ 
+ 
+-def _terminal_states():
+-    from tui_gateway.kanban_remote_notices import _TERMINAL
+-    return _TERMINAL
+-
+-
+ def _changed_rows_cards(conn, replica: Path, me, decoded: dict, lane=None) -> list[tuple]:
+     """``decoded`` is the caller's (replica, owner, key) -> (seq, terminal summary or None) map.
+ 
+-- 
+2.43.0
+

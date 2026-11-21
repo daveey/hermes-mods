@@ -1,0 +1,171 @@
+From c8e642c511aa8e63dec3dd12005510d656e2a4da Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 01:53:30 +0000
+Subject: [PATCH] [daveey] Cover retry custody review branches and preserve
+ interrupt issuer
+
+Problem: restored retry waits label a backend-exit interrupt as user Stop; independent review also found five untested custody clauses. Why: the new pre-provider exception branch hardcoded user attribution, while earlier tests asserted only terminal provider timing. Root happened: attribution was not preserved at the new interrupt boundary. Root not caught: redundant wait gates masked ordering and guard mutations. Recurrence: scoped follow-up to PR3820 review6001906830, not a new natural-window receipt. Countermeasures: use the canonical interrupt issuer; seven focused cases kill all six mutations including Stop during boundary, declined wait return, per-iteration ordering, refused-marker carry and stale exact-value clear. Proof: r22-mutants.log baseline7pass,6killed; regression38pass/10files; scripts/check21OK. Real600s process proof remains prior r20 evidence, not rerun or installed proof here. Actual-precondition installed verification and5natural90s windows remain verifier-owned; historical latency failures are not waived.
+---
+ agent/provider_retry_deadline.py              |   5 +-
+ .../test_retry_deadline_declined_pause.py     |   5 +-
+ .../test_retry_deadline_review_controls.py    | 111 ++++++++++++++++++
+ 3 files changed, 116 insertions(+), 5 deletions(-)
+ create mode 100644 tests/tui_gateway/test_retry_deadline_review_controls.py
+
+diff --git a/agent/provider_retry_deadline.py b/agent/provider_retry_deadline.py
+index fb54a3ed7f..644a9613ac 100644
+--- a/agent/provider_retry_deadline.py
++++ b/agent/provider_retry_deadline.py
+@@ -132,8 +132,11 @@ def before_provider_work(agent: Any, messages: Any, conversation_history: Any, a
+             tracked_messages = messages or [{"role": "user", "content": ""}]
+             verdict = wait_restored(agent, retry, tracked_messages, api_call_count + 1)
+         except InterruptedError:
++            from agent.interrupt_control import interrupt_issuer
++
++            issuer = interrupt_issuer(agent)
+             return {"messages": messages, "final_response": "", "interrupted": True,
+-                    "turn_exit_reason": "interrupted_by_user"}
++                    "turn_exit_reason": f"interrupted_by_system({issuer})" if issuer else "interrupted_by_user"}
+         if verdict == "done":
+             return None
+         if verdict == "redirect":
+diff --git a/tests/tui_gateway/test_retry_deadline_declined_pause.py b/tests/tui_gateway/test_retry_deadline_declined_pause.py
+index 6a60088d82..287f0a3160 100644
+--- a/tests/tui_gateway/test_retry_deadline_declined_pause.py
++++ b/tests/tui_gateway/test_retry_deadline_declined_pause.py
+@@ -1,4 +1,4 @@
+-"""Repro (review only): a declined boundary pause after the durable API-error wait yields -> early provider call?"""
++"""A declined boundary pause must retain the selected API-error retry deadline."""
+ import threading, time
+ import httpx, pytest
+ from openai import RateLimitError
+@@ -51,9 +51,6 @@ def test_declined_pause_keeps_deadline(home, tmp_path, monkeypatch, mode):
+         result = agent.run_conversation("run the quick job")
+     finally:
+         stop(); th.join(6); reservation.close()
+-    print(mode, "paused=", result.get("paused_for_update"), "ncalls=", len(calls),
+-          "gap=", round(calls[2] - calls[1], 2) if len(calls) > 2 else None,
+-          "marker_deadline_left=", (read_turn_marker(home, "session-key") or {}).get("provider_retry_not_before", 0) - calls[-1])
+     assert not result.get("paused_for_update")
+     assert len(calls) == 3
+     assert calls[2] - calls[1] >= WAIT - 0.2, f"{mode}: provider called {calls[2]-calls[1]:.2f}s after a {WAIT}s retry wait"
+diff --git a/tests/tui_gateway/test_retry_deadline_review_controls.py b/tests/tui_gateway/test_retry_deadline_review_controls.py
+new file mode 100644
+index 0000000000..7cfabce9f9
+--- /dev/null
++++ b/tests/tui_gateway/test_retry_deadline_review_controls.py
+@@ -0,0 +1,111 @@
++"""Reviewer survivor controls: Stop ordering, declined custody, refused-turn and exact clear."""
++from types import SimpleNamespace
++import time
++
++import pytest
++
++from agent import conversation_loop, provider_retry_deadline as prd, turn_iteration_prep as tip
++from agent import update_pause_cancel as cancel
++from tests.tui_gateway import test_update_pause_model_request as helpers
++from tui_gateway import server, turn_marker as tm
++
++_quiet = helpers._quiet
++MESSAGES = [{"role": "tool", "content": "completed", "tool_call_id": "done"}]
++
++
++def test_stop_arriving_in_restored_boundary_wins(tmp_path, monkeypatch):
++    agent = helpers._make_agent(tmp_path)
++    monkeypatch.setattr(prd, "wait_restored", lambda *a: "yield")
++
++    def boundary():
++        agent.interrupt()
++        return "core_update_pause"
++
++    agent.step_boundary_pause = boundary
++    result = prd.before_provider_work(agent, MESSAGES, [], 1)
++    assert result["interrupted"] and result["turn_exit_reason"] == "interrupted_by_user"
++    assert not result.get("paused_for_update")
++
++
++def test_declined_restored_boundary_serves_remaining_epoch(tmp_path, monkeypatch):
++    agent = helpers._make_agent(tmp_path)
++    now = [time.time()]
++    deadline = now[0] + 60
++    prd.install(agent, stamp=lambda d: True, clear=None, restored=deadline)
++    monkeypatch.setattr(prd, "_now", lambda: now[0])
++    monkeypatch.setattr(prd, "_sleep", lambda s: now.__setitem__(0, now[0] + s))
++    # The real restored wait yields once; declining the real boundary must loop,
++    # not return to provider-capable iteration work while custody is still owed.
++    agent.interrupt(tool_reason=cancel.CANCEL_TOOL_REASON)
++    monkeypatch.setattr(cancel, "model_yield_requested", lambda a: a._interrupt_requested)
++    seen = []
++    agent.step_boundary_pause = lambda: seen.append(now[0]) or None
++    assert prd.before_provider_work(agent, MESSAGES, [], 1) is None
++    assert len(seen) == 1 and seen[0] < deadline
++    assert now[0] >= deadline and prd.RESTORED_ATTR not in vars(agent)
++
++
++def test_iteration_custody_precedes_provider_capable_preparation(tmp_path, monkeypatch):
++    agent = helpers._make_agent(tmp_path)
++    now = [time.time()]
++    deadline = now[0] + 60
++    prd.install(agent, stamp=None, clear=None, restored=deadline)
++    monkeypatch.setattr(prd, "_now", lambda: now[0])
++    monkeypatch.setattr(prd, "_sleep", lambda s: now.__setitem__(0, now[0] + s))
++    agent._checkpoint_mgr = SimpleNamespace(new_turn=lambda: None)
++    agent.step_boundary_pause = None
++    seen = []
++    # This preparation gate runs before compression/hooks; checking only the
++    # final provider call would be masked by perform_api_call's second gate.
++    monkeypatch.setattr(conversation_loop, "_review_input_budget_exhausted", lambda a: seen.append(now[0]) or True)
++    verdict = tip.begin_iteration(agent, messages=MESSAGES, conversation_history=[],
++                                 original_user_message="continue", api_call_count=1,
++                                 interrupted=False, _turn_exit_reason=None)
++    assert verdict.action == "break"
++    assert seen and min(seen) >= deadline
++
++
++@pytest.mark.parametrize("reason, expected", [(None, "interrupted_by_user"),
++                                               ("backend_exit", "interrupted_by_system(backend_exit)")])
++def test_restored_wait_interrupt_retains_issuer(tmp_path, monkeypatch, reason, expected):
++    agent = helpers._make_agent(tmp_path)
++    prd.install(agent, stamp=None, clear=None, restored=time.time() + 600)
++
++    def stop(_seconds):
++        agent.interrupt(tool_reason=reason)
++
++    monkeypatch.setattr(prd, "_sleep", stop)
++    result = prd.before_provider_work(agent, MESSAGES, [], 1)
++    assert result["turn_exit_reason"] == expected
++    assert result["interrupted"] and not result.get("paused_for_update")
++
++
++def test_refused_combined_prompt_keeps_retry_epoch(tmp_path, monkeypatch):
++    key, deadline = "refused-key", time.time() + 600
++    assert tm.record_turn_start(tmp_path, key, "latest", provider_retry_not_before=deadline)
++    session = {"session_key": key, "profile_home": str(tmp_path), "_refused_turn_earlier": "earlier"}
++    monkeypatch.setattr(server, "_load_cfg", lambda: helpers.CFG)
++    monkeypatch.setattr(server, "_session_home", lambda s: tmp_path)
++    monkeypatch.setattr(server, "_auto_continue_config", lambda: (True, 14400, 2))
++    monkeypatch.setattr(server, "_active_goal_manager", lambda s: None)
++    monkeypatch.setattr(server, "read_turn_marker", tm.read_turn_marker)
++    monkeypatch.setattr(server, "record_turn_start", tm.record_turn_start)
++    # Gateway test isolation disables refused timers; restore bounded policy data
++    # without scheduling a timer (this exercises only the durable hold producer).
++    monkeypatch.setattr(server, "_REFUSED_RETRY_DELAYS_S", (45.0, 180.0))
++    server._hold_refused_turn(session, key, "auto_continue", {"retryable": True})
++    assert "_refused_turn_earlier" not in session, session
++    marker = tm.read_turn_marker(tmp_path, key)
++    assert marker["prompt"] == "earlier\n\nlatest"
++    assert marker[tm.PROVIDER_RETRY_FIELD] == deadline
++    assert session["_refused_turn_marker_key"] == key
++
++
++def test_clear_old_epoch_cannot_remove_new_epoch_in_same_generation(tmp_path):
++    key, deadline = "clear-key", time.time() + 600
++    assert tm.record_turn_start(tmp_path, key, "original", provider_retry_not_before=deadline)
++    generation = tm.read_turn_marker(tmp_path, key)
++    assert not tm.clear_provider_retry_deadline(tmp_path, key, deadline - 1, generation)
++    assert tm.read_turn_marker(tmp_path, key)[tm.PROVIDER_RETRY_FIELD] == deadline
++    assert tm.clear_provider_retry_deadline(tmp_path, key, deadline, generation)
++    assert tm.PROVIDER_RETRY_FIELD not in tm.read_turn_marker(tmp_path, key)
+-- 
+2.43.0
+

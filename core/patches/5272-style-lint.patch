@@ -1,0 +1,454 @@
+From bb27809e47083514fd9665f8507678d96942bb42 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 19:36:50 +0000
+Subject: [PATCH] style: lint
+
+---
+ hermes_cli/kanban_admission.py         |  19 ++++
+ hermes_cli/kanban_db_dispatch.py       |  15 +++
+ hermes_cli/process_identity.py         |   2 +
+ hermes_cli/worker_drain_fence.py       | 124 +++++++++++++++++++++--
+ tests/tools/test_worker_drain_spawn.py | 134 +++++++++++++++++++++++++
+ tools/process_registry.py              |   3 +
+ tools/process_registry_survivable.py   |   3 +
+ 7 files changed, 294 insertions(+), 6 deletions(-)
+ create mode 100644 tests/tools/test_worker_drain_spawn.py
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index 55fffd98bb..c5908daf0a 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -381,6 +381,25 @@ def _bind_echo(conn, task_id, gate):
+ 
+ @contextlib.contextmanager
+ def claim_transaction(conn, *, task_id=None, gate=None):
++    """Worker-drain admission (a latched, sealed or unknown node defers the claim, CPU policy on or
++    off), then the real claim transaction. The lease spans COMMIT so the census sees a claim in flight."""
++    from hermes_cli import worker_drain_fence as drain_fence
++    try:
++        lease = drain_fence.admit("kanban.claim")
++    except drain_fence.DrainRefused as exc:
++        logging.getLogger(__name__).warning("kanban claim deferred: %s", exc)
++        yield False
++        return
++    try:
++        with _claim_transaction(conn, task_id=task_id, gate=gate) as admitted:
++            yield admitted
++    finally:
++        if lease is not None:
++            lease.close()
++
++
++@contextlib.contextmanager
++def _claim_transaction(conn, *, task_id=None, gate=None):
+     """Fence check, the hub CPU/cap gate and real SQL commit share admission.lock (never a savepoint).
+ 
+     Board storage may be overridden independently of the installation. Use the
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 5492843baf..4493106e49 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2676,6 +2676,17 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, o
+ def _popen_worker(task: Task, board: Optional[str], cmd, workspace: str, env, observation):
+     """Open the worker log and start the detached child; a raise means no child exists."""
+     log_f = _open_worker_log(task, board)
++    from hermes_cli import worker_drain_fence as _drain
++    try:
++        lease = _drain.admit("kanban.worker")  # refused/unknown => no child exists
++    except BaseException:
++        log_f.close()
++        raise
++    # An activated node's worker keeps the lease (inherited fd) for its whole life so its own
++    # descendants stay admitted while draining; the census sees it as busy until the worker exits.
++    fence_kw = {"pass_fds": lease.pass_fds()} if lease is not None else {}
++    if lease is not None:
++        env = lease.child_env(env)
+     try:
+         proc = (observation or subprocess.Popen)(
+             cmd,
+@@ -2686,6 +2697,7 @@ def _popen_worker(task: Task, board: Optional[str], cmd, workspace: str, env, ob
+             env=env,
+             start_new_session=True,  # detached-spawn: ok — restart-safe kanban worker, must survive the dispatcher
+             creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
++            **fence_kw,
+         )
+     except FileNotFoundError:
+         log_f.close()
+@@ -2696,6 +2708,9 @@ def _popen_worker(task: Task, board: Optional[str], cmd, workspace: str, env, ob
+     except BaseException:
+         log_f.close()
+         raise
++    finally:
++        if lease is not None:
++            lease.close()
+     # Intentionally NOT closing log_f: the child keeps writing after return;
+     # the OS-level FD stays open in the child until it exits.
+     return proc
+diff --git a/hermes_cli/process_identity.py b/hermes_cli/process_identity.py
+index dd92682766..b6c750ac27 100644
+--- a/hermes_cli/process_identity.py
++++ b/hermes_cli/process_identity.py
+@@ -31,6 +31,7 @@ from pathlib import Path
+ from typing import Iterator, Optional, Sequence
+ 
+ from utils import atomic_json_write
++from hermes_cli.worker_drain_fence import fenced as drain_fenced
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -1215,6 +1216,7 @@ def stop_owned_group_survivors(pgid: int, *, proc=None, grace: float = 3.0) -> b
+     return release_process_group_once_empty(pgid, proc=proc, timeout=0)
+ 
+ 
++@drain_fenced("process_identity.spawn_owned")
+ def spawn_owned(argv, *, purpose: str, **popen_kwargs) -> subprocess.Popen:
+     """Start a long-lived child that dies with this process: the one way to own a child.
+ 
+diff --git a/hermes_cli/worker_drain_fence.py b/hermes_cli/worker_drain_fence.py
+index ea46592288..c1526bd69f 100644
+--- a/hermes_cli/worker_drain_fence.py
++++ b/hermes_cli/worker_drain_fence.py
+@@ -14,7 +14,12 @@ is busy only when an independent fresh nonblocking flock fails.
+ """
+ from __future__ import annotations
+ 
+-import fcntl  # windows-footgun: ok (Linux worker nodes only)
++import importlib
++import os
++from typing import Any
++
++# Linux worker nodes only; on Windows enforcement can never be activated.
++fcntl: Any = importlib.import_module('fcntl') if os.name == 'posix' else None
+ import hashlib
+ import json
+ import os
+@@ -217,13 +222,28 @@ def apply_request(root: Path, ident: Identity, req: dict, *, now_ms: int | None
+ class WorkLease:
+     """A flocked close-only lease file. Closing never unlinks or unlocks."""
+ 
+-    def __init__(self, fd: int, path: Path):
+-        self.fd, self.path = fd, path
++    def __init__(self, fd: int, path: Path, owned: bool = True, parent: WorkLease | None = None):
++        self.fd, self.path, self.owned, self.parent = fd, path, owned, parent
+ 
+     def close(self) -> None:
+-        if self.fd is not None:
++        if self.fd is not None and self.owned:
+             os.close(self.fd)
+-            self.fd = None
++        self.fd = None
++
++    def pass_fds(self) -> tuple:
++        """fds for subprocess pass_fds: the child keeps the same open file description (and flock),
++        plus the held parent so deeper hermes descendants stay admitted while draining."""
++        fds = [f for f in (self.fd, self.parent.fd if self.parent else None) if f is not None]
++        for f in fds:
++            os.set_inheritable(f, True)
++        return tuple(fds)
++
++    def child_env(self, env: dict | None = None) -> dict:
++        out = dict(os.environ if env is None else env)
++        anchor = self.parent if self.parent is not None and self.parent.fd is not None else self
++        if anchor.fd is not None:
++            out[LEASE_FD_ENV] = str(anchor.fd)
++        return out
+ 
+ 
+ def lease_busy(path: Path) -> bool:
+@@ -266,7 +286,7 @@ def acquire_lease(root: Path, ident: Identity, purpose: str, *, parent: WorkLeas
+         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+         os.write(fd, _canon({'version': 1, 'boot': ident.boot, 'pid': os.getpid(), 'purpose': purpose}))
+         os.fsync(fd)
+-        return WorkLease(fd, ld / name)
++        return WorkLease(fd, ld / name, parent=parent)
+ 
+ 
+ def seal_precheck(root: Path, ident: Identity) -> bool:
+@@ -274,3 +294,95 @@ def seal_precheck(root: Path, ident: Identity) -> bool:
+     with account_lock(root):
+         read_latch(root, ident)
+         return busy_leases(root) == 0
++
++
++# ---------------------------------------------------------------------------
++# Activation-gated hook API used by every admission/spawn seam.
++# ---------------------------------------------------------------------------
++LEASE_FD_ENV = 'HERMES_WORKER_DRAIN_LEASE_FD'
++_IMDS = 'http://169.254.169.254'
++_iid_cache: dict = {}
++
++
++def read_imds_iid(timeout: float = 1.5) -> str:
++    """Instance id from IMDSv2; any failure is unknown-state (never guessed)."""
++    import urllib.request
++    try:
++        tok = urllib.request.urlopen(urllib.request.Request(
++            _IMDS + '/latest/api/token', method='PUT',
++            headers={'X-aws-ec2-metadata-token-ttl-seconds': '60'}), timeout=timeout).read().decode()
++        iid = urllib.request.urlopen(urllib.request.Request(
++            _IMDS + '/latest/meta-data/instance-id',
++            headers={'X-aws-ec2-metadata-token': tok}), timeout=timeout).read().decode().strip()
++    except Exception as exc:  # any transport failure holds
++        raise DrainRefused('unknown-state', f'imds unavailable: {type(exc).__name__}') from exc
++    if not IID_RE.match(iid):
++        raise DrainRefused('unknown-state', 'imds iid malformed')
++    return iid
++
++
++def current_identity(act: dict, *, imds=None) -> Identity:
++    boot = read_boot_id()
++    iid = _iid_cache.get(boot)
++    if iid is None:
++        iid = (imds or read_imds_iid)()
++        _iid_cache.clear()
++        _iid_cache[boot] = iid
++    if iid != act['iid']:
++        raise DrainRefused('identity-mismatch', 'activation bound to another instance')
++    return Identity(iid=iid, boot=boot, node_epoch=act['node_epoch'])
++
++
++def _state_base() -> Path:
++    from hermes_cli.worker_compute_capacity import policy_root
++    return policy_root()
++
++
++def _inherited_parent(root: Path):
++    raw = os.environ.get(LEASE_FD_ENV)
++    if not raw or not raw.isdigit():
++        return None
++    fd = int(raw)
++    try:
++        real = Path(os.readlink(f'/proc/self/fd/{fd}'))
++        same = os.path.samestat(os.fstat(fd), os.stat(real))
++    except OSError:
++        return None
++    if real.parent != _state_root(root) / LEASE_DIR or not same:
++        return None
++    return WorkLease(fd, real, owned=False)
++
++
++def fenced(purpose: str):
++    """Decorator: admit before the call, hold the lease for its duration, refuse loudly otherwise.
++    A no-op wrapper when the node is not activated."""
++    import functools
++
++    def deco(fn):
++        @functools.wraps(fn)
++        def wrapper(*args, **kwargs):
++            lease = admit(purpose)
++            try:
++                return fn(*args, **kwargs)
++            finally:
++                if lease is not None:
++                    lease.close()
++        wrapper.__drain_fenced__ = purpose  # type: ignore[attr-defined]
++        return wrapper
++    return deco
++
++
++def admit(purpose: str, *, activation_path: Path | None = None, imds=None):
++    """Gate one admission/spawn. None when enforcement is not activated (full no-op).
++
++    Raises DrainRefused when latched, sealed, or state is unknown. The returned lease keeps the
++    node non-idle while held; for detached children pass ``lease.pass_fds()`` and
++    ``lease.child_env()`` to the spawn so the flock outlives this process, then ``close()``.
++    """
++    act = load_activation(ACTIVATION_PATH if activation_path is None else activation_path)
++    if act is None:
++        return None
++    root = _state_base()
++    ident = current_identity(act, imds=imds)
++    return acquire_lease(root, ident, purpose, parent=_inherited_parent(root))
++
+diff --git a/tests/tools/test_worker_drain_spawn.py b/tests/tools/test_worker_drain_spawn.py
+new file mode 100644
+index 0000000000..64a4b71fb5
+--- /dev/null
++++ b/tests/tools/test_worker_drain_spawn.py
+@@ -0,0 +1,134 @@
++"""Admission/spawn hooks honour the drain latch (isolated root, no AWS, no live node)."""
++import json
++import os
++import sqlite3
++import subprocess
++import sys
++import time
++
++import pytest
++
++from hermes_cli import worker_drain_fence as f
++
++IID = 'i-0123456789abcdef0'
++
++
++@pytest.fixture
++def node(tmp_path, monkeypatch):
++    act = tmp_path / 'activation.json'
++    root = tmp_path / 'acct'
++    root.mkdir()
++    ident = f.Identity(IID, f.read_boot_id(), 'epoch-1')
++    f.install_state(root, ident)
++    act.write_text(json.dumps({'version': 1, 'iid': IID, 'uid': os.getuid(), 'node_epoch': 'epoch-1',
++                               'home': str(tmp_path)}))
++    monkeypatch.setattr(f, 'ACTIVATION_PATH', act)
++    monkeypatch.setattr(f, '_state_base', lambda: root)
++    monkeypatch.setattr(f, 'read_imds_iid', lambda timeout=1.5: IID)
++    monkeypatch.delenv(f.LEASE_FD_ENV, raising=False)
++    f._iid_cache.clear()
++    return root, ident
++
++
++def latch(root, ident, op='establish', gen=1):
++    now = int(time.time() * 1000)
++    return f.apply_request(root, ident, {
++        'version': 1, 'op': op, 'iid': ident.iid, 'boot': ident.boot, 'node_epoch': ident.node_epoch,
++        'attempt': 'a1', 'generation': gen, 'request_id': f'{op}-{gen}', 'issued_at_ms': now,
++        'not_after_ms': now + 20000})
++
++
++def test_not_activated_is_a_full_noop(tmp_path, monkeypatch):
++    monkeypatch.setattr(f, 'ACTIVATION_PATH', tmp_path / 'absent.json')
++    assert f.admit('x') is None
++
++    @f.fenced('t')
++    def go():
++        return 7
++    assert go() == 7
++
++
++def test_fenced_hook_refuses_after_latch_and_admits_before(node):
++    root, ident = node
++    calls = []
++
++    @f.fenced('t')
++    def go():
++        calls.append(f.busy_leases(root))  # lease held during the call
++        return 'ok'
++    assert go() == 'ok' and calls == [1] and f.busy_leases(root) == 0
++    latch(root, ident)
++    with pytest.raises(f.DrainRefused) as e:
++        go()
++    assert e.value.reason == 'draining' and calls == [1]
++
++
++def test_unknown_state_and_wrong_iid_refuse(node, monkeypatch):
++    root, _ident = node
++    monkeypatch.setattr(f, 'read_imds_iid', lambda timeout=1.5: 'i-0fffffffffffffff0')
++    f._iid_cache.clear()
++    with pytest.raises(f.DrainRefused) as e:
++        f.admit('x')
++    assert e.value.reason == 'identity-mismatch'
++    monkeypatch.setattr(f, 'read_imds_iid', lambda timeout=1.5: IID)
++    f._iid_cache.clear()
++    (root / 'core-update' / f.LATCH_FILE).unlink()
++    with pytest.raises(f.DrainRefused) as e:
++        f.admit('x')
++    assert e.value.reason == 'unknown-state'
++
++
++def test_real_spawn_hooks_refuse_when_latched(node):
++    root, ident = node
++    from hermes_cli.process_identity import spawn_owned
++    from tools.process_registry import ProcessRegistry
++    p = spawn_owned([sys.executable, '-c', 'pass'], purpose='drain-test')
++    p.wait()
++    latch(root, ident)
++    with pytest.raises(f.DrainRefused):
++        spawn_owned([sys.executable, '-c', 'pass'], purpose='drain-test')
++    with pytest.raises(f.DrainRefused):
++        ProcessRegistry().spawn_local('true')
++    with pytest.raises(f.DrainRefused):
++        ProcessRegistry().spawn_via_env(object(), 'true')
++
++
++def test_worker_lease_survives_dispatcher_and_admits_descendant(node):
++    root, ident = node
++    lease = f.admit('kanban.worker')
++    child = subprocess.Popen(
++        [sys.executable, '-c', 'import time; time.sleep(30)'], pass_fds=lease.pass_fds(),
++        env=lease.child_env())
++    try:
++        lease.close()
++        assert f.busy_leases(root) == 1  # the worker keeps the flock after the spawner closed
++        latch(root, ident)
++        assert f.seal_precheck(root, ident) is False
++    finally:
++        child.kill()
++        child.wait()
++    assert f.seal_precheck(root, ident) is True
++
++
++def test_descendant_with_inherited_parent_admitted_while_draining(node, monkeypatch):
++    root, ident = node
++    parent = f.admit('kanban.worker')
++    latch(root, ident)
++    monkeypatch.setenv(f.LEASE_FD_ENV, str(parent.fd))
++    kid = f.admit('terminal')
++    assert kid is not None
++    kid.close()
++    monkeypatch.setenv(f.LEASE_FD_ENV, '999')  # bogus fd never mints authority
++    with pytest.raises(f.DrainRefused):
++        f.admit('terminal')
++    parent.close()
++
++
++def test_claim_transaction_defers_when_latched(node):
++    from hermes_cli.kanban_admission import claim_transaction
++    root, ident = node
++    latch(root, ident)
++    conn = sqlite3.connect(':memory:')
++    with claim_transaction(conn, task_id='t_x') as admitted:
++        assert admitted is False
++    assert not conn.in_transaction
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 0402018c71..bedd4007ed 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -29,6 +29,7 @@ from tools.process_registry_bg_shell import arm_start_gate, bg_command_env, bg_l
+ from tools.environments.sandbox_scope import hosted_scope, producer_fields
+ from tools.environments.local import _append_dropped_path_entries, _resolve_safe_cwd, _sanitize_subprocess_env, _terminal_env, process_cwd, routed_terminal_base
+ from hermes_cli._subprocess_compat import windows_hide_flags
++from hermes_cli.worker_drain_fence import fenced as drain_fenced
+ from dataclasses import MISSING, dataclass, field
+ from typing import Any, Dict, List, Literal, NamedTuple, Optional
+ from hermes_cli.config import get_hermes_home
+@@ -1185,6 +1186,7 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+         self._track_started(session, self._pty_reader_loop, f"proc-pty-reader-{session.id}")
+         return session
+ 
++    @drain_fenced("process_registry.spawn_local")
+     def spawn_local(
+         self, command: str, cwd: str | None = None, task_id: str = "", session_key: str = "",
+         env_vars: dict | None = None, use_pty: bool = False, owner_task_id: str = "",
+@@ -1279,6 +1281,7 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+             raise
+         return session
+ 
++    @drain_fenced("process_registry.spawn_via_env")
+     def spawn_via_env(
+         self, env: Any, command: str, cwd: str | None = None, task_id: str = "", session_key: str = "",
+         timeout: int = 10, owner_task_id: str = "", persist_on_release: bool = False) -> ProcessSession:
+diff --git a/tools/process_registry_survivable.py b/tools/process_registry_survivable.py
+index 19627db6a4..6c1d8807a9 100644
+--- a/tools/process_registry_survivable.py
++++ b/tools/process_registry_survivable.py
+@@ -30,6 +30,8 @@ from contextlib import ExitStack, suppress
+ from pathlib import Path
+ from typing import Any, Optional
+ 
++from hermes_cli.worker_drain_fence import fenced as drain_fenced
++
+ logger = logging.getLogger("tools.process_registry")
+ 
+ CONFIG_KEY = "update_survivable_processes"
+@@ -145,6 +147,7 @@ class SurvivableForeground:
+         self.session = None
+         self.converted = False
+ 
++    @drain_fenced("process_registry.survivable_spawn")
+     def spawn(self, args: list[str], run_env: dict, cwd: str, stdin_data: Optional[str],
+               markers: tuple = ()) -> Optional[subprocess.Popen]:
+         """Start ``args`` (``[bash, ..., "-c", script]``) in its own scope, held in the registry; None when
+-- 
+2.43.0
+

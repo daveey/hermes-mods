@@ -1,0 +1,137 @@
+From ff42d0a0a87cb6dc0f7eee6e2835dd4e05775f38 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 03:36:51 +0000
+Subject: [PATCH] fix(kanban): containment receipt cache ignores volatile
+ evidence head [daveey]
+
+Defect: on a synced board every resume-contained was refused with
+"canonical receipt identity changed" once the Board feed advanced after the
+stop was cached. remember() stored the raw /evidence JSON and compared it
+whole on a repeat call; the response carries a moving top-level `head` (feed
+cursor), and certified_release re-fetches the stop, so release always hit it.
+
+Fix: on a repeat remember(), identity is (uid, board, task_id, kind, payload,
+origin) plus the evidence `row` and `containment_v1` proof. Other top-level
+transport keys (head etc.) are ignored; the first stored evidence is kept and
+the append-only cache, triggers and certified_stop/certified_release are
+untouched. Any row/payload/origin/proof difference still refuses.
+
+Five whys: release refused -> remember() mismatch -> raw evidence compared ->
+evidence embeds feed head -> identity was never separated from transport.
+
+Proof: RED on main (2 new tests fail with identity changed), GREEN after;
+all 30 test_kanban_containment_*.py files pass (497 tests). New tests:
+replica head-ignored + payload/origin/proof/row still refuse; remote
+contain->resume with hub head advancing between calls.
+---
+ hermes_cli/kanban_containment_replica.py      | 10 +++++-
+ .../test_kanban_containment_remote.py         | 20 +++++++++++
+ .../test_kanban_containment_replica.py        | 33 +++++++++++++++++++
+ 3 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_containment_replica.py b/hermes_cli/kanban_containment_replica.py
+index 209f49d825..5d6ccb254e 100644
+--- a/hermes_cli/kanban_containment_replica.py
++++ b/hermes_cli/kanban_containment_replica.py
+@@ -60,7 +60,10 @@ def remember(conn: sqlite3.Connection, evidence: dict, *, board: str, task: str,
+         prior = conn.execute("SELECT uid,board,task_id,kind,payload,origin,evidence FROM containment_canonical_receipts "
+                              "WHERE uid=?", (uid,)).fetchone()
+         if prior is not None:
+-            if tuple(prior) != values:
++            # Identity is the certified fields only; volatile transport keys of the
++            # evidence response (feed `head` etc.) are ignored. The first stored
++            # evidence is kept: the cache is append-only.
++            if tuple(prior)[:6] != values[:6] or _certified(prior[6]) != _certified(raw):
+                 raise ContainmentRefused("canonical receipt identity changed")
+             return
+         token = _CACHE.set(id(conn))
+@@ -70,6 +73,11 @@ def remember(conn: sqlite3.Connection, evidence: dict, *, board: str, task: str,
+             _CACHE.reset(token)
+ 
+ 
++def _certified(raw: str) -> tuple:
++    data = json.loads(raw)
++    return tuple(json.dumps(data.get(k), sort_keys=True) for k in ("row", "containment_v1"))
++
++
+ def _cached(conn: sqlite3.Connection, uid: str) -> dict | None:
+     if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='containment_canonical_receipts'").fetchone():
+         return None
+diff --git a/tests/hermes_cli/test_kanban_containment_remote.py b/tests/hermes_cli/test_kanban_containment_remote.py
+index 108a997915..06e1016ca4 100644
+--- a/tests/hermes_cli/test_kanban_containment_remote.py
++++ b/tests/hermes_cli/test_kanban_containment_remote.py
+@@ -114,6 +114,26 @@ def test_public_synced_self_stop_then_authority_resume_preserves_edges(board, mo
+     assert hub.closed == 2
+ 
+ 
++def test_resume_succeeds_when_hub_evidence_head_advances(board, monkeypatch):
++    target, authority, session, hub = setup(board, monkeypatch)
++    head = [1000]
++    original = hub.row_evidence
++
++    def moving(slug, table, uid):
++        data = original(slug, table, uid)
++        head[0] += 7
++        data["head"] = head[0]
++        return data
++    hub.row_evidence = moving
++    with scoped_current_session_id(session):
++        stopped = service.contain(board, authority=authority, summary="Fixture handoff")
++    adopt(board, monkeypatch, authority, session)
++    with scoped_current_session_id(session):
++        resumed = service.resume(board, task_id=target, episode=stopped["episode"])
++    assert resumed["status"] == "ready"
++    assert head[0] > 1007
++
++
+ def test_unknown_transport_reuses_committed_request_and_rejects_changed_policy(board, monkeypatch):
+     target, authority, session, hub = setup(board, monkeypatch)
+     hub.drop_reply = True
+diff --git a/tests/hermes_cli/test_kanban_containment_replica.py b/tests/hermes_cli/test_kanban_containment_replica.py
+index e29d5ba83d..4b2111f58e 100644
+--- a/tests/hermes_cli/test_kanban_containment_replica.py
++++ b/tests/hermes_cli/test_kanban_containment_replica.py
+@@ -161,6 +161,39 @@ def test_receipt_cache_immutable_and_foreign_board_not_authority(synced_conn):
+         replica.remember(conn, proof, board="fixture", task=target, uid=stop["event_uid"])
+ 
+ 
++def test_receipt_cache_ignores_volatile_evidence_head(synced_conn):
++    conn = synced_conn
++    target, _, stop, _, hub = scenario(conn)
++    proof = hub.events[stop["event_uid"]]
++    proof["head"] = 100
++    replica.remember(conn, proof, board="fixture", task=target, uid=stop["event_uid"])
++    moved = copy.deepcopy(proof)
++    moved["head"] = 200
++    moved["transport_noise"] = "x"
++    replica.remember(conn, moved, board="fixture", task=target, uid=stop["event_uid"])
++    stored = conn.execute("SELECT evidence FROM containment_canonical_receipts").fetchall()
++    assert len(stored) == 1 and json.loads(stored[0][0])["head"] == 100
++
++
++@pytest.mark.parametrize("mutate", [
++    lambda e: e["row"].update(payload=e["row"]["payload"] + " "),
++    lambda e: e["row"].update(origin_gateway="foreign"),
++    lambda e: e["containment_v1"].update(request="changed"),
++    lambda e: e["row"].update(created_at=12345),
++], ids=["payload", "origin", "proof", "row"])
++def test_receipt_cache_still_refuses_certified_changes_with_head(synced_conn, mutate):
++    conn = synced_conn
++    target, _, stop, _, hub = scenario(conn)
++    proof = hub.events[stop["event_uid"]]
++    proof["head"] = 100
++    replica.remember(conn, proof, board="fixture", task=target, uid=stop["event_uid"])
++    altered = copy.deepcopy(proof)
++    altered["head"] = 200
++    mutate(altered)
++    with pytest.raises(ContainmentRefused):
++        replica.remember(conn, altered, board="fixture", task=target, uid=stop["event_uid"])
++
++
+ def _released_unheld(conn):
+     target, child, stop, release, hub = scenario(conn)
+     marker = sync.RemoteChange(1, "tasks", target, "upsert",
+-- 
+2.43.0
+

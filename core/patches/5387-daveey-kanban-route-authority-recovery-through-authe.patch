@@ -1,0 +1,445 @@
+From 0b0df50f31e5a795d7298517e5fc7d1b94a2795b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 03:45:43 +0000
+Subject: [PATCH] [daveey] kanban: route authority recovery through
+ authenticated owner-wake tool
+
+Problem: the first authority-reopen patch passed helper tests but was unreachable
+from a fenced worker shell and looked up a default-board supervisor on bb.
+Why: CLI entry fences reject worker shell writes before the handler; workers'
+terminal environments intentionally lack task/run authority.
+Root (happened): the recovery privilege was implemented below the authenticated
+tool boundary rather than composing the existing cross-board owner-wake grant.
+Root (not caught): private-handler same-board fixtures bypassed both boundaries.
+Recurrence: follow-up to cb3a7b1f, independently rejected on review card
+t_eeeeee000000003c; no shell fence exception is retained.
+
+Countermeasure: explicit kanban_unblock(task_id=<listed contained target>,
+board=<listed board>, reopen_authority=<exact nominated done authority>) uses
+worker authority on its own board and containment evidence on the target board.
+Revalidate the live run and policy inside reopen's write transaction, locking
+the source board during cross-board mutation. Ordinary reopen parent gating
+and audit remain in place; containment release and shell permissions unchanged.
+
+Proof: public-tool regression 12 passed, including cross-board and same-board
+success, unrelated authority/target/board, non-owner, stale/ended/dead run,
+delegated child, direct containment resume and shell refusals. Mutant disabling
+the new tool branch fails both success cases (2 failed). Both episodes and the
+consumer dependency remain held in positive tests. Portable checks, independent
+review, exact-head CI and canonical ship remain mandatory before delivery.
+---
+ hermes_cli/kanban.py                          |  46 +------
+ hermes_cli/kanban_db_operator.py              |   4 +-
+ hermes_cli/kanban_requeue.py                  |  19 ++-
+ ...test_kanban_owner_wake_authority_reopen.py | 128 +++++++++++-------
+ tools/kanban_tools_authority_reopen.py        |  44 ++++++
+ tools/kanban_tools_schemas.py                 |   6 +-
+ tools/kanban_tools_self_heal.py               |   3 +
+ 7 files changed, 148 insertions(+), 102 deletions(-)
+ create mode 100644 tools/kanban_tools_authority_reopen.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 5ef7205012..65b1884531 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -10,7 +10,6 @@ import argparse
+ import contextlib
+ import importlib
+ import json
+-import sqlite3
+ 
+ from hermes_cli.kanban_published_worktree import publication_scope
+ import logging
+@@ -72,9 +71,8 @@ from hermes_cli.kanban_archive_scope import (  # moved here from this module; re
+     archive_scope_for, worker_archive_scope, worker_may_archive,
+ )
+ from hermes_cli.kanban_requeue import (  # moved here from this module; re-exported for callers
+-    OWNER_WAKE_REQUEUE_STATUSES, _is_owner_wake_supervisor, _is_self_heal_fix_card,
+-    has_requeue_grant, named_defect_card, owner_wake_authority_reopen_grant,
+-    owner_wake_listed_cards, requeue_grant, self_heal_requeue_grant,
++    OWNER_WAKE_REQUEUE_STATUSES, _is_owner_wake_supervisor, _is_self_heal_fix_card, has_requeue_grant,
++    named_defect_card, owner_wake_listed_cards, requeue_grant, self_heal_requeue_grant,
+ )
+ 
+ 
+@@ -168,8 +166,7 @@ def kanban_command(args: argparse.Namespace) -> int:
+ 
+     # Fast-fail for UX only; the durable trust boundary is in kanban_db, since children can
+     # import DB mutators directly.
+-    if _is_delegated_child_cli_mutation(args) and not (
+-            action == "reopen" and _owner_wake_reopen_cli_allowed(args)):
++    if _is_delegated_child_cli_mutation(args):
+         from hermes_cli.top_level_env import delegated_child_refusal  # names a leaked worker env [daveey]
+         return _err(delegated_child_refusal(
+             "kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI "
+@@ -282,32 +279,6 @@ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
+ })
+ 
+ 
+-def _owner_wake_reopen_cli_allowed(args: argparse.Namespace) -> bool:
+-    """Permit the exact owner-wake authority reopen before the worker-shell fence."""
+-    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+-    target = getattr(args, "task_id", None)
+-    if not env_tid or not target or env_tid == target:
+-        return False
+-    from agent.delegation_context import is_delegated_child_context, is_dispatcher_owned_worker_context
+-    if is_delegated_child_context() or not is_dispatcher_owned_worker_context():
+-        return False
+-    raw_run = os.environ.get("HERMES_KANBAN_RUN_ID")
+-    try:
+-        expected_run = int(raw_run) if raw_run else None
+-    except ValueError:
+-        return False
+-    try:
+-        with (kb.scoped_current_board(args.board) if getattr(args, "board", None)
+-              else contextlib.nullcontext()):
+-            kb.init_db()
+-            with kbc.connect_closing() as conn:
+-                return owner_wake_authority_reopen_grant(
+-                    conn, env_tid, target, board=getattr(args, "board", None),
+-                    expected_run_id=expected_run) is not None
+-    except (OSError, sqlite3.Error, ValueError):
+-        return False
+-
+-
+ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
+     action = getattr(args, "kanban_action", None)
+     if action == "boards":
+@@ -1406,17 +1377,6 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+ def _cmd_reopen(args: argparse.Namespace) -> int:
+     """``done`` -> ``ready`` (``todo`` while a parent is open) with an audited reason. [daveey]"""
+     with kbc.connect_closing() as conn:
+-        env_tid = os.environ.get("HERMES_KANBAN_TASK")
+-        if env_tid and env_tid != args.task_id:
+-            raw_run = os.environ.get("HERMES_KANBAN_RUN_ID")
+-            try:
+-                expected_run = int(raw_run) if raw_run else None
+-            except ValueError:
+-                expected_run = None
+-            if owner_wake_authority_reopen_grant(
+-                    conn, env_tid, args.task_id, board=getattr(args, "board", None),
+-                    expected_run_id=expected_run) is None:
+-                return _err(f"kanban reopen: worker is not authorized to reopen {args.task_id}", 2)
+         try:
+             status = kbo.reopen_done_task(conn, args.task_id, reason=args.reason, actor=_profile_author())
+         except kbo.KanbanEditRefused as exc:
+diff --git a/hermes_cli/kanban_db_operator.py b/hermes_cli/kanban_db_operator.py
+index 56f178d33e..c56195b90e 100644
+--- a/hermes_cli/kanban_db_operator.py
++++ b/hermes_cli/kanban_db_operator.py
+@@ -124,7 +124,7 @@ def set_completion_contract(
+ 
+ 
+ def reopen_done_task(
+-    conn: sqlite3.Connection, task_id: str, *, reason: str, actor: str,
++    conn: sqlite3.Connection, task_id: str, *, reason: str, actor: str, precondition=None,
+ ) -> Optional[str]:
+     """Operator reopen: ``done`` -> ``ready`` (``todo`` while a parent is open,
+     the same re-gate unblock uses), ``completed_at`` cleared, the breaker reset.
+@@ -140,6 +140,8 @@ def reopen_done_task(
+         raise KanbanEditRefused("reopen requires a reason")
+     from hermes_cli.kanban_terminal_guard import stale_hold
+     with _kb.write_txn(conn):
++        if precondition is not None:
++            precondition(conn)
+         # A blocked/scheduled/triage row held done by its event log (a stale copy; ``unblock_task`` refuses it and
+         # points here) is reopened too: otherwise no verb revives it.
+         previous = _kb._task_status(conn, task_id)
+diff --git a/hermes_cli/kanban_requeue.py b/hermes_cli/kanban_requeue.py
+index a2fbc1f8f0..a319cfa791 100644
+--- a/hermes_cli/kanban_requeue.py
++++ b/hermes_cli/kanban_requeue.py
+@@ -184,6 +184,7 @@ def owner_wake_listed_cards(task, board: str) -> list[str]:
+ 
+ def owner_wake_authority_reopen_grant(conn, worker_task_id: str, authority_id: str, *,
+                                       board: Optional[str] = None, expected_run_id: Optional[int] = None,
++                                      worker_conn=None, target_id: Optional[str] = None,
+                                       ) -> Optional[str]:
+     """Return the supervisor id when it may reopen one nominated done authority.
+ 
+@@ -195,11 +196,16 @@ def owner_wake_authority_reopen_grant(conn, worker_task_id: str, authority_id: s
+     """
+     if not worker_task_id or not authority_id:
+         return None
+-    worker = kb.get_task(conn, worker_task_id)
++    worker = kb.get_task(worker_conn if worker_conn is not None else conn, worker_task_id)
+     if worker is None or not _is_owner_wake_supervisor(worker) or worker.status != "running":
+         return None
+     if expected_run_id is None or worker.current_run_id != expected_run_id:
+         return None
++    runs = worker_conn if worker_conn is not None else conn
++    live = runs.execute("SELECT status FROM task_runs WHERE id=? AND task_id=?",
++                        (expected_run_id, worker_task_id)).fetchone()
++    if live is None or live[0] != "running":
++        return None
+     slug = board or kb.get_current_board()
+     listed = owner_wake_listed_cards(worker, slug)
+     if not listed:
+@@ -207,14 +213,16 @@ def owner_wake_authority_reopen_grant(conn, worker_task_id: str, authority_id: s
+     authority = kb.get_task(conn, authority_id)
+     if authority is None or authority.status != "done":
+         return None
+-    for target_id in listed:
+-        target = kb.get_task(conn, target_id)
++    for listed_id in listed:
++        if target_id is not None and listed_id != target_id:
++            continue
++        target = kb.get_task(conn, listed_id)
+         episode = getattr(target, "containment_episode", None) if target is not None else None
+         if not episode:
+             continue
+         row = conn.execute(
+             "SELECT payload FROM task_events WHERE task_id=? AND uid=? AND kind='contained'",
+-            (target_id, episode),
++            (listed_id, episode),
+         ).fetchone()
+         if row is None:
+             continue
+@@ -224,7 +232,8 @@ def owner_wake_authority_reopen_grant(conn, worker_task_id: str, authority_id: s
+             continue
+         policy = payload.get("policy") if isinstance(payload, dict) else None
+         named = policy.get("authority") if isinstance(policy, dict) else None
+-        if isinstance(named, dict) and named.get("task_id") == authority_id:
++        if (isinstance(named, dict) and named.get("task_id") == authority_id
++                and named.get("board") == slug):
+             return worker_task_id
+     return None
+ 
+diff --git a/tests/tools/test_kanban_owner_wake_authority_reopen.py b/tests/tools/test_kanban_owner_wake_authority_reopen.py
+index cd0fdabc7d..e2fdcb2ea8 100644
+--- a/tests/tools/test_kanban_owner_wake_authority_reopen.py
++++ b/tests/tools/test_kanban_owner_wake_authority_reopen.py
+@@ -1,70 +1,94 @@
+-"""Owner-wake recovery may reopen only a contained card's done authority."""
++"""Exercise authority recovery through the public tool with default -> bb custody."""
+ from __future__ import annotations
+ 
++import json
+ from argparse import Namespace
+ 
++import pytest
++
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_db_connect as kbc
+-from hermes_cli.kanban_requeue import owner_wake_authority_reopen_grant
+ from tests.hermes_cli import test_kanban_containment_lifecycle as containment
+ from tests.tools import test_kanban_owner_wake_requeue as wake
++from tools import kanban_tools as kt
+ 
+ board = wake.board
+ 
+ 
+-def _fixture(conn):
+-    relay, _consumer, authority, target, spec = containment.setup(conn)
+-    episode = containment.contain(conn, relay, target, spec)["episode"]
+-    conn.execute("UPDATE tasks SET status='done', completed_at=1, current_run_id=NULL WHERE id=?", (authority,))
+-    supervisor = wake._supervisor(conn, kb, [wake._line(f"default/{relay}")])
+-    kb.claim_task(conn, supervisor)
+-    supervisor_task = kb.get_task(conn, supervisor)
+-    assert supervisor_task is not None
+-    run_id = supervisor_task.current_run_id
+-    assert run_id is not None
+-    return relay, authority, supervisor, episode, run_id
++def _fixture(monkeypatch, *, cross=True):
++    slug = "bb" if cross else "default"
++    kb.create_board(slug)
++    with kbc.connect_closing(db_path=kb.board_own_db_path(slug)) as conn:
++        relay, consumer, authority, target, spec = containment.setup(conn)
++        target["board"] = slug
++        spec["authority"]["board"] = slug
++        episode = containment.contain(conn, relay, target, spec)["episode"]
++        conn.execute("UPDATE tasks SET status='done', completed_at=1, current_run_id=NULL WHERE id=?", (authority,))
++        other = kb.create_task(conn, title="Unrelated done authority", assignee="default")
++        conn.execute("UPDATE tasks SET status='done', completed_at=1 WHERE id=?", (other,))
++        conn.commit()
++    with kbc.connect_closing() as own:
++        supervisor = wake._supervisor(own, kb, [wake._line(f"{slug}/{relay}")])
++        wake._as_worker(monkeypatch, own, kb, supervisor)
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.board_own_db_path("default")))
++    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
++    return slug, relay, consumer, authority, other, supervisor, episode
+ 
+ 
+-def test_owner_wake_reopens_exact_done_authority_via_cli_handler(board, monkeypatch):
+-    conn = kbc.connect()
+-    relay, authority, supervisor, episode, run_id = _fixture(conn)
+-    conn.close()
+-    monkeypatch.setenv("HERMES_KANBAN_TASK", supervisor)
+-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++def _call(slug, relay, authority):
++    return json.loads(kt._handle_unblock({"task_id": relay, "board": slug, "reopen_authority": authority}))
+ 
+-    conn = kbc.connect()
+-    try:
+-        assert owner_wake_authority_reopen_grant(
+-            conn, supervisor, authority, expected_run_id=run_id) == supervisor
+-    finally:
+-        conn.close()
+-    from hermes_cli.kanban import _cmd_reopen
+-    assert _cmd_reopen(Namespace(task_id=authority, reason="owner-wake recovery", board=None)) == 0
+ 
+-    conn = kbc.connect()
+-    try:
+-        authority_task = kb.get_task(conn, authority)
+-        relay_task = kb.get_task(conn, relay)
+-        assert authority_task is not None and relay_task is not None
+-        assert authority_task.status == "ready"
+-        assert relay_task.containment_episode == episode
+-        assert [row[0] for row in conn.execute(
+-            "SELECT kind FROM task_events WHERE task_id=? AND kind='contained'", (relay,)
+-        )] == ["contained"]
+-    finally:
+-        conn.close()
++@pytest.mark.parametrize("cross", [True, False])
++def test_public_tool_reopens_only_authority_and_preserves_episode(board, monkeypatch, cross):
++    slug, relay, consumer, authority, _, _, episode = _fixture(monkeypatch, cross=cross)
++    out = _call(slug, relay, authority)
++    assert out.get("ok") is True, out
++    assert out["via"] == "owner-wake-authority-reopen"
++    with kbc.connect_closing(db_path=kb.board_own_db_path(slug)) as conn:
++        assert kb.get_task(conn, authority).status == "ready"
++        assert kb.get_task(conn, relay).containment_episode == episode
++        assert kb.get_task(conn, relay).status == "triage"
++        assert kb.get_task(conn, consumer).status == "todo"
++        assert conn.execute("SELECT count(*) FROM task_links WHERE parent_id=? AND child_id=?",
++                            (relay, consumer)).fetchone()[0] == 1
++        assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='containment_released'", (relay,)).fetchone()
+ 
+ 
+-def test_owner_wake_reopen_denies_unrelated_authority_and_non_owner(board, monkeypatch):
+-    conn = kbc.connect()
+-    relay, authority, supervisor, _episode, run_id = _fixture(conn)
+-    other = kb.create_task(conn, title="Unrelated done authority", assignee="default")
+-    conn.execute("UPDATE tasks SET status='done', completed_at=1 WHERE id=?", (other,))
+-    conn.commit()
+-    assert owner_wake_authority_reopen_grant(conn, supervisor, other, expected_run_id=run_id) is None
+-    assert owner_wake_authority_reopen_grant(
+-        conn, supervisor, authority, board="other", expected_run_id=run_id) is None
+-    assert owner_wake_authority_reopen_grant(conn, relay, authority, expected_run_id=run_id) is None
+-    conn.close()
+-    monkeypatch.setenv("HERMES_KANBAN_TASK", supervisor)
+-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++@pytest.mark.parametrize("case", ["unrelated", "wrong_board", "wrong_target", "non_owner", "stale_run", "ended_run", "dead_run", "child", "direct_resume", "shell"])
++def test_public_boundaries_deny_without_changing_authority(board, monkeypatch, case):
++    slug, relay, _, authority, other, supervisor, episode = _fixture(monkeypatch)
++    mutations = {
++        "non_owner": "UPDATE tasks SET created_by='default' WHERE id=?",
++        "ended_run": "UPDATE tasks SET status='done' WHERE id=?",
++        "dead_run": "UPDATE task_runs SET status='done' WHERE task_id=?",
++    }
++    if case in mutations:
++        with kbc.connect_closing() as own:
++            own.execute(mutations[case], (supervisor,))
++            own.commit()
++    environment = {
++        "stale_run": ("HERMES_KANBAN_RUN_ID", "999999"),
++        "child": ("HERMES_DELEGATED_CHILD_CONTEXT", "1"),
++    }
++    if case in environment:
++        monkeypatch.setenv(*environment[case])
++    if case == "direct_resume":
++        from tools import kanban_containment_tools as tools
++        out = json.loads(kt._kanban_handler("kanban_resume_contained")(tools.handle_resume)(
++            {"task_id": relay, "board": slug, "episode": episode}))
++    elif case == "shell":
++        from hermes_cli.kanban import kanban_command
++        monkeypatch.delenv("HERMES_KANBAN_TASK")
++        monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
++        monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
++        assert kanban_command(Namespace(kanban_action="reopen", task_id=authority, board=slug, reason="recovery")) != 0
++        out = {"ok": False}
++    else:
++        out = _call("other" if case == "wrong_board" else slug,
++                    other if case == "wrong_target" else relay,
++                    other if case == "unrelated" else authority)
++    assert out.get("ok") is not True, out
++    with kbc.connect_closing(db_path=kb.board_own_db_path(slug)) as conn:
++        assert kb.get_task(conn, authority).status == "done"
++        assert kb.get_task(conn, relay).containment_episode == episode
+diff --git a/tools/kanban_tools_authority_reopen.py b/tools/kanban_tools_authority_reopen.py
+new file mode 100644
+index 0000000000..ab99708a39
+--- /dev/null
++++ b/tools/kanban_tools_authority_reopen.py
+@@ -0,0 +1,44 @@
++"""Exact owner-wake authority reopen through the authenticated tool, never a shell."""
++from __future__ import annotations
++
++import os
++from contextlib import nullcontext
++
++
++def handle(args: dict) -> str:
++    from tools import kanban_tools as kt
++    from hermes_cli import kanban_db_connect as kbc, kanban_db_operator as operator
++    from hermes_cli import kanban_foreign_card as foreign
++    from hermes_cli.kanban_requeue import owner_wake_authority_reopen_grant, owner_wake_listed_refs
++
++    kt._check(kt._is_dispatcher_owned_worker(), "authority reopen requires a live owner-wake worker")
++    owner = os.environ.get("HERMES_KANBAN_TASK")
++    target, authority = args.get("task_id"), args.get("reopen_authority")
++    kt._check(owner and target and authority, "task_id and reopen_authority are required")
++    owner, target, authority = str(owner), str(target), str(authority)
++    with kt._board(None) as (kb, own):
++        worker = kb.get_task(own, owner)
++        refs = [(slug, tid) for slug, tid in owner_wake_listed_refs(worker)
++                if tid == target and (args.get("board") is None or args["board"] == slug)]
++        kt._check(len(refs) == 1, "authority reopen requires one exact listed contained target")
++        slug = refs[0][0]
++        same = slug == kb.get_current_board()
++        path = kb.board_own_db_path(slug)
++        kt._check(same or path.is_file(), "listed board is not available locally")
++        scope = nullcontext(own) if same else kbc.connect_closing(db_path=path)
++        with scope as conn:
++            for tid in (target, authority):
++                kt._check(not foreign.refusal(conn, tid), "authority reopen requires local target custody")
++            def precondition(current):
++                kt._check(owner_wake_authority_reopen_grant(
++                    current, owner, authority, board=slug, expected_run_id=kt._worker_run_id(owner),
++                    worker_conn=own, target_id=target) == owner,
++                    "owner-wake authority grant or live run does not match")
++            # Lock the owner board across the cross-board write; the same-board
++            # precondition is already inside reopen's write transaction.
++            with (nullcontext() if same else kbc.write_txn(own)):
++                status = operator.reopen_done_task(
++                    conn, authority, reason=f"Owner-wake {owner}: reopen nominated authority of {slug}/{target}",
++                    actor=owner, precondition=precondition)
++            kt._check(status is not None, "nominated authority is no longer done")
++    return kt._ok(task_id=authority, status=status, via="owner-wake-authority-reopen", contained_target=target)
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 24551b6d77..f519689fdb 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -1113,10 +1113,14 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
+         "in triage or blocked; a missing-parent repair card may unblock the child "
+         "whose newest parent_missing block names it (on another gateway the call "
+         "is forwarded to the child's home as an operator call). Any other worker "
+-        "call is refused, and the worker shell stays fenced."
++        "call is refused, and the worker shell stays fenced. "
++        "An owner-wake supervisor may pass reopen_authority=<done authority id> with task_id=<listed "
++        "contained target> and its board to reopen only that target’s nominated authority, without "
++        "releasing containment or changing its gates."
+     ),
+     {
+         "task_id": _prop("string", "Blocked task id to move to ready or parent-gated todo."),
++        "reopen_authority": _prop("string", "Owner-wake only: reopen this listed contained target’s exact done authority; do not release the target."),
+         "seen_comment_id": _prop("integer", "Newest comment id read on this card. Without it, foreign-session comments in the last 60 minutes refuse manual release with unread_comments; read the listing before retrying."),
+     },
+     ["task_id"],
+diff --git a/tools/kanban_tools_self_heal.py b/tools/kanban_tools_self_heal.py
+index 38b7121579..b09da15e2c 100644
+--- a/tools/kanban_tools_self_heal.py
++++ b/tools/kanban_tools_self_heal.py
+@@ -121,6 +121,9 @@ def handle_unblock(args: dict, **kw) -> str:
+     from hermes_cli.kanban_shared_blockers import unblock_verdict
+ 
+     kt._reject_delegated_child_mutation("kanban_unblock")
++    if args.get("reopen_authority") is not None:
++        from tools.kanban_tools_authority_reopen import handle
++        return handle(args)
+     tid = args.get("task_id")
+     kt._check(tid, "task_id is required")
+     tid = str(tid)
+-- 
+2.43.0
+

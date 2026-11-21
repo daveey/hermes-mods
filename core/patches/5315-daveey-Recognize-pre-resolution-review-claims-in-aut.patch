@@ -1,0 +1,100 @@
+From bb55eaa189a1f1590b3095beac7bebf4caa755c6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 14:26:47 +0000
+Subject: [PATCH] [daveey] Recognize pre-resolution review claims in author
+ epochs
+
+Dispatch claims review runs before model resolution. Read claimed.source_status as lane provenance so a receipt-less review is not mistaken for an unknown implementation run. Keep verdict-only boundaries and conservative unknown-implementer handling.
+
+Proof: three new claim/real-dispatch regressions red on 09b2990d24, then green. All 40 model-tier/review consumers pass (1099 tests). Nine mutants killed including removal of claim-lane classification. Full scripts/check passes. Read-only ordinary-card history replay: 850 histories, 17 changed sets against original full-history exclusions; none empty.
+---
+ hermes_cli/kanban_review_model.py             |  9 +++-
+ .../test_kanban_review_model_cycles.py        | 52 +++++++++++++++++++
+ 2 files changed, 59 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index bf7c829667..2abc4fd942 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -130,8 +130,13 @@ def _current_authors(conn, task_id):
+                             (task_id,)).fetchall():
+         events = conn.execute("SELECT kind, payload FROM task_events WHERE task_id=? AND run_id=? "
+                               "ORDER BY id DESC", (task_id, row[0])).fetchall()
+-        reviewing = any(event[0] in ("model_tier", "run_route") and
+-                        _payload(event[1]).get("lane") == "review" for event in events)
++        # Dispatch claims before resolving a model. The claim already records
++        # its source lane, even if resolution refuses before any route receipt.
++        reviewing = any(
++            (event[0] in ("model_tier", "run_route") and _payload(event[1]).get("lane") == "review")
++            or (event[0] == "claimed" and _payload(event[1]).get("source_status") == "review")
++            for event in events)
++
+         if reviewing:
+             # Launch/result receipts prove execution, not that anyone judged the
+             # head. Parked and crashed reviewers must not release its authors.
+diff --git a/tests/hermes_cli/test_kanban_review_model_cycles.py b/tests/hermes_cli/test_kanban_review_model_cycles.py
+index 50d4cc6bab..ddc9e5d7bb 100644
+--- a/tests/hermes_cli/test_kanban_review_model_cycles.py
++++ b/tests/hermes_cli/test_kanban_review_model_cycles.py
+@@ -127,6 +127,58 @@ def test_real_reviewer_lifecycle_only_verdict_releases_authors(board, how):
+         assert model not in authors
+ 
+ 
++def implement(conn, tid, model):
++    claimed = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++    assert claimed is not None
++    kb._append_event(conn, tid, "run_route", {"model": model, "provider": "anthropic", "lane": "ready"},
++                     run_id=claimed.current_run_id)
++    assert kb.request_review(conn, tid)
++
++
++def verdict(conn, tid, model):
++    claimed = kb.claim_review_task(conn, tid, claimer=kb._claimer_id())
++    assert claimed is not None
++    kb._append_event(conn, tid, "model_tier", {"model": model, "lane": "review"},
++                     run_id=claimed.current_run_id)
++    assert kb.request_changes(conn, tid, reason="rework")[0]
++
++
++@pytest.mark.parametrize("refused", [False, True])
++def test_claimed_review_without_route_is_not_an_unknown_author(board, refused):
++    cfg = helpers.config(board, strong=MODELS[0], routes=MODELS)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="claimed review epoch", assignee="default")
++        implement(conn, tid, MODELS[0])
++        verdict(conn, tid, MODELS[1])
++        implement(conn, tid, MODELS[2])
++        claimed = kb.claim_review_task(conn, tid, claimer=kb._claimer_id())
++        assert claimed is not None
++        if refused:
++            # No model_tier exists when admission refuses before resolution.
++            conn.execute("UPDATE task_runs SET outcome='spawn_failed' WHERE id=?", (claimed.current_run_id,))
++        assert review.implementer_models(conn, claimed) == {MODELS[2]}
++        model, _, _ = tier.resolve_model_tier(conn, claimed, lane="review", cfg=cfg)
++        assert model == MODELS[0]
++
++
++def test_dispatch_fifth_review_after_four_real_verdict_cycles(board, monkeypatch):
++    helpers.config(board, strong=MODELS[0], routes=MODELS)
++    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
++    spawned = []
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="dispatch review epoch", assignee="default")
++        for index, model in enumerate(MODELS):
++            implement(conn, tid, model)
++            verdict(conn, tid, MODELS[(index + 1) % len(MODELS)])
++        implement(conn, tid, MODELS[-1])
++        result = dispatch.dispatch_once(conn, spawn_fn=lambda *args: spawned.append(args) or 4242)
++        assert len(spawned) == 1
++        assert result.auto_blocked == []
++        events = [e.payload for e in kb.list_events(conn, tid) if e.kind == "model_tier"]
++        assert events[-1]["model"] == MODELS[0]
++        assert events[-1]["implementer_models"] == [MODELS[-1]]
++
++
+ def test_provider_wall_does_not_become_structural_exhaustion(board, monkeypatch):
+     cfg = helpers.config(board)
+     from hermes_cli import kanban_provider_walls as walls
+-- 
+2.43.0
+

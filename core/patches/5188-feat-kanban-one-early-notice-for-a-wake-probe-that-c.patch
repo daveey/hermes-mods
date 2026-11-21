@@ -1,0 +1,344 @@
+From fd567b4cb158f7e3a5d20f9d6f351b9ba6660d3d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 04:12:40 +0000
+Subject: [PATCH] feat(kanban): one early notice for a wake probe that cannot
+ pass under a far backstop [daveey]
+
+A card parked on a probe that can never become true (t_eeeeee0000000016 run 6: a probe passing only when a
+restarting service's PID is gone) sat `scheduled` for 17.7 h with no notice; the existing wake_check_stale
+wake fires only at 48 h.
+
+Extends the wake-episode path (kanban_wake_episode.not_yet) with detection only: after >= 3 clean exit-1
+checks spanning more than kanban.wake_check_notice_hours (default 6) within the current park, while the
+park's wake_at backstop is more than 24 h away, append ONE passive `wake_probe_unproven_notice` naming the
+probe and its last output (delivered to the origin chat by the gateway and TUI notifiers; never wakes it).
+One per park episode (a re-park opens a new one); clock_only parks never notify. Probe semantics, backstops,
+admission and the 48 h wake are unchanged.
+
+RED/GREEN: tests/hermes_cli/test_kanban_wake_unproven.py (2 positive tests failed before the hook).
+---
+ gateway/kanban_watchers_notifier.py           |   8 +-
+ hermes_cli/kanban_wake_check.py               |   2 +
+ hermes_cli/kanban_wake_unproven.py            | 103 +++++++++++++++
+ tests/hermes_cli/test_kanban_wake_unproven.py | 119 ++++++++++++++++++
+ tui_gateway/session_notifications.py          |   8 +-
+ 5 files changed, 238 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_wake_unproven.py
+ create mode 100644 tests/hermes_cli/test_kanban_wake_unproven.py
+
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index e6c182d3fe..ca9a1a85fa 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -62,7 +62,7 @@ TERMINAL_KINDS = (*TERMINAL_KINDS, "failure_finalized", "spend_budget_decision_r
+ _WAKE_KINDS = (*_WAKE_KINDS, "park_progress_notice")
+ _WAKE_KINDS = (*_WAKE_KINDS, "spend_budget_decision_ready")
+ # ``decision_requested`` (hermes_cli.kanban_decision_ask): a card parked on its orchestrator's answer.
+-TERMINAL_KINDS = (*TERMINAL_KINDS, "decision_requested")
++TERMINAL_KINDS = (*TERMINAL_KINDS, "decision_requested", "wake_probe_unproven_notice")
+ _WAKE_KINDS = (*_WAKE_KINDS, "decision_requested")
+ 
+ 
+@@ -626,6 +626,11 @@ def _fmt_repin_notice(ev, n) -> tuple:
+     return f"⚠ {n.head}: {notice_text(ev.payload)}", None, None
+ 
+ 
++def _fmt_unproven_notice(ev, n) -> tuple:
++    from hermes_cli.kanban_wake_unproven import notice_text
++    return f"⚠ {n.head}: {notice_text(ev.payload)}", None, None
++
++
+ def _fmt_parent_unclaimed(ev, n) -> tuple:
+     from hermes_cli.kanban_parent_unclaimed import notice_text
+     return f"⏳ {n.head}: {notice_text(ev.payload)}", None, None
+@@ -700,6 +705,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
+     "block_loop_detected": _fmt_block_loop_detected,
+     "quota_episode_notice": _fmt_quota_episode,
+     "worker_repin_notice": _fmt_repin_notice,
++    "wake_probe_unproven_notice": _fmt_unproven_notice,
+     "dependency_parent_unclaimed": _fmt_parent_unclaimed,
+     "spend_budget_decision_ready": _fmt_spend_budget,
+     "chat_wait_unclaimed": _fmt_chat_wait,
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index d2e3b31c17..806d73005d 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -931,6 +931,8 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+                 if woke:
+                     kb.add_comment(conn, task_id, "kanban-dispatcher", stale["note"])
+                 return woke
++            from hermes_cli import kanban_wake_unproven as unproven  # [daveey] one early passive notice
++            unproven.note_check(conn, task_id, cmd, tail, now)
+             conn.execute(
+                 "UPDATE task_wake_checks SET last_at = ?, last_rc = 1, last_out = ?, fails = 0, "
+                 "next_at = ? WHERE task_id = ?", (now, tail, _after_probe(state, claimed_next_at, now), task_id))
+diff --git a/hermes_cli/kanban_wake_unproven.py b/hermes_cli/kanban_wake_unproven.py
+new file mode 100644
+index 0000000000..af70d57a61
+--- /dev/null
++++ b/hermes_cli/kanban_wake_unproven.py
+@@ -0,0 +1,103 @@
++"""One early notice when a scheduled wait's probe keeps saying "not yet" under a far backstop. [daveey]
++
++The 48 h ``wake_check_stale`` wake (``kanban_wake_episode``) is the late, card-waking reconsideration. A probe
++whose premise can never hold (a PID of a service that restarts, a file nothing writes) leaves the card
++``scheduled`` for days with nobody told. This adds only detection: after ``wake_check_notice_hours`` (default
++6 h) of clean exit-1 checks within the current park, while the park's backstop (``wake_at``) is more than
++24 h away, the card's origin chat gets ONE passive ``wake_probe_unproven_notice`` naming the probe and its
++last output. Probe semantics, backstops and admission are untouched; the card stays scheduled.
++
++One notice per park episode: a later park event (re-park) opens a new episode. Clock-only waits run no probe,
++so they never reach this.
++"""
++from __future__ import annotations
++
++import json
++import math
++import sqlite3
++from typing import Optional
++
++NOTICE_KIND = "wake_probe_unproven_notice"
++DEFAULT_NOTICE_HOURS = 6
++MIN_CHECKS = 3
++FAR_BACKSTOP_SECONDS = 24 * 3600
++
++
++def notice_seconds() -> float:
++    from hermes_cli.config import load_config_readonly
++    from hermes_cli.config_backend import ConfigBackendUnavailable
++
++    try:
++        section = load_config_readonly().get("kanban")
++    except (ConfigBackendUnavailable, OSError, ValueError):
++        section = None
++    value = section.get("wake_check_notice_hours") if isinstance(section, dict) else DEFAULT_NOTICE_HOURS
++    try:
++        hours = float(value)
++    except (TypeError, ValueError):
++        hours = DEFAULT_NOTICE_HOURS
++    if not math.isfinite(hours) or hours <= 0:
++        hours = DEFAULT_NOTICE_HOURS
++    return hours * 3600
++
++
++def _latest_park(conn: sqlite3.Connection, task_id: str) -> Optional[tuple[int, int, int]]:
++    """``(event_id, parked_at, wake_at)`` of the card's newest park, or None."""
++    from hermes_cli import kanban_timed_park as ktp
++
++    row = conn.execute("SELECT id, payload, created_at FROM task_events WHERE task_id = ? "
++                       "AND kind IN ('scheduled', 'continued') ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    if row is None:
++        return None
++    try:
++        payload = json.loads(row[1] or "{}")
++    except ValueError:
++        payload = {}
++    if not isinstance(payload, dict):
++        payload = {}
++    if payload.get("clock_only"):
++        return None  # a pure time wait has no probe to doubt
++    return int(row[0]), int(row[2]), int(ktp.implied_wake(payload, int(row[2])))
++
++
++def maybe_notice(conn: sqlite3.Connection, task_id: str, cmd: str, out: str, *, now: int, first_at: int,
++                 checks: int, threshold: Optional[float] = None) -> bool:
++    """Append the notice when due; call inside the probe-result write txn after a counted clean exit 1."""
++    from hermes_cli import kanban_db as kb
++
++    if checks < MIN_CHECKS:
++        return False
++    park = _latest_park(conn, task_id)
++    if park is None:
++        return False
++    park_id, parked_at, wake_at = park
++    if wake_at - now <= FAR_BACKSTOP_SECONDS:
++        return False
++    limit = notice_seconds() if threshold is None else threshold
++    since = max(first_at, parked_at)  # a re-park opens a new episode and restarts the age
++    if now - since < limit:
++        return False
++    if conn.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? AND id > ?",
++                    (task_id, NOTICE_KIND, park_id)).fetchone():
++        return False
++    kb._append_event(conn, task_id, NOTICE_KIND, {
++        "wake_check": cmd, "output": (out or "")[-500:], "checks": checks, "hours": round((now - since) / 3600, 1),
++        "wake_at": wake_at})
++    return True
++
++
++def note_check(conn: sqlite3.Connection, task_id: str, cmd: str, out: str, now: int) -> bool:
++    """After a counted clean exit 1: notice from the card's wake episode, when there is one."""
++    ep = conn.execute("SELECT first_at, checks FROM task_wake_episodes WHERE task_id = ?", (task_id,)).fetchone()
++    return bool(ep) and maybe_notice(conn, task_id, cmd, out, now=now, first_at=ep[0], checks=ep[1])
++
++
++def notice_text(payload: dict) -> str:
++    payload = payload if isinstance(payload, dict) else {}
++    cmd = str(payload.get("wake_check") or "")[:300]
++    out = str(payload.get("output") or "").strip()[-300:] or "(no output)"
++    hours = payload.get("hours")
++    span = f"{hours:g} h" if isinstance(hours, (int, float)) else "hours"
++    return (f"its wake probe has not passed in {span} ({payload.get('checks', '?')} checks) and the wait's "
++            f"backstop is more than 24 h away. Check that the condition can occur. Probe: `{cmd}`. "
++            f"Last output: {out}")
+diff --git a/tests/hermes_cli/test_kanban_wake_unproven.py b/tests/hermes_cli/test_kanban_wake_unproven.py
+new file mode 100644
+index 0000000000..6fff2d0ab6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wake_unproven.py
+@@ -0,0 +1,119 @@
++"""A probe that keeps saying "not yet" under a far backstop notifies its chat once per park. [daveey]"""
++from __future__ import annotations
++
++import time
++from datetime import UTC, datetime
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as wc
++from hermes_cli import kanban_wake_unproven as unproven
++from tests.hermes_cli import test_kanban_wake_check as helpers
++
++kanban_home = helpers.kanban_home
++HOUR = 3600
++KIND = unproven.NOTICE_KIND
++PROBE = "python3 run6_ready.py"
++
++
++def _park(conn, tid, clock, *, days=7, **kw):
++    until = datetime.fromtimestamp(clock[0] + days * 24 * HOUR, UTC).isoformat()
++    reason = f"waiting SCHEDULED_UNTIL={until}" if days else "waiting"
++    assert kb.schedule_task(conn, tid, reason=reason, **kw)
++
++
++@pytest.fixture
++def parked(kanban_home, monkeypatch):
++    clock = [int(time.time())]
++    monkeypatch.setattr(time, "time", lambda: clock[0])
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        _park(conn, tid, clock, wake_check=PROBE)
++        yield conn, tid, clock
++
++
++def result(parked, hours, out="pids still alive"):
++    conn, tid, clock = parked
++    state = wc.get_state(conn, tid)
++    return wc.apply_result(conn, tid, state["cmd"], 1, out, generation=state["generation"],
++                           now=clock[0] + int(hours * HOUR))
++
++
++def notices(conn, tid):
++    return helpers._events(conn, tid, KIND)
++
++
++def test_not_ready_past_age_with_far_backstop_notifies_exactly_once(parked):
++    conn, tid, _ = parked
++    for hour in (0, 2, 5):
++        result(parked, hour)
++    assert not notices(conn, tid)
++    for hour in (6, 7, 12, 20):
++        result(parked, hour)
++    found = notices(conn, tid)
++    assert len(found) == 1
++    assert found[0].payload["wake_check"] == PROBE
++    assert found[0].payload["output"] == "pids still alive"
++    assert PROBE in unproven.notice_text(found[0].payload)
++    assert kb.get_task(conn, tid).status == "scheduled"  # detection only: nobody is woken
++
++
++def test_not_ready_under_the_age_does_not_notify(parked):
++    conn, tid, _ = parked
++    for hour in (0, 1, 2, 3, 4, 5.9):
++        result(parked, hour)
++    assert not notices(conn, tid)
++
++
++def test_backstop_within_24_hours_does_not_notify(kanban_home, monkeypatch):
++    clock = [int(time.time())]
++    monkeypatch.setattr(time, "time", lambda: clock[0])
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        _park(conn, tid, clock, days=0, wake_check=PROBE)  # default backstop is exactly 24 h
++        for hour in (0, 3, 7, 12):
++            result((conn, tid, clock), hour)
++        assert not notices(conn, tid)
++
++
++def test_repark_starts_a_new_episode(parked):
++    conn, tid, clock = parked
++    for hour in (0, 3, 6, 8):
++        result(parked, hour)
++    assert len(notices(conn, tid)) == 1
++    clock[0] += 9 * HOUR
++    with kb.write_txn(conn):  # a wake, as the dispatcher does it
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    _park(conn, tid, clock, wake_check=PROBE)
++    for hour in (0, 2, 5):
++        result(parked, hour)
++    assert len(notices(conn, tid)) == 1  # the new episode has not aged yet
++    for hour in (6, 7, 10):
++        result(parked, hour)
++    assert len(notices(conn, tid)) == 2
++
++
++def test_clock_only_wait_never_notifies(kanban_home, monkeypatch):
++    clock = [int(time.time())]
++    monkeypatch.setattr(time, "time", lambda: clock[0])
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        _park(conn, tid, clock, clock_only=True)
++        assert wc.get_state(conn, tid) is None  # no probe runs, so nothing can count a check
++        assert unproven._latest_park(conn, tid) is None  # the park is marked clock-only
++        clock[0] += 12 * HOUR
++        assert unproven.maybe_notice(conn, tid, PROBE, "", now=clock[0], first_at=clock[0] - 12 * HOUR,
++                                     checks=5) is False
++        assert not notices(conn, tid)
++
++
++def test_notice_is_a_delivered_passive_kind():
++    from gateway import kanban_watchers_notifier as gw
++    from tui_gateway import session_notifications as tui
++
++    assert KIND in gw.TERMINAL_KINDS and KIND in tui._KANBAN_NOTIFY_KINDS
++    assert KIND not in gw._WAKE_KINDS  # never wakes the origin turn
++    assert KIND in gw._EVENT_FORMATTERS and KIND in tui._KANBAN_EVENT_FORMATTERS
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 05aa8703b2..66743c547a 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -176,7 +176,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
+ _KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked",
+                         "quota_episode_notice", "worker_repin_notice", "dependency_parent_unclaimed",
+                         "chat_wait_unclaimed", "spend_budget_decision_ready", "request_withdrawn", "failure_finalized", "resolved_check_broken",
+-                        "resolved_check_lost", "park_progress_notice", "decision_requested")
++                        "resolved_check_lost", "park_progress_notice", "decision_requested", "wake_probe_unproven_notice")
+ # kanban, /loop + /heartbeat and the bot mailbox share one idle-poll cadence; probing the lease registry on
+ # every 0.5s queue timeout cost ~a core at 11 sessions (#108005).
+ _KANBAN_POLL_SECONDS = _LOOP_POLL_SECONDS = 5.0
+@@ -627,6 +627,11 @@ def _kb_park_progress(payload):
+     return ": " + notice_text(payload)
+ 
+ 
++def _unproven_text(payload):
++    from hermes_cli.kanban_wake_unproven import notice_text
++    return notice_text(payload)
++
++
+ _KANBAN_EVENT_FORMATTERS = {
+     "park_progress_notice": ("ℹ", lambda t, p, title: _kb_park_progress(p)),
+     "decision_requested": ("❓", lambda t, p, title: _kb_decision_requested(p)),
+@@ -644,6 +649,7 @@ _KANBAN_EVENT_FORMATTERS = {
+     "status": ("🔄", lambda t, p, title: f" → {p.get('status') or ''}"),
+     "quota_episode_notice": ("⏳", lambda t, p, title: _kb_quota_episode(p)),
+     "worker_repin_notice": ("⚠", lambda t, p, title: _kb_repin_notice(p)),
++    "wake_probe_unproven_notice": ("⚠", lambda t, p, title: ": " + _unproven_text(p)),
+     "dependency_parent_unclaimed": ("⏳", lambda t, p, title: _kb_parent_unclaimed(p)),
+     "chat_wait_unclaimed": ("⏳", lambda t, p, title: _kb_chat_wait(p)),
+ }
+-- 
+2.43.0
+

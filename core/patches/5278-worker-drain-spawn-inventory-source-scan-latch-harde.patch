@@ -1,0 +1,2767 @@
+From c3abdd683ace959fa14cf7de235d373b85f0644f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 19:36:51 +0000
+Subject: [PATCH] worker-drain: spawn-inventory source scan, latch hardening,
+ manifest census with live baseline, composed producer-to-scale-in test
+
+Hermes-Card: t_eeeeee0000000031
+---
+ agent/shell_hooks.py                          |    8 +-
+ cron/scheduler.py                             |   36 +-
+ fixture/cache/plugin_hooks.json               |    2 +-
+ hermes_cli/worker_drain_census.py             |  133 +-
+ hermes_cli/worker_drain_fence.py              |   89 +-
+ hermes_cli/worker_drain_results_gate.py       |   19 +
+ hermes_cli/worker_drain_spawn_inventory.json  | 1505 +++++++++++++++++
+ .../test_worker_drain_census_manifest.py      |  124 ++
+ .../hermes_cli/test_worker_drain_composed.py  |  127 ++
+ tests/hermes_cli/test_worker_drain_fence.py   |   11 +-
+ .../hermes_cli/test_worker_drain_hardening.py |  170 ++
+ .../test_worker_drain_source_scan.py          |  185 ++
+ tests/tools/test_worker_drain_spawn.py        |    4 +-
+ tools/computer_use/cua_backend_session.py     |    6 +
+ tools/mcp_tool_transport.py                   |   10 +
+ 15 files changed, 2397 insertions(+), 32 deletions(-)
+ create mode 100644 hermes_cli/worker_drain_spawn_inventory.json
+ create mode 100644 tests/hermes_cli/test_worker_drain_census_manifest.py
+ create mode 100644 tests/hermes_cli/test_worker_drain_composed.py
+ create mode 100644 tests/hermes_cli/test_worker_drain_hardening.py
+ create mode 100644 tests/hermes_cli/test_worker_drain_source_scan.py
+
+diff --git a/agent/shell_hooks.py b/agent/shell_hooks.py
+index cf3b88c780..47d73e6f7c 100644
+--- a/agent/shell_hooks.py
++++ b/agent/shell_hooks.py
+@@ -511,9 +511,11 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> dict[str, Any]:
+     try:
+         if IS_WINDOWS:
+             argv = _windows_script_argv(argv)
+-        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+-                                text=True, encoding='utf-8', errors='replace', shell=False,
+-                                env=build_subprocess_env(scrub_secrets=is_multiplex_active()), **popen_kwargs)
++        from hermes_cli.worker_drain_fence import popen_worker  # DrainRefused falls to the generic failure below
++        proc = popen_worker(subprocess.Popen, argv, drain_purpose='shell_hook',
++                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                            text=True, encoding='utf-8', errors='replace', shell=False,
++                            env=build_subprocess_env(scrub_secrets=is_multiplex_active()), **popen_kwargs)
+     except Exception as exc:
+         for cls, msg in _POPEN_ERRORS:
+             if isinstance(exc, cls):
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 0dacc0c8a1..82d1e15efd 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -830,7 +830,8 @@ def try_register_running_job(job_id: str, *, owner=None, future=_FUTURE_PENDING)
+     with retirement.work() as admitted, _running_lock:
+         if not admitted or key in _running_job_ids:
+             return False
+-        _take_run_reservation(key)
++        if not _take_run_reservation(key):
++            return False  # draining/sealed/unknown: no new cron work may start on this node
+         _running_job_ids.add(key)
+         # Same critical section as the add: no window where an in-flight id lacks an age the sweep
+         # can bound. Sentinel is replaced by the real future once ``pool.submit`` returns.
+@@ -866,9 +867,12 @@ def release_running_job(
+ 
+ # in-flight key -> its core-update admission reservation (``hermes_cli.admission_fence``). [daveey]
+ _running_reservations: dict = {}
++# in-flight key -> its worker-drain work lease (``hermes_cli.worker_drain_fence``); the run's own
++# descendants inherit it through ``lease_scope`` in ``run_one_job``. [daveey]
++_running_leases: dict = {}
+ 
+ 
+-def _take_run_reservation(key) -> None:
++def _take_run_reservation(key) -> bool:
+     """Hold a core-update admission reservation for the whole run (caller holds ``_running_lock``).
+ 
+     hermes-sync's drain only reads reservations; the gateway's restart wait, which counts this run,
+@@ -878,20 +882,35 @@ def _take_run_reservation(key) -> None:
+     A manual run during a hold also counts, so the window waits for it instead of restarting under it.
+     Waits out a busy admission.lock for up to ``backend_retirement.BUSY_WAIT_S`` (a hub claim holds it up to
+     CLAIM_MAX_HOLD_S; ``_running_lock`` is cron's own, not a session lock, and no turn-waiter is registered).
+-    Best-effort: an unavailable fence never blocks a run. The flock dies with this process.
++    Best-effort for the UPDATE fence: an unavailable fence never blocks a run. The worker-drain lease
++    is the opposite: a refusal (draining, sealed, unknown state) returns False and the run is not
++    registered; no drain lease is held for a run that was not admitted. Flocks die with this process.
+     """
++    from hermes_cli.worker_drain_fence import DrainRefused, admit
++    try:
++        drain_lease = admit('cron.run')
++    except DrainRefused as exc:
++        logger.warning("cron run %s refused by worker drain: %s", key[1], exc)
++        return False
++    if drain_lease is not None:
++        _running_leases[key] = drain_lease
+     try:
+         from hermes_cli.admission_fence import extend, SUPPORTED
+         if not SUPPORTED:
+-            return
++            return True
+         from hermes_cli.backend_retirement import BUSY_WAIT_S
+         from hermes_constants import get_default_hermes_root
+         _running_reservations[key] = extend(get_default_hermes_root(home=key[0]), timeout=BUSY_WAIT_S)
+     except (ImportError, OSError, TimeoutError) as exc:
+         logger.debug("cron run %s: no update admission reservation (%s)", key[1], exc)
++    return True
+ 
+ 
+ def _drop_run_reservation(key) -> None:
++    lease = _running_leases.pop(key, None)
++    if lease is not None:
++        with contextlib.suppress(Exception):
++            lease.close()
+     reservation = _running_reservations.pop(key, None)
+     if reservation is not None:
+         with contextlib.suppress(Exception):
+@@ -3082,7 +3101,9 @@ def run_one_job(job: dict, **kwargs) -> bool:
+     """Run ONE due job (see ``_run_one_job_unscoped``). Reserves at entry so claim/setup before the agent
+     reservation (``run_job``) is covered; cron itself is never gated by quiet."""
+     from agent import local_work_agent
+-    with local_work_agent.scope("cron_fire", "cron.scheduler.run_one_job"):
++    from hermes_cli.worker_drain_fence import lease_scope
++    with local_work_agent.scope("cron_fire", "cron.scheduler.run_one_job"), lease_scope(
++            _running_leases.get(_inflight_key(job.get("id"), _get_hermes_home()))):
+         return _run_one_job_unscoped(job, **kwargs)
+ 
+ 
+@@ -4010,8 +4031,11 @@ def _launch_external_cron_worker(job: dict) -> bool:
+     try:
+         stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+         try:
+-            process = subprocess.Popen(
++            from hermes_cli.worker_drain_fence import popen_worker  # [daveey] the worker keeps the run's lease fd
++            process = popen_worker(
++                subprocess.Popen,
+                 dispatch.argv,
++                drain_purpose="cron.worker",
+                 cwd=str(repo_root),
+                 env=worker_env,
+                 stdin=subprocess.DEVNULL,
+diff --git a/fixture/cache/plugin_hooks.json b/fixture/cache/plugin_hooks.json
+index e573b708f9..a8e37322bd 100644
+--- a/fixture/cache/plugin_hooks.json
++++ b/fixture/cache/plugin_hooks.json
+@@ -1 +1 @@
+-{"version": 1, "fingerprint": "30663ffde4ba2fde515cfd40d8ec58f7b50afd3ffdb9e8ba36a5784433787f44", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
++{"version": 1, "fingerprint": "bc6addb52d356cf0d1d4ea21156c615dc8cc13e7ef46c0c9366b5972e9252d33", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/hermes_cli/worker_drain_census.py b/hermes_cli/worker_drain_census.py
+index d132a9f310..8c80943e57 100644
+--- a/hermes_cli/worker_drain_census.py
++++ b/hermes_cli/worker_drain_census.py
+@@ -8,9 +8,12 @@ processes.json is not an authority.
+ """
+ from __future__ import annotations
+ 
++import json
+ import os
+ import re
++import stat
+ import sys
++from dataclasses import dataclass
+ 
+ _SCOPED = re.compile(r'/(app|hermes)\.slice(/|$)')
+ _PF_KTHREAD = 0x200000
+@@ -66,7 +69,133 @@ def _is_kernel_thread(root: str, pid: str) -> bool:
+     return bool(int(fields[6]) & _PF_KTHREAD) and _read(f'{root}/{pid}/cmdline') == ''
+ 
+ 
++# ---------------------------------------------------------------------------
++# Manifest census: zero is provable only when EVERY manifest adapter proves zero.
++# ---------------------------------------------------------------------------
++BASELINE_PATH = '/var/lib/hermes-worker/drain-baseline.json'
++ADAPTERS = ('host_processes', 'work_leases', 'local_results')  # the complete manifest
++ZERO, POSITIVE, UNKNOWN = 'zero', 'positive', 'unknown'
++
++
++@dataclass(frozen=True)
++class Observation:
++    state: str
++    count: int = 0
++    reason: str = ''
++
++
++def load_baseline(path: str = BASELINE_PATH) -> frozenset | None:
++    """Exact idle identities (uid, cgroup, exe) captured at install. None = no usable baseline.
++
++    Trusted only when root-owned, a regular non-symlink file and not group/world writable. A unit
++    name or comm never matches; descendants are judged separately by ``observe_processes``.
++    """
++    try:
++        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
++    except OSError:
++        return None
++    try:
++        st = os.fstat(fd)
++        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
++            return None
++        doc = json.loads(os.read(fd, 1 << 20))
++        if doc.get('version') != 1 or not isinstance(doc.get('idle'), list):
++            return None
++        return frozenset((int(e['uid']), str(e['cgroup']), str(e['exe'])) for e in doc['idle'])
++    except (OSError, ValueError, KeyError, TypeError):
++        return None
++    finally:
++        os.close(fd)
++
++
++def observe_processes(proc_root: str = '/proc', baseline: frozenset | None = None) -> Observation:
++    """Every userspace process is work unless it exactly matches a live baseline identity and so
++    do all of its descendants. Any unreadable entry or missing baseline cannot prove zero."""
++    if not sys.platform.startswith('linux'):
++        return Observation(UNKNOWN, reason='not linux')
++    try:
++        pids = [e for e in os.listdir(proc_root) if e.isdigit()]
++    except OSError:
++        return Observation(UNKNOWN, reason='proc unreadable')
++    me = str(os.getpid())
++    procs: dict = {}  # pid -> (ppid, identity)
++    unreadable = 0
++    for pid in pids:
++        if pid == me:
++            continue
++        try:
++            if _is_kernel_thread(proc_root, pid):
++                continue
++            ppid = _read(f'{proc_root}/{pid}/stat').rsplit(')', 1)[1].split()[1]
++            ident = (os.stat(f'{proc_root}/{pid}').st_uid, _read_cgroup(proc_root, pid),
++                     os.readlink(f'{proc_root}/{pid}/exe'))
++            procs[pid] = (ppid, ident)
++        except (OSError, ValueError, IndexError):
++            if os.path.exists(f'{proc_root}/{pid}'):
++                unreadable += 1  # alive but unobservable: not an absence proof
++    work = {pid for pid, (_, ident) in procs.items() if baseline is None or ident not in baseline}
++    grew = True
++    while grew:  # an exempt process with a working descendant is itself working
++        grew = False
++        for pid, (ppid, _) in procs.items():
++            if pid in work and ppid in procs and ppid not in work:
++                work.add(ppid)
++                grew = True
++    if work:
++        return Observation(POSITIVE, len(work))
++    if unreadable:
++        return Observation(UNKNOWN, reason=f'{unreadable} unobservable processes')
++    if baseline is None:
++        return Observation(UNKNOWN, reason='no trusted live baseline')
++    return Observation(ZERO)
++
++
++def observe_leases() -> Observation:
++    from hermes_cli import worker_compute_capacity as capacity
++    from hermes_cli import worker_drain_fence as fence
++    try:
++        busy = fence.busy_leases(capacity.policy_root())
++    except (fence.DrainRefused, OSError):
++        return Observation(UNKNOWN, reason='lease dir unreadable')
++    return Observation(POSITIVE, busy) if busy else Observation(ZERO)
++
++
++def observe_results() -> Observation:
++    from hermes_cli import worker_drain_results_gate as gate
++    state = gate.local_results_state()
++    if state.state == gate.CLEAR:
++        return Observation(ZERO)
++    if state.state == gate.PENDING:
++        return Observation(POSITIVE, max(state.pending, 1), state.reason)
++    return Observation(UNKNOWN, reason=state.reason)
++
++
++def observe_all(adapters: dict | None = None) -> dict:
++    """Run the full manifest. A missing/extra adapter raises: the manifest is exact."""
++    if adapters is None:
++        base = load_baseline()
++        adapters = {'host_processes': lambda: observe_processes(baseline=base),
++                    'work_leases': observe_leases, 'local_results': observe_results}
++    if set(adapters) != set(ADAPTERS):
++        raise ValueError('census adapters differ from manifest')
++    out = {}
++    for name in ADAPTERS:
++        try:
++            out[name] = adapters[name]()
++        except Exception as exc:  # an adapter fault is unknown, never zero
++            out[name] = Observation(UNKNOWN, reason=type(exc).__name__)
++    return out
++
++
++def manifest_count(adapters: dict | None = None) -> int | None:
++    """Positive lower bound if any adapter sees work; 0 only if every adapter proves zero; else UNKNOWN."""
++    seen = observe_all(adapters)
++    if any(o.state == POSITIVE for o in seen.values()):
++        return sum(o.count for o in seen.values() if o.state == POSITIVE)
++    return 0 if all(o.state == ZERO for o in seen.values()) else None
++
++
+ def complete_count() -> int | None:
+-    """Positive/UNKNOWN observation through the unsent-results gate."""
++    """Census for the heartbeat: manifest result through the unsent-results gate."""
+     from hermes_cli import machine_persistent_jobs as jobs
+-    return jobs.census_count(census())
++    return jobs.census_count(manifest_count())
+diff --git a/hermes_cli/worker_drain_fence.py b/hermes_cli/worker_drain_fence.py
+index 028fb78e10..d18d918f54 100644
+--- a/hermes_cli/worker_drain_fence.py
++++ b/hermes_cli/worker_drain_fence.py
+@@ -55,6 +55,44 @@ class Identity:
+     iid: str
+     boot: str
+     node_epoch: str
++    uid: int | None = None  # worker account uid from the activation; a root process also trusts it
++
++
++ACTIVATION_OWNERS: tuple = (0,)  # who may own the activation file (tests rebind)
++
++
++def _trusted(uid: int | None = None) -> set:
++    return {0, os.geteuid(), *(() if uid is None else (uid,))}  # windows-footgun: ok — POSIX-only module
++
++
++def _check_stat(st, what: str, owners: set, *, directory: bool = False) -> None:
++    import stat as _stat
++    kind = _stat.S_ISDIR(st.st_mode) if directory else (_stat.S_ISREG(st.st_mode) and st.st_nlink == 1)
++    if not kind or st.st_uid not in owners or st.st_mode & 0o022:
++        raise DrainRefused('unknown-state', f'{what} untrusted owner/mode/type')
++
++
++def _secure_read(path: Path, owners: set) -> bytes:
++    """Read a state file through O_NOFOLLOW; reject non-regular, hardlinked, foreign-owner or
++    group/world-writable files (checked on the opened descriptor, not the path)."""
++    try:
++        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
++    except FileNotFoundError:
++        raise
++    except OSError as exc:
++        raise DrainRefused('unknown-state', f'{Path(path).name} unreadable: {type(exc).__name__}') from exc
++    try:
++        _check_stat(os.fstat(fd), Path(path).name, owners)
++        return os.read(fd, 1 << 20)
++    finally:
++        os.close(fd)
++
++
++def _check_dir(d: Path, owners: set) -> None:
++    try:
++        _check_stat(os.lstat(d), d.name, owners, directory=True)  # lstat: a symlinked dir is refused
++    except OSError as exc:
++        raise DrainRefused('unknown-state', f'{d.name} unreadable: {type(exc).__name__}') from exc
+ 
+ 
+ def read_boot_id() -> str:
+@@ -72,11 +110,9 @@ def request_hash(req: dict) -> str:
+ def load_activation(path: Path = ACTIVATION_PATH) -> dict | None:
+     """None when absent (hooks no-op). Raises DrainRefused('unknown-state') when present but invalid."""
+     try:
+-        raw = Path(path).read_bytes()
++        raw = _secure_read(Path(path), set(ACTIVATION_OWNERS))
+     except FileNotFoundError:
+         return None
+-    except OSError as exc:
+-        raise DrainRefused('unknown-state', f'activation unreadable: {type(exc).__name__}') from exc
+     try:
+         doc = json.loads(raw)
+         if (doc.get('version') != 1 or not IID_RE.match(doc.get('iid', '')) or not isinstance(doc.get('uid'), int)
+@@ -95,8 +131,11 @@ def _state_root(root: Path) -> Path:
+ def account_lock(root: Path, *, timeout: float = 2.0):
+     """Nonblocking-poll flock on the shared admission.lock; never unlinks or replaces it."""
+     d = _state_root(root)
+-    d.mkdir(parents=True, exist_ok=True)
+-    fd = os.open(d / LOCK_FILE, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
++    d.mkdir(parents=True, exist_ok=True, mode=0o700)
++    try:
++        fd = os.open(d / LOCK_FILE, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
++    except OSError as exc:
++        raise DrainRefused('unknown-state', f'admission lock unavailable: {type(exc).__name__}') from exc
+     deadline = time.monotonic() + timeout
+     try:
+         while True:
+@@ -128,9 +167,9 @@ def _write_atomic(path: Path, doc: dict) -> None:
+         os.close(dfd)
+ 
+ 
+-def _read_json(path: Path) -> dict:
++def _read_json(path: Path, owners: set | None = None) -> dict:
+     try:
+-        doc = json.loads(path.read_bytes())
++        doc = json.loads(_secure_read(path, _trusted() if owners is None else owners))
+     except (OSError, ValueError) as exc:
+         raise DrainRefused('unknown-state', f'{path.name} unreadable') from exc
+     if not isinstance(doc, dict) or doc.get('version') != 1:
+@@ -142,13 +181,13 @@ def install_state(root: Path, ident: Identity) -> None:
+     """Installer only: immutable install binding (O_EXCL) plus an open latch at generation 0."""
+     d = _state_root(root)
+     with account_lock(root):
+-        d.mkdir(parents=True, exist_ok=True)
++        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+         (d / LEASE_DIR).mkdir(mode=0o700, exist_ok=True)
+         binding = {'version': 1, 'iid': ident.iid, 'node_epoch': ident.node_epoch}
+         try:
+-            fd = os.open(d / INSTALL_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
++            fd = os.open(d / INSTALL_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+         except FileExistsError:
+-            if _read_json(d / INSTALL_FILE) != binding:
++            if _read_json(d / INSTALL_FILE, _trusted(ident.uid)) != binding:
+                 raise DrainRefused('identity-mismatch', 'install binding differs') from None
+         else:
+             try:
+@@ -168,8 +207,10 @@ def _latch_doc(ident: Identity, phase: str, generation: int, attempt: str, last)
+ def read_latch(root: Path, ident: Identity) -> dict:
+     """Validated latch. Missing/corrupt/other-IID/other-epoch/other-boot raise; never read as open."""
+     d = _state_root(root)
+-    install = _read_json(d / INSTALL_FILE)
+-    latch = _read_json(d / LATCH_FILE)
++    owners = _trusted(ident.uid)
++    _check_dir(d, owners)
++    install = _read_json(d / INSTALL_FILE, owners)
++    latch = _read_json(d / LATCH_FILE, owners)
+     if install.get('iid') != ident.iid or install.get('node_epoch') != ident.node_epoch:
+         raise DrainRefused('identity-mismatch', 'install binding')
+     if latch.get('iid') != ident.iid or latch.get('node_epoch') != ident.node_epoch:
+@@ -193,7 +234,13 @@ def apply_request(root: Path, ident: Identity, req: dict, *, now_ms: int | None
+         raise DrainRefused('unknown-state', 'request expired')
+     digest = request_hash(req)
+     d = _state_root(root)
+-    with account_lock(root):
++    remaining = max(0.0, (req['not_after_ms'] - now_ms) / 1000)
++    started = time.monotonic()
++    with account_lock(root, timeout=min(2.0, remaining)):
++        # Lock waits and slow disks spend the request's own deadline: the monotonic elapsed time is
++        # added to the supplied clock, so a stalled holder or a stepped wall clock cannot extend it.
++        if (now_ms + int((time.monotonic() - started) * 1000)) > req['not_after_ms']:
++            raise DrainRefused('unknown-state', 'request expired waiting for lock')
+         latch = read_latch(root, ident)
+         last = latch.get('last')
+         if last and last['request_id'] == req['request_id']:
+@@ -336,7 +383,7 @@ def current_identity(act: dict, *, imds=None) -> Identity:
+         _iid_cache[boot] = iid
+     if iid != act['iid']:
+         raise DrainRefused('identity-mismatch', 'activation bound to another instance')
+-    return Identity(iid=iid, boot=boot, node_epoch=act['node_epoch'])
++    return Identity(iid=iid, boot=boot, node_epoch=act['node_epoch'], uid=act['uid'])
+ 
+ 
+ def _state_base() -> Path:
+@@ -344,6 +391,18 @@ def _state_base() -> Path:
+     return policy_root()
+ 
+ 
++def _activation_root(act: dict) -> Path:
++    """State root for the activated account. A root-run process (sync, installer, core update) has
++    root's home as its policy root, which is a different latch from the worker's; it must use the
++    activated account's. Any other foreign uid is refused, never given an empty state."""
++    me = os.geteuid()  # windows-footgun: ok — POSIX-only module
++    if me == act['uid']:
++        return _state_base()
++    if me != 0:
++        raise DrainRefused('identity-mismatch', 'process uid is not the activated account')
++    return Path(act['home']) / '.hermes'
++
++
+ def _inherited_parent(root: Path):
+     local = _authority.get()
+     if local is not None and local.fd is not None:
+@@ -449,7 +508,7 @@ def admit(purpose: str, *, activation_path: Path | None = None, imds=None):
+     if act is None:
+         return None
+     try:
+-        root = _state_base()
++        root = _activation_root(act)
+         ident = current_identity(act, imds=imds)
+         return acquire_lease(root, ident, purpose, parent=_inherited_parent(root))
+     except OSError as exc:
+diff --git a/hermes_cli/worker_drain_results_gate.py b/hermes_cli/worker_drain_results_gate.py
+index 4f459f2d37..a8ffb62745 100644
+--- a/hermes_cli/worker_drain_results_gate.py
++++ b/hermes_cli/worker_drain_results_gate.py
+@@ -38,6 +38,20 @@ def _outbox_rows(path: Path) -> int:
+         conn.close()
+ 
+ 
++def _sync_running(path: Path) -> int:
++    """1 when a sync round holds this board's sync lock, else 0. Probe failure raises (UNKNOWN).
++
++    Takes and immediately drops the same nonblocking flock a round holds, so a clear answer means no
++    round is between reading outbox rows and acknowledging them.
++    """
++    from hermes_cli.kanban_sync_guard import SyncRoundBusy, board_sync_lock
++    try:
++        with board_sync_lock(path):
++            return 0
++    except SyncRoundBusy:
++        return 1
++
++
+ def local_results_state(boards: list[Path] | None = None) -> ResultsState:
+     """Fail closed: unreadable inventory or board is UNKNOWN, a pending row is PENDING."""
+     try:
+@@ -45,10 +59,15 @@ def local_results_state(boards: list[Path] | None = None) -> ResultsState:
+             from hermes_cli import worker_account_boards
+             boards = worker_account_boards.paths()
+         pending = 0
++        running = 0
+         for path in boards:
+             pending += _outbox_rows(Path(path))
++            running += _sync_running(Path(path))
+     except (OSError, ValueError, sqlite3.Error) as exc:
+         return ResultsState(UNKNOWN, reason=f'outbox unreadable: {type(exc).__name__}')
++    if running and not pending:
++        # A round that popped rows may be mid-acknowledgement; its lock is the only witness.
++        return ResultsState(PENDING, running, 'kanban sync round in flight')
+     if pending:
+         return ResultsState(PENDING, pending, 'unsent local results in kanban_sync_outbox')
+     return ResultsState(CLEAR)
+diff --git a/hermes_cli/worker_drain_spawn_inventory.json b/hermes_cli/worker_drain_spawn_inventory.json
+new file mode 100644
+index 0000000000..a618f0af2e
+--- /dev/null
++++ b/hermes_cli/worker_drain_spawn_inventory.json
+@@ -0,0 +1,1505 @@
++{
++ "files": {
++  "agent/acp_client.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/anthropic_adapter.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/anthropic_credentials.py": {
++   "direct": 4,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/command_token_source.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/context_references.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/credential_relay_preflight.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/credential_relay_repull.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/deadline.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/lsp/client.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/lsp/install.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/proxy_sources/iron_proxy.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/secret_sources/base.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/secret_sources/command.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/skill_preprocessing.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/trace_upload.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/transports/codex_app_server.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/vault_backends/base.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "agent/verify/runner.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "apps/desktop/e2e/update/seed.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "apps/desktop/electron/fixtures/source-backend.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "apps/desktop/electron/native/hud-modifier-x11.test.py": {
++   "direct": 3,
++   "routed": 0,
++   "status": "pending"
++  },
++  "cli.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "cron/restart_rerun.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "cron/scheduler.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "cron/scheduler_script.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "gateway/boot_pinned_imports.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "gateway/platforms/base.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "gateway/platforms/webhook_filters.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "gateway/run.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "gateway/run_inbound_hooks.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "gateway/run_shutdown.py": {
++   "direct": 3,
++   "routed": 0,
++   "status": "pending"
++  },
++  "gateway/runtime_bootstrap_windows.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "gateway/session_managed_worker.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "gateway/session_shell.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "gateway/shutdown_forensics.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "gateway/slash_commands.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "gateway/status.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_bootstrap.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/_early_recovery.py": {
++   "direct": 7,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/_old_updater.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/_secrets_common.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/_subprocess_compat.py": {
++   "direct": 3,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/_update_takeover.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/always_on_dashboard.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/always_on_rollover.py": {
++   "direct": 3,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/bang_shell.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/boot_bootstrap.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/browser_connect.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/bundled_app.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/cli_commands_mixin.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/cli_session_mixin.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/clipboard.py": {
++   "direct": 9,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/code_attestation.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/commands_completion.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/config.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/dashboard_procs.py": {
++   "direct": 5,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/default_plugins.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/desktop_build_reuse.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/doctor_platform.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/doctor_state.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/doctor_tools.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/dump.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/gateway.py": {
++   "direct": 15,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/gateway_connections_ssh_transport.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/gateway_launchd.py": {
++   "direct": 22,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/gateway_launchd_runtime.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/gateway_migrate_guards.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/gateway_runtime_service.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/gateway_runtime_start.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/gateway_windows.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/git_commit_graph.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/git_credentials.py": {
++   "direct": 5,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/github_api.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/gitlock.py": {
++   "direct": 7,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/goals.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/journey.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_aggregate_scope.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_capability_registry.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_capability_routing.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_ci_progress.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_continue_archive.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_db.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_db_connect.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_db_dispatch_guard_notice.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_db_dispatch_pid.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_db_dispatch_pr_state.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_db_recover.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_db_workspace.py": {
++   "direct": 3,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_dead_ancestry.py": {
++   "direct": 3,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_dependency_review_relink.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_failed_result_observer.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_failed_result_service.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_host_identity.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_host_reboot.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_lanes_flow_pr.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_notify_reconcile_exec.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_operator_labels.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_placement.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_placement_forward.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_pr_acceptance.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_priority_runner.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_published_worktree.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_quiet.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_quota_recovery.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_scratch_archive.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_scratch_archive_omit.py": {
++   "direct": 11,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_selfwork_outbound.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_shared_blocker_checks.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_source_cli.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_source_clones.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_source_launch.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_source_publish.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_sync_schema_alert.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_wait_check.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_wake_check.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_worker_scope.py": {
++   "direct": 3,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/kanban_workspace_publication.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/launch_probe.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/linux_desktop_entry.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/local_runtime/devices.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/local_runtime/hardware.py": {
++   "direct": 3,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/local_runtime/processes.py": {
++   "direct": 0,
++   "routed": 1,
++   "status": "fenced"
++  },
++  "hermes_cli/local_runtime/supervisor.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/macos_signing.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/macos_tcc_anchor.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/main.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/main_container.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/main_dashboard.py": {
++   "direct": 4,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/main_desktop.py": {
++   "direct": 15,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/main_desktop_apparmor.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/main_desktop_tcc.py": {
++   "direct": 5,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/main_platform_setup.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/main_tui_launch.py": {
++   "direct": 3,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/main_web_build.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/mcp_catalog.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/memory_setup.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/model_setup_flows.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/onepassword_secrets_cli.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/plugin_host.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/plugin_host_profiles.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/plugin_validate.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/plugins_provenance.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/process_identity.py": {
++   "direct": 1,
++   "routed": 1,
++   "status": "pending"
++  },
++  "hermes_cli/profiles.py": {
++   "direct": 3,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/profiles_service_cleanup.py": {
++   "direct": 3,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/pty_bridge.py": {
++   "direct": 0,
++   "routed": 1,
++   "status": "fenced"
++  },
++  "hermes_cli/quiet_single_query.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/relaunch.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/restart_ignore_paths.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/review_session_activity.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/secrets_cli.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/service_manager.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/session_handover.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/session_lost_and_found.py": {
++   "direct": 4,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/setup_agent_import.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/setup_terminal.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/setup_tts.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/source_build.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/source_check.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/source_completion.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/source_releases.py": {
++   "direct": 6,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/sqlite_runtime.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/sqlite_safe_read.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/ssh_workspace_fs.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/stderr_timestamp.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/tools_config_cua.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/top_level_env.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/uninstall.py": {
++   "direct": 6,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_abort_recovery.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_cmd.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_cmd_commit.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_cmd_fleet.py": {
++   "direct": 4,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_cmd_force_stop.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_cmd_git.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_cmd_maint.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_cmd_posix_pause.py": {
++   "direct": 5,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_cmd_validation.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_cmd_windows.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_completion.py": {
++   "direct": 4,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_custody.py": {
++   "direct": 7,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_gateway_fence.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_lock.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_owning_install.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_pause_deferrals.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_stage.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/update_upstream_conflict.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/venv_sync.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/version_info.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/web_git.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/web_routers/files.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/web_routers/messaging.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/web_routers/profiles.py": {
++   "direct": 3,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/web_server_gateway.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/web_server_lifecycle.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/web_server_memory.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/win_pty_bridge.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/windows_ssh_runtime.py": {
++   "direct": 4,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/worker_compute_capacity.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/worktree_archive.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/worktree_gc.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/worktree_ops.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/worktree_retention.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_cli/worktree_sweep.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_constants.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_constants_scratch.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_constants_scratch_detach.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_dir_acl.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_state_corruption_confirm.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hermes_state_lockowners.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "hosts/hermes-ci-runners/bootstrap/serve-manifest.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "nix/tests/agent-references.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "nix/tests/desktop-backend.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/google_meet/audio_bridge.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/google_meet/cli.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/google_meet/meet_bot.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/google_meet/process_manager.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/memory/byterover/__init__.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/platforms/buzz/adapter.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/platforms/discord/adapter.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/platforms/discord/voice_mixer.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/platforms/matrix/adapter.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/platforms/photon/adapter.py": {
++   "direct": 3,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/platforms/photon/cli.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/platforms/qqbot/adapter.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/platforms/signal/adapter.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/platforms/simplex/adapter.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/platforms/telegram/adapter.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/platforms/telegram/telegram_audio_meta.py": {
++   "direct": 4,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/platforms/whatsapp/adapter.py": {
++   "direct": 7,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/teams_pipeline/pipeline.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "plugins/web/ddgs/provider.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/build_compilers.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/cli.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/client.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/environment.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/extras.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/features.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/libatomic.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/package.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/packages.py": {
++   "direct": 3,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/plugin_eviction.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/pnpm_release_age.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/progress.py": {
++   "direct": 3,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/recovery.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/runtime.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/runtime_stage.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/security_packages.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/shell.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "pm/workspace.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/async_delegation_recovery_hints.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/bot_desktop/install.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/bot_desktop/runtime.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/bot_desktop/sandbox_host.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/bot_mode_dm.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/bot_mode_dm_coordination.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/browser_lightpanda.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/browser_use_cli.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/checkpoint_manager.py": {
++   "direct": 5,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/code_execution_env.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/computer_use/cua_backend.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/computer_use/cua_backend_capture.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/computer_use/cua_backend_daemon.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/computer_use/cua_backend_session.py": {
++   "direct": 0,
++   "routed": 1,
++   "status": "fenced"
++  },
++  "tools/computer_use/doctor.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/computer_use/permissions.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/delegate_tool_resumable.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/env_probe.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/environments/docker.py": {
++   "direct": 4,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/environments/docker_ownership.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/environments/reattach.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/environments/remote_common.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/environments/sandbox_conformance.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/environments/ssh.py": {
++   "direct": 4,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/environments/streams.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/file_operations_lint.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/file_operations_search.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/mcp_tool_config.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/mcp_tool_transport.py": {
++   "direct": 0,
++   "routed": 1,
++   "status": "fenced"
++  },
++  "tools/plugin_guard.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/process_registry.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/process_registry_survivable.py": {
++   "direct": 0,
++   "routed": 1,
++   "status": "fenced"
++  },
++  "tools/process_registry_termination.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/read_extract.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/self_repo_guard.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/skillevaluator_scan.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/subagent_worktree.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/terminal_http_readback.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/terminal_tool_backends.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/transcription_audio.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/transcription_local.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/tts_command_provider.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/tts_tool_delivery.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/tts_tool_local.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/vision_tools_image_prep.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/voice_mode.py": {
++   "direct": 3,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tools/working_diff.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tui_gateway/compute_host.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tui_gateway/host_supervisor.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tui_gateway/methods_complete_helpers.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
++  "tui_gateway/methods_prompt.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  }
++ },
++ "version": 1
++}
+diff --git a/tests/hermes_cli/test_worker_drain_census_manifest.py b/tests/hermes_cli/test_worker_drain_census_manifest.py
+new file mode 100644
+index 0000000000..df7d71ef17
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_census_manifest.py
+@@ -0,0 +1,124 @@
++"""Manifest census: zero only when every adapter proves it; sync-round probe; live baseline trust."""
++from __future__ import annotations
++
++import json
++import os
++import sqlite3
++
++import pytest
++
++from hermes_cli import worker_drain_census as c
++from hermes_cli import worker_drain_results_gate as gate
++from hermes_cli.kanban_db_sync import SYNC_SCHEMA_SQL
++from hermes_cli.kanban_sync_guard import board_sync_lock
++
++ZERO, POS, UNK = c.Observation(c.ZERO), c.Observation(c.POSITIVE, 2), c.Observation(c.UNKNOWN, reason='x')
++CG = '/system.slice/idle.service'
++
++
++def adapters(a=ZERO, b=ZERO, r=ZERO):
++    return {'host_processes': lambda: a, 'work_leases': lambda: b, 'local_results': lambda: r}
++
++
++def test_zero_needs_every_adapter_and_unknown_never_becomes_zero():
++    assert c.manifest_count(adapters()) == 0
++    for position in range(3):
++        mixed = [ZERO, ZERO, ZERO]
++        mixed[position] = UNK
++        assert c.manifest_count(adapters(*mixed)) is None
++        mixed[position] = POS
++        assert c.manifest_count(adapters(*mixed)) == 2
++
++
++def test_adapter_fault_is_unknown_and_manifest_is_exact():
++    def boom():
++        raise RuntimeError('adapter down')
++    assert c.manifest_count({**adapters(), 'work_leases': boom}) is None
++    with pytest.raises(ValueError):
++        c.observe_all({'host_processes': lambda: ZERO})
++    with pytest.raises(ValueError):
++        c.observe_all({**adapters(), 'extra': lambda: ZERO})
++
++
++def _proc(root, pid, ppid=1, cgroup=CG, exe='/usr/sbin/idled', uid_dir=True, link=True):
++    d = root / str(pid)
++    d.mkdir()
++    (d / 'cgroup').write_text(f'0::{cgroup}\n', encoding='utf-8')
++    (d / 'cmdline').write_bytes(b'x\0')
++    (d / 'stat').write_text(f'{pid} (p q) S {ppid} 1 1 0 -1 0 ' + ' '.join(['0'] * 12) + ' 100', encoding='utf-8')
++    if link:
++        os.symlink(exe, d / 'exe')
++
++
++def _ident(root, cgroup=CG, exe='/usr/sbin/idled'):
++    return (os.stat(root).st_uid, cgroup, exe)
++
++
++def test_baseline_exempts_only_exact_identity_with_no_working_descendant(tmp_path):
++    base = frozenset({_ident(tmp_path)})
++    _proc(tmp_path, 10)
++    assert c.observe_processes(str(tmp_path), base) == c.Observation(c.ZERO)
++    _proc(tmp_path, 11, ppid=10, exe='/usr/bin/python3')  # unlisted descendant of an exempt daemon
++    seen = c.observe_processes(str(tmp_path), base)
++    assert seen.state == c.POSITIVE and seen.count == 2  # parent is dragged in: a unit name exempts no descendants
++
++
++def test_same_exe_in_other_cgroup_is_work(tmp_path):
++    base = frozenset({_ident(tmp_path)})
++    _proc(tmp_path, 10, cgroup='/user.slice/job.scope')
++    assert c.observe_processes(str(tmp_path), base).state == c.POSITIVE
++
++
++def test_unlisted_process_without_baseline_is_work(tmp_path):
++    _proc(tmp_path, 10)
++    assert c.observe_processes(str(tmp_path), None).state == c.POSITIVE
++
++
++def test_empty_proc_without_baseline_is_unknown(tmp_path):
++    assert c.observe_processes(str(tmp_path), None) == c.Observation(c.UNKNOWN, reason='no trusted live baseline')
++    assert c.observe_processes(str(tmp_path), frozenset()).state == c.ZERO
++
++
++def test_unreadable_exe_blocks_zero(tmp_path):
++    _proc(tmp_path, 10, link=False)  # alive, exe not readable (foreign uid)
++    seen = c.observe_processes(str(tmp_path), frozenset({_ident(tmp_path)}))
++    assert seen.state == c.UNKNOWN and 'unobservable' in seen.reason
++
++
++def test_baseline_file_trust(tmp_path):
++    path = tmp_path / 'b.json'
++    path.write_text(json.dumps({'version': 1, 'idle': [{'uid': 0, 'cgroup': CG, 'exe': '/x'}]}), encoding='utf-8')
++    path.chmod(0o644)
++    assert c.load_baseline(str(path)) is None  # owned by the test user, not root
++    assert c.load_baseline(str(tmp_path / 'missing')) is None
++    link = tmp_path / 'l.json'
++    link.symlink_to(path)
++    assert c.load_baseline(str(link)) is None  # O_NOFOLLOW
++
++
++def _board(tmp_path, name='kanban.db'):
++    path = tmp_path / name
++    conn = sqlite3.connect(path)
++    conn.executescript(SYNC_SCHEMA_SQL)
++    conn.commit()
++    conn.close()
++    return path
++
++
++def test_running_sync_round_is_not_clear_even_with_empty_outbox(tmp_path):
++    path = _board(tmp_path)
++    assert gate.local_results_state([path]).state == gate.CLEAR
++    with board_sync_lock(path):
++        state = gate.local_results_state([path])
++        assert state.state == gate.PENDING and 'in flight' in state.reason
++        assert gate.gate_count(0, [path]) is None
++    assert gate.gate_count(0, [path]) == 0
++
++
++def test_results_adapter_maps_states(monkeypatch):
++    monkeypatch.setattr(gate, 'local_results_state', lambda boards=None: gate.ResultsState(gate.CLEAR))
++    assert c.observe_results() == c.Observation(c.ZERO)
++    monkeypatch.setattr(gate, 'local_results_state', lambda boards=None: gate.ResultsState(gate.PENDING, 3, 'r'))
++    assert c.observe_results().count == 3
++    monkeypatch.setattr(gate, 'local_results_state', lambda boards=None: gate.ResultsState(gate.UNKNOWN, reason='r'))
++    assert c.observe_results().state == c.UNKNOWN
+diff --git a/tests/hermes_cli/test_worker_drain_composed.py b/tests/hermes_cli/test_worker_drain_composed.py
+new file mode 100644
+index 0000000000..6e507156f1
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_composed.py
+@@ -0,0 +1,127 @@
++"""Composed producer -> sender -> Board -> registry -> scale-in decision, through the real census.
++
++Real: ``machine_persistent_jobs.collect``, the manifest census, lease adapter (real flock files), results gate
++(real sqlite outbox + sync lock), ``fresh`` and ``send_compatible``. Stand-ins: the Board accepts the sample,
++the registry stores it, and ``scale_in_allowed`` models the consumer contract (exact integer zero, fresh,
++for the exact instance id). The real Board/registry/scaler live in the state repo and are NOT exercised here.
++"""
++from __future__ import annotations
++
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import machine_persistent_jobs as jobs
++from hermes_cli import worker_compute_capacity as capacity
++from hermes_cli import worker_drain_census as census
++from hermes_cli import worker_drain_fence as fence
++from hermes_cli import worker_account_boards
++from hermes_cli.kanban_db_sync import SYNC_SCHEMA_SQL
++from hermes_cli.kanban_sync_guard import board_sync_lock
++from hermes_cli.machine_drain_metrics import send_compatible
++
++IID = 'i-0123456789abcdef0'
++IDENT = fence.Identity(IID, 'boot-1', 'epoch-1')
++
++
++class Board:
++    """Accepts samples and keeps the newest per instance (the registry)."""
++
++    def __init__(self):
++        self.registry: dict = {}
++
++    def send(self, iid):
++        def _send(sample):
++            self.registry[iid] = dict(sample, received_ms=int(time.time() * 1000))
++            return {'ok': True}
++        return _send
++
++
++def scale_in_allowed(registry_entry, iid, expected_iid, now_ms, max_age_ms=5000):
++    if iid != expected_iid or registry_entry is None:
++        return False
++    count, at = registry_entry.get('persistent_jobs'), registry_entry.get('persistent_jobs_at_ms')
++    return type(count) is int and count == 0 and type(at) is int and 0 <= now_ms - at <= max_age_ms
++
++
++@pytest.fixture
++def node(tmp_path, monkeypatch):
++    fence.install_state(tmp_path, IDENT)
++    board = tmp_path / 'kanban.db'
++    conn = sqlite3.connect(board)
++    conn.executescript(SYNC_SCHEMA_SQL)
++    conn.commit()
++    conn.close()
++    monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
++    monkeypatch.setattr(capacity, 'occupied_owners', lambda *a, **k: set())
++    monkeypatch.setattr(worker_account_boards, 'paths', lambda: [board])
++    monkeypatch.setattr(fence, 'load_activation', lambda path=None: {'iid': IID})
++    monkeypatch.setattr(census, 'observe_processes', lambda *a, **k: census.Observation(census.ZERO))
++    return tmp_path, board
++
++
++def produce_and_send(iid=IID):
++    b = Board()
++    send_compatible(b.send(iid), jobs.collect())
++    return b
++
++
++def test_idle_node_with_every_proof_reaches_scaler_as_zero(node):
++    b = produce_and_send()
++    sample = b.registry[IID]
++    assert sample['persistent_jobs'] == 0
++    assert scale_in_allowed(sample, IID, IID, int(time.time() * 1000))
++    assert not scale_in_allowed(sample, IID, 'i-fedcba9876543210f', int(time.time() * 1000))  # other instance
++
++
++@pytest.mark.parametrize('breaker', ['activation', 'process_unknown', 'lease', 'outbox_row', 'sync_round', 'board_missing'])
++def test_any_missing_proof_never_reaches_scaler_as_zero(node, monkeypatch, breaker):
++    root, board = node
++    held = []
++    if breaker == 'activation':
++        monkeypatch.setattr(fence, 'load_activation', lambda path=None: None)
++    elif breaker == 'process_unknown':
++        monkeypatch.setattr(census, 'observe_processes', lambda *a, **k: census.Observation(census.UNKNOWN))
++    elif breaker == 'lease':
++        held.append(fence.acquire_lease(root, IDENT, 'live-work'))
++    elif breaker == 'outbox_row':
++        conn = sqlite3.connect(board)
++        conn.execute("INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,op,fields,hlc,created_at) "
++                     "VALUES ('o','task_runs','r','upsert','{}','h',1)")
++        conn.commit()
++        conn.close()
++    elif breaker == 'sync_round':
++        lock = board_sync_lock(board)
++        lock.__enter__()
++        held.append(lock)
++    elif breaker == 'board_missing':
++        board.unlink()
++    try:
++        b = produce_and_send()
++        sample = b.registry[IID]
++        assert not scale_in_allowed(sample, IID, IID, int(time.time() * 1000))
++        assert sample.get('persistent_jobs') != 0
++    finally:
++        for h in held:
++            h.close() if hasattr(h, 'close') else h.__exit__(None, None, None)
++
++
++def test_positive_work_is_a_positive_lower_bound_end_to_end(node):
++    root, _ = node
++    lease = fence.acquire_lease(root, IDENT, 'live-work')
++    try:
++        monkey_count = census.manifest_count()
++        assert monkey_count == 1
++    finally:
++        lease.close()
++
++
++def test_stale_sample_is_dropped_at_the_send_boundary(node, monkeypatch):
++    sample = jobs.collect()
++    assert sample['persistent_jobs'] == 0
++    old = dict(sample, persistent_jobs_at_ms=sample['persistent_jobs_at_ms'] - 60000)
++    b = Board()
++    send_compatible(b.send(IID), old)
++    assert 'persistent_jobs' not in b.registry[IID]
++    assert not scale_in_allowed(b.registry[IID], IID, IID, int(time.time() * 1000))
+diff --git a/tests/hermes_cli/test_worker_drain_fence.py b/tests/hermes_cli/test_worker_drain_fence.py
+index d615662c4a..b98aec818f 100644
+--- a/tests/hermes_cli/test_worker_drain_fence.py
++++ b/tests/hermes_cli/test_worker_drain_fence.py
+@@ -1,4 +1,5 @@
+ import json
++import os
+ import multiprocessing
+ import time
+ 
+@@ -93,18 +94,20 @@ def test_missing_corrupt_other_boot_never_open(root):
+     f.apply_request(root, IDENT, req('establish', 1))
+     refuses('unknown-state', f.acquire_lease, root, f.Identity(IDENT.iid, 'boot-2', IDENT.node_epoch), 'x')
+     refuses('identity-mismatch', f.acquire_lease, root, f.Identity('i-ffffffff', 'boot-1', 'epoch-1'), 'x')
+-    (root / 'core-update' / f.LATCH_FILE).write_text('{bad')
++    (root / 'core-update' / f.LATCH_FILE).write_text('{bad', encoding='utf-8')
+     refuses('unknown-state', f.acquire_lease, root, IDENT, 'x')
+     (root / 'core-update' / f.LATCH_FILE).unlink()
+     refuses('unknown-state', f.acquire_lease, root, IDENT, 'x')
+ 
+ 
+-def test_activation(tmp_path):
++def test_activation(tmp_path, monkeypatch):
++    monkeypatch.setattr(f, 'ACTIVATION_OWNERS', (os.geteuid(),))  # windows-footgun: ok
+     path = tmp_path / 'act.json'
+     assert f.load_activation(path) is None
+-    path.write_text('{nope')
++    path.write_text('{nope', encoding='utf-8')
+     refuses('unknown-state', f.load_activation, path)
+-    path.write_text(json.dumps({'version': 1, 'iid': IDENT.iid, 'uid': 1000, 'node_epoch': 'e', 'home': '/home/ubuntu'}))
++    path.write_text(json.dumps({'version': 1, 'iid': IDENT.iid, 'uid': 1000, 'node_epoch': 'e', 'home': '/home/ubuntu'}), encoding='utf-8')
++    path.chmod(0o644)
+     assert f.load_activation(path)['uid'] == 1000
+ 
+ 
+diff --git a/tests/hermes_cli/test_worker_drain_hardening.py b/tests/hermes_cli/test_worker_drain_hardening.py
+new file mode 100644
+index 0000000000..a6d8d64b02
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_hardening.py
+@@ -0,0 +1,170 @@
++"""Latch hardening (nofollow/owner/mode, root path, deadline) and the cron / shell-hook seams."""
++from __future__ import annotations
++
++import fcntl  # windows-footgun: ok
++import json
++import os
++import time
++
++import pytest
++
++from hermes_cli import worker_drain_fence as f
++
++IDENT = f.Identity('i-0123456789abcdef0', 'boot-1', 'epoch-1')
++
++
++def req(op, gen, attempt='a1', **kw):
++    now = int(time.time() * 1000)
++    doc = {'version': 1, 'op': op, 'iid': IDENT.iid, 'boot': IDENT.boot, 'node_epoch': IDENT.node_epoch,
++           'attempt': attempt, 'generation': gen, 'request_id': f'{op}-{gen}-{attempt}',
++           'issued_at_ms': now, 'not_after_ms': now + 20000}
++    doc.update(kw)
++    return doc
++
++
++@pytest.fixture
++def root(tmp_path):
++    f.install_state(tmp_path, IDENT)
++    return tmp_path
++
++
++def refuses(fn, *a, reason='unknown-state', **k):
++    with pytest.raises(f.DrainRefused) as e:
++        fn(*a, **k)
++    assert e.value.reason == reason
++
++
++def test_symlinked_latch_is_refused(root):
++    latch = root / 'core-update' / f.LATCH_FILE
++    real = root / 'elsewhere.json'
++    real.write_bytes(latch.read_bytes())
++    latch.unlink()
++    latch.symlink_to(real)
++    refuses(f.read_latch, root, IDENT)
++    refuses(f.acquire_lease, root, IDENT, 'x')
++
++
++def test_group_or_world_writable_latch_is_refused(root):
++    latch = root / 'core-update' / f.LATCH_FILE
++    assert f.read_latch(root, IDENT)['phase'] == 'open'
++    latch.chmod(0o666)
++    refuses(f.read_latch, root, IDENT)
++    latch.chmod(0o620)
++    refuses(f.read_latch, root, IDENT)
++    latch.chmod(0o600)
++    assert f.read_latch(root, IDENT)['phase'] == 'open'
++
++
++def test_hardlinked_latch_is_refused(root):
++    latch = root / 'core-update' / f.LATCH_FILE
++    os.link(latch, root / 'alias.json')
++    refuses(f.read_latch, root, IDENT)
++
++
++def test_state_dir_must_be_a_real_private_directory(root, tmp_path):
++    d = root / 'core-update'
++    d.chmod(0o777)
++    refuses(f.read_latch, root, IDENT)
++    d.chmod(0o700)
++    assert f.read_latch(root, IDENT)['phase'] == 'open'
++    moved = root / 'moved'
++    d.rename(moved)
++    d.symlink_to(moved)
++    refuses(f.read_latch, root, IDENT)
++
++
++def test_foreign_owner_is_refused(root, monkeypatch):
++    # Trust is {root, effective uid, activated uid}; a state file owned by anyone else is unknown.
++    monkeypatch.setattr(f.os, 'geteuid', lambda: os.getuid() + 12345)  # windows-footgun: ok
++    refuses(f.read_latch, root, IDENT)
++    assert f.read_latch(root, f.Identity(IDENT.iid, IDENT.boot, IDENT.node_epoch, uid=os.getuid()))['phase'] == 'open'  # windows-footgun: ok
++
++
++def test_activation_must_be_root_owned_by_default(tmp_path):
++    path = tmp_path / 'act.json'
++    path.write_text(json.dumps({'version': 1, 'iid': IDENT.iid, 'uid': 1000, 'node_epoch': 'e', 'home': '/home/ubuntu'}), encoding='utf-8')
++    path.chmod(0o644)
++    assert f.ACTIVATION_OWNERS == (0,)
++    if os.getuid() != 0:  # windows-footgun: ok
++        refuses(f.load_activation, path)
++    link = tmp_path / 'link.json'
++    link.symlink_to(path)
++    refuses(f.load_activation, link)
++
++
++def test_root_process_uses_the_activated_accounts_state_not_roots(monkeypatch):
++    act = {'uid': 1000, 'home': '/home/ubuntu'}
++    monkeypatch.setattr(f.os, 'geteuid', lambda: 0)
++    assert str(f._activation_root(act)) == '/home/ubuntu/.hermes'
++    monkeypatch.setattr(f.os, 'geteuid', lambda: 1000)
++    monkeypatch.setattr(f, '_state_base', lambda: f.Path('/policy'))
++    assert str(f._activation_root(act)) == '/policy'
++    monkeypatch.setattr(f.os, 'geteuid', lambda: 4242)
++    refuses(f._activation_root, act, reason='identity-mismatch')
++
++
++def test_deadline_is_spent_by_lock_wait(root):
++    fd = os.open(root / 'core-update' / f.LOCK_FILE, os.O_RDWR)
++    fcntl.flock(fd, fcntl.LOCK_EX)  # another holder keeps the account lock
++    try:
++        now = int(time.time() * 1000)
++        start = time.monotonic()
++        refuses(f.apply_request, root, IDENT, req('establish', 1, issued_at_ms=now, not_after_ms=now + 300), now_ms=now)
++        assert time.monotonic() - start < 1.5  # lock wait is bounded by the request deadline, not 2s
++        assert f.read_latch(root, IDENT)['phase'] == 'open'
++    finally:
++        os.close(fd)
++
++
++def test_expired_and_overlong_requests_refused(root):
++    now = int(time.time() * 1000)
++    refuses(f.apply_request, root, IDENT, req('establish', 1, issued_at_ms=now - 40000, not_after_ms=now - 1))
++    refuses(f.apply_request, root, IDENT, req('establish', 1, issued_at_ms=now, not_after_ms=now + 60000))
++    refuses(f.apply_request, root, IDENT, req('establish', 1, issued_at_ms=now + 60000, not_after_ms=now + 70000))
++    assert f.apply_request(root, IDENT, req('establish', 1))['phase'] == 'draining'
++
++
++# --------------------------------------------------------------------------- cron + shell hook seams
++
++class _Lease:
++    def __init__(self):
++        self.closed = False
++
++    def close(self):
++        self.closed = True
++
++
++def test_cron_registration_refused_while_draining_and_lease_released(monkeypatch):
++    from cron import scheduler
++    lease = _Lease()
++    calls = []
++
++    def admit(purpose, **kw):
++        calls.append(purpose)
++        if len(calls) == 1:
++            raise f.DrainRefused('draining')
++        return lease
++    monkeypatch.setattr(f, 'admit', admit)
++    monkeypatch.setattr(scheduler, '_running_job_ids', set())
++    assert scheduler.try_register_running_job('drain-job-1') is False  # refused: nothing registered
++    assert scheduler.get_running_job_ids() == frozenset()
++    assert scheduler.try_register_running_job('drain-job-1') is True
++    key = scheduler._inflight_key('drain-job-1')
++    assert scheduler._running_leases[key] is lease and not lease.closed
++    scheduler.release_running_job('drain-job-1')
++    assert lease.closed and key not in scheduler._running_leases
++    assert calls.count('cron.run') == 2
++
++
++def test_shell_hook_refused_when_node_drains(monkeypatch):
++    from agent import shell_hooks
++    monkeypatch.setattr(f, 'admit', lambda purpose, **kw: (_ for _ in ()).throw(f.DrainRefused('sealed')))
++    spec = shell_hooks.ShellHookSpec(event='pre_tool_call', command='/bin/true', timeout=5)
++    out = shell_hooks._spawn(spec, '{}')
++    assert out['returncode'] is None and 'sealed' in out['error']
++
++
++def test_shell_hook_runs_when_not_activated():
++    from agent import shell_hooks
++    spec = shell_hooks.ShellHookSpec(event='pre_tool_call', command='/bin/true', timeout=5)
++    assert shell_hooks._spawn(spec, '{}')['returncode'] == 0
+diff --git a/tests/hermes_cli/test_worker_drain_source_scan.py b/tests/hermes_cli/test_worker_drain_source_scan.py
+new file mode 100644
+index 0000000000..0d9e77bc70
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_source_scan.py
+@@ -0,0 +1,185 @@
++"""Source scan: every process-spawn seam is either fenced by the worker-drain latch or inventoried.
++
++Run ``python tests/hermes_cli/test_worker_drain_source_scan.py --write`` to regenerate the inventory
++after fencing a seam. The inventory is a ratchet, not a proof of completeness:
++
++* ``fenced`` files must still reference the drain fence (``popen_worker`` / ``admit`` / ``fenced``).
++* ``pending`` files are known-unfenced spawn sites. A new spawn file, or more spawn sites in a pending
++  file, fails the test until the author fences it or consciously adds it to the inventory.
++* A pending file that has since been fenced must be promoted, so the pending list only shrinks.
++* ``REQUIRED_SEAMS`` names the seams the drain design owes; each must be fenced or explicitly pending.
++"""
++from __future__ import annotations
++
++import ast
++import json
++import subprocess
++import sys
++from pathlib import Path
++
++REPO = Path(__file__).resolve().parents[2]
++INVENTORY = REPO / 'hermes_cli' / 'worker_drain_spawn_inventory.json'
++SKIP_TOP = {'tests', 'scripts', 'website', 'docs', 'optional-skills', 'skills', 'node_modules', 'ui-tui',
++            'packaging', 'benchmarks', 'e2e', 'evals'}
++SUBPROCESS_FUNCS = {'Popen', 'run', 'call', 'check_call', 'check_output'}
++OS_FUNCS = {'fork', 'forkpty', 'system', 'popen', 'posix_spawn', 'posix_spawnp', 'execv', 'execve', 'execl',
++            'execle', 'execlp', 'execlpe', 'execvp', 'execvpe', 'spawnl', 'spawnle', 'spawnlp', 'spawnlpe',
++            'spawnv', 'spawnve', 'spawnvp', 'spawnvpe'}
++ASYNC_FUNCS = {'create_subprocess_exec', 'create_subprocess_shell', 'subprocess_exec', 'subprocess_shell'}
++
++# Seams the drain design owes, by file path (glob-free exact prefixes). Each must be present in the
++# inventory as fenced or pending; "pending" is an honest INCOMPLETE marker, not an exemption.
++# Seams with no raw spawn call: they reach a subprocess only through fenced wrappers or other seams.
++NO_DIRECT_SPAWN = {'registry.dispatch', 'gateway session worker', 'shell_hooks', 'terminal local env',
++                   'survivable fd transport'}
++FENCED_BY_THIS_CHANGE = ('agent/shell_hooks.py', 'cron/scheduler.py', 'tools/mcp_tool_transport.py',
++                         'tools/computer_use/cua_backend_session.py', 'tools/process_registry.py',
++                         'tools/process_registry_survivable.py', 'tools/environments/local.py',
++                         'hermes_cli/pty_bridge.py', 'tools/browser_launcher.py', 'hermes_cli/process_identity.py')
++REQUIRED_SEAMS = {
++    'registry.dispatch': 'tools/registry.py',
++    'gateway session worker': 'gateway/session_worker_spawn.py',
++    'mcp stdio': 'tools/mcp_tool_transport.py',
++    'cua': 'tools/computer_use/cua_backend_session.py',
++    'shell_hooks': 'agent/shell_hooks.py',
++    'cron run reservation': 'cron/scheduler.py',
++    'survivable fd transport': 'tools/process_registry_survivable.py',
++    'process registry': 'tools/process_registry.py',
++    'terminal local env': 'tools/environments/local.py',
++    'pty': 'hermes_cli/pty_bridge.py',
++}
++
++
++ROUTERS = {'admit', 'popen_worker', 'admitted_reservation', '_drain_admit'}
++
++
++def _name(node) -> str:
++    return node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else ''
++
++
++def _is_spawn(node: ast.Call) -> bool:
++    fn = node.func
++    if isinstance(fn, ast.Name):
++        return fn.id in {'stdio_client', 'open_process'}
++    if not isinstance(fn, ast.Attribute):
++        return False
++    base, name = _name(fn.value), fn.attr
++    return bool((base == 'subprocess' and name in SUBPROCESS_FUNCS) or (base == 'os' and name in OS_FUNCS)
++                or (base == 'pty' and name in {'fork', 'spawn'}) or name in ASYNC_FUNCS
++                or name in {'stdio_client', 'open_process'}
++                or (name == 'spawn' and base in {'PtyProcess', 'ptyprocess'}))
++
++
++def _routed_function(fn) -> bool:
++    """A function is a drain seam if it is decorated ``fenced`` or itself calls an admission router."""
++    for dec in fn.decorator_list:
++        target = dec.func if isinstance(dec, ast.Call) else dec
++        if 'fenced' in _name(target):
++            return True
++    return any(isinstance(n, ast.Call) and _name(n.func) in ROUTERS for n in ast.walk(fn))
++
++
++def _spawn_sites(tree: ast.AST) -> tuple[int, int]:
++    """(direct, routed): raw spawn calls outside / inside a function that admits through the fence."""
++    direct = routed = 0
++
++    def visit(node, in_seam):
++        nonlocal direct, routed
++        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
++            in_seam = in_seam or _routed_function(node)
++        if isinstance(node, ast.Call) and _is_spawn(node):
++            if in_seam:
++                routed += 1
++            else:
++                direct += 1
++        for child in ast.iter_child_nodes(node):
++            visit(child, in_seam)
++
++    visit(tree, False)
++    return direct, routed
++
++
++def scan() -> dict[str, dict]:
++    files = subprocess.run(['git', 'ls-files', '*.py'], cwd=REPO, capture_output=True, text=True, encoding='utf-8',
++                           check=True).stdout.split()
++    out = {}
++    for rel in files:
++        if rel.split('/')[0] in SKIP_TOP:
++            continue
++        try:
++            direct, routed = _spawn_sites(ast.parse((REPO / rel).read_text(encoding='utf-8-sig')))
++        except (OSError, SyntaxError, UnicodeDecodeError):
++            continue
++        if direct or routed:
++            out[rel] = {'direct': direct, 'routed': routed, 'status': 'pending' if direct else 'fenced'}
++    return out
++
++
++def _inventory() -> dict:
++    return json.loads(INVENTORY.read_text(encoding='utf-8-sig'))
++
++
++def write() -> None:
++    found = scan()
++    doc = {'version': 1, 'files': {k: found[k] for k in sorted(found)}}
++    INVENTORY.write_text(json.dumps(doc, indent=1, sort_keys=True) + '\n', encoding='utf-8')
++
++
++def test_no_new_or_grown_spawn_site_escapes_inventory():
++    inv, found = _inventory()['files'], scan()
++    new = sorted(set(found) - set(inv))
++    assert not new, f'new subprocess seams not in worker_drain_spawn_inventory.json (fence them): {new}'
++    grown = {k: (inv[k]['direct'], v['direct']) for k, v in found.items() if k in inv and v['direct'] > inv[k]['direct']}
++    assert not grown, f'spawn sites grew in inventoried files: {grown}'
++
++
++def test_status_matches_source_so_pending_only_shrinks():
++    inv, found = _inventory()['files'], scan()
++    promoted = sorted(k for k, v in found.items() if k in inv and inv[k]['status'] == 'pending' and v['status'] == 'fenced')
++    demoted = sorted(k for k, v in found.items() if k in inv and inv[k]['status'] == 'fenced' and v['status'] == 'pending')
++    assert not demoted, f'fenced seam lost its drain fence: {demoted}'
++    assert not promoted, f'now fenced: regenerate the inventory (--write) to promote: {promoted}'
++    gone = sorted(set(inv) - set(found))
++    assert not gone, f'inventoried file no longer has spawn sites: regenerate: {gone}'
++
++
++def test_required_seams_are_accounted_for():
++    """Every owed seam is inventoried (fenced or pending), carries the fence, or has a stated reason."""
++    inv = _inventory()['files']
++    missing = {}
++    for label, prefix in REQUIRED_SEAMS.items():
++        path = REPO / prefix
++        assert path.exists(), f'{label}: {prefix} moved; update REQUIRED_SEAMS'
++        if any(k == prefix or k.startswith(prefix.rstrip('/') + '/') for k in inv):
++            continue
++        text = '\n'.join(p.read_text(encoding='utf-8-sig') for p in ([path] if path.is_file() else path.rglob('*.py')))
++        if label in NO_DIRECT_SPAWN and not any(m in text for m in ROUTERS | {'drain_fenced'}):
++            continue
++        if any(m in text for m in ROUTERS | {'drain_fenced'}):
++            continue
++        missing[label] = prefix
++    assert not missing, f'required drain seams neither inventoried nor fenced: {missing}'
++
++
++def test_pending_inventory_is_the_honest_incomplete_list():
++    """Pending files still hold unfenced direct spawns (bounded helper probes and the long tail)."""
++    pending = [k for k, v in _inventory()['files'].items() if v['status'] == 'pending']
++    assert pending, 'no pending seams: only claim completion after independent review'
++
++
++def test_seams_fenced_by_this_change_stay_fenced():
++    for rel in FENCED_BY_THIS_CHANGE:
++        text = (REPO / rel).read_text(encoding='utf-8-sig')
++        assert any(m in text for m in ROUTERS | {'drain_fenced'}), rel
++
++
++def test_cron_run_registration_is_fenced_by_a_drain_lease():
++    text = (REPO / 'cron' / 'scheduler.py').read_text(encoding='utf-8-sig')
++    assert "admit('cron.run')" in text and 'lease_scope' in text
++
++
++if __name__ == '__main__':
++    if '--write' not in sys.argv:
++        sys.exit('pass --write to regenerate the inventory')
++    write()
++    print(f'wrote {INVENTORY}')
+diff --git a/tests/tools/test_worker_drain_spawn.py b/tests/tools/test_worker_drain_spawn.py
+index 64a4b71fb5..4dd148a8ce 100644
+--- a/tests/tools/test_worker_drain_spawn.py
++++ b/tests/tools/test_worker_drain_spawn.py
+@@ -20,9 +20,11 @@ def node(tmp_path, monkeypatch):
+     root.mkdir()
+     ident = f.Identity(IID, f.read_boot_id(), 'epoch-1')
+     f.install_state(root, ident)
+-    act.write_text(json.dumps({'version': 1, 'iid': IID, 'uid': os.getuid(), 'node_epoch': 'epoch-1',
++    act.write_text(json.dumps({'version': 1, 'iid': IID, 'uid': os.getuid(), 'node_epoch': 'epoch-1',  # windows-footgun: ok
+                                'home': str(tmp_path)}))
++    act.chmod(0o644)
+     monkeypatch.setattr(f, 'ACTIVATION_PATH', act)
++    monkeypatch.setattr(f, 'ACTIVATION_OWNERS', (os.geteuid(),))  # windows-footgun: ok
+     monkeypatch.setattr(f, '_state_base', lambda: root)
+     monkeypatch.setattr(f, 'read_imds_iid', lambda timeout=1.5: IID)
+     monkeypatch.delenv(f.LEASE_FD_ENV, raising=False)
+diff --git a/tools/computer_use/cua_backend_session.py b/tools/computer_use/cua_backend_session.py
+index 6efa4aae05..f79d92f598 100644
+--- a/tools/computer_use/cua_backend_session.py
++++ b/tools/computer_use/cua_backend_session.py
+@@ -221,6 +221,7 @@ class _CuaDriverSession:
+         # Phase marker surfaced by the ready-timeout error (issue #57025): when startup wedges, the caller
+         # reports HOW FAR it got instead of an opaque "never reached ready".
+         self._startup_phase = "binary-check"
++        _drain_lease = None
+         try:
+             driver_cmd = _driver.resolve_cua_driver_cmd()
+             if not driver_cmd and _cb.sandbox_mcp_invocation() is None:
+@@ -233,6 +234,9 @@ class _CuaDriverSession:
+             _t_manifest = _time.monotonic()
+             # Telemetry policy first (default: disabled), then strip Hermes secrets.
+             params = StdioServerParameters(command=command, args=args, env=_sanitize_subprocess_env(child_env))
++            # [daveey] SDK-spawned driver: the lease is held here for the session's whole life.
++            from hermes_cli.worker_drain_fence import admit as _drain_admit
++            _drain_lease = _drain_admit('cua.stdio')
+             async with stdio_client(params) as (read, write):
+                 self._startup_phase = "mcp-initialize"
+                 async with ClientSession(read, write) as session:
+@@ -252,6 +256,8 @@ class _CuaDriverSession:
+             self._ready_event.set()
+             raise
+         finally:
++            if _drain_lease is not None:
++                _drain_lease.close()
+             # A session that dies for ANY reason must be re-enterable: the next call sees _started False and
+             # rebuilds. Atomic bool write — stop() may hold _lock.
+             self._session, self._started = None, False
+diff --git a/tools/mcp_tool_transport.py b/tools/mcp_tool_transport.py
+index 612e9c596a..4c29e93555 100644
+--- a/tools/mcp_tool_transport.py
++++ b/tools/mcp_tool_transport.py
+@@ -423,6 +423,14 @@ class MCPServerTransportMixin:
+         # Subprocess stderr goes to ~/.hermes/logs/mcp-stderr.log so banners can't corrupt the TUI.
+         _config._write_stderr_log_header(self.name)
+         stderr = _config._StderrTee(_config._get_mcp_stderr_log())
++        # [daveey] The server child is spawned by the SDK, so it cannot inherit an fd: this process holds
++        # the work lease for the whole connection and refuses to spawn at all once the node drains.
++        from hermes_cli.worker_drain_fence import admit as _drain_admit
++        try:
++            _drain_lease = _drain_admit('mcp.stdio')
++        except BaseException:
++            stderr.close(timeout=0)
++            raise
+         try:
+             async with _core.stdio_client(server_params, errlog=stderr.sink) as (read_stream, write_stream):
+                 # New PIDs for force-kill cleanup, minus non-MCP children (slash_worker, LSP) racing
+@@ -444,6 +452,8 @@ class MCPServerTransportMixin:
+             raise
+         finally:  # clean exit, exceptions AND cancellation
+             stderr.close(timeout=0)
++            if _drain_lease is not None:
++                _drain_lease.close()
+             if new_pids:
+                 self._release_spawned_children(new_pids)
+ 
+-- 
+2.43.0
+

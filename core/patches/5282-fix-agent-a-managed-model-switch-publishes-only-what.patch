@@ -1,0 +1,258 @@
+From 38442ecdb4243042a0b72733bd4d4c1e6bf10f17 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 19:11:18 +0000
+Subject: [PATCH] fix(agent): a managed model switch publishes only what it
+ changed [daveey]
+
+switch_runtime stages a managed/class/one-turn switch on copy(agent), resolves
+the route (an allocation commit and a client build, seconds), then published
+with vars(agent).update(vars(staged)): every attribute of the snapshot, not
+just the runtime it built. The callers' `running` check is unlocked
+(tui_gateway methods_slash._mirror_slash_side_effects, which notes the race
+itself, and methods_config_set._set_model), so a turn can be admitted on the
+live agent between snapshot and publish. The publish then reverted that turn's
+custody:
+
+- snapshot between turns, turn admitted meanwhile: the lease holder went back
+  to None, so the turn's flushes skipped the lease check entirely;
+- snapshot during turn N, published during turn N+1: turn N's released holder
+  was installed and the valid owner's flush was refused, "Session turn lease
+  lost ... (holder mismatch)";
+- snapshot during a turn, published after its release: the released holder was
+  resurrected on the idle agent.
+
+Publish a three-way result instead: a key is written only when the switch
+changed it relative to its own snapshot (a rebound attribute, or a staged
+container whose content differs from the pristine copy). Everything else keeps
+the live value. A switch with no concurrent writer publishes the same runtime
+as before. No lease row is inserted, and released or superseded holders still
+refuse.
+
+Not attributed to the 2026-01-02 00:00 UTC incident on session abc124: that
+agent was freshly built and ran one turn, so no snapshot could carry a holder.
+The unlocked running check itself (a switch swapping the client under a turn
+that started meanwhile) is not closed here.
+
+Tests: tests/agent/test_managed_switch_turn_custody.py drives the real switch
+on a second thread, parked after its snapshot, against real
+admit_durable_turn_lease and SessionDB writes. Without the fix 3 of 4 fail;
+with it 4 pass, and 657 pass across the 43 switch/one-turn test files.
+
+Hermes-Card: t_eeeeee000000002b
+---
+ agent/agent_runtime_switch.py                 |  32 +++-
+ .../agent/test_managed_switch_turn_custody.py | 143 ++++++++++++++++++
+ 2 files changed, 171 insertions(+), 4 deletions(-)
+ create mode 100644 tests/agent/test_managed_switch_turn_custody.py
+
+diff --git a/agent/agent_runtime_switch.py b/agent/agent_runtime_switch.py
+index 2cd0282180..1f5f913ccd 100644
+--- a/agent/agent_runtime_switch.py
++++ b/agent/agent_runtime_switch.py
+@@ -39,6 +39,28 @@ def _stage_compressor(compressor):
+     return staged, writes
+ 
+ 
++def _switch_changes(base, pristine, working, staged):
++    """Only what the switch itself changed since its snapshot is published.
++
++    Resolution can take seconds and the callers' ``running`` check is unlocked, so a turn may be
++    admitted on the live agent meanwhile. Publishing the whole stale copy reverted that turn's state:
++    its lease holder went back to None (the flush then skipped the lease check) or to an earlier
++    turn's released holder (the flush was refused as a lost lease)."""
++    changes = {}
++    for key, value in staged.items():
++        if key in working and value is working[key]:
++            try:
++                unchanged = value == pristine[key]
++            except (TypeError, ValueError, RecursionError):
++                unchanged = False  # incomparable content: publish, as before
++        else:
++            unchanged = key in base and value is base[key]
++        if unchanged:
++            continue
++        changes[key] = value
++    return changes
++
++
+ def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabilities):
+     """Prepare managed switches privately, then publish after the allocation commits."""
+     from agent.agent_runtime_helpers import _switch_model_runtime
+@@ -54,11 +76,13 @@ def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabili
+     if config is None and not temporary:
+         return _switch_model_runtime(agent, model, provider, api_key, base_url, api_mode, capabilities)
+     staged = copy(agent)
++    base = dict(vars(agent))
+     # Switch helpers mutate these containers in place. Never expose partial work
+     # or clear live provenance while constructing a replacement.
+-    for key, value in vars(agent).items():
+-        if isinstance(value, (dict, list, set)):
+-            setattr(staged, key, copy(value))
++    pristine = {key: copy(value) for key, value in base.items() if isinstance(value, (dict, list, set))}
++    for key, value in pristine.items():
++        setattr(staged, key, copy(value))
++    working = {key: vars(staged)[key] for key in pristine}
+     staged.context_compressor, compressor_writes = _stage_compressor(getattr(agent, 'context_compressor', None))
+     staged._session_db = None
+ 
+@@ -81,7 +105,7 @@ def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabili
+     backend = getattr(staged.context_compressor, '_session_db', None)
+     if isinstance(backend, _DeferredSessionWrites):
+         staged.context_compressor._session_db = backend.backend
+-    vars(agent).update(vars(staged))
++    vars(agent).update(_switch_changes(base, pristine, working, vars(staged)))
+     persist_class_metadata(agent)
+     for method, args, kwargs in ([] if temporary else compressor_writes):
+         method(*args, **kwargs)
+diff --git a/tests/agent/test_managed_switch_turn_custody.py b/tests/agent/test_managed_switch_turn_custody.py
+new file mode 100644
+index 0000000000..d66945cad3
+--- /dev/null
++++ b/tests/agent/test_managed_switch_turn_custody.py
+@@ -0,0 +1,143 @@
++"""A managed switch that resolves while a turn is admitted must not publish a stale turn lease holder."""
++import threading
++import uuid
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from agent import agent_runtime_helpers as runtime
++from agent.turn_facade_lease import admit_durable_turn_lease
++from hermes_state import SessionDB
++from hermes_state_errors import SessionTurnLeaseLostError
++from tests.agent import test_managed_subscription as fixtures
++from tests.agent import test_managed_switch as switch_fixtures
++
++managed = fixtures.managed
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++destinations = switch_fixtures.destinations
++build = switch_fixtures.build
++
++SESSION, TARGET = 'pin', 'z-anthropic-deep'
++
++
++@pytest.fixture
++def live(destinations, tmp_path):
++    with patch('model_tools.get_tool_definitions', return_value=[]), \
++         patch('agent.anthropic_adapter.build_anthropic_client', return_value=MagicMock()):
++        agent = build('class:deep', SESSION)
++        db = SessionDB(tmp_path / 'state.db')
++        db.create_session(SESSION, source='desktop')
++        agent._session_db = db
++        agent.platform = 'desktop'
++        try:
++            yield agent, db
++        finally:
++            db.close()
++
++
++def admit(agent):
++    lease = admit_durable_turn_lease(  # holders are per turn, as turn_facade's uuid makes them
++        agent, session_id=SESSION, relay_turn_id=f'{SESSION}:fixture:{uuid.uuid4().hex[:8]}',
++        task_context={'platform': 'desktop', 'session_id': SESSION}, conversation_history=[]).lease
++    assert lease is not None
++    return lease
++
++
++class PausedSwitch:
++    """Run the real switch on another thread, parked after its snapshot and before it publishes."""
++
++    def __init__(self, agent):
++        self.snapshotted, self.resume, self.errors = threading.Event(), threading.Event(), []
++        original = runtime._update_switch_compressor
++
++        def parked(*args):
++            self.snapshotted.set()
++            assert self.resume.wait(30)
++            return original(*args)
++
++        def run():
++            try:
++                with patch.object(runtime, '_update_switch_compressor', side_effect=parked):
++                    agent.switch_model(TARGET, 'anthropic')
++            except BaseException as exc:  # reported by finish()
++                self.errors.append(exc)
++
++        self.thread = threading.Thread(target=run, daemon=True)
++        self.thread.start()
++        assert self.snapshotted.wait(30)
++
++    def finish(self):
++        self.resume.set()
++        self.thread.join(30)
++        assert not self.thread.is_alive() and self.errors == []
++
++
++def flush(agent, db, text):
++    """The persist path's own arguments (agent.session_persistence._db_flush_write)."""
++    db.append_messages_batch(
++        session_id=agent.session_id, messages=[{'role': 'assistant', 'content': text}],
++        turn_lease_holder=agent._active_session_turn_lease_holder,
++        turn_lease_ttl_seconds=agent._active_session_turn_lease_ttl_seconds or 300.0)
++
++
++def contents(db):
++    return [row['content'] for row in db.get_messages(SESSION)]
++
++
++def test_turn_admitted_during_switch_keeps_its_lease(live):
++    agent, db = live
++    admit(agent).release()                # an earlier turn: the agent now carries a cleared holder
++    switch = PausedSwitch(agent)          # snapshot: no turn, holder None
++    lease = admit(agent)                  # the unlocked running check lost the race
++    switch.finish()
++    try:
++        assert agent.model == TARGET      # the switch itself still lands
++        assert agent._active_session_turn_lease_holder == lease.holder
++        assert agent._last_session_turn_lease_holder == lease.holder
++        flush(agent, db, 'reply')
++    finally:
++        lease.release()
++    assert contents(db) == ['reply']
++    assert agent._active_session_turn_lease_holder is None
++    with pytest.raises(SessionTurnLeaseLostError, match='missing lease row'):
++        db.append_message(SESSION, role='assistant', content='late', turn_lease_holder=lease.holder)
++    assert contents(db) == ['reply']
++
++
++def test_switch_snapshotted_in_one_turn_does_not_install_its_holder_in_the_next(live):
++    agent, db = live
++    first = admit(agent)
++    switch = PausedSwitch(agent)          # snapshot carries the first turn's holder
++    first.release()
++    second = admit(agent)
++    switch.finish()
++    try:
++        assert agent._active_session_turn_lease_holder == second.holder
++        flush(agent, db, 'second reply')  # base: refused, "holder mismatch"
++    finally:
++        second.release()
++    assert contents(db) == ['second reply']
++    with pytest.raises(SessionTurnLeaseLostError):
++        db.append_message(SESSION, role='assistant', content='stale', turn_lease_holder=first.holder)
++    assert contents(db) == ['second reply']
++
++
++def test_switch_after_release_does_not_resurrect_the_holder(live):
++    agent, db = live
++    lease = admit(agent)
++    switch = PausedSwitch(agent)          # snapshot carries the live holder
++    lease.release()
++    switch.finish()
++    assert agent.model == TARGET
++    assert agent._active_session_turn_lease_holder is None
++    with pytest.raises(SessionTurnLeaseLostError, match='missing lease row'):
++        db.append_message(SESSION, role='assistant', content='late', turn_lease_holder=lease.holder)
++    assert contents(db) == []
++
++
++def test_quiet_switch_publishes_the_same_runtime(live):
++    agent, db = live
++    agent.switch_model(TARGET, 'anthropic')
++    assert agent.model == TARGET and agent._session_db is db
++    assert getattr(agent, '_active_session_turn_lease_holder', None) is None
+-- 
+2.43.0
+

@@ -1,0 +1,1134 @@
+From 970106d8f54dbf693311b125eef6aa1a7cb69dbc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 20:27:24 +0000
+Subject: [PATCH] [daveey] Preserve provider retry deadline across update pause
+ and continuation
+
+---
+ agent/provider_retry_deadline.py              | 146 +++++++
+ agent/turn_api_call.py                        |   9 +
+ agent/turn_api_error.py                       |  28 +-
+ agent/turn_iteration_prep.py                  |   8 +
+ agent/turn_recovery.py                        |   9 +-
+ agent/update_pause_cancel.py                  |   3 +-
+ .../test_retry_deadline_custody.py            |  48 +++
+ .../test_retry_deadline_declined_pause.py     |  59 +++
+ .../test_retry_deadline_integration.py        | 359 ++++++++++++++++++
+ .../test_retry_deadline_prework.py            |  61 +++
+ .../test_update_pause_retry_wait.py           |   4 +-
+ tui_gateway/prompt_turn.py                    |  17 +
+ tui_gateway/session_auto_continue.py          |  10 +-
+ tui_gateway/turn_marker.py                    |  72 +++-
+ tui_gateway/update_pause.py                   |  13 +
+ 15 files changed, 829 insertions(+), 17 deletions(-)
+ create mode 100644 agent/provider_retry_deadline.py
+ create mode 100644 tests/tui_gateway/test_retry_deadline_custody.py
+ create mode 100644 tests/tui_gateway/test_retry_deadline_declined_pause.py
+ create mode 100644 tests/tui_gateway/test_retry_deadline_integration.py
+ create mode 100644 tests/tui_gateway/test_retry_deadline_prework.py
+
+diff --git a/agent/provider_retry_deadline.py b/agent/provider_retry_deadline.py
+new file mode 100644
+index 0000000000..13bf34f35a
+--- /dev/null
++++ b/agent/provider_retry_deadline.py
+@@ -0,0 +1,146 @@
++"""[daveey] Durable provider-retry deadline: the agent side of ``turn_marker.PROVIDER_RETRY_FIELD``.
++
++An API-error retry wait (Retry-After up to ``RETRY_AFTER_CAP_S``) used to live only in process memory, so a core-update
++pause + restart could call the provider early. The gateway installs per turn (``vars(agent)``, reset in ``reset``):
++``provider_retry_deadline_stamp(deadline) -> bool`` (durable, generation-fenced, read back), ``provider_retry_deadline_clear(deadline)``
++and, for a logical continuation only, ``provider_retry_not_before`` restored from that turn's own marker. No callback
++means no stamp: the wait stays the ordinary in-process sleep and never yields to an update pause.
++"""
++
++from __future__ import annotations
++
++import logging
++from contextlib import nullcontext
++from types import SimpleNamespace
++import math
++import time
++from typing import Any
++
++from agent import update_pause_cancel
++
++logger = logging.getLogger(__name__)
++
++STAMP_ATTR = "provider_retry_deadline_stamp"
++CLEAR_ATTR = "provider_retry_deadline_clear"
++RESTORED_ATTR = "provider_retry_not_before"
++_SLICE_S = 0.2
++
++
++def _now() -> float:
++    return time.time()
++
++
++def _sleep(seconds: float) -> None:
++    time.sleep(seconds)
++
++
++def _attr(agent: Any, name: str) -> Any:
++    try:
++        return vars(agent).get(name)
++    except TypeError:
++        return None
++
++
++def install(agent: Any, *, stamp: Any, clear: Any, restored: float | None) -> None:
++    slots = vars(agent)
++    slots[STAMP_ATTR], slots[CLEAR_ATTR] = stamp, clear
++    if restored is not None and math.isfinite(restored):
++        slots[RESTORED_ATTR] = float(restored)
++    else:
++        slots.pop(RESTORED_ATTR, None)
++
++
++def reset(agent: Any) -> None:
++    """Turn end: a cached agent reused by the next turn carries no callback and no deadline."""
++    slots = vars(agent)
++    for name in (STAMP_ATTR, CLEAR_ATTR, RESTORED_ATTR):
++        slots.pop(name, None)
++
++
++def stamp(agent: Any, deadline: float) -> bool:
++    """True only when the deadline is durable (readback-verified). Any failure means: no pause for this wait."""
++    fn = _attr(agent, STAMP_ATTR)
++    if not callable(fn) or not math.isfinite(deadline):
++        return False
++    try:
++        durable = fn(deadline) is True
++        if durable:
++            # A boundary may decline after the wait yields (Stop/job custody/pause withdrawn).
++            # Keep the SAME epoch in this process until actually served, not only on disk.
++            vars(agent)[RESTORED_ATTR] = float(deadline)
++        return durable
++    except Exception:  # health: allow BLE001 -- persistence failure keeps the ordinary wait
++        logger.warning("provider retry deadline stamp failed", exc_info=True)
++        return False
++
++
++def _clear(agent: Any, deadline: float) -> None:
++    fn = _attr(agent, CLEAR_ATTR)
++    if callable(fn):
++        try:
++            fn(deadline)
++        except Exception:  # health: allow BLE001 -- best effort; an expired deadline is inert
++            logger.debug("provider retry deadline clear failed", exc_info=True)
++
++
++def wait_restored(agent: Any, _retry: Any, messages: Any, api_call_count: int) -> str:
++    """Before this turn's first provider/middleware call: wait out the restored epoch in this execution thread.
++    Never recomputes backoff. Returns ``"done"`` (nothing left to wait / served), ``"yield"`` (the update's cancel won:
++    the caller yields to the boundary pause) or ``"redirect"`` (steer restart armed). A user Stop raises
++    ``InterruptedError`` (the provider path's own Stop handling)."""
++    deadline = _attr(agent, RESTORED_ATTR)
++    if not isinstance(deadline, float) or not math.isfinite(deadline):
++        return "done"
++    if _now() < deadline:
++        touched = 0
++        # No own-marker readback means no permission to yield, but the continuation
++        # still owes its selected epoch in this process.
++        can_yield = callable(_attr(agent, STAMP_ATTR))
++        context = update_pause_cancel.model_request_in_flight(agent, messages, api_call_count=api_call_count) \
++            if can_yield else nullcontext()
++        with context:
++            while _now() < deadline:
++                if agent._interrupt_requested:
++                    if can_yield and update_pause_cancel.model_yield_requested(agent):
++                        return "yield"  # deadline stays restored + on the marker
++                    if _retry is not None and agent.clear_interrupt(preserve_redirect=True):
++                        _retry.restart_with_redirected_messages = True
++                        return "redirect"
++                    raise InterruptedError("Interrupt detected during restored provider retry wait")
++                _sleep(min(_SLICE_S, max(0.0, deadline - _now())))
++                touched += 1
++                if touched % 150 == 0:
++                    agent._touch_activity(f"provider retry wait, {int(deadline - _now())}s remaining")
++    vars(agent).pop(RESTORED_ATTR, None)
++    _clear(agent, deadline)
++    return "done"
++
++
++def before_provider_work(agent: Any, messages: Any, conversation_history: Any, api_call_count: int) -> dict | None:
++    """Serve custody before hooks/compression; a declined boundary resumes the same wait.
++
++    Redirect stays queued for the ordinary iteration boundary. Stop wins over pause.
++    """
++    from agent.turn_iteration_prep import _step_boundary_pause
++
++    retry = SimpleNamespace(restart_with_redirected_messages=False)
++    while True:
++        try:
++            verdict = wait_restored(agent, retry, messages, api_call_count)
++        except InterruptedError:
++            return {"messages": messages, "final_response": "", "interrupted": True,
++                    "turn_exit_reason": "interrupted_by_user"}
++        if verdict == "done":
++            return None
++        if verdict == "redirect":
++            continue
++        update_pause_cancel.take_pending(agent)
++        pause = _step_boundary_pause(agent, messages, api_call_count)
++        agent.clear_interrupt(only_reason=update_pause_cancel.CANCEL_TOOL_REASON)
++        if update_pause_cancel.user_stop_pending(agent):
++            return {"messages": messages, "final_response": "", "interrupted": True,
++                    "turn_exit_reason": "interrupted_by_user"}
++        if pause:
++            agent._persist_session(messages, conversation_history)
++            return {"messages": messages, "final_response": "", "interrupted": True,
++                    "paused_for_update": pause, "turn_exit_reason": f"paused_for_update({pause})"}
+diff --git a/agent/turn_api_call.py b/agent/turn_api_call.py
+index 00ceaffd59..de661dfc50 100644
+--- a/agent/turn_api_call.py
++++ b/agent/turn_api_call.py
+@@ -92,6 +92,15 @@ def perform_api_call(
+         nonlocal thinking_spinner
+         thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
+ 
++    # [daveey] A resumed turn serves its original provider-retry epoch here, before middleware/SDK, in this
++    # execution thread (never in scheduling/activation). A Stop raises into the provider path's own handling.
++    from agent import provider_retry_deadline
++    _restored = provider_retry_deadline.wait_restored(agent, _retry, messages, api_call_count)
++    if _restored != "done":
++        if _restored == "yield":
++            yield_to_update_pause(_retry)
++        return _verdict("break")
++
+     _use_streaming = _should_stream(agent)
+ 
+     def _perform_api_call(next_api_kwargs):
+diff --git a/agent/turn_api_error.py b/agent/turn_api_error.py
+index c7433ca10d..089b35dc9d 100644
+--- a/agent/turn_api_error.py
++++ b/agent/turn_api_error.py
+@@ -16,7 +16,7 @@ import time
+ from typing import Any, Dict, Optional
+ 
+ from agent.api_error_summary import is_provider_stream_parse_error
+-from agent import update_pause_cancel
++from agent import provider_retry_deadline, update_pause_cancel
+ from agent.turn_api_call import yield_to_update_pause
+ from agent.error_classifier import CODEX_BARE_400_MARKER, RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
+ from agent.turn_offline_wait import wait_out_offline
+@@ -487,14 +487,24 @@ def settle_unrecovered_error(
+     # must survive backoff, not die as "Operation interrupted".
+     # The failed request's context has exited, but its retry wait is still at the same
+     # boundary. Keep it visible to the update watcher without broadening eligibility.
+-    with update_pause_cancel.model_request_in_flight(agent, messages, api_call_count=api_call_count):
+-        _interrupted = interruptible_backoff_sleep(
+-            agent, wait_time, _retry, messages=messages, conversation_history=conversation_history,
+-            api_call_count=api_call_count,
+-            abort_message="Interrupt detected during retry wait, aborting.",
+-            interrupt_text=f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries}).",
+-            activity_label=f"error retry backoff ({retry_count}/{max_retries})",
+-        )
++    # [daveey] Only with a durable, absolute deadline: a pause + restart must not shorten a Retry-After the
++    # process-local sleep alone would lose. Stamp failure keeps the ordinary wait and never yields.
++    _deadline = time.time() + wait_time
++    _durable = update_pause_cancel.model_request_can_yield(
++        messages, api_call_count=api_call_count, first_request_ok=update_pause_cancel.first_request_can_pause(agent),
++    ) and provider_retry_deadline.stamp(agent, _deadline)
++    _sleep_kwargs = dict(
++        messages=messages, conversation_history=conversation_history, api_call_count=api_call_count,
++        abort_message="Interrupt detected during retry wait, aborting.",
++        interrupt_text=f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries}).",
++        activity_label=f"error retry backoff ({retry_count}/{max_retries})",
++    )
++    if _durable:
++        with update_pause_cancel.model_request_in_flight(agent, messages, api_call_count=api_call_count):
++            _interrupted = interruptible_backoff_sleep(
++                agent, wait_time, _retry, deadline=_deadline, update_yield=True, **_sleep_kwargs)
++    else:
++        _interrupted = interruptible_backoff_sleep(agent, wait_time, _retry, **_sleep_kwargs)
+     if _interrupted is not None:
+         return _verdict("return", _interrupted)
+     if _retry.restart_with_redirected_messages:
+diff --git a/agent/turn_iteration_prep.py b/agent/turn_iteration_prep.py
+index 1c535676ef..2adf456aed 100644
+--- a/agent/turn_iteration_prep.py
++++ b/agent/turn_iteration_prep.py
+@@ -442,6 +442,14 @@ def begin_iteration(
+         _turn_exit_reason = f"paused_for_update({_pause})"
+         return _verdict("break")
+ 
++    from agent.provider_retry_deadline import before_provider_work
++    if (retry_result := before_provider_work(agent, messages, conversation_history, api_call_count)) is not None:
++        interrupted = True
++        _turn_exit_reason = retry_result["turn_exit_reason"]
++        if retry_result.get("paused_for_update"):
++            agent._step_boundary_paused = retry_result["paused_for_update"]
++        return _verdict("break")
++
+     # Aggregate input budget for detached auxiliary forks bounds the whole review, not
+     # each request; checked between iterations so the crossing request's writes landed.
+     if _review_input_budget_exhausted(agent):
+diff --git a/agent/turn_recovery.py b/agent/turn_recovery.py
+index e533a62a96..00fe141108 100644
+--- a/agent/turn_recovery.py
++++ b/agent/turn_recovery.py
+@@ -1398,20 +1398,23 @@ def interruptible_backoff_sleep(
+     agent: Any, wait_time: float, _retry: Optional[TurnRetryState], *,
+     messages: list[dict[str, Any]], conversation_history: Any, api_call_count: int,
+     abort_message: str, interrupt_text: str, activity_label: str,
++    deadline: Optional[float] = None, update_yield: bool = False,
+ ) -> Optional[dict[str, Any]]:
+-    """Sleep ``wait_time`` in 200 ms slices so interrupts are honoured promptly, touching
++    """``deadline`` (absolute epoch) replaces ``now + wait_time``; ``update_yield`` is the explicit opt-in (only the
++    API-error wait, after its deadline is durable) to yield to a core-update pause instead of treating its cancel as
++    a Stop. Sleep ``wait_time`` in 200 ms slices so interrupts are honoured promptly, touching
+     activity every ~30 s so the gateway's inactivity monitor knows we are alive.
+ 
+     On interrupt with ``_retry`` given and a redirect pending: preserve the redirect, arm
+     ``_retry.restart_with_redirected_messages`` and return ``None`` (caller rebuilds the
+     turn). Otherwise return the ``interrupted`` result dict. ``None`` when the wait completed."""
+-    sleep_end = time.time() + wait_time
++    sleep_end = deadline if deadline is not None else time.time() + wait_time
+     _touch_counter = 0
+     while time.time() < sleep_end:
+         if agent._interrupt_requested:
+             # Preserve the update-owned cancel for begin_iteration's boundary pause;
+             # generic interrupt handling would clear it and append a terminal Stop row.
+-            if _retry is not None and update_pause_cancel.model_yield_requested(agent):
++            if update_yield and _retry is not None and update_pause_cancel.model_yield_requested(agent):
+                 yield_to_update_pause(_retry)
+                 return None
+             if _retry is not None and agent.clear_interrupt(preserve_redirect=True):
+diff --git a/agent/update_pause_cancel.py b/agent/update_pause_cancel.py
+index e2bec73025..80f6e67ed8 100644
+--- a/agent/update_pause_cancel.py
++++ b/agent/update_pause_cancel.py
+@@ -254,7 +254,8 @@ def pause_before_turn(agent: Any, conversation_history: Any) -> dict | None:
+         reason = _ask(gate) if callable(gate) else None
+         unstarted = bool(reason)
+     if not reason:
+-        return None
++        from agent.provider_retry_deadline import before_provider_work
++        return before_provider_work(agent, list(conversation_history or ()), conversation_history, 0)
+     return {"final_response": "", "messages": list(conversation_history or []), "api_calls": 0,
+             "completed": False, "interrupted": True, "paused_for_update": reason,
+             "turn_exit_reason": f"paused_for_update({reason})", **({UNSTARTED_KEY: True} if unstarted else {})}
+diff --git a/tests/tui_gateway/test_retry_deadline_custody.py b/tests/tui_gateway/test_retry_deadline_custody.py
+new file mode 100644
+index 0000000000..df0dc8d6cf
+--- /dev/null
++++ b/tests/tui_gateway/test_retry_deadline_custody.py
+@@ -0,0 +1,48 @@
++"""Safety contract for retry-wait update parking (WIP: must fail until wired).
++
++These tests isolate marker projection and continuation kickoff, not a real
++provider/process recovery proof. The complete sleep/resume proof is also required.
++"""
++import threading
++import time
++
++import pytest
++
++from tui_gateway import server, turn_marker
++
++
++@pytest.mark.parametrize("seam", ["projection", "continuation_kickoff"])
++def test_retry_deadline_survives_pause_and_continuation(tmp_path, monkeypatch, seam):
++    key = "retry-deadline-session"
++    prompt = "Finish the original job"
++    deadline = time.time() + 600.0
++    assert turn_marker.record_turn_start(tmp_path, key, prompt)
++
++    def seed(entries):
++        entries[key]["provider_retry_not_before"] = deadline
++        return entries
++
++    # Arrange future producer output using the real flocked store, then exercise
++    # the unchanged production readers. No provider pool independently benches it.
++    assert turn_marker._update(tmp_path, key, seed, "fixture retry deadline")
++    assert turn_marker.mark_turn_paused(tmp_path, key, "core_update_pause")
++    if seam == "projection":
++        marker = turn_marker.read_turn_marker(tmp_path, key)
++        assert marker.get("provider_retry_not_before") == deadline
++        return
++
++    # Isolate kickoff from projection so the second failure is not masked by
++    # the first. The scheduler must eventually transfer this field on both
++    # cold and in-place resume; a new user turn must not receive it.
++    session = {
++        "session_key": key, "profile_home": str(tmp_path),
++        "history_lock": threading.Lock(), "_auto_continue_prompt": prompt,
++        "_auto_continue_attempt": 0, "_auto_continue_pauses": 1,
++        "_auto_continue_provider_retry_not_before": deadline,
++    }
++    monkeypatch.setattr(server, "_session_home", lambda _: tmp_path)
++    assert server._record_turn_marker(session, "Continue") == key
++    # Inspect raw storage to avoid conflating kickoff with reader projection.
++    marker = turn_marker._load(turn_marker._marker_path(tmp_path))[key]
++    assert marker.get("provider_retry_not_before") == deadline
++    assert "_auto_continue_provider_retry_not_before" not in session
+diff --git a/tests/tui_gateway/test_retry_deadline_declined_pause.py b/tests/tui_gateway/test_retry_deadline_declined_pause.py
+new file mode 100644
+index 0000000000..6a60088d82
+--- /dev/null
++++ b/tests/tui_gateway/test_retry_deadline_declined_pause.py
+@@ -0,0 +1,59 @@
++"""Repro (review only): a declined boundary pause after the durable API-error wait yields -> early provider call?"""
++import threading, time
++import httpx, pytest
++from openai import RateLimitError
++from agent import provider_retry_deadline, turn_api_error
++from hermes_cli import admission_fence as af
++from tui_gateway import update_pause as up
++from tui_gateway.turn_marker import read_turn_marker, record_turn_start
++from tests.tui_gateway import test_update_pause_model_request as helpers
++
++home = helpers.home
++_quiet = helpers._quiet
++WAIT = 6.0
++
++@pytest.mark.parametrize("mode", ["decline_hook", "opt_out", "jobs_stop_fail"])
++def test_declined_pause_keeps_deadline(home, tmp_path, monkeypatch, mode):
++    agent = helpers._make_agent(tmp_path)
++    if mode == "jobs_stop_fail":
++        monkeypatch.setattr(up, "stop_owned_jobs_for_update_pause", lambda killed, save: False)
++    if mode == "opt_out":
++        monkeypatch.setattr(helpers.server, "_load_cfg", lambda: {"desktop": {"auto_continue": {"enabled": False}}})
++    record_turn_start(home, "session-key", "run the quick job")
++    session = {"agent": agent, "session_key": "session-key", "profile_home": str(home), "history_lock": threading.Lock()}
++    stamp, clear = up.provider_retry_hooks(session, "session-key", read_turn_marker(home, "session-key"))
++    provider_retry_deadline.install(agent, stamp=stamp, clear=clear, restored=None)
++    entered, issued, calls = threading.Event(), threading.Event(), []
++    err = RateLimitError("rl", response=httpx.Response(429, request=httpx.Request("POST", "https://x/c")), body=None)
++    def provider(*a, **k):
++        calls.append(time.time())
++        if len(calls) == 1:
++            return helpers._response(helpers._call("call_1"))
++        if len(calls) == 2:
++            raise err
++        return helpers._response()
++    real_sleep = turn_api_error.interruptible_backoff_sleep
++    def observed(*a, **k):
++        entered.set(); assert issued.wait(5); return real_sleep(*a, **k)
++    def pause():
++        if entered.wait(5):
++            af.set_hold(home); af.request_pause(home, expires_at=time.time() + 120); issued.set()
++    agent._interruptible_api_call = provider
++    monkeypatch.setattr("model_tools.handle_function_call", lambda *a, **k: "quick result")
++    monkeypatch.setattr(turn_api_error, "compute_error_backoff", lambda *a, **k: WAIT)
++    monkeypatch.setattr(turn_api_error, "interruptible_backoff_sleep", observed)
++    reservation = af.reserve(home)
++    th = threading.Thread(target=pause); th.start()
++    real_hook = up.boundary_pause_hook(session, "session-key")
++    agent.step_boundary_pause = (lambda: None) if mode == "decline_hook" else real_hook
++    stop = up.start_mid_tool_cancel(session, "session-key", agent)
++    try:
++        result = agent.run_conversation("run the quick job")
++    finally:
++        stop(); th.join(6); reservation.close()
++    print(mode, "paused=", result.get("paused_for_update"), "ncalls=", len(calls),
++          "gap=", round(calls[2] - calls[1], 2) if len(calls) > 2 else None,
++          "marker_deadline_left=", (read_turn_marker(home, "session-key") or {}).get("provider_retry_not_before", 0) - calls[-1])
++    assert not result.get("paused_for_update")
++    assert len(calls) == 3
++    assert calls[2] - calls[1] >= WAIT - 0.2, f"{mode}: provider called {calls[2]-calls[1]:.2f}s after a {WAIT}s retry wait"
+diff --git a/tests/tui_gateway/test_retry_deadline_integration.py b/tests/tui_gateway/test_retry_deadline_integration.py
+new file mode 100644
+index 0000000000..a3ec6ed510
+--- /dev/null
++++ b/tests/tui_gateway/test_retry_deadline_integration.py
+@@ -0,0 +1,359 @@
++"""Durable provider-retry deadline: marker custody, stamp fencing, and real-turn pause/resume.
++
++Real AIAgent retry loop, real flocked marker store, real admission fence and gateway hook/watcher. Only the provider
++and the tool body are fakes. Clock-controlled cases drive the REAL ``compute_error_backoff`` (503 + Retry-After 600, no
++credential pool) with a fake clock, so no provider call is observed before the original epoch; that is deterministic
++evidence for the seam, NOT a live process proof (production policy is the real 600 s).
++"""
++from __future__ import annotations
++
++import threading
++import time
++
++import httpx
++import pytest
++from openai import InternalServerError
++
++from agent import provider_retry_deadline as prd
++from agent import turn_api_error, turn_recovery, update_pause_cancel
++from hermes_cli import admission_fence as af
++from tui_gateway import server, turn_marker
++from tui_gateway import update_pause as up
++from tui_gateway.turn_marker import PROVIDER_RETRY_FIELD as F
++from tui_gateway.turn_marker import read_turn_marker, record_turn_start
++from tests.tui_gateway import test_update_pause_model_request as helpers
++
++home = helpers.home
++_quiet = helpers._quiet
++KEY = "session-key"
++
++
++class Clock:
++    """Fake wall clock: each sleep advances ``speed`` x the slept time and only yields briefly in real time."""
++
++    def __init__(self, start=None, speed=5.0):
++        self.t, self.speed = start or time.time(), speed
++
++    def time(self):
++        return self.t
++
++    def sleep(self, s):
++        time.sleep(0.002)  # health: allow HX013 -- simulated clock wait yields to the real cancellation watcher
++        self.t += s * self.speed
++
++    def __getattr__(self, name):
++        return getattr(time, name)
++
++
++def _own(home_):
++    return read_turn_marker(home_, KEY)
++
++
++def _session(home_):
++    return {"session_key": KEY, "profile_home": str(home_), "history_lock": threading.Lock()}
++
++
++def _hooks(agent, home_, restored=None, marker=None):
++    stamp, clear = up.provider_retry_hooks(_session(home_), KEY, marker or _own(home_))
++    prd.install(agent, stamp=stamp, clear=clear, restored=restored)
++
++
++def _err503(retry_after="600"):
++    req = httpx.Request("POST", "https://example.com/chat")
++    return InternalServerError("overloaded", response=httpx.Response(503, request=req, headers={"retry-after": retry_after}),
++                               body=None)
++
++
++# ---- turn_marker seams ------------------------------------------------------------------------------------------
++def test_marker_projection_replacement_and_first_write(tmp_path):
++    assert record_turn_start(tmp_path, KEY, "p")
++    gen = _own(tmp_path)
++    d = time.time() + 600
++    assert turn_marker.stamp_provider_retry_deadline(tmp_path, KEY, d, gen)
++    assert _own(tmp_path)[F] == d
++    # first active write wins; a different one is refused, the same one is idempotent
++    assert not turn_marker.stamp_provider_retry_deadline(tmp_path, KEY, d + 50, gen)
++    assert turn_marker.stamp_provider_retry_deadline(tmp_path, KEY, d, gen)
++    assert turn_marker.mark_turn_paused(tmp_path, KEY, "core_update_pause")
++    assert _own(tmp_path)[F] == d  # pause keeps it, repeat pause too
++    assert turn_marker.mark_turn_paused(tmp_path, KEY, "core_update_pause")
++    assert _own(tmp_path)[F] == d
++    # replacement: only an explicit continuation kwarg carries it
++    assert record_turn_start(tmp_path, KEY, "p", pauses=2)
++    assert F not in _own(tmp_path)
++    assert record_turn_start(tmp_path, KEY, "p", pauses=2, provider_retry_not_before=d)
++    assert _own(tmp_path)[F] == d
++    for junk in (float("nan"), float("inf"), -1, True, "9"):
++        assert record_turn_start(tmp_path, KEY, "p", provider_retry_not_before=junk) and F not in _own(tmp_path)
++
++
++def test_expired_deadline_is_replaced_by_later_retry(tmp_path):
++    assert record_turn_start(tmp_path, KEY, "p")
++    gen = _own(tmp_path)
++    old = time.time() - 5
++    assert turn_marker.stamp_provider_retry_deadline(tmp_path, KEY, old, gen)
++    new = time.time() + 30
++    assert turn_marker.stamp_provider_retry_deadline(tmp_path, KEY, new, gen)
++    assert _own(tmp_path)[F] == new
++    assert turn_marker.clear_provider_retry_deadline(tmp_path, KEY, new, gen)
++    assert F not in _own(tmp_path)
++
++
++def test_stamp_fencing_refuses_missing_foreign_successor_and_empty(tmp_path, monkeypatch):
++    d = time.time() + 60
++    assert not turn_marker.stamp_provider_retry_deadline(tmp_path, KEY, d, {"started_at": 1.0})  # no marker
++    assert record_turn_start(tmp_path, KEY, "p")
++    gen = _own(tmp_path)
++    assert not turn_marker.stamp_provider_retry_deadline(tmp_path, "", d, gen)
++    assert not turn_marker.stamp_provider_retry_deadline(tmp_path, KEY, float("nan"), gen)
++    assert not turn_marker.stamp_provider_retry_deadline(tmp_path, KEY, d, None)
++    # foreign live writer
++    monkeypatch.setattr(turn_marker, "_writer_identity", lambda: {"writer_pid": gen["writer_pid"] + 1})
++    assert not turn_marker.stamp_provider_retry_deadline(tmp_path, KEY, d, gen)
++    monkeypatch.undo()
++    # successor turn (new generation) must not take the old turn's stamp, and is not mutated
++    monkeypatch.setattr(turn_marker.time, "time", lambda: gen["started_at"] + 1)
++    assert record_turn_start(tmp_path, KEY, "p2")
++    assert not turn_marker.stamp_provider_retry_deadline(tmp_path, KEY, d, gen)
++    assert F not in _own(tmp_path)
++    # no marker (Stop retired it) after all
++    turn_marker.clear_turn_marker(tmp_path, KEY)
++    assert not turn_marker.stamp_provider_retry_deadline(tmp_path, KEY, d, gen)
++
++
++def test_carried_notice_gets_no_hooks_and_keeps_paused_deadline(tmp_path, monkeypatch):
++    d = time.time() + 600
++    assert record_turn_start(tmp_path, KEY, "orig")
++    assert turn_marker.stamp_provider_retry_deadline(tmp_path, KEY, d, _own(tmp_path))
++    assert turn_marker.mark_turn_paused(tmp_path, KEY, "core_update_pause")
++    assert up.provider_retry_hooks(_session(tmp_path), "", _own(tmp_path)) == (None, None)
++    assert up.provider_retry_hooks(_session(tmp_path), KEY, None) == (None, None)
++    session = {**_session(tmp_path), "_synthesized_turn": True}
++    monkeypatch.setattr(server, "_session_home", lambda _s: tmp_path)
++    monkeypatch.setattr(server, "_load_cfg", lambda: helpers.CFG)
++    assert server._record_turn_marker(session, "notice") == ""  # carried: no marker of its own
++    assert _own(tmp_path)[F] == d and _own(tmp_path)["reason"] == "core_update_pause"
++
++
++def test_fresh_user_turn_and_kickoff_input_cleanup(tmp_path, monkeypatch):
++    from tui_gateway import session_auto_continue as sac
++    assert "_auto_continue_provider_retry_not_before" in sac._KICKOFF_MARKER_INPUTS
++    session = {**_session(tmp_path), "_auto_continue_provider_retry_not_before": 5.0e9}
++    sac._drop_kickoff_marker_inputs(session, {})  # refused kickoff: inputs removed
++    assert "_auto_continue_provider_retry_not_before" not in session
++    monkeypatch.setattr(server, "_session_home", lambda _s: tmp_path)
++    session = _session(tmp_path)  # a typed user message after it
++    assert server._record_turn_marker(session, "hello") == KEY
++    assert F not in _own(tmp_path)
++
++
++# ---- agent seams ------------------------------------------------------------------------------------------------
++def test_wait_restored_unit(tmp_path, monkeypatch):
++    agent = helpers._make_agent(tmp_path)
++    clock = Clock()
++    monkeypatch.setattr(prd, "_now", clock.time)
++    monkeypatch.setattr(prd, "_sleep", clock.sleep)
++    cleared = []
++    d = clock.t + 100
++    prd.install(agent, stamp=None, clear=cleared.append, restored=d)
++    assert prd.wait_restored(agent, None, [{"role": "user", "content": "x"}], 1) == "done"
++    assert clock.t >= d and cleared == [d] and prd.RESTORED_ATTR not in vars(agent)
++    assert prd.wait_restored(agent, None, [], 1) == "done"  # nothing left
++    # expired deadline: no wait
++    prd.install(agent, stamp=None, clear=None, restored=clock.t - 1)
++    t0 = clock.t
++    assert prd.wait_restored(agent, None, [], 1) == "done" and clock.t == t0
++    # Stop during the restored wait raises into the provider path's Stop handling
++    prd.install(agent, stamp=None, clear=None, restored=clock.t + 100)
++    agent.interrupt()
++    with pytest.raises(InterruptedError):
++        prd.wait_restored(agent, None, [], 1)
++    assert vars(agent)[prd.RESTORED_ATTR] > clock.t  # still owed
++    prd.reset(agent)
++    assert prd.RESTORED_ATTR not in vars(agent) and prd.STAMP_ATTR not in vars(agent)
++
++
++def test_generic_waits_never_take_the_update_yield(tmp_path, monkeypatch):
++    agent = helpers._make_agent(tmp_path)
++    monkeypatch.setattr(update_pause_cancel, "model_yield_requested", lambda a: True)
++    sentinel = {"interrupted": True}
++    monkeypatch.setattr(turn_recovery, "abort_turn_on_interrupt", lambda *a, **k: sentinel)
++    agent._interrupt_requested = True
++    kw = dict(messages=[], conversation_history=None, api_call_count=1, abort_message="a", interrupt_text="i",
++              activity_label="x")
++    retry = type("R", (), {"restart_with_redirected_messages": False})()
++    # default (empty-response / invalid-response / autorecovery sites): update cancel is NOT a yield
++    assert turn_recovery.interruptible_backoff_sleep(agent, 5, retry, **kw) is sentinel
++    assert retry.restart_with_redirected_messages is False
++    # explicit opt-in yields
++    assert turn_recovery.interruptible_backoff_sleep(agent, 5, retry, update_yield=True, **kw) is None
++    assert retry.restart_with_redirected_messages is True
++
++
++def _run_first_phase(home_, tmp_path, monkeypatch, *, stamp_mode="real", retry_after="600"):
++    """Progressed turn; 503 Retry-After (REAL compute_error_backoff, no pool); update pause requested in the wait."""
++    agent = helpers._make_agent(tmp_path)
++    record_turn_start(home_, KEY, "run the quick job")
++    _hooks(agent, home_)
++    if stamp_mode == "refuse":
++        agent.provider_retry_deadline_stamp = lambda d: False
++    elif stamp_mode == "mismatch":
++        real = turn_marker._update
++        monkeypatch.setattr(turn_marker, "_update",
++                            lambda h, k, m, what: True if what == "stamp retry deadline" else real(h, k, m, what))
++    session = _session(home_)
++    entered, issued, calls = threading.Event(), threading.Event(), []
++
++    def provider(*a, **k):
++        calls.append(time.time())
++        if len(calls) == 1:
++            return helpers._response(helpers._call("call_1"))
++        if len(calls) == 2:
++            raise _err503(retry_after)
++        return helpers._response()
++
++    real_sleep = turn_api_error.interruptible_backoff_sleep
++
++    def observed(*a, **k):
++        entered.set()
++        assert issued.wait(5)
++        return real_sleep(*a, **k)
++
++    def pause():
++        if entered.wait(10):
++            af.set_hold(home_)
++            af.request_pause(home_, expires_at=time.time() + 120)
++            issued.set()
++
++    agent._interruptible_api_call = provider
++    monkeypatch.setattr("model_tools.handle_function_call", lambda *a, **k: "quick result")
++    monkeypatch.setattr(turn_api_error, "interruptible_backoff_sleep", observed)
++    if stamp_mode != "real":  # keep the wait short: the point is that it runs to its ORIGINAL end without pausing
++        monkeypatch.setattr(turn_api_error, "compute_error_backoff", lambda *a, **k: 2.0)
++    reservation = af.reserve(home_)
++    producer = threading.Thread(target=pause)
++    producer.start()
++    agent.step_boundary_pause = up.boundary_pause_hook(session, KEY)
++    stop = up.start_mid_tool_cancel(session, KEY, agent)
++    try:
++        result = agent.run_conversation("run the quick job")
++    finally:
++        stop()
++        producer.join(12)
++        reservation.close()
++    return agent, result, calls
++
++
++@pytest.mark.parametrize("mode", ["refuse", "mismatch"])
++def test_stamp_failure_and_readback_mismatch_keep_original_wait(home, tmp_path, monkeypatch, mode):
++    _agent, result, calls = _run_first_phase(home, tmp_path, monkeypatch, stamp_mode=mode)
++    assert not result.get("paused_for_update"), mode
++    assert result["final_response"] == "done" and len(calls) == 3, mode
++    assert calls[2] - calls[1] >= 1.9, mode  # ordinary original wait, to its end, then the provider
++    assert F not in (read_turn_marker(home, KEY) or {}), mode
++
++
++def _continue(home_, tmp_path, monkeypatch, marker, *, agent=None, clock=None):
++    """Kickoff inputs -> _record_turn_marker -> the gateway's per-turn install -> run the continuation."""
++    agent = agent or helpers._make_agent(tmp_path)
++    session = {**_session(home_), "_auto_continue_prompt": marker["prompt"], "_auto_continue_attempt": 0,
++               "_auto_continue_pauses": marker["pauses"],
++               "_auto_continue_provider_retry_not_before": marker[F]}
++    monkeypatch.setattr(server, "_session_home", lambda _s: home_)
++    assert server._record_turn_marker(session, "Continue") == KEY
++    assert "_auto_continue_provider_retry_not_before" not in session
++    own = _own(home_)
++    assert own[F] == marker[F]  # survived continuation replacement
++    _hooks(agent, home_, restored=own[F], marker=own)
++    return agent
++
++
++@pytest.mark.parametrize("flow", ["cold", "in_place"])
++def test_no_pool_503_retry_after_600_survives_pause_and_resume(home, tmp_path, monkeypatch, flow):
++    agent1, result, calls = _run_first_phase(home, tmp_path, monkeypatch)
++    assert result.get("paused_for_update") == up.PAUSE_REASON and len(calls) == 2
++    marker = read_turn_marker(home, KEY)
++    deadline = marker[F]
++    assert marker["reason"] == up.PAUSE_REASON and 590 < deadline - time.time() <= 601
++    assert getattr(agent1, "_credential_pool", None) is None
++    assert af.state(home)["reservations"] == 0
++    prd.reset(agent1)  # turn-end cleanup of the cached agent
++    clock = Clock(start=time.time())
++    for mod in (prd,):
++        monkeypatch.setattr(mod, "_now", clock.time)
++        monkeypatch.setattr(mod, "_sleep", clock.sleep)
++    af.clear_hold(home) if hasattr(af, "clear_hold") else None
++    agent2 = _continue(home, tmp_path, monkeypatch, marker, agent=agent1 if flow == "in_place" else None)
++    seen = []
++    agent2._interruptible_api_call = lambda *a, **k: seen.append(clock.t) or helpers._response()
++    result2 = agent2.run_conversation("Continue")
++    assert result2["final_response"] == "done"
++    assert len(seen) == 1 and seen[0] >= deadline, (seen, deadline)  # not one call before the ORIGINAL epoch
++    assert clock.t - deadline < 10  # waited for the original epoch, not a recomputed/extended one
++    assert F not in (read_turn_marker(home, KEY) or {})  # served deadline cleared
++    # next turn after terminal: nothing inherited
++    prd.reset(agent2)
++    assert prd.RESTORED_ATTR not in vars(agent2)
++
++
++def test_repeat_pause_keeps_epoch_then_resume_waits_original(home, tmp_path, monkeypatch):
++    _a, result, _calls = _run_first_phase(home, tmp_path, monkeypatch)
++    assert result.get("paused_for_update")
++    marker = read_turn_marker(home, KEY)
++    deadline = marker[F]
++    clock = Clock(start=time.time(), speed=40.0)
++    monkeypatch.setattr(prd, "_now", clock.time)
++    monkeypatch.setattr(prd, "_sleep", clock.sleep)
++    # second pause DURING the restored wait (watcher cancels after the real grace, long before the epoch)
++    agent2 = _continue(home, tmp_path, monkeypatch, marker)
++    agent2.update_pause_first_request = True
++    session = _session(home)
++    af.set_hold(home)
++    af.request_pause(home, expires_at=time.time() + 120)
++    seen = []
++    agent2._interruptible_api_call = lambda *a, **k: seen.append(clock.t) or helpers._response()
++    agent2.step_boundary_pause = up.boundary_pause_hook(session, KEY)
++    reservation = af.reserve(home) if hasattr(af, "reserve") else None
++    stop = up.start_mid_tool_cancel(session, KEY, agent2)
++    try:
++        r2 = agent2.run_conversation("Continue")
++    finally:
++        stop()
++        if reservation:
++            reservation.close()
++    assert r2.get("paused_for_update") == up.PAUSE_REASON and not seen
++    marker2 = read_turn_marker(home, KEY)
++    assert marker2[F] == deadline and marker2["pauses"] == marker["pauses"] + 1  # epoch neither shortened nor extended
++    # third run: resume again; still no call before the same epoch
++    af.clear_hold(home) if hasattr(af, "clear_hold") else None
++    clock2 = Clock(start=clock.t, speed=40.0)
++    monkeypatch.setattr(prd, "_now", clock2.time)
++    monkeypatch.setattr(prd, "_sleep", clock2.sleep)
++    agent3 = _continue(home, tmp_path, monkeypatch, marker2)
++    agent3._interruptible_api_call = lambda *a, **k: seen.append(clock2.t) or helpers._response()
++    assert agent3.run_conversation("Continue")["final_response"] == "done"
++    assert seen and seen[0] >= deadline
++
++
++def test_stop_during_restored_wait_makes_no_provider_call(home, tmp_path, monkeypatch):
++    assert record_turn_start(home, KEY, "run the quick job")
++    agent = helpers._make_agent(tmp_path)
++    _hooks(agent, home, restored=time.time() + 600)
++    calls = []
++    agent._interruptible_api_call = lambda *a, **k: calls.append(1) or helpers._response()
++    threading.Timer(0.6, agent.interrupt).start()
++    result = agent.run_conversation("run the quick job")
++    assert not calls and result.get("interrupted") is True and not result.get("paused_for_update")
++    assert (read_turn_marker(home, KEY) or {}).get("reason") != up.PAUSE_REASON
++
++
++def test_other_session_and_scheduler_are_not_blocked_by_a_future_deadline(home, tmp_path):
++    from tui_gateway import startup_resume  # the sweep module must import without waiting
++    assert record_turn_start(home, KEY, "orig")
++    assert turn_marker.stamp_provider_retry_deadline(home, KEY, time.time() + 600, _own(home))
++    assert turn_marker.mark_turn_paused(home, KEY, up.PAUSE_REASON)
++    other = helpers._make_agent(tmp_path)  # another session's agent: no restored epoch, no wait
++    other._interruptible_api_call = lambda *a, **k: helpers._response()
++    t0 = time.time()
++    assert other.run_conversation("hi")["final_response"] == "done"
++    assert time.time() - t0 < 5
+diff --git a/tests/tui_gateway/test_retry_deadline_prework.py b/tests/tui_gateway/test_retry_deadline_prework.py
+new file mode 100644
+index 0000000000..da208aaaee
+--- /dev/null
++++ b/tests/tui_gateway/test_retry_deadline_prework.py
+@@ -0,0 +1,61 @@
++"""Restored retry custody precedes turn-start compression and provider-capable hooks."""
++import time
++
++from agent import provider_retry_deadline as prd, turn_context
++from types import SimpleNamespace
++import threading
++from tui_gateway import server
++from tui_gateway.prompt_turn import _TurnRun
++from tests.tui_gateway import test_update_pause_model_request as helpers
++
++_quiet = helpers._quiet
++
++
++def test_restored_deadline_precedes_turn_start_provider_work(tmp_path, monkeypatch):
++    agent = helpers._make_agent(tmp_path)
++    now = [time.time()]
++    deadline = now[0] + 1200  # finite epochs must not be capped to now + 600
++    monkeypatch.setattr(prd, "_now", lambda: now[0])
++    monkeypatch.setattr(prd, "_sleep", lambda s: now.__setitem__(0, now[0] + s))
++    prd.install(agent, stamp=None, clear=None, restored=deadline)
++    seen = []
++    original = turn_context._collect_pre_llm_call_context
++
++    def hook(*args, **kwargs):
++        seen.append(now[0])
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(turn_context, "_collect_pre_llm_call_context", hook)
++    agent._interruptible_api_call = lambda *a, **k: helpers._response()
++    assert agent.run_conversation("Continue")["final_response"] == "done"
++    assert seen and min(seen) >= deadline
++
++
++def test_invoke_without_own_marker_still_serves_selected_epoch(tmp_path, monkeypatch):
++    agent = helpers._make_agent(tmp_path)
++    now = [time.time()]
++    deadline = now[0] + 1200
++    monkeypatch.setattr(prd, "_now", lambda: now[0])
++    monkeypatch.setattr(prd, "_sleep", lambda s: now.__setitem__(0, now[0] + s))
++    monkeypatch.setattr(server, "_start_usage_ticker", lambda *a: (
++        threading.Event(), SimpleNamespace(join=lambda: None)))
++    session = {"agent": agent, "session_key": "key", "profile_home": str(tmp_path),
++               "history_lock": threading.Lock()}
++    st = _TurnRun(agent, None, None, True, marker_key="key", own_marker=None,
++                  provider_retry_not_before=deadline)
++    run = agent.run_conversation
++
++    def observed(message, **kwargs):
++        assert vars(agent)[prd.RESTORED_ATTR] == deadline
++        assert vars(agent)[prd.STAMP_ATTR] is None
++        assert agent.step_boundary_pause is None
++        return run(message, **kwargs)
++
++    agent.run_conversation = observed
++    calls = []
++    agent._interruptible_api_call = lambda *a, **k: calls.append(now[0]) or helpers._response()
++    monkeypatch.setattr("agent.turn_api_call._should_stream", lambda _agent: False)
++    server._invoke_agent("ui", session, st, "Continue", "Continue", None, [], "auto_continue", None, text="Continue")
++    assert st.result["final_response"] == "done"
++    assert calls and min(calls) >= deadline
++    assert prd.RESTORED_ATTR not in vars(agent)
+diff --git a/tests/tui_gateway/test_update_pause_retry_wait.py b/tests/tui_gateway/test_update_pause_retry_wait.py
+index f1c308cbb9..d37d275505 100644
+--- a/tests/tui_gateway/test_update_pause_retry_wait.py
++++ b/tests/tui_gateway/test_update_pause_retry_wait.py
+@@ -8,7 +8,7 @@ import httpx
+ import pytest
+ from openai import RateLimitError
+ 
+-from agent import turn_api_error, update_pause_cancel
++from agent import provider_retry_deadline, turn_api_error, update_pause_cancel
+ from hermes_cli import admission_fence as af
+ from tui_gateway import update_pause as up
+ from tui_gateway.turn_marker import read_turn_marker, record_turn_start
+@@ -29,6 +29,8 @@ def test_api_error_backoff_pause_custody(home, tmp_path, monkeypatch, mode):
+     record_turn_start(home, "session-key", "run the quick job")
+     session = {"agent": agent, "session_key": "session-key", "profile_home": str(home),
+                "history_lock": threading.Lock()}
++    stamp, clear = up.provider_retry_hooks(session, "session-key", read_turn_marker(home, "session-key"))
++    provider_retry_deadline.install(agent, stamp=stamp, clear=clear, restored=None)
+     entered = threading.Event()
+     issued = threading.Event()
+     calls = []
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index ff0a7f69ac..7553df1082 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -277,6 +277,7 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+     marker_key = str(session.get("session_key") or "")
+     marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
+     marker_pauses = int(session.pop("_auto_continue_pauses", 0) or 0)
++    retry_not_before = session.pop("_auto_continue_provider_retry_not_before", None)  # a continuation's wait only
+     killed_jobs = session.pop("_auto_continue_killed_jobs", None)
+     marker_text = session.pop("_auto_continue_prompt", None) or text
+     session.pop("_refused_turn_marker_key", None)
+@@ -312,6 +313,7 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True,
+                           **({"until_tool": True} if until_tool and auto_continue else {}),
+                           **({"killed_jobs": killed_jobs} if killed_jobs else {}),
+                           **({"pauses": marker_pauses} if marker_pauses else {}),
++                          **({"provider_retry_not_before": retry_not_before} if retry_not_before else {}),
+                           **({"notification_category": "diagnostic"}
+                              if notification_category == "diagnostic" else {}))
+         with session["history_lock"]:
+@@ -702,6 +704,7 @@ class _TurnRun:
+     # [daveey] The marker this turn recorded, read back at once: its identity is the only marker evidence the
+     # turn-end outcome refresh may discount (tui_gateway/turn_outcome.concluding_turn_identity).
+     own_marker: Any = None
++    provider_retry_not_before: float | None = None  # selected kickoff epoch survives own-marker read failure
+     display_kind: Any = None
+     receipt_attempted: bool = False
+     # [daveey] An automation turn (kanban_notice, process_complete): its display metadata and the one replay plan
+@@ -1055,6 +1058,18 @@ def _invoke_agent(
+     notice_secured = (display_kind == "kanban_notice" and session.pop("_first_request_prompt_secured", False)
+                       and st.own_marker is not None and st.own_marker.get("prompt") == text)
+     agent.update_pause_first_request = bool(st.marker_key) and (display_kind == "auto_continue" or bool(notice_secured))
++    # [daveey] Provider-retry deadline custody for THIS turn's own marker only (empty key = carried notice: none).
++    from agent import provider_retry_deadline
++    from tui_gateway.update_pause import provider_retry_hooks
++    _retry_stamp, _retry_clear = provider_retry_hooks(session, st.marker_key, st.own_marker)
++    provider_retry_deadline.install(
++        agent, stamp=_retry_stamp, clear=_retry_clear,
++        restored=((st.own_marker or {}).get("provider_retry_not_before") or st.provider_retry_not_before)
++        if st.marker_key else None)
++    if st.provider_retry_not_before is not None and not _retry_stamp:
++        # Failed own-marker readback: serve the epoch, but cannot park it safely.
++        agent.step_boundary_pause = None
++        pause_key = ""
+     _mid_tool_stop = None
+     if pause_key:
+         install_clarify_pause_provider()  # a blocked clarify is withdrawn so the pause can land
+@@ -1075,6 +1090,7 @@ def _invoke_agent(
+     finally:
+         agent.step_boundary_pause = None
+         agent.update_pause_first_request = False
++        provider_retry_deadline.reset(agent)
+         if _mid_tool_stop is not None:
+             _mid_tool_stop()
+         # Stop AND join before anything emits: a tick surviving past message.complete would
+@@ -1453,6 +1469,7 @@ def _run_admitted_prompt(
+         st = _TurnRun(
+             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
+             receipt_committed=terminal_callback is None)
++        st.provider_retry_not_before = session.get("_auto_continue_provider_retry_not_before")
+         st.marker_key = _record_turn_marker(session, text, auto_continue=auto_continue and terminal_callback is None,
+             notification_category=(display_metadata or {}).get("notification_category"))
+         from tui_gateway.turn_outcome import own_turn_marker
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 8fc6fd816b..17f57110e3 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -111,7 +111,8 @@ def _hold_refused_turn(session: dict, marker_key: str, display_kind, error_surfa
+     prompt, earlier = marker["prompt"], session.pop("_refused_turn_earlier", None)
+     if earlier:
+         prompt = f"{earlier}\n\n{prompt}"
+-        record_turn_start(home, marker_key, prompt, attempts=attempts)
++        record_turn_start(home, marker_key, prompt, attempts=attempts,
++                          provider_retry_not_before=marker.get("provider_retry_not_before"))
+     delay = _REFUSED_RETRY_DELAYS_S[attempts]
+     session.update(_refused_turn_marker_key=marker_key, _refused_turn_prompt=prompt, _refused_turn_delay=delay,
+                    _auto_continue_retry_after=time.monotonic() + delay - 1.0)
+@@ -348,6 +349,11 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+             # nested notes). Set here, not at schedule time, so a bail above leaves nothing for a racing user turn.
+             session["_auto_continue_attempt"], session["_auto_continue_prompt"] = attempt, marker["prompt"]
+             session["_auto_continue_pauses"] = pauses
++            # [daveey] The logical turn's absolute provider-retry epoch rides the continuation (never a user turn).
++            if marker.get("provider_retry_not_before"):
++                session["_auto_continue_provider_retry_not_before"] = marker["provider_retry_not_before"]
++            else:
++                session.pop("_auto_continue_provider_retry_not_before", None)
+             session["_auto_continue_killed_jobs"] = marker.get("killed_jobs", [])
+             # [daveey] A continued at-most-once turn keeps the contract: off again at its first tool.
+             session["_marker_until_tool"] = bool(marker.get("until_tool"))
+@@ -466,7 +472,7 @@ def _owner_forward_transient(exc: BaseException) -> bool:
+ 
+ 
+ _KICKOFF_MARKER_INPUTS = ("_auto_continue_attempt", "_auto_continue_prompt", "_auto_continue_pauses",
+-                          "_auto_continue_killed_jobs")
++                          "_auto_continue_killed_jobs", "_auto_continue_provider_retry_not_before")
+ # Re-arms of the pause watcher for one pause whose continuation keeps being refused: each re-arm is a fresh
+ # watcher with a fresh budget, so a refusal that persists would otherwise loop every ~10-15 s.
+ REFUSED_REARM_MAX = 6
+diff --git a/tui_gateway/turn_marker.py b/tui_gateway/turn_marker.py
+index 14defaca50..14b727bdfd 100644
+--- a/tui_gateway/turn_marker.py
++++ b/tui_gateway/turn_marker.py
+@@ -11,6 +11,7 @@ from __future__ import annotations
+ 
+ import json
+ import logging
++import math
+ import os
+ import threading
+ import time
+@@ -33,6 +34,10 @@ _MAX_PROMPT_CHARS = 64_000
+ UPDATE_HOLD_QUEUE_REASON = "update_hold_queue"
+ UPDATE_HOLD_QUEUE_MAX_AGE_S = 3600.0
+ 
++# Finite absolute epoch before which this logical turn must not call its provider again (an API-error retry
++# wait: a Retry-After the credential pool never benched). Written once per wait, never a duration.
++PROVIDER_RETRY_FIELD = "provider_retry_not_before"
++
+ _lock = threading.Lock()
+ _file_lock_holder = threading.local()
+ 
+@@ -73,6 +78,14 @@ def auto_continue_bounds(config: Any) -> tuple[bool, float, int]:
+             attempts if attempts >= 0 else AUTO_CONTINUE_MAX_ATTEMPTS_DEFAULT)
+ 
+ 
++def finite_deadline(value: Any) -> float | None:
++    """``value`` as a finite positive epoch, else None (junk, bool, NaN/inf)."""
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        return None
++    value = float(value)
++    return value if math.isfinite(value) and value > 0 else None
++
++
+ def _started_at(entry: dict) -> float:
+     return float(entry.get("started_at") or 0)
+ 
+@@ -194,7 +207,8 @@ def release_update_queue(home: Path | str, session_key: str, marker: dict) -> bo
+ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attempts: int = 0,
+                       auto_continue: bool = True, notification_category: str | None = None,
+                       pauses: int = 0, killed_jobs: list | None = None, until_tool: bool = False,
+-                      reason: str | None = None, carried_job_ids=()) -> bool:
++                      reason: str | None = None, carried_job_ids=(),
++                      provider_retry_not_before: float | None = None) -> bool:
+     """Persist the marker for a turn that is about to run. ``attempts`` = how many auto-continues led to
+     this run (0 for a user-initiated turn); the crash-loop breaker reads it back on the next resume.
+     ``pauses`` = core-update pauses this logical turn already took (``mark_turn_paused``), counted apart
+@@ -222,6 +236,9 @@ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attemp
+         entry["notification_category"] = notification_category
+     if reason:
+         entry["reason"] = str(reason)
++    # Only a logical continuation passes this; a fresh user turn's entry never carries a wait.
++    if (retry_deadline := finite_deadline(provider_retry_not_before)) is not None:
++        entry[PROVIDER_RETRY_FIELD] = retry_deadline
+     # Identity only — never the prompt: this log is read on crash triage and must not carry turn content.
+     logger.debug("turn marker recorded for session %s by writer pid %s", session_key, entry["writer_pid"])
+     carried = {str(i) for i in carried_job_ids or ()}
+@@ -359,6 +376,58 @@ def mark_turn_paused(home: Path | str, session_key: str, reason: str,
+     return False
+ 
+ 
++def _is_own_generation(entry: Any, generation: Any) -> bool:
++    """``entry`` is the marker THIS process's turn wrote: same ``started_at`` and writer identity as the one
++    captured when the turn recorded it. A carried, successor or foreign-writer marker never matches."""
++    if not isinstance(entry, dict) or not isinstance(generation, dict):
++        return False
++    started = generation.get("started_at")
++    if not started or entry.get("started_at") != started:
++        return False
++    me = _writer_identity()
++    if entry.get("writer_pid") != me["writer_pid"] or generation.get("writer_pid") != me["writer_pid"]:
++        return False
++    return entry.get("writer_start_time") == me.get("writer_start_time") == generation.get("writer_start_time")
++
++
++def stamp_provider_retry_deadline(home: Path | str, session_key: str, deadline: float, generation: dict | None) -> bool:
++    """[daveey] Durably record this turn's absolute retry deadline on its OWN marker. Fails closed (False) for an
++    empty key, a missing/carried/successor/foreign marker, a different still-active deadline (first write wins)
++    and any write or readback mismatch; the caller then keeps the ordinary in-process wait and never yields.
++    True only after the projected marker reads back the exact deadline under the same generation."""
++    want = finite_deadline(deadline)
++    if not session_key or want is None or not generation:
++        return False
++
++    def mutate(entries):
++        entry = entries.get(session_key)
++        if not _is_own_generation(entry, generation):
++            return None
++        current = finite_deadline(entry.get(PROVIDER_RETRY_FIELD))
++        if current is not None and current > time.time() and current != want:
++            return None
++        entry[PROVIDER_RETRY_FIELD] = want
++        return entries
++
++    if not _update(home, session_key, mutate, "stamp retry deadline"):
++        return False
++    back = read_turn_marker(home, session_key)
++    return bool(back) and back.get(PROVIDER_RETRY_FIELD) == want and back.get("started_at") == generation["started_at"] \
++        and back.get("writer_pid") == generation.get("writer_pid")
++
++
++def clear_provider_retry_deadline(home: Path | str, session_key: str, deadline: float, generation: dict | None) -> bool:
++    """Best-effort: drop ``deadline`` from this turn's own marker once served (only that exact value)."""
++    def mutate(entries):
++        entry = entries.get(session_key)
++        if not _is_own_generation(entry, generation) or entry.get(PROVIDER_RETRY_FIELD) != deadline:
++            return None
++        entry.pop(PROVIDER_RETRY_FIELD, None)
++        return entries
++
++    return bool(session_key) and _update(home, session_key, mutate, "clear retry deadline")
++
++
+ def clear_carried_turn_paused(home: Path | str, session_key: str) -> bool:
+     """[daveey] Take back a write-ahead ``carried_turn_paused`` stamp whose carried pause did not stand (the job
+     stop failed, or a user Stop won), so the continuation does not name a notification turn that ran to completion
+@@ -470,6 +539,7 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
+                 **({"paused_at": float(entry["paused_at"])} if entry.get("paused_at") else {}),
+                 **({"until_tool": True} if entry.get("until_tool") else {}),
+                 **({"carried_turn_paused": True} if entry.get("carried_turn_paused") else {}),
++                **({PROVIDER_RETRY_FIELD: d} if (d := finite_deadline(entry.get(PROVIDER_RETRY_FIELD))) else {}),
+                 **({"notification_category": "diagnostic"}
+                    if entry.get("notification_category") == "diagnostic" else {}),
+                 **({"killed_jobs": killed} if killed else {})}
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index 6ef523a1cd..af0b8e37a7 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -143,6 +143,19 @@ def _home(session: dict) -> Path:
+     return Path(session.get("profile_home") or server._hermes_home)
+ 
+ 
++def provider_retry_hooks(session: dict, marker_key: str, own_marker: dict | None):
++    """[daveey] ``(stamp, clear)`` callbacks for this turn's provider-retry deadline, bound to THIS turn's own marker
++    key and generation (never ``effective_pause_key``, never a carried/successor marker). ``(None, None)`` when this
++    turn wrote no marker of its own: its waits then stay ordinary and never yield to a pause."""
++    if not marker_key or not own_marker or not own_marker.get("started_at"):
++        return None, None
++    from tui_gateway import turn_marker
++    generation = {k: own_marker[k] for k in ("started_at", "writer_pid", "writer_start_time") if k in own_marker}
++    home = _home(session)
++    return (lambda deadline: turn_marker.stamp_provider_retry_deadline(home, marker_key, deadline, generation),
++            lambda deadline: turn_marker.clear_provider_retry_deadline(home, marker_key, deadline, generation))
++
++
+ def _root(session: dict) -> Path:
+     from hermes_constants import get_default_hermes_root
+     return get_default_hermes_root(home=_home(session))
+-- 
+2.43.0
+

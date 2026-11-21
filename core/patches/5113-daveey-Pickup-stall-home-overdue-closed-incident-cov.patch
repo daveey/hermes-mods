@@ -1,0 +1,116 @@
+From 735e7b7d8c78100d70e9cce48eab4646efdd5b61 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 02:57:39 +0000
+Subject: [PATCH] [daveey] Pickup-stall home-overdue: closed incident covers
+ same overdue set for 12h
+
+The repair worker completes after a no-op inspect, and _covering_repair only reuses open
+incidents, so every hub tick minted a new example-host card (~102/day). The home observer now
+stays silent while a closed incident for the same home and same overdue membership is
+younger than HOME_REPLACE_AFTER_SECONDS (12h, <=2 cards/day); a changed membership or an
+expired cooldown files a fresh repair. Threshold, hub-only observer, held/revoked/silent
+predicates and ready-pickup grouping are unchanged.
+
+Proof: new tests fail on main (new card per tick), pass here.
+---
+ hermes_cli/kanban_pickup_stall_home.py        | 24 +++++++++++
+ .../test_kanban_pickup_stall_home.py          | 40 +++++++++++++++++--
+ 2 files changed, 61 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_pickup_stall_home.py b/hermes_cli/kanban_pickup_stall_home.py
+index 4285f999a0..d8100cc471 100644
+--- a/hermes_cli/kanban_pickup_stall_home.py
++++ b/hermes_cli/kanban_pickup_stall_home.py
+@@ -144,6 +144,25 @@ def _fresh(replica, now: float) -> bool:
+     return row is not None and type(row[0]) in (int, float) and -5 <= now - row[0] <= FRESH_SECONDS
+ 
+ 
++# Pick: a closed incident keeps covering the same home and same overdue membership for 12 h (the repair
++# completes after a no-op inspect, so the 1 h REPLACE_AFTER_SECONDS floor still minted ~24 cards/day for a
++# silent example host; 12 h gives <= 2/day). A changed membership files a fresh incident at once.
++HOME_REPLACE_AFTER_SECONDS = 12 * 3600
++_LISTED = re.compile(r"^- (\S+) \(", re.MULTILINE)
++
++
++def _recently_closed(conn, key: str, card_ids: list[str], now_ms: int) -> str | None:
++    from hermes_cli import kanban_pickup_stall as kps
++    row = conn.execute(
++        "SELECT id, body, COALESCE(completed_at, created_at) AS closed FROM tasks WHERE created_by = ? "
++        "AND idempotency_key >= ? AND idempotency_key < ? AND status IN ('done', 'archived') "
++        "ORDER BY COALESCE(completed_at, created_at) DESC, id LIMIT 1", (kps.DETECTOR, key, key + "\U0010ffff")
++    ).fetchone()
++    if row is None or now_ms / 1000 - row["closed"] >= HOME_REPLACE_AFTER_SECONDS:
++        return None
++    return row["id"] if set(_LISTED.findall(row["body"] or "")) == set(card_ids) else None
++
++
+ def sweep(conn, replica, own: str, *, now_ms: int) -> list[str]:
+     from hermes_cli import kanban_pickup_stall as kps
+     from hermes_cli import kanban_worker_node as wn
+@@ -165,6 +184,11 @@ def sweep(conn, replica, own: str, *, now_ms: int) -> list[str]:
+                 f"greater than 30 minutes. {cards[0]['home_evidence']}. A todo clock starts when the "
+                 "last parent completed; a scheduled clock uses its current wake/backstop.\n\n" + listed
+                 + "\n\n" + HOWTO)
++        key = f"{kps.KEY_PREFIX}{own}:home-overdue-{home}:"
++        recent = _recently_closed(conn, key, [c["id"] for c in cards], now_ms)
++        if recent is not None:
++            ids.append(recent)  # silence: the same overdue set was just repaired, do not mint another worker
++            continue
+         ids.append(kps._create(
+             conn, key=f"{kps.KEY_PREFIX}{own}:home-overdue-{home}:",
+             title=f"Home transitions overdue on {home} ({len(cards)} cards)", body=body,
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_home.py b/tests/hermes_cli/test_kanban_pickup_stall_home.py
+index 58e1cc1426..c6150eb39c 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_home.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_home.py
+@@ -188,10 +188,44 @@ def test_separate_homes_and_closed_incidents(replica, local):
+     card(replica, "two", home="worker-7")
+     first = subject.sweep(local, replica, "hub", now_ms=NOW * 1000)
+     assert len(first) == 2
+-    local.execute("UPDATE tasks SET status='done' WHERE id=?", (first[0],))
++    _close(local, first[0], NOW)
++    # Same tick, same membership: the closed incident still covers (no new card per tick).
++    same = subject.sweep(local, replica, "hub", now_ms=NOW * 1000)
++    assert same == first
++    assert local.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
++    # Past the cooldown a still-overdue home gets a fresh repair.
++    _fresh_at(replica, NOW + subject.HOME_REPLACE_AFTER_SECONDS + 1)
++    later = subject.sweep(local, replica, "hub", now_ms=(NOW + subject.HOME_REPLACE_AFTER_SECONDS + 1) * 1000)
++    assert later[1] == first[1] and later[0] != first[0]
++
++
++def _fresh_at(replica, at):
++    replica.execute("UPDATE kanban_sync_state SET pulled_at=?", (at,))
++
++
++def _close(local, tid, at):
++    local.execute("UPDATE tasks SET status='done', completed_at=? WHERE id=?", (at, tid))
+     local.commit()
+-    again = subject.sweep(local, replica, "hub", now_ms=NOW * 1000)
+-    assert first[1] == again[1] and first[0] != again[0]
++
++
++def test_closed_incident_does_not_respawn_every_tick(replica, local):
++    card(replica, "one")
++    [first] = subject.sweep(local, replica, "hub", now_ms=NOW * 1000)
++    _close(local, first, NOW)
++    for minutes in (1, 2, 60, 61, 6 * 60):
++        _fresh_at(replica, NOW + minutes * 60)
++        assert subject.sweep(local, replica, "hub", now_ms=(NOW + minutes * 60) * 1000) == [first]
++    assert local.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
++
++
++def test_closed_incident_is_replaced_when_membership_changes(replica, local):
++    card(replica, "one")
++    [first] = subject.sweep(local, replica, "hub", now_ms=NOW * 1000)
++    _close(local, first, NOW)
++    card(replica, "two")
++    _fresh_at(replica, NOW + 60)
++    [second] = subject.sweep(local, replica, "hub", now_ms=(NOW + 60) * 1000)
++    assert second != first
+ 
+ 
+ def test_legacy_backstop_and_current_park(replica):
+-- 
+2.43.0
+

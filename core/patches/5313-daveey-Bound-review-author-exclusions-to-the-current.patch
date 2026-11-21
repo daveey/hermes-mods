@@ -1,0 +1,338 @@
+From d3794c203339fb9e2046f834ba1a726c9ba0c496 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:28:16 +0000
+Subject: [PATCH] [daveey] Bound review author exclusions to the current
+ implementation epoch
+
+Why: every implementation run accumulated forever on long-churn cards, so
+four review/rework cycles could exclude every independent reviewer. The
+reviewer resolver then requeued an impossible spawn instead of stopping.
+
+Keep all concrete authors after the last real review preceding the latest
+implementation; keep the epoch across review-only retries, failed spawns,
+and unknown current receipts. Retain first-epoch pin provenance and source
+card traversal. Structural exhaustion now has a typed refusal propagated
+through model-tier dispatch into the canonical sticky infrastructure triage
+block, with named excluded models, rather than a spawn-failure retry loop.
+Temporary provider walls retain bounded infrastructure deferrals.
+
+Proof: six new acceptance cases RED on b28fa0fa569f; 10 epoch/exhaustion
+regressions GREEN. 40 consumer files: 1089 passed, 0 failed. Seven source
+mutants killed using the canonical runner. scripts/check: 21 checks pass.
+Read-only replay of local boards and full replicas: 994 same-card histories,
+31 changed author sets, each requiring a real review boundary. Replay found
+unknown-receipt histories; conservative retention was added and tested.
+Independent exact-head review and required green CI remain ship gates.
+---
+ hermes_cli/kanban_review_model.py             |  76 +++++++++---
+ .../test_kanban_managed_pin_policy.py         |   8 +-
+ tests/hermes_cli/test_kanban_review_model.py  |   7 +-
+ .../test_kanban_review_model_cycles.py        | 114 ++++++++++++++++++
+ 4 files changed, 178 insertions(+), 27 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_review_model_cycles.py
+
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index c1a1d79acb..0ac6029968 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -70,9 +70,11 @@ def _payload(raw):
+ 
+ 
+ def implementer_models(conn, task) -> set[str]:
+-    """All concrete author models, never a downstream review card's reviewer pin.
++    """Concrete author models for the current implementation epoch.
+ 
+     Read each run independently: a live worker result supersedes its launch receipt.
++    A real review separates epochs only after new concrete implementation evidence;
++    review-only retries and missing receipts preserve the previous authors.
+     Related source cards are traversed with a visited set to tolerate cyclic links.
+     """
+     from hermes_cli import kanban_db as kb
+@@ -88,23 +90,13 @@ def implementer_models(conn, task) -> set[str]:
+         skilled = "sdlc-review" in (getattr(stored, "skills", None) or [])
+         models = set()
+         pin = str(getattr(card, "model_override", None) or "").strip()
+-        if pin and not is_class_selector(pin) and not downstream:
+-            models.add(pin)
++        boundary = False
+         if not downstream and not skilled:
+-            from hermes_cli.kanban_review_retry import rehandoff_runs
+-            repeats = rehandoff_runs(conn, card.id)
+-            for row in conn.execute("SELECT id FROM task_runs WHERE task_id=?", (card.id,)).fetchall():
+-                if row[0] in repeats:
+-                    continue
+-                events = conn.execute(
+-                    "SELECT kind, payload FROM task_events WHERE task_id=? AND run_id=? "
+-                    "AND kind IN ('model_tier', 'run_route') ORDER BY id DESC", (card.id, row[0])).fetchall()
+-                if any(_payload(event[1]).get("lane") == "review" for event in events):
+-                    continue
+-                model = (_run_model(conn, card.id, row[0], "worker_result", "route_model")
+-                         or _run_model(conn, card.id, row[0], "run_route", "model"))
+-                if model:
+-                    models.add(model)
++            models, boundary = _current_authors(conn, card.id)
++        # Preserve conservative pin provenance on the first epoch and when the
++        # current epoch has no concrete receipt; an old pin is not a new author.
++        if pin and not is_class_selector(pin) and not downstream and (not boundary or not models):
++            models.add(pin)
+         if downstream:
+             # Declared provenance counts as evidence of its own: the change came from outside the board.
+             models.update(declared_implementers(getattr(stored, "body", None), getattr(stored, "assignee", None)))
+@@ -123,6 +115,36 @@ def implementer_models(conn, task) -> set[str]:
+         return collect(conn, task)
+ 
+ 
++def _current_authors(conn, task_id):
++    """Authors since the review preceding the latest implementation, plus epoch boundary.
++
++    Consecutive review retries keep the same author set. A pre-spawn refusal is
++    not a review boundary: nobody inspected the head. Run IDs are local and read
++    on the same connection, including when source_reader selects a replica.
++    """
++    from hermes_cli.kanban_review_retry import rehandoff_runs
++    repeats = rehandoff_runs(conn, task_id)
++    models = set()
++    for row in conn.execute("SELECT id FROM task_runs WHERE task_id=? ORDER BY id DESC",
++                            (task_id,)).fetchall():
++        events = conn.execute("SELECT kind, payload FROM task_events WHERE task_id=? AND run_id=? "
++                              "ORDER BY id DESC", (task_id, row[0])).fetchall()
++        reviewing = any(event[0] in ("model_tier", "run_route") and
++                        _payload(event[1]).get("lane") == "review" for event in events)
++        if reviewing:
++            ran = any(event[0] in ("worker_result", "spawned") for event in events)
++            if ran and models:
++                return models, True
++            continue
++        if row[0] in repeats:
++            continue
++        model = (_run_model(conn, task_id, row[0], "worker_result", "route_model")
++                 or _run_model(conn, task_id, row[0], "run_route", "model"))
++        if model:
++            models.add(model)
++    return models, False
++
++
+ def is_review_run(conn, task, lane) -> bool:
+     return (lane == "review" or "sdlc-review" in (getattr(task, "skills", None) or [])
+             or _downstream(task))
+@@ -178,10 +200,17 @@ class ReviewRouteDeferred(ReviewModelUnavailable):
+         self.until = until
+ 
+ 
++class ReviewModelsExhausted(ReviewModelUnavailable):
++    """No configured independent candidate exists; retrying cannot change authorship."""
++
++
+ def resolution_error(exc):
+-    """Preserve deadline-bearing refusals through the tier's contextual error wrapper."""
+-    return exc if isinstance(exc, ReviewRouteDeferred) else ReviewModelUnavailable(
+-        f"Review model resolution failed: {exc}")
++    """Keep deadline and structural-exhaustion refusals typed through the tier's error wrapper."""
++    if isinstance(exc, ReviewRouteDeferred):
++        return exc
++    if isinstance(exc, ReviewModelsExhausted):
++        return ReviewModelsExhausted(f"Review model resolution failed: {exc}")
++    return ReviewModelUnavailable(f"Review model resolution failed: {exc}")
+ 
+ 
+ def _handoff(conn, task):
+@@ -304,6 +333,8 @@ def admission_refusal(conn, task_id, exc):
+     from tools.process_registry import RestartSafeScopeUnavailable
+     if isinstance(exc, ReviewRouteDeferred):
+         return True, False, None  # a wall appearing after preflight never exhausts reviewer admission
++    if isinstance(exc, ReviewModelsExhausted):
++        return False, True, {"admission_refusal": "review_models_exhausted", "infrastructure": True}
+     if isinstance(exc, ReviewModelUnavailable) and deferral_exhausted(conn, task_id, str(exc)):
+         return False, True, {"admission_refusal": "review_model_unavailable", "deferrals": DEFERRAL_LIMIT}
+     from hermes_cli.kanban_pace_reroute import OfferLost  # a lapsed pace move: requeue for a fresh judgment
+@@ -419,7 +450,9 @@ def resolve_review_model(conn, task, cfg):
+         if pin not in excluded:
+             from itertools import chain
+             candidates = chain([pin_route], candidates)
++    independent_candidate = False
+     for model, provider in candidates:
++        independent_candidate = True
+         if _unavailable(model, provider) or (override and registry_refusal(model, provider, assignee)):
+             continue
+         reason = (OVERRIDE_REFUSED if refusal else "review_override" if class_override or override_moved
+@@ -427,6 +460,7 @@ def resolve_review_model(conn, task, cfg):
+         return model, provider, reason
+     # Refused overrides retain their existing registered-deep-only recovery contract.
+     for model, provider in (() if refusal else independent_routes(excluded, cfg, assignee, level="standard")):
++        independent_candidate = True
+         if _unavailable(model, provider) or (override and registry_refusal(model, provider, assignee)):
+             continue
+         return model, provider, "review_tier_fallback"
+@@ -436,4 +470,6 @@ def resolve_review_model(conn, task, cfg):
+         detail = f"review_model {override[0]!r} is refused here ({refusal.code}); {detail}"
+     if waits:
+         raise ReviewRouteDeferred(detail, min(waits))
++    if not independent_candidate and not override_moved:
++        raise ReviewModelsExhausted(f"{detail}; infrastructure blocker: configure an independent reviewer")
+     raise ReviewModelUnavailable(detail)
+diff --git a/tests/hermes_cli/test_kanban_managed_pin_policy.py b/tests/hermes_cli/test_kanban_managed_pin_policy.py
+index 7f5cc5aa64..d916308e19 100644
+--- a/tests/hermes_cli/test_kanban_managed_pin_policy.py
++++ b/tests/hermes_cli/test_kanban_managed_pin_policy.py
+@@ -248,8 +248,8 @@ def test_refused_review_override_without_independent_reviewer_never_spawns(board
+     dispatch_once(conn, spawn_fn=lambda *args: seen.append(args), max_spawn=1)
+     assert seen == []
+     task = kb.get_task(conn, tid)
+-    assert task.status == 'review' and task.consecutive_failures == 0 and task.claim_lock is None
+-    failed = [e.payload for e in kb.list_events(conn, tid) if e.kind == 'spawn_failed'][-1]
++    assert task.status == 'triage' and task.claim_lock is None
++    failed = [e.payload for e in kb.list_events(conn, tid) if e.kind == 'gave_up'][-1]
+     assert failed['infrastructure'] is True
+     assert FABLE in failed['error'] and 'model_pin_not_in_routing_registry' in failed['error']
+ 
+@@ -345,6 +345,6 @@ def test_rerouted_pin_reviewer_is_distinct_from_the_model_that_ran(board, overri
+         return
+     assert seen == []
+     task = kb.get_task(conn, tid)
+-    assert task.status == 'review' and task.consecutive_failures == 0
+-    failed = [e.payload for e in kb.list_events(conn, tid) if e.kind == 'spawn_failed'][-1]
++    assert task.status == 'triage'
++    failed = [e.payload for e in kb.list_events(conn, tid) if e.kind == 'gave_up'][-1]
+     assert 'claude-opus-5-5' in failed['error'] and 'gpt-6.1-sol' in failed['error']
+diff --git a/tests/hermes_cli/test_kanban_review_model.py b/tests/hermes_cli/test_kanban_review_model.py
+index c882ce39af..b8fb5723de 100644
+--- a/tests/hermes_cli/test_kanban_review_model.py
++++ b/tests/hermes_cli/test_kanban_review_model.py
+@@ -114,10 +114,11 @@ def test_review_admission_failure_never_spawns_or_spends_retry(board, monkeypatc
+         dispatch.dispatch_once(conn, dry_run=False, spawn_fn=lambda *args: seen.append(args))
+         stored = kb.get_task(conn, t.id)
+         assert seen == []
+-        assert stored.status == "review"
+-        assert stored.consecutive_failures == 0
++        assert stored.status == ("triage" if failure == "no_route" else "review")
++        assert stored.consecutive_failures == (1 if failure == "no_route" else 0)
+         assert stored.claim_lock is None
+-        events = [e.payload for e in kb.list_events(conn, t.id) if e.kind == "spawn_failed"]
++        event_kind = "gave_up" if failure == "no_route" else "spawn_failed"
++        events = [e.payload for e in kb.list_events(conn, t.id) if e.kind == event_kind]
+         assert events[-1]["infrastructure"] is True
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_review_model_cycles.py b/tests/hermes_cli/test_kanban_review_model_cycles.py
+new file mode 100644
+index 0000000000..bb9728f079
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_review_model_cycles.py
+@@ -0,0 +1,114 @@
++"""Current-head authorship survives retries without exhausting historical reviewers."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli import kanban_review_model as review
++from tests.hermes_cli import test_kanban_review_implementer_set as provenance
++from tests.hermes_cli import test_kanban_review_model as helpers
++
++board = helpers.board
++MODELS = [helpers.OPUS, helpers.FABLE, helpers.SONNET, "claude-review-four"]
++
++
++def run(conn, tid, model, lane="ready"):
++    return provenance._run(conn, tid, model=model, receipt=model, lane=lane)
++
++
++def test_fifth_review_reuses_older_models_not_current_author(board):
++    cfg = helpers.config(board, strong=MODELS[0], routes=MODELS)
++    with kbc.connect() as conn:
++        task = helpers.task(conn, MODELS[0])
++        for index, model in enumerate(MODELS):
++            run(conn, task.id, model)
++            run(conn, task.id, MODELS[(index + 1) % len(MODELS)], "review")
++        run(conn, task.id, MODELS[-1])
++        model, _, _ = tier.resolve_model_tier(conn, kb.get_task(conn, task.id), lane="review", cfg=cfg)
++        assert model in MODELS and model != MODELS[-1]
++        assert review.implementer_models(conn, kb.get_task(conn, task.id)) == {MODELS[-1]}
++
++
++@pytest.mark.parametrize("current", MODELS)
++def test_current_epoch_excludes_all_authors_even_across_review_retries(board, current):
++    cfg = helpers.config(board, strong=current, routes=MODELS)
++    with kbc.connect() as conn:
++        task = helpers.task(conn, MODELS[0])
++        for model in MODELS:
++            run(conn, task.id, model)
++            run(conn, task.id, model, "review")
++        other = MODELS[(MODELS.index(current) + 1) % len(MODELS)]
++        run(conn, task.id, current)
++        run(conn, task.id, other)
++        for _ in range(2):
++            run(conn, task.id, MODELS[0], "review")
++        authors = review.implementer_models(conn, kb.get_task(conn, task.id))
++        assert authors == {current, other}
++        model, _, _ = tier.resolve_model_tier(conn, kb.get_task(conn, task.id), lane="review", cfg=cfg)
++        assert model not in authors
++
++
++@pytest.mark.parametrize("started", [False, True])
++def test_refused_spawn_is_not_a_review_boundary(board, started):
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, kb.create_task(conn, title="epoch fixture", assignee="default"))
++        run(conn, task.id, MODELS[0])
++        review_id = run(conn, task.id, MODELS[1], "review")
++        conn.execute("DELETE FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_result'",
++                     (task.id, review_id))
++        if started:
++            kb._append_event(conn, task.id, "spawned", {"pid": 123}, run_id=review_id)
++        run(conn, task.id, MODELS[2])
++        expected = {MODELS[2]} if started else {MODELS[0], MODELS[2]}
++        assert review.implementer_models(conn, kb.get_task(conn, task.id)) == expected
++
++
++def test_missing_current_receipt_keeps_previous_author_evidence(board):
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, kb.create_task(conn, title="unknown author", assignee="default"))
++        run(conn, task.id, MODELS[0])
++        run(conn, task.id, MODELS[1], "review")
++        unknown = run(conn, task.id, None)
++        conn.execute("UPDATE task_runs SET outcome='review_requested' WHERE id=?", (unknown,))
++        assert review.implementer_models(conn, kb.get_task(conn, task.id)) == {MODELS[0]}
++
++
++def test_provider_wall_does_not_become_structural_exhaustion(board, monkeypatch):
++    cfg = helpers.config(board)
++    from hermes_cli import kanban_provider_walls as walls
++    monkeypatch.setattr(walls, "active_walls", lambda **kwargs: {"anthropic": 99999999999})
++    with kbc.connect() as conn:
++        with pytest.raises(review.ReviewModelUnavailable) as raised:
++            review.resolve_review_model(conn, helpers.task(conn), cfg)
++        infrastructure, force_trip, _ = review.admission_refusal(conn, "absent", raised.value)
++        assert infrastructure and not force_trip
++
++
++def test_structural_exhaustion_blocks_once_without_spawn_retry_loop(board, monkeypatch):
++    helpers.config(board, strong=helpers.OPUS, routes=[helpers.OPUS])
++    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
++    spawned = []
++    with kbc.connect() as conn:
++        task = helpers.task(conn, helpers.OPUS)
++        kb.claim_task(conn, task.id)
++        kb.request_review(conn, task.id)
++        result = dispatch.dispatch_once(conn, spawn_fn=lambda *args: spawned.append(args))
++        stored = kb.get_task(conn, task.id)
++        # Canonical non-human infrastructure block is sticky triage, never a Owner ask.
++        assert stored.status == "triage"
++        assert result.auto_blocked == [task.id]
++        assert stored.human_request is None
++        assert helpers.OPUS in stored.last_failure_error
++        events = kb.list_events(conn, task.id)
++        gave_up = [e.payload for e in events if e.kind == "gave_up"]
++        assert len(gave_up) == 1
++        assert gave_up[0]["infrastructure"] is True
++        assert gave_up[0]["admission_refusal"] == "review_models_exhausted"
++        assert gave_up[0]["sticky"] is True
++        runs = len(kb.list_runs(conn, task.id))
++        for _ in range(4):
++            dispatch.dispatch_once(conn, spawn_fn=lambda *args: spawned.append(args))
++        assert len(kb.list_runs(conn, task.id)) == runs
++        assert len([e for e in kb.list_events(conn, task.id) if e.kind == "gave_up"]) == 1
++        assert spawned == []
+-- 
+2.43.0
+

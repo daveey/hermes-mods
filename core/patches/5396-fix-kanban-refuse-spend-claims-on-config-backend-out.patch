@@ -1,0 +1,121 @@
+From d912ee96dd38edbaad1c455f6899bca4a8437a71 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 05:04:53 +0000
+Subject: [PATCH] fix(kanban): refuse spend claims on config backend outage
+ [daveey]
+
+Catch the typed fail-closed backend refusal at claim-policy preparation so
+ready and review claims return no admission rather than crashing dispatch.
+Exercise the actual limits reader despite the accounting fixture's stub.
+
+Keep deploy-window clock/escalation fixtures independent of the newly
+universal spend admission and restore readable config only for the blocker
+fixture's separate claim, retaining every hold-outage assertion.
+
+Proof: config-outage RED 2 failed at claim-policy read; GREEN 281 passed
+across 13 suites including all nine unchanged spend contract suites.
+Broad direct-consumer gate: 1188 files, 22722 passed, four diagnosed
+interaction failures corrected here; separate baseline psutil deleted-cwd
+fixture failure passed retry and remains outside this change.
+
+Hermes-Card: t_eeeeee000000003d
+---
+ hermes_cli/kanban_spend_claim.py              |  8 ++++++-
+ .../test_kanban_blocker_input_config.py       |  6 +++++-
+ tests/hermes_cli/test_kanban_deploy_window.py |  4 ++++
+ .../test_kanban_spend_claim_accounting.py     | 21 +++++++++++++++++++
+ 4 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_spend_claim.py b/hermes_cli/kanban_spend_claim.py
+index 53e937d80e..de7db2040c 100644
+--- a/hermes_cli/kanban_spend_claim.py
++++ b/hermes_cli/kanban_spend_claim.py
+@@ -14,7 +14,13 @@ def claim_check(conn, task_id):
+     from hermes_cli import kanban_spend_decision as decision
+     from hermes_cli import kanban_spend_pr_owner as owner
+ 
+-    board = budget.limits()
++    from hermes_cli.config_backend import ConfigBackendUnavailable
++
++    try:
++        board = budget.limits()
++    except ConfigBackendUnavailable:
++        # A missing policy cannot authorize spending; do not crash the dispatcher either.
++        return lambda: True
+     pr = None
+     if not decision.pending(conn, task_id):
+         lim = budget.card_limits(conn, task_id, board)
+diff --git a/tests/hermes_cli/test_kanban_blocker_input_config.py b/tests/hermes_cli/test_kanban_blocker_input_config.py
+index 3409f18529..426d90ef26 100644
+--- a/tests/hermes_cli/test_kanban_blocker_input_config.py
++++ b/tests/hermes_cli/test_kanban_blocker_input_config.py
+@@ -219,7 +219,11 @@ def test_hold_decision_falls_back_when_config_backend_is_unavailable(kanban_home
+         assert outcome(blockers.shared_blocker_guard, conn, tids[1], now=now) == blockers.GUARD_REASON
+         assert outcome(blockers._hold_config) is None
+         # Checks cannot be listed either, so a registered wall's operator-release exemption does not apply.
+-        assert helpers.kb.unblock_task(conn, tids[0]) and helpers.kb.claim_task(conn, tids[0])
++        assert helpers.kb.unblock_task(conn, tids[0])
++        # Claim admission itself requires a readable spend policy, independently of hold fallback.
++        monkeypatch.setattr('hermes_cli.config.load_config', lambda: healthy)
++        assert helpers.kb.claim_task(conn, tids[0])
++        _backend_down(monkeypatch)
+         assert helpers.kb.unblock_task(conn, tids[1])
+         assert outcome(blockers._shared_blocker_hold, conn, tids[1], now=now + 1) == ('test-wall', tids[0], 0)
+         _counting_config(monkeypatch, healthy)
+diff --git a/tests/hermes_cli/test_kanban_deploy_window.py b/tests/hermes_cli/test_kanban_deploy_window.py
+index 757a0e0ab3..b13027e3ec 100644
+--- a/tests/hermes_cli/test_kanban_deploy_window.py
++++ b/tests/hermes_cli/test_kanban_deploy_window.py
+@@ -30,6 +30,10 @@ DAY = 24 * 3600  # the healthy-exemption bound (kanban_deploy_window.HEALTHY_MAX
+ 
+ @pytest.fixture
+ def board(tmp_path, monkeypatch):
++    from hermes_cli import kanban_spend_budget as budget
++
++    # Exercise the deploy-wait clock/escalation policy independently of spend admission.
++    monkeypatch.setattr(budget, "limits", lambda: budget.Limits(0, 0))
+     home = tmp_path / ".hermes"
+     home.mkdir()
+     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+diff --git a/tests/hermes_cli/test_kanban_spend_claim_accounting.py b/tests/hermes_cli/test_kanban_spend_claim_accounting.py
+index b32a808622..b9d2bca444 100644
+--- a/tests/hermes_cli/test_kanban_spend_claim_accounting.py
++++ b/tests/hermes_cli/test_kanban_spend_claim_accounting.py
+@@ -10,6 +10,7 @@ from tests.hermes_cli import test_kanban_spend_pr_owner as helpers
+ 
+ kanban_home = helpers.kanban_home
+ github = helpers.github
++_REAL_LIMITS = budget.limits
+ 
+ 
+ @pytest.mark.parametrize("lane", ["ready", "review"])
+@@ -41,6 +42,26 @@ def test_publication_observation_never_runs_under_claim_write_lock(kanban_home,
+         assert calls == [tid]
+ 
+ 
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_config_outage_refuses_claim_without_escaping(kanban_home, monkeypatch, lane):
++    from hermes_cli.config_backend import ConfigBackendUnavailable
++
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="config outage claim", assignee="worker")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (lane, tid))
++
++        def down():
++            raise ConfigBackendUnavailable("down")
++
++        monkeypatch.setattr(budget, "limits", _REAL_LIMITS)
++        monkeypatch.setattr("hermes_cli.config.load_config", down)
++        claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++        assert claim(conn, tid) is None
++        assert conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0] == lane
++        assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0] == 0
++
++
+ def test_transaction_rechecks_override_and_publication_identity(kanban_home, github):
+     with kbc.connect_closing() as conn:
+         tid = helpers.owner(conn)
+-- 
+2.43.0
+

@@ -1,0 +1,202 @@
+From 385ae033c90b9e496c474d8758403a8aff6a8643 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 00:31:43 +0000
+Subject: [PATCH] [daveey] Skip impossible qualified-card legacy alias scans
+
+Why: links-source projection indexed receipts by origin, but still scanned that
+bucket for every qualified card. supersedes rejects a non-None profile before
+reading any receipt. A captured source composition performed 296,941 such
+immediately rejected comparisons for 6,335 legacy-list cards.
+
+Move only that exact first rejection ahead of the scan. Keep the origin-key
+lookup before it to preserve malformed/unhashable-origin failure ordering.
+Keep by-key and compression-tip suppression for every card. No memberships,
+clocks, active streams or terminal deadlines are cached or skipped.
+
+Proof:
+- Behavioral RED on parent c99417f4aa: 4 failed, 9 passed; failures assert work.
+- Expanded focused regression: 16 passed; 95 passed across the initial three
+  focused files before adding three falsey-profile controls.
+- Direct-importer suite: 163 files, 2,965 tests passed, zero failures.
+- Three exact-anchor mutants killed: omitted gate, truthiness gate, skipped
+  qualified origin lookup. Full scripts/check: 21 checks passed.
+- Twenty alternating captured parent/candidate source-composition pairs have
+  exact ordered cards and ledger-slice parity (5,842 cards). Median thread CPU
+  290.230 -> 258.615 ms on a loaded worker, all raw samples retained.
+  This is diagnostic: plain SQLite opener, unavailable local authority/empty
+  local dedup, omitted cold durable carry and frozen clock. It is NOT live
+  links-family acceptance; the prior mature Mac pair still fails at 0.8053%.
+
+Task: t_eeeeee0000000018. Read-only Mac capture; no signal/restart/update.
+---
+ hermes_cli/kanban_session_activity.py         |   6 +-
+ .../test_kanban_links_alias_work.py           | 133 ++++++++++++++++++
+ 2 files changed, 136 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_links_alias_work.py
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index ec690a05cc..2a37fe19ca 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1044,8 +1044,7 @@ def _project_remote_links() -> list[dict[str, Any]]:
+                 tips[sid] = None
+         return tips[sid]
+ 
+-    # [daveey] Both tests below need an exact identity match, so index the receipt rows by it: scanning every
+-    # row per legacy card was ~2.4k x ~200 ``supersedes`` calls (~45 ms) per projection.
++    # [daveey] Index exact receipt identities: scanning all rows per legacy card cost ~45 ms per projection.
+     by_origin: dict[tuple, list[dict[str, Any]]] = {}
+     by_key: dict[tuple, list[dict[str, Any]]] = {}
+     if legacy:
+@@ -1057,7 +1056,8 @@ def _project_remote_links() -> list[dict[str, Any]]:
+     def superseded(card: dict[str, Any]) -> bool:
+         from hermes_cli.kanban_origin_legacy import supersedes
+         origin = (card.get('gateway'), card.get('origin_gateway'), card.get('origin_profile'), card.get('session'))
+-        if any(supersedes(card, row) for row in by_origin.get(origin, ())):
++        bucket = by_origin.get(origin, ())  # preserve lookup errors; supersedes rejects qualified cards below
++        if card.get('profile') is None and any(supersedes(card, row) for row in bucket):
+             return True
+         for row in by_key.get((card.get('key'), card.get('origin_gateway'), card.get('origin_profile')), ()):
+             aliases = (row['origin_session'], row['session'])
+diff --git a/tests/hermes_cli/test_kanban_links_alias_work.py b/tests/hermes_cli/test_kanban_links_alias_work.py
+new file mode 100644
+index 0000000000..09032a9a6d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_links_alias_work.py
+@@ -0,0 +1,133 @@
++"""Qualified cards cannot consume legacy alias receipts; keep lineage fallback live."""
++from copy import deepcopy
++
++import pytest
++
++from hermes_cli import kanban_origin_adapter as adapter
++from hermes_cli import kanban_origin_ledger as ledger
++from hermes_cli import kanban_origin_legacy as legacy
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import profiles
++
++
++@pytest.fixture
++def projection(tmp_path, monkeypatch):
++    import hermes_constants
++    from hermes_cli import kanban_origin
++
++    (tmp_path / 'kanban').mkdir()
++    (tmp_path / 'kanban/origin-ledger.db').touch()
++    monkeypatch.setattr(hermes_constants, 'get_hermes_home', lambda: tmp_path)
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    monkeypatch.setattr(adapter, '_gateway', lambda path: 'origin')
++    monkeypatch.setattr(activity, '_hub_db_path', lambda: None)
++    monkeypatch.setattr(activity, '_without_local_open_duplicates', lambda rows, **kw: rows)
++    rows, cards, calls, resolutions = [], [], [], []
++    monkeypatch.setattr(ledger, 'project', lambda *args, **kwargs: deepcopy(rows))
++    monkeypatch.setattr(activity, '_legacy_remote_links', lambda: deepcopy(cards))
++    original = legacy.supersedes
++
++    def counted(card, row):
++        calls.append((card.get('profile'), row['key']))
++        return original(card, row)
++
++    monkeypatch.setattr(legacy, 'supersedes', counted)
++
++    class Connection:
++        def close(self):
++            pass
++
++    monkeypatch.setattr(kanban_origin, '_ro', lambda path: Connection())
++
++    def resolve(path, sid, conn):
++        resolutions.append(sid)
++        return 'tip' if sid in ('compressed', 'start', 'accepted') else sid
++
++    monkeypatch.setattr(adapter, '_resolve_session', resolve)
++    return rows, cards, calls, resolutions
++
++
++def row(**changes):
++    return dict(gateway='owner', origin_gateway='origin', origin_profile='default',
++                origin_session='start', session='accepted', key='owner/default/main/task',
++                unfinished=True, legacy_aliases=[{'key': 'main/task', 'version': 2, 'digest': 'proof'}],
++                **changes)
++
++
++def card(**changes):
++    result = dict(gateway='owner', origin_gateway='origin', origin_profile='default',
++                  session='start', key='owner/main/task', profile='default',
++                  legacy_record={'key': 'main/task', 'version': 2, 'digest': 'proof'})
++    result.update(changes)
++    return result
++
++
++@pytest.mark.parametrize('profile', ['default', '', 0, False])
++def test_qualified_cards_skip_alias_scans_even_with_shared_origin(projection, profile):
++    rows, cards, calls, _ = projection
++    rows.extend(row() for _ in range(80))
++    cards.extend(card(key=f'owner/main/other-{i}', profile=profile) for i in range(100))
++    assert activity._project_remote_links() == cards + rows
++    assert calls == []
++
++
++@pytest.mark.parametrize('missing', [False, True])
++def test_unqualified_aliases_still_superseded(projection, missing):
++    rows, cards, calls, _ = projection
++    rows.append(row())
++    item = card(profile=None)
++    if missing:
++        del item['profile']
++    cards.append(item)
++    assert activity._project_remote_links() == rows
++    assert len(calls) == 1
++
++
++@pytest.mark.parametrize('field,value', [('version', 3), ('digest', 'changed'), ('key', 'other/task')])
++def test_unqualified_alias_change_is_not_superseded(projection, field, value):
++    rows, cards, _, _ = projection
++    rows.append(row())
++    item = card(profile=None)
++    item['legacy_record'][field] = value
++    cards.append(item)
++    assert activity._project_remote_links() == cards + rows
++
++
++@pytest.mark.parametrize('session', ['start', 'accepted', 'compressed'])
++def test_qualified_card_retains_key_and_compression_fallback(projection, session):
++    rows, cards, calls, resolutions = projection
++    rows.append(row())
++    cards.append(card(key=rows[0]['key'], session=session))
++    assert activity._project_remote_links() == rows
++    assert calls == []
++    assert bool(resolutions) == (session == 'compressed')
++
++
++@pytest.mark.parametrize('field', ['session', 'gateway'])
++def test_qualified_card_preserves_origin_lookup_error(projection, field):
++    rows, cards, _, resolutions = projection
++    rows.append(row())
++    cards.append(card(**{field: []}))
++    with pytest.raises(TypeError, match='unhashable'):
++        activity._project_remote_links()
++    assert resolutions == []
++
++
++def test_qualified_card_does_not_inspect_malformed_aliases(projection):
++    rows, cards, calls, _ = projection
++    item = row()
++    item['legacy_aliases'] = 123
++    rows.append(item)
++    cards.append(card())
++    assert activity._project_remote_links() == cards + rows
++    assert calls == []
++
++
++def test_profile_change_rechecks_aliases_on_next_projection(projection):
++    rows, cards, calls, _ = projection
++    rows.append(row())
++    cards.append(card())
++    assert activity._project_remote_links() == cards + rows
++    cards[0]['profile'] = None
++    assert activity._project_remote_links() == rows
++    assert calls == [(None, rows[0]['key'])]
+-- 
+2.43.0
+

@@ -1,0 +1,208 @@
+From e9752b369a0e128f5028bd6dc324996e7fa99b34 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 04:42:50 +0000
+Subject: [PATCH] fix(kanban): retain WAL guard after refused reader close
+ [daveey]
+
+The real thread-checking close can raise before SQLite closes. Guard rearm
+then attempted SQL on the same foreign thread, failed the same thread check
+and left a live tracked reader without its OFD protection. Snapshot held
+custody before release and rearm from its verified WAL path without SQL.
+Preserve ProgrammingError and existing close/registry/lifecycle ordering.
+
+Independent Opus bounded design review approved this correction before
+production edits (close-review.md). The strengthened real WAL reader test
+fails on the prior source at is_guarded after three rejected closes; the
+fixed version retains tracking and balanced handle counts. Also migrate
+reader-isolation cleanup assertions to the new tracked cache lifetime.
+Linux-specific fd proof tests are marked explicitly; no fake platforms.
+Correctness only: G26 remains STOP; no performance acceptance.
+---
+ hermes_cli/kanban_lockguard.py                | 34 ++++++++++++-------
+ .../test_cached_ro_restore_safety.py          |  2 ++
+ .../test_kanban_observer_tracking.py          | 19 ++++++++---
+ .../test_kanban_open_session_isolation.py     |  4 +++
+ .../test_kanban_reader_close_isolation.py     | 11 ++++--
+ 5 files changed, 50 insertions(+), 20 deletions(-)
+
+diff --git a/hermes_cli/kanban_lockguard.py b/hermes_cli/kanban_lockguard.py
+index ce1e155825..b75d1c2a1c 100644
+--- a/hermes_cli/kanban_lockguard.py
++++ b/hermes_cli/kanban_lockguard.py
+@@ -96,6 +96,7 @@ class _GuardMixin:
+ 
+     def close(self) -> None:  # type: ignore[misc]
+         held = getattr(self, "_hermes_lockguard", None)
++        was_guarded = bool(held)
+         _release(self)
+         try:
+             super().close()  # type: ignore[misc]
+@@ -103,8 +104,13 @@ class _GuardMixin:
+             forget(self)
+         except sqlite3.ProgrammingError:
+             # Cross-thread close refused: the connection stays open, so put the guard back.
+-            if held is not None:
+-                _apply(self, held_path=getattr(self, "_hermes_lockguard_path", None))
++            if was_guarded:
++                try:
++                    # SQL cannot run on this foreign thread either. The held WAL
++                    # guard already proved the mode before release emptied it.
++                    _apply(self, held_path=self._hermes_lockguard_path, wal_verified=True)
++                except Exception:
++                    logger.debug("kanban guard rearm after refused close failed", exc_info=True)
+             raise
+ 
+ 
+@@ -141,19 +147,23 @@ def unguard(conn: sqlite3.Connection) -> None:
+         conn._hermes_lockguard = None
+ 
+ 
+-def _apply(conn: Any, held_path: Optional[str] = None, *, strict=False) -> bool:
++def _apply(conn: Any, held_path: Optional[str] = None, *, strict=False, wal_verified=False) -> bool:
++    # Refused-close rearming may not execute SQL on the foreign thread.
++    if wal_verified and not held_path:
++        return False
+     path = held_path or _db_file(conn)
+     if not path:
+         return False
+-    try:
+-        # Also the first read: it opens -wal/-shm, so hold() can lock SQLite's own -shm descriptor.
+-        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+-    except sqlite3.Error:
+-        if strict:
+-            raise
+-        return False
+-    if str(mode).lower() != "wal":
+-        return False
++    if not wal_verified:
++        try:
++            # First read attaches -wal/-shm so hold() can use SQLite's own fds.
++            mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
++        except sqlite3.Error:
++            if strict:
++                raise
++            return False
++        if str(mode).lower() != "wal":
++            return False
+     held = getattr(conn, "_hermes_lockguard", None)
+     if held is None or getattr(conn, "_hermes_lockguard_finalizer", None) is None:
+         held = {}
+diff --git a/tests/hermes_cli/test_cached_ro_restore_safety.py b/tests/hermes_cli/test_cached_ro_restore_safety.py
+index f6322495f5..2b42ef4c3b 100644
+--- a/tests/hermes_cli/test_cached_ro_restore_safety.py
++++ b/tests/hermes_cli/test_cached_ro_restore_safety.py
+@@ -11,6 +11,8 @@ from hermes_cli import backup_restore as restore
+ from hermes_cli.kanban_session_activity import cached_ro, evict_readers
+ from hermes_cli.sqlite_safe_read import pread_lock_safe, release_unlinked_fds
+ 
++pytestmark = pytest.mark.platforms('linux')  # Real pread and deleted-inode descriptor proofs.
++
+ 
+ def make_db(path, marker):
+     with contextlib.closing(sqlite3.connect(path)) as conn:
+diff --git a/tests/hermes_cli/test_kanban_observer_tracking.py b/tests/hermes_cli/test_kanban_observer_tracking.py
+index 4a59fff3a0..77b74f129d 100644
+--- a/tests/hermes_cli/test_kanban_observer_tracking.py
++++ b/tests/hermes_cli/test_kanban_observer_tracking.py
+@@ -71,24 +71,33 @@ def test_gc_releases_tracked_reader(tmp_path):
+     assert not has_live_connection(target)
+ 
+ 
++@pytest.mark.platforms('linux')
+ def test_cross_thread_close_failure_retains_tracking(tmp_path):
+     target = tmp_path / 'board.db'
++    with contextlib.closing(sqlite3.connect(target)) as setup:
++        setup.execute('PRAGMA journal_mode=WAL')
++        setup.execute('CREATE TABLE t(v)')
+     conn = guard.connect(target)
++    assert guard.is_guarded(conn)
+     errors = []
++    counts = dict(guard._lockguard._HANDLES)
+ 
+     def close():
+-        try:
+-            conn.close()
+-        except sqlite3.ProgrammingError as exc:
+-            errors.append(exc)
++        for _ in range(3):
++            try:
++                conn.close()
++            except sqlite3.ProgrammingError as exc:
++                errors.append(exc)
+ 
+     thread = threading.Thread(target=close)
+     thread.start()
+     thread.join(3)
+     assert not thread.is_alive()
+     try:
+-        assert len(errors) == 1
++        assert len(errors) == 3
+         assert has_live_connection(target)
++        assert guard.is_guarded(conn)
++        assert dict(guard._lockguard._HANDLES) == counts
+         assert conn.execute('SELECT 1').fetchone() == (1,)
+     finally:
+         conn.close()
+diff --git a/tests/hermes_cli/test_kanban_open_session_isolation.py b/tests/hermes_cli/test_kanban_open_session_isolation.py
+index 761ab33731..d3e5f320c9 100644
+--- a/tests/hermes_cli/test_kanban_open_session_isolation.py
++++ b/tests/hermes_cli/test_kanban_open_session_isolation.py
+@@ -94,6 +94,10 @@ def test_busy_board_open_does_not_block_session_poll(tmp_path, monkeypatch, http
+             blocker.rollback()
+             blocker.close()
+         opening.result(timeout=10)
++    if discover_board:
++        # Annotation legitimately retains a tracked cached reader after its poll.
++        # Release that custody before asserting that all board handles are gone.
++        activity._reset_cache_for_tests()
+     assert not has_live_connection(board_path)
+     assert not has_live_connection(state_path)
+     client.close()
+diff --git a/tests/hermes_cli/test_kanban_reader_close_isolation.py b/tests/hermes_cli/test_kanban_reader_close_isolation.py
+index e95667ae96..364cfaf3a7 100644
+--- a/tests/hermes_cli/test_kanban_reader_close_isolation.py
++++ b/tests/hermes_cli/test_kanban_reader_close_isolation.py
+@@ -73,7 +73,7 @@ def test_reader_close_does_not_wait_for_busy_native_opener(tmp_path, monkeypatch
+         activity._reset_cache_for_tests()
+ 
+ 
+-def test_untracked_reader_close_while_native_open_waits_for_registry(tmp_path, monkeypatch):
++def test_tracked_reader_close_serializes_with_registry_without_deadlock(tmp_path, monkeypatch):
+     from hermes_cli import sqlite_safe_read
+ 
+     path = tmp_path / "board.db"
+@@ -84,6 +84,7 @@ def test_untracked_reader_close_while_native_open_waits_for_registry(tmp_path, m
+     entered = threading.Event()
+     release = threading.Event()
+     ready = threading.Event()
++    closing = threading.Event()
+     original = sqlite_safe_read.connect_tracked
+ 
+     def observed(*args, **kwargs):
+@@ -96,6 +97,7 @@ def test_untracked_reader_close_while_native_open_waits_for_registry(tmp_path, m
+         conn = open_ro(path)
+         ready.set()
+         assert release.wait(10)
++        closing.set()
+         conn.close()
+ 
+     def native():
+@@ -112,10 +114,13 @@ def test_untracked_reader_close_while_native_open_waits_for_registry(tmp_path, m
+             with sqlite_safe_read._live_lock:
+                 opening = pool.submit(native)
+                 assert entered.wait(10)
+-                # Synchronize on the tracking-open boundary, not a sleep.
++                # Readers now register their fd lifetime too: real close and
++                # unregister must serialize under this mutex, not escape it.
+                 release.set()
+-                reading.result(timeout=3)
++                assert closing.wait(3)
++                assert not reading.done()
+                 assert not opening.done()
++            reading.result(timeout=3)
+         finally:
+             release.set()
+         opening.result(timeout=5)
+-- 
+2.43.0
+

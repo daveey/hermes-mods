@@ -1,0 +1,503 @@
+From 962d63128a209631c9c1221d24084db550ea05a6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 08:34:45 +0000
+Subject: [PATCH] fix(kanban): dead-watcher alert review fixes - running loop,
+ incident key, backoff, hub host [daveey]
+
+Review of #3751 at 8c1dc18f49bc (REQUEST_CHANGES):
+- No card while a sync loop runs now: this process's kanban_sync_claims._STATE.loop
+  (dispatcher and watcher share the gateway process), else a live .sync.lock holder.
+  A respawned loop keeps the old crash record until its first round completes.
+- Incident = the alert's own first_seen_dead (the first crash record's since), kept
+  across crash/respawn cycles whatever the crash text; a cleared record ends it.
+- A failed tasks/create-task/comment call records last_attempt/last_error and waits
+  10 min. _updating() moved after the cheap record read.
+- The hub gateway never files through the courier (its card would wait on its own
+  sync-gated board): one ERROR per incident plus hub_incident in the state file.
+  Known gap: the hub's own dead sync needs a non-Kanban route.
+- Host label is ident.gateway, as the SchemaAhead alarm uses.
+- 5-minute test asserts the exact tasks/create-task argv and that
+  kanban_db.create_task (the local outbox path) is not called.
+
+Tests: test_kanban_sync_watcher_alert 15 passed; mutation (running-loop guard and
+backoff disabled) fails 4 of them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_sync_watcher_alert.py       | 131 +++++++++---
+ .../test_kanban_sync_watcher_alert.py         | 192 +++++++++++++++---
+ 2 files changed, 264 insertions(+), 59 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_watcher_alert.py b/hermes_cli/kanban_sync_watcher_alert.py
+index 9b5688ea17..f9f98c7164 100644
+--- a/hermes_cli/kanban_sync_watcher_alert.py
++++ b/hermes_cli/kanban_sync_watcher_alert.py
+@@ -6,14 +6,20 @@ because sync was the thing that died. SchemaAhead already files through the ``he
+ watcher crash did not.
+ 
+ :func:`check` runs on the dispatcher tick (outside the dead loop). A ``.sync-state.json`` crash record
+-(``kanban sync loop crashed:``) older than :data:`DOWN_S` opens one hub card; while that card is open a
+-later crash comments. Graceful ``STOPPED`` and SchemaAhead give-ups are other alarms. Never raises.
++(``kanban sync loop crashed:``) with no sync loop running now opens one hub card once the incident is
++:data:`DOWN_S` old; while that card is open a later incident comments. Graceful ``STOPPED`` and SchemaAhead
++give-ups are other alarms. Never raises.
++
++The incident is this module's own ``first_seen_dead`` (the first crash record's ``since``), not the crash
++text: a supervisor respawn that crashes again with another message is the same incident. A completed round
++(the record cleared) ends it. A failed courier call backs off :data:`RETRY_S`. The hub gateway never files
++through the courier: its card would wait on the hub's own sync-gated board, so it logs one ERROR per
++incident and records it in the state file instead.
+ """
+ from __future__ import annotations
+ 
+ import json
+ import logging
+-import socket
+ import time
+ from pathlib import Path
+ from typing import Any, Callable, Optional
+@@ -23,10 +29,18 @@ log = logging.getLogger(__name__)
+ HUB = "hub"
+ KEY_PREFIX = "kanban-sync-watcher-dead"
+ DOWN_S = 300.0
++RETRY_S = 600.0
+ CRASH_PREFIX = "kanban sync loop crashed:"
+ _FILE = ".sync-watcher-alert.json"
+ _CLOSED = ("done", "archived", "failed", "cancelled")
+ _FRESH_S = 6 * 3600
++# Per-incident fields, dropped once a completed round clears the crash record. The card ids stay so a
++# quick next incident comments on a still-open card.
++_INCIDENT = ("first_seen_dead", "last_attempt", "last_error", "hub_incident")
++
++
++class CourierFailed(RuntimeError):
++    """A ``hermes-hub tasks``/``create-task``/comment call failed; the next try waits :data:`RETRY_S`."""
+ 
+ 
+ def _state_path() -> Path:
+@@ -76,13 +90,13 @@ def _body(host: str, why: str, since: float, info: dict) -> str:
+ 
+ 
+ def _replica_rows(hub_cli: str, runner) -> list[dict]:
+-    rc, out, _err = runner([hub_cli, "tasks", "--gw", HUB, "--json", "--all"])
++    rc, out, err = runner([hub_cli, "tasks", "--gw", HUB, "--json", "--all"])
+     if rc != 0:
+-        return []
++        raise CourierFailed(f"tasks exit {rc}: {(err or out or '')[-300:]}")
+     try:
+         rows = json.loads(out or "[]")
+-    except ValueError:
+-        return []
++    except ValueError as exc:
++        raise CourierFailed(f"tasks returned non-JSON: {exc}") from exc
+     return [r for r in rows if isinstance(r, dict)]
+ 
+ 
+@@ -111,15 +125,31 @@ def _open_card(host: str, state: dict, hub_cli: str, runner, now: float) -> Opti
+ 
+ def report(host: str, why: str, since: float, *, runner: Optional[Callable[[list[str]], tuple[int, str, str]]] = None,
+            hub_cli: Optional[str] = None, info: Optional[dict] = None, now: Optional[float] = None) -> Optional[str]:
+-    """Open (or comment) this host's dead-watcher card on the hub. Never raises."""
++    """Open (or comment) this host's dead-watcher card on the hub. Never raises; a failure is recorded
++    (``last_attempt``/``last_error``) so :func:`check` waits :data:`RETRY_S` before the next try."""
++    wall = time.time() if now is None else now
+     try:
+-        return _report(host, why, since, runner, hub_cli, info, time.time() if now is None else now)
+-    except Exception:  # health: allow BLE001 -- an alert must never break the dispatcher tick
+-        log.warning("kanban sync: could not open the dead-watcher card on the hub", exc_info=True)
++        return _report(host, why, since, runner, hub_cli, info, wall)
++    except Exception as exc:  # health: allow BLE001 -- an alert must never break the dispatcher tick
++        log.warning("kanban sync: could not open the dead-watcher card on the hub: %s", exc,
++                    exc_info=not isinstance(exc, CourierFailed))
++        _write_state({**_read_state(), "last_attempt": wall, "last_error": str(exc)[:500]})
+         return None
+ 
+ 
+ def _report(host, why, since, runner, hub_cli, info, now) -> Optional[str]:
++    key = incident_key(host, since)
++    state = _read_state()
++    if state.get("key") == key:
++        return None
++    if host == HUB:
++        # The hub's card would sit on its own sync-gated board, which is the thing that is dead. Known gap:
++        # the hub's dead sync needs a non-Kanban route.
++        _write_state({**state, "key": key, "hub_incident": {"since": since, "why": why, "seen_at": now}})
++        log.error("kanban sync: the hub's own sync watcher has been down since %s (%s); no hub card filed "
++                  "(it would wait on this dead sync), recover the hub gateway by hand",
++                  time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(since)), why)
++        return None
+     from hermes_cli import kanban_capability_registry as reg
+     from hermes_cli import kanban_placement as kp
+     from hermes_cli.kanban_sync_schema_alert import cores
+@@ -130,11 +160,9 @@ def _report(host, why, since, runner, hub_cli, info, now) -> Optional[str]:
+             log.warning("kanban sync: dead-watcher hub card not filed from a test process")
+             return None
+     hub_cli = hub_cli or reg.hub_cli_path(kp.config().get("hub_cli"))
+-    key = incident_key(host, since)
+-    state = _read_state()
+-    if state.get("key") == key:
+-        return None
+     info = info if info is not None else cores()
++    state = {**state, "last_attempt": now}
++    state.pop("last_error", None)
+     open_tid = _open_card(host, state, hub_cli, runner, now)
+     if open_tid:
+         rid = f"{key}:comment"
+@@ -144,9 +172,7 @@ def _report(host, why, since, runner, hub_cli, info, now) -> Optional[str]:
+                 f"text={text[:7900]}", "--id", rid]
+         rc, out, err = runner(argv)
+         if rc not in (0, 3):
+-            log.warning("kanban sync: could not comment the dead-watcher card %s on the hub (exit %s): %s",
+-                        open_tid, rc, (err or out)[-300:])
+-            return None
++            raise CourierFailed(f"comment on {open_tid} exit {rc}: {(err or out or '')[-300:]}")
+         _write_state({**state, "key": key, "task_id": open_tid, "commented_at": now})
+         log.error("kanban sync: watcher still down; commented hub card %s (%s)", open_tid, rid)
+         return rid
+@@ -157,10 +183,8 @@ def _report(host, why, since, runner, hub_cli, info, now) -> Optional[str]:
+             "--option", "priority=900"]
+     rc, out, err = runner(argv)
+     if rc not in (0, 3):
+-        log.warning("kanban sync: could not open the dead-watcher card on the hub (exit %s): %s",
+-                    rc, (err or out)[-300:])
+-        return None
+-    _write_state({"key": key, "request_id": rid, "task_id": None, "filed_at": now})
++        raise CourierFailed(f"create-task exit {rc}: {(err or out or '')[-300:]}")
++    _write_state({**state, "key": key, "request_id": rid, "task_id": None, "filed_at": now})
+     log.error("kanban sync: opened a hub card for a dead sync watcher (request %s)", rid)
+     return rid
+ 
+@@ -176,20 +200,65 @@ def check(*, now: Optional[float] = None, runner: Optional[Callable[[list[str]],
+         return None
+ 
+ 
++def loop_running() -> bool:
++    """A sync loop runs now: this process's (the dispatcher and the sync watcher share the gateway process),
++    or another live process holds the host ``.sync.lock``. A crashed loop releases that lock."""
++    from hermes_cli import kanban_sync_claims as claims
++    with claims._STATE.lock:
++        if claims._STATE.loop:
++            return True
++    try:
++        from gateway.kanban_singleton import holder_info
++        from hermes_cli import kanban_db as kb
++        return holder_info(kb.kanban_home() / "kanban" / ".sync.lock") is not None
++    except Exception:  # health: allow BLE001 -- an unreadable lock table is "no other loop known"
++        return False
++
++
++def _gateway() -> str:
++    """This gateway's Board name (``ident.gateway``), as the SchemaAhead alarm labels its cards."""
++    from hermes_cli import kanban_sync_client as ksc
++    gateway = ksc.load_identity().gateway
++    if not gateway:
++        raise ValueError("kanban.sync.gateway is not set")
++    return gateway
++
++
+ def _check(now, runner, hub_cli, host, info) -> Optional[str]:
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_sync_runstate as runstate
+-    from hermes_cli.kanban_sync_schema_alert import _updating
+-    if not sync.sync_enabled() or _updating():
++    if not sync.sync_enabled():
+         return None
+-    record = runstate._read(runstate.path()) or {}
+-    if record.get("running") is not False:
++    wall = time.time() if now is None else now
++    record = runstate._read(runstate.path())
++    state = _read_state()
++    if record is None:  # a completed round cleared the record: any incident is over
++        if any(k in state for k in _INCIDENT):
++            _write_state({k: v for k, v in state.items() if k not in _INCIDENT})
+         return None
+     why = str(record.get("reason") or "")
+-    if not why.startswith(CRASH_PREFIX):
++    if record.get("running") is not False or not why.startswith(CRASH_PREFIX):
+         return None
+-    since = float(record.get("since") or 0)
+-    wall = time.time() if now is None else now
+-    if since <= 0 or wall - since < DOWN_S:
++    if loop_running():  # a respawned loop whose first round has not completed yet
++        return None
++    first = state.get("first_seen_dead")
++    if not isinstance(first, (int, float)) or first <= 0:
++        since = float(record.get("since") or 0)
++        first = since if 0 < since <= wall else wall
++        state = {**state, "first_seen_dead": first}
++        _write_state(state)
++    if wall - first < DOWN_S:
++        return None
++    from hermes_cli.kanban_sync_schema_alert import _updating
++    if _updating():
+         return None
+-    return report(host or socket.gethostname(), why, since, runner=runner, hub_cli=hub_cli, info=info, now=wall)
++    if state.get("last_error") and wall - float(state.get("last_attempt") or 0) < RETRY_S:
++        return None
++    if host is None:
++        try:
++            host = _gateway()
++        except Exception as exc:  # health: allow BLE001 -- recorded below; retried after the backoff
++            log.warning("kanban sync: dead-watcher alert has no gateway identity: %s", exc)
++            _write_state({**state, "last_attempt": wall, "last_error": f"no gateway identity: {exc}"[:500]})
++            return None
++    return report(host, why, first, runner=runner, hub_cli=hub_cli, info=info, now=wall)
+diff --git a/tests/hermes_cli/test_kanban_sync_watcher_alert.py b/tests/hermes_cli/test_kanban_sync_watcher_alert.py
+index d520649386..056268482e 100644
+--- a/tests/hermes_cli/test_kanban_sync_watcher_alert.py
++++ b/tests/hermes_cli/test_kanban_sync_watcher_alert.py
+@@ -6,9 +6,12 @@ gave up at 04:43:21. replica-stale filed locally at 05:02 via the outbox, which
+ from __future__ import annotations
+ 
+ import json
++import logging
++from types import SimpleNamespace
+ 
+ import pytest
+ 
++from hermes_cli import kanban_sync_claims as claims
+ from hermes_cli import kanban_sync_runstate as runstate
+ from hermes_cli import kanban_sync_watcher_alert as alert
+ from tests.hermes_cli import kanban_sync_support as support
+@@ -21,59 +24,134 @@ def home(tmp_path, monkeypatch):
+         monkeypatch.delenv(var, raising=False)
+     h = support.kanban_home(tmp_path, monkeypatch)
+     support.write_sync_config(h, True)
++    claims.reset()
+     yield h
++    claims.reset()
+ 
+ 
+ CRASH = "kanban sync loop crashed: ContainmentRefused: canonical receipt identity changed"
++CRASH_2 = "kanban sync loop crashed: RuntimeError: feed socket closed"
+ SINCE = 1_000.0
++KEY = "kanban-sync-watcher-dead:worker-1:1000"
+ INFO = {"installed": "/opt/hermes", "installed_sha": "0362a20c0e", "newest_sha": None, "origin_main_sha": "a99783a19e"}
+ 
+ 
+-def _crash(*, since=SINCE):
++def _crash(*, since=SINCE, why=CRASH):
+     runstate.path().parent.mkdir(parents=True, exist_ok=True)
+-    runstate.path().write_text(json.dumps({"running": False, "since": since, "reason": CRASH, "pid": 1}))
++    runstate.path().write_text(json.dumps({"running": False, "since": since, "reason": why, "pid": 1}))
++
++
++def _round_completed():
++    runstate.clear()
++
++
++def _check(hub, now, host="worker-1"):
++    return alert.check(now=now, runner=hub, hub_cli="hermes-hub", host=host, info=INFO)
++
++
++class FailingHubCli(FakeHubCli):
++    def __init__(self, verb: str) -> None:
++        super().__init__()
++        self.verb = verb
++
++    def __call__(self, argv):
++        if argv[1] == self.verb:
++            self.calls.append(argv)
++            return 1, "", "hub unreachable"
++        return super().__call__(argv)
+ 
+ 
+ def test_crash_under_five_minutes_does_not_file(home):
+     _crash()
+     hub = FakeHubCli()
+-    assert alert.check(now=SINCE + 299, runner=hub, hub_cli="hermes-hub", host="worker-1", info=INFO) is None
+-    assert hub.sent("create-task") == []
++    assert _check(hub, SINCE + 299) is None
++    assert hub.calls == []
+ 
+ 
+-def test_crash_at_five_minutes_opens_one_hub_card(home):
++def test_crash_at_five_minutes_opens_one_hub_card_through_the_courier_only(home, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    local = []
++    monkeypatch.setattr(kb, "create_task", lambda *a, **k: local.append((a, k)) or "t_local")
+     _crash()
+     hub = FakeHubCli()
+-    rid = alert.check(now=SINCE + 300, runner=hub, hub_cli="hermes-hub", host="worker-1", info=INFO)
+-    creates = hub.sent("create-task")
+-    assert rid == "kanban-sync-watcher-dead:worker-1:1000" and len(creates) == 1
+-    argv = creates[0]
+-    assert argv[2] == "hub" and "worker-1" in argv[3]
+-    body = argv[argv.index("--body") + 1]
+-    assert "ContainmentRefused" in body and "0362a20c0e" in body
+-    assert "hermes-hub" in argv[0] or argv[0] == "hermes-hub"
+-    assert 'idempotency_key="kanban-sync-watcher-dead:worker-1:1000"' in argv
+-    # Does not use the local default-board outbox path.
+-    assert "create-task" in argv[1]
++    rid = _check(hub, SINCE + 300)
++    assert rid == KEY
++    tasks, create = hub.calls
++    assert tasks == ["hermes-hub", "tasks", "--gw", "hub", "--json", "--all"]
++    body = create[5]
++    assert create == ["hermes-hub", "create-task", "hub", "Kanban sync watcher dead on worker-1 for 5+ min",
++                      "--body", body, "--assignee", "default", "--origin-session", "", "--id", KEY,
++                      "--option", f'idempotency_key="{KEY}"', "--option", "priority=900"]
++    assert "ContainmentRefused" in body and "0362a20c0e" in body and "a99783a19e" in body
++    # The local default-board outbox path (kanban_db.create_task) is not used.
++    assert local == []
+ 
+ 
+ def test_same_crash_incident_does_not_file_again(home):
+     _crash()
+     hub = FakeHubCli()
+-    alert.check(now=SINCE + 300, runner=hub, hub_cli="hermes-hub", host="worker-1", info=INFO)
+-    assert alert.check(now=SINCE + 400, runner=hub, hub_cli="hermes-hub", host="worker-1", info=INFO) is None
++    _check(hub, SINCE + 300)
++    assert _check(hub, SINCE + 400) is None
+     assert len(hub.sent("create-task")) == 1 and not hub.sent("request")
+ 
+ 
+-def test_new_crash_while_open_comments_instead_of_a_second_card(home):
++def test_no_card_while_a_sync_loop_is_running(home):
+     _crash()
+     hub = FakeHubCli()
+-    alert.check(now=SINCE + 300, runner=hub, hub_cli="hermes-hub", host="worker-1", info=INFO)
+-    hub.open = [{"id": "t_open", "status": "ready",
+-                 "idempotency_key": "kanban-sync-watcher-dead:worker-1:1000"}]
+-    runstate.path().write_text(json.dumps(
+-        {"running": False, "since": 2_000.0, "reason": CRASH, "pid": 2}))
+-    rid = alert.check(now=2_000.0 + 300, runner=hub, hub_cli="hermes-hub", host="worker-1", info=INFO)
++    claims.loop_started()  # a respawned loop whose first round has not cleared the old crash record
++    assert _check(hub, SINCE + 900) is None
++    assert hub.calls == [] and "first_seen_dead" not in alert._read_state()
++    claims.loop_stopped()
++    assert _check(hub, SINCE + 900) == KEY
++
++
++def test_no_card_while_another_process_holds_the_sync_lock(home, monkeypatch):
++    from gateway import kanban_singleton
++    _crash()
++    hub = FakeHubCli()
++    monkeypatch.setattr(kanban_singleton, "holder_info", lambda _path: {"pid": 4242})
++    assert _check(hub, SINCE + 900) is None
++    assert hub.calls == []
++
++
++def test_crash_respawn_crash_with_new_text_is_one_incident(home):
++    hub = FakeHubCli()
++    _crash()
++    assert _check(hub, SINCE + 10) is None  # first seen dead: the crash record's since
++    claims.loop_started()  # supervisor respawn
++    assert _check(hub, SINCE + 100) is None
++    claims.loop_stopped()
++    _crash(since=SINCE + 150, why=CRASH_2)  # a different crash text resets runstate's since
++    assert _check(hub, SINCE + 300) == KEY  # aged from the first crash, not from SINCE + 150
++    claims.loop_started()
++    claims.loop_stopped()
++    _crash(since=SINCE + 400, why=CRASH)
++    assert _check(hub, SINCE + 1_000) is None
++    assert len(hub.sent("create-task")) == 1 and not hub.sent("request")
++
++
++def test_a_cleared_record_ends_the_incident_and_a_new_crash_is_a_new_one(home):
++    hub = FakeHubCli()
++    _crash()
++    assert _check(hub, SINCE + 300) == KEY
++    _round_completed()
++    assert _check(hub, SINCE + 400) is None
++    assert "first_seen_dead" not in alert._read_state()
++    _crash(since=5_000.0, why=CRASH_2)
++    assert _check(hub, 5_000.0 + 299) is None
++    assert _check(hub, 5_000.0 + 300) == "kanban-sync-watcher-dead:worker-1:5000"
++    assert len(hub.sent("create-task")) == 2
++
++
++def test_new_incident_while_the_card_is_open_comments_instead_of_a_second_card(home):
++    _crash()
++    hub = FakeHubCli()
++    _check(hub, SINCE + 300)
++    hub.open = [{"id": "t_open", "status": "ready", "idempotency_key": KEY}]
++    _round_completed()
++    _check(hub, 1_900.0)
++    _crash(since=2_000.0)
++    rid = _check(hub, 2_000.0 + 300)
+     assert rid == "kanban-sync-watcher-dead:worker-1:2000:comment"
+     assert len(hub.sent("create-task")) == 1
+     (comment,) = hub.sent("request")
+@@ -81,17 +159,75 @@ def test_new_crash_while_open_comments_instead_of_a_second_card(home):
+     assert "ContainmentRefused" in comment[comment.index("--arg") + 1]
+ 
+ 
++@pytest.mark.parametrize("verb", ["tasks", "create-task"])
++def test_a_failing_courier_is_retried_once_per_ten_minutes_not_every_tick(home, verb):
++    _crash()
++    hub = FailingHubCli(verb)
++    assert _check(hub, SINCE + 300) is None
++    assert len(hub.sent(verb)) == 1
++    state = alert._read_state()
++    assert state["last_attempt"] == SINCE + 300 and "exit 1" in state["last_error"]
++    for tick in range(301, 900, 7):  # dispatcher ticks inside the backoff
++        assert _check(hub, SINCE + tick) is None
++    assert len(hub.sent(verb)) == 1
++    assert _check(hub, SINCE + 900) is None  # backoff over: one more try
++    assert len(hub.sent(verb)) == 2
++    hub.verb = "none"  # the hub is back
++    assert _check(hub, SINCE + 1_499) is None
++    assert _check(hub, SINCE + 1_500) == KEY
++    assert "last_error" not in alert._read_state()
++
++
++def test_update_check_runs_only_after_a_crash_record_is_due(home, monkeypatch):
++    from hermes_cli import kanban_sync_schema_alert as schema_alert
++    calls = []
++    monkeypatch.setattr(schema_alert, "_updating", lambda: calls.append(True) or True)
++    hub = FakeHubCli()
++    assert _check(hub, SINCE + 900) is None  # no record: no update probe
++    _crash()
++    assert _check(hub, SINCE + 100) is None  # not yet due
++    assert calls == []
++    assert _check(hub, SINCE + 900) is None  # due, but an update is in flight
++    assert calls == [True] and hub.calls == []
++
++
++def test_the_hub_gateway_never_files_through_the_courier(home, caplog):
++    _crash()
++    hub = FakeHubCli()
++    with caplog.at_level(logging.ERROR, logger=alert.log.name):
++        assert _check(hub, SINCE + 300, host="hub") is None
++        assert _check(hub, SINCE + 900, host="hub") is None
++        assert alert.report("hub", CRASH, SINCE, runner=hub, hub_cli="hermes-hub", info=INFO, now=SINCE + 950) is None
++    assert hub.calls == []
++    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
++    assert len(errors) == 1 and "ContainmentRefused" in errors[0].getMessage()
++    state = alert._read_state()
++    assert state["key"] == "kanban-sync-watcher-dead:hub:1000"
++    assert state["hub_incident"]["why"] == CRASH
++
++
++def test_the_host_label_is_the_gateway_identity(home, monkeypatch):
++    from hermes_cli import kanban_sync_client as ksc
++    monkeypatch.setattr(ksc, "load_identity", lambda *a, **k: SimpleNamespace(gateway="worker-7"))
++    _crash()
++    hub = FakeHubCli()
++    assert alert.check(now=SINCE + 300, runner=hub, hub_cli="hermes-hub", info=INFO) == \
++        "kanban-sync-watcher-dead:worker-7:1000"
++    (create,) = hub.sent("create-task")
++    assert create[3] == "Kanban sync watcher dead on worker-7 for 5+ min"
++
++
+ def test_graceful_stop_and_schema_ahead_are_not_this_alarm(home):
+     hub = FakeHubCli()
+     runstate.path().parent.mkdir(parents=True, exist_ok=True)
+     runstate.path().write_text(json.dumps(
+         {"running": False, "since": SINCE, "reason": runstate.STOPPED, "pid": 1}))
+-    assert alert.check(now=SINCE + 900, runner=hub, hub_cli="hermes-hub", host="worker-1", info=INFO) is None
++    assert _check(hub, SINCE + 900) is None
+     runstate.path().write_text(json.dumps(
+         {"running": False, "since": SINCE,
+          "reason": "gave up the sync role: board default: SchemaAhead: x", "pid": 1}))
+-    assert alert.check(now=SINCE + 900, runner=hub, hub_cli="hermes-hub", host="worker-1", info=INFO) is None
+-    assert hub.sent("create-task") == []
++    assert _check(hub, SINCE + 900) is None
++    assert hub.calls == []
+ 
+ 
+ def test_dispatcher_tick_runs_the_dead_watcher_check(home, monkeypatch):
+-- 
+2.43.0
+

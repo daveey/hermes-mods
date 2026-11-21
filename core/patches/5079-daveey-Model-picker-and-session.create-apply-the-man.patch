@@ -1,0 +1,533 @@
+From 80638566686a185dc2abdd15863bd31466412b9b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 00:07:10 +0000
+Subject: [PATCH] [daveey] Model picker and session.create apply the managed
+ pin policy
+
+On an example gateway (model_routing.enforce_subscription_only) the Desktop composer offered
+gemini-4-argon; session.create stored the pin and the first turn died at agent build, leaving a
+chat that can never answer.
+
+- hermes_cli/model_options_managed.py (new): managed_pin_refusal() asks the pin_policy the agent
+  build uses whether it would run a (model, provider) pin; drop_refused_managed_pins() narrows
+  model.options rows (models, featured_models, unavailable_models, subscription_overlap_models;
+  total_models recounted). Hosts without the policy, or with an unreadable one, are unchanged;
+  class selectors pass; "" and "custom" rows are refused only when no route registers the model.
+- model.options filters after the memo and reads the policy on every call (the memo deep-copies
+  on store and hit), and model.save_key's refreshed row (#129260) is narrowed the same way, so
+  the picker offers only pins the policy runs.
+- session.create refuses a policy-refused pin with -32602 before any session exists, ahead of
+  the #96817 catalog-coherence check, judging the pin the way create_overrides stores it. The
+  message fits the Desktop toast (summarizeErrorMessage falls back above 180 chars); error data
+  carries model, provider and the allowed pins.
+
+Problem: an observed incident on an example gateway, gui.log:<line> `session.create
+  20000101_000000_00000a: model=gemini-4-argon provider=gemini source=client override`;
+  gui.log:<line> `agent build failed ... ManagedPinRejectedError: Managed subscription policy
+  rejects unregistered or ambiguous concrete pin 'gemini-4-argon' on provider 'gemini'`; the
+  first prompt.submit failed (gui.log:<line>, errors.log:<line>). state.db keeps that session at
+  2 messages, pinned to the refused model.
+Why 1: The agent build refused the pin: the hub policy runs subscription routes only, gemini is
+  not a subscription provider (agent/model_routing.py:13, :38) and no route registers it.
+Why 2: The chat existed with that pin because session.create checked catalog coherence only
+  (methods_session_model_guard.model_override_conflict -> static_model_provider_conflict,
+  #96817); it never asked pin_policy.
+Why 3: The pin was offered because model.options lists every authenticated provider's catalog
+  with no policy filter: on the example gateway the offered catalog exceeded the policy allowlist (gemini refused,
+  nous refused, openrouter refused; subscription providers partly allowed).
+Why 4: The policy was enforced where a pin is used (agent build, and /model since 2e57d4ceef2b)
+  but not where a pin is offered or stored; there was no shared "would the policy run this pin?"
+  check for model.options and session.create to call.
+Root (happened): pin admission lived only at the consumers, so the surfaces that offer
+  (model.options, model.save_key) and store (session.create) a pin disagreed with the agent build.
+Root (not caught): the model.options and session.create suites (test_model_options_memo.py,
+  test_session_create_model_provider_guard.py) run with the policy off; no test composed an
+  enforced policy with the picker or session.create.
+Recurrence: third occurrence of this class: t_eeeeee0000000009, then t_eeeeee000000000d, fixed
+  by 2e57d4ceef2b (/model refuses a rejected pin). That fix guarded switch_model only; a new
+  chat's composer pin reaches session.create as a client override and never calls switch_model,
+  so the gap stayed open. This change puts the check in one helper that all three surfaces share.
+Countermeasures:
+- symptom: session.create refuses before any session state - proof:
+  tests/tui_gateway/test_session_create_managed_pin_guard.py (10 tests; with the guard as on
+  main 4 fail; the message-length assertion failed at 361 chars before the message change).
+- root: one shared helper for model.options, model.save_key and session.create - proof:
+  tests/hermes_cli/test_model_options_managed_pins.py (7 tests; each mutation fails: no
+  model.options filter 2, no save_key narrowing 1, overlap list left unfiltered 3, no
+  non-dict row guard 1, memo hit returning the unfiltered cache 1).
+- detection: both suites drive the picker, save_key and session.create under an enforced-policy
+  fixture, so a regression on any of the three paths fails there. Affected suite (80 files):
+  1646 passed; scripts/check --base origin/main: ok.
+- deferred: none.
+---
+ hermes_cli/inventory.py                       |  14 ++
+ hermes_cli/model_options_managed.py           |  78 ++++++++++
+ .../test_model_options_managed_pins.py        | 133 ++++++++++++++++++
+ .../test_session_create_managed_pin_guard.py  | 127 +++++++++++++++++
+ tui_gateway/methods_complete.py               |   4 +-
+ tui_gateway/methods_session.py                |   4 +-
+ tui_gateway/methods_session_model_guard.py    |  26 +++-
+ 7 files changed, 376 insertions(+), 10 deletions(-)
+ create mode 100644 hermes_cli/model_options_managed.py
+ create mode 100644 tests/hermes_cli/test_model_options_managed_pins.py
+ create mode 100644 tests/tui_gateway/test_session_create_managed_pin_guard.py
+
+diff --git a/hermes_cli/inventory.py b/hermes_cli/inventory.py
+index e7e12cb34e..24030b3fd0 100644
+--- a/hermes_cli/inventory.py
++++ b/hermes_cli/inventory.py
+@@ -396,6 +396,20 @@ def _memo_stamp() -> Optional[tuple]:
+ def build_model_options_payload(
+     ctx: ConfigContext, *, explicit_only: bool = False, include_unconfigured: bool = False,
+     refresh: bool = False,
++) -> dict:
++    """The memoized payload, narrowed on every open to the pins this host's managed subscription policy
++    runs: the policy is read fresh, so no memo entry outlives a policy edit (``model_options_managed``)."""
++    from hermes_cli.model_options_managed import drop_refused_managed_pins
++
++    payload = _memoized_model_options_payload(
++        ctx, explicit_only=explicit_only, include_unconfigured=include_unconfigured, refresh=refresh)
++    drop_refused_managed_pins(payload.get("providers") or [])
++    return payload
++
++
++def _memoized_model_options_payload(
++    ctx: ConfigContext, *, explicit_only: bool = False, include_unconfigured: bool = False,
++    refresh: bool = False,
+ ) -> dict:
+     """``_build_model_options_payload_uncached`` behind the whole-payload memo (see ``_STAMP_PARTS``)."""
+     explicit_only, include_unconfigured, refresh = bool(explicit_only), bool(include_unconfigured), bool(refresh)
+diff --git a/hermes_cli/model_options_managed.py b/hermes_cli/model_options_managed.py
+new file mode 100644
+index 0000000000..f151e2035d
+--- /dev/null
++++ b/hermes_cli/model_options_managed.py
+@@ -0,0 +1,78 @@
++"""Which concrete pins this host's managed subscription policy lets a turn run. [daveey]
++
++With ``model_routing.enforce_subscription_only`` every turn resolves its concrete model through
++``agent.model_routing_managed.pin_policy``: a pin no eligible subscription route registers on its
++provider is refused before the agent starts, and no fallback rescues it. ``session.create`` accepted
++any pin and the picker (``model.options``) listed every authenticated catalog (201 ids on the hub, 9 of
++them runnable), so a pick like ``gemini-4-argon`` minted a chat whose every turn failed. Both now ask
++this module, so the picker offers exactly what ``session.create`` accepts.
++"""
++from __future__ import annotations
++
++import logging
++
++logger = logging.getLogger(__name__)
++
++# The agent build re-derives these providers (``empty_provider_identity`` / ``canonical_custom_identity``
++# in ``tui_gateway.agent_factory``), so for them only "no route names this model" is certain.
++_REDERIVED_PROVIDERS = frozenset({"", "custom"})
++# Every per-row list naming model ids; ``total_models`` counts ``models`` (as the aggregator strip does).
++_ID_LISTS = ("models", "featured_models", "unavailable_models", "subscription_overlap_models")
++
++
++def _policy(config=None):
++    """The validated managed config; ``None`` when the policy is off or unreadable (every turn reports that)."""
++    from agent.model_routing import ModelRoutingError
++    from agent.model_routing_managed import managed_config
++
++    try:
++        return managed_config(config)
++    except ModelRoutingError as exc:
++        logger.warning("model_routing policy unreadable, pins left to the turn: %s", exc)
++        return None
++
++
++def _refusal(model, provider, policy, allowed):
++    from agent.model_routing import is_class_selector
++    from agent.model_routing_managed import ManagedPinRejectedError, pin_policy
++
++    if is_class_selector(model):
++        return None  # routed by class, never pinned
++    if model not in allowed:  # no route names it, on any provider
++        return ManagedPinRejectedError(model, provider, allowed)
++    if str(provider or "").strip().lower() in _REDERIVED_PROVIDERS:
++        return None
++    try:
++        pin_policy(model, provider, policy)
++    except ManagedPinRejectedError as exc:
++        return exc
++    return None
++
++
++def managed_pin_refusal(model, provider, config=None):
++    """The ``ManagedPinRejectedError`` a turn would raise for ``model`` on ``provider``, else ``None``."""
++    from agent.model_routing_managed import allowed_pins
++
++    policy = _policy(config)
++    return None if policy is None else _refusal(model, provider, policy, allowed_pins(policy))
++
++
++def drop_refused_managed_pins(rows, config=None) -> None:
++    """Remove, in place, every model id a turn would refuse on its row's provider (``slug``)."""
++    from agent.model_routing_managed import allowed_pins
++
++    if (policy := _policy(config)) is None:
++        return
++    allowed = allowed_pins(policy)
++    for row in rows:
++        if not isinstance(row, dict):  # shapes as ``drop_unofferable_model_ids``: a crash here blanks the picker
++            continue
++        lists = {key: row[key] for key in _ID_LISTS if isinstance(row.get(key), list)}
++        ids = {model for models in lists.values() for model in models if isinstance(model, str)}
++        refused = {model for model in ids if _refusal(model, row.get("slug"), policy, allowed) is not None}
++        if not refused:
++            continue
++        for key, models in lists.items():  # a featured list naming only dropped ids would hide the row's defaults
++            row[key] = [model for model in models if not (isinstance(model, str) and model in refused)]
++        if "models" in lists and len(row["models"]) != len(lists["models"]):
++            row["total_models"] = len(row["models"])
+diff --git a/tests/hermes_cli/test_model_options_managed_pins.py b/tests/hermes_cli/test_model_options_managed_pins.py
+new file mode 100644
+index 0000000000..105a8968b9
+--- /dev/null
++++ b/tests/hermes_cli/test_model_options_managed_pins.py
+@@ -0,0 +1,133 @@
++"""``model.options`` offers only pins this host's managed subscription policy can run. [daveey]
++
++On a host with ``model_routing.enforce_subscription_only`` the Desktop picker listed every
++authenticated catalog (201 ids on the hub, 9 of them runnable), so choosing ``gemini-4-argon``
++started a chat whose every turn the policy refused. Rows now drop the ids ``pin_policy`` refuses on
++their provider; class selectors and hosts without the policy are unchanged.
++"""
++
++import copy
++import types
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import inventory
++from hermes_cli.config import atomic_config_write
++from tests.agent.test_model_routing import policy
++
++ROWS = [
++    {"slug": "anthropic", "models": ["anthropic-deep", "claude-unregistered", "class:deep"], "total_models": 3,
++     "featured_models": ["claude-unregistered", "anthropic-deep"], "is_current": True},
++    # a registered id is refused on a provider whose route does not serve it
++    {"slug": "openai-codex", "models": ["openai-codex-fast", "anthropic-deep"], "total_models": 40},
++    {"slug": "gemini", "models": ["gemini-4-argon"], "total_models": 20, "unavailable_models": ["gemini-4-argon"]},
++    # the metered API row also names the ids it shares with the subscription row
++    {"slug": "openai", "billing": "metered", "models": ["openai-codex-fast"], "total_models": 1,
++     "subscription_overlap_models": ["openai-codex-fast"]},
++]
++OFFERED = [
++    {"slug": "anthropic", "models": ["anthropic-deep", "class:deep"], "total_models": 2,
++     "featured_models": ["anthropic-deep"], "is_current": True},
++    {"slug": "openai-codex", "models": ["openai-codex-fast"], "total_models": 1},
++    {"slug": "gemini", "models": [], "total_models": 0, "unavailable_models": []},
++    {"slug": "openai", "billing": "metered", "models": [], "total_models": 0, "subscription_overlap_models": []},
++]
++
++
++def _config(enforced=True):
++    cfg = policy()
++    cfg["model"] = {"default": "anthropic-deep", "provider": "anthropic"}
++    cfg["model_routing"]["enforce_subscription_only"] = enforced
++    return cfg
++
++
++def _ctx():
++    return inventory.ConfigContext(current_provider="anthropic", current_model="anthropic-deep",
++                                   current_base_url="", user_providers={}, custom_providers=[])
++
++
++@pytest.mark.parametrize("enforced, expected", [(True, OFFERED), (False, ROWS)])
++def test_rows_keep_only_runnable_pins(enforced, expected):
++    from hermes_cli.model_options_managed import drop_refused_managed_pins
++
++    rows = copy.deepcopy(ROWS)
++    drop_refused_managed_pins(rows, _config(enforced))
++    assert rows == expected
++
++
++def test_a_broken_policy_leaves_the_picker_to_the_turn_s_error(caplog):
++    from hermes_cli.model_options_managed import drop_refused_managed_pins
++
++    cfg = _config()
++    cfg["model_routing"]["routes"]["deep"][0]["billing"] = "bogus"
++    rows = copy.deepcopy(ROWS)
++    drop_refused_managed_pins(rows, cfg)
++    assert rows == ROWS
++    assert "model_routing" in caplog.text
++
++
++def test_shapes_it_cannot_judge_pass_through():
++    """A non-row entry, a non-string id and a ``None`` list neither crash the picker nor change."""
++    from hermes_cli.model_options_managed import drop_refused_managed_pins
++
++    rows = [None, {"slug": "gemini", "models": [{"id": "gemini-4-argon"}, "gemini-4-argon"], "featured_models": None}]
++    drop_refused_managed_pins(rows, _config())
++    assert rows == [None, {"slug": "gemini", "models": [{"id": "gemini-4-argon"}], "featured_models": None,
++                           "total_models": 1}]
++
++
++@pytest.fixture
++def managed_home(monkeypatch):
++    from hermes_constants import get_hermes_home
++
++    home = get_hermes_home()
++    atomic_config_write(home / "config.yaml", _config())
++    payload = {"providers": ROWS, "model": "anthropic-deep", "provider": "anthropic"}
++    monkeypatch.setattr(inventory, "_build_model_options_payload_uncached", lambda *a, **k: copy.deepcopy(payload))
++    monkeypatch.setattr(inventory, "_MEMO_ENABLED", True)
++    inventory.reset_model_options_memo()
++    yield home
++    inventory.reset_model_options_memo()
++
++
++def test_model_options_payload_offers_only_runnable_pins_on_every_open(managed_home):
++    first = inventory.build_model_options_payload(_ctx())
++    again = inventory.build_model_options_payload(_ctx())  # a memo hit is narrowed too
++    refreshed = inventory.build_model_options_payload(_ctx(), refresh=True)
++
++    assert first["providers"] == again["providers"] == refreshed["providers"] == OFFERED
++    assert (first["model"], first["provider"]) == ("anthropic-deep", "anthropic")
++
++
++def test_a_policy_edit_reaches_a_memo_hit(managed_home, monkeypatch):
++    """The memo keeps the unnarrowed payload (narrowing a hit never narrows the cached entry), so a
++    policy edit shows on the next open without a rebuild, even when nothing in the memo stamp moved."""
++    builds = []
++    build = inventory._build_model_options_payload_uncached
++    monkeypatch.setattr(inventory, "_build_model_options_payload_uncached",
++                        lambda *a, **k: builds.append(a) or build(*a, **k))
++    monkeypatch.setattr(inventory, "_memo_stamp", lambda: (("pinned", 0),))
++
++    assert inventory.build_model_options_payload(_ctx())["providers"] == OFFERED  # miss: cached whole
++    assert inventory.build_model_options_payload(_ctx())["providers"] == OFFERED  # hit: a narrowed copy
++    atomic_config_write(managed_home / "config.yaml", _config(enforced=False))
++    assert inventory.build_model_options_payload(_ctx())["providers"] == ROWS  # hit: the entry is still whole
++    assert len(builds) == 1
++
++
++def test_save_key_refreshes_the_row_narrowed_as_the_picker(managed_home, monkeypatch):
++    """``model.save_key``'s row replaces the picker's row (#129260), so it offers what model.options does."""
++    from tui_gateway import server
++
++    monkeypatch.setattr("hermes_cli.auth.PROVIDER_REGISTRY", {"gemini": types.SimpleNamespace(
++        name="Google AI Studio", auth_type="api_key", api_key_env_vars=("TEST_GEMINI_API_KEY",))})
++    monkeypatch.setattr("hermes_cli.config.is_managed", lambda: False)
++    monkeypatch.setattr("hermes_cli.credential_lifecycle.save_provider_env_credential", Mock())
++    monkeypatch.setattr(server, "_model_picker_context", Mock())
++    monkeypatch.setattr("hermes_cli.inventory.build_models_payload",
++                        lambda *a, **k: {"providers": copy.deepcopy(ROWS)})
++
++    resp = server._methods["model.save_key"]("r1", {"slug": "gemini", "api_key": "replacement-" + "value"})
++
++    assert resp["result"]["provider"] == {**OFFERED[2], "authenticated": True}, resp
+diff --git a/tests/tui_gateway/test_session_create_managed_pin_guard.py b/tests/tui_gateway/test_session_create_managed_pin_guard.py
+new file mode 100644
+index 0000000000..29e4bdac65
+--- /dev/null
++++ b/tests/tui_gateway/test_session_create_managed_pin_guard.py
+@@ -0,0 +1,127 @@
++"""``session.create`` refuses a concrete pin this host's managed subscription policy refuses. [daveey]
++
++The Desktop composer started a chat pinned to ``gemini-4-argon`` on ``gemini`` on a host whose
++``model_routing.enforce_subscription_only`` registry runs subscription routes only. The session was
++minted, then its first turn failed "before the agent was ready" with the policy's refusal: a dead
++chat. The create gate now runs the turn's own ``pin_policy`` verdict before any state exists.
++"""
++
++import copy
++
++import pytest
++
++from agent.model_routing_managed import allowed_pins, managed_config
++from hermes_cli.config import atomic_config_write
++from tests.agent.test_model_routing import policy
++
++
++def _write_policy(home, *, enforced=True):
++    cfg = policy()
++    cfg["model"] = {"default": "anthropic-deep", "provider": "anthropic"}
++    cfg["model_routing"]["enforce_subscription_only"] = enforced
++    atomic_config_write(home / "config.yaml", cfg)
++
++
++@pytest.fixture
++def _create(monkeypatch, tmp_path):
++    monkeypatch.setattr("hermes_cli.banner.prefetch_update_check", lambda: None)
++    # The catalog-coherence half of the gate (#96817) has its own tests: this file judges the registry.
++    monkeypatch.setattr("hermes_cli.models_validate.static_model_provider_conflict", lambda *a, **k: None)
++    from tui_gateway import server
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(server, "_sessions", {})
++    monkeypatch.setattr(server, "_load_cfg", dict)
++    monkeypatch.setattr(server, "_profile_home", lambda *a: None)
++    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
++    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a: None)
++    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
++    monkeypatch.setattr(server, "_register_session_cwd", lambda *a: None)
++    monkeypatch.setattr(server, "_project_info_for_cwd", lambda *a: None)
++    return lambda params: (server._methods["session.create"]("r1", {"cols": 80, **params}), server._sessions)
++
++
++def test_unregistered_pin_is_refused_before_any_state(_create, tmp_path):
++    _write_policy(tmp_path)
++
++    response, sessions = _create({"model": "gemini-4-argon", "provider": "gemini"})
++
++    error = response["error"]
++    assert error["code"] == -32602
++    allowed = allowed_pins(managed_config())
++    assert "'gemini-4-argon'" in error["message"] and "'gemini'" in error["message"]
++    # The Desktop toast swaps a message over 180 chars for its "Session unavailable" fallback
++    # (``summarizeErrorMessage``): the reason must fit, and the allowed pins ride in ``data``.
++    assert len(error["message"]) <= 180, error["message"]
++    assert error["data"] == {"model": "gemini-4-argon", "provider": "gemini", "allowed": allowed}
++    assert sessions == {}
++
++
++def test_registered_model_on_a_provider_that_does_not_serve_it_is_refused(_create, tmp_path):
++    _write_policy(tmp_path)
++
++    response, sessions = _create({"model": "anthropic-deep", "provider": "openai-codex"})
++
++    assert response["error"]["code"] == -32602
++    assert sessions == {}
++
++
++@pytest.mark.parametrize("params", [
++    {"model": "anthropic-deep", "provider": "anthropic"},  # a registered pin
++    {"model": "openai-codex-fast"},  # registered; no provider matches its registered one, as a turn does
++    {"model": "class:deep"},  # a class selector is routed, never pinned
++    {},  # no override: the profile default runs
++])
++def test_runnable_choices_still_mint_a_session(_create, tmp_path, params):
++    _write_policy(tmp_path)
++
++    response, sessions = _create(params)
++
++    assert "error" not in response, response
++    assert response["result"]["session_id"] in sessions
++
++
++def test_policy_off_keeps_any_pin(_create, tmp_path):
++    _write_policy(tmp_path, enforced=False)
++
++    response, sessions = _create({"model": "gemini-4-argon", "provider": "gemini"})
++
++    assert "error" not in response, response
++    session = sessions[response["result"]["session_id"]]
++    assert session["model_override"] == {"model": "gemini-4-argon", "provider": "gemini"}
++
++
++@pytest.mark.parametrize("profile_enforced, refused", [(True, True), (False, False)])
++def test_gate_reads_the_policy_of_the_profile_the_session_builds_under(
++        _create, tmp_path, monkeypatch, profile_enforced, refused):
++    from tui_gateway import server
++
++    profile = tmp_path / "profiles" / "work"
++    profile.mkdir(parents=True)
++    _write_policy(tmp_path, enforced=not profile_enforced)  # the launch profile says the opposite
++    _write_policy(profile, enforced=profile_enforced)
++    monkeypatch.setattr(server, "_profile_home", lambda *a: profile)
++
++    response, sessions = _create({"model": "gemini-4-argon", "provider": "gemini", "profile": "work"})
++
++    assert ("error" in response) is refused, response
++    assert bool(sessions) is not refused
++
++
++def test_create_accepts_exactly_what_the_picker_offers(_create, tmp_path):
++    """The picker's managed filter and this gate are one predicate: an offered id always runs."""
++    from hermes_cli.model_options_managed import drop_refused_managed_pins
++
++    _write_policy(tmp_path)
++    rows = [{"slug": "anthropic", "models": ["anthropic-deep", "anthropic-fast", "claude-unregistered"]},
++            {"slug": "openai-codex", "models": ["openai-codex-standard", "anthropic-deep"]},
++            {"slug": "gemini", "models": ["gemini-4-argon"]}]
++    offered = copy.deepcopy(rows)
++    drop_refused_managed_pins(offered)
++
++    assert [row["models"] for row in offered] == [["anthropic-deep", "anthropic-fast"],
++                                                 ["openai-codex-standard"], []]
++    for row, kept in zip(rows, offered):
++        for model in row["models"]:
++            response, _ = _create({"model": model, "provider": row["slug"]})
++            assert ("error" not in response) is (model in kept["models"]), (row["slug"], model, response)
+diff --git a/tui_gateway/methods_complete.py b/tui_gateway/methods_complete.py
+index 25786933d6..b3df99963b 100644
+--- a/tui_gateway/methods_complete.py
++++ b/tui_gateway/methods_complete.py
+@@ -372,8 +372,10 @@ def _(rid, params: dict) -> dict:
+     reconcile_record()
+     # Shared inventory builder (lock-step with model.options / dashboard); picker_hints carries `authenticated`.
+     from hermes_cli.inventory import build_models_payload
+-    # Uncapped, as model.options: the refreshed row replaces the full one in the picker (#129260).
++    from hermes_cli.model_options_managed import drop_refused_managed_pins
++    # Uncapped and policy-narrowed, as model.options: the refreshed row replaces the full one in the picker (#129260).
+     payload = build_models_payload(_model_picker_context(_session_agent(params)), picker_hints=True)
++    drop_refused_managed_pins(payload["providers"])
+     provider_data = next((p for p in payload["providers"] if p["slug"] == slug), None)
+     if provider_data is None:  # key saved but provider didn't appear — still success
+         provider_data = {"slug": slug, "name": pconfig.name, "is_current": False, "models": [], "total_models": 0}
+diff --git a/tui_gateway/methods_session.py b/tui_gateway/methods_session.py
+index 7fd93a9abb..ad731454b4 100644
+--- a/tui_gateway/methods_session.py
++++ b/tui_gateway/methods_session.py
+@@ -315,8 +315,8 @@ def _create_session(rid, params: dict, *, copy_parent_history: bool = False) ->
+     transcript server-side and omits it from the reply."""
+     # ``profile`` (app-global remote mode): stored so the build and every turn re-bind HERMES_HOME.
+     profile_home = _profile_home(profile := (params.get("profile") or "").strip() or None)
+-    # Reject an incoherent model×provider pair BEFORE any state exists: minting it only defers the
+-    # failure to the first turn's provider 404 (#96817). Custom/unknown providers stay permissive.
++    # Reject a pin the managed policy refuses or an incoherent model×provider pair BEFORE any state
++    # exists: minting it only defers the failure to the first turn (#96817). Unknown stays permissive.
+     from .methods_session_model_guard import model_override_conflict
+     if conflict := model_override_conflict(params, _profile_build_scope(profile_home)):
+         return _err(rid, -32602, conflict.pop("message"), conflict)
+diff --git a/tui_gateway/methods_session_model_guard.py b/tui_gateway/methods_session_model_guard.py
+index ba2fa63627..f13fade165 100644
+--- a/tui_gateway/methods_session_model_guard.py
++++ b/tui_gateway/methods_session_model_guard.py
+@@ -12,20 +12,32 @@ import contextlib
+ 
+ 
+ def model_override_conflict(params: dict, build_scope) -> dict | None:
+-    """The conflict record for the create params' model override, or ``None`` when coherent /
+-    undecidable. Without an explicit ``provider`` the pair is judged against the provider the
+-    session would actually build with (profile config, then env) inside ``build_scope`` — the
+-    handler's ``_profile_build_scope(profile_home)`` context manager."""
++    """The conflict record for the create params' model override, or ``None`` when runnable /
++    undecidable. Judged inside ``build_scope`` (the handler's ``_profile_build_scope(profile_home)``:
++    the config and secrets the session's turns bind). First the managed subscription policy: the pin
++    ``create_overrides`` stores, judged by the turn's own ``pin_policy``, so a refused pick never mints
++    a chat whose every turn fails. Then catalog coherence; without an explicit ``provider`` the pair
++    is judged against the provider the session would actually build with (profile config, then env)."""
+     model = str(params.get("model") or "").strip()
+     if not model:
+         return None
++    from hermes_cli.model_options_managed import managed_pin_refusal
+     from hermes_cli.models_validate import static_model_provider_conflict
+     from hermes_cli.runtime_provider import resolve_requested_provider
+ 
+     provider = str(params.get("provider") or "").strip()
+-    if not provider:
+-        with build_scope:
+-            provider = resolve_requested_provider()
++    # Derived where ``create_overrides`` derives it, so the judged pin is the one the session stores.
++    pin = _prefer_subscription_route({"model": model, "provider": provider or None})
++    with build_scope:
++        refusal = managed_pin_refusal(pin["model"], pin["provider"])
++        provider = provider or resolve_requested_provider()
++    if refusal is not None:
++        # Fits the Desktop toast, which swaps a message over 180 chars for its fallback
++        # (``summarizeErrorMessage``); the allowed pins ride in ``data``, and the picker lists them.
++        on = f" on {refusal.provider!r}" if refusal.provider else ""
++        return {"message": f"{refusal.model!r}{on} can't run on this host: its managed subscription policy "
++                           "refuses that pin. Pick a model the picker lists.",
++                "model": refusal.model, "provider": refusal.provider, "allowed": refusal.allowed}
+     return static_model_provider_conflict(model, provider)
+ 
+ 
+-- 
+2.43.0
+

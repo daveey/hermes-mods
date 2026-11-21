@@ -1,0 +1,593 @@
+From 3ca764536a7422a32c8af0590205da654b7d68a6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 05:46:06 +0000
+Subject: [PATCH] fix(update): consolidate conflict observations on configured
+ integration owner [daveey]
+
+Recurring upstream SHA inventories were copied to independent checkout-local
+repair owners because reporting had no explicit integration-owner policy.
+Add opt-in update.upstream_conflict_reporting with inventory/pointer modes,
+qualified owner and explicit repository/owner-checkout binding. Unset remains
+legacy; malformed config or invalid/unreachable owner fails closed.
+
+Inventory only updates the designated existing local owner. Pointers retain
+per-checkout incident identity, serialize/dedupe and skip archived/foreign
+consumers. Keep the fresh-interpreter reporter and all update custody/pause,
+source, acceptance and containment behavior unchanged. No upstream integration.
+
+Proof:
+- Behavior RED before routing hookup: 18 failing configured-routing cases.
+- Canonical scripts/run_tests.sh: focused routing, stale-module reporter,
+  pause ordering, config validation, docs drift and post-swap/update contracts.
+- Full scripts/check --base origin/main passed, including health/ruff.
+- Prepublication adversarial review corrections: strict malformed-file reads,
+  authenticated Board gateway identity, foreign pickup exclusion.
+- Website documents atomic config set/get/unset and fail-closed deployment.
+---
+ hermes_cli/config.py                          |   5 +-
+ hermes_cli/config_defaults.py                 |   4 +-
+ hermes_cli/config_value_checks.py             |  17 ++
+ hermes_cli/update_conflict_reporting.py       | 123 ++++++++
+ hermes_cli/update_upstream_conflict.py        |   4 +
+ .../test_update_conflict_reporting.py         | 275 ++++++++++++++++++
+ website/docs/user-guide/configuration.md      |  51 ++++
+ 7 files changed, 474 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/update_conflict_reporting.py
+ create mode 100644 tests/hermes_cli/test_update_conflict_reporting.py
+
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index ba75af1d45..fd34beb251 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -1061,10 +1061,9 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
+             return [config_load_issue(exc)]
+ 
+     from hermes_cli.config_value_checks import (
+-        _validate_quoted_containers, _validate_timezone, _validate_voice, _validate_web_backends)
++        _validate_quoted_containers, _validate_startup_values, _validate_web_backends)
+     issues: list[ConfigIssue] = []
+-    _validate_voice(config, issues)
+-    _validate_timezone(config, issues)
++    _validate_startup_values(config, issues)
+     from agent.model_routing import ModelRoutingError, validate_policy
+     try:
+         validate_policy(config.get("model_routing", {}))
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index bdcc09cc46..1f747448d5 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1,7 +1,6 @@
+ """Default configuration data for Hermes Agent: DEFAULT_CONFIG and OPTIONAL_ENV_VARS.
+ 
+-Pure-data leaf module — must not import from hermes_cli.config. Comments are the user-facing
+-docs of config.yaml.
++Pure-data leaf module: no hermes_cli.config imports. Comments document config.yaml.
+ """
+ 
+ from hermes_cli.config_defaults_auxiliary import _aux
+@@ -27,6 +26,7 @@ DEFAULT_CONFIG = {
+     "model": "",
+     "providers": {},
+     "fallback_providers": [],
++    "update": {"upstream_conflict_reporting": None},  # None retains legacy per-checkout owners.
+     # Opt-in class selectors; exact pins retain legacy behavior. Empty manifests
+     # fail closed. Eligibility/funding attestations are host-specific, not keys.
+     "model_routing": routing_defaults(),
+diff --git a/hermes_cli/config_value_checks.py b/hermes_cli/config_value_checks.py
+index 738e988c68..6ec5f0941b 100644
+--- a/hermes_cli/config_value_checks.py
++++ b/hermes_cli/config_value_checks.py
+@@ -6,6 +6,23 @@ from typing import Any
+ from hermes_cli.config_issues import ConfigIssue, _issue
+ 
+ 
++def _validate_startup_values(config: dict[str, Any], issues: list[ConfigIssue]) -> None:
++    _validate_voice(config, issues)
++    _validate_timezone(config, issues)
++    _validate_upstream_conflict_reporting(config, issues)
++
++
++def _validate_upstream_conflict_reporting(config: dict[str, Any], issues: list[ConfigIssue]) -> None:
++    from hermes_cli.update_conflict_reporting import parse
++    update = config.get('update', {})
++    try:
++        if not isinstance(update, dict):
++            raise ValueError('update.upstream_conflict_reporting requires an update mapping')
++        parse(update.get('upstream_conflict_reporting'))
++    except ValueError as exc:
++        _issue(issues, 'error', str(exc), 'Correct the conflict reporting mapping or unset it for legacy behavior')
++
++
+ def _validate_voice(config: dict[str, Any], issues: list[ConfigIssue]) -> None:
+     voice_cfg = config.get("voice")
+     if not (isinstance(voice_cfg, dict) and "submit_mode" in voice_cfg):
+diff --git a/hermes_cli/update_conflict_reporting.py b/hermes_cli/update_conflict_reporting.py
+new file mode 100644
+index 0000000000..14b1da5a66
+--- /dev/null
++++ b/hermes_cli/update_conflict_reporting.py
+@@ -0,0 +1,123 @@
++"""Opt-in, fail-closed routing for unattended updater conflict observations."""
++from __future__ import annotations
++
++import hashlib
++import re
++import subprocess
++from pathlib import Path
++
++CLOSED = frozenset({'done', 'failed', 'cancelled', 'archived'})
++_REF = re.compile(r'@task:([A-Za-z0-9_.-]+)@([A-Za-z0-9_.-]+)/(t_[0-9a-f]{8}(?:[0-9a-f]{8})?)\Z')
++
++
++def incident_key(cwd: Path) -> str:
++    return 'upstream-merge-conflict:' + hashlib.sha256(str(cwd.resolve()).encode()).hexdigest()[:24]
++
++
++def parse(value: object) -> dict | None:
++    """None is the registered legacy default; every explicit mapping must be complete."""
++    if value is None:
++        return None
++    prefix = 'update.upstream_conflict_reporting'
++    if not isinstance(value, dict) or set(value) != {'mode', 'owner', 'repository', 'owner_checkout'}:
++        raise ValueError(f'{prefix} needs mode, owner, repository and owner_checkout')
++    if value['mode'] not in ('inventory', 'pointer'):
++        raise ValueError(f'{prefix}.mode must be inventory or pointer')
++    owner = value['owner']
++    match = _REF.fullmatch(owner) if isinstance(owner, str) else None
++    if not match:
++        raise ValueError(f'{prefix}.owner must be @task:board@gateway/t_<8 or 16 lowercase hex>')
++    path, repo = value['owner_checkout'], value['repository']
++    if not isinstance(path, str) or not path.startswith('/') or '`' in path or '\n' in path:
++        raise ValueError(f'{prefix}.owner_checkout must be an absolute owner-host checkout path')
++    if not isinstance(repo, str) or not re.fullmatch(r'https://[^/\s@]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git', repo):
++        raise ValueError(f'{prefix}.repository must be a canonical HTTPS repository URL ending in .git')
++    return {**value, 'board': match[1], 'gateway': match[2], 'task_id': match[3]}
++
++
++def configured() -> dict | None:
++    from hermes_cli.config_effective import load_user_config_effective
++    update = load_user_config_effective(fail_closed=True).get('update', {})
++    if not isinstance(update, dict):
++        raise ValueError('update must be a mapping')
++    return parse(update.get('upstream_conflict_reporting'))
++
++
++def _repository(cwd: Path) -> str:
++    """Read only; normalize equivalent SSH/HTTPS origin spellings without executing repository code."""
++    proc = subprocess.run(['git', 'remote', 'get-url', 'origin'], cwd=cwd, check=True,
++                          capture_output=True, text=True, encoding='utf-8', timeout=10)
++    url = proc.stdout.strip()
++    match = re.fullmatch(r'(?:git@([^:]+):|https://([^/]+)/)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?', url)
++    if not match:
++        raise ValueError('upstream conflict reporting: origin is not a supported repository identity')
++    return f'https://{match[1] or match[2]}/{match[3]}.git'
++
++
++def _owner_evidence(board: str, task_id: str) -> dict:
++    from hermes_cli.kanban_sync_client import Hub, load_identity
++    hub = Hub(load_identity(), timeout=10)
++    try:
++        return {**hub.row_evidence(board, 'tasks', task_id), 'reporting_gateway': hub.ident.gateway}
++    finally:
++        hub.close()
++
++
++def validate_owner(cfg: dict, cwd: Path) -> str:
++    """An administrator binds this repository to an existing, gateway-qualified incident owner."""
++    if _repository(cwd) != cfg['repository']:
++        raise ValueError('upstream conflict reporting: reporting repository does not match configured repository')
++    evidence = _owner_evidence(cfg['board'], cfg['task_id'])
++    if (not isinstance(evidence, dict)
++            or (evidence.get('board'), evidence.get('table'), evidence.get('uid')) != (cfg['board'], 'tasks', cfg['task_id'])
++            or evidence.get('state') != 'live' or evidence.get('tombstone') is not None
++            or type(evidence.get('head')) is not int or not isinstance(evidence.get('row'), dict)):
++        raise ValueError('upstream conflict reporting: authoritative owner unavailable or invalid')
++    row = evidence['row']
++    # Hash the owner's already-resolved path as text: resolving a foreign host's path locally is wrong.
++    key = 'upstream-merge-conflict:' + hashlib.sha256(cfg['owner_checkout'].encode()).hexdigest()[:24]
++    lead = f"`hermes update` could not merge upstream into `{cfg['owner_checkout']}`. Nothing moved.\n"
++    if (row.get('uid') != cfg['task_id'] or row.get('created_on') != cfg['gateway']
++            or row.get('deleted_at') is not None or type(row.get('version')) is not int or row['version'] <= 0
++            or row.get('status') not in {'todo', 'ready', 'running', 'review', 'blocked', 'triage', 'scheduled'}
++            or row.get('created_by') != 'upstream-merge' or row.get('title') != 'Resolve unattended upstream merge conflict'
++            or row.get('idempotency_key') != key or not isinstance(row.get('body'), str) or not row['body'].startswith(lead)):
++        raise ValueError('upstream conflict reporting: owner identity, project binding or status does not match')
++    gateway = evidence.get('reporting_gateway')
++    if not isinstance(gateway, str) or not gateway:
++        raise ValueError('upstream conflict reporting: authenticated reporting gateway unavailable')
++    if cfg['mode'] == 'inventory' and (str(cwd.resolve()) != cfg['owner_checkout'] or gateway != cfg['gateway']):
++        raise ValueError('upstream conflict reporting: inventory is restricted to the designated owner checkout and gateway')
++    return gateway
++
++
++def report(conn, cfg: dict, cwd: Path, upstream: str, conflicts: list[str]) -> str:
++    """Only add observations; never create/reopen/redirect tasks or change acceptance/holds."""
++    from hermes_cli import kanban_db as kb
++    gateway = validate_owner(cfg, cwd)  # Network outside the local transaction; never trust a stale replica.
++    key = incident_key(cwd)
++    with kb.write_txn(conn, allow_nested=True):
++        if cfg['mode'] == 'inventory':
++            from hermes_cli.kanban_db_sync import board_slug_for_path
++            path = conn.execute('PRAGMA database_list').fetchone()[2]
++            if board_slug_for_path(path) != cfg['board']:
++                raise ValueError('upstream conflict reporting: inventory board does not match configured owner')
++            row = conn.execute('SELECT id,status,body,idempotency_key,created_by,title FROM tasks WHERE id=?',
++                               (cfg['task_id'],)).fetchone()
++            if (not row or row[1] in CLOSED or row[3] != key or row[4] != 'upstream-merge'
++                    or row[5] != 'Resolve unattended upstream merge conflict'):
++                raise ValueError('upstream conflict reporting: inventory owner is not an eligible local incident')
++            notes = [(row[0], f'Upstream SHA: `{upstream}`\nConflicting paths:\n' + '\n'.join(f'- `{p}`' for p in conflicts), row[2])]
++        else:
++            pointer = f"Upstream conflict `{upstream}`; integration owner: {cfg['owner']}. Incident: {key}. No local integration authorized."
++            columns = {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}
++            origin = 'created_on' if 'created_on' in columns else 'NULL'
++            rows = conn.execute(f'SELECT id,status,body,{origin} FROM tasks WHERE idempotency_key=?', (key,)).fetchall()
++            notes = [(r[0], pointer, r[2]) for r in rows
++                     if r[1] not in CLOSED and r[0] != cfg['task_id'] and r[3] in (None, '', gateway)]
++        for task_id, text, body in notes:
++            if text not in (body or '') and not conn.execute(
++                    'SELECT 1 FROM task_comments WHERE task_id=? AND author=? AND body=?',
++                    (task_id, 'upstream-merge', text)).fetchone():
++                kb.add_comment(conn, task_id, 'upstream-merge', text)
++    return notes[0][0] if notes else cfg['task_id']
+diff --git a/hermes_cli/update_upstream_conflict.py b/hermes_cli/update_upstream_conflict.py
+index c40ed7ad45..93aa77121d 100644
+--- a/hermes_cli/update_upstream_conflict.py
++++ b/hermes_cli/update_upstream_conflict.py
+@@ -62,6 +62,10 @@ def main(argv: list[str] | None = None) -> int:
+ def _report(conn, cwd: Path, upstream: str, conflicts: list[str]) -> str:
+     from hermes_cli import kanban_db as kb
+ 
++    from hermes_cli import update_conflict_reporting as routing
++    config = routing.configured()
++    if config is not None:
++        return routing.report(conn, config, cwd, upstream, conflicts)
+     key = "upstream-merge-conflict:" + hashlib.sha256(str(cwd.resolve()).encode()).hexdigest()[:24]
+     evidence = f"Upstream SHA: `{upstream}`\nConflicting paths:\n" + "\n".join(f"- `{p}`" for p in conflicts)
+     # Serialize lookup + create so overlapping unattended invocations cannot create two owners.
+diff --git a/tests/hermes_cli/test_update_conflict_reporting.py b/tests/hermes_cli/test_update_conflict_reporting.py
+new file mode 100644
+index 0000000000..61b63ee1bc
+--- /dev/null
++++ b/tests/hermes_cli/test_update_conflict_reporting.py
+@@ -0,0 +1,275 @@
++"""Configured conflict routing never creates competing owners or leaks inventories."""
++from concurrent.futures import ThreadPoolExecutor
++import hashlib
++import json
++import subprocess
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++import pytest
++
++from hermes_cli import update_upstream_conflict as reporter
++from hermes_cli.config import save_config, validate_config_structure
++from hermes_cli.kanban_db_connect import connect_closing
++
++OWNER = 't_eeeeee0000000002'
++REF = f'@task:default@hub/{OWNER}'
++REPO = 'https://github.com/example/core.git'
++
++
++@pytest.fixture
++def routing(tmp_path, monkeypatch):
++    checkout = tmp_path / 'checkout'
++    checkout.mkdir()
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'board.db'))
++    save_config({'platform_toolsets': {'cli': ['terminal', 'file']}, 'terminal': {'backend': 'local'}})
++    with connect_closing() as conn:
++        consumer = reporter._report(conn, checkout, 'a' * 40, ['old.txt'])
++    from hermes_cli import update_conflict_reporting as routing
++    monkeypatch.setattr(routing, '_repository', lambda cwd: REPO)
++    key = 'upstream-merge-conflict:' + hashlib.sha256(str(checkout.resolve()).encode()).hexdigest()[:24]
++    owner = {'uid': OWNER, 'created_on': 'hub', 'created_by': 'upstream-merge', 'status': 'triage',
++             'title': 'Resolve unattended upstream merge conflict', 'idempotency_key': key,
++             'body': f'`hermes update` could not merge upstream into `{checkout}`. Nothing moved.\n',
++             'version': 1, 'deleted_at': None}
++    evidence = {'reporting_gateway': 'hub', 'board': 'default', 'table': 'tasks', 'uid': OWNER, 'head': 1,
++                'state': 'live', 'tombstone': None, 'row': owner}
++    monkeypatch.setattr(routing, '_owner_evidence', lambda board, tid: evidence)
++    cfg = {'mode': 'pointer', 'owner': REF, 'repository': REPO, 'owner_checkout': str(checkout)}
++    save_config({'update': {'upstream_conflict_reporting': cfg}})
++    return checkout, consumer, cfg, evidence
++
++
++def comments(conn, tid):
++    return [r[0] for r in conn.execute('SELECT body FROM task_comments WHERE task_id=?', (tid,))]
++
++
++def test_pointer_dedupes_changed_sha_and_preserves_consumer(routing):
++    checkout, consumer, _, _ = routing
++    with connect_closing() as conn:
++        before = tuple(conn.execute('SELECT body,status,idempotency_key FROM tasks WHERE id=?', (consumer,)).fetchone())
++        for sha in ('b' * 40, 'b' * 40, 'c' * 40):
++            assert reporter._report(conn, checkout, sha, ['secret.txt']) == consumer
++        notes = comments(conn, consumer)
++        assert len(notes) == 2
++        assert all(REF in note and 'secret.txt' not in note and 'Conflicting paths' not in note for note in notes)
++        assert tuple(conn.execute('SELECT body,status,idempotency_key FROM tasks WHERE id=?', (consumer,)).fetchone()) == before
++        assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
++
++
++def test_pointer_archived_consumer_and_other_checkout_never_create_owner(routing):
++    checkout, consumer, _, _ = routing
++    with connect_closing() as conn:
++        conn.execute("UPDATE tasks SET status='archived' WHERE id=?", (consumer,))
++        conn.commit()
++        for path in (checkout, checkout.parent / 'another'):
++            assert reporter._report(conn, path, 'b' * 40, ['secret.txt']) == OWNER
++        assert comments(conn, consumer) == []
++        assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
++
++
++def test_inventory_targets_existing_owner_only(routing):
++    checkout, consumer, cfg, _ = routing
++    cfg['mode'] = 'inventory'
++    # The canonical owner must also be this local board's exact existing row.
++    with connect_closing() as conn:
++        cfg['owner'] = f'@task:default@hub/{consumer}'
++        from hermes_cli import update_conflict_reporting as routing
++        routing_owner = routing._owner_evidence('hermes', OWNER)
++        routing_owner['uid'] = routing_owner['row']['uid'] = consumer
++        save_config({'update': {'upstream_conflict_reporting': cfg}})
++        for sha in ('b' * 40, 'b' * 40, 'c' * 40):
++            assert reporter._report(conn, checkout, sha, ['inventory.txt']) == consumer
++        assert len(comments(conn, consumer)) == 2
++        assert all('inventory.txt' in c for c in comments(conn, consumer))
++        with pytest.raises(ValueError, match='inventory'):
++            reporter._report(conn, checkout.parent / 'elsewhere', 'd' * 40, ['no.txt'])
++        assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
++
++
++@pytest.mark.parametrize('fault', ['missing', 'deleted', 'gateway', 'project', 'key', 'terminal', 'author', 'title', 'body', 'board',
++                                    'uid', 'row_uid', 'table', 'head', 'version', 'tombstone', 'row_deleted'])
++def test_bad_owner_fails_closed(routing, monkeypatch, fault):
++    checkout, consumer, _, evidence = routing
++    from hermes_cli import update_conflict_reporting as routing
++    if fault == 'project':
++        monkeypatch.setattr(routing, '_repository', lambda cwd: 'https://github.com/other/project.git')
++    mutations = {'missing': lambda: evidence.update(row=None),
++                 'deleted': lambda: evidence.update(state='deleted'),
++                 'board': lambda: evidence.update(board='other'),
++                 'uid': lambda: evidence.update(uid='t_00000000'),
++                 'table': lambda: evidence.update(table='task_events'),
++                 'head': lambda: evidence.update(head=None),
++                 'tombstone': lambda: evidence.update(tombstone={})}
++    if fault in mutations:
++        mutations[fault]()
++    fields = {'gateway': ('created_on', 'other'), 'key': ('idempotency_key', 'other'),
++              'terminal': ('status', 'archived'), 'author': ('created_by', 'other'),
++              'title': ('title', 'other'), 'body': ('body', 'other'),
++              'row_uid': ('uid', 't_00000000'), 'version': ('version', 0), 'row_deleted': ('deleted_at', 1)}
++    if fault in fields:
++        field, value = fields[fault]
++        evidence['row'][field] = value
++    with connect_closing() as conn:
++        with pytest.raises(ValueError):
++            reporter._report(conn, checkout, 'b' * 40, ['secret.txt'])
++        assert comments(conn, consumer) == []
++        assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
++
++
++def test_unavailable_owner_fails_closed(routing, monkeypatch):
++    checkout, consumer, _, _ = routing
++    from hermes_cli import update_conflict_reporting as routing
++    def unavailable(*args):
++        raise TimeoutError('owner unavailable')
++    monkeypatch.setattr(routing, '_owner_evidence', unavailable)
++    with connect_closing() as conn:
++        with pytest.raises(TimeoutError):
++            reporter._report(conn, checkout, 'b' * 40, ['secret.txt'])
++        assert comments(conn, consumer) == []
++
++
++@pytest.mark.parametrize('config', [{}, {'mode': 'typo'}, {'mode': 'pointer', 'owner': 't_eeeeee0000000002'}, 'pointer'])
++def test_config_validation_and_runtime_refusal(routing, config):
++    checkout, consumer, _, _ = routing
++    assert any('upstream_conflict_reporting' in i.message for i in validate_config_structure(
++        {'update': {'upstream_conflict_reporting': config}}))
++    save_config({'update': {'upstream_conflict_reporting': config}})
++    with connect_closing() as conn:
++        with pytest.raises(ValueError):
++            reporter._report(conn, checkout, 'b' * 40, ['secret.txt'])
++        assert comments(conn, consumer) == []
++
++
++def test_concurrent_pointers_are_serialized(routing):
++    checkout, consumer, _, _ = routing
++    def send(_):
++        with connect_closing() as conn:
++            return reporter._report(conn, checkout, 'b' * 40, ['secret.txt'])
++    with ThreadPoolExecutor(max_workers=3) as pool:
++        assert set(pool.map(send, range(6))) == {consumer}
++    with connect_closing() as conn:
++        assert len(comments(conn, consumer)) == 1
++
++
++def test_fresh_child_reads_config_and_authoritative_owner_without_mutating_source(routing, tmp_path, monkeypatch):
++    checkout, consumer, cfg, evidence = routing
++    for args in [('init', '-q'), ('remote', 'add', 'origin', REPO),
++                 ('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
++                  '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-qm', 'fixture')]:
++        subprocess.run(['git', *args], cwd=checkout, check=True, capture_output=True)
++    before = subprocess.run(['git', 'show-ref'], cwd=checkout, capture_output=True, check=True).stdout
++    requests = []
++
++    class OwnerHandler(BaseHTTPRequestHandler):
++        def do_GET(self):
++            requests.append(self.path)
++            raw = json.dumps(evidence).encode()
++            self.send_response(200)
++            self.send_header('Content-Type', 'application/json')
++            self.send_header('Content-Length', str(len(raw)))
++            self.end_headers()
++            self.wfile.write(raw)
++
++        def log_message(self, format, *args):
++            pass
++
++    server = ThreadingHTTPServer(('127.0.0.1', 0), OwnerHandler)
++    worker = threading.Thread(target=server.serve_forever, daemon=True)
++    worker.start()
++    key = tmp_path / 'gateway.key'
++    key.write_text('fixture-key')
++    save_config({'update': {'upstream_conflict_reporting': cfg}, 'kanban': {'sync': {
++        'enabled': False, 'url': f'http://127.0.0.1:{server.server_port}', 'gateway': 'mac', 'key_file': str(key)}}})
++    from tests.hermes_cli.test_update_upstream_conflict import _stale_config_effective
++    _stale_config_effective(monkeypatch)
++    try:
++        assert reporter.report(checkout, 'b' * 40, ['secret.txt']) == consumer
++        assert reporter.report(checkout, 'b' * 40, ['secret.txt']) == consumer
++    finally:
++        server.shutdown()
++        server.server_close()
++        worker.join(timeout=5)
++    assert len(requests) == 2
++    assert all(p == f'/v2/boards/default/evidence?table=tasks&uid={OWNER}' for p in requests)
++    assert subprocess.run(['git', 'show-ref'], cwd=checkout, capture_output=True, check=True).stdout == before
++    assert sorted(p.name for p in checkout.iterdir()) == ['.git']
++    with connect_closing() as conn:
++        assert len(comments(conn, consumer)) == 1
++        assert 'secret.txt' not in comments(conn, consumer)[0]
++
++
++def test_invalid_config_in_fresh_child_warns_and_never_creates_owner(routing, capsys):
++    checkout, consumer, _, _ = routing
++    save_config({'update': {'upstream_conflict_reporting': {'mode': 'pointer', 'owner': 'bad'}}})
++    assert reporter.report(checkout, 'b' * 40, ['secret.txt']) is None
++    assert 'could not file upstream merge conflict card' in capsys.readouterr().out
++    with connect_closing() as conn:
++        assert comments(conn, consumer) == []
++        assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
++
++
++@pytest.mark.parametrize('origin', ['git@github.com:example/core.git', REPO, 'https://github.com/example/core'])
++def test_repository_normalization(tmp_path, origin):
++    from hermes_cli import update_conflict_reporting as routing
++    subprocess.run(['git', 'init', '-q', str(tmp_path)], check=True)
++    subprocess.run(['git', 'remote', 'add', 'origin', origin], cwd=tmp_path, check=True)
++    assert routing._repository(tmp_path) == REPO
++
++
++@pytest.mark.parametrize('broken', ['update: [', '- not-a-mapping'])
++def test_malformed_file_never_recovers_into_legacy_creation(routing, broken, capsys):
++    checkout, consumer, _, _ = routing
++    from hermes_cli.config import get_config_path
++    from ruamel.yaml.error import YAMLError
++    from hermes_cli import update_conflict_reporting as routing
++    get_config_path().write_text(broken)
++    with pytest.raises((ValueError, TypeError, YAMLError)):
++        routing.configured()
++    assert reporter.report(checkout, 'b' * 40, ['secret.txt']) is None
++    assert 'could not file upstream merge conflict card' in capsys.readouterr().out
++    with connect_closing() as conn:
++        assert comments(conn, consumer) == []
++        assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
++
++
++def test_foreign_pickup_is_not_a_local_consumer(routing):
++    checkout, consumer, _, _ = routing
++    with connect_closing() as conn:
++        conn.execute('ALTER TABLE tasks ADD COLUMN created_on TEXT')
++        conn.execute('UPDATE tasks SET created_on=? WHERE id=?', ('foreign', consumer))
++        conn.commit()
++        assert reporter._report(conn, checkout, 'b' * 40, ['secret.txt']) == OWNER
++        assert comments(conn, consumer) == []
++        conn.execute('UPDATE tasks SET created_on=? WHERE id=?', ('hub', consumer))
++        conn.commit()
++        assert reporter._report(conn, checkout, 'b' * 40, ['secret.txt']) == consumer
++        assert len(comments(conn, consumer)) == 1
++
++
++@pytest.mark.parametrize('field,value', [('reporting_gateway', ''), ('reporting_gateway', 'mac')])
++def test_inventory_requires_authenticated_owner_gateway(routing, field, value):
++    checkout, _, cfg, evidence = routing
++    cfg['mode'] = 'inventory'
++    evidence[field] = value
++    save_config({'update': {'upstream_conflict_reporting': cfg}})
++    with connect_closing() as conn:
++        with pytest.raises(ValueError):
++            reporter._report(conn, checkout, 'b' * 40, ['secret.txt'])
++
++
++def test_two_local_checkouts_retain_separate_pointer_incidents(routing):
++    checkout, consumer, cfg, _ = routing
++    other = checkout.parent / 'second-checkout'
++    other.mkdir()
++    save_config({'update': {'upstream_conflict_reporting': None}})
++    with connect_closing() as conn:
++        second = reporter._report(conn, other, 'a' * 40, ['other-old.txt'])
++    save_config({'update': {'upstream_conflict_reporting': cfg}})
++    with connect_closing() as conn:
++        for _ in range(2):
++            assert reporter._report(conn, checkout, 'b' * 40, ['secret.txt']) == consumer
++            assert reporter._report(conn, other, 'b' * 40, ['secret.txt']) == second
++        assert len(comments(conn, consumer)) == len(comments(conn, second)) == 1
++        assert comments(conn, consumer) != comments(conn, second)
++        assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 2
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index dcbb1885a7..7db3f08309 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -16,6 +16,57 @@ All settings are stored in the `~/.hermes/` directory for easy access.
+ Run `hermes setup --portal` — one OAuth gets you a model provider and all four Tool Gateway tools without hand-editing YAML. Portal subscribers also get 10% off token-billed providers. See [Nous Portal](../integrations/nous-portal.md).
+ :::
+ 
++## Upstream conflict reporting
++
++`update.upstream_conflict_reporting` defaults to `null` (legacy per-checkout repair
++owner creation/reuse). Set the entire mapping atomically with the supported CLI,
++only after installing a revision that implements it:
++
++```bash
++hermes config set update.upstream_conflict_reporting '{"mode":"pointer","owner":"@task:default@integration-host/t_eeeeee0000000002","repository":"https://github.com/example/core.git","owner_checkout":"/srv/core"}'
++hermes config get update.upstream_conflict_reporting
++```
++
++The mapping requires exactly these four fields:
++
++- `mode`: `inventory` or `pointer`.
++- `owner`: a canonical, gateway-qualified `@task:board@gateway/t_<16 lowercase hex>`
++  reference to an existing unattended upstream-conflict task (legacy 8-hex IDs
++  are also accepted).
++- `repository`: the reporting checkout's canonical HTTPS origin identity, ending
++  in `.git`. Equivalent `git@host:organization/repository.git` origins are accepted.
++  Credentials, aliases, and local-file remotes are not accepted.
++- `owner_checkout`: the owner's already-resolved absolute checkout path on its
++  own host. It need not equal a pointer consumer's path on another host.
++
++The repository/path pair is an explicit administrator binding: legacy task rows
++record a path hash, not repository provenance. Do not copy another project's
++binding. Each observation verifies the reporting repository, reads the exact
++owner through authenticated Board row evidence (not a cached replica), and checks
++its gateway, incident key, original task author/title/checkout and open status.
++A contained `triage` owner remains eligible for observations; reporting never
++releases containment, changes acceptance, resumes work or changes update fences.
++
++`inventory` only appends full conflict evidence to that existing owner on its own
++host and checkout. `pointer` only adds compact owner/SHA/incident pointers to
++existing nonterminal local consumers of the reporting checkout; it never sends
++file lists or creates another repair owner. Archived consumers remain untouched.
++With no open local consumer, the validated designated owner's ID is returned,
++without creating a local task. Lookup plus comment insertion is serialized; the
++same pointer is deduplicated, while a changed SHA can add a new compact pointer.
++Historic lists are not removed or redirected. Existing updater output labels the
++returned task ID as `Repair owner`; a qualified pointer in the consumer comment
++is the authoritative destination across gateways.
++
++Malformed settings, another repository, an unavailable/deleted/closed owner or
++an inventory request off the designated host fail closed with the reporter's
++visible warning. They never fall back to full inventory or replacement-owner
++creation. Board authentication and reachability are required even for inventory.
++Unset with `hermes config unset update.upstream_conflict_reporting` to restore
++legacy behavior. Do not enable on an older installed revision: it ignores the
++control. A merge alone is not deployment evidence; verify the installed revision,
++effective config and a natural updater observation on each host.
++
+ ## Kanban fairness evidence capture
+ 
+ Fairness evidence capture is opt-in and does not change scheduling or scoring.
+-- 
+2.43.0
+

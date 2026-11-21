@@ -1,0 +1,170 @@
+From 7930b71768da6f03c15c5f4144156eed09831f20 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 22:33:33 +0000
+Subject: [PATCH] fix(kanban): address creation receipt custody review [daveey]
+
+Align cross-board creator identity, propagate SQLite auto-rollback, and pin custody and courier guards with regression tests. Cross-board and rollback RED/GREEN; both previously surviving guard mutants killed. Restored targeted suite: 60 passed. scripts/check --base origin/main passes. No live capture or policy changes.
+---
+ hermes_cli/kanban_fairness_creation.py        |  4 ++
+ .../test_kanban_fairness_creation.py          | 36 +++++++++++++
+ ...test_kanban_create_priority_inheritance.py | 54 +++++++++++++++----
+ tools/kanban_tools.py                         |  2 +-
+ 4 files changed, 86 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban_fairness_creation.py b/hermes_cli/kanban_fairness_creation.py
+index 4ba8bd2bf8..2a1c89b232 100644
+--- a/hermes_cli/kanban_fairness_creation.py
++++ b/hermes_cli/kanban_fairness_creation.py
+@@ -86,3 +86,7 @@ def stage(conn, task_id, *, creator_task_id, board, receipt):
+     except (sqlite3.Error, ValueError, TypeError):
+         # Observation failure makes the capture incomplete, never changes scheduling policy.
+         runtime.invalidate(board=board)
++        if not conn.in_transaction:
++            # SQLite FULL/IOERR/NOMEM can roll back the whole creator transaction.
++            # Stop here rather than let later creation writes commit in autocommit.
++            raise
+diff --git a/tests/hermes_cli/test_kanban_fairness_creation.py b/tests/hermes_cli/test_kanban_fairness_creation.py
+index fee4e66d1f..50f53bb347 100644
+--- a/tests/hermes_cli/test_kanban_fairness_creation.py
++++ b/tests/hermes_cli/test_kanban_fairness_creation.py
+@@ -226,6 +226,42 @@ def test_named_board_uses_connection_not_default(capture, tmp_path):
+         named.close()
+ 
+ 
++def test_sqlite_auto_rollback_does_not_commit_orphan_changes(capture, monkeypatch):
++    import sqlite3
++    from hermes_cli import kanban_fairness_creation as receipts
++
++    conn, session = capture
++    before = [tuple(row) for row in conn.execute("SELECT * FROM kanban_task_change ORDER BY task_id")]
++
++    calls = []
++
++    def auto_rollback(conn, *args):
++        calls.append(conn.in_transaction)
++        conn.execute("ROLLBACK")
++        raise sqlite3.OperationalError("simulated SQLite auto-rollback")
++
++    monkeypatch.setattr(receipts, "_append", auto_rollback)
++    with pytest.raises(sqlite3.OperationalError, match="simulated SQLite auto-rollback"):
++        kb.create_task(conn, title="auto-rollback child", assignee="a")
++    assert calls == [True]
++    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
++    assert [tuple(row) for row in conn.execute("SELECT * FROM kanban_task_change ORDER BY task_id")] == before
++    assert session.abandoned.is_set()
++
++
++@pytest.mark.parametrize("mismatch", ["creator_task_uid", "capture_id"])
++def test_receipt_custody_mismatch_abandons_without_record(capture, mismatch):
++    conn, session = capture
++    evidence = {}
++    creation.inherit_tool_priority(conn, {"priority": 5}, None, receipt=evidence)
++    evidence[mismatch] = "different-custodian"
++    child = kb.create_task(conn, title="mismatched receipt", assignee="a", priority=5,
++                           creation_receipt=evidence)
++    assert kb.get_task(conn, child).priority == 5
++    assert session.abandoned.is_set()
++    assert not [row for row in journal.rows(conn) if row[1] == "creation"]
++
++
+ def test_origin_retry_excludes_internal_observation(capture):
+     from tests.hermes_cli.test_kanban_origin_creation import intent
+ 
+diff --git a/tests/tools/test_kanban_create_priority_inheritance.py b/tests/tools/test_kanban_create_priority_inheritance.py
+index e1a60bbcb2..3921c8f85b 100644
+--- a/tests/tools/test_kanban_create_priority_inheritance.py
++++ b/tests/tools/test_kanban_create_priority_inheritance.py
+@@ -12,13 +12,16 @@ home = helpers.home
+ 
+ 
+ @pytest.mark.parametrize('argument,intent,expected', [
+-    ("omitted", "omitted", 37), (0, "explicit", 0), (None, "explicit", 37), (60000, "explicit", 1000)])
+-def test_capture_keeps_original_tool_intent(home, monkeypatch, argument, intent, expected):
++    ("omitted", "omitted", 37), (0, "explicit", 0), (5, "explicit", 5),
++    (None, "explicit", 37), (60000, "explicit", 1000)])
++@pytest.mark.parametrize('creator_present', [True, False])
++def test_capture_keeps_original_tool_intent(home, monkeypatch, argument, intent, expected, creator_present):
+     from hermes_cli import kanban_fairness_journal as journal
+     from hermes_cli import kanban_fairness_runtime as runtime
+ 
+     with kbc.connect_closing() as conn:
+-        creator = kb.create_task(conn, title='creator', priority=37, session_id=helpers.CHAT)
++        creator = (kb.create_task(conn, title='creator', priority=37, session_id=helpers.CHAT)
++                   if creator_present else 't_absent_on_target_board')
+         journal.arm(conn, 'tool-intent')
+     config = {'kanban': {'fairness_capture': {'enabled': True, 'capture_id': 'tool-intent',
+                                            'directory': str(home / 'capture')}}}
+@@ -33,7 +36,13 @@ def test_capture_keeps_original_tool_intent(home, monkeypatch, argument, intent,
+         assert result.get('ok'), result
+         with kbc.connect_closing() as conn:
+             records = [json.loads(row[5]) for row in journal.rows(conn) if row[1] == 'creation']
++        assert not session.abandoned.is_set()
+         assert len(records) == 1
++        assert records[0]['creator_task_uid'] == (creator if creator_present else None)
++        if not creator_present:
++            assert 'creator_task_uid' in records[0]['unknown_fields']
++            if argument in ('omitted', None):
++                expected = 0
+         assert records[0]['priority_intent'] == intent
+         assert records[0]['priority_argument'] == (None if argument == 'omitted' else argument)
+         assert records[0]['stored_child_priority'] == expected
+@@ -97,10 +106,37 @@ def test_inheritance_crosses_placement_and_courier_without_owner_reinference(hom
+     intent = {'request_id': 'priority-transport-fixture',
+               'owner': {'gateway': 'owner', 'profile': 'default', 'board': 'default'},
+               'origin': {'gateway': 'sender', 'profile': 'default', 'session': helpers.CHAT}}
+-    result = json.loads(tools._handle_create(sent[0], origin_intent=intent))
+-    # No remote session exists in this fixture; persisted creation is distinct
+-    # from the intentionally pending origin-binding acknowledgement.
+-    assert result.get('created') and result.get('code') == 'origin_bind_pending', result
++    from hermes_cli import kanban_fairness_journal as journal
++    from hermes_cli import kanban_fairness_runtime as runtime
++
+     with kbc.connect_closing() as conn:
+-        child = kb.get_task(conn, result['task_id'])
+-        assert child is not None and child.priority == 37
++        journal.arm(conn, 'courier-intent')
++    config = {'kanban': {'fairness_capture': {'enabled': True, 'capture_id': 'courier-intent',
++                                           'directory': str(home / 'courier-capture')}}}
++    session = runtime.activate(config, home=home, board='default', source_gateway='test', board_uid='board')
++    assert session is not None
++    observed_receipts = []
++    inherit = tools.inherit_tool_priority
++
++    def observe_courier(*args, **kwargs):
++        observed_receipts.append(kwargs.get('receipt'))
++        return inherit(*args, **kwargs)
++
++    monkeypatch.setattr(tools, 'inherit_tool_priority', observe_courier)
++    try:
++        result = json.loads(tools._handle_create(sent[0], origin_intent=intent))
++        assert observed_receipts == [None]  # do not collect normalized courier intent, even before DB filtering
++        # Persisted creation is distinct from the pending origin-binding acknowledgement.
++        assert result.get('created') and result.get('code') == 'origin_bind_pending', result
++        with kbc.connect_closing() as conn:
++            child = kb.get_task(conn, result['task_id'])
++            assert child is not None and child.priority == 37
++            records = [json.loads(row[5]) for row in journal.rows(conn) if row[1] == 'creation']
++        assert not session.abandoned.is_set()
++        assert len(records) == 1
++        assert records[0]['priority_intent'] == 'unknown'
++        assert records[0]['priority_argument'] is None
++        assert {'priority_intent', 'priority_argument', 'creator_task_uid'} <= set(records[0]['unknown_fields'])
++        assert records[0]['stored_child_priority'] == 37
++    finally:
++        session.close()
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index e2d81ec7bb..8f5bc138c9 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -1649,7 +1649,7 @@ def _handle_create(args: dict, **kw) -> str:
+                 # session's current board.
+                 board=args.get("board"),
+                 project_source_task_id=project_source_task_id, triage=triage,
+-                creator_task_id=self_tid,
++                creator_task_id=self_tid if self_task is not None else None,
+                 idempotency_key=args.get("idempotency_key"),
+                 max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+                 requires=_effective_requires(marker_placement, args),
+-- 
+2.43.0
+

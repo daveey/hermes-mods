@@ -1,0 +1,555 @@
+From ff8e1d0cee0f32f98b53fe9c970e6d70636319d0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 03:29:04 +0000
+Subject: [PATCH] fix(kanban): carry creator decision asks to remote origin
+ chats [daveey]
+
+Problem: accepted worker-1 -> hub origin binding did not provide a decision
+wake. Read-only SSM readback of t_eeeeee0000000017 confirms origin event
+<origin-event-id>, chat refusal reported in comment<refusal-id>, successful HUMAN block
+<blocked-event-id> at an example block time, and external scheduled event<park-id> at an example park time.
+The latter waited on own comment<question-id>; creator answer<reply-id> is at an example reply time.
+This corrects the incident premise: human_request itself was not refused.
+No original/ASG card was changed.
+
+Why 1: no creator turn consumed the second question -- it was an external
+park, not a decision_requested event (authoritative worker event<park-id>).
+Why 2: chat waits explicitly excluded platform=hub, so the worker's prior
+chat park failed no_chat_subscriber despite its accepted origin binding
+(kanban_awaiting.has_chat_subscriber; comment<refusal-id>).
+Why 3: remote notice candidates, indexes, state and sweep gates handled
+terminal cards, not scheduled decision envelopes; admitting hub rows alone
+would leave the transport broken (remote_index_projection, remote
+observations, unloaded gates, remote notices).
+Why 4: adoption validates binding/link and publication ownership; its
+handoff_complete receipt is not an end-to-end decision-delivery capability
+receipt (kanban_origin_creation / kanban_origin_ledger). It truthfully
+reported a bound link while the separate decision route remained absent.
+Root (happened): current owner asks had no snapshot/consumer contract,
+and own-card reply probes could silently be classified as external.
+Root (not caught): local chat-wait tests deliberately enshrined hub
+rejection; no adoption -> park -> owner snapshot -> remote wake regression.
+Recurrence: local-orchestrator incident t_eeeeee0000000010 and the existing
+chat-wait fixes (b31fffd8cb, 4e084ff899) cover local delivery/retry, not this
+cross-gateway composition.
+
+Countermeasures:
+- Publish a validated current ask with owner snapshots, using event time
+  and identity; do not resurrect an old ask after a later non-chat park.
+- Include decisions throughout remote indexing/observations and host wake
+  gates, and keep retrying when no agent wake can start (no passive ack).
+- Treat self wait-comment probes as creator questions with normal
+  subscriber/authority checks, even when tagged external/inferred.
+- Explicitly address the creator agent; preserve genuine human-request
+  rendering, human-block wake policy, approval authority and escalation.
+- Composed adoption regression covers explicit creator, inferred/external
+  reply probe, block(kind=time), and existing human_request transport.
+  Fresh baseline replay: 4 creator variants fail; human characterization
+  already passes. Also test budget retry, durable dedup, repeated/stale
+  asks and malformed envelopes.
+
+Validation: full scripts/check --base origin/main passes. Focused suite
+and complete direct-consumer tests recorded on task t_eeeeee000000001c.
+Installed/live scratch proof remains a post-landing acceptance step;
+unit-test success is not a claim of deployment or natural wake.
+---
+ gateway/kanban_remote_owner.py                |   3 +-
+ hermes_cli/kanban_awaiting.py                 |  21 ++-
+ hermes_cli/kanban_decision_ask.py             |   2 +-
+ hermes_cli/kanban_origin_ledger.py            |   5 +-
+ hermes_cli/kanban_remote_ask.py               |  47 ++++++
+ tests/hermes_cli/test_kanban_decision_ask.py  |   4 +-
+ .../test_kanban_origin_decision_wake.py       | 137 ++++++++++++++++++
+ tui_gateway/kanban_remote_notice_state.py     |   4 +
+ tui_gateway/kanban_remote_notices.py          |  13 +-
+ tui_gateway/kanban_remote_observations.py     |   8 +-
+ tui_gateway/kanban_unloaded.py                |   6 +
+ tui_gateway/kanban_unloaded_gates.py          |   4 +-
+ tui_gateway/remote_index_projection.py        |   2 +-
+ 13 files changed, 237 insertions(+), 19 deletions(-)
+ create mode 100644 hermes_cli/kanban_remote_ask.py
+ create mode 100644 tests/hermes_cli/test_kanban_origin_decision_wake.py
+
+diff --git a/gateway/kanban_remote_owner.py b/gateway/kanban_remote_owner.py
+index 9443a74103..cbeac67202 100644
+--- a/gateway/kanban_remote_owner.py
++++ b/gateway/kanban_remote_owner.py
+@@ -218,7 +218,8 @@ def _metadata(item: dict) -> dict:
+     task_id = "" if item.get("children") else str(item.get("ref") or "").rsplit("/", 1)[-1]
+     parts = str(item.get("ref") or "").split("/")
+     board = parts[2] if task_id and len(parts) == 4 else ""
+-    kind = {"blocked": "blocked", "done": "completed", "request_withdrawn": "request_withdrawn"}.get(
++    kind = {"blocked": "blocked", "done": "completed", "request_withdrawn": "request_withdrawn",
++            "decision_requested": "decision_requested"}.get(
+         str(item.get("state") or "").split("@", 1)[0])
+     card = {"task_id": task_id, "board": board, "kinds": [kind] if task_id and kind else [],
+             "text": text[:_CARD_TEXT_LIMIT]}
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 335d81877c..2898912c52 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -592,11 +592,10 @@ def _owns_card(conn: sqlite3.Connection, task_id: str) -> bool:
+ def has_chat_subscriber(conn: sqlite3.Connection, task_id: str) -> bool:
+     """A subscribed chat that ``decision_requested`` can wake.
+ 
+-    A ``tui`` row whose chat is reachable (:func:`tui_chat_reachable`): the live poller queues the notice and
+-    the unloaded sweeper starts a turn in a dormant chat. A messaging row in ``notify+wake`` / ``wake`` mode:
+-    the gateway notifier wakes the agent. Never a ``hub`` relay row, whatever its mode (legacy rows were
+-    backfilled to ``notify+wake``): it carries only cards that turned terminal. Not a plain ``notify``
+-    messaging row either: a passive ping, possibly to a person rather than the orchestrator."""
++    A reachable local TUI chat, a wake-enabled messaging row, or a fully
++    qualified hub relay destination (current asks travel in the owner snapshot).
++    Plain notify messaging rows are not agent wakes.
++    """
+     try:
+         rows = conn.execute("SELECT platform, chat_id, delivery_mode FROM kanban_notify_subs WHERE task_id = ?",
+                             (task_id,)).fetchall()
+@@ -605,6 +604,11 @@ def has_chat_subscriber(conn: sqlite3.Connection, task_id: str) -> bool:
+     for platform, chat_id, mode in rows:
+         platform = (platform or "").lower()
+         if platform == "hub":
++            # The owner collector publishes current asks with the origin link.
++            # Reject malformed destinations rather than silently parking them.
++            from hermes_cli.kanban_restore_chat_subs import _safe
++            if isinstance(chat_id, str) and len(chat_id.split('/')) == 3 and all(_safe(p) for p in chat_id.split('/')):
++                return True
+             continue
+         if platform == "tui":
+             if chat_id and tui_chat_reachable(chat_id):
+@@ -741,7 +745,9 @@ def resolve(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Op
+         return inferred
+     kanban_soak_wait.check(conn, task_id, declared, reason, short_continue=_short_continue(op, wake_in))
+     text = " ".join(x for x in (reason, declared.get("why"), declared.get("ref")) if x)
+-    if declared["kind"] == "external" and orchestrator_wait(text, declared.get("ref")):
++    from hermes_cli.kanban_remote_ask import own_comment_wait
++    if declared["kind"] == "external" and (orchestrator_wait(text, declared.get("ref"))
++                                            or own_comment_wait(wake_check, task_id)):
+         declared = {**declared, "kind": CHAT, "reclassified_from": "external",
+                     "why": declared.get("why") or (reason or "")[:600]}
+     if declared["kind"] == RESOURCE and not (wake_check and str(wake_check).strip()):
+@@ -811,7 +817,8 @@ def _infer(conn, task_id, *, reason, wake_check, clock_only, op, wake_in) -> dic
+             raise wall_error(task_id, wall, text, named=producer)
+     if producer:
+         return {"kind": "card", "ref": producer, "inferred": True}
+-    if not short and orchestrator_wait(text):
++    from hermes_cli.kanban_remote_ask import own_comment_wait
++    if (not short and orchestrator_wait(text)) or own_comment_wait(wake_check, task_id):
+         record = {"kind": CHAT, "ref": "owning orchestrator", "why": text[:600], "inferred": True}
+         _check_chat(conn, task_id, record, text)
+         return record
+diff --git a/hermes_cli/kanban_decision_ask.py b/hermes_cli/kanban_decision_ask.py
+index 8cf4e9d85d..358569f3c3 100644
+--- a/hermes_cli/kanban_decision_ask.py
++++ b/hermes_cli/kanban_decision_ask.py
+@@ -36,7 +36,7 @@ def notice_text(payload: dict) -> str:
+     ask = str(payload.get("why") or payload.get("reason") or "")
+     if len(ask) > 6000:
+         ask = ask[:4500] + "\n[... full text in the card comments ...]\n" + ask[-1500:]
+-    return ("This card is parked until you decide:\n" + ask
++    return ("Decision for the creator agent (not a request for the user). This card is parked until you decide:\n" + ask
+             + "\nAnswer with a comment on the card (kanban_comment); the comment wakes it. "
+             "If you cannot decide, block it with kind='needs_input' and a human_request for David.")
+ 
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 33a1497f8c..7f767dd018 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -245,9 +245,12 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+         current_task=lambda: conn.execute('SELECT title,body FROM tasks WHERE id=?', (task['id'],)).fetchone(),
+         receipt_epoch=lambda: _receipt_epoch(conn))
+     payload = {k: v for k, v in task.items()
+-               if k not in ('origin_observation', 'withdrawal_notice', 'withdrawal_recipients')}
++               if k not in ('origin_observation', 'withdrawal_notice', 'withdrawal_recipients', 'ask_notice')}
+     from hermes_cli.kanban_session_activity_card_details import _add_blocked_upstream
+     _add_blocked_upstream(conn, {task['id']: payload})
++    from hermes_cli.kanban_remote_ask import publish as publish_ask
++    if (ask := publish_ask(conn, task)) is not None:
++        payload['ask_notice'] = ask
+     from hermes_cli.kanban_withdrawal_notice import publish
+     withdrawal = publish(conn, task)
+     if withdrawal is not None:
+diff --git a/hermes_cli/kanban_remote_ask.py b/hermes_cli/kanban_remote_ask.py
+new file mode 100644
+index 0000000000..d519d36b9f
+--- /dev/null
++++ b/hermes_cli/kanban_remote_ask.py
+@@ -0,0 +1,47 @@
++"""Owner-snapshot ask envelopes for origin chats on another gateway."""
++import json
++import math
++
++
++def publish(conn, task: dict) -> dict | None:
++    """Publish only the latest current park's ask, never a historical question."""
++    status = task.get('status')
++    if status not in ('scheduled', 'blocked'):
++        return None
++    kinds = ('scheduled', 'continued', 'decision_requested') if status == 'scheduled' else ('blocked',)
++    marks = ','.join('?' for _ in kinds)
++    row = conn.execute(
++        f'SELECT id,kind,created_at,payload FROM task_events WHERE task_id=? AND kind IN ({marks}) ORDER BY id DESC LIMIT 1',
++        (task['id'], *kinds)).fetchone()
++    if row is None or (status == 'scheduled' and row[1] != 'decision_requested'):
++        return None
++    return {'event_id': row[0], 'kind': row[1], 'created_at': row[2], 'payload': json.loads(row[3] or '{}')}
++
++
++def envelope(task: dict) -> dict | None:
++    """Read only a well-formed ask matching the card's current state."""
++    notice = task.get('ask_notice')
++    if not isinstance(notice, dict):
++        return None
++    expected = {'scheduled': 'decision_requested', 'blocked': 'blocked'}.get(task.get('status'))
++    if (expected is None or notice.get('kind') != expected or type(notice.get('event_id')) is not int
++            or notice['event_id'] <= 0 or type(notice.get('created_at')) not in (int, float)
++            or not math.isfinite(notice['created_at']) or not isinstance(notice.get('payload'), dict)):
++        return None
++    return notice
++
++
++def own_comment_wait(cmd: str | None, task_id: str) -> bool:
++    """A wait on replies to this card is a chat ask, not an external producer."""
++    import os
++    import shlex
++    try:
++        words = shlex.split(cmd or '')
++    except ValueError:
++        return False
++    return any(os.path.basename(words[i]) == 'hermes' and words[i + 1:i + 4] == ['kanban', 'wait-comment', task_id]
++               for i in range(len(words) - 3))
++
++
++def notifiable(task: dict) -> bool:
++    return task.get('status') in ('done', 'blocked') or envelope(task) is not None
+diff --git a/tests/hermes_cli/test_kanban_decision_ask.py b/tests/hermes_cli/test_kanban_decision_ask.py
+index c61a6cd373..3235bbcf41 100644
+--- a/tests/hermes_cli/test_kanban_decision_ask.py
++++ b/tests/hermes_cli/test_kanban_decision_ask.py
+@@ -233,8 +233,8 @@ def test_chat_wait_never_launders_a_david_ask_or_an_agent_wall(kanban_home, monk
+     ("tui", None, True),
+     ("telegram", "notify+wake", True),
+     ("telegram", None, False),  # a passive ping, maybe to a person: no orchestrator is woken
+-    ("hub", None, False),       # the hub relay carries only cards that turned terminal
+-    ("hub", "notify+wake", False),  # legacy hub rows were backfilled to notify+wake: still only terminal cards
++    ("hub", None, True),       # origin asks travel in the owner snapshot
++    ("hub", "notify+wake", True),
+ ])
+ def test_only_a_subscription_the_notice_can_wake_counts(kanban_home, monkeypatch, platform, mode, parks) -> None:
+     with kbc.connect_closing() as conn:
+diff --git a/tests/hermes_cli/test_kanban_origin_decision_wake.py b/tests/hermes_cli/test_kanban_origin_decision_wake.py
+new file mode 100644
+index 0000000000..8c31ab5f37
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_decision_wake.py
+@@ -0,0 +1,137 @@
++"""Compose owner adoption, real park, publication and remote chat delivery."""
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_origin_creation import adopt_with_origin
++from hermes_cli.kanban_origin_ledger import observe_owner_task
++from tests.hermes_cli import test_kanban_decision_ask as helpers
++from tests.tui_gateway import test_kanban_remote_wake as remote
++from tui_gateway import kanban_remote_notices as notices
++
++kanban_home = helpers.kanban_home
++home = remote.home
++
++
++def _publish_owner(conn, tid):
++    task = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    task.update(gateway="hub", profile="default", board="default", origin_bindings=[
++        json.loads(r[0]) for r in conn.execute("SELECT binding_json FROM origin_creation_intents WHERE task_id=?", (tid,))])
++    run = conn.execute("SELECT ended_at,summary FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++    task['run'] = dict(run) if run else {}
++    conn.execute('BEGIN')
++    try:
++        return observe_owner_task(conn, task, now=time.time())
++    finally:
++        conn.rollback()
++
++
++@pytest.mark.parametrize('entry', ['creator', 'external_comment', 'inferred_comment', 'block_time', 'human'])
++def test_adopted_owner_ask_reaches_origin_chat(kanban_home, home, monkeypatch, entry, caplog):
++    import logging
++    caplog.set_level(logging.DEBUG, logger='tui_gateway.kanban_remote_notices')
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        adopt_with_origin(conn, {
++            'request_id': 'adopt:decision-proof-001',
++            'owner': {'gateway': 'hub', 'profile': 'default', 'board': 'default', 'task_id': tid},
++            'origin': {'gateway': 'macbook', 'profile': 'default', 'session': remote.CHAT},
++        }, board='default')
++        # A real durable binding and its owner-written subscription, not a fabricated link.
++        assert conn.execute('SELECT 1 FROM origin_creation_intents WHERE task_id=?', (tid,)).fetchone()
++        helpers._as_worker(monkeypatch, conn, tid)
++        if entry != 'human':
++            args = {
++                'reason': 'Decide premise A/B/C; waiting on the next reply.',
++                'wake_check': f'hermes kanban wait-comment {tid} --after-id 0 --skip-system',
++            }
++            if entry != 'inferred_comment':
++                args['awaiting'] = {'kind': 'external' if entry == 'external_comment' else 'chat',
++                                    'why': 'Decide premise A/B/C.', 'ref': 'origin session'}
++            if entry == 'block_time':
++                args['kind'] = 'time'
++            out = helpers._tool('block' if entry == 'block_time' else 'schedule', args)
++        else:
++            out = helpers._tool('block', {
++                'kind': 'needs_input', 'reason': 'Choose premise A/B/C.',
++                'human_request': {
++                    'action': 'Reply A or B. Unblock = use the pick; archive = drop it.',
++                    'why_human': 'Only the user can choose the personal preference.',
++                    'interaction': 'reply', 'scope': 'premise A/B/C', 'evidence': 'No preference recorded.',
++                },
++            })
++        assert out.get('ok') is not False and 'error' not in out, out
++        card = _publish_owner(conn, tid)
++    remote._publish(home, [card])
++    from hermes_cli import kanban_origin
++    monkeypatch.setattr(kanban_origin, 'gateway_names', lambda: ('macbook',))
++    assert notices._linked_chats(card, 'macbook') == [('default', remote.CHAT)]
++    from hermes_cli.profiles import get_profile_dir
++    from hermes_constants import get_hermes_home
++    assert get_profile_dir('default') == get_hermes_home(), (get_profile_dir('default'), get_hermes_home())
++    assert notices._sweep_snapshot(home / 'hub.db', 'macbook')[0], card
++    from tui_gateway import kanban_unloaded as ku
++    wakes = []
++    def wake(tip, text, metadata):
++        wakes.append((tip, text, metadata))
++        remote._turn_writes_row(tip, text, metadata)
++        return 'started'
++    monkeypatch.setattr(ku, 'wake_turn', wake)
++    monkeypatch.setattr(ku, '_spawn_thread', lambda job: job())
++    def sweep():
++        return ku.sweep_remote_once(set(), grace_s=0, gateway='macbook')
++    if entry == 'creator':
++        # A decision must not be acked as a passive row when the agent cannot run.
++        monkeypatch.setattr(ku, '_has_wake_budget', lambda *_: False)
++        sweep()
++        assert remote._notice_rows() == [] and wakes == []
++        monkeypatch.setattr(ku, '_has_wake_budget', lambda *_: True)
++    sweep()
++    rows = remote._notice_rows()
++    assert len(rows) == 1, (wakes, rows)
++    text = rows[0]['content']
++    assert 'premise A/B/C' in text
++    if entry != 'human':
++        assert [w[0] for w in wakes] == [remote.CHAT]
++        assert 'creator agent' in text.lower() and 'kanban_comment' in text
++        assert 'Next action for the user' not in text
++    else:
++        # Existing human-request policy deliberately presents the human ask without an agent turn.
++        assert 'Next action for the user' in text
++    assert sweep() == []
++    notices._reset_for_tests()
++    assert sweep() == []
++
++
++def test_owner_envelope_does_not_resurrect_old_question(kanban_home):
++    from hermes_cli.kanban_remote_ask import publish
++    from hermes_cli.kanban_db_events import append_event
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        task = {'id': tid, 'status': 'scheduled'}
++        append_event(conn, tid, 'decision_requested', {'why': 'first question'})
++        first = publish(conn, task)
++        assert first is not None and first['payload']['why'] == 'first question'
++        append_event(conn, tid, 'scheduled', {})  # a later non-chat park supersedes it
++        assert publish(conn, task) is None
++        append_event(conn, tid, 'decision_requested', {'why': 'second question'})
++        second = publish(conn, task)
++        assert second is not None and second['event_id'] != first['event_id']
++        assert publish(conn, {**task, 'status': 'running'}) is None
++        from tui_gateway.kanban_remote_notice_state import state
++        assert state({**task, 'ask_notice': first}) != state({**task, 'ask_notice': second})
++
++
++@pytest.mark.parametrize('change', [
++    {'kind': 'blocked'}, {'event_id': True}, {'event_id': -1},
++    {'created_at': 'yesterday'}, {'created_at': float('nan')}, {'payload': 'not a mapping'},
++])
++def test_malformed_decision_envelope_is_not_notifiable(change):
++    from hermes_cli.kanban_remote_ask import notifiable
++    ask = {'kind': 'decision_requested', 'event_id': 1, 'created_at': 1.0, 'payload': {}}
++    assert notifiable({'status': 'scheduled', 'ask_notice': ask})
++    assert not notifiable({'status': 'scheduled', 'ask_notice': {**ask, **change}})
++    assert not notifiable({'status': 'running', 'ask_notice': ask})
++
+diff --git a/tui_gateway/kanban_remote_notice_state.py b/tui_gateway/kanban_remote_notice_state.py
+index e1f646586d..a724a56403 100644
+--- a/tui_gateway/kanban_remote_notice_state.py
++++ b/tui_gateway/kanban_remote_notice_state.py
+@@ -6,6 +6,10 @@ def state(task: dict) -> str:
+     notice = envelope(task)
+     if notice is not None:
+         return f"request_withdrawn@{notice['event_id']}"
++    from hermes_cli.kanban_remote_ask import envelope as ask_envelope
++    from tui_gateway.kanban_remote_notices import drop_mark
++    if (ask := ask_envelope(task)) is not None and drop_mark(task) is None:
++        return f"{ask['kind']}@{ask['event_id']}"
+     from tui_gateway.kanban_remote_notices import _terminal_at
+     at = _terminal_at(task) if task.get("status") in ("done", "blocked") else None
+     return f"{task['status']}@{int(at) if at else 0}"
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 31bf05c8d2..fc9b893bfa 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -39,6 +39,7 @@ from types import SimpleNamespace
+ from typing import Any, Callable, Optional
+ from hermes_cli.kanban_withdrawal_notice import envelope as _withdrawal
+ from tui_gateway.kanban_remote_notice_state import state as _notice_state
++from hermes_cli.kanban_remote_ask import envelope as _ask, notifiable as _notifiable
+ 
+ FRESH_S = 6 * 3600.0
+ # [daveey] How long, from this host's first observation, a state it OBSERVED (not one seeded by a source's first
+@@ -108,6 +109,8 @@ def drop_mark(task: dict) -> Optional[float]:
+ def _terminal_at(task: dict) -> Optional[float]:
+     if (dropped := drop_mark(task)) is not None:
+         return dropped
++    if (ask := _ask(task)) is not None:
++        return float(ask['created_at'])
+     run = task.get("run") if isinstance(task.get("run"), dict) else {}
+     for value in (task.get("completed_at") if task.get("status") == "done" else None, run.get("ended_at")):
+         with contextlib.suppress(TypeError, ValueError):
+@@ -333,6 +336,10 @@ def format_notice(gw: str, key: str, task: dict) -> str:
+         return server._format_kanban_event_text(
+             {"task_id": tid}, SimpleNamespace(**task),
+             SimpleNamespace(kind="request_withdrawn", payload={}), board)
++    if (ask := _ask(task)) is not None and ask['kind'] == 'decision_requested':
++        from hermes_cli.kanban_decision_ask import notice_text
++        return (f"? {prefix}Kanban {tid} — {title}\n" + notice_text(ask['payload'])
++                + f"\nCard: @task:{board}@{gw}/{tid}")
+     if task.get("status") == "done":
+         handoff = _first_line(run.get("summary") or task.get("result"), 200)
+         return f"✔ {prefix}Kanban {tid} done — {title}{handoff}\n(ran on {gw}; read it with cross_task @task:{board}@{gw}/{tid})"
+@@ -366,6 +373,8 @@ def _shared_key(owner: str, key: str, task: dict, profile: str, sid: str) -> str
+     notice = task.get("completion_notice")
+     if task.get("status") == "done" and isinstance(notice, dict) and "event_id" in notice:
+         return _event_key(owner, key, notice)
++    if (ask := _ask(task)) is not None and drop_mark(task) is None:
++        return f"remote:{owner}:{key}:{ask['kind']}:{ask['event_id']}"
+     at = _terminal_at(task)
+     return f"remote:{owner}:{key}:{task.get('status')}@{int(at) if at else 0}:{profile}:{sid}"
+ 
+@@ -1201,6 +1210,8 @@ def _sweep_payload(owner: str, key: str, task: dict, me: str, profile: str, sid:
+     metadata = {"notice_id": event_key, "board": task.get("board", "default"),
+                 "task_id": task["id"], "gateway": owner, "kanban_event_keys": [event_key],
+                 "blocked_on_human": remote_blocked_on_human(task)}
++    if (ask := _ask(task)) is not None:
++        metadata['event_kind'] = ask['kind']
+     return event_key, metadata, format_notice(owner, key, task)
+ 
+ 
+@@ -1213,7 +1224,7 @@ def _sweep_cards(rows: list[tuple], me: str):
+             continue
+         notice = task.get("completion_notice") if isinstance(task, dict) else None
+         done = task.get("status") == "done" and isinstance(notice, dict) and "event_id" in notice
+-        if not done and task.get("status") != "blocked" and _withdrawal(task) is None:
++        if not done and task.get('status') != 'blocked' and _ask(task) is None and _withdrawal(task) is None:
+             continue
+         links = [{"profile": profile, "session": sid} for profile, sid in _linked_chats(task, me)]
+         if not links:
+diff --git a/tui_gateway/kanban_remote_observations.py b/tui_gateway/kanban_remote_observations.py
+index c39f2016b3..63395f88c1 100644
+--- a/tui_gateway/kanban_remote_observations.py
++++ b/tui_gateway/kanban_remote_observations.py
+@@ -23,7 +23,7 @@ def _snapshot(replica: Path, previous, decoded: dict, lane=None) -> tuple[bool,
+     Include unlinked cards and historical done cards without completion evidence:
+     linking a chat or switching between sweep and collect must not resurrect them.
+     """
+-    from tui_gateway.kanban_remote_notices import _canonical, _ro, _task_rows, _TERMINAL
++    from tui_gateway.kanban_remote_notices import _canonical, _ro, _task_rows, _notifiable
+ 
+     with contextlib.closing(_ro(replica)) as conn:
+         conn.execute("BEGIN")
+@@ -47,7 +47,7 @@ def _snapshot(replica: Path, previous, decoded: dict, lane=None) -> tuple[bool,
+             for owner, key, _seq, raw in _canonical(_task_rows(conn, meta.get("gateway"))):
+                 with contextlib.suppress(TypeError, ValueError):
+                     task = json.loads(raw)
+-                    if isinstance(task, dict) and (task.get("status") in _TERMINAL or _withdrawal(task) is not None):
++                    if isinstance(task, dict) and (_notifiable(task) or _withdrawal(task) is not None):
+                         cards.append((owner, key, task))
+             return ready, cards, signature
+         cards = _changed_rows_cards(conn, replica, meta.get("gateway"), decoded, lane)
+@@ -55,6 +55,7 @@ def _snapshot(replica: Path, previous, decoded: dict, lane=None) -> tuple[bool,
+ 
+ 
+ def _summary(task) -> dict | None:
++    from hermes_cli.kanban_remote_ask import notifiable
+     from tui_gateway.kanban_remote_notices import drop_mark
+ 
+     if not isinstance(task, dict):
+@@ -62,7 +63,7 @@ def _summary(task) -> dict | None:
+     withdrawal = _withdrawal(task)
+     if withdrawal is not None:
+         return {"status": task["status"], "withdrawal_notice": withdrawal}
+-    if task.get("status") not in _terminal_states():
++    if notifiable(task) is False:
+         return None
+     run = task.get("run")
+     run = run if isinstance(run, dict) else {}
+@@ -72,6 +73,7 @@ def _summary(task) -> dict | None:
+             "run": {"ended_at": run.get("ended_at")},
+             "human_request": ({"resolved_check_dropped_at": drop_mark(task)}
+                               if drop_mark(task) is not None else None),
++            "ask_notice": task.get('ask_notice'),
+             "completion_notice": {"created_at": notice.get("created_at")}}
+ 
+ 
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index b23395e2ae..4940ff8fa3 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -657,6 +657,12 @@ class _RemoteWaker:
+         """Start one turn with ``text`` in ``tip``, else ``persist()`` the row. Returns the verdict. Never raises.
+         With every wake slot busy, ``defer()`` hands the claim back for the next pass instead of the row, until the
+         notice has waited ``OVERDUE_S`` for a slot (design t_01a1d45d75851804 R4)."""
++        decision = metadata.get('event_kind') == 'decision_requested'
++        if decision and defer is not None:
++            # A passive row cannot answer an agent question: release for retry.
++            def persist():
++                defer()
++                return False
+         try:
+             from types import SimpleNamespace
+             view = SimpleNamespace(status=task.get("status"), human_request=task.get("human_request"),
+diff --git a/tui_gateway/kanban_unloaded_gates.py b/tui_gateway/kanban_unloaded_gates.py
+index 2d4b0764c2..f49744809a 100644
+--- a/tui_gateway/kanban_unloaded_gates.py
++++ b/tui_gateway/kanban_unloaded_gates.py
+@@ -474,13 +474,13 @@ def _row_print(task, me):
+ def _substantive(gw, key, task, swept, path=None, me=None) -> bool:
+     """A replica task row whose write the remote sweep (or ``observe``) may act on."""
+     from hermes_cli.kanban_withdrawal_notice import envelope
+-    from tui_gateway.kanban_remote_notices import _TERMINAL
++    from tui_gateway.kanban_remote_notices import _notifiable
+     if task is None:
+         return True
+     ident = (str(path), gw, key)
+     if me is not None and gw == me:
+         return False  # ``observe`` and the sweep read every gateway's rows but this one's own
+-    terminal = task.get('status') in _TERMINAL or not task.get('status')
++    terminal = _notifiable(task) or not task.get('status')
+     if not (f'{gw}/{key}' in swept or envelope(task) is not None or terminal):
+         _row_prints.pop(ident, None)  # left the terminal set: its next terminal write is a new state
+         return False
+diff --git a/tui_gateway/remote_index_projection.py b/tui_gateway/remote_index_projection.py
+index 1c37b8e45e..03f15512b6 100644
+--- a/tui_gateway/remote_index_projection.py
++++ b/tui_gateway/remote_index_projection.py
+@@ -73,7 +73,7 @@ def snapshot(conn, identity, me):
+                 task = None
+             chats = []
+             if (isinstance(task, dict) and task.get("id")
+-                    and (task.get("status") in remote._TERMINAL or remote._withdrawal(task) is not None)):
++                    and (remote._notifiable(task) or remote._withdrawal(task) is not None)):
+                 chats = remote._linked_chats(task, me)
+             # Only a row routed to a chat keeps its card: the rest (all but a few dozen of ~17k on the mini) kept
+             # every decoded task here, ~155 MB and 1.5M GC-tracked objects per gateway. [daveey]
+-- 
+2.43.0
+

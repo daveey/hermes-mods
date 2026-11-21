@@ -1,0 +1,310 @@
+From ecfc58e883c10128a133567242d4e55e3b6ec594 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:15:35 +0000
+Subject: [PATCH] [daveey] Retain cron cleanup drain custody beyond caller
+ timeout
+
+---
+ cron/cleanup_timeout.py                       |  63 ++++++++
+ cron/scheduler.py                             |  39 +----
+ tests/hermes_cli/test_worker_drain_cleanup.py | 138 ++++++++++++++++++
+ .../test_worker_drain_cron_degrade.py         |  20 +++
+ 4 files changed, 224 insertions(+), 36 deletions(-)
+ create mode 100644 cron/cleanup_timeout.py
+ create mode 100644 tests/hermes_cli/test_worker_drain_cleanup.py
+
+diff --git a/cron/cleanup_timeout.py b/cron/cleanup_timeout.py
+new file mode 100644
+index 0000000000..7c8b559deb
+--- /dev/null
++++ b/cron/cleanup_timeout.py
+@@ -0,0 +1,63 @@
++"""Bounded cron cleanup with drain custody retained by the actual worker."""
++from __future__ import annotations
++
++import threading
++
++from agent.memory_provider import spawn_context_thread
++
++
++def run_cleanup(cleanup, *, job_id, label, timeout, logger) -> bool:
++    from hermes_cli.worker_drain_fence import admit, lease_scope
++
++    # Acquire BEFORE thread construction; inherited parent authority may close
++    # as soon as this function times out. The independent descriptor cannot.
++    lease = admit('cron.cleanup')
++
++    def owned_cleanup():
++        try:
++            with lease_scope(lease):
++                cleanup()
++        finally:
++            if lease is not None:
++                lease.close()
++
++    if timeout <= 0:
++        try:
++            owned_cleanup()
++            return True
++        except (Exception, KeyboardInterrupt) as exc:  # health: allow BLE001 -- cleanup failures are logged
++            logger.debug("Job '%s': %s failed: %s", job_id, label, exc)
++            return False
++
++    done = threading.Event()
++    error: list[BaseException] = []
++
++    def runner():
++        try:
++            owned_cleanup()
++        except BaseException as exc:
++            logger.debug("Job '%s': %s cleanup worker failed", job_id, label, exc_info=True)
++            error.append(exc)
++        finally:
++            done.set()
++
++    try:
++        # A daemon thread may outlive the timeout, never the retained lease.
++        worker = spawn_context_thread(runner, name=f'cron-cleanup-{job_id}', daemon=True)
++        worker.start()
++    except BaseException:
++        # start() can be interrupted after native creation but before returning.
++        # Never release custody while still claiming this daemon fully covered.
++        from hermes_cli.worker_drain_capability import revoke
++        revoke('cron cleanup thread start outcome uncertain')
++        if lease is not None:
++            lease.close()
++        raise
++    if not done.wait(timeout):
++        logger.error("Job '%s': %s exceeded %.1fs; abandoning cleanup so future runs remain dispatchable",
++                     job_id, label, timeout)
++        return False
++    if error:
++        logger.debug("Job '%s': %s failed: %s", job_id, label, error[0])
++        return False
++    return True
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index 82d1e15efd..e4e24bb36e 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1492,43 +1492,10 @@ def _cron_cleanup_timeout_seconds() -> float:
+ def _run_cron_cleanup_with_timeout(
+     cleanup, *, job_id: str, label: str, timeout_seconds: Optional[float] = None,
+ ) -> bool:
+-    """Run fallible post-run cleanup without permanently wedging a cron ID."""
++    """Run fallible cleanup with independent custody through any timeout survivor."""
++    from cron.cleanup_timeout import run_cleanup
+     timeout = (_cron_cleanup_timeout_seconds() if timeout_seconds is None else float(timeout_seconds))
+-    if timeout <= 0:
+-        try:
+-            cleanup()
+-            return True
+-        except (Exception, KeyboardInterrupt) as exc:
+-            logger.debug("Job '%s': %s failed: %s", job_id, label, exc)
+-            return False
+-
+-    done = threading.Event()
+-    error: list[BaseException] = []
+-
+-    def _runner() -> None:
+-        try:
+-            cleanup()
+-        except BaseException as exc:
+-            error.append(exc)
+-        finally:
+-            done.set()
+-
+-    # Daemon thread is deliberate: unlike ThreadPoolExecutor workers it is not joined at interpreter
+-    # exit if cleanup never returns, so the gateway can still shut down.
+-    worker = threading.Thread(
+-        target=ctx_bound(_runner), name=f"cron-cleanup-{job_id}", daemon=True)
+-    worker.start()
+-    if not done.wait(timeout):
+-        logger.error(
+-            "Job '%s': %s exceeded %.1fs; abandoning cleanup so future runs remain dispatchable",
+-            job_id,
+-            label,
+-            timeout)
+-        return False
+-    if error:
+-        logger.debug("Job '%s': %s failed: %s", job_id, label, error[0])
+-        return False
+-    return True
++    return run_cleanup(cleanup, job_id=job_id, label=label, timeout=timeout, logger=logger)
+ 
+ 
+ class _BoundedCronSessionDB:
+diff --git a/tests/hermes_cli/test_worker_drain_cleanup.py b/tests/hermes_cli/test_worker_drain_cleanup.py
+new file mode 100644
+index 0000000000..d23370d2b9
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_cleanup.py
+@@ -0,0 +1,138 @@
++"""A timed-out cron cleanup keeps custody until the real thread unwinds."""
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from cron.scheduler import _run_cron_cleanup_with_timeout
++from hermes_cli import worker_drain_fence as fence
++
++
++@pytest.fixture
++def custody(monkeypatch):
++    events = []
++    closed = threading.Event()
++    lease = SimpleNamespace(close=lambda: (events.append('close'), closed.set()))
++    monkeypatch.setattr(fence, 'admit', lambda purpose: (events.append('admit') or lease))
++    return lease, events, closed
++
++
++def test_timeout_retains_independent_lease_and_thread_authority(custody):
++    lease, events, closed = custody
++    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
++    observed = []
++
++    def cleanup():
++        observed.append(fence._authority.get())
++        entered.set()
++        try:
++            assert release.wait(5)
++            events.append('cleanup')
++        finally:
++            finished.set()
++
++    try:
++        assert not _run_cron_cleanup_with_timeout(
++            cleanup, job_id='fixture', label='cleanup', timeout_seconds=0.001)
++        assert entered.wait(5)
++        assert observed == [lease]
++        assert events == ['admit'] and not closed.is_set()
++        assert fence._authority.get() is None
++    finally:
++        release.set()
++        assert finished.wait(5)
++    assert closed.wait(5)
++    assert events == ['admit', 'cleanup', 'close']
++
++
++@pytest.mark.parametrize('timeout', [0, 5])
++@pytest.mark.parametrize('failure', [False, True])
++def test_cleanup_success_or_failure_releases_after_actual_cleanup(custody, timeout, failure):
++    lease, events, closed = custody
++
++    def cleanup():
++        assert fence._authority.get() is lease
++        assert not closed.is_set()
++        events.append('cleanup')
++        if failure:
++            raise ValueError('fixture')
++
++    assert _run_cron_cleanup_with_timeout(
++        cleanup, job_id='fixture', label='cleanup', timeout_seconds=timeout) is not failure
++    assert events == ['admit', 'cleanup', 'close']
++    assert fence._authority.get() is None
++
++
++def test_thread_start_failure_releases_custody(custody, monkeypatch):
++    from hermes_cli import worker_drain_capability as capability
++    _lease, events, closed = custody
++    monkeypatch.setattr(capability, 'revoke', lambda reason: events.append('revoke'))
++
++    def reject(self):
++        raise RuntimeError('cannot start')
++
++    monkeypatch.setattr(threading.Thread, 'start', reject)
++    with pytest.raises(RuntimeError, match='cannot start'):
++        _run_cron_cleanup_with_timeout(
++            lambda: pytest.fail('must not run'), job_id='fixture', label='cleanup', timeout_seconds=5)
++    assert events == ['admit', 'revoke', 'close'] and closed.is_set()
++
++
++def test_refused_cleanup_never_starts(monkeypatch):
++    def refuse(purpose):
++        raise fence.DrainRefused('draining')
++
++    monkeypatch.setattr(fence, 'admit', refuse)
++    with pytest.raises(fence.DrainRefused):
++        _run_cron_cleanup_with_timeout(
++            lambda: pytest.fail('unadmitted cleanup'), job_id='fixture', label='cleanup', timeout_seconds=5)
++
++
++def test_real_timeout_survivor_stays_busy_after_parent_closes(tmp_path, monkeypatch):
++    import os
++
++    ident = fence.Identity('i-0123456789abcdef0', fence.read_boot_id(), 'cleanup-proof')
++    fence.install_state(tmp_path, ident)
++    monkeypatch.setattr(fence, 'load_activation', lambda *a: {'uid': os.getuid()})
++    monkeypatch.setattr(fence, '_activation_root', lambda act: tmp_path)
++    monkeypatch.setattr(fence, 'current_identity', lambda *a, **k: ident)
++    release, entered, exited = threading.Event(), threading.Event(), threading.Event()
++    threads = []
++    children = []
++
++    def cleanup():
++        threads.append(threading.current_thread())
++        entered.set()
++        try:
++            assert release.wait(5)
++            children.append(fence.admit('cleanup.child'))
++        finally:
++            exited.set()
++
++    parent = fence.admit('cron.run')
++    try:
++        with fence.lease_scope(parent):
++            assert not _run_cron_cleanup_with_timeout(
++                cleanup, job_id='fixture', label='cleanup', timeout_seconds=0.001)
++        assert entered.wait(5)
++        parent.close()
++        assert fence.busy_leases(tmp_path) == 1
++        latch = fence.read_latch(tmp_path, ident)
++        latch['phase'] = 'draining'
++        fence._write_atomic(tmp_path / 'core-update' / fence.LATCH_FILE, latch)
++        with pytest.raises(fence.DrainRefused):
++            fence.admit('unrelated')
++        release.set()
++        assert exited.wait(5)
++        threads[0].join(5)
++        assert not threads[0].is_alive()
++        assert len(children) == 1
++        assert fence.busy_leases(tmp_path) == 1  # child retains its own lease
++    finally:
++        release.set()
++        parent.close()
++        for thread in threads:
++            thread.join(5)
++        for child in children:
++            child.close()
++    assert fence.busy_leases(tmp_path) == 0
+diff --git a/tests/hermes_cli/test_worker_drain_cron_degrade.py b/tests/hermes_cli/test_worker_drain_cron_degrade.py
+index c2a97ced6b..81ee7301f9 100644
+--- a/tests/hermes_cli/test_worker_drain_cron_degrade.py
++++ b/tests/hermes_cli/test_worker_drain_cron_degrade.py
+@@ -24,3 +24,23 @@ def test_failopen_revokes_exemption_before_dispatch(monkeypatch, unavailable):
+         assert allowed
+         events.append('dispatch')
+     assert events == ['revoked', 'dispatch']
++
++
++def test_import_failure_revokes_before_legacy_failopen(monkeypatch):
++    import builtins
++
++    events = []
++    real_import = builtins.__import__
++
++    def unavailable(name, globals=None, locals=None, fromlist=(), level=0):
++        if name == 'hermes_cli.admission_fence':
++            raise ImportError('controlled unavailable admission')
++        return real_import(name, globals, locals, fromlist, level)
++
++    monkeypatch.setattr(cap, 'revoke', lambda reason: events.append('revoked'))
++    monkeypatch.setattr(builtins, '__import__', unavailable)
++    with tick.update_admission() as allowed:
++        assert allowed
++        events.append('dispatch')
++    assert events == ['revoked', 'dispatch']
++
+-- 
+2.43.0
+

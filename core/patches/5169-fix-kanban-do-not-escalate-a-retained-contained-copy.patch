@@ -1,0 +1,129 @@
+From ba0cb92453b7aa06f87fe4aa6b1506df5ebdcc2c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 06:58:31 +0000
+Subject: [PATCH] fix(kanban): do not escalate a retained contained copy
+ [daveey]
+
+sweep_stale_triage ran escalate_stranded_contained before the foreign-copy
+fence, so a worker created a supervisor card for a copy it does not own.
+Skip those copies, and run the escalation only after the fence.
+---
+ hermes_cli/kanban_triage_sweep.py             | 21 ++++++----
+ .../hermes_cli/test_kanban_triage_replica.py  | 39 +++++++++++++++++++
+ 2 files changed, 53 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index fdb29841ba..fd7fc44593 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -119,17 +119,23 @@ def stranded_contained(conn: sqlite3.Connection, *, now: Optional[float] = None)
+     return out
+ 
+ 
+-def escalate_stranded_contained(conn: sqlite3.Connection, *, now: Optional[float] = None) -> list[str]:
++def escalate_stranded_contained(conn: sqlite3.Connection, *, now: Optional[float] = None,
++                                skip: Optional[set] = None) -> list[str]:
+     """A stranded contained card with a chat is woken by the owner wake (``wait.agent_owned``); one with NO chat has
+     no owner, so it gets one board-supervisor card per containment episode (key ``containment-strand:<task>:<episode>``)
+     plus a comment on the held card. Writes no event on the held card (its history is containment custody). Returns
+-    the supervisor card ids created this call. [daveey]"""
++    the supervisor card ids created this call.
++
++    Retained copies of another gateway's card are skipped. Those copies have no triage authority, and a worker
++    must not create a supervisor card for one. [daveey]"""
+     from hermes_cli.kanban_chat_links import _local_links
+     from hermes_cli.kanban_origin import gateway_name
++    from hermes_cli.kanban_wake_check import foreign_ids
+ 
+     stranded = stranded_contained(conn, now=now)
+     if not stranded:
+         return []
++    skipped = foreign_ids(conn) if skip is None else skip
+     try:
+         linked = {link["task_id"] for link in _local_links(conn, gateway_name()).values() if not link.get("released")}
+     except Exception:
+@@ -138,7 +144,7 @@ def escalate_stranded_contained(conn: sqlite3.Connection, *, now: Optional[float
+     created: list[str] = []
+     for card in stranded:
+         tid, episode = card["id"], card["episode"]
+-        if tid in linked:
++        if tid in linked or tid in skipped:
+             continue
+         key = f"containment-strand:{tid}:{episode}"
+         if conn.execute("SELECT 1 FROM tasks WHERE idempotency_key = ?", (key,)).fetchone():
+@@ -177,10 +183,6 @@ def sweep_stale_triage(
+     in ``TRIAGE_SWEEP_CAP_WINDOW`` it is capped instead (see :func:`_cap`). Cards with an open human
+     request, or an open kernel recovery card for their current park, are left alone. Returns swept task ids."""
+     now = int(now if now is not None else time.time())
+-    try:
+-        escalate_stranded_contained(conn, now=now)  # held cards no chat owns: their authority finished
+-    except Exception:
+-        logger.exception("kanban: containment strand escalation failed")
+     cutoff = now - older_than
+     swept: list[str] = []
+     rows = conn.execute(
+@@ -202,6 +204,11 @@ def sweep_stale_triage(
+     # arbitrate supervisor creation across gateways, even when neither has synced yet.
+     from hermes_cli.kanban_spend_decision import pending as spend_decision_pending, safe_ensure_producer
+     copies = foreign_ids(conn)
++    try:
++        # After the foreign-copy fence. A retained worker copy must not create a supervisor card.
++        escalate_stranded_contained(conn, now=now, skip=copies)
++    except Exception:
++        logger.exception("kanban: containment strand escalation failed")
+     from hermes_cli.kanban_containment_connections import held as containment_held
+     for row in rows:
+         if row["id"] in copies or containment_held(conn, row["id"]):
+diff --git a/tests/hermes_cli/test_kanban_triage_replica.py b/tests/hermes_cli/test_kanban_triage_replica.py
+index 5f05841c74..cc17bde5f8 100644
+--- a/tests/hermes_cli/test_kanban_triage_replica.py
++++ b/tests/hermes_cli/test_kanban_triage_replica.py
+@@ -67,6 +67,45 @@ def test_only_home_sweeps_or_caps_retained_copy(gws, svc, home_first, capped):
+     assert rows["tasks"][target]["status"] == ("triage" if capped else "ready")
+ 
+ 
++def test_worker_sweep_does_not_escalate_a_retained_contained_copy(gws):
++    """A worker's retained copy has no triage authority, even when its authority is done."""
++    home, worker, target = _retained_pair(gws)
++    now = int(time.time())
++    finished = now - 45 * 60
++    worker.enter()
++    authority = kb.create_task(worker.conn, title="done authority", assignee="default")
++    worker.conn.execute(
++        "UPDATE tasks SET status='done', completed_at=?, current_run_id=NULL WHERE id=?",
++        (finished, authority),
++    )
++    home_name = home.name
++    payload = {
++        "version": 1,
++        "target": {"gateway": home_name, "board": "default", "task_id": target},
++        "policy": {"version": 1, "authority": {"gateway": home_name, "board": "default", "task_id": authority}},
++        "producer_baseline": None,
++    }
++    with kb.write_txn(worker.conn):
++        kb._append_event(worker.conn, target, "contained", payload)
++        uid = worker.conn.execute(
++            "SELECT uid FROM task_events WHERE task_id=? AND kind='contained' ORDER BY id DESC LIMIT 1",
++            (target,),
++        ).fetchone()[0]
++        worker.conn.execute(
++            "UPDATE tasks SET status='triage', containment_episode=?, current_run_id=NULL WHERE id=?",
++            (uid, target),
++        )
++    created = ts.escalate_stranded_contained(worker.conn, now=now)
++    assert created == []
++    assert worker.conn.execute(
++        "SELECT COUNT(*) FROM tasks WHERE created_by='triage-sweep'"
++    ).fetchone()[0] == 0
++    ts.sweep_stale_triage(worker.conn, now=now + ts.TRIAGE_STALE_SECONDS + 1)
++    assert worker.conn.execute(
++        "SELECT COUNT(*) FROM tasks WHERE created_by='triage-sweep'"
++    ).fetchone()[0] == 0
++
++
+ @pytest.mark.parametrize("legacy", [False, True])
+ def test_recovery_hold_survives_replica_local_event_ids(gws, legacy):
+     home, worker, target = _retained_pair(gws)
+-- 
+2.43.0
+

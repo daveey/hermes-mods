@@ -1,0 +1,157 @@
+From 631608bd5c7b40b8d872ea155d967818ee917369 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 09:10:19 +0000
+Subject: [PATCH] fix(auth): keep removed pool rows deleted across stale
+ runtime flushes [daveey]
+
+Cause: the locked pool writer retained concurrent disk additions but treated all
+incoming rows as additions, including rows removed since a runtime loaded them.
+Use the existing per-id generation bases to distinguish new rows from deleted
+known rows while merging against the locked disk snapshot. Reconcile removed
+known rows and current selection in memory so a second flush cannot reinsert them.
+Keep ephemeral seeded rows without a persisted baseline for borrowed singletons.
+
+Proof: cross-process removal followed by stale cooldown persistence fails five
+regressions on the original code, then passes. All 35 pool/auth files pass (282
+tests). Removing the disk filter kills five tests; removing memory reconciliation
+kills four. scripts/check --base origin/main: 21 checks pass.
+
+Implemented-by: gpt-6.1-sol (OpenAI)
+---
+ agent/credential_pool.py                      |  9 ++-
+ hermes_cli/auth.py                            | 13 ++--
+ .../test_credential_pool_deleted_rows.py      | 63 +++++++++++++++++++
+ 3 files changed, 73 insertions(+), 12 deletions(-)
+ create mode 100644 tests/agent/test_credential_pool_deleted_rows.py
+
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index a37ba4017a..f4f91b844f 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -797,12 +797,9 @@ def _update_root_pool_rows(
+     *, status_cleared_ids: Optional[Iterable[str]] = None,
+     token_bases: Optional[dict[str, tuple[Any, Any]]] = None,
+ ) -> list[dict[str, Any]]:
+-    """UPDATE-ONLY merge of *payloads* into the root store's rows for *provider*.
++    """UPDATE-ONLY root merge: borrowers may refresh rows, never add or delete them.
+ 
+-    A borrower may refresh the root's rows (rotation, cooldown state) but
+-    never add or delete them — the root owns their lifecycle. In particular a
+-    profile's singleton-prune (it has no ``.anthropic_oauth.json`` of its own)
+-    must not delete the root grant, so ``removed_ids`` is ignored by callers.
++    Root owns their lifecycle; ignore profile singleton-prune's ``removed_ids``.
+     """
+     with _auth_store_lock(target_path=global_path):
+         store = _load_auth_store(global_path)
+@@ -1090,6 +1087,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+             if written is None:
+                 return
+             rows = auth_mod._entry_ids(written)
++            self._entries = [e for e in self._entries if e.id not in self._persisted_token_pairs or e.id in rows]
++            self._current_id = self._current_id if any(e.id == self._current_id for e in self._entries) else None
+             self._persisted_token_pairs = auth_mod._token_pairs_by_id(written)
+             from agent.credential_pool_model_state import adopt_persisted_row
+             for entry in self._entries:
+diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
+index 7c4c06142c..3afdce4554 100644
+--- a/hermes_cli/auth.py
++++ b/hermes_cli/auth.py
+@@ -1017,12 +1017,10 @@ def write_credential_pool(
+ ) -> list[dict[str, Any]]:
+     """Persist one provider's credential pool under auth.json.
+ 
+-    Final disk-boundary sanitizer for borrowed credentials (callers may pass raw dicts). Entries on
+-    disk but missing from *entries* (added concurrently) are merged back unless in *removed_ids*,
+-    so a rotation/exhaustion rewrite never drops a concurrent credential. Entries in
+-    *status_cleared_ids* were cleared deliberately (``hermes auth reset``) and skip the
+-    recency merge, which would otherwise read their cleared ``last_status_at`` (None ->
+-    epoch 0) as a stale snapshot and copy a still-binding cooldown back."""
++    Final disk-boundary sanitizer for borrowed credentials (callers may pass raw dicts).
++    Known IDs in *token_bases* missing on disk were removed; never insert them again.
++    IDs without a base are new additions. Concurrent disk additions are retained unless
++    in *removed_ids*. *status_cleared_ids* skips the status-recency merge for explicit resets."""
+     removed = {rid for rid in (removed_ids or ()) if rid}
+     bases = token_bases or {}
+     with _auth_store_lock():
+@@ -1043,7 +1041,8 @@ def write_credential_pool(
+                 status_cleared=e.get("id") in status_cleared,
+             )
+             if isinstance(e, dict) else e
+-            for e in sanitized]
++            for e in sanitized
++            if not isinstance(e, dict) or e.get("id") not in bases or e.get("id") in existing_by_id]
+         for disk_entry in existing_list:
+             disk_id = disk_entry.get("id") if isinstance(disk_entry, dict) else None
+             if disk_id and disk_id not in new_ids and disk_id not in removed:
+diff --git a/tests/agent/test_credential_pool_deleted_rows.py b/tests/agent/test_credential_pool_deleted_rows.py
+new file mode 100644
+index 0000000000..035f7e1acd
+--- /dev/null
++++ b/tests/agent/test_credential_pool_deleted_rows.py
+@@ -0,0 +1,63 @@
++"""A stale runtime must not resurrect rows removed by another auth process."""
++from dataclasses import replace
++import multiprocessing
++
++import pytest
++
++from agent import credential_pool as pools
++from hermes_cli import auth
++
++
++def _remove_in_peer(provider, ids):
++    # The production writer reads/merges/saves under _auth_store_lock.
++    auth.write_credential_pool(provider, [], removed_ids=ids)
++
++
++@pytest.mark.parametrize("provider", ["anthropic", "openrouter"])
++@pytest.mark.parametrize("remove_all", [False, True])
++def test_stale_runtime_flush_after_peer_removal(monkeypatch, provider, remove_all):
++    monkeypatch.setattr(pools, "_seed_from_singletons", lambda *args: (False, set()))
++    monkeypatch.setattr(pools, "_seed_from_env", lambda *args: (False, set()))
++    rows = [pools.PooledCredential(
++        provider=provider, id=f"row{i}", label=f"fixture{i}", source="manual",
++        auth_type="api_key", priority=i, access_token=f"fixture-{i}",
++    ) for i in range(2)]
++    auth.write_credential_pool(provider, [e.to_dict() for e in rows])
++    stale = pools.load_pool(provider)
++    stale._current_id = "row0"
++    removed = [e.id for e in rows] if remove_all else ["row0"]
++    peer = multiprocessing.get_context("fork").Process(target=_remove_in_peer, args=(provider, removed))
++    peer.start()
++    peer.join(10)
++    try:
++        assert peer.exitcode == 0
++    finally:
++        if peer.is_alive():
++            peer.terminate()
++            peer.join(10)
++    assert not (set(auth._entry_ids(auth.read_credential_pool(provider))) & set(removed))
++    # A new login by a third writer must survive the stale runtime's flush too.
++    fresh = replace(rows[0], id="fresh", access_token="fixture-fresh")
++    auth.write_credential_pool(provider, [fresh.to_dict()])
++    stale._entries = [replace(e, last_status="exhausted", last_status_at=100,
++                              last_error_code=429) for e in stale.entries()]
++    for _ in range(2):
++        stale._persist()
++        written = auth._entry_ids(auth.read_credential_pool(provider))
++        assert not (set(written) & set(removed))
++        assert written["fresh"]["access_token"] == "fixture-fresh"
++        if not remove_all:
++            assert written["row1"]["last_status"] == "exhausted"
++    assert not (set(e.id for e in stale.entries()) & set(removed))
++    assert stale._current_id is None
++    # Explicit addition is still supported after reconciliation.
++    stale.add_entry(replace(rows[0], id="explicit"))
++    assert "explicit" in auth._entry_ids(auth.read_credential_pool(provider))
++
++
++def test_tokenless_known_row_cannot_be_reinserted():
++    row = {"id": "blank", "source": "manual", "auth_type": "api_key"}
++    auth.write_credential_pool("openrouter", [row])
++    bases = auth._token_pairs_by_id([row])
++    auth.write_credential_pool("openrouter", [], removed_ids=["blank"])
++    assert auth.write_credential_pool("openrouter", [row], token_bases=bases) == []
+-- 
+2.43.0
+

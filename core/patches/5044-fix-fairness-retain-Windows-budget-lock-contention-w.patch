@@ -1,0 +1,120 @@
+From 22f32c8499a2b2eba8a1b706392436939e60c477 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 22:41:54 +0000
+Subject: [PATCH] fix(fairness): retain Windows budget lock contention waits
+ [daveey]
+
+---
+ hermes_cli/kanban_fairness_budget.py          | 11 ++-
+ .../test_kanban_fairness_budget_portable.py   | 69 +++++++++++++++++++
+ 2 files changed, 79 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_fairness_budget.py b/hermes_cli/kanban_fairness_budget.py
+index bec0c94077..ec5414ea24 100644
+--- a/hermes_cli/kanban_fairness_budget.py
++++ b/hermes_cli/kanban_fairness_budget.py
+@@ -8,6 +8,7 @@ are counted on the next write but cannot be prevented by this advisory protocol.
+ from __future__ import annotations
+ 
+ from contextlib import contextmanager
++import errno
+ import json
+ import os
+ from pathlib import Path
+@@ -35,7 +36,15 @@ def _locked(root):
+             # Windows locks a byte range from the current position; seeking is
+             # required on both acquisition and release, including an empty file.
+             stream.seek(0)
+-            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK if acquire else msvcrt.LK_UNLCK, 1)
++            while True:
++                try:
++                    msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK if acquire else msvcrt.LK_UNLCK, 1)
++                    return
++                except OSError as exc:
++                    # LK_LOCK waits only ten times, unlike flock(LOCK_EX).
++                    # Continue its blocking windows on contention, not IO errors.
++                    if not acquire or exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
++                        raise
+     if (root / ".capture-budget.lock").is_symlink():
+         raise ValueError("budget lock must not be a symlink")
+     with (root / ".capture-budget.lock").open("a+b") as stream:
+diff --git a/tests/hermes_cli/test_kanban_fairness_budget_portable.py b/tests/hermes_cli/test_kanban_fairness_budget_portable.py
+index 25942401f9..36443be20d 100644
+--- a/tests/hermes_cli/test_kanban_fairness_budget_portable.py
++++ b/tests/hermes_cli/test_kanban_fairness_budget_portable.py
+@@ -58,3 +58,72 @@ def test_db_capture_without_unix_primitives(tmp_path, monkeypatch):
+     assert not (bounded / "too-large").exists()
+     assert calls and calls == [1, 2] * (len(calls) // 2)
+     assert budget._used(out) <= budget._limit(out)
++
++
++def _windows_lock(monkeypatch, locking):
++    real_import = builtins.__import__
++    windows = SimpleNamespace(locking=locking, LK_LOCK=1, LK_UNLCK=2)
++
++    def platform_import(name, globals=None, locals=None, fromlist=(), level=0):
++        if globals and globals.get("__name__") == budget.__name__:
++            if name == "fcntl":
++                raise ImportError("Windows has no fcntl")
++            if name == "msvcrt":
++                return windows
++        return real_import(name, globals, locals, fromlist, level)
++
++    monkeypatch.setattr(builtins, "__import__", platform_import)
++
++
++@pytest.mark.parametrize("error_name", ["EACCES", "EAGAIN", "EDEADLK"])
++def test_windows_budget_waits_past_crt_retry_window(tmp_path, monkeypatch, error_name):
++    import errno
++
++    calls = []
++
++    def locking(fd, mode, count):
++        calls.append(mode)
++        assert count == 1
++        if mode == 1 and len(calls) <= 2:
++            raise OSError(getattr(errno, error_name), "CRT ten-attempt window exhausted")
++
++    _windows_lock(monkeypatch, locking)
++    budget.initialize(tmp_path, 4096)
++    assert budget._limit(tmp_path) == 4096
++    assert calls == [1, 1, 1, 2]
++
++
++@pytest.mark.parametrize("mode,error_name", [(1, "EBADF"), (2, "EBADF"), (2, "EACCES")])
++def test_windows_budget_does_not_retry_noncontention_errors(tmp_path, monkeypatch, mode, error_name):
++    import errno
++
++    calls = []
++
++    def locking(fd, operation, count):
++        calls.append(operation)
++        assert len(calls) <= 2, "must not retry a fatal acquisition or failed unlock"
++        if operation == mode:
++            raise OSError(getattr(errno, error_name), "lock failure")
++
++    _windows_lock(monkeypatch, locking)
++    with pytest.raises(OSError) as caught:
++        with budget._locked(tmp_path):
++            pass
++    assert caught.value.errno == getattr(errno, error_name)
++    assert calls == ([1] if mode == 1 else [1, 2])
++
++
++def test_windows_budget_locks_byte_zero_with_existing_sentinel(tmp_path, monkeypatch):
++    (tmp_path / ".capture-budget.lock").write_bytes(b"existing sentinel")
++    calls = []
++
++    def locking(fd, mode, count):
++        assert os.lseek(fd, 0, os.SEEK_CUR) == 0
++        calls.append(mode)
++        # Prove release repositions too, rather than relying on acquisition.
++        os.lseek(fd, 7, os.SEEK_SET)
++
++    _windows_lock(monkeypatch, locking)
++    with budget._locked(tmp_path):
++        pass
++    assert calls == [1, 2]
+-- 
+2.43.0
+

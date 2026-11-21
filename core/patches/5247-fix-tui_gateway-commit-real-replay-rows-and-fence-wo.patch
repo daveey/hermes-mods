@@ -1,0 +1,549 @@
+From 3e90849739bb76e295a86366c4671bec66c6ad4b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 11:54:52 +0000
+Subject: [PATCH] fix(tui_gateway): commit real replay rows and fence worker
+ admission [daveey]
+
+Proof: canonical six-file consumer run 98 passed, retries disabled; seven real SessionDB boundary cases cover rollback, restaging, admitted crash, profile refusal, and actual delayed wake versus Stop. Full scripts/check 21 checks pass. Remaining retirement concurrency and retention acceptance stays on owner card before landing.
+---
+ .../test_automation_replay_dispatch.py        | 158 ++++++++++++++++++
+ .../test_automation_replay_handoff.py         |  28 +++-
+ tui_gateway/automation_replay.py              |  32 +++-
+ tui_gateway/automation_replay_dispatch.py     |  90 ++++++++++
+ tui_gateway/automation_replay_handoff.py      |  26 +++
+ tui_gateway/prompt_turn.py                    |  20 ++-
+ tui_gateway/session_notifications.py          |   7 +-
+ 7 files changed, 349 insertions(+), 12 deletions(-)
+ create mode 100644 tests/tui_gateway/test_automation_replay_dispatch.py
+ create mode 100644 tui_gateway/automation_replay_dispatch.py
+
+diff --git a/tests/tui_gateway/test_automation_replay_dispatch.py b/tests/tui_gateway/test_automation_replay_dispatch.py
+new file mode 100644
+index 0000000000..e95a0e53b3
+--- /dev/null
++++ b/tests/tui_gateway/test_automation_replay_dispatch.py
+@@ -0,0 +1,158 @@
++"""Real session-store boundaries for retirement replay admission."""
++import sqlite3
++import threading
++from contextlib import nullcontext
++from types import SimpleNamespace
++
++from tests.tui_gateway import test_prompt_start_lock_order as prompt_helpers
++
++turn_env = prompt_helpers.turn_env
++
++import pytest
++
++from hermes_state import SessionDB
++from tui_gateway.automation_replay_handoff import Journal
++from tests.tui_gateway.test_automation_replay_handoff import item
++
++
++@pytest.fixture
++def store(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("chat", source="desktop")
++    journal = Journal(tmp_path)
++    journal.publish("chat", [item(persisted=False)])
++    batch = journal.claim("chat", 100, "dead", lambda _: False)
++    yield db, journal, batch
++    db.close()
++
++
++def delivery(journal, batch):
++    from tui_gateway.automation_replay_dispatch import Delivery
++    return Delivery(journal, batch)
++
++
++def stage(db, journal, batch, text="original"):
++    session = {"session_key": "chat", "agent": SimpleNamespace(session_id="chat")}
++    pending = delivery(journal, batch)
++    accepted = pending.stage(db, session, text, "process_complete", {"automation_replay": {"batch_id": batch["id"]}})
++    assert accepted == session["_submit_user_row"]["content"]
++    return pending, session
++
++
++def test_commit_recovery_restages_same_real_row_and_original_content(store):
++    db, journal, batch = store
++    first, session = stage(db, journal, batch)
++    recovered = journal.claim("chat", 100, "successor", lambda _: False)
++    second, resumed = stage(db, journal, recovered, "new timestamp note")
++    assert resumed["_submit_user_row"]["content"] == "original"
++    assert resumed["_submit_user_row"]["_row_id"] == session["_submit_user_row"]["_row_id"]
++    assert len(db.get_messages("chat")) == 1
++    assert not first.admit()
++    assert second.admit()
++    assert not second.admit()
++
++
++def test_admitted_receipt_recovers_without_assistant_or_second_dispatch(store):
++    db, journal, batch = store
++    pending, _ = stage(db, journal, batch)
++    assert pending.admit()
++    # Simulate death after durable worker admission but before settlement/model API.
++    recovered = journal.claim("chat", 100, "successor", lambda _: False)
++    assert recovered["dispatch"] == "admitted"
++    assert not delivery(journal, recovered).admit()
++    assert journal.settle(recovered)
++    assert len(db.get_messages("chat")) == 1
++    assert journal.owners() == []
++
++
++def test_stop_between_row_commit_and_worker_entry_refuses_dispatch(store):
++    db, journal, batch = store
++    pending, _ = stage(db, journal, batch)
++    journal.cancel("chat", 1e20, stop=True)
++    assert not pending.admit()
++    assert journal.owners() == []
++
++
++def test_commit_receipt_rolls_back_real_message_and_counters(store, monkeypatch):
++    db, journal, batch = store
++    original = db._bump_session_counters
++    def fail(*args, **kwargs):
++        original(*args, **kwargs)
++        raise RuntimeError("crash in transaction")
++    monkeypatch.setattr(db, "_bump_session_counters", fail)
++    with pytest.raises(RuntimeError, match="crash"):
++        stage(db, journal, batch)
++    assert db.get_messages("chat") == []
++    with sqlite3.connect(journal.path) as conn:
++        assert conn.execute("SELECT message_row_id FROM automation_replay_batches").fetchone()[0] is None
++        assert conn.execute("SELECT message_count FROM sessions WHERE id='chat'").fetchone()[0] == 0
++
++
++def test_wrong_profile_store_cannot_write_replay(store, tmp_path):
++    _, journal, batch = store
++    other = SessionDB(tmp_path / "foreign.db")
++    try:
++        other.create_session("chat", source="desktop")
++        with pytest.raises(ValueError, match="profile"):
++            stage(other, journal, batch)
++        assert other.get_messages("chat") == []
++    finally:
++        other.close()
++
++
++@pytest.mark.parametrize("stop", [False, True])
++def test_real_wake_worker_entry_and_live_pending_claim(store, turn_env, monkeypatch, stop):
++    from tui_gateway import server, automation_replay as ar
++    from tui_gateway import wake_profiles
++    from agent import memory_provider
++    db, journal, batch = store
++    entered, release, completed = threading.Event(), threading.Event(), threading.Event()
++    sid = "dispatch-worker-proof"
++    session = prompt_helpers._registered_session(sid, threading.RLock(), completed)
++    session.update(profile_home=str(journal.path.parent), session_key="chat", running=False)
++    session["agent"].session_id = "chat"
++    session["agent"]._session_db = db
++    monkeypatch.setattr(server, "_session_db", lambda _: nullcontext(db))
++    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _: True)
++    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a: None)
++    monkeypatch.setattr(server, "_routing_provenance_db", lambda _: nullcontext(None))
++    monkeypatch.setattr(server, "_reopen_routed_session_row", lambda *a: None)
++    monkeypatch.setattr(server, "_start_agent_build", lambda *a: None)
++    monkeypatch.setattr(server, "_restart_completed_failed_agent_build", lambda *a: None)
++    monkeypatch.setattr(wake_profiles, "live_for_profiles", lambda *a: (sid, session))
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: None)
++    monkeypatch.setattr(ar, "retiring_backend_refuses", lambda *a: False)
++    original_spawn = memory_provider.spawn_context_thread
++    def delayed(target, **kwargs):
++        def wait_then_run():
++            entered.set()
++            assert release.wait(10)
++            target()
++        return original_spawn(wait_then_run, **kwargs)
++    monkeypatch.setattr(memory_provider, "spawn_context_thread", delayed)
++    journal.release(batch)
++    try:
++        assert ar.consume_handoffs([journal.path.parent], now=100) == 1
++        assert entered.wait(10)
++        # Wake returned, but the actual PreparedWork has not entered its body.
++        assert ar.consume_handoffs([journal.path.parent], now=100) == 0
++        if stop:
++            ar.cancel_durable(journal.path.parent, ("chat",), 1e20, stop=True)
++        release.set()
++        session["_run_thread"].join(10)
++        assert not session["_run_thread"].is_alive()
++        assert completed.is_set() is (not stop)
++        assert len(db.get_messages("chat")) >= 1
++        assert not session["running"]
++        if not stop:
++            # Worker admission is permanent even without relying on its assistant rows.
++            ar.consume_handoffs([journal.path.parent], now=100)
++        assert journal.owners() == []
++        assert "_submit_user_row" not in session
++        assert "inflight_turn" not in session or session["inflight_turn"] is None
++    finally:
++        release.set()
++        if session.get("_run_thread") is not None:
++            session["_run_thread"].join(10)
++        with server._sessions_lock:
++            server._sessions.pop(sid, None)
+diff --git a/tests/tui_gateway/test_automation_replay_handoff.py b/tests/tui_gateway/test_automation_replay_handoff.py
+index 4c257bd65c..776bb5f35a 100644
+--- a/tests/tui_gateway/test_automation_replay_handoff.py
++++ b/tests/tui_gateway/test_automation_replay_handoff.py
+@@ -212,6 +212,9 @@ KEY = "20261119_232638_a67251"
+ 
+ @pytest.fixture
+ def wired(journal, monkeypatch):
++    from hermes_state import SessionDB
++    db = SessionDB(journal.path)
++    db.create_session(KEY, source="desktop")
+     monkeypatch.setattr("hermes_constants.get_process_hermes_home", lambda: journal.path.parent)
+     monkeypatch.setattr(ar, "ENABLED", True)
+     monkeypatch.setattr(threading, "Timer", lambda delay, fn: types.SimpleNamespace(
+@@ -219,6 +222,21 @@ def wired(journal, monkeypatch):
+     ar.reset()
+     yield journal
+     ar.reset()
++    db.close()
++
++
++def accepted_wake(journal, key, text, kw):
++    from hermes_state import SessionDB
++    db = SessionDB(journal.path)
++    try:
++        delivery = kw["replay_delivery"]
++        session = {"session_key": key}
++        assert delivery.stage(db, session, text, kw["display_kind"], kw["display_metadata"])
++        assert delivery.admit()
++        assert journal.settle(delivery.batch)
++    finally:
++        db.close()
++    return "started"
+ 
+ 
+ def _arm_mixed(home, now=1000.0):
+@@ -248,7 +266,7 @@ def test_successor_replays_handed_off_mixed_delivery_exactly_once_in_exact_profi
+ 
+     def wake(key, text, **kw):
+         calls.append((key, text, kw))
+-        return "started"
++        return accepted_wake(wired, key, text, kw)
+ 
+     assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000.0) == 1
+     assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000.0) == 0  # settled: no duplicate
+@@ -266,7 +284,9 @@ def test_refused_admission_retains_custody_for_the_next_pass(wired, monkeypatch,
+     ar._fire(KEY)
+     monkeypatch.setattr(ar, "stale_code_reason", lambda: None)
+     verdicts = iter([blocked] * 20 + ["started"])
+-    wake = lambda *a, **k: next(verdicts)
++    def wake(key, text, **kw):
++        verdict = next(verdicts)
++        return accepted_wake(wired, key, text, kw) if verdict == "started" else verdict
+     for _ in range(20):
+         assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000.0) == 1
+     assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000.0) == 1
+@@ -343,7 +363,9 @@ def test_storage_error_after_claim_does_not_strand_the_batch_or_raise(wired, mon
+ 
+     monkeypatch.setattr(Journal, "release", flaky)
+     verdicts = iter(["busy", "started"])
+-    wake = lambda *a, **k: next(verdicts)
++    def wake(key, text, **kw):
++        verdict = next(verdicts)
++        return accepted_wake(wired, key, text, kw) if verdict == "started" else verdict
+     assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000.0) == 1  # no raise
+     assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000.0) == 1  # own stale claim re-claimed
+     assert not wired.owners()
+diff --git a/tui_gateway/automation_replay.py b/tui_gateway/automation_replay.py
+index a526232d35..1fb5c42e69 100644
+--- a/tui_gateway/automation_replay.py
++++ b/tui_gateway/automation_replay.py
+@@ -704,6 +704,7 @@ def _holder_alive(holder: str) -> bool:
+ HANDOFF_FAILURES_MAX = 3  # failed builds/dispatches; ownership refusals retain custody
+ _failures: dict[str, int] = {}
+ _consume_mu = threading.Lock()
++_deliveries: dict[str, Any] = {}
+ 
+ 
+ def consume_handoffs(homes: list, wake: Callable[..., str] | None = None, now: float | None = None) -> int:
+@@ -721,8 +722,11 @@ def consume_handoffs(homes: list, wake: Callable[..., str] | None = None, now: f
+ 
+ 
+ def _own_or_alive(holder: str) -> bool:
+-    # Inside ``_consume_mu`` a claim held by THIS process is a leftover of an earlier pass that failed to release.
+-    return holder != _holder() and _holder_alive(holder)
++    process = holder.split("#", 1)[0]
++    if process != _holder():
++        return _holder_alive(process)
++    delivery = _deliveries.get(holder)
++    return delivery is not None and delivery.alive()
+ 
+ 
+ def _consume(homes: list, wake: Callable[..., str] | None, now: float | None) -> int:
+@@ -740,7 +744,11 @@ def _consume(homes: list, wake: Callable[..., str] | None, now: float | None) ->
+         profile = _profile_of(home)
+         for owner in owners:
+             try:
+-                batch = journal.claim(owner, time.time() if now is None else now, _holder(), _own_or_alive)
++                for held, delivery in list(_deliveries.items()):
++                    if not delivery.alive():
++                        _deliveries.pop(held, None)
++                holder = _holder() + "#" + uuid.uuid4().hex
++                batch = journal.claim(owner, time.time() if now is None else now, holder, _own_or_alive)
+             except Exception:  # health: allow BLE001 -- retried on the next pass
+                 logger.warning("automation-replay: claiming the handed-off replay of %s failed", owner, exc_info=True)
+                 continue
+@@ -755,6 +763,12 @@ def _consume(homes: list, wake: Callable[..., str] | None, now: float | None) ->
+ 
+ 
+ def _run_batch(journal, batch: dict, owner: str, profile: str | None, wake) -> None:
++    from tui_gateway.automation_replay_dispatch import Delivery
++    if batch.get("dispatch") == "admitted":
++        journal.settle(batch)
++        return
++    delivery = Delivery(journal, batch)
++    _deliveries[batch["holder"]] = delivery
+     try:
+         items = [_item_from(d) for d in json.loads(batch["payload"])]
+         text, kind, meta = replay_payload(items)
+@@ -763,11 +777,18 @@ def _run_batch(journal, batch: dict, owner: str, profile: str | None, wake) -> N
+             from tui_gateway import server
+             wake = server._wake_session_turn
+         verdict = wake(owner, text, display_kind=kind, display_metadata=meta, label="automation-replay",
+-                       profiles=[profile])
++                       profiles=[profile], replay_delivery=delivery)
+     except Exception:  # health: allow BLE001 -- bounded below
+         logger.warning("automation-replay: handed-off replay of %s raised", owner, exc_info=True)
+         verdict = "error"
+     bid = batch["id"]
++    if verdict == "started":
++        # The worker-entry gate, not return from wake, owns the durable admission.
++        # Retain the exact prepared worker until it finishes; dead work is reclaimable.
++        _failures.pop(bid, None)
++        return
++    _deliveries.pop(batch["holder"], None)
++    delivery.cleanup()
+     if verdict in ("busy", "refused"):
+         # Refusal is an admission/ownership wait, not a model failure: the retiring
+         # predecessor may retain the slot for its entire drain. Never discard custody.
+@@ -789,5 +810,4 @@ def _run_batch(journal, batch: dict, owner: str, profile: str | None, wake) -> N
+     elif verdict == "missing":
+         logger.warning("automation-replay: %s is gone; dropping its handed-off replay", owner)
+     _failures.pop(bid, None)
+-    journal.commit_message(batch, lambda conn, uid, v=verdict: (0, v))
+-    journal.settle(batch)
++    journal.discard(batch)
+diff --git a/tui_gateway/automation_replay_dispatch.py b/tui_gateway/automation_replay_dispatch.py
+new file mode 100644
+index 0000000000..33825af246
+--- /dev/null
++++ b/tui_gateway/automation_replay_dispatch.py
+@@ -0,0 +1,90 @@
++"""Atomic transcript custody and worker-entry fencing for retired automation."""
++from pathlib import Path
++
++
++class Delivery:
++    def __init__(self, journal, batch):
++        self.journal, self.batch = journal, batch
++        self.work = None
++        self.session = self.staged = None
++
++    def stage(self, db, session, text, kind, metadata):
++        """Write on the journal's transaction, then adopt its exact committed content."""
++        from agent.context_compressor import _DB_PERSISTED_MARKER
++        from agent.message_metadata import stamp_message_timestamp
++        from tui_gateway.session_workdir import _submit_row_target_key, _SUBMIT_ROW_SESSION_KEY
++        if db is None or Path(db.db_path).resolve() != self.journal.path:
++            raise ValueError("replay profile store mismatch")
++        target = _submit_row_target_key(session)
++        staged = stamp_message_timestamp({"role": "user", "content": text,
++                                          "display_kind": kind, "display_metadata": metadata})
++
++        def write(conn, uid):
++            db._check_transcript_write_guards(conn, target, None, reject_active_turn_lease=True)
++            row = conn.execute("SELECT ended_at,end_reason FROM sessions WHERE id=?", (target,)).fetchone()
++            if row is None or row["end_reason"] == "compression":
++                raise ValueError("replay target missing or rotated")
++            if row["ended_at"] is not None:
++                db._reopen_session_conn(conn, target)
++            staged["message_uid"] = uid
++            db._insert_message_rows(conn, target, [staged])
++            db._bump_session_counters(conn, target, 1, 0, unit=True)
++            return staged["_row_id"], target
++
++        receipt = self.journal.commit_message(self.batch, write)
++        if receipt is None or receipt["dispatch"] != "pending":
++            return None
++        with self.journal.transaction() as conn:
++            row = conn.execute("SELECT * FROM messages WHERE id=? AND session_id=? AND message_uid=? AND role='user'",
++                               (receipt["message_row_id"], receipt["target"], receipt["message_uid"])).fetchone()
++            if row is None:
++                raise ValueError("replay transcript identity cannot be restaged")
++            import json
++            staged = {"role": "user", "content": row["content"], "timestamp": row["timestamp"],
++                      "message_uid": row["message_uid"], "_row_id": row["id"],
++                      "display_kind": row["display_kind"],
++                      "display_metadata": json.loads(row["display_metadata"] or "{}")}
++        staged[_DB_PERSISTED_MARKER] = True
++        staged[_SUBMIT_ROW_SESSION_KEY] = receipt["target"]
++        session["_submit_user_row"] = staged
++        session["_marker_until_tool"] = True
++        self.session, self.staged = session, staged
++        return staged["content"]
++
++    def submit(self, rid, sid, session, text, kind, metadata, label):
++        from tui_gateway import server
++        accepted = False
++        claim = session.get("_notif_turn_claim")
++        try:
++            if server._ensure_session_db_row(session) is False:
++                raise RuntimeError("replay session store unavailable")
++            with server._session_db(session) as db:
++                text = self.stage(db, session, text, kind, metadata)
++            if text is None:
++                return False
++            accepted = server._notif_submit(rid, sid, session, text, f"{label} dispatch failed",
++                                             display_kind=self.staged.get("display_kind"),
++                                             display_metadata=self.staged.get("display_metadata"),
++                                             replay_delivery=self)
++            return accepted
++        finally:
++            if not accepted:
++                self.cleanup()
++                server._notif_release_claim(session, claim)
++
++    def admit(self):
++        return self.journal.admit(self.batch)
++
++    def cleanup(self):
++        if self.session is not None:
++            with self.session["history_lock"]:
++                if self.session.get("_submit_user_row") is self.staged:
++                    self.session.pop("_submit_user_row", None)
++                    self.session.pop("_marker_until_tool", None)
++
++    def bind_work(self, work):
++        self.work = work
++
++    def alive(self):
++        # PreparedWork owns cancellation/finish even if thread start or admission fails.
++        return self.work is not None and not self.work._finished
+diff --git a/tui_gateway/automation_replay_handoff.py b/tui_gateway/automation_replay_handoff.py
+index c16ed6ec09..01eaf6c8ca 100644
+--- a/tui_gateway/automation_replay_handoff.py
++++ b/tui_gateway/automation_replay_handoff.py
+@@ -44,6 +44,8 @@ class Journal:
+                 conn.execute("BEGIN IMMEDIATE")
+                 for statement in _SCHEMA:
+                     conn.execute(statement)
++                if "dispatch" not in {row["name"] for row in conn.execute("PRAGMA table_info(automation_replay_batches)")}:
++                    conn.execute("ALTER TABLE automation_replay_batches ADD COLUMN dispatch TEXT NOT NULL DEFAULT 'pending'")
+                 yield conn
+ 
+     def publish(self, owner: str, items: list[dict]) -> None:
+@@ -129,6 +131,20 @@ class Journal:
+                 "UPDATE automation_replay_batches SET token=NULL,holder=NULL WHERE id=? AND token=? "
+                 "AND status='pending'", (batch["id"], batch["token"])).rowcount)
+ 
++    def admit(self, batch: dict) -> bool:
++        """One durable worker-entry winner, not a promise of external API execution."""
++        with self.transaction() as conn:
++            row = self._owned(conn, batch)
++            if row is None or row["message_row_id"] is None or row["dispatch"] != "pending":
++                return False
++            message = conn.execute("SELECT role,message_uid FROM messages WHERE id=? AND session_id=?",
++                                   (row["message_row_id"], row["target"])).fetchone()
++            if message is None or message["role"] != "user" or message["message_uid"] != row["message_uid"]:
++                raise ValueError("replay transcript identity cannot be verified")
++            return bool(conn.execute("UPDATE automation_replay_batches SET dispatch='admitted' "
++                                     "WHERE id=? AND token=? AND dispatch='pending'",
++                                     (batch["id"], batch["token"])).rowcount)
++
+     def settle(self, batch: dict) -> bool:
+         with self.transaction() as conn:
+             row = self._owned(conn, batch)
+@@ -139,6 +155,16 @@ class Journal:
+             conn.execute("UPDATE automation_replay_items SET status='dispatched' WHERE batch=?", (batch["id"],))
+             return True
+ 
++    def discard(self, batch: dict) -> bool:
++        """Positively undeliverable/rewalled work; never fabricate a transcript receipt."""
++        with self.transaction() as conn:
++            if self._owned(conn, batch) is None:
++                return False
++            conn.execute("UPDATE automation_replay_batches SET status='cancelled',token=NULL,holder=NULL WHERE id=?",
++                         (batch["id"],))
++            conn.execute("UPDATE automation_replay_items SET status='cancelled' WHERE batch=?", (batch["id"],))
++            return True
++
+     def cancel(self, owner: str, through: float, *, stop: bool = False) -> None:
+         """Fence late publication too; successful context never covers unpersisted deliveries.
+ 
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 8077d340d3..45316118e2 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1371,7 +1371,7 @@ def _run_admitted_prompt(
+     queued_prompt_generation: int | None = None,
+     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
+     turn_author: dict | None = None, auto_continue: bool = True,
+-    report_ownership_refusal: bool = True, input_origin: str = "") -> bool:
++    report_ownership_refusal: bool = True, input_origin: str = "", replay_delivery=None) -> bool:
+     # Every dispatch binds the session's own row (session_key, real source) before the turn writes:
+     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
+     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
+@@ -1557,6 +1557,22 @@ def _run_admitted_prompt(
+                     _rearm_carried_pause_watcher(sid, session, st)
+         return st.result, goal_followup
+     def run():
++        permitted = replay_delivery is None
++        try:
++            if replay_delivery is not None:
++                permitted = replay_delivery.admit()
++        finally:
++            if replay_delivery is not None and not permitted:
++                replay_delivery.cleanup()
++                from tui_gateway.turn_admission import owns
++                with session["history_lock"]:
++                    if owns(session):
++                        session["running"] = False
++                        _clear_inflight_turn(session)
++                        if session.get(SESSION_KEY) is segments:
++                            session.pop(SESSION_KEY)
++        if not permitted:
++            return
+         from agent.notification_presentation import notification_turn
+         # _prepare_turn_input owns profile binding for the worker. The context
+         # here only gates presentation; do not introduce a second runtime scope.
+@@ -1571,6 +1587,8 @@ def _run_admitted_prompt(
+     # history_lock while they take _sessions_lock (a resume racing this submit deadlocked the backend).
+     # [daveey] The notice commit (start_synthesized_turn) marks before _sessions_lock for the same reason.
+     work = _prepare_session_work(run, name=f"prompt-turn-{sid}", session=session)
++    if replay_delivery is not None:
++        replay_delivery.bind_work(work)
+     spawning = started = False
+     try:
+         with start_synthesized_turn(session) as commit:
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 534f749a67..addced7bb8 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -1683,7 +1683,7 @@ def _readopt_wake_profiles() -> list:
+ 
+ def _wake_session_turn(session_key: str, text: str, *, display_kind: str | None = None,
+                        display_metadata: dict | None = None, label: str = "wake", build_timeout: float = 120.0,
+-                       profiles: list | None = None) -> str:
++                       profiles: list | None = None, replay_delivery=None) -> str:
+     """Run ONE agent turn with ``text`` in chat ``session_key`` from this backend: the chat live here is used as is,
+     otherwise it is resumed in-process first (``session.resume``, launch store then each named profile, the same
+     path the re-adopted-exit waker uses). For plugins that must close a loop without the user typing (e.g. a chat
+@@ -1755,7 +1755,10 @@ def _wake_session_turn(session_key: str, text: str, *, display_kind: str | None
+             logger.info("%s: %s has another live owner; not waking it here", label, key)
+             return "refused"
+         kwargs = {k: v for k, v in (("display_kind", display_kind), ("display_metadata", display_metadata)) if v}
+-        accepted = _notif_submit(rid, sid, session, text, f"{label} dispatch failed", **kwargs)
++        if replay_delivery is not None:
++            accepted = replay_delivery.submit(rid, sid, session, text, display_kind, display_metadata, label)
++        else:
++            accepted = _notif_submit(rid, sid, session, text, f"{label} dispatch failed", **kwargs)
+         if accepted is False:
+             return "refused"
+         logger.info("%s: started a turn in chat %s (live sid %s)", label, key, sid)
+-- 
+2.43.0
+

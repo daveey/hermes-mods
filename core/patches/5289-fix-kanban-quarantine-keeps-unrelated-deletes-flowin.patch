@@ -1,0 +1,363 @@
+From f67acdb37c0958cb2beae1f5903e6bab0c51d652 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 17:09:19 +0000
+Subject: [PATCH] fix(kanban): quarantine keeps unrelated deletes flowing;
+ owner-visible hold with a real release path [daveey]
+
+Review r2 on 55e25b6b75: sendable() pinned every unrelated chat-link/attachment delete pending
+(no task identity on a delete envelope) once any quarantine row existed; the hold was silent and
+its refusal named resume-contained, which cannot release it.
+- deletes with no identifiable task are sent (cannot release a hold); unidentifiable tables stay pending
+- refusal text names the receipt and 'sync quarantine --release'; status shows quarantined count
+- new 'hermes kanban sync quarantine [--release RECEIPT --reason TEXT]' (live + shadow)
+- file_holds fails closed; restore consumes its checkpoint file
+---
+ hermes_cli/kanban_containment_connections.py  |  3 +
+ hermes_cli/kanban_parser.py                   |  5 +
+ hermes_cli/kanban_sync_cli.py                 | 38 +++++++-
+ hermes_cli/kanban_sync_client.py              |  5 +-
+ hermes_cli/kanban_sync_quarantine.py          | 71 +++++++++++++-
+ .../test_kanban_receipt_quarantine_release.py | 94 +++++++++++++++++++
+ 6 files changed, 209 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_receipt_quarantine_release.py
+
+diff --git a/hermes_cli/kanban_containment_connections.py b/hermes_cli/kanban_containment_connections.py
+index 1a935ad638..6d9b4f9fed 100644
+--- a/hermes_cli/kanban_containment_connections.py
++++ b/hermes_cli/kanban_containment_connections.py
+@@ -49,6 +49,9 @@ def drop_held(conn: sqlite3.Connection, rows: list) -> list:
+ 
+ 
+ def refusal(conn: sqlite3.Connection, task_id: str) -> str | None:
++    from hermes_cli.kanban_sync_quarantine import held as quarantined, refusal as quarantine_refusal
++    if quarantined(conn, task_id):  # a host-local hold: resume-contained has no episode to release  [daveey]
++        return quarantine_refusal(conn, task_id)
+     return "containment_pending: scoped resume-contained required" if held(conn, task_id) else None
+ 
+ 
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 7b19a3f0f5..9addd0292d 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -816,6 +816,11 @@ _SPECS = [
+                                    _arg("--apply", action="store_true"),
+                                    _arg("--expect", metavar="TOKEN", default=None)],
+              help="Abandon containment-refused historical deletes in favor of the live canonical link (audited preview by default)"),
++        _cmd("quarantine", [_json_flag(), _arg("--release", metavar="RECEIPT", default=None,
++                                               help="Release one receipt's host-local hold (needs --reason)"),
++                            _arg("--reason", metavar="TEXT", default=None)],
++             help="List receipts quarantined for a changed certified identity and the tasks they hold; "
++                  "--release RECEIPT --reason TEXT lifts one after you have ruled on the Board's copy"),
+         _cmd("reserved-key", [_json_flag(), _arg("task_id", metavar="TASK_ID"),
+                               _arg("--new-key", required=True, metavar="KEY",
+                                    help="Replacement idempotency key (non-empty, not pickup-stall:/worker-resources-unknown:)"),
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index da66499605..8bc2947c40 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -49,6 +49,8 @@ def _status(args: argparse.Namespace) -> int:
+         conn.close()
+     from hermes_cli.kanban_sync_claims import describe
+     out["claims"] = describe(_path(slug), out.get("mode") or "off")  # the dispatcher's first-round gate
++    if out.get("quarantined"):
++        out["quarantined"] = f"{out['quarantined']} receipt(s) held; run `hermes kanban sync quarantine`"
+     shadow = ksc.shadow_path(slug)
+     if shadow.exists():
+         sconn = kbc.connect(shadow)
+@@ -260,6 +262,37 @@ def _reserved_key(args: argparse.Namespace) -> int:
+         report.get("action") == "preview" and report.get("eligible")) else 1
+ 
+ 
++def _quarantine(args: argparse.Namespace) -> int:
++    """List (default) or release (``--release RECEIPT --reason TEXT``) host-local receipt quarantines."""
++    from hermes_cli import kanban_sync_quarantine as quarantine
++    slug = _board(args)
++    release = getattr(args, "release", None)
++    if release and not (getattr(args, "reason", None) or "").strip():
++        print("kanban sync: --reason TEXT is required to release a quarantine")
++        return 2
++    paths = [_path(slug)] + ([ksc.shadow_path(slug)] if ksc.shadow_path(slug).exists() else [])
++    released = 0
++    listed: dict[str, dict] = {}
++    for path in paths:
++        conn = kbc.connect(path)
++        try:
++            if release:
++                released += quarantine.release(conn, release)
++            for entry in quarantine.entries(conn):
++                listed.setdefault(entry["receipt"], entry)
++        finally:
++            conn.close()
++    if release:
++        if not released:
++            print(f"kanban sync: no quarantined receipt {release} on board {slug}")
++            return 1
++        print(f"kanban sync: released {release} ({args.reason.strip()}); its refused rows are redelivered by a "
++              "replica rebuild, and it quarantines again if the Board's receipt still conflicts")
++        return 0
++    _print({"board": slug, "quarantined": list(listed.values())}, args.json)
++    return 0
++
++
+ def _dependency_delete(args: argparse.Namespace) -> int:
+     """Preview/apply audited abandonment of one refused historical link delete."""
+     from hermes_cli import kanban_sync_dependency_delete as recovery
+@@ -279,14 +312,15 @@ def _dependency_delete(args: argparse.Namespace) -> int:
+ 
+ _ACTIONS = {"status": _status, "attach": _attach, "import": _import, "diff": _diff, "run": _run,
+             "links": _links, "links-diff": _links_diff, "reconcile": _reconcile, "machine-links": _machine_links,
+-            "refill-history": _refill_history, "reserved-key": _reserved_key, "dependency-delete": _dependency_delete}
++            "refill-history": _refill_history, "reserved-key": _reserved_key, "dependency-delete": _dependency_delete,
++            "quarantine": _quarantine}
+ 
+ 
+ def cmd_sync(args: argparse.Namespace) -> int:
+     action = getattr(args, "sync_action", None)
+     if action not in _ACTIONS:
+         print("usage: hermes kanban sync {status,attach,import,diff,run,links,links-diff,reconcile,machine-links,"
+-              "refill-history,reserved-key} [--board B]")
++              "refill-history,reserved-key,quarantine} [--board B]")
+         return 2
+     try:
+         return _ACTIONS[action](args)
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 624c23fd8f..a9d94ddf23 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -945,7 +945,7 @@ def open_shadow(slug: str, gateway: str) -> sqlite3.Connection:
+         cleanup.callback(conn.close)
+         ensure_identity(conn, slug, gateway)
+         from hermes_cli import kanban_sync_quarantine as quarantine
+-        quarantine.restore(conn, quarantine.load_rebuild(path))
++        quarantine.restore(conn, quarantine.load_rebuild(path), path)
+         cleanup.pop_all()
+         return conn
+ 
+@@ -1767,6 +1767,9 @@ def status(conn: sqlite3.Connection) -> dict[str, Any]:
+            "cursor": st.get("cursor"), "pending": counts.get("pending", 0), "rejected": counts.get("rejected", 0),
+            "oldest_pending_age_s": round(age) if st and (age := outbox_age.oldest_pending_age_s(conn)) is not None
+            else None, "last_error": last_error}
++    from hermes_cli import kanban_sync_quarantine as quarantine
++    if quarantined := len(quarantine.entries(conn)):  # a held task is otherwise silent [daveey]
++        out["quarantined"] = quarantined
+     if mode != "off":
+         # A refused start writes no outbox row, so ``last_error`` alone read a stalled board as healthy. [daveey]
+         from hermes_cli import kanban_sync_runstate as runstate
+diff --git a/hermes_cli/kanban_sync_quarantine.py b/hermes_cli/kanban_sync_quarantine.py
+index b72fcd2c26..6d7c7be42d 100644
+--- a/hermes_cli/kanban_sync_quarantine.py
++++ b/hermes_cli/kanban_sync_quarantine.py
+@@ -38,11 +38,11 @@ def file_holds(path: Path) -> bool:
+         # Short-lived read-only peek, closed below; never a pooled handle.
+         peek = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)  # noqa: kanban-lockguard
+     except sqlite3.Error:
+-        return False
++        return True  # cannot tell: fail closed so the caller adopts through the real connection
+     try:
+         return _exists(peek) and peek.execute("SELECT 1 FROM containment_sync_quarantine LIMIT 1").fetchone() is not None
+     except sqlite3.Error:
+-        return False
++        return True
+     finally:
+         peek.close()
+ 
+@@ -74,6 +74,58 @@ def held(conn, task: str) -> bool:
+     return task in tasks(conn)
+ 
+ 
++def entries(conn) -> list[dict]:
++    """Owner-visible view: one dict per quarantined receipt, with every task it holds."""
++    if not _exists(conn):
++        return []
++    out = []
++    for uid, task, board, reason in conn.execute("SELECT uid,task_id,board,reason FROM containment_sync_quarantine ORDER BY rowid"):
++        held_tasks = [r[0] for r in conn.execute(
++            "SELECT task_id FROM containment_sync_quarantine_tasks WHERE receipt_uid=? ORDER BY task_id", (uid,))]
++        out.append({"receipt": uid, "board": board, "task": task, "held_tasks": held_tasks, "reason": reason})
++    return out
++
++
++def refusal(conn, task: str) -> str | None:
++    """Accurate text for a hold that ``resume-contained`` cannot release (it is host-local, not an episode)."""
++    if not held(conn, task):
++        return None
++    mine = [e["receipt"] for e in entries(conn) if task in e["held_tasks"]]
++    cause = f"receipt {mine[0]}" if mine else "a quarantined parent task"
++    return (f"containment_quarantine: held by {cause}, whose identity changed after first certification. "
++            "resume-contained cannot release it; list with `hermes kanban sync quarantine`, rule on the Board's "
++            "receipt, then `hermes kanban sync quarantine --release <receipt> --reason <why>`")
++
++
++def release(conn, receipt: str) -> int:
++    """Operator release of one receipt's host-local hold. The refused wire rows are NOT replayed: a replica
++    rebuild or the next ordinary change redelivers them. A still-conflicting receipt quarantines again on its
++    next delivery, so releasing without ruling on the Board's copy is self-correcting, never a bypass."""
++    from hermes_cli import kanban_db as kb
++    if not _exists(conn):
++        return 0
++    with kb.write_txn(conn, allow_nested=True):
++        found = conn.execute("SELECT 1 FROM containment_sync_quarantine WHERE uid=?", (receipt,)).fetchone()
++        if not found:
++            return 0
++        saved = {}
++        for table in _TABLES:
++            for op in ("update", "delete"):
++                name = f"{table}_{op}"
++                row = conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)).fetchone()
++                saved[name] = row[0]
++                conn.execute(f"DROP TRIGGER {name}")
++        conn.execute("DELETE FROM containment_sync_quarantine_tasks WHERE receipt_uid=?", (receipt,))
++        conn.execute("DELETE FROM containment_sync_quarantine WHERE uid=?", (receipt,))
++        if conn.execute("SELECT 1 FROM containment_sync_quarantine LIMIT 1").fetchone() is None:
++            # Only dependency marks can remain; with no receipt left they have no cause.
++            conn.execute("DELETE FROM containment_sync_quarantine_tasks WHERE receipt_uid='dependency'")
++        for sql in saved.values():
++            conn.execute(sql)
++    log.warning("kanban sync: released quarantine for receipt %s", receipt)
++    return 1
++
++
+ def _subjects(conn, table: str, uid: str, fields: dict) -> set[str]:
+     if table == "tasks":
+         return {uid}
+@@ -166,9 +218,17 @@ def sendable(conn, rows: list[dict], *, blocked: set[str] | None = None) -> list
+     for row in rows:
+         fields = row["fields"]
+         fields = json.loads(fields) if isinstance(fields, str) else fields
+-        subjects = _subjects(conn, row["table_name"], row["row_uid"], fields or {})
++        try:
++            subjects = _subjects(conn, row["table_name"], row["row_uid"], fields or {})
++        except ContainmentRefused:
++            continue  # unidentifiable: stays pending, never pushed
+         if subjects and not subjects & blocked:
+             safe.append(row)
++        elif not subjects and row.get("op") == "delete":
++            # A delete envelope of a chat link/attachment carries no fields and its local row is gone, so
++            # the owning task is unknowable. Removing such a row cannot release a hold; do not let one
++            # quarantined task pin every unrelated delete pending.
++            safe.append(row)
+     return safe
+ 
+ 
+@@ -181,7 +241,7 @@ def snapshot(conn) -> dict:
+     return data
+ 
+ 
+-def restore(conn, data: dict) -> None:
++def restore(conn, data: dict, checkpoint: Path | None = None) -> None:
+     if not data:
+         return
+     from hermes_cli import kanban_containment_replica as replica
+@@ -201,6 +261,9 @@ def restore(conn, data: dict) -> None:
+             for row in data[table]:
+                 marks = ",".join("?" for _ in row)
+                 conn.execute(f"INSERT OR IGNORE INTO {table} VALUES ({marks})", row)
++    if checkpoint is not None:
++        # The data now lives in the database; a later open must not re-certify every receipt again.
++        checkpoint.with_suffix(".quarantine.json").unlink(missing_ok=True)
+ 
+ 
+ def adopt(source, dest) -> None:
+diff --git a/tests/hermes_cli/test_kanban_receipt_quarantine_release.py b/tests/hermes_cli/test_kanban_receipt_quarantine_release.py
+new file mode 100644
+index 0000000000..ea94bca841
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_receipt_quarantine_release.py
+@@ -0,0 +1,94 @@
++"""Review round 2: unrelated deletes keep flowing, the hold is owner-visible and has a real release path."""
++from __future__ import annotations
++
++import json
++import time
++
++from hermes_cli import kanban_containment_connections as connections
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_quarantine as quarantine
++from tests.hermes_cli import test_kanban_containment_replica as fixtures
++from tests.hermes_cli import test_kanban_receipt_quarantine_safety as safety
++
++kanban_home = fixtures.kanban_home
++synced_conn = fixtures.synced_conn
++
++
++class Hub:
++    def __init__(self):
++        self.wires = []
++
++    def ops(self, board, wire):
++        self.wires.extend(wire)
++        return {"results": []}
++
++
++def _link(conn, task):
++    conn.execute("INSERT INTO task_chat_links (uid,task_id,chat_gateway,chat_session,kind,created_at) "
++                 "VALUES (?,?,?,?,?,?)", (f"link-{task}", task, "gw", "sess", "owner", int(time.time())))
++    conn.execute("DELETE FROM kanban_sync_outbox")
++    conn.execute("DELETE FROM task_chat_links WHERE task_id=?", (task,))
++
++
++def test_unrelated_delete_of_chat_link_is_pushed_while_a_quarantine_exists(synced_conn):
++    conn = synced_conn
++    safety.conflict(conn)
++    other = kb.create_task(conn, title="Unrelated", assignee="default")
++    _link(conn, other)
++    assert conn.execute("SELECT op FROM kanban_sync_outbox").fetchall()[0][0] == "delete"
++    hub = Hub()
++    result = ksc.push(conn, hub, "fixture", "worker", primary=False, max_batches=1)
++    assert result.sent == 1
++    assert len(hub.wires) == 1 and "delete" in json.dumps(hub.wires[0])
++
++
++def test_unidentifiable_table_stays_pending_instead_of_killing_push(synced_conn):
++    conn = synced_conn
++    safety.conflict(conn)
++    row = {"table_name": "mystery", "row_uid": "x", "op": "upsert", "fields": "{}"}
++    assert quarantine.sendable(conn, [row]) == []
++
++
++def test_hold_refusal_names_receipt_and_a_release_path_not_resume_contained(synced_conn):
++    conn = synced_conn
++    target, child, change, _hub, _ = safety.conflict(conn)
++    for task in (target, child):
++        text = connections.refusal(conn, task)
++        assert "resume-contained required" not in text
++        assert "quarantine --release" in text
++    assert change.uid in connections.refusal(conn, target)
++    listed = quarantine.entries(conn)
++    assert [e["receipt"] for e in listed] == [change.uid]
++    assert target in listed[0]["held_tasks"]
++    assert ksc.status(conn)["quarantined"] == 1
++
++
++def test_release_lifts_only_that_receipt_and_keeps_the_append_only_cache(synced_conn):
++    conn = synced_conn
++    target, child, change, _hub, original = safety.conflict(conn)
++    from hermes_cli import kanban_containment_replica as replica
++    assert quarantine.release(conn, "no-such-receipt") == 0
++    assert quarantine.release(conn, change.uid) == 1
++    assert not quarantine.held(conn, target) and not quarantine.held(conn, child)
++    assert quarantine.entries(conn) == []
++    assert replica._cached(conn, change.uid) == original  # the first observation is never rewritten
++    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'containment_sync_%'")}
++    assert len(names) == 6  # immutability triggers are back after a release
++
++
++def test_restore_consumes_checkpoint_file(synced_conn, tmp_path):
++    conn = synced_conn
++    safety.conflict(conn)
++    path = tmp_path / "replica.db"
++    quarantine.save_rebuild(conn, path)
++    assert path.with_suffix(".quarantine.json").exists()
++    data = quarantine.load_rebuild(path)
++    quarantine.restore(conn, data, path)
++    assert not path.with_suffix(".quarantine.json").exists()
++
++
++def test_unreadable_file_fails_closed(tmp_path):
++    bad = tmp_path / "shadow.db"
++    bad.write_bytes(b"not a database" * 100)
++    assert quarantine.file_holds(bad) is True
+-- 
+2.43.0
+

@@ -1,0 +1,306 @@
+From 9831d5f680aa4ec807829b531c660cfd44e5cfb9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:25:13 +0000
+Subject: [PATCH] fix(tui_gateway): handoff covers launch profile, bounds
+ failing batches, survives storage errors, tests the seams [daveey]
+
+---
+ .../test_automation_replay_handoff.py         | 107 +++++++++++++++++-
+ tui_gateway/automation_replay.py              | 103 +++++++++++++----
+ tui_gateway/automation_replay_handoff.py      |  10 +-
+ 3 files changed, 189 insertions(+), 31 deletions(-)
+
+diff --git a/tests/tui_gateway/test_automation_replay_handoff.py b/tests/tui_gateway/test_automation_replay_handoff.py
+index 064a740e06..4d52314f25 100644
+--- a/tests/tui_gateway/test_automation_replay_handoff.py
++++ b/tests/tui_gateway/test_automation_replay_handoff.py
+@@ -291,11 +291,110 @@ def test_retirement_hook_hands_off_pending(wired, monkeypatch):
+     assert ar.handoff_all() == 1 and not ar.pending(KEY) and wired.owners() == [KEY]
+ 
+ 
+-def test_entry_without_profile_home_stays_local_and_old_busy_budget_still_applies(wired, monkeypatch):
+-    ar.schedule(KEY, text="x", display_kind="kanban_notice", display_metadata={}, due=1060.0, cause="q",
+-                persisted=True, now=1000.0)
++def test_launch_profile_chat_hands_off_and_fences_via_the_launch_home(wired, monkeypatch):
++    # session records carry profile_home=None for the launch profile: that is the default case, not a leftover
++    monkeypatch.setattr("hermes_constants.get_process_hermes_home", lambda: wired.path.parent)
++    ar.schedule(KEY, text="x", display_kind="kanban_notice", display_metadata={}, due=1060.0,
++                cause="q", persisted=True, now=1000.0, profile_home=None)
+     monkeypatch.setattr(ar, "stale_code_reason", lambda: "superseded")
+-    assert not ar.handoff(KEY) and ar.pending(KEY)
++    for _ in range(ar.BUSY_RECHECKS_MAX + 2):
++        ar._fire(KEY)
++    assert not ar.pending(KEY) and wired.owners() == [KEY]
++    ar.cancel_durable(None, (KEY,), 1001.0, stop=True)  # None = launch store here too
++    assert wired.claim(KEY, 5000, "h", lambda _: False) is None
++
++
++def test_failing_batch_is_bounded_not_rewoken_every_pass(wired, monkeypatch):
++    wired.publish(KEY, [item(due=0)])
++    calls = []
++    for verdict in ("error", "refused"):
++        for _ in range(50):
++            ar.consume_handoffs([wired.path.parent], wake=lambda *a, **k: calls.append(1) or verdict, now=5000.0)
++        assert len(calls) <= ar.HANDOFF_FAILURES_MAX and not wired.owners()
++        wired.publish(KEY, [item(verdict, due=0)])
++        calls.clear()
++
++
++def test_build_failure_with_local_replay_settles_instead_of_double_owning(wired, monkeypatch):
++    wired.publish(KEY, [item(due=0)])
++
++    def wake(*a, **k):  # the real wake's build failure arms a local replay before returning "error"
++        ar.schedule(KEY, text="x", display_kind="kanban_notice", display_metadata={}, due=9e9, cause="build",
++                    persisted=False, now=1000.0, profile_home=wired.path.parent)
++        return "error"
++
++    assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000.0) == 1
++    assert not wired.owners() and ar.pending(KEY)
++
++
++def test_storage_error_after_claim_does_not_strand_the_batch_or_raise(wired, monkeypatch):
++    wired.publish(KEY, [item(due=0)])
++    real, boom = Journal.release, {"n": 1}
++
++    def flaky(self, batch):
++        if boom["n"]:
++            boom["n"] = 0
++            raise sqlite3.OperationalError("database is locked")
++        return real(self, batch)
++
++    monkeypatch.setattr(Journal, "release", flaky)
++    verdicts = iter(["busy", "started"])
++    wake = lambda *a, **k: next(verdicts)
++    assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000.0) == 1  # no raise
++    assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000.0) == 1  # own stale claim re-claimed
++    assert not wired.owners()
++
++
++# --- the wiring seams the retirement fix depends on ----------------------------------------------------------------
++
++
++def test_seam_retire_host_loops_publishes_pending(wired, monkeypatch):
++    from hermes_cli import host_loop_lease as hl
++    done = threading.Event()
++    monkeypatch.setattr(ar, "handoff_all", lambda: done.set() or 1)
++    monkeypatch.setattr(hl, "_RETIRED", {})
++    monkeypatch.setattr(hl, "_LEASES", [])
++    assert hl.retire_host_loops("t-seam", "superseded")
++    assert done.wait(5)
++
++
++def test_seam_run_pass_consumes_handoffs(monkeypatch):
++    from tui_gateway import producer_admission as pa
++    seen = []
++    monkeypatch.setattr(pa, "sweep_once", lambda: None)
++    monkeypatch.setattr(ar, "consume_handoffs", lambda homes, **k: seen.append(list(homes)) or 0)
++    monkeypatch.setattr(pa, "_server", lambda: types.SimpleNamespace(_readopt_wake_profiles=lambda: [None, "work"]))
++    lease = types.SimpleNamespace(held=lambda: True, beat=lambda: None)
++    assert pa.run_pass(lease)
++    assert len(seen) == 1 and len(seen[0]) == 2 and seen[0][1].name == "work"
++
++
++def test_seam_wake_resumes_only_in_the_given_profile(monkeypatch):
++    from tui_gateway import server
++    resumed = []
++    monkeypatch.setattr(server, "_find_live_session_by_key", lambda key: None)
++    monkeypatch.setattr(server, "_readopt_wake_profiles", lambda: [None, "a", "b"])
++    monkeypatch.setattr("tui_gateway.update_pause.left_to_successor", lambda *a, **k: False)
++    monkeypatch.setattr(ar, "retiring_backend_refuses", lambda *a, **k: False)
++
++    def resume(rid, params):
++        resumed.append(params.get("profile"))
++        return {"error": {"code": 4007}}
++
++    monkeypatch.setitem(server._methods, "session.resume", resume)
++    assert server._wake_session_turn(KEY, "x", label="t", profiles=["b"]) == "missing"
++    assert resumed == ["b"]
++    resumed.clear()
++    server._wake_session_turn(KEY, "x", label="t")
++    assert resumed == [None, "a", "b"]
++
++
++def test_seam_turn_success_and_user_stop_call_cancel_durable():
++    import inspect
++    from tui_gateway import prompt_turn, session_lifecycle
++    assert "cancel_durable" in inspect.getsource(prompt_turn._run_admitted_prompt)
++    src = inspect.getsource(session_lifecycle._interrupt_session_turn)
++    assert 'reason == "user_stop"' in src and "stop=True" in src
+ 
+ 
+ def test_durable_success_and_stop_fences(wired):
+diff --git a/tui_gateway/automation_replay.py b/tui_gateway/automation_replay.py
+index 20facf1787..5bdc3d1434 100644
+--- a/tui_gateway/automation_replay.py
++++ b/tui_gateway/automation_replay.py
+@@ -22,7 +22,8 @@ This module is the retry owner between the two, bounded so it cannot loop either
+   fired at the recorded reset, the provider still refused and rebooked an hour, the replay gave up and the notice
+   waited 8.5 h for a manual "resume", provider-169ae0ed1f).
+ 
+-The timers live in this process: a backend restart drops a pending replay (the boot sweeps and the notice
++The timers live in this process. A backend RETIRED by an update hands its pending replays to the successor through
++the chat's profile store (automation_replay_handoff); a hard crash still drops them (the boot sweeps and the notice
+ guarantee own that case). The boundary row an automation turn leaves says what failed and what happens next
+ (``failure_line``), never "send it again".
+ """
+@@ -353,7 +354,7 @@ def schedule(session_key: str, *, text: str, display_kind: str, display_metadata
+     item = _Item(text, display_kind, dict(display_metadata or {}), persisted, cause,
+                  now if failed_at is None else failed_at, attempt)
+     fire = fire or _fire
+-    home = str(profile_home) if profile_home else None
++    home = _home_of(profile_home)
+     with _lock:
+         entry = _entries.get(key)
+         if entry is not None:
+@@ -549,6 +550,17 @@ def _fire(key: str) -> None:
+ # --- replays into the chat's own profile store; the successor's continuing producer-admission pass replays them.
+ 
+ 
++def _home_of(profile_home: Any) -> str | None:
++    """The chat's exact profile home; ``None`` in a session record means the LAUNCH profile (resolved here)."""
++    if profile_home:
++        return str(profile_home)
++    try:
++        from hermes_constants import get_process_hermes_home
++        return str(get_process_hermes_home())
++    except Exception:  # health: allow BLE001 -- no resolvable home: custody stays local
++        return None
++
++
+ def _item_dict(item: _Item, due: float) -> dict:
+     return {"id": item.id, "text": item.text, "display_kind": item.display_kind,
+             "display_metadata": item.display_metadata, "persisted": item.persisted, "cause": item.cause,
+@@ -623,6 +635,7 @@ def _has_journal(home: Any) -> bool:
+ 
+ def cancel_durable(home: Any, keys: Any, through: float, *, stop: bool = False) -> None:
+     """A successful turn (context started at ``through``) or an explicit Stop fences handed-off custody."""
++    home = _home_of(home)
+     if not home or not _has_journal(home):
+         return
+     try:
+@@ -648,13 +661,31 @@ def _holder_alive(holder: str) -> bool:
+         return False
+ 
+ 
++HANDOFF_FAILURES_MAX = 3  # error/refused verdicts one batch gets before the successor gives it up
++_failures: dict[str, int] = {}
++_consume_mu = threading.Lock()
++
++
+ def consume_handoffs(homes: list, wake: Callable[..., str] | None = None, now: float | None = None) -> int:
+     """The successor's pass: replay every due handed-off delivery through the ordinary wake admission, in the exact
+-    profile that owns it. Returns how many batches ran. A refused admission leaves the batch pending (the
+-    predecessor spent no budget). Delivery is at-least-once: a crash between the wake and settlement replays once
+-    more (marked and bounded), never loses it. Never raises."""
+-    if stale_code_reason():
++    profile that owns it. Returns how many batches ran. A busy admission leaves the batch pending (the
++    predecessor spent no budget); error/refused verdicts are bounded (``HANDOFF_FAILURES_MAX``) and a build failure
++    that already armed a local replay settles the batch (one owner). Delivery is at-least-once: a crash between the
++    wake and settlement replays once more (marked and bounded). Storage errors are contained per batch."""
++    if stale_code_reason() or not _consume_mu.acquire(blocking=False):
+         return 0
++    try:
++        return _consume(homes, wake, now)
++    finally:
++        _consume_mu.release()
++
++
++def _own_or_alive(holder: str) -> bool:
++    # Inside ``_consume_mu`` a claim held by THIS process is a leftover of an earlier pass that failed to release.
++    return holder != _holder() and _holder_alive(holder)
++
++
++def _consume(homes: list, wake: Callable[..., str] | None, now: float | None) -> int:
+     from tui_gateway.automation_replay_handoff import Journal
+     ran = 0
+     for home in homes:
+@@ -668,26 +699,50 @@ def consume_handoffs(homes: list, wake: Callable[..., str] | None = None, now: f
+             continue
+         profile = Path(str(home)).name if Path(str(home)).parent.name == "profiles" else None
+         for owner in owners:
+-            batch = journal.claim(owner, time.time() if now is None else now, _holder(), _holder_alive)
++            try:
++                batch = journal.claim(owner, time.time() if now is None else now, _holder(), _own_or_alive)
++            except Exception:  # health: allow BLE001 -- retried on the next pass
++                logger.warning("automation-replay: claiming the handed-off replay of %s failed", owner, exc_info=True)
++                continue
+             if batch is None:
+                 continue
+             ran += 1
+             try:
+-                items = [_item_from(d) for d in json.loads(batch["payload"])]
+-                text, kind, meta = replay_payload(items)
+-                if wake is None:
+-                    from tui_gateway import server
+-                    wake = server._wake_session_turn
+-                verdict = wake(owner, text, display_kind=kind, display_metadata=meta, label="automation-replay",
+-                               profiles=[profile])
+-            except Exception:  # health: allow BLE001 -- retried on the next pass
+-                logger.warning("automation-replay: handed-off replay of %s raised", owner, exc_info=True)
+-                verdict = "error"
+-            if verdict in ("started", "missing"):
+-                if verdict == "missing":
+-                    logger.warning("automation-replay: %s is gone; dropping its handed-off replay", owner)
+-                journal.commit_message(batch, lambda conn, uid, v=verdict: (0, v))
+-                journal.settle(batch)
+-            else:
+-                journal.release(batch)
++                _run_batch(journal, batch, owner, profile, wake)
++            except Exception:  # health: allow BLE001 -- storage error: the claim is ours, the next pass re-claims it
++                logger.warning("automation-replay: handed-off replay of %s hit a storage error", owner, exc_info=True)
+     return ran
++
++
++def _run_batch(journal, batch: dict, owner: str, profile: str | None, wake) -> None:
++    try:
++        items = [_item_from(d) for d in json.loads(batch["payload"])]
++        text, kind, meta = replay_payload(items)
++        if wake is None:
++            from tui_gateway import server
++            wake = server._wake_session_turn
++        verdict = wake(owner, text, display_kind=kind, display_metadata=meta, label="automation-replay",
++                       profiles=[profile])
++    except Exception:  # health: allow BLE001 -- bounded below
++        logger.warning("automation-replay: handed-off replay of %s raised", owner, exc_info=True)
++        verdict = "error"
++    bid = batch["id"]
++    if verdict == "busy":
++        journal.release(batch)
++        return
++    if verdict not in ("started", "missing"):
++        with _lock:
++            _failures[bid] = _failures.get(bid, 0) + 1
++            tries = _failures[bid]
++            local = bool(_entries.get(owner))  # the failed wake already armed a local replay: it owns the delivery
++        if not local and tries < HANDOFF_FAILURES_MAX:
++            journal.release(batch)
++            return
++        logger.warning("automation-replay: giving up the handed-off replay of %s (%s after %d tries%s)", owner,
++                       verdict, tries, "; a local replay owns it" if local else "")
++        verdict = "gave_up"
++    elif verdict == "missing":
++        logger.warning("automation-replay: %s is gone; dropping its handed-off replay", owner)
++    _failures.pop(bid, None)
++    journal.commit_message(batch, lambda conn, uid, v=verdict: (0, v))
++    journal.settle(batch)
+diff --git a/tui_gateway/automation_replay_handoff.py b/tui_gateway/automation_replay_handoff.py
+index ce6b3ed1c2..c16ed6ec09 100644
+--- a/tui_gateway/automation_replay_handoff.py
++++ b/tui_gateway/automation_replay_handoff.py
+@@ -179,6 +179,10 @@ class Journal:
+                              "WHERE batch=? AND status='batched'", (row["batch"],))
+ 
+     def owners(self) -> list[str]:
+-        with self.transaction() as conn:
+-            return [row[0] for row in conn.execute(
+-                "SELECT DISTINCT owner FROM automation_replay_items WHERE status IN ('queued','batched')")]
++        """Read-only (no write lock, no DDL): owners with undelivered custody."""
++        try:
++            with closing(sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=5.0)) as conn:
++                return [row[0] for row in conn.execute(
++                    "SELECT DISTINCT owner FROM automation_replay_items WHERE status IN ('queued','batched')")]
++        except sqlite3.OperationalError:  # table not created yet
++            return []
+-- 
+2.43.0
+

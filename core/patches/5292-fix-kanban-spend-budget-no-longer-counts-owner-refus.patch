@@ -1,0 +1,237 @@
+From 2ab86d03e146eee1f17b61a759dd6e6a94160573 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 20:16:03 +0000
+Subject: [PATCH] fix(kanban): spend budget no longer counts owner-refusal runs
+ that ran no turn
+
+A card whose profile owner refused its claim fifteen times was held by the
+spend budget as if it had spent fifteen runs (t_eeeeee0000000023: 8 real runs
+plus 7 refusals, 6 owner_unavailable and 1 crashed rc 69, hit the 15-run limit).
+Refused claims run no turn and spend nothing.
+
+kanban_spend_budget.spend() now leaves out closed runs whose outcome is
+owner_unavailable / owner_down, and crashed runs with exit_code 69 (the
+owner-unreachable exit) and no usage receipt. Spend.excluded counts them and
+`spend-budget` shows the count. A crashed run that reported usage, or any other
+exit code, still counts. The cache-read token limit is unchanged.
+
+Five whys:
+1. Why was the card held? Its spend window counted 15 closed runs.
+2. Why did refusals count? spend() selects task_runs by ended_at/duration only;
+   a refusal that lasted MIN_RUN_SECONDS passes that filter.
+3. Why wasn't that fixed with the failure-budget fix? t_eeeeee0000000005 and
+   t_eeeeee0000000008 changed the dispatch failure counter only; the spend
+   counter reads task_runs with its own filter.
+4. Why did nothing catch it? No test tied the two budgets to one shared
+   definition of "a turn ran".
+5. Fix: the spend counter excludes no-turn owner refusals, with tests for the
+   mixed window, the real-runs control, a crashed-with-usage control, the
+   cache-read limit and the readback.
+
+RED/GREEN: against the old source the 5 new tests in
+tests/hermes_cli/test_kanban_spend_budget.py fail (including the 8 real + 7
+refusal window being held); with the fix the 8 test files importing
+kanban_spend_budget pass (194 tests).
+---
+ hermes_cli/kanban_spend_budget.py            | 36 ++++++++--
+ hermes_cli/kanban_spend_budget_cli.py        |  5 +-
+ tests/hermes_cli/test_kanban_spend_budget.py | 71 +++++++++++++++++++-
+ 3 files changed, 101 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_spend_budget.py b/hermes_cli/kanban_spend_budget.py
+index 5c4000afe4..e8258ca4ce 100644
+--- a/hermes_cli/kanban_spend_budget.py
++++ b/hermes_cli/kanban_spend_budget.py
+@@ -15,7 +15,9 @@ the tokens those runs reported. A spending run is a closed run that lasted at le
+ quota walls, released claims and spawn failures end in seconds and spend nothing. Tokens come from the
+ run's own ``worker_result`` receipt (``usage``, written by the managed worker from its agent's session
+ counters on the host that ran it, so a card that ran on several workers is still summed on its home board);
+-a run with no usage receipt counts as a run only.
++a run with no usage receipt counts as a run only. Runs in which the profile owner refused the claim and no
++turn ran (``owner_unavailable`` / ``owner_down``, or ``crashed`` with the owner-unreachable exit 69 and no usage
++receipt) are not spending runs; ``Spend.excluded`` counts them.
+ 
+ At ``kanban.spend_budget_runs`` spending runs (default 15) or ``kanban.spend_budget_cache_read_tokens``
+ cache-read tokens (default 30M) -- 0 disables either -- the dispatcher does not spawn the card. Deciding
+@@ -46,6 +48,11 @@ OVERRIDE_EVENT = "spend_budget_set"  # a card's own limits (``set_override``); t
+ AUTHOR = "kanban-spend-budget"
+ # A run that handed work on closes the budget window.
+ RESET_OUTCOMES = ("completed", "review_requested", "changes_requested")
++# Runs booked while the profile owner refused the claim ran no turn and spent nothing. ``owner_unavailable`` /
++# ``owner_down`` are booked as such; the fifth consecutive refusal is booked ``crashed`` with the worker's
++# owner-unreachable exit code (``kanban_owner_unavailable``: 69) and no usage receipt.
++REFUSAL_OUTCOMES = ("owner_unavailable", "owner_down")
++REFUSAL_EXIT_CODE = 69
+ USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+ _AGENT_COUNTERS = {
+     "input_tokens": "session_input_tokens", "output_tokens": "session_output_tokens",
+@@ -64,6 +71,7 @@ class Spend(NamedTuple):
+     tokens: dict  # summed USAGE_KEYS over the runs that reported usage
+     reported: int  # how many of ``runs`` carried a usage receipt
+     cost_usd: float
++    excluded: int = 0  # closed runs left out because the owner refused them and no turn ran
+ 
+ 
+ def _int(raw: Any, default: int) -> int:
+@@ -216,16 +224,32 @@ def _run_usage(conn: sqlite3.Connection, task_id: str, run_ids: list[int]) -> di
+     return out
+ 
+ 
++def _refused(outcome: Any, raw_metadata: Any, has_usage: bool) -> bool:
++    """True for a run in which the owner refused the claim and no turn ran."""
++    if outcome in REFUSAL_OUTCOMES:
++        return True
++    if outcome != "crashed" or has_usage:
++        return False
++    try:
++        meta = json.loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
++    except ValueError:
++        return False
++    code = meta.get("exit_code") if isinstance(meta, dict) else None
++    return code == REFUSAL_EXIT_CODE and not isinstance(code, bool)
++
++
+ def spend(conn: sqlite3.Connection, task_id: str, *, as_of: Optional[int] = None) -> Spend:
+     """What the card spent since it last handed work on (or was last sent to triage by this budget)."""
+     cut = int(time.time()) + 1 if as_of is None else int(as_of)
+     since = _window_start(conn, task_id, cut)
+-    run_ids = [int(r[0]) for r in conn.execute(
+-        "SELECT id FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL AND ended_at < ? AND started_at >= ? "
+-        "AND ended_at - started_at >= ?", (task_id, cut, since, MIN_RUN_SECONDS))]
++    rows = conn.execute(
++        "SELECT id, outcome, metadata FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL AND ended_at < ? "
++        "AND started_at >= ? AND ended_at - started_at >= ?", (task_id, cut, since, MIN_RUN_SECONDS)).fetchall()
++    usage = _run_usage(conn, task_id, [int(r[0]) for r in rows])
++    run_ids = [int(r[0]) for r in rows if not _refused(r[1], r[2], int(r[0]) in usage)]
++    excluded = len(rows) - len(run_ids)
+     tokens = {key: 0 for key in USAGE_KEYS}
+     cost = 0.0
+-    usage = _run_usage(conn, task_id, run_ids)
+     for item in usage.values():
+         for key in USAGE_KEYS:
+             value = item.get(key)
+@@ -234,7 +258,7 @@ def spend(conn: sqlite3.Connection, task_id: str, *, as_of: Optional[int] = None
+         value = item.get("cost_usd")
+         if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+             cost += float(value)
+-    return Spend(len(run_ids), since, tokens, len(usage), round(cost, 2))
++    return Spend(len(run_ids), since, tokens, len(usage), round(cost, 2), excluded)
+ 
+ 
+ def over(spent: Spend, lim: Limits) -> Optional[str]:
+diff --git a/hermes_cli/kanban_spend_budget_cli.py b/hermes_cli/kanban_spend_budget_cli.py
+index b6ab1767b0..0838f26daa 100644
+--- a/hermes_cli/kanban_spend_budget_cli.py
++++ b/hermes_cli/kanban_spend_budget_cli.py
+@@ -45,7 +45,7 @@ def command(args: argparse.Namespace) -> int:
+         override = ksb.card_override(conn, tid)
+         spent = ksb.spend(conn, tid)
+     out = {"task_id": tid, "limits": lim._asdict(), "override": override,
+-           "spent": {"runs": spent.runs, "since": spent.since, "tokens": spent.tokens}}
++           "spent": {"runs": spent.runs, "since": spent.since, "tokens": spent.tokens, "excluded": spent.excluded}}
+     if getattr(args, "json", False):
+         print(json.dumps(out, sort_keys=True))
+         return 0
+@@ -56,5 +56,6 @@ def command(args: argparse.Namespace) -> int:
+         print(f"{tid}: spend budget {shown}")
+     if override is not None and ksb.override_set(override):
+         print(f"  override set by {override.get('by')}: {override.get('reason')}")
+-    print(f"  spent: {spent.runs} runs, {spent.tokens['cache_read_tokens']} cache-read tokens in this window")
++    skipped = f" ({spent.excluded} owner-refusal runs excluded)" if spent.excluded else ""
++    print(f"  spent: {spent.runs} runs{skipped}, {spent.tokens['cache_read_tokens']} cache-read tokens in this window")
+     return 0
+diff --git a/tests/hermes_cli/test_kanban_spend_budget.py b/tests/hermes_cli/test_kanban_spend_budget.py
+index 17244509d1..4075b13e9a 100644
+--- a/tests/hermes_cli/test_kanban_spend_budget.py
++++ b/tests/hermes_cli/test_kanban_spend_budget.py
+@@ -55,15 +55,17 @@ class Spawns:
+ _CLOCK = {"t": 0}
+ 
+ 
+-def _run(conn, tid: str, outcome: str = "continued", *, seconds: int = 600, usage: dict | None = None) -> int:
++def _run(conn, tid: str, outcome: str = "continued", *, seconds: int = 600, usage: dict | None = None,
++         metadata: dict | None = None) -> int:
+     """One closed past run of ``tid`` (``seconds`` long), with an optional ``worker_result`` usage receipt.
+     Runs are laid out back to back, ending before now, so every one is inside the read cutoff."""
+     _CLOCK["t"] += seconds + 5
+     end = int(time.time()) - 400_000 + _CLOCK["t"]
+     with kb.write_txn(conn):
+         cur = conn.execute(
+-            "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
+-            "VALUES (?, 'default', ?, ?, ?, ?)", (tid, outcome, end - seconds, end, outcome))
++            "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, metadata) "
++            "VALUES (?, 'default', ?, ?, ?, ?, ?)",
++            (tid, outcome, end - seconds, end, outcome, None if metadata is None else json.dumps(metadata)))
+         run_id = int(cur.lastrowid)
+         if usage is not None:
+             kb._append_event(conn, tid, "worker_result", {"pid": 1, "claim_lock": "x", "exit_code": 0,
+@@ -477,3 +479,66 @@ def test_cli_sets_and_shows_the_card_override(kanban_home):
+         assert len(_events(conn, tid, ksb.OVERRIDE_EVENT)) == 3
+     assert "unknown" in kc.run_slash("spend-budget t_missing --exempt --reason x")
+     assert "--exempt" in kc.run_slash(f"spend-budget {tid} --exempt --runs 3 --reason x")
++
++
++# --- owner refusals ran no turn: they are not spending runs (t_eeeeee0000000023's 15-run hold) -----------------
++
++def _refusals(conn, tid: str) -> None:
++    """The 7 no-turn runs of t_eeeeee0000000023: six ``owner_unavailable`` and one ``crashed`` rc 69."""
++    for _ in range(3):
++        _run(conn, tid, "owner_unavailable")
++    _run(conn, tid, "crashed", metadata={"exit_kind": "nonzero_exit", "exit_code": 69})
++    for _ in range(3):
++        _run(conn, tid, "owner_unavailable")
++
++
++def test_owner_refusals_do_not_hold_the_t_eeeeee0000000023_window(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="mostly refused", assignee="default")
++        _runs(conn, tid, 8)
++        _refusals(conn, tid)  # 15 closed runs, 8 of which ran a turn
++        spent = ksb.spend(conn, tid)
++        assert (spent.runs, spent.excluded) == (8, 7)
++        assert ksb.hold(conn, tid, lim=LIMITS) is None
++        spawns = Spawns()
++        assert kbd.dispatch_once(conn, spawn_fn=spawns).no_progress_held == [] and spawns.ids == [tid]
++
++
++def test_fifteen_real_runs_still_hold_next_to_refusals(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="really spent", assignee="default")
++        _runs(conn, tid, ksb.DEFAULT_RUNS)
++        _refusals(conn, tid)
++        assert ksb.spend(conn, tid).runs == ksb.DEFAULT_RUNS
++        assert ksb.hold(conn, tid, lim=LIMITS) == "triage"
++
++
++def test_a_crashed_run_that_ran_a_turn_still_counts(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="crashed mid-turn", assignee="default")
++        _run(conn, tid, "crashed", metadata={"exit_code": 69}, usage={"input_tokens": 5})  # reported usage: a turn ran
++        _run(conn, tid, "crashed", metadata={"exit_code": 1})  # an ordinary crash
++        _run(conn, tid, "crashed")  # no receipt at all
++        spent = ksb.spend(conn, tid)
++        assert (spent.runs, spent.excluded) == (3, 0)
++
++
++def test_cache_read_limit_ignores_refusals_and_is_unchanged(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="deep reader", assignee="default")
++        _refusals(conn, tid)
++        _run(conn, tid, usage={"cache_read_tokens": 30_000_000})
++        assert ksb.hold(conn, tid, lim=LIMITS) == "triage"
++        (event,) = _events(conn, tid, ksb.EVENT)
++        assert event.payload["limit"] == "cache_read_tokens" and event.payload["runs"] == 1
++
++
++def test_readback_reports_the_excluded_count(kanban_home):
++    from hermes_cli import kanban as kc
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="mostly refused", assignee="default")
++        _runs(conn, tid, 8)
++        _refusals(conn, tid)
++    shown = json.loads(kc.run_slash(f"spend-budget {tid} --json"))
++    assert shown["spent"]["runs"] == 8 and shown["spent"]["excluded"] == 7
++    assert "spent: 8 runs (7 owner-refusal runs excluded)" in kc.run_slash(f"spend-budget {tid}")
+-- 
+2.43.0
+

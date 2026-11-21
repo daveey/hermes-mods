@@ -1,0 +1,317 @@
+From f9a03c043e062eaa9fc8626d9991cf6bb4874b92 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:37:46 +0000
+Subject: [PATCH] test(kanban-sync): per-guard coverage for dependency-delete
+ recovery; settle revalidates sync identity in its transaction [daveey]
+
+Why: a per-conjunct mutation sweep needs each guard killed independently. It surfaced one real gap: settle() rechecked evidence age, local snapshot and receipt inside its write transaction but not sync identity (apply() already did), so an identity change between proof and commit could still retire a rejected op.
+
+Proof: RED guards-red-run1.log (settle identity test retired the op); GREEN guards-green-run1.log, 95 tests in the recovery file.
+---
+ hermes_cli/kanban_sync_dependency_delete.py   |   1 +
+ .../test_kanban_sync_dependency_delete.py     | 280 ++++++++++++++++++
+ 2 files changed, 281 insertions(+)
+
+diff --git a/hermes_cli/kanban_sync_dependency_delete.py b/hermes_cli/kanban_sync_dependency_delete.py
+index 58fa743c3e..bf5a4482a7 100644
+--- a/hermes_cli/kanban_sync_dependency_delete.py
++++ b/hermes_cli/kanban_sync_dependency_delete.py
+@@ -220,6 +220,7 @@ def settle(conn, hub, board, op, receipt):
+         _require(proof["link"] == json.loads(receipt["evidence_json"])["link"], "receipt_link_changed")
+         with write_txn(conn):
+             _require(keys._fresh(started), "evidence_expired")
++            _require(keys._identity_refusal(conn, hub, board) is None, "sync_identity_changed")
+             _require(_snapshot(conn, op["row_uid"]) == snap, "local_inputs_changed")
+             _require(receipt_for_op(conn, op) == receipt, "receipt_changed")
+             conn.execute("DELETE FROM kanban_sync_outbox WHERE op_id=? AND state='rejected'", (op["op_id"],))
+diff --git a/tests/hermes_cli/test_kanban_sync_dependency_delete.py b/tests/hermes_cli/test_kanban_sync_dependency_delete.py
+index 2465fa20ab..958e0691c7 100644
+--- a/tests/hermes_cli/test_kanban_sync_dependency_delete.py
++++ b/tests/hermes_cli/test_kanban_sync_dependency_delete.py
+@@ -387,3 +387,283 @@ def test_canonical_change_during_evidence_reads_vetoes_apply(case, monkeypatch):
+     r = recovery.apply(live, hub, BOARD, uid, p["token"], "retain link")
+     assert r.get("reason") == "authoritative_feed_changed", r
+     assert rows(live, "kanban_sync_tombstones")
++
++
++# --- per-guard coverage: each test kills a specific guard/conjunct mutant -----------------------
++
++@pytest.mark.parametrize("bad", ["a", "a>a", ">b", "a>", "a>b>c", None, ""])
++def test_bad_link_uid_refused(case, bad):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, *_ = case
++    assert recovery.plan(live, hub, BOARD, bad, "retain link").get("reason") == "bad_link_uid"
++
++
++def test_local_snapshot_is_bounded(case, monkeypatch):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _, uid, *_ = case
++    monkeypatch.setattr(recovery, "MAX_ROWS", 2)
++    assert recovery.plan(live, hub, BOARD, uid, "retain link").get("reason") == "local_snapshot_too_large"
++
++
++@pytest.mark.parametrize("defect,reason", [
++    ("no_link", "local_link_changed"), ("no_endpoint", "missing_endpoint"), ("no_ops", "no_rejected_deletes"),
++    ("endpoint_tombstone", "uncovered_tombstone"), ("no_tombstone", "uncovered_tombstone"),
++    ("extra_event", None)])
++def test_local_shape_vetoes(case, defect, reason):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _, uid, parent, child = case
++    live.execute("PRAGMA foreign_keys=OFF")
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying=1")
++        if defect == "no_link":
++            live.execute("DELETE FROM task_links WHERE parent_id=?", (parent,))
++        elif defect == "no_endpoint":
++            live.execute("DELETE FROM tasks WHERE id=?", (parent,))
++        elif defect == "no_ops":
++            live.execute("DELETE FROM kanban_sync_outbox WHERE row_uid=?", (uid,))
++        elif defect == "endpoint_tombstone":
++            live.execute("INSERT INTO kanban_sync_tombstones VALUES ('tasks',?,5)", (parent,))
++        elif defect == "no_tombstone":
++            live.execute("DELETE FROM kanban_sync_tombstones WHERE row_uid=?", (uid,))
++        elif defect == "extra_event":
++            live.execute("INSERT INTO task_events(uid,task_id,kind,payload,created_at) VALUES ('x',?,'unlinked',?,1)",
++                         (child, json.dumps({"parent": parent, "child": child})))
++        live.execute("UPDATE kanban_sync_state SET applying=0")
++    p = recovery.plan(live, hub, BOARD, uid, "retain link")
++    if reason is None:
++        assert p["eligible"], p  # extra matching history only widens the audited snapshot
++    else:
++        assert p.get("reason") == reason, p
++
++
++@pytest.mark.parametrize("reason", [None, "", "   ", 5])
++def test_reason_required(case, reason):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _, uid, *_ = case
++    assert recovery.plan(live, hub, BOARD, uid, reason).get("reason") == "reason_required"
++
++
++def test_plan_refuses_inside_open_transaction(case):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _, uid, *_ = case
++    live.execute("BEGIN IMMEDIATE")
++    try:
++        assert recovery.plan(live, hub, BOARD, uid, "retain link").get("reason") == "network_inside_transaction"
++    finally:
++        live.execute("ROLLBACK")
++
++
++def test_plan_refuses_changed_sync_identity(case, monkeypatch):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _, uid, *_ = case
++    monkeypatch.setattr(recovery.keys, "_identity_refusal", lambda *a: "identity changed")
++    assert recovery.plan(live, hub, BOARD, uid, "retain link").get("reason") == "sync_identity_changed"
++
++
++def test_apply_rechecks_sync_identity_inside_transaction(case, monkeypatch):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _, uid, *_ = case
++    p = recovery.plan(live, hub, BOARD, uid, "retain link")
++    calls = []
++
++    def flip(*a):
++        calls.append(1)
++        return None if len(calls) < 2 else "identity changed"
++    monkeypatch.setattr(recovery.keys, "_identity_refusal", flip)
++    r = recovery.apply(live, hub, BOARD, uid, p["token"], "retain link")
++    assert r.get("reason") == "sync_identity_changed", r
++    assert rows(live, "kanban_sync_tombstones")
++    assert not live.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_sync_dependency_recoveries'").fetchone()
++
++
++def test_plan_refuses_shadow_link_drift(case, monkeypatch):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _, uid, parent, _child = case
++    monkeypatch.setattr(client, "_pull_replica", lambda *a, **kw: client.Pulled(busy=False, more=False))
++    shadow = client.open_shadow(BOARD, hub.ident.gateway)
++    shadow.execute("DELETE FROM task_links WHERE parent_id=?", (parent,))
++    shadow.commit()
++    shadow.close()
++    assert recovery.plan(live, hub, BOARD, uid, "retain link").get("reason") == "shadow_link_changed"
++
++
++def test_plan_alone_enforces_evidence_age(case, monkeypatch):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _, uid, *_ = case
++    clock = [0.0]
++    monkeypatch.setattr(recovery.keys, "_mono", lambda: clock[0])
++    read = hub.row_evidence
++
++    def slow(*args):
++        e = read(*args)
++        clock[0] += 11
++        return e
++    monkeypatch.setattr(hub, "row_evidence", slow)
++    assert recovery.plan(live, hub, BOARD, uid, "retain link").get("reason") == "evidence_expired"
++
++
++def test_plan_alone_detects_local_change_during_proof(case, monkeypatch):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _, uid, *_ = case
++    original = hub.row_evidence
++
++    def read(*args):
++        e = original(*args)
++        with kbc.write_txn(live):
++            live.execute("UPDATE kanban_sync_outbox SET attempts=attempts+1 WHERE op_id=?", (OP_IDS[0],))
++        return e
++    monkeypatch.setattr(hub, "row_evidence", read)
++    assert recovery.plan(live, hub, BOARD, uid, "retain link").get("reason") == "local_inputs_changed"
++
++
++def test_apply_requires_string_token(case):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _, uid, *_ = case
++    assert recovery.apply(live, hub, BOARD, uid, None, "retain link").get("reason") == "preview_token_changed"
++
++
++@pytest.mark.parametrize("defect,reason", [
++    ("board", "authoritative_identity_changed"), ("table", "authoritative_identity_changed"),
++    ("head", "authoritative_identity_changed"), ("state", "authoritative_identity_changed"),
++    ("tombstone", "authoritative_identity_changed"), ("not_dict", "authoritative_identity_changed"),
++    ("zero_version", "authoritative_version_changed"), ("child", "canonical_link_changed"),
++    ("endpoint_id", "endpoint_identity_changed"), ("episode", "canonical_containment_hold"),
++    ("next", "authoritative_feed_changed")])
++def test_authoritative_conjunct_vetoes(case, monkeypatch, defect, reason):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _svc, uid, parent, _child = case
++    read = hub.row_evidence
++
++    def evidence(board, table, key):
++        e = read(board, table, key)
++        if table == "task_links":
++            if defect == "board": e["board"] = "other"
++            if defect == "table": e["table"] = "tasks"
++            if defect == "head": e["head"] = e["head"] + 1
++            if defect == "state": e["state"] = "deleted"
++            if defect == "tombstone": e["tombstone"] = {"deleted_at": 1}
++            if defect == "not_dict": return {**e, "row": None}
++            if defect == "zero_version": e["row"]["version"] = 0
++            if defect == "child": e["row"]["child_id"] = parent
++        elif key == parent:
++            if defect == "endpoint_id": e["row"]["id"] = "other"
++            if defect == "episode": e["row"]["containment_episode"] = "ep"
++        return e
++    monkeypatch.setattr(hub, "row_evidence", evidence)
++    if defect == "next":
++        old = hub.changes
++
++        def changed(board, cursor, limit=500):
++            result = old(board, cursor, limit)
++            result["next"] = cursor + 1
++            return result
++        monkeypatch.setattr(hub, "changes", changed)
++    p = recovery.plan(live, hub, BOARD, uid, "retain link")
++    assert p.get("reason") == reason, p
++
++
++def _applied(case):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _, uid, *_ = case
++    p = recovery.plan(live, hub, BOARD, uid, "retain link")
++    assert recovery.apply(live, hub, BOARD, uid, p["token"], "retain link")["action"] == "applied"
++    op = dict(live.execute("SELECT * FROM kanban_sync_outbox WHERE op_id=?", (OP_IDS[0],)).fetchone())
++    return recovery, live, hub, op, recovery.receipt_for_op(live, op)
++
++
++@pytest.mark.parametrize("defect,reason", [
++    ("sha", "receipt_bytes_changed"), ("op_not_saved", "receipt_bytes_changed"),
++    ("board", "receipt_identity_changed"), ("endpoint", "receipt_identity_changed")])
++def test_settle_receipt_integrity(case, defect, reason):
++    recovery, live, hub, op, receipt = _applied(case)
++    if defect == "sha": receipt = {**receipt, "snapshot_sha256": "0" * 64}
++    if defect == "op_not_saved": op = {**op, "attempts": 77}
++    if defect == "board": receipt = {**receipt, "board": "other"}
++    if defect == "endpoint": receipt = {**receipt, "endpoint": "other"}
++    r = recovery.settle(live, hub, BOARD, op, receipt)
++    assert (r["action"], r["proof"]) == ("retained", reason), r
++
++
++def test_settle_refuses_extra_matching_history(case):
++    recovery, live, hub, op, receipt = _applied(case)
++    _, _, _, _uid, parent, child = case
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying=1")
++        live.execute("INSERT INTO task_events(uid,task_id,kind,payload,created_at) VALUES ('extra',?,'unlinked',?,1)",
++                     (child, json.dumps({"parent": parent, "child": child})))
++        live.execute("UPDATE kanban_sync_state SET applying=0")
++    r = recovery.settle(live, hub, BOARD, op, receipt)
++    assert (r["action"], r["proof"]) == ("retained", "history_changed"), r
++
++
++def test_settle_receipt_changed_between_proof_and_commit(case, monkeypatch):
++    recovery, live, hub, op, receipt = _applied(case)
++    monkeypatch.setattr(recovery, "receipt_for_op", lambda c, o: {**receipt, "reason": "changed"})
++    r = recovery.settle(live, hub, BOARD, op, receipt)
++    assert (r["action"], r["proof"]) == ("retained", "receipt_changed"), r
++    assert len(rows(live, "kanban_sync_outbox")) == 3
++
++
++def test_settle_age_includes_writer_lock_wait(case, monkeypatch):
++    import contextlib
++    recovery, live, hub, op, receipt = _applied(case)
++    clock = [0.0]
++    monkeypatch.setattr(recovery.keys, "_mono", lambda: clock[0])
++    transaction = recovery.write_txn
++
++    @contextlib.contextmanager
++    def delayed(conn):
++        with transaction(conn):
++            clock[0] += 31
++            yield
++    monkeypatch.setattr(recovery, "write_txn", delayed)
++    r = recovery.settle(live, hub, BOARD, op, receipt)
++    assert (r["action"], r["proof"]) == ("retained", "evidence_expired"), r
++    assert len(rows(live, "kanban_sync_outbox")) == 3
++
++
++def test_settle_local_cas_after_transaction_entry(case, monkeypatch):
++    import contextlib
++    recovery, live, hub, op, receipt = _applied(case)
++    transaction = recovery.write_txn
++
++    @contextlib.contextmanager
++    def interleaved(conn):
++        with transaction(conn):
++            conn.execute("UPDATE kanban_sync_state SET applying=1")
++            conn.execute("INSERT INTO kanban_sync_tombstones VALUES ('task_links',?,9999)", (op["row_uid"],))
++            conn.execute("UPDATE kanban_sync_state SET applying=0")
++        with transaction(conn):
++            yield
++    monkeypatch.setattr(recovery, "write_txn", interleaved)
++    r = recovery.settle(live, hub, BOARD, op, receipt)
++    assert (r["action"], r["proof"]) == ("retained", "local_inputs_changed"), r
++    assert len(rows(live, "kanban_sync_outbox")) == 3
++
++
++def test_settle_rechecks_sync_identity_inside_transaction(case, monkeypatch):
++    recovery, live, hub, op, receipt = _applied(case)
++    calls = []
++
++    def flip(*a):
++        calls.append(1)
++        return None if len(calls) < 2 else "identity changed"
++    monkeypatch.setattr(recovery.keys, "_identity_refusal", flip)
++    r = recovery.settle(live, hub, BOARD, op, receipt)
++    assert (r["action"], r["proof"]) == ("retained", "sync_identity_changed"), r
++    assert len(rows(live, "kanban_sync_outbox")) == 3
++
++
++@pytest.mark.parametrize("feed", [[], {"changes": [{"t": 1}], "more": False, "head": 1, "next": 1},
++                                  {"changes": [], "more": True, "head": 1, "next": 1},
++                                  {"changes": [], "more": False, "head": True, "next": True},
++                                  {"changes": [], "more": False, "head": 2, "next": 1},
++                                  {"changes": [], "more": False, "head": 1, "next": 2}])
++def test_empty_feed_conjuncts(feed):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++
++    class Hub:
++        def changes(self, board, cursor):
++            return feed
++    with pytest.raises(recovery.Refused, match="^authoritative_feed_changed$"):
++        recovery._empty(Hub(), BOARD, 1)
+-- 
+2.43.0
+

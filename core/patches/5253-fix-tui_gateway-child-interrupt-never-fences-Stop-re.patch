@@ -1,0 +1,94 @@
+From a41b528c3e60e85d020c9ce1695ff227238a61f6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:26:16 +0000
+Subject: [PATCH] fix(tui_gateway): child interrupt never fences Stop;
+ re-walled replay ignores earlier-success fence [daveey]
+
+---
+ .../test_automation_replay_handoff.py          | 11 +++++++++++
+ .../test_compute_host_turn_protocol.py         | 18 ++++++++++++++++++
+ tui_gateway/automation_replay_handoff.py       |  5 ++++-
+ tui_gateway/compute_host.py                    |  5 ++++-
+ 4 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/tests/tui_gateway/test_automation_replay_handoff.py b/tests/tui_gateway/test_automation_replay_handoff.py
+index 776bb5f35a..8c2e35afb1 100644
+--- a/tests/tui_gateway/test_automation_replay_handoff.py
++++ b/tests/tui_gateway/test_automation_replay_handoff.py
+@@ -470,3 +470,14 @@ def test_named_launch_profile_is_consumed(monkeypatch, tmp_path):
+     monkeypatch.setattr(ar, "consume_handoffs", lambda homes, **kw: seen.extend(homes))
+     pa._consume_replay_handoffs()
+     assert seen == [home]
++
++
++def test_rewalled_replay_is_not_fenced_by_an_earlier_success_but_is_by_stop(wired):
++    ar.cancel_durable(wired.path.parent, (KEY,), 60.0)  # earlier turn succeeded after the first failure (created=50)
++    rewalled = dict(item("rewall", created=50), source_batch="parent-batch")
++    wired.publish(KEY, [rewalled])
++    got = wired.claim(KEY, 200, "h", lambda _: False)
++    assert got and [r["id"] for r in json.loads(got["payload"])] == ["rewall"]
++    ar.cancel_durable(wired.path.parent, (KEY,), 999.0, stop=True)
++    wired.publish(KEY, [dict(item("rewall2", created=50), source_batch="parent-batch")])
++    assert wired.claim(KEY, 300, "h2", lambda _: False) is None
+diff --git a/tests/tui_gateway/test_compute_host_turn_protocol.py b/tests/tui_gateway/test_compute_host_turn_protocol.py
+index 2e2ccad158..0abead384a 100644
+--- a/tests/tui_gateway/test_compute_host_turn_protocol.py
++++ b/tests/tui_gateway/test_compute_host_turn_protocol.py
+@@ -286,3 +286,21 @@ def test_turn_start_runs_the_turn_with_the_forwarded_input_origin(turn_env, fram
+         server._sessions.pop("s-origin", None)
+         host.close()
+     assert seen == [expected]
++
++
++@pytest.mark.parametrize("reason", [None, "send_now", "plugin:hermes-bots"])
++def test_child_interrupt_never_writes_the_durable_stop_fence(monkeypatch, reason):
++    from tui_gateway import automation_replay
++    monkeypatch.setenv("HERMES_COMPUTE_HOST_CHILD", "1")
++    fenced = []
++    monkeypatch.setattr(automation_replay, "cancel_durable", lambda *a, **k: fenced.append(a))
++    host = ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
++    session = _session(types.SimpleNamespace(interrupt=lambda: None))
++    session["running"] = True
++    server._sessions["s9"] = session
++    try:
++        host._handle_interrupt({"sid": "s9", "request_id": "r", "reason": reason})
++    finally:
++        server._sessions.pop("s9", None)
++        host.close()
++    assert fenced == []
+diff --git a/tui_gateway/automation_replay_handoff.py b/tui_gateway/automation_replay_handoff.py
+index 84b10b114e..7ea360e3b9 100644
+--- a/tui_gateway/automation_replay_handoff.py
++++ b/tui_gateway/automation_replay_handoff.py
+@@ -63,8 +63,11 @@ class Journal:
+             fence = conn.execute("SELECT * FROM automation_replay_fences WHERE owner=?", (owner,)).fetchone()
+             for item in items:
+                 created = item["created_at"]
++                # A re-walled replay (source_batch) keeps the first failure's created_at, so a success that landed
++                # between that failure and the replay says nothing about this attempt: only Stop fences it.
+                 covered = fence and (created <= fence["stopped_at"] or
+-                                     (item["persisted"] and created <= fence["carried_through"]))
++                                     (item["persisted"] and not item.get("source_batch")
++                                      and created <= fence["carried_through"]))
+                 payload = json.dumps(item, separators=(",", ":"))
+                 terminal = conn.execute("SELECT owner,payload_sha256 FROM automation_replay_tombstones WHERE id=?",
+                                         (item["id"],)).fetchone()
+diff --git a/tui_gateway/compute_host.py b/tui_gateway/compute_host.py
+index 76176046b0..8d85d818eb 100644
+--- a/tui_gateway/compute_host.py
++++ b/tui_gateway/compute_host.py
+@@ -200,7 +200,10 @@ class ComputeHost:
+                 return
+             # In the child the shared helper interrupts the local agent and releases this
+             # process's pending clarify Event (the parent only has a metadata mirror).
+-            server._interrupt_session_turn(sid, session, reason=frame.get("reason") or None)
++            # [daveey] The parent already applied the durable Stop fence for a plain Stop before sending this
++            # frame (its frame carries no origin); the child must never write one for send-now/rewind/plugin.
++            server._interrupt_session_turn(sid, session, reason=frame.get("reason") or None,
++                                           cancel_automation_replays=False)
+             self._reply("interrupt.ack", sid, request_id, applied=True, applied_ns=now_ns())
+         self._guarded(frame, "interrupt.ack", body, applied=False)
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,958 @@
+From 910463c09f411daaa3a3809403cc5348a3828e5d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 09:57:14 +0000
+Subject: [PATCH] fix(tui_gateway): hand pending automation replays to the
+ successor on retirement [daveey]
+
+A failed automation turn's one delayed replay lived only in the process that
+scheduled it. When that backend was retired (superseded always-on / boot commit
+behind the checkout) every `_fire` was refused as "busy", spent the busy budget
+and, after BUSY_RECHECKS_MAX, dropped the mixed process_complete + kanban_notice
+delivery with no model replay (hub chat 20260101_000000_abc123, Jan 01 00:00-00:02 UTC).
+
+Five whys: the chat stayed unresolved(turn_failed) -> the retry was dropped ->
+retirement was counted as a busy chat -> custody was process-local with no
+successor owner -> no test crossed predecessor -> successor.
+
+Fix: a retired process hands each pending replay (stable item ids, original
+payload/due/attempt/persisted) to the chat's exact profile state.db
+(automation_replay_handoff.Journal) on retire_host_loops, on schedule while
+retired, and on every retired timer fire; local custody is dropped only after
+the journal accepted it, a storage failure keeps it and spends no budget.
+The producer-admission pass of the live backend consumes due batches through
+the ordinary wake admission (`_wake_session_turn(profiles=[exact profile])`),
+claim-fenced; a refused admission leaves the batch pending. A successful turn
+(context-start watermark) and an explicit user Stop fence handed-off custody;
+shutdown does not. Genuine busy exhaustion and WALL_REPLAYS_MAX are unchanged.
+
+Delivery is at-least-once: a crash between the wake and settlement replays once
+more (marked, bounded). Tests: predecessor->successor exactly-once, storage
+failure, schedule-while-retired, exact-profile wake, durable success/stop fences.
+---
+ hermes_cli/host_loop_lease.py                 |  11 +
+ .../test_automation_replay_handoff.py         | 316 ++++++++++++++++++
+ tui_gateway/automation_replay.py              | 197 ++++++++++-
+ tui_gateway/automation_replay_handoff.py      | 184 ++++++++++
+ tui_gateway/producer_admission.py             |  12 +
+ tui_gateway/prompt_turn.py                    |   4 +
+ tui_gateway/session_lifecycle.py              |   5 +
+ tui_gateway/session_notifications.py          |   9 +-
+ 8 files changed, 725 insertions(+), 13 deletions(-)
+ create mode 100644 tests/tui_gateway/test_automation_replay_handoff.py
+ create mode 100644 tui_gateway/automation_replay_handoff.py
+
+diff --git a/hermes_cli/host_loop_lease.py b/hermes_cli/host_loop_lease.py
+index 05236d0339..a02212af9b 100644
+--- a/hermes_cli/host_loop_lease.py
++++ b/hermes_cli/host_loop_lease.py
+@@ -121,9 +121,20 @@ def retire_host_loops(key: str, reason: str) -> bool:
+         lease.release()
+         if had:
+             logger.info("host loop %s: released the lease (%s)", lease.name, reason)
++    _handoff_replays()
+     return True
+ 
+ 
++def _handoff_replays() -> None:
++    """[daveey] The retired process hands its pending automation replays to the successor (off the caller)."""
++    try:
++        from agent.memory_provider import spawn_context_thread
++        from tui_gateway import automation_replay
++    except ImportError:
++        return
++    spawn_context_thread(automation_replay.handoff_all, name="automation-replay-handoff").start()
++
++
+ def resume_host_loops(key: str) -> bool:
+     """Clear one retirement reason; True when none is left (the next ``held()`` competes again)."""
+     with _RETIRE_MU:
+diff --git a/tests/tui_gateway/test_automation_replay_handoff.py b/tests/tui_gateway/test_automation_replay_handoff.py
+new file mode 100644
+index 0000000000..064a740e06
+--- /dev/null
++++ b/tests/tui_gateway/test_automation_replay_handoff.py
+@@ -0,0 +1,316 @@
++"""Durable retirement custody; deterministic crash and concurrent-publisher boundaries."""
++from __future__ import annotations
++
++import json
++import sqlite3
++from concurrent.futures import ThreadPoolExecutor
++
++import pytest
++
++from tui_gateway.automation_replay_handoff import Journal
++
++
++@pytest.fixture
++def journal(tmp_path):
++    home = tmp_path / "profile"
++    home.mkdir()
++    with sqlite3.connect(home / "state.db") as conn:
++        conn.execute("CREATE TABLE transcript(id INTEGER PRIMARY KEY, uid TEXT UNIQUE, content TEXT)")
++    return Journal(home)
++
++
++def item(identity="a", *, due=100, created=50, persisted=True, kind="kanban_notice"):
++    return {"id": identity, "due": due, "created_at": created, "persisted": persisted,
++            "text": identity, "display_kind": kind, "display_metadata": {"task_ids": ["t_eeeeee0000000002"]},
++            "cause": "quota", "failed_at": 40, "attempt": 1, "busy_rechecks": 2}
++
++
++def take(journal, now=100, holder="process-birth-A", alive=lambda _: False):
++    return journal.claim("chat", now, holder, alive)
++
++
++def writer(conn, uid):
++    cursor = conn.execute("INSERT INTO transcript(uid,content) VALUES(?,?)", (uid, "mixed replay"))
++    return cursor.lastrowid, "chat"
++
++
++def test_mixed_payload_preserves_later_reset_and_original_fields(journal):
++    items = [item(kind="process_complete"), item("b", due=3600, persisted=False)]
++    journal.publish("chat", items)
++    journal.publish("chat", items)  # retry after durable acceptance, before predecessor drops custody
++    assert take(journal, 3599) is None
++    batch = take(journal, 3600)
++    assert json.loads(batch["payload"]) == items
++    assert take(journal, 100000, holder="successor", alive=lambda _: True) is None
++    journal.commit_message(batch, writer)
++    assert journal.settle(batch)
++    assert not journal.owners()
++    journal.publish("chat", items)
++    assert take(journal, 100000) is None  # replaying old publication never resurrects settled IDs
++
++
++def test_uncommitted_batch_cannot_settle(journal):
++    journal.publish("chat", [item()])
++    batch = take(journal)
++    assert not journal.settle(batch)
++    assert journal.owners() == ["chat"]
++
++
++def test_conflicting_identity_is_not_silently_dropped(journal):
++    journal.publish("chat", [item()])
++    with pytest.raises(ValueError, match="identity"):
++        journal.publish("other-chat", [item()])
++    with pytest.raises(ValueError, match="identity"):
++        journal.publish("chat", [item(due=200)])
++
++
++def test_committed_mixed_batch_remains_one_row_until_context_covers_it(journal):
++    journal.publish("chat", [item(), item("unpersisted", persisted=False)])
++    batch = take(journal)
++    committed = journal.commit_message(batch, writer, now=90)
++    journal.cancel("chat", 60)
++    assert journal.release(batch)
++    survivor = take(journal)
++    recovered = journal.commit_message(survivor, writer, now=100)
++    assert recovered["message_uid"] == committed["message_uid"]
++    journal.cancel("chat", 95)
++    assert not journal.settle(survivor)
++    assert not journal.owners()
++    with sqlite3.connect(journal.path) as conn:
++        assert conn.execute("SELECT count(*) FROM transcript").fetchone()[0] == 1
++
++
++def test_warm_successor_observes_late_publication(journal):
++    assert journal.owners() == []
++    journal.publish("chat", [item()])
++    assert journal.owners() == ["chat"]
++    assert take(journal) is not None
++
++
++def test_join_during_claim_does_not_mutate_or_get_settled_with_old_batch(journal):
++    journal.publish("chat", [item()])
++    batch = take(journal)
++    journal.publish("chat", [item("b")])
++    assert [row["id"] for row in json.loads(batch["payload"])] == ["a"]
++    journal.commit_message(batch, writer)
++    assert journal.settle(batch)
++    successor = take(journal)
++    assert [row["id"] for row in json.loads(successor["payload"])] == ["b"]
++
++
++def test_dead_claim_recovery_keeps_identity_and_fences_stale_settlement(journal):
++    journal.publish("chat", [item()])
++    abandoned = take(journal)
++    successor = take(journal, holder="process-birth-B")
++    assert successor["id"] == abandoned["id"]
++    assert successor["token"] != abandoned["token"]
++    assert not journal.settle(abandoned)
++    assert not journal.release(abandoned)
++    assert journal.commit_message(abandoned, writer) is None
++    journal.commit_message(successor, writer)
++    assert journal.settle(successor)
++
++
++def test_transcript_commit_and_receipt_are_one_transaction(journal):
++    journal.publish("chat", [item()])
++    batch = take(journal)
++
++    def crash_before_commit(conn, uid):
++        writer(conn, uid)
++        raise RuntimeError("consumer died before commit")
++
++    with pytest.raises(RuntimeError, match="before commit"):
++        journal.commit_message(batch, crash_before_commit)
++    with sqlite3.connect(journal.path) as conn:
++        assert conn.execute("SELECT count(*) FROM transcript").fetchone()[0] == 0
++    committed = journal.commit_message(batch, writer)
++    # Death after COMMIT, before dispatch or settlement: exact existing row is restaged.
++    successor = take(journal, holder="process-birth-B")
++
++    def duplicate_writer(*_):
++        pytest.fail("must reuse committed row")
++
++    recovered = journal.commit_message(successor, duplicate_writer)
++    assert recovered["message_row_id"] == committed["message_row_id"]
++    assert recovered["message_uid"] == committed["message_uid"]
++    with sqlite3.connect(journal.path) as conn:
++        assert conn.execute("SELECT count(*) FROM transcript").fetchone()[0] == 1
++
++
++@pytest.mark.parametrize("when", ["before_publish", "after_claim", "after_commit"])
++def test_stop_fences_late_publish_claim_and_restart(journal, when):
++    batch = None
++    if when != "before_publish":
++        journal.publish("chat", [item()])
++        batch = take(journal)
++        if when == "after_commit":
++            journal.commit_message(batch, writer)
++    journal.cancel("chat", 60, stop=True)
++    journal.publish("chat", [item()])
++    fresh = Journal(journal.path.parent)
++    assert fresh.owners() == [] and take(fresh) is None
++    if batch:
++        assert not journal.settle(batch)
++        assert journal.commit_message(batch, writer) is None
++    fresh.publish("chat", [item("new-after-stop", created=61)])
++    assert take(fresh) is not None
++
++
++def test_context_watermark_preserves_unpersisted_and_later_join(journal):
++    journal.publish("chat", [item(), item("unpersisted", persisted=False), item("later", created=80)])
++    claimed = take(journal)
++    journal.cancel("chat", 60)
++    assert not journal.settle(claimed)
++    survivor = take(journal)
++    assert {row["id"] for row in json.loads(survivor["payload"])} == {"unpersisted", "later"}
++    # A later publication from the predecessor is governed by the same watermark.
++    journal.publish("chat", [item("late-published-old", created=55)])
++    journal.commit_message(survivor, writer)
++    assert journal.settle(survivor)
++    assert take(journal) is None
++
++
++def test_release_is_not_stop_and_new_instance_recovers(journal):
++    journal.publish("chat", [item()])
++    batch = take(journal)
++    assert journal.release(batch)
++    assert take(Journal(journal.path.parent)) is not None
++
++
++def test_exact_profile_isolation_and_missing_profile_refusal(journal, tmp_path):
++    home = tmp_path / "other"
++    home.mkdir()
++    with pytest.raises(FileNotFoundError):
++        Journal(home)
++    with sqlite3.connect(home / "state.db"):
++        pass
++    other = Journal(home)
++    journal.publish("chat", [item()])
++    other.publish("chat", [item()])
++    journal.cancel("chat", 60, stop=True)
++    assert take(journal) is None
++    assert take(other) is not None
++
++
++def test_concurrent_consumers_have_one_claim_and_publish_is_idempotent(journal):
++    with ThreadPoolExecutor(max_workers=4) as pool:
++        list(pool.map(lambda _: journal.publish("chat", [item()]), range(8)))
++        batches = list(pool.map(lambda n: take(journal, holder=f"birth-{n}", alive=lambda _: True), range(4)))
++    claimed = [batch for batch in batches if batch is not None]
++    assert len(claimed) == 1
++    assert len(json.loads(claimed[0]["payload"])) == 1
++
++
++# --- wiring: retirement -> journal -> successor pass (automation_replay) -----------------------------------------
++import threading
++import types
++
++from tui_gateway import automation_replay as ar
++
++KEY = "20260101_000000_abc123"
++
++
++@pytest.fixture
++def wired(journal, monkeypatch):
++    monkeypatch.setattr(ar, "ENABLED", True)
++    monkeypatch.setattr(threading, "Timer", lambda delay, fn: types.SimpleNamespace(
++        start=lambda: None, daemon=False, cancel=lambda: None))
++    ar.reset()
++    yield journal
++    ar.reset()
++
++
++def _arm_mixed(home, now=1000.0):
++    ar.schedule(KEY, text="report", display_kind="process_complete", display_metadata={}, due=now + 60,
++                cause="quota", persisted=True, now=now, profile_home=home)
++    ar.schedule(KEY, text="card done", display_kind="kanban_notice", display_metadata={"task_ids": ["t_eeeeee0000000002"]},
++                due=now + 60, cause="quota", persisted=True, now=now, profile_home=home)
++
++
++def test_retired_fire_hands_off_instead_of_spending_the_busy_budget(wired, monkeypatch):
++    _arm_mixed(wired.path.parent)
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: "superseded")
++    woken = []
++    monkeypatch.setattr("tui_gateway.server._wake_session_turn", lambda *a, **k: woken.append(a) or "busy")
++    for _ in range(ar.BUSY_RECHECKS_MAX + 3):  # far past the old busy window: nothing is spent, nothing woken
++        ar._fire(KEY)
++    assert woken == [] and not ar.pending(KEY)
++    assert wired.owners() == [KEY]
++
++
++def test_successor_replays_handed_off_mixed_delivery_exactly_once_in_exact_profile(wired, monkeypatch):
++    _arm_mixed(wired.path.parent)
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: "superseded")
++    ar._fire(KEY)
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: None)
++    calls = []
++
++    def wake(key, text, **kw):
++        calls.append((key, text, kw))
++        return "started"
++
++    assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000.0) == 1
++    assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000.0) == 0  # settled: no duplicate
++    (key, text, kw), = calls
++    assert key == KEY and "report" in text and "card done" in text
++    assert kw["display_kind"] == "kanban_notice" and ar.is_replay(kw["display_metadata"])
++    assert kw["display_metadata"][ar.REPLAY_METADATA_KEY]["deliveries"] == 2
++    assert kw["profiles"] == [None]  # tmp home is not under profiles/: the launch store, never a scan
++
++
++def test_refused_admission_retains_custody_for_the_next_pass(wired, monkeypatch):
++    _arm_mixed(wired.path.parent)
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: "superseded")
++    ar._fire(KEY)
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: None)
++    verdicts = iter(["busy"] * 20 + ["started"])
++    wake = lambda *a, **k: next(verdicts)
++    for _ in range(20):
++        assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000.0) == 1
++    assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000.0) == 1
++    assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000.0) == 0
++
++
++def test_storage_failure_keeps_local_custody_without_spending_budget(wired, monkeypatch):
++    _arm_mixed(wired.path.parent)
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: "superseded")
++    monkeypatch.setattr(Journal, "publish", lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("locked")))
++    ar._fire(KEY)
++    assert ar.pending(KEY) and ar._entries[KEY].busy_rechecks == 0 and len(ar._entries[KEY].items) == 2
++
++
++def test_schedule_while_already_retired_hands_off_at_once(wired, monkeypatch):
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: "superseded")
++    _arm_mixed(wired.path.parent)
++    assert not ar.pending(KEY) and wired.owners() == [KEY]
++
++
++def test_retirement_hook_hands_off_pending(wired, monkeypatch):
++    _arm_mixed(wired.path.parent)
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: "superseded")
++    assert ar.handoff_all() == 1 and not ar.pending(KEY) and wired.owners() == [KEY]
++
++
++def test_entry_without_profile_home_stays_local_and_old_busy_budget_still_applies(wired, monkeypatch):
++    ar.schedule(KEY, text="x", display_kind="kanban_notice", display_metadata={}, due=1060.0, cause="q",
++                persisted=True, now=1000.0)
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: "superseded")
++    assert not ar.handoff(KEY) and ar.pending(KEY)
++
++
++def test_durable_success_and_stop_fences(wired):
++    wired.publish(KEY, [item("persisted", created=50), item("unpersisted", created=50, persisted=False)])
++    ar.cancel_durable(wired.path.parent, (KEY,), 60.0)  # a successful turn whose context started at 60
++    survivors = wired.claim(KEY, 200, "h", lambda _: False)
++    assert {r["id"] for r in json.loads(survivors["payload"])} == {"unpersisted"}
++    ar.cancel_durable(wired.path.parent, (KEY,), 999.0, stop=True)
++    assert wired.claim(KEY, 300, "h2", lambda _: False) is None
++
++
++def test_cancel_durable_never_creates_tables(tmp_path):
++    home = tmp_path / "h"
++    home.mkdir()
++    sqlite3.connect(home / "state.db").close()
++    ar.cancel_durable(home, (KEY,), 1.0, stop=True)
++    with sqlite3.connect(home / "state.db") as conn:
++        assert conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0
+diff --git a/tui_gateway/automation_replay.py b/tui_gateway/automation_replay.py
+index 0a8c35e252..20facf1787 100644
+--- a/tui_gateway/automation_replay.py
++++ b/tui_gateway/automation_replay.py
+@@ -29,11 +29,16 @@ guarantee own that case). The boundary row an automation turn leaves says what f
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
+ import math
++import os
+ import re
++import sqlite3
+ import threading
+ import time
++import uuid
++from pathlib import Path
+ from dataclasses import dataclass, field
+ from typing import Any, Callable
+ 
+@@ -75,6 +80,7 @@ class _Item:
+     cause: str
+     failed_at: float
+     attempt: int = 0  # replays this delivery already had (a wall-refused replay re-armed: ``rewall_due``)
++    id: str = field(default_factory=lambda: uuid.uuid4().hex)  # stable identity across a retirement handoff
+ 
+ 
+ @dataclass
+@@ -83,6 +89,7 @@ class _Entry:
+     due: float = 0.0
+     timer: Any = None
+     busy_rechecks: int = 0
++    home: str | None = None  # the chat's exact profile home: where a retirement hands the custody over
+ 
+ 
+ _lock = threading.Lock()
+@@ -233,11 +240,12 @@ def replay_failed_wake(key: str, text: str, session: dict, display_kind: str | N
+             return
+         body, inner, failed_at, attempt = _unwrap_replay(text, meta, now)
+         schedule(key, text=body, display_kind=str(display_kind), display_metadata=inner, due=due,
+-                 cause=f"{label}: {cause}", persisted=False, attempt=attempt, failed_at=failed_at)
++                 cause=f"{label}: {cause}", persisted=False, attempt=attempt, failed_at=failed_at,
++                 profile_home=session.get("profile_home"))
+         return
+     due = replay_due(now, resets_at)
+     schedule(key, text=text, display_kind=str(display_kind), display_metadata=meta, due=due,
+-             cause=f"{label}: {cause}", persisted=False)
++             cause=f"{label}: {cause}", persisted=False, profile_home=session.get("profile_home"))
+ 
+ 
+ def _task_ids(display_metadata: Any, text: Any) -> list[str]:
+@@ -334,7 +342,8 @@ def _cancel_timer(entry: _Entry) -> None:
+ 
+ def schedule(session_key: str, *, text: str, display_kind: str, display_metadata: dict | None, due: float,
+              cause: str, persisted: bool, now: float | None = None,
+-             fire: Callable[[str], None] | None = None, attempt: int = 0, failed_at: float | None = None) -> bool:
++             fire: Callable[[str], None] | None = None, attempt: int = 0, failed_at: float | None = None,
++             profile_home: Any = None) -> bool:
+     """Arm (or join) this chat's one pending replay. True when it is pending after the call. ``attempt`` is the
+     replays the delivery already had (a wall-refused replay re-armed), ``failed_at`` its first failure."""
+     key = str(session_key or "")
+@@ -344,9 +353,11 @@ def schedule(session_key: str, *, text: str, display_kind: str, display_metadata
+     item = _Item(text, display_kind, dict(display_metadata or {}), persisted, cause,
+                  now if failed_at is None else failed_at, attempt)
+     fire = fire or _fire
++    home = str(profile_home) if profile_home else None
+     with _lock:
+         entry = _entries.get(key)
+         if entry is not None:
++            entry.home = entry.home or home
+             entry.items.append(item)
+             # A later quota/route reset wins: the joined deliveries wait for it together. A plain failure a few
+             # seconds later joins the timer already armed (no re-arm per delivery).
+@@ -356,12 +367,16 @@ def schedule(session_key: str, *, text: str, display_kind: str, display_metadata
+                 _arm(key, entry, max(due - now, REPLAY_MIN_DELAY_S), fire)
+             logger.info("automation-replay: %s joined the pending replay of %s (%d deliveries)",
+                         subject(display_kind, display_metadata, text), key, len(entry.items))
+-            return True
+-        entry = _Entry(items=[item], due=due)
+-        _entries[key] = entry
+-        _arm(key, entry, max(due - now, REPLAY_MIN_DELAY_S), fire)
+-    logger.info("automation-replay: %s failed in %s (%s); one replay at %s", subject(display_kind, display_metadata,
+-                text), key, cause, format_when(due, now))
++            joined = True
++        else:
++            joined = False
++            entry = _Entry(items=[item], due=due, home=home)
++            _entries[key] = entry
++            _arm(key, entry, max(due - now, REPLAY_MIN_DELAY_S), fire)
++    if not joined:
++        logger.info("automation-replay: %s failed in %s (%s); one replay at %s", subject(
++            display_kind, display_metadata, text), key, cause, format_when(due, now))
++    _handoff_if_retired(key)
+     return True
+ 
+ 
+@@ -482,10 +497,24 @@ def schedule_for_turn(session: dict, st: Any) -> None:
+     if is_replay(meta):  # a wall refused the replay (``rewall_due``): re-arm the deliveries it wrapped
+         text, meta, failed_at, attempt = _unwrap_replay(text, meta, time.time())
+     schedule(key, text=text, display_kind=st.display_kind, display_metadata=meta, due=plan.due, cause=plan.cause,
+-             persisted=True, attempt=attempt, failed_at=failed_at)
++             persisted=True, attempt=attempt, failed_at=failed_at,
++             profile_home=session.get("profile_home"))
+ 
+ 
+ def _fire(key: str) -> None:
++    if stale_code_reason():
++        # [daveey] A retiring backend starts no wake (``retiring_backend_refuses``): that is not a busy chat, so it
++        # must neither spend the busy budget nor drop the delivery. Hand it to the successor, or keep it.
++        with _lock:
++            entry = _entries.get(key)
++            custody = entry is not None and bool(entry.home) and bool(entry.items)
++        if custody:
++            if not handoff(key):
++                with _lock:
++                    kept = _entries.get(key)
++                    if kept is not None:
++                        _arm(key, kept, BUSY_RECHECK_S, _fire)
++            return
+     with _lock:
+         entry = _entries.pop(key, None)
+     if entry is None or not entry.items:
+@@ -514,3 +543,151 @@ def _fire(key: str) -> None:
+         return
+     logger.warning("automation-replay: gave up on %s in %s after one retry (%s); nothing more is scheduled",
+                    what, key, verdict)
++
++
++# --- retirement handoff (tui_gateway/automation_replay_handoff.py): a retiring backend publishes its pending
++# --- replays into the chat's own profile store; the successor's continuing producer-admission pass replays them.
++
++
++def _item_dict(item: _Item, due: float) -> dict:
++    return {"id": item.id, "text": item.text, "display_kind": item.display_kind,
++            "display_metadata": item.display_metadata, "persisted": item.persisted, "cause": item.cause,
++            "failed_at": item.failed_at, "attempt": item.attempt, "due": due, "created_at": item.failed_at}
++
++
++def _item_from(data: dict) -> _Item:
++    return _Item(data["text"], data["display_kind"], dict(data.get("display_metadata") or {}),
++                 bool(data["persisted"]), data.get("cause") or "", float(data["failed_at"]),
++                 int(data.get("attempt") or 0), str(data["id"]))
++
++
++def handoff(key: str) -> bool:
++    """Publish this chat's pending replay to its profile's journal; the local copy goes only once the journal
++    accepted it. False (custody kept here, nothing lost) when it cannot (no profile home, storage failure)."""
++    from tui_gateway.automation_replay_handoff import Journal
++    for _ in range(3):  # deliveries that join while the write is in flight are handed over by the next round
++        with _lock:
++            entry = _entries.get(key)
++            if entry is None or not entry.home or not entry.items:
++                return entry is None
++            items, due, home = list(entry.items), entry.due, entry.home
++        try:
++            Journal(home).publish(key, [_item_dict(i, due) for i in items])
++        except Exception:  # health: allow BLE001 -- storage failure keeps custody here
++            logger.warning("automation-replay: handing %s to the successor failed; kept here", key, exc_info=True)
++            return False
++        with _lock:
++            current = _entries.get(key)
++            if current is entry:
++                sent = {i.id for i in items}
++                current.items = [i for i in current.items if i.id not in sent]
++                if not current.items:
++                    _cancel_timer(current)
++                    del _entries[key]
++                    logger.info("automation-replay: handed the replay of %s to the successor backend", key)
++                    return True
++    return False
++
++
++def _handoff_if_retired(key: str) -> None:
++    if stale_code_reason():
++        handoff(key)
++
++
++def handoff_all() -> int:
++    """Hand every pending replay over (this process was just retired). Never raises."""
++    done = 0
++    try:
++        for key in list(_entries):
++            done += bool(handoff(key))
++    except Exception:  # health: allow BLE001 -- retirement must not fail on custody transfer
++        logger.warning("automation-replay: retirement handoff failed", exc_info=True)
++    return done
++
++
++def _has_journal(home: Any) -> bool:
++    """Cheap read-only probe: does this profile store hold replay custody at all (never creates the tables)."""
++    path = Path(str(home)) / "state.db"
++    if not path.is_file():
++        return False
++    try:
++        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)  # health: allow HX015 -- one-shot read-only probe, closed below
++        try:
++            return conn.execute(
++                "SELECT 1 FROM sqlite_master WHERE name='automation_replay_items'").fetchone() is not None
++        finally:
++            conn.close()
++    except sqlite3.Error:
++        return False
++
++
++def cancel_durable(home: Any, keys: Any, through: float, *, stop: bool = False) -> None:
++    """A successful turn (context started at ``through``) or an explicit Stop fences handed-off custody."""
++    if not home or not _has_journal(home):
++        return
++    try:
++        from tui_gateway.automation_replay_handoff import Journal
++        journal = Journal(home)
++        for key in dict.fromkeys(k for k in keys if k):
++            journal.cancel(str(key), through, stop=stop)
++    except Exception:  # health: allow BLE001 -- a fence that cannot be written must not break the turn
++        logger.warning("automation-replay: durable cancel failed", exc_info=True)
++
++
++def _holder() -> str:
++    from hermes_cli.host_loop_lease import _start_of
++    return f"{os.getpid()}|{_start_of(os.getpid())}"
++
++
++def _holder_alive(holder: str) -> bool:
++    from hermes_cli.host_loop_lease import _start_of
++    try:
++        pid, start = str(holder).split("|", 1)
++        return str(_start_of(int(pid))) == start
++    except (ValueError, TypeError):
++        return False
++
++
++def consume_handoffs(homes: list, wake: Callable[..., str] | None = None, now: float | None = None) -> int:
++    """The successor's pass: replay every due handed-off delivery through the ordinary wake admission, in the exact
++    profile that owns it. Returns how many batches ran. A refused admission leaves the batch pending (the
++    predecessor spent no budget). Delivery is at-least-once: a crash between the wake and settlement replays once
++    more (marked and bounded), never loses it. Never raises."""
++    if stale_code_reason():
++        return 0
++    from tui_gateway.automation_replay_handoff import Journal
++    ran = 0
++    for home in homes:
++        if not _has_journal(home):
++            continue
++        try:
++            journal = Journal(home)
++            owners = journal.owners()
++        except Exception:  # health: allow BLE001 -- one unreadable store must not stop the others
++            logger.warning("automation-replay: journal of %s unreadable", home, exc_info=True)
++            continue
++        profile = Path(str(home)).name if Path(str(home)).parent.name == "profiles" else None
++        for owner in owners:
++            batch = journal.claim(owner, time.time() if now is None else now, _holder(), _holder_alive)
++            if batch is None:
++                continue
++            ran += 1
++            try:
++                items = [_item_from(d) for d in json.loads(batch["payload"])]
++                text, kind, meta = replay_payload(items)
++                if wake is None:
++                    from tui_gateway import server
++                    wake = server._wake_session_turn
++                verdict = wake(owner, text, display_kind=kind, display_metadata=meta, label="automation-replay",
++                               profiles=[profile])
++            except Exception:  # health: allow BLE001 -- retried on the next pass
++                logger.warning("automation-replay: handed-off replay of %s raised", owner, exc_info=True)
++                verdict = "error"
++            if verdict in ("started", "missing"):
++                if verdict == "missing":
++                    logger.warning("automation-replay: %s is gone; dropping its handed-off replay", owner)
++                journal.commit_message(batch, lambda conn, uid, v=verdict: (0, v))
++                journal.settle(batch)
++            else:
++                journal.release(batch)
++    return ran
+diff --git a/tui_gateway/automation_replay_handoff.py b/tui_gateway/automation_replay_handoff.py
+new file mode 100644
+index 0000000000..ce6b3ed1c2
+--- /dev/null
++++ b/tui_gateway/automation_replay_handoff.py
+@@ -0,0 +1,184 @@
++"""Retirement-only replay custody, in the owning profile's session store. [daveey]
++
++Publishing is idempotent per delivery, claiming freezes a batch, and settlement is
++fenced by the claim token. New deliveries never mutate an already claimed batch.
++The transcript row can be committed in the SAME transaction via ``commit_message``.
++Explicit Stop and successful-context watermarks survive backend replacement.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++import uuid
++from contextlib import closing, contextmanager
++from pathlib import Path
++
++_SCHEMA = (
++    "CREATE TABLE IF NOT EXISTS automation_replay_items ("
++    "id TEXT PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, due REAL NOT NULL, "
++    "created_at REAL NOT NULL, persisted INTEGER NOT NULL, batch TEXT, status TEXT NOT NULL)",
++    "CREATE INDEX IF NOT EXISTS automation_replay_pending ON automation_replay_items(owner,status)",
++    "CREATE TABLE IF NOT EXISTS automation_replay_batches ("
++    "id TEXT PRIMARY KEY, owner TEXT NOT NULL, token TEXT, holder TEXT, payload TEXT NOT NULL, "
++    "status TEXT NOT NULL, message_row_id INTEGER, message_uid TEXT, target TEXT, committed_at REAL)",
++    "CREATE TABLE IF NOT EXISTS automation_replay_fences ("
++    "owner TEXT PRIMARY KEY, stopped_at REAL NOT NULL DEFAULT 0, carried_through REAL NOT NULL DEFAULT 0)",
++)
++
++
++class Journal:
++    """One exact profile; no fallback, profile discovery, or process-global home resolution."""
++
++    def __init__(self, profile_home):
++        self.path = Path(profile_home).expanduser().resolve() / "state.db"
++        # A retry must never invent a profile/session store when its owner has vanished.
++        if not self.path.is_file():
++            raise FileNotFoundError(self.path)
++
++    @contextmanager
++    def transaction(self):
++        with closing(sqlite3.connect(self.path, timeout=5.0)) as conn:
++            conn.row_factory = sqlite3.Row
++            with conn:
++                conn.execute("BEGIN IMMEDIATE")
++                for statement in _SCHEMA:
++                    conn.execute(statement)
++                yield conn
++
++    def publish(self, owner: str, items: list[dict]) -> None:
++        """Accept original delivery IDs, due dates and fields; repeats do not reset custody."""
++        with self.transaction() as conn:
++            fence = conn.execute("SELECT * FROM automation_replay_fences WHERE owner=?", (owner,)).fetchone()
++            for item in items:
++                created = item["created_at"]
++                covered = fence and (created <= fence["stopped_at"] or
++                                     (item["persisted"] and created <= fence["carried_through"]))
++                payload = json.dumps(item, separators=(",", ":"))
++                prior = conn.execute("SELECT owner,payload FROM automation_replay_items WHERE id=?",
++                                     (item["id"],)).fetchone()
++                if prior and (prior["owner"] != owner or prior["payload"] != payload):
++                    raise ValueError("delivery identity already published with different owner or payload")
++                conn.execute(
++                    "INSERT OR IGNORE INTO automation_replay_items "
++                    "(id,owner,payload,due,created_at,persisted,status) VALUES(?,?,?,?,?,?,?)",
++                    (item["id"], owner, payload, item["due"], created,
++                     bool(item["persisted"]), "cancelled" if covered else "queued"))
++
++    def claim(self, owner: str, now: float, holder: str, holder_alive) -> dict | None:
++        """Freeze one coalesced due batch, or recover the exact batch of a dead custodian.
++
++        ``holder`` is a process-birth identity, not a reusable PID. No time expiry can
++        steal a claim from a live dispatch; the caller supplies the OS liveness probe.
++        """
++        with self.transaction() as conn:
++            row = conn.execute(
++                "SELECT * FROM automation_replay_batches WHERE owner=? AND status='pending'", (owner,)).fetchone()
++            if row:
++                if row["holder"] and holder_alive(row["holder"]):
++                    return None
++                batch = dict(row)
++            else:
++                rows = conn.execute(
++                    "SELECT * FROM automation_replay_items WHERE owner=? AND status='queued' "
++                    "ORDER BY created_at,id", (owner,)).fetchall()
++                if not rows or max(row["due"] for row in rows) > now:
++                    return None
++                batch = {"id": uuid.uuid4().hex, "owner": owner,
++                         "payload": json.dumps([json.loads(row["payload"]) for row in rows]),
++                         "status": "pending", "message_row_id": None, "message_uid": None, "target": None}
++                conn.execute(
++                    "INSERT INTO automation_replay_batches(id,owner,payload,status) VALUES(?,?,?,'pending')",
++                    (batch["id"], owner, batch["payload"]))
++                conn.executemany("UPDATE automation_replay_items SET batch=?,status='batched' WHERE id=?",
++                                 [(batch["id"], row["id"]) for row in rows])
++            token = uuid.uuid4().hex
++            conn.execute("UPDATE automation_replay_batches SET token=?,holder=? WHERE id=?",
++                         (token, holder, batch["id"]))
++            return {**batch, "token": token, "holder": holder}
++
++    @staticmethod
++    def _owned(conn, batch):
++        return conn.execute(
++            "SELECT * FROM automation_replay_batches WHERE id=? AND token=? AND status='pending'",
++            (batch["id"], batch["token"])).fetchone()
++
++    def commit_message(self, batch: dict, write_message, *, now: float | None = None) -> dict | None:
++        """Commit/restage ONE transcript row under the claim fence.
++
++        ``write_message(conn, uid)`` writes on this connection and returns (row_id,
++        target). It must not commit. A crash rolls back both the row and its receipt.
++        Reclaim after COMMIT returns the same receipt without invoking the writer.
++        """
++        with self.transaction() as conn:
++            row = self._owned(conn, batch)
++            if row is None:
++                return None
++            if row["message_row_id"] is None:
++                uid = "automation-replay-" + row["id"]
++                row_id, target = write_message(conn, uid)
++                conn.execute("UPDATE automation_replay_batches SET message_row_id=?,message_uid=?,target=?,committed_at=? "
++                             "WHERE id=? AND token=?", (row_id, uid, target, time.time() if now is None else now,
++                                                      batch["id"], batch["token"]))
++            return dict(conn.execute("SELECT * FROM automation_replay_batches WHERE id=?", (batch["id"],)).fetchone())
++
++    def release(self, batch: dict) -> bool:
++        """Leave a refused admission pending; a later pass may claim it again."""
++        with self.transaction() as conn:
++            return bool(conn.execute(
++                "UPDATE automation_replay_batches SET token=NULL,holder=NULL WHERE id=? AND token=? "
++                "AND status='pending'", (batch["id"], batch["token"])).rowcount)
++
++    def settle(self, batch: dict) -> bool:
++        with self.transaction() as conn:
++            row = self._owned(conn, batch)
++            if row is None or row["message_row_id"] is None:
++                return False
++            conn.execute("UPDATE automation_replay_batches SET status='dispatched',token=NULL,holder=NULL WHERE id=?",
++                         (batch["id"],))
++            conn.execute("UPDATE automation_replay_items SET status='dispatched' WHERE batch=?", (batch["id"],))
++            return True
++
++    def cancel(self, owner: str, through: float, *, stop: bool = False) -> None:
++        """Fence late publication too; successful context never covers unpersisted deliveries.
++
++        A partially covered batch is retired and its uncovered items are queued again.
++        Its old claimant cannot commit or settle under the invalidated token.
++        """
++        column = "stopped_at" if stop else "carried_through"
++        with self.transaction() as conn:
++            conn.execute("INSERT OR IGNORE INTO automation_replay_fences(owner) VALUES(?)", (owner,))
++            conn.execute(f"UPDATE automation_replay_fences SET {column}=MAX({column},?) WHERE owner=?",
++                         (through, owner))
++            # Once committed, the shared row is an indivisible context unit. A success
++            # predating that row cannot split it and manufacture a duplicate survivor row.
++            committed = conn.execute(
++                "SELECT id,committed_at FROM automation_replay_batches WHERE owner=? "
++                "AND status='pending' AND message_row_id IS NOT NULL", (owner,)).fetchall()
++            for batch in committed:
++                if not stop and batch["committed_at"] > through:
++                    continue
++                conn.execute("UPDATE automation_replay_batches SET status='cancelled',token=NULL,holder=NULL "
++                             "WHERE id=?", (batch["id"],))
++                conn.execute("UPDATE automation_replay_items SET status='cancelled' WHERE batch=?",
++                             (batch["id"],))
++            predicate = "" if stop else " AND persisted=1"
++            predicate += (" AND (batch IS NULL OR batch IN (SELECT id FROM automation_replay_batches "
++                          "WHERE message_row_id IS NULL))")
++            rows = conn.execute("SELECT DISTINCT batch FROM automation_replay_items WHERE owner=? "
++                                "AND created_at<=? AND status IN ('queued','batched')" + predicate,
++                                (owner, through)).fetchall()
++            conn.execute("UPDATE automation_replay_items SET status='cancelled' WHERE owner=? AND created_at<=? "
++                         "AND status IN ('queued','batched')" + predicate, (owner, through))
++            for row in rows:
++                if row["batch"] is None:
++                    continue
++                conn.execute("UPDATE automation_replay_batches SET status='cancelled',token=NULL,holder=NULL "
++                             "WHERE id=? AND status='pending'", (row["batch"],))
++                conn.execute("UPDATE automation_replay_items SET batch=NULL,status='queued' "
++                             "WHERE batch=? AND status='batched'", (row["batch"],))
++
++    def owners(self) -> list[str]:
++        with self.transaction() as conn:
++            return [row[0] for row in conn.execute(
++                "SELECT DISTINCT owner FROM automation_replay_items WHERE status IN ('queued','batched')")]
+diff --git a/tui_gateway/producer_admission.py b/tui_gateway/producer_admission.py
+index b84454a04e..d3b8833e17 100644
+--- a/tui_gateway/producer_admission.py
++++ b/tui_gateway/producer_admission.py
+@@ -351,6 +351,17 @@ def _sweep_owner(server, db, profile: Optional[str], owner: str) -> dict:
+ LEASE_NAME = "producer-admission"
+ 
+ 
++def _consume_replay_handoffs() -> None:
++    """[daveey] Replays a retired predecessor handed to a profile store (automation_replay_handoff). Never raises."""
++    try:
++        from tui_gateway import automation_replay
++        server = _server()
++        homes = [_profile_home(p) for p in server._readopt_wake_profiles()]
++        automation_replay.consume_handoffs([h for h in homes if h is not None])
++    except Exception:
++        logger.warning("automation-replay handoff pass failed", exc_info=True)
++
++
+ def run_pass(lease) -> bool:
+     """One tick: the cold-chat sweep only while this process holds the ``producer-admission`` host loop lease
+     (design t_01a1d45d75851804 §2b; ``HERMES_HOST_LOOP_LEASE=0`` = every process). The per-chat poller's
+@@ -361,6 +372,7 @@ def run_pass(lease) -> bool:
+         return False
+     try:
+         sweep_once()
++        _consume_replay_handoffs()
+     finally:
+         lease.beat()
+     return True
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 40cf822bba..1c1d1f7b31 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1402,6 +1402,7 @@ def _run_admitted_prompt(
+     # The ONE INFO record proving a prompt was accepted by THIS process; ties ui sid,
+     # session_key and the agent's live session_id together.  No prompt content is logged.
+     _turn_started_monotonic = time.monotonic()
++    _turn_started_wall = time.time()
+     logger.info(
+         # Desktop/TUI observability (#86647): this is the ONE INFO record proving a Desktop/TUI prompt was
+         # accepted by THIS process, and it ties together every id a rotation-mute trace needs — the UI
+@@ -1482,6 +1483,9 @@ def _run_admitted_prompt(
+             if status == "complete":
+                 # [daveey] This turn's context carried any failed delivery already in the transcript.
+                 automation_replay.cancel_carried(st.marker_key, str(session.get("session_key") or ""))
++                automation_replay.cancel_durable(session.get("profile_home"),
++                                                 (st.marker_key, str(session.get("session_key") or "")),
++                                                 _turn_started_wall)
+             automation_replay.schedule_for_turn(session, st)
+ 
+             goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index 2e400161a4..1a7c848c45 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -946,6 +946,11 @@ def _interrupt_session_turn(
+     """
+     reason = reason or ("ws_orphan" if orphan else "user_stop")
+     agent_tool_reason = None if reason == "user_stop" else reason.replace("_", " ")
++    if reason == "user_stop":  # [daveey] an explicit Stop fences handed-off automation replays (shutdown does not)
++        from tui_gateway import automation_replay
++        import time as _time
++        automation_replay.cancel_durable(session.get("profile_home"), (session.get("session_key"),),
++                                         _time.time(), stop=True)
+     from tui_gateway.process_consumer_health import invalidate
+     invalidate(session)
+     use_compute_host = _session_uses_compute_host(session)
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 66743c547a..2ab287cd6f 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -1682,7 +1682,8 @@ def _readopt_wake_profiles() -> list:
+ 
+ 
+ def _wake_session_turn(session_key: str, text: str, *, display_kind: str | None = None,
+-                       display_metadata: dict | None = None, label: str = "wake", build_timeout: float = 120.0) -> str:
++                       display_metadata: dict | None = None, label: str = "wake", build_timeout: float = 120.0,
++                       profiles: list | None = None) -> str:
+     """Run ONE agent turn with ``text`` in chat ``session_key`` from this backend: the chat live here is used as is,
+     otherwise it is resumed in-process first (``session.resume``, launch store then each named profile, the same
+     path the re-adopted-exit waker uses). For plugins that must close a loop without the user typing (e.g. a chat
+@@ -1705,13 +1706,15 @@ def _wake_session_turn(session_key: str, text: str, *, display_kind: str | None
+         if live is None:
+             # [daveey] A paused turn is its restarting backend's: here its viewers are not attached (update_pause).
+             from tui_gateway.update_pause import left_to_successor
+-            if left_to_successor(_hermes_home, _readopt_wake_profiles(), key, label):
++            # [daveey] ``profiles``: a handed-off replay resumes in its exact profile, never a first-match scan.
++            wake_profiles = profiles if profiles is not None else _readopt_wake_profiles()
++            if left_to_successor(_hermes_home, wake_profiles, key, label):
+                 return "busy"
+             handler = _methods.get("session.resume")
+             if handler is None:
+                 return "error"
+             resumed = False
+-            for n, profile in zip(_it.count(1), _readopt_wake_profiles()):
++            for n, profile in zip(_it.count(1), wake_profiles):
+                 params = {"session_id": key, "omit_messages": True, **({"profile": profile} if profile else {})}
+                 env = handler(f"{label}-resume-{n}", params) or {}
+                 err = env.get("error") if isinstance(env, dict) else None
+-- 
+2.43.0
+

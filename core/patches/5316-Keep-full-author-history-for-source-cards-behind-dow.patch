@@ -1,0 +1,129 @@
+From 015cb1c34fdcf0f525326f67487b53a2e80efc1c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:09:51 +0000
+Subject: [PATCH] Keep full author history for source cards behind downstream
+ reviews
+
+---
+ hermes_cli/kanban_review_model.py             | 11 ++--
+ .../test_kanban_review_model_cycles.py        | 58 +++++++++++++++++++
+ 2 files changed, 64 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index 2abc4fd942..c9acea1fc3 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -81,7 +81,7 @@ def implementer_models(conn, task) -> set[str]:
+     from hermes_cli.kanban_review_sources import source_reader
+     seen = set()
+ 
+-    def collect(conn, card):
++    def collect(conn, card, bounded=True):
+         if card.id in seen:
+             return set()
+         seen.add(card.id)
+@@ -92,7 +92,7 @@ def implementer_models(conn, task) -> set[str]:
+         pin = str(getattr(card, "model_override", None) or "").strip()
+         boundary = False
+         if not downstream and not skilled:
+-            models, boundary = _current_authors(conn, card.id)
++            models, boundary = _current_authors(conn, card.id, bounded)
+         # Preserve conservative pin provenance on the first epoch and when the
+         # current epoch has no concrete receipt; an old pin is not a new author.
+         if pin and not is_class_selector(pin) and not downstream and (not boundary or not models):
+@@ -108,14 +108,15 @@ def implementer_models(conn, task) -> set[str]:
+                 sources.append(creator)
+             for source in sources:
+                 source_conn, related = lookup(source)
+-                models.update(collect(source_conn, related))
++                # The exact-head diff holds every epoch's commits: keep full history.
++                models.update(collect(source_conn, related, bounded=False))
+         return models
+ 
+     with source_reader(conn) as lookup:
+         return collect(conn, task)
+ 
+ 
+-def _current_authors(conn, task_id):
++def _current_authors(conn, task_id, bounded=True):
+     """Authors since the review preceding the latest implementation, plus epoch boundary.
+ 
+     Consecutive review retries keep the same author set. A pre-spawn refusal is
+@@ -141,7 +142,7 @@ def _current_authors(conn, task_id):
+             # Launch/result receipts prove execution, not that anyone judged the
+             # head. Parked and crashed reviewers must not release its authors.
+             verdict = row[1] in ("changes_requested", "completed")
+-            if verdict and models and not unknown_author:
++            if bounded and verdict and models and not unknown_author:
+                 return models, True
+             continue
+         if row[0] in repeats:
+diff --git a/tests/hermes_cli/test_kanban_review_model_cycles.py b/tests/hermes_cli/test_kanban_review_model_cycles.py
+index ddc9e5d7bb..97bd1560c3 100644
+--- a/tests/hermes_cli/test_kanban_review_model_cycles.py
++++ b/tests/hermes_cli/test_kanban_review_model_cycles.py
+@@ -217,3 +217,61 @@ def test_structural_exhaustion_blocks_once_without_spawn_retry_loop(board, monke
+         assert len(kb.list_runs(conn, task.id)) == runs
+         assert len([e for e in kb.list_events(conn, task.id) if e.kind == "gave_up"]) == 1
+         assert spawned == []
++
++
++def test_downstream_review_keeps_full_history_of_source_authors(board):
++    with kbc.connect() as conn:
++        src = kb.get_task(conn, kb.create_task(conn, title="source work", assignee="default"))
++        run(conn, src.id, MODELS[0])
++        run(conn, src.id, MODELS[1], "review")
++        run(conn, src.id, MODELS[2])
++        down = kb.get_task(conn, kb.create_task(conn, title="Independent exact-head review of PR",
++                                                assignee="default", creator_task_id=src.id))
++        # The PR diff holds both epochs' commits; only the card's own lane is bounded.
++        assert review.implementer_models(conn, down) == {MODELS[0], MODELS[2]}
++        assert review.implementer_models(conn, kb.get_task(conn, src.id)) == {MODELS[2]}
++
++
++def test_completed_review_outcome_is_an_epoch_boundary(board):
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, kb.create_task(conn, title="completed verdict", assignee="default"))
++        run(conn, task.id, MODELS[0])
++        verdict_run = run(conn, task.id, MODELS[1], "review")
++        conn.execute("UPDATE task_runs SET outcome='completed' WHERE id=?", (verdict_run,))
++        run(conn, task.id, MODELS[2])
++        assert review.implementer_models(conn, kb.get_task(conn, task.id)) == {MODELS[2]}
++
++
++def _walled(monkeypatch):
++    from hermes_cli import kanban_provider_walls as walls
++    monkeypatch.setattr(walls, "active_walls", lambda **kwargs: {"anthropic": 99999999999})
++
++
++def test_walled_override_with_no_other_candidate_is_retryable_not_exhausted(board, monkeypatch):
++    cfg = helpers.config(board, strong=helpers.OPUS, routes=[helpers.OPUS])
++    _walled(monkeypatch)
++    with kbc.connect() as conn:
++        task = helpers.task(conn, helpers.OPUS)
++        kb.claim_task(conn, task.id)
++        assert kb.request_review(conn, task.id, metadata={"review_model": helpers.FABLE})
++        with pytest.raises(review.ReviewModelUnavailable) as raised:
++            review.resolve_review_model(conn, kb.get_task(conn, task.id), cfg)
++        assert not isinstance(raised.value, review.ReviewModelsExhausted)
++
++
++def test_walled_standard_candidate_is_retryable_not_exhausted(board, monkeypatch):
++    import json
++    cfg = helpers.config(board, strong=helpers.OPUS, routes=[helpers.OPUS])
++    path = board.joinpath("config.yaml")
++    data = json.loads(path.read_text(encoding="utf-8"))
++    deep = data["model_routing"]["routes"]["deep"][0]
++    data["model_routing"]["routes"]["standard"] = [{**deep, "model": helpers.FABLE}]
++    path.write_text(json.dumps(data), encoding="utf-8")
++    _walled(monkeypatch)
++    with kbc.connect() as conn:
++        task = helpers.task(conn, helpers.OPUS)
++        kb.claim_task(conn, task.id)
++        assert kb.request_review(conn, task.id)
++        with pytest.raises(review.ReviewModelUnavailable) as raised:
++            review.resolve_review_model(conn, kb.get_task(conn, task.id), cfg)
++        assert not isinstance(raised.value, review.ReviewModelsExhausted)
+-- 
+2.43.0
+

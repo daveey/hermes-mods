@@ -1,0 +1,147 @@
+From 3a2fc4ce1ccc62ad9aa46370fdb1b70ae0cde946 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:59:50 +0000
+Subject: [PATCH] fix(kanban): snapshot notice age before submitting wake
+ probes [daveey]
+
+---
+ hermes_cli/kanban_wake_check.py               | 12 +++---
+ hermes_cli/kanban_wake_unproven.py            |  4 +-
+ tests/hermes_cli/test_kanban_wake_unproven.py | 37 ++++++++++++++++++-
+ 3 files changed, 45 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 17383b29a9..f2408aa667 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -820,7 +820,7 @@ def _after_probe(state: dict, claimed_next_at: Optional[int], now: int) -> int:
+ 
+ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict, now: Optional[int], generation: str,
+                      purpose: str = "wake", stale_interval: Optional[float] = None, passive_policy=None,
+-                     claimed_next_at: Optional[int] = None) -> Any:
++                     claimed_next_at: Optional[int] = None, notice_interval: Optional[float] = None) -> Any:
+     key = (db_path, task_id)
+     try:
+         rc, out = _run_probe(key, cmd, cwd, env)
+@@ -855,7 +855,7 @@ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict,
+                 dead_ancestry = detect(cmd, cwd)
+             apply_result(conn, task_id, cmd, rc, out, now=now, generation=generation, diagnostics=diag,
+                          answered=answered, producer=producer, dead_ancestry=dead_ancestry,
+-                         stale_interval=stale_interval, passive_policy=passive_policy,
++                         stale_interval=stale_interval, passive_policy=passive_policy, notice_interval=notice_interval,
+                          claimed_next_at=claimed_next_at)
+             if rc == 1 and not output_error(out):
+                 from hermes_cli import kanban_decision_ask  # [daveey] a chat wait unanswered for 2 h goes to David
+@@ -873,7 +873,7 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+                  diagnostics: Optional[dict] = None, answered: Optional[dict] = None,
+                  producer: Optional[dict] = None, dead_ancestry: Optional[list[dict]] = None,
+                  stale_interval: Optional[float] = None, passive_policy=None,
+-                 claimed_next_at: Optional[int] = None) -> Optional[str]:
++                 claimed_next_at: Optional[int] = None, notice_interval: Optional[float] = None) -> Optional[str]:
+     """Record one probe result; wake the card on success or a broken probe. Returns the event
+     kind appended (``condition_met`` / ``wake_check_broken``) or None. A result for a probe
+     that is no longer the card's (re-parked, unblocked) is dropped."""
+@@ -932,7 +932,7 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+                     kb.add_comment(conn, task_id, "kanban-dispatcher", stale["note"])
+                 return woke
+             from hermes_cli import kanban_wake_unproven as unproven  # [daveey] one early passive notice
+-            unproven.note_check(conn, task_id, cmd, tail, now, passive_policy=passive_policy)
++            unproven.note_check(conn, task_id, cmd, tail, now, passive_policy=passive_policy, threshold=notice_interval)
+             conn.execute(
+                 "UPDATE task_wake_checks SET last_at = ?, last_rc = 1, last_out = ?, fails = 0, "
+                 "next_at = ? WHERE task_id = ?", (now, tail, _after_probe(state, claimed_next_at, now), task_id))
+@@ -1063,7 +1063,9 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+                 f"JOIN tasks t ON t.id = w.task_id WHERE {_LIVE_ROW} AND w.next_at <= ? ORDER BY w.next_at",
+                 (ts,)).fetchall()
+         # Resolve policy only for a real probe batch, still on the scoped dispatcher thread.
++        from hermes_cli import kanban_wake_unproven as unproven
+         stale_interval = episode.stale_seconds() if due else None
++        notice_interval = unproven.notice_seconds() if due else None
+         from hermes_cli import kanban_passive_intake as passive
+         passive_policy = passive.snapshot() if due else {}
+         for task_id, cmd, every, generation, purpose in due:
+@@ -1092,7 +1094,7 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+                     continue
+             cwd = probe_cwd(task.workspace_path)
+             fut = _pool().submit(_probe_and_apply, db_path, task_id, cmd, cwd, _probe_env(task, db_path), now, claim,
+-                                 purpose, stale_interval, passive_policy, ts + int(every))
++                                 purpose, stale_interval, passive_policy, ts + int(every), notice_interval)
+             with _LOCK:
+                 _IN_FLIGHT[key] = fut
+             submitted.append(task_id)
+diff --git a/hermes_cli/kanban_wake_unproven.py b/hermes_cli/kanban_wake_unproven.py
+index 188fe40e98..3dbb1d4e27 100644
+--- a/hermes_cli/kanban_wake_unproven.py
++++ b/hermes_cli/kanban_wake_unproven.py
+@@ -77,7 +77,7 @@ def maybe_notice(conn: sqlite3.Connection, task_id: str, cmd: str, out: str, *,
+ 
+ 
+ def note_check(conn: sqlite3.Connection, task_id: str, cmd: str, out: str, now: int, *,
+-               passive_policy=None) -> bool:
++               passive_policy=None, threshold: Optional[float] = None) -> bool:
+     """Count clean not-ready observations within this park, not the longer stale-wake episode.
+ 
+     Local observation state is deliberately separate from the portable same-probe age: re-parking
+@@ -103,7 +103,7 @@ def note_check(conn: sqlite3.Connection, task_id: str, cmd: str, out: str, now:
+                  (task_id, park[0], now))
+     first, checks = conn.execute("SELECT first_at, checks FROM task_wake_notice_checks WHERE task_id = ?",
+                                  (task_id,)).fetchone()
+-    return maybe_notice(conn, task_id, cmd, out, now=now, first_at=first, checks=checks)
++    return maybe_notice(conn, task_id, cmd, out, now=now, first_at=first, checks=checks, threshold=threshold)
+ 
+ 
+ def notice_text(payload: dict) -> str:
+diff --git a/tests/hermes_cli/test_kanban_wake_unproven.py b/tests/hermes_cli/test_kanban_wake_unproven.py
+index cd769da110..ed5998a2d3 100644
+--- a/tests/hermes_cli/test_kanban_wake_unproven.py
++++ b/tests/hermes_cli/test_kanban_wake_unproven.py
+@@ -161,10 +161,45 @@ def test_configurable_notice_age(parked, monkeypatch):
+     assert len(notices(conn, tid)) == 1
+ 
+ 
++def test_async_notice_age_uses_dispatcher_scope(parked, monkeypatch):
++    from contextvars import ContextVar
++    from hermes_cli import config
++
++    conn, tid, clock = parked
++    age = ContextVar("notice_age", default=30)
++    token = age.set(2)
++    monkeypatch.setattr(config, "load_config_readonly",
++                        lambda: {"kanban": {"wake_check_notice_hours": age.get()}})
++    monkeypatch.setattr(wc, "_run_probe", lambda *a: (1, "still waiting"))
++    try:
++        for hour in (0, 1, 2):
++            assert tid in wc.run_due_wake_checks(conn, now=clock[0] + hour * HOUR, wait=True)["submitted"]
++        assert len(notices(conn, tid)) == 1
++        assert notices(conn, tid)[0].payload["hours"] == 2
++    finally:
++        wc._shutdown_for_tests()
++        age.reset(token)
++
++
++def test_new_park_preserving_probe_row_resets_upsert(parked):
++    conn, tid, clock = parked
++    for hour in (0, 3, 5):
++        result(parked, hour)
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "scheduled", {"wake_at": clock[0] + 7 * 24 * HOUR})
++    for hour in (6, 11.5):
++        result(parked, hour)
++    first, checks = conn.execute(
++        "SELECT first_at, checks FROM task_wake_notice_checks WHERE task_id=?", (tid,)).fetchone()
++    assert first == clock[0] + 6 * HOUR
++    assert checks == 2
++    assert not notices(conn, tid)
++
++
+ def test_notice_key_is_registered():
+     from hermes_cli.config_defaults import DEFAULT_CONFIG
+ 
+-    assert DEFAULT_CONFIG["kanban"]["wake_check_notice_hours"] == 6
++    assert DEFAULT_CONFIG["kanban"]["wake_check_notice_hours"] == unproven.DEFAULT_NOTICE_HOURS
+ 
+ 
+ def test_passive_listener_does_not_notify(parked, monkeypatch):
+-- 
+2.43.0
+

@@ -1,0 +1,235 @@
+From a650574a13a0aef76471230e36679ffa7c9a0883 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 19:35:02 +0000
+Subject: [PATCH] [daveey] fix(desktop): stripe rules follow the whole lineage,
+ not the row id
+
+Review t_eeeeee000000002e (REQUEST CHANGES on 3c05887ff2df):
+1. A chat reached through a lineage alias lost both rules: the displayed
+   check looked only at row.id, and an alias's read was compared with the
+   row's epoch (epochs are per tracked stored id, so it never matched).
+2. The epochless clause (read begun while the route had no authority) had no
+   test.
+
+Fix:
+- The hook tracks every lineage member (only a tracked id gets an epoch and
+  runtime roles that republish the revision when they change).
+- Displayed = any lineage member shown in the main pane or a tile.
+- workSourceVetoed judges each alias's read against that alias's own
+  authority; an epochless pending/failed read still vetoes.
+
+Tests (session-control-authority-routing): displayed-through-alias with no
+reads is not done, and turns done once a full current read set lands; a
+failed current read under an alias vetoes an undisplayed row; an epochless
+read holds an undisplayed row on a live route.
+Mutants (each RED, restored after): alias list ignored, epochless clause
+dropped, displayed checked on row id only, alias judged with the row's
+authority, only the row tracked, dead-route veto dropped.
+Proof: vitest src/store src/lib src/app/chat 737 files / 7714 tests pass;
+tsc --noEmit clean for apps/desktop/src.
+---
+ .../src/lib/use-work-source-unavailable.ts    | 23 +++--
+ .../session-control-authority-routing.test.ts | 87 ++++++++++++++++++-
+ apps/desktop/src/store/session-work-source.ts | 22 +++--
+ 3 files changed, 117 insertions(+), 15 deletions(-)
+
+diff --git a/apps/desktop/src/lib/use-work-source-unavailable.ts b/apps/desktop/src/lib/use-work-source-unavailable.ts
+index 1b02db30ab..66f55bf7c1 100644
+--- a/apps/desktop/src/lib/use-work-source-unavailable.ts
++++ b/apps/desktop/src/lib/use-work-source-unavailable.ts
+@@ -24,13 +24,18 @@ export function useWorkSourceUnavailable(row: SessionInfo | null | undefined): b
+   const owner = row ? qualifiedWorkSourceOwner(knownSessionOwner([row], row.id)) : undefined
+   const connectionId = owner?.connectionId
+   const profile = owner?.profile
+-  const storedSessionId = row?.id
++  const ids = row ? lineageAliases(row.id, sessions) : []
++  // Every lineage member is tracked: the runtime on screen and reads may hold any of them (compression rotates the
++  // tip), and only a tracked id gets an authority epoch and runtime roles that republish the revision on change.
++  const trackedIds = ids.join('\u0000')
+ 
+   useEffect(() => {
+-    if (connectionId && profile && storedSessionId) {
+-      workSourceAuthorityForSession(connectionId, profile, storedSessionId)
++    if (connectionId && profile && trackedIds) {
++      for (const id of trackedIds.split('\u0000')) {
++        workSourceAuthorityForSession(connectionId, profile, id)
++      }
+     }
+-  }, [connectionId, profile, storedSessionId])
++  }, [connectionId, profile, trackedIds])
+ 
+   if (!row) {
+     return false
+@@ -41,12 +46,14 @@ export function useWorkSourceUnavailable(row: SessionInfo | null | undefined): b
+   }
+ 
+   const authority = peekWorkSourceAuthorityForSession(owner.connectionId, owner.profile, row.id)
+-  const ids = lineageAliases(row.id, sessions)
+ 
+-  // The displayed chat gets every source read, so it must earn green by positive proof (a rebind revokes it).
+-  if (workSourceSessionDisplayed(owner.connectionId, owner.profile, row.id)) {
++  // The displayed chat gets every source read, so it must earn green by positive proof (a rebind revokes it). Its
++  // runtime may hold any member of the lineage (compression rotates the tip), so any alias on screen counts.
++  if (ids.some(id => workSourceSessionDisplayed(owner.connectionId, owner.profile, id))) {
+     return !workSourceAuthorityComplete(owner.connectionId, owner.profile, ids, authority, sources)
+   }
+ 
+-  return workSourceVetoed(owner.connectionId, owner.profile, ids, authority, sources)
++  return workSourceVetoed(owner.connectionId, owner.profile, ids, authority, sources, id =>
++    peekWorkSourceAuthorityForSession(owner.connectionId, owner.profile, id)
++  )
+ }
+diff --git a/apps/desktop/src/store/session-control-authority-routing.test.ts b/apps/desktop/src/store/session-control-authority-routing.test.ts
+index fc3cb111df..da5be2eb40 100644
+--- a/apps/desktop/src/store/session-control-authority-routing.test.ts
++++ b/apps/desktop/src/store/session-control-authority-routing.test.ts
+@@ -11,7 +11,7 @@ import { $activeSessionId, _resetSessionOwnerHintsForTests, setSessions } from '
+ import { $sessionControlBySession, clearAllSessionControl, refreshSessionControl } from '@/store/session-control'
+ import { sessionStatusStripe } from '@/store/session-dot-state'
+ import { $sessionTiles, clearAllSessionStates, publishSessionState } from '@/store/session-states'
+-import { $unavailableWorkSources } from '@/store/session-work-source'
++import { $unavailableWorkSources, beginWorkSourceRead } from '@/store/session-work-source'
+ import { _resetWorkSourceOwnerForTests } from '@/store/work-source-owner'
+ import { makeSessionInfo } from '@/test/session-info'
+ 
+@@ -315,6 +315,91 @@ describe('control authority at the real idle row hook', () => {
+     }
+   })
+ 
++  // Compression rotates the tip: the runtime on screen (rt-main, bound to `stored-chat`) and the sidebar row (`tip`)
++  // are different members of one lineage. Both rules must follow the lineage, not the row's own id.
++  const aliasRow = () =>
++    makeSessionInfo({
++      id: 'tip',
++      profile: 'default',
++      connection_id: 'local',
++      outcome: DONE,
++      _lineage_root_id: 'stored-chat',
++      _lineage_ids: ['stored-chat', 'tip']
++    } as never)
++
++  it('a chat displayed through a lineage alias still needs positive proof', () => {
++    const row = aliasRow()
++    setSessions([row])
++    $activeSessionId.set('rt-main')
++    const { result, unmount } = renderHook(() => useWorkSourceUnavailable(row))
++
++    try {
++      expect(stripe(result.current)).not.toBe('done')
++      act(() => {
++        for (const source of ['lineage', 'tasks', 'process', 'subagent', 'control'] as const) {
++          const read = sessionsHost.beginWorkSourceRead({
++            connectionId: 'local',
++            profile: 'default',
++            storedSessionId: row.id,
++            source
++          })
++
++          sessionsHost.reportWorkSourceRead({ ...read, available: true })
++        }
++      })
++      expect(stripe(result.current)).toBe('done') // a complete current read set still earns green
++    } finally {
++      $activeSessionId.set(null)
++      unmount()
++    }
++  })
++
++  it('a failed current read recorded under a lineage alias vetoes an undisplayed row', () => {
++    const row = aliasRow()
++    setSessions([row])
++    const { result, unmount } = renderHook(() => useWorkSourceUnavailable(row))
++
++    try {
++      expect(stripe(result.current)).toBe('done')
++      act(() => {
++        const read = sessionsHost.beginWorkSourceRead({
++          connectionId: 'local',
++          profile: 'default',
++          storedSessionId: 'stored-chat',
++          source: 'tasks'
++        })
++
++        expect(read.authorityEpoch).not.toBeUndefined()
++        sessionsHost.reportWorkSourceRead({ ...read, available: false })
++      })
++      expect(stripe(result.current)).not.toBe('done')
++    } finally {
++      unmount()
++    }
++  })
++
++  it('a read begun while the route had no authority still holds an undisplayed row once it is live', () => {
++    const row = makeSessionInfo({ id: 'stored-chat', profile: 'default', connection_id: 'local', outcome: DONE })
++    setSessions([row])
++    const { result, unmount } = renderHook(() => useWorkSourceUnavailable(row))
++
++    try {
++      expect(stripe(result.current)).toBe('done')
++      act(() => {
++        beginWorkSourceRead({
++          connectionId: 'local',
++          profile: 'default',
++          storedSessionId: row.id,
++          source: 'control',
++          authorityEpoch: undefined
++        })
++      })
++      expect(stripe(result.current)).not.toBe('done')
++    } finally {
++      unmount()
++    }
++  })
++
+   // Only the displayed chat polls process / subagent / control, so an unread source is no evidence for any other row:
+   // its stored outcome decides. Requiring proof there kept finished chats grey until navigated to.
+   it('an undisplayed row with unread sources keeps its stored done on a live route', () => {
+diff --git a/apps/desktop/src/store/session-work-source.ts b/apps/desktop/src/store/session-work-source.ts
+index 17203b5be5..76945455e4 100644
+--- a/apps/desktop/src/store/session-work-source.ts
++++ b/apps/desktop/src/store/session-work-source.ts
+@@ -94,25 +94,35 @@ export function workSourceVetoed(
+   profile: string | undefined,
+   ids: readonly string[],
+   authority: WorkSourceAuthority,
+-  observations: Observations = $unavailableWorkSources.get()
++  observations: Observations = $unavailableWorkSources.get(),
++  aliasAuthority: (storedSessionId: string) => WorkSourceAuthority = () => authority
+ ): boolean {
+   if (!connectionId || !profile || authority.durable === null || authority.runtime === null) {
+     return true
+   }
+ 
+-  return ids.some(storedSessionId =>
+-    requiredSources.some(source => {
++  return ids.some(storedSessionId => {
++    // Epochs are allocated per tracked (owner, stored id): a read recorded under a lineage alias is judged against
++    // that alias's own authority. An untracked alias's epoch read is no evidence (the row's own route is live).
++    const current = aliasAuthority(storedSessionId)
++
++    return requiredSources.some(source => {
+       const observation = observations[key({ connectionId, profile, storedSessionId, source })]
+ 
+       if (!observation || observation.available) {
+         return false
+       }
+ 
+-      const expected = source === 'lineage' || source === 'tasks' ? authority.durable : authority.runtime
++      // Begun while the route had no authority: it cannot be placed in an epoch, so it still holds the row.
++      if (observation.authorityEpoch === undefined) {
++        return true
++      }
++
++      const expected = source === 'lineage' || source === 'tasks' ? current.durable : current.runtime
+ 
+-      return observation.authorityEpoch === undefined || observation.authorityEpoch === expected
++      return expected !== null && observation.authorityEpoch === expected
+     })
+-  )
++  })
+ }
+ 
+ /** Missing, pending, failed and obsolete reads cannot authorize idle green.
+-- 
+2.43.0
+

@@ -1,0 +1,307 @@
+From c77037a4c9b543f36aedf7d16d8ec22ffc74acc7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 23:14:57 -0800
+Subject: [PATCH] fix(state): online FTS plan judges integrity_check past the
+ old 100k cap
+
+The online stale-FTS plan collected integrity_check output into a list capped at
+100,000 lines and refused any check that reached the cap as an unfinished walk.
+A family the plan detaches leaves its pages orphaned ("Page N: never used", one
+line per page): an example recovery left more orphaned pages than the cap, so every
+later plan was repeatedly refused with fts_stale set.
+
+- plan_from_check judges each line as it arrives and keeps only a count, the
+  damaged families and the refusing line; plan_online_recovery iterates each
+  row's text lazily (the b-tree walk is one newline-joined row) instead of
+  splitting it into a list
+- the cap rises to 5,000,000 lines: far below SQLITE_MAX_LENGTH, above which
+  SQLite drops the walk text and the check returns no rows at all
+- a check that returned no line is refused (never read as a clean store)
+- the per-line structural test is factored out of integrity_damage_is_structural
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_state_fts_online.py                    |  52 ++++++---
+ hermes_state_repair.py                        |  27 +++--
+ tests/hermes_state/test_fts_free_gates.py     |   2 +-
+ .../hermes_state/test_fts_online_recovery.py  | 106 +++++++++++++++++-
+ 4 files changed, 156 insertions(+), 31 deletions(-)
+
+diff --git a/hermes_state_fts_online.py b/hermes_state_fts_online.py
+index ed367bec21..35473c8fb3 100644
+--- a/hermes_state_fts_online.py
++++ b/hermes_state_fts_online.py
+@@ -149,10 +149,16 @@ class OnlineRecoveryRefused(Exception):
+     """The plan step found a reason not to touch the store."""
+ 
+ 
+-_CHECK_LIMIT = 100_000
++# Problem lines integrity_check may report before it stops. A family this module detaches leaves its pages orphaned
++# ("Page N: never used", one line per page): in an example incident, such lines from an earlier recovery ran
++# past the old 100,000 cap, so every later plan read as an unfinished walk and was refused for hours. The cap must
++# stay far below SQLITE_MAX_LENGTH (1e9 bytes): SQLite builds the b-tree walk's messages in one string, and when that
++# string would overflow it is dropped and the check returns NO rows (no "ok" either), which plan_from_check refuses.
++# 5,000,000 lines of at most ~90 bytes is ~450 MB; the walk's text is one row held by SQLite while it is judged.
++_CHECK_LIMIT = 5_000_000
+ 
+ 
+-def plan_from_check(lines, master) -> dict:
++def plan_from_check(lines, master, *, limit: Optional[int] = None) -> dict:
+     """The decision of :func:`plan_online_recovery` from integrity_check output and the ``(rootpage, type, name)``
+     rows of the same snapshot. Raises :class:`OnlineRecoveryRefused` unless every problem line is attributable.
+ 
+@@ -160,18 +166,28 @@ def plan_from_check(lines, master) -> dict:
+     against the SECOND structure that reaches it. So a family not named by any line shares no page with anything
+     reached after it, and anything reached before it was named itself: a canonical tree (refused here), the other
+     family (unlinked, never read again) or nothing. Draining an unnamed family therefore frees only its own pages.
+-    That argument needs every line mapped and the walk complete, hence the refusals below."""
+-    from hermes_state_repair import _INTEGRITY_TREE_RE, integrity_damage_is_structural
+-
+-    problems = [line for line in lines if line not in ("ok", "*** in database main ***")]
+-    if len(problems) >= _CHECK_LIMIT - 1:
+-        raise OnlineRecoveryRefused(f"integrity_check stopped at its {_CHECK_LIMIT}-error limit; later trees unchecked")
+-    if integrity_damage_is_structural(problems, master):
+-        raise OnlineRecoveryRefused("integrity_check reports damage outside the search indexes: "
+-                                    + "; ".join(problems[:3]))
++    That argument needs every line mapped and the walk complete, hence the refusals below.
++
++    *lines* may be any iterable; each line is judged as it arrives and only counted (no list of problems is kept).
++    *limit* is the cap the check ran with (default :data:`_CHECK_LIMIT`). integrity_check(N) returns exactly N lines
++    when it stops early, so N - 1 problems already count as a stopped walk (conservative by one line). A check that
++    returned no line at all did not complete (its output overflowed SQLITE_MAX_LENGTH) and is refused."""
++    from hermes_state_repair import _INTEGRITY_TREE_RE, integrity_line_is_structural
++
++    limit = _CHECK_LIMIT if limit is None else limit
+     by_root = {int(rp): name for rp, _type, name in master}
+     damaged = set()
+-    for line in problems:
++    problems = 0
++    seen = False
++    for line in lines:
++        seen = True
++        if line in ("ok", "*** in database main ***"):
++            continue
++        problems += 1
++        if problems >= limit - 1:
++            raise OnlineRecoveryRefused(f"integrity_check stopped at its {limit}-error limit; later trees unchecked")
++        if integrity_line_is_structural(line, by_root):
++            raise OnlineRecoveryRefused(f"integrity_check reports damage outside the search indexes: {line}")
+         tree = _INTEGRITY_TREE_RE.search(line)
+         if not tree:
+             continue  # "Page N: never used", FTS5 xIntegrity blob lines: no page is shared
+@@ -180,7 +196,9 @@ def plan_from_check(lines, master) -> dict:
+         if family is None:  # Tree 1 (sqlite_schema) or a root this snapshot cannot name
+             raise OnlineRecoveryRefused(f"integrity_check names a tree outside the search indexes: {line}")
+         damaged.add(family)
+-    return {"unlink": sorted(damaged), "trash": [f for f in FAMILIES if f not in damaged], "problems": len(problems),
++    if not seen:
++        raise OnlineRecoveryRefused("integrity_check returned nothing (its output overflowed SQLITE_MAX_LENGTH)")
++    return {"unlink": sorted(damaged), "trash": [f for f in FAMILIES if f not in damaged], "problems": problems,
+             "roots": {name: int(rp) for rp, _type, name in master if family_of(name)},
+             "trash_roots": {name: int(rp) for rp, _type, name in master if name.startswith(TRASH_PREFIX)}}
+ 
+@@ -201,8 +219,10 @@ def plan_online_recovery(db_path) -> dict:
+     try:
+         conn.execute("BEGIN")  # one read snapshot for the schema and the check
+         master = [tuple(r) for r in conn.execute("SELECT rootpage, type, name FROM sqlite_master WHERE rootpage > 0")]
+-        lines = [line for r in conn.execute(f"PRAGMA integrity_check({_CHECK_LIMIT})")
+-                 for line in str(r[0]).splitlines()]
++        # judged inside the snapshot, line by line over each row's text (the b-tree walk is one newline-joined row):
++        # no list of lines is built next to the text SQLite returns
++        plan = plan_from_check((m.group(0) for r in conn.execute(f"PRAGMA integrity_check({_CHECK_LIMIT})")
++                                for m in re.finditer(r"[^\n]+", str(r[0]))), master, limit=_CHECK_LIMIT)
+         conn.execute("COMMIT")
+     except sqlite3.DatabaseError as exc:
+         refusal = OnlineRecoveryRefused(f"integrity_check could not complete: {exc}")
+@@ -210,7 +230,7 @@ def plan_online_recovery(db_path) -> dict:
+         raise (refusal if is_malformed_db_error(exc) else _transient(refusal)) from exc
+     finally:
+         conn.close()
+-    return plan_from_check(lines, master)
++    return plan
+ 
+ 
+ def _transient(exc: OnlineRecoveryRefused) -> OnlineRecoveryRefused:
+diff --git a/hermes_state_repair.py b/hermes_state_repair.py
+index 9cf0ee003d..1d5fe1e819 100644
+--- a/hermes_state_repair.py
++++ b/hermes_state_repair.py
+@@ -746,19 +746,22 @@ def integrity_damage_is_structural(integrity_lines, master_rows) -> bool:
+     rebuild cannot repair a canonical b-tree, and the ``.malformed-backup`` it leaves behind
+     is a snapshot of the same damage."""
+     name_by_rootpage = {int(rp): name for rp, _type, name in master_rows if rp}
+-    for line in integrity_lines:
+-        text = str(line)
+-        if text.startswith("Freelist"):
+-            return True
+-        tree = _INTEGRITY_TREE_RE.search(text)
+-        if tree:
+-            name = name_by_rootpage.get(int(tree.group(1)), "")
+-            if name and not _FTS_OBJECT_RE.fullmatch(name):
+-                return True
+-        missing = _INTEGRITY_MISSING_INDEX_RE.search(text)
+-        if missing and not _FTS_OBJECT_RE.fullmatch(missing.group(1)):
++    return any(integrity_line_is_structural(line, name_by_rootpage) for line in integrity_lines)
++
++
++def integrity_line_is_structural(line, name_by_rootpage) -> bool:
++    """One ``PRAGMA integrity_check`` line of :func:`integrity_damage_is_structural`, against a prebuilt
++    ``{rootpage: name}`` map (callers that stream the check judge each line as it arrives)."""
++    text = str(line)
++    if text.startswith("Freelist"):
++        return True
++    tree = _INTEGRITY_TREE_RE.search(text)
++    if tree:
++        name = name_by_rootpage.get(int(tree.group(1)), "")
++        if name and not _FTS_OBJECT_RE.fullmatch(name):
+             return True
+-    return False
++    missing = _INTEGRITY_MISSING_INDEX_RE.search(text)
++    return bool(missing and not _FTS_OBJECT_RE.fullmatch(missing.group(1)))
+ 
+ 
+ def state_db_has_structural_damage(db_path: Path) -> bool:
+diff --git a/tests/hermes_state/test_fts_free_gates.py b/tests/hermes_state/test_fts_free_gates.py
+index 61a52d11ea..291bfd3661 100644
+--- a/tests/hermes_state/test_fts_free_gates.py
++++ b/tests/hermes_state/test_fts_free_gates.py
+@@ -608,7 +608,7 @@ def test_a_refusal_is_remembered_across_processes(store, plans, monkeypatch):
+     db = SessionDB(db_path=path)
+     try:
+         monkeypatch.setattr(hermes_state_fts_online, "plan_from_check",
+-                            lambda lines, master: (_ for _ in ()).throw(
++                            lambda lines, master, **_kw: (_ for _ in ()).throw(
+                                 hermes_state_fts_online.OnlineRecoveryRefused("test damage")))
+         with pytest.raises(hermes_state_fts_online.FtsFreeRefused):
+             db.optimize_fts()
+diff --git a/tests/hermes_state/test_fts_online_recovery.py b/tests/hermes_state/test_fts_online_recovery.py
+index fa08830624..fee1b5280b 100644
+--- a/tests/hermes_state/test_fts_online_recovery.py
++++ b/tests/hermes_state/test_fts_online_recovery.py
+@@ -8,6 +8,8 @@ connections keep writing.
+ """
+ 
+ import argparse
++import inspect
++import itertools
+ import sqlite3
+ import time
+ 
+@@ -450,12 +452,112 @@ def test_plan_unlinks_exactly_the_named_families(lines, unlink):
+     ["Tree 99 page 5: 2nd reference to page 6"],                 # a root this snapshot cannot name
+     ["Tree 3 page 7 cell 0: 2nd reference to page 80"],          # a canonical table
+     ["Freelist: 2nd reference to page 5"],
+-    ["Tree 80 page 2: x"] * 100_000,                              # the check stopped at its limit
++    ["Tree 80 page 2: x"] * 1_000,                                # the check stopped at its limit
+ ])
+ def test_plan_refuses_what_it_cannot_attribute(lines):
+     from hermes_state_fts_online import OnlineRecoveryRefused, plan_from_check
+     with pytest.raises(OnlineRecoveryRefused):
+-        plan_from_check(lines, _MASTER)
++        plan_from_check(lines, _MASTER, limit=1_000)
++
++
++def test_plan_judges_a_check_past_the_old_cap():
++    """An example check reported more "never used" pages than the old 100,000 cap after an earlier detach, which it read
++    as an unfinished walk: every plan was refused for hours. Lines are judged as they arrive, and only counted."""
++    from hermes_state_fts_online import plan_from_check
++
++    consumed = 0
++
++    def stream():
++        nonlocal consumed
++        for i in range(250_000):
++            consumed += 1
++            yield f"Tree 80 page {i}: btreeInitPage() returns error code 11" if i % 2 else f"Page {i}: never used"
++
++    plan = plan_from_check(stream(), _MASTER)
++    assert consumed == 250_000 and plan["problems"] == 250_000
++    assert plan["unlink"] == ["messages_fts_trigram"] and plan["trash"] == ["messages_fts"]
++
++
++def test_plan_refuses_canonical_damage_after_many_index_lines():
++    from hermes_state_fts_online import OnlineRecoveryRefused, plan_from_check
++
++    lines = (f"Tree 80 page {i}: x" for i in range(200_000))
++    with pytest.raises(OnlineRecoveryRefused, match="reports damage outside"):
++        plan_from_check(itertools.chain(lines, ["Tree 3 page 7 cell 0: 2nd reference to page 80"]), _MASTER)
++
++
++def test_plan_refuses_a_check_that_returned_nothing():
++    """integrity_check returns no row at all when its b-tree-walk text would exceed SQLITE_MAX_LENGTH: an empty
++    check never means a clean store."""
++    from hermes_state_fts_online import OnlineRecoveryRefused, plan_from_check
++
++    with pytest.raises(OnlineRecoveryRefused, match="returned nothing"):
++        plan_from_check(iter(()), _MASTER)
++
++
++def test_plan_does_not_count_the_ok_and_database_marker_lines():
++    from hermes_state_fts_online import plan_from_check
++
++    assert plan_from_check(["*** in database main ***", "ok"], _MASTER)["problems"] == 0
++
++
++@pytest.mark.parametrize("count, refused", [(998, False), (999, True)])
++def test_plan_cap_boundary(count, refused):
++    """integrity_check(N) returns exactly N lines when it stops early; N - 1 problems already read as stopped."""
++    from hermes_state_fts_online import OnlineRecoveryRefused, plan_from_check
++
++    lines = [f"Page {i}: never used" for i in range(count)]
++    if refused:
++        with pytest.raises(OnlineRecoveryRefused, match="error limit"):
++            plan_from_check(lines, _MASTER, limit=1_000)
++    else:
++        assert plan_from_check(lines, _MASTER, limit=1_000)["problems"] == count
++
++
++def test_the_check_cap_stays_far_below_sqlite_max_length():
++    """Above SQLITE_MAX_LENGTH (1e9 bytes) of walk text integrity_check returns nothing; the cap must stop first."""
++    from hermes_state_fts_online import _CHECK_LIMIT
++
++    assert _CHECK_LIMIT * 120 < 1_000_000_000
++
++
++def test_plan_online_recovery_judges_the_check_lazily_with_its_cap(tmp_path, monkeypatch):
++    """plan_online_recovery hands plan_from_check a lazy iterator over the check's lines (no list of lines is built)
++    and the cap the check ran with."""
++    import hermes_state_fts_online
++
++    path = tmp_path / "state.db"
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE TABLE t (x)")
++    seen = {}
++
++    def fake(lines, master, *, limit=0):
++        seen["lazy"], seen["limit"], seen["lines"] = inspect.isgenerator(lines), limit, list(lines)
++        return {"unlink": [], "trash": list(hermes_state_fts_online.FAMILIES), "problems": 0}
++
++    monkeypatch.setattr(hermes_state_fts_online, "plan_from_check", fake)
++    hermes_state_fts_online.plan_online_recovery(path)
++    assert seen == {"lazy": True, "limit": hermes_state_fts_online._CHECK_LIMIT, "lines": ["ok"]}
++
++
++def test_plan_online_recovery_splits_a_multi_line_walk_row(tmp_path, monkeypatch):
++    """The b-tree walk comes back as one newline-joined row: each of its lines is judged on its own."""
++    import hermes_state_fts_online
++
++    class Conn:
++        def execute(self, sql):
++            if sql.startswith("SELECT rootpage"):
++                return [(80, "table", "messages_fts_trigram_data")]
++            if sql.startswith("PRAGMA integrity_check"):
++                return [("*** in database main ***\nPage 5: never used\nTree 80 page 2: x",)]
++            return []
++
++        def close(self):
++            pass
++
++    monkeypatch.setattr("hermes_cli.sqlite_safe_read.connect_tracked", lambda *a, **k: Conn())
++    plan = hermes_state_fts_online.plan_online_recovery(tmp_path / "state.db")
++    assert plan["problems"] == 2 and plan["unlink"] == ["messages_fts_trigram"]
+ 
+ 
+ def test_family_of_full_matches_shadow_names():
+-- 
+2.43.0
+

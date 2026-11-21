@@ -1,0 +1,369 @@
+From dd6e8eebb4216793734cac3a3e9823cee4e218cd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 08:22:49 +0000
+Subject: [PATCH] fix(kanban): a containment refusal ends only its board's
+ round; never abandon the sync watcher [daveey]
+
+Example incident: ContainmentRefused from certify_page escaped sync_board -> sync_all_once
+-> run_forever, killed kanban_sync_watcher, and after 5 rapid restarts the supervisor gave up
+for good. Every board on the example gateways stopped syncing in repeated incidents and
+stayed down until each gateway restarted; dispatchers held all claims on sync_first_round.
+
+- sync_all_once catches ContainmentRefused per board (kanban_sync_refusal): nothing from the
+  page is applied, the cursor is kept, the board backs off 60 s doubling to 15 min, one ERROR
+  per distinct refusal; other boards keep syncing. certify_page/remember stay strict.
+- _spawn_supervised: tasks in _SUPERVISED_SLOW_RETRY_SECS (kanban_sync_watcher: 300 s) respawn
+  with a fresh budget after giving up; on_give_up still fires first.
+
+Proof: tests/hermes_cli/test_kanban_sync_refusal.py and tests/gateway/test_supervised_slow_retry.py
+fail on c9e2b66d13 and pass here; 9 sync/containment/supervisor files: 198 passed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gateway/run_adapters.py                      |  19 ++++
+ hermes_cli/kanban_sync_client.py             |  11 ++
+ hermes_cli/kanban_sync_refusal.py            |  67 ++++++++++++
+ tests/gateway/test_supervised_slow_retry.py  |  78 ++++++++++++++
+ tests/hermes_cli/test_kanban_sync_refusal.py | 103 +++++++++++++++++++
+ 5 files changed, 278 insertions(+)
+ create mode 100644 hermes_cli/kanban_sync_refusal.py
+ create mode 100644 tests/gateway/test_supervised_slow_retry.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_refusal.py
+
+diff --git a/gateway/run_adapters.py b/gateway/run_adapters.py
+index 45786ee0dd..2ac34ebe6b 100644
+--- a/gateway/run_adapters.py
++++ b/gateway/run_adapters.py
+@@ -484,6 +484,10 @@ class GatewayAdapterLifecycleMixin(GatewayAdapterStatusMixin, GatewaySecondaryRe
+         self._exit_reason = reason
+         self._shutdown_event.set()
+ 
++    # Supervised tasks never abandoned: after the rapid-restart budget is spent they respawn with a fresh
++    # budget this many seconds later (_spawn_supervised). kanban_sync_watcher: its death stops every board.
++    _SUPERVISED_SLOW_RETRY_SECS: dict = {"kanban_sync_watcher": 300.0}
++
+     @staticmethod
+     def _supervised_backoff(attempt: int) -> float:
+         """Capped exponential respawn delay (a method so tests can collapse the schedule)."""
+@@ -546,6 +550,21 @@ class GatewayAdapterLifecycleMixin(GatewayAdapterStatusMixin, GatewaySecondaryRe
+                         on_give_up(name)
+                     except Exception:  # pragma: no cover - defensive
+                         logger.debug("on_give_up callback for %s raised", name, exc_info=True)
++                slow = self._SUPERVISED_SLOW_RETRY_SECS.get(name)
++                if slow is not None and self._running:
++                    # A watcher whose death stops the whole host (kanban_sync_watcher: no board syncs, the
++                    # dispatcher claims nothing) is never abandoned for good: after the budget is spent it
++                    # respawns with a fresh budget every `slow` seconds (example incident: the sync watcher gave up
++                    # on the example gateways and stayed dead until each gateway restarted).
++                    logger.warning("Supervised task %s: slow retry in %ds after giving up", name, int(slow))
++
++                    async def _slow_respawn():
++                        await asyncio.sleep(slow)
++                        if self._running:
++                            self._spawn_supervised(coro_factory, name, restart=restart, _attempt=0,
++                                                   on_spawn=on_spawn, on_give_up=on_give_up)
++
++                    self._retain_background_task(Context().run(lambda: asyncio.create_task(_slow_respawn())))
+                 return
+             backoff = self._supervised_backoff(effective_attempt)
+ 
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 8cc0e588d0..6c0fb3d013 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -48,6 +48,8 @@ from hermes_cli import kanban_sync_outbox_age as outbox_age  # oldest pending op
+ from hermes_cli.kanban_sync_backlog import BUSY_RETRY_S, PULL_PAGE_BUDGET, Pulled
+ from hermes_cli import kanban_sync_timing as sync_timing  # off unless kanban.sync.diagnostics.timing_until arms it
+ from hermes_cli import kanban_sync_cpu as sync_cpu
++from hermes_cli import kanban_sync_refusal as refusal  # one board's ContainmentRefused ends only its round
++from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
+ from hermes_cli.kanban_sync_connections import connection, connection_scope, invalidate
+ from hermes_cli.kanban_sync_hub_routes import HubRoutesMixin
+ from hermes_cli.kanban_sync_client_attempt import note_attempt, raise_bounded_error, replay_after_timeout
+@@ -1163,8 +1165,17 @@ def sync_all_once(hub: Optional[Hub] = None, *,
+     results = []
+     for slug, path in board_paths() if boards is None else boards:
+         mark = sync_timing.board_start(slug, results)
++        held = refusal.waiting(slug)
++        if held is not None:  # backing off after a containment refusal; the other boards still run
++            results.append(RoundResult(board=slug, mode="?", error=held, skipped=True))
++            sync_timing.board_end(mark, results)
++            continue
+         try:
+             results.append(sync_board(slug, path, hub, ident.gateway))
++            refusal.cleared(slug)
++        except ContainmentRefused as exc:
++            # One board's refused page must not stop every board's sync (kanban_sync_refusal).
++            results.append(RoundResult(board=slug, mode="?", error=refusal.refused(slug, exc)))
+         except SchemaAhead as exc:
+             _log.error("kanban sync: %s not synced: %s", slug, exc)
+             results.append(RoundResult(board=slug, mode="?", error=f"SchemaAhead: {exc}"))
+diff --git a/hermes_cli/kanban_sync_refusal.py b/hermes_cli/kanban_sync_refusal.py
+new file mode 100644
+index 0000000000..644ec0bfa5
+--- /dev/null
++++ b/hermes_cli/kanban_sync_refusal.py
+@@ -0,0 +1,67 @@
++"""One board's containment refusal ends only that board's sync round (example incident).
++
++``certify_page`` raises ``ContainmentRefused`` when a feed page's protected containment event does not match its
++canonical receipt. That refusal is correct and stays strict: nothing from the page is applied and the board's
++cursor does not move. Before this module the exception escaped ``sync_board`` -> ``sync_all_once`` ->
++``run_forever``, killed ``kanban_sync_watcher`` and, after the supervisor's five rapid restarts, stopped every
++board on the host until the gateway restarted (example incident: example gateways).
++
++Here the loop records the refusal as that board's round error, logs it once per distinct refusal, and skips the
++board with a doubling backoff (60 s to 15 min) while the other boards keep syncing. A round that completes for the
++board clears its state. [daveey]
++"""
++from __future__ import annotations
++
++import logging
++import threading
++import time
++from typing import Callable, Optional
++
++_log = logging.getLogger("hermes_cli.kanban_sync_client")
++
++FIRST_BACKOFF_S = 60.0
++MAX_BACKOFF_S = 900.0
++
++_lock = threading.Lock()
++# board slug -> (retry_at on the monotonic clock, current backoff seconds, refusal text)
++_state: dict[str, tuple[float, float, str]] = {}
++
++
++def waiting(slug: str, *, now: Optional[Callable[[], float]] = None) -> Optional[str]:
++    """The refusal text while ``slug`` is backing off after a refusal; None when it may run."""
++    clock = now or time.monotonic
++    with _lock:
++        entry = _state.get(slug)
++    if entry is None or clock() >= entry[0]:
++        return None
++    return entry[2]
++
++
++def refused(slug: str, exc: BaseException, *, now: Optional[Callable[[], float]] = None) -> str:
++    """Record a refusal for ``slug`` and return the round error text. Logs ERROR only when the refusal text is new
++    for this board; a retry that hits the same refusal logs at DEBUG."""
++    clock = now or time.monotonic
++    text = f"ContainmentRefused: {exc}"
++    with _lock:
++        prior = _state.get(slug)
++        backoff = FIRST_BACKOFF_S if prior is None else min(prior[1] * 2, MAX_BACKOFF_S)
++        _state[slug] = (clock() + backoff, backoff, text)
++    if prior is None or prior[2] != text:
++        _log.error("kanban sync: %s round refused (%s); nothing applied, cursor kept; other boards keep syncing, "
++                   "retry in %ds", slug, text, int(backoff))
++    else:
++        _log.debug("kanban sync: %s still refused (%s); retry in %ds", slug, text, int(backoff))
++    return text
++
++
++def cleared(slug: str) -> None:
++    """A round for ``slug`` completed: drop its refusal backoff."""
++    with _lock:
++        prior = _state.pop(slug, None)
++    if prior is not None:
++        _log.info("kanban sync: %s syncs again after a containment refusal (%s)", slug, prior[2])
++
++
++def reset() -> None:
++    with _lock:
++        _state.clear()
+diff --git a/tests/gateway/test_supervised_slow_retry.py b/tests/gateway/test_supervised_slow_retry.py
+new file mode 100644
+index 0000000000..36ec52b323
+--- /dev/null
++++ b/tests/gateway/test_supervised_slow_retry.py
+@@ -0,0 +1,78 @@
++"""Example sync outage: the supervisor gave up on kanban_sync_watcher after 5 rapid deaths and the whole host
++stopped syncing until its gateway restarted. A watcher listed in ``_SUPERVISED_SLOW_RETRY_SECS`` is never abandoned:
++after the budget it respawns with a fresh budget."""
++from __future__ import annotations
++
++import asyncio
++
++import pytest
++
++from gateway.run import GatewayRunner
++from tests.gateway.test_platform_reconnect import _make_runner
++
++
++async def _settle(times=300):
++    for _ in range(times):
++        await asyncio.sleep(0)
++
++
++def _runner(monkeypatch):
++    runner = _make_runner()
++    runner._background_tasks = set()
++    runner._running = True
++    monkeypatch.setattr(GatewayRunner, "_MAX_SUPERVISED_RESTARTS", 2)
++    monkeypatch.setattr(GatewayRunner, "_SUPERVISED_HEALTHY_SECS", 3600)
++    monkeypatch.setattr(GatewayRunner, "_supervised_backoff", staticmethod(lambda _a: 0))
++    return runner
++
++
++def _crashing(crashes):
++    state = {"spawns": 0, "live": 0, "left": crashes}
++
++    async def watcher():
++        state["spawns"] += 1
++        if state["left"] > 0:
++            state["left"] -= 1
++            raise RuntimeError("ContainmentRefused-like crash")
++        state["live"] += 1
++        await asyncio.Event().wait()
++
++    return state, watcher
++
++
++@pytest.mark.asyncio
++async def test_sync_watcher_respawns_after_giving_up(monkeypatch):
++    runner = _runner(monkeypatch)
++    monkeypatch.setattr(GatewayRunner, "_SUPERVISED_SLOW_RETRY_SECS", {"kanban_sync_watcher": 0})
++    gave_up = []
++    state, watcher = _crashing(crashes=4)  # past the 2-restart budget: the give-up branch is reached
++    runner._spawn_supervised(watcher, "kanban_sync_watcher", on_give_up=gave_up.append)
++    await _settle()
++    assert gave_up == ["kanban_sync_watcher"]  # the existing give-up hook still fires
++    assert state["live"] == 1, "the slow tier must bring the watcher back once it stops crashing"
++    for t in list(runner._background_tasks):
++        t.cancel()
++
++
++@pytest.mark.asyncio
++async def test_unlisted_watcher_still_gives_up_for_good(monkeypatch):
++    runner = _runner(monkeypatch)
++    monkeypatch.setattr(GatewayRunner, "_SUPERVISED_SLOW_RETRY_SECS", {"kanban_sync_watcher": 0})
++    state, watcher = _crashing(crashes=4)
++    runner._spawn_supervised(watcher, "some_other_watcher")
++    await _settle()
++    assert state["live"] == 0 and state["spawns"] == 3  # unchanged behaviour for other tasks
++
++
++@pytest.mark.asyncio
++async def test_no_slow_respawn_after_shutdown(monkeypatch):
++    runner = _runner(monkeypatch)
++    monkeypatch.setattr(GatewayRunner, "_SUPERVISED_SLOW_RETRY_SECS", {"kanban_sync_watcher": 0})
++    state, watcher = _crashing(crashes=3)
++
++    def stop(_name):
++        runner._running = False
++
++    runner._spawn_supervised(watcher, "kanban_sync_watcher", on_give_up=stop)
++    await _settle()
++    assert state["live"] == 0
+diff --git a/tests/hermes_cli/test_kanban_sync_refusal.py b/tests/hermes_cli/test_kanban_sync_refusal.py
+new file mode 100644
+index 0000000000..69c01b12c6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_refusal.py
+@@ -0,0 +1,103 @@
++"""Example sync outage: one board's ContainmentRefused must end only that board's round.
++
++Before the fix the refusal escaped ``sync_all_once`` (and so ``run_forever``) and stopped every board on the host.
++"""
++from __future__ import annotations
++
++import logging
++
++import pytest
++
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_refusal as refusal
++from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
++
++
++class _Ident:
++    gateway = "gw-test"
++
++
++class _Hub:
++    ident = _Ident()
++
++
++@pytest.fixture(autouse=True)
++def _isolate(monkeypatch):
++    refusal.reset()
++    monkeypatch.setattr(ksc, "publish_pickup_if_changed", lambda hub: None)
++    import hermes_cli.kanban_source_clones as sc
++    monkeypatch.setattr(sc, "attest_if_due", lambda hub: None)
++    yield
++    refusal.reset()
++
++
++def _boards(tmp_path):
++    return [("refused", tmp_path / "refused.db"), ("healthy", tmp_path / "healthy.db")]
++
++
++def test_refused_board_does_not_stop_the_other_boards(monkeypatch, tmp_path, caplog):
++    synced = []
++
++    def fake_sync_board(slug, path, hub, gateway):
++        if slug == "refused":
++            raise ContainmentRefused("replica event differs from its canonical receipt")
++        synced.append(slug)
++        return ksc.RoundResult(board=slug, mode="primary", pulled=3)
++
++    monkeypatch.setattr(ksc, "sync_board", fake_sync_board)
++    with caplog.at_level(logging.ERROR, logger="hermes_cli.kanban_sync_client"):
++        results = ksc.sync_all_once(_Hub(), boards=_boards(tmp_path))
++
++    assert synced == ["healthy"]
++    by = {r.board: r for r in results}
++    assert by["refused"].error == "ContainmentRefused: replica event differs from its canonical receipt"
++    assert by["healthy"].error is None and by["healthy"].pulled == 3
++    assert sum("round refused" in r.getMessage() for r in caplog.records) == 1
++
++
++def test_refused_board_backs_off_then_retries_and_logs_once(monkeypatch, tmp_path, caplog):
++    clock = {"t": 1000.0}
++    monkeypatch.setattr(refusal.time, "monotonic", lambda: clock["t"])
++    calls = {"refused": 0}
++    state = {"fixed": False}
++
++    def fake_sync_board(slug, path, hub, gateway):
++        if slug == "refused":
++            calls["refused"] += 1
++            if not state["fixed"]:
++                raise ContainmentRefused("canonical receipt identity changed")
++        return ksc.RoundResult(board=slug, mode="primary")
++
++    monkeypatch.setattr(ksc, "sync_board", fake_sync_board)
++    boards = _boards(tmp_path)
++    with caplog.at_level(logging.DEBUG, logger="hermes_cli.kanban_sync_client"):
++        ksc.sync_all_once(_Hub(), boards=boards)          # refused: backoff 60 s
++        clock["t"] += 30
++        held = {r.board: r for r in ksc.sync_all_once(_Hub(), boards=boards)}
++        assert calls["refused"] == 1 and held["refused"].skipped  # still backing off: not retried
++        clock["t"] += 31
++        ksc.sync_all_once(_Hub(), boards=boards)          # retried, refused again: backoff 120 s
++        assert calls["refused"] == 2
++        clock["t"] += 61
++        ksc.sync_all_once(_Hub(), boards=boards)          # still inside 120 s
++        assert calls["refused"] == 2
++        state["fixed"] = True
++        clock["t"] += 60
++        done = {r.board: r for r in ksc.sync_all_once(_Hub(), boards=boards)}
++        assert calls["refused"] == 3 and done["refused"].error is None
++        clock["t"] += 1
++        ksc.sync_all_once(_Hub(), boards=boards)          # cleared: runs every round again
++        assert calls["refused"] == 4
++
++    errors = [r for r in caplog.records if r.levelno == logging.ERROR and "round refused" in r.getMessage()]
++    assert len(errors) == 1  # one ERROR per distinct refusal, not one per retry
++
++
++def test_backoff_caps_at_fifteen_minutes():
++    clock = {"t": 0.0}
++    now = lambda: clock["t"]
++    for _ in range(12):
++        refusal.refused("b", ContainmentRefused("x"), now=now)
++    assert refusal.waiting("b", now=now) is not None
++    clock["t"] += refusal.MAX_BACKOFF_S
++    assert refusal.waiting("b", now=now) is None
+-- 
+2.43.0
+

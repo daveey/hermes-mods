@@ -1,0 +1,798 @@
+From 21e4b4834894604aa34bf96d859bbe19d25efeaf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 19:36:52 +0000
+Subject: [PATCH] [daveey] worker-drain: adopt pre-existing state dirs at
+ install, stay a no-op off POSIX, resolve import aliases in the spawn scan
+
+Review round 1 of this PR found four defects in the previous head.
+
+Install over an existing core-update dir. The update fence creates
+core-update under the account umask (0775 on worker nodes) long before the
+first drain install, and the hardened readers refuse a group-writable state
+dir. install_state left the mode alone, so activation would have refused every
+spawn, cron run, MCP connect and shell hook on the node. install_state now
+tightens the dir and the lease dir through their own descriptors when a
+trusted uid owns them, and refuses loudly for a symlink, another type or a
+foreign owner. The lease dir is checked on every lease count and acquire, so
+an untrusted lease dir reads as unknown-state, never as zero leases.
+
+Windows. load_activation evaluated os.O_NOFOLLOW | os.O_CLOEXEC, which do not
+exist there, so every seam routed through admit raised AttributeError.
+load_activation now returns None when fcntl is unavailable and the flags fall
+back to 0 at import.
+
+Source scan. The AST scan only matched the literal name subprocess, so
+`import subprocess as _sp` and `from subprocess import Popen` were invisible
+(cua_backend_session._cli_run_json, batch_runner). It now resolves module and
+function aliases file-wide, counts popen_worker calls and @fenced entry points
+as routed seams, and the required-seams test no longer passes by default:
+tools/registry.py and gateway/session_worker_spawn.py are recorded in the
+inventory as incomplete_seams with the reason, and a test fails once either
+gains a spawn or the fence. The cua-driver CLI fallback now runs under a lease.
+
+Census root. observe_leases read this process's policy root while admit writes
+under the activated account's root; a root-run heartbeat could have counted an
+unrelated dir. Both now use the same root.
+
+Also reverts fixture/cache/plugin_hooks.json, a test-run artifact.
+
+Still INCOMPLETE and named in the code: no producer writes the process
+baseline (host_processes is never zero in production, so scale-in stays off);
+the composed test uses stand-ins for the Board, registry and scaler until the
+scaler fence exists; registry.dispatch, the gateway session worker, platform
+adapters and web actions hold no drain lease; seven-table custody and GC/WAL
+are excluded.
+
+Tests: tests/hermes_cli/test_worker_drain*.py and tests/tools/test_worker_drain*.py
+103 passed; 45 files touching the changed modules 696 passed, 12 skipped;
+scripts/check --base origin/main 21 checks ok.
+---
+ fixture/cache/plugin_hooks.json               |   2 +-
+ hermes_cli/worker_drain_census.py             |   6 +-
+ hermes_cli/worker_drain_fence.py              |  67 ++++++--
+ hermes_cli/worker_drain_spawn_inventory.json  |  53 +++++-
+ .../hermes_cli/test_worker_drain_composed.py  |   7 +-
+ .../hermes_cli/test_worker_drain_hardening.py |  81 +++++++++
+ .../test_worker_drain_source_scan.py          | 162 ++++++++++++++----
+ tools/computer_use/cua_backend_session.py     |   8 +-
+ 8 files changed, 333 insertions(+), 53 deletions(-)
+
+diff --git a/fixture/cache/plugin_hooks.json b/fixture/cache/plugin_hooks.json
+index a8e37322bd..e573b708f9 100644
+--- a/fixture/cache/plugin_hooks.json
++++ b/fixture/cache/plugin_hooks.json
+@@ -1 +1 @@
+-{"version": 1, "fingerprint": "bc6addb52d356cf0d1d4ea21156c615dc8cc13e7ef46c0c9366b5972e9252d33", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
++{"version": 1, "fingerprint": "30663ffde4ba2fde515cfd40d8ec58f7b50afd3ffdb9e8ba36a5784433787f44", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/hermes_cli/worker_drain_census.py b/hermes_cli/worker_drain_census.py
+index a30a1b02f6..5f8efa6adf 100644
+--- a/hermes_cli/worker_drain_census.py
++++ b/hermes_cli/worker_drain_census.py
+@@ -72,6 +72,9 @@ def _is_kernel_thread(root: str, pid: str) -> bool:
+ # ---------------------------------------------------------------------------
+ # Manifest census: zero is provable only when EVERY manifest adapter proves zero.
+ # ---------------------------------------------------------------------------
++# Nothing writes BASELINE_PATH yet: core has no producer and the state-repo installer (Stage 2 item (d),
++# card t_eeeeee000000002f, install-drain-fence.py) does not capture one. Until it does, host_processes is
++# never ZERO in production, so the manifest count is positive or UNKNOWN and scale-in stays off. INCOMPLETE.
+ BASELINE_PATH = '/var/lib/hermes-worker/drain-baseline.json'
+ ADAPTERS = ('host_processes', 'work_leases', 'local_results')  # the complete manifest
+ ZERO, POSITIVE, UNKNOWN = 'zero', 'positive', 'unknown'
+@@ -151,10 +154,9 @@ def observe_processes(proc_root: str = '/proc', baseline: frozenset | None = Non
+ 
+ 
+ def observe_leases() -> Observation:
+-    from hermes_cli import worker_compute_capacity as capacity
+     from hermes_cli import worker_drain_fence as fence
+     try:
+-        busy = fence.busy_leases(capacity.policy_root())
++        busy = fence.busy_leases(*fence.census_root())  # admit's root, also under a root-run heartbeat
+     except (fence.DrainRefused, OSError):
+         return Observation(UNKNOWN, reason='lease dir unreadable')
+     return Observation(POSITIVE, busy) if busy else Observation(ZERO)
+diff --git a/hermes_cli/worker_drain_fence.py b/hermes_cli/worker_drain_fence.py
+index d18d918f54..79a22ca65c 100644
+--- a/hermes_cli/worker_drain_fence.py
++++ b/hermes_cli/worker_drain_fence.py
+@@ -59,6 +59,8 @@ class Identity:
+ 
+ 
+ ACTIVATION_OWNERS: tuple = (0,)  # who may own the activation file (tests rebind)
++# Absent off POSIX; enforcement cannot be activated there, so 0 only keeps the module importable.
++_NOFOLLOW, _CLOEXEC = getattr(os, 'O_NOFOLLOW', 0), getattr(os, 'O_CLOEXEC', 0)
+ 
+ 
+ def _trusted(uid: int | None = None) -> set:
+@@ -76,7 +78,7 @@ def _secure_read(path: Path, owners: set) -> bytes:
+     """Read a state file through O_NOFOLLOW; reject non-regular, hardlinked, foreign-owner or
+     group/world-writable files (checked on the opened descriptor, not the path)."""
+     try:
+-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
++        fd = os.open(path, os.O_RDONLY | _NOFOLLOW | _CLOEXEC)
+     except FileNotFoundError:
+         raise
+     except OSError as exc:
+@@ -95,6 +97,31 @@ def _check_dir(d: Path, owners: set) -> None:
+         raise DrainRefused('unknown-state', f'{d.name} unreadable: {type(exc).__name__}') from exc
+ 
+ 
++def _adopt_dir(d: Path, owners: set) -> None:
++    """Installer only: bring a state dir that predates the latch to a trusted mode.
++
++    ``core-update`` is created by the update fence under the account umask (0775 on worker nodes), so
++    it exists group-writable before the first install. Only a real directory owned by a trusted uid is
++    tightened (through its own descriptor, never the path); a symlink, another type or a foreign owner
++    is refused loudly so the installer never activates over state the readers would reject.
++    """
++    try:
++        fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW | _CLOEXEC)
++    except OSError as exc:
++        raise DrainRefused('unknown-state', f'{d.name} is not a usable directory: {type(exc).__name__}') from exc
++    try:
++        st = os.fstat(fd)
++        if st.st_uid not in owners:
++            raise DrainRefused('unknown-state', f'{d.name} untrusted owner')
++        if st.st_mode & 0o022:
++            os.fchmod(fd, st.st_mode & 0o7755)
++    except OSError as exc:
++        raise DrainRefused('unknown-state', f'{d.name} mode not fixable: {type(exc).__name__}') from exc
++    finally:
++        os.close(fd)
++    _check_dir(d, owners)
++
++
+ def read_boot_id() -> str:
+     return Path('/proc/sys/kernel/random/boot_id').read_text(encoding='ascii').strip()
+ 
+@@ -108,7 +135,11 @@ def request_hash(req: dict) -> str:
+ 
+ 
+ def load_activation(path: Path = ACTIVATION_PATH) -> dict | None:
+-    """None when absent (hooks no-op). Raises DrainRefused('unknown-state') when present but invalid."""
++    """None when absent (hooks no-op). Raises DrainRefused('unknown-state') when present but invalid.
++
++    Off POSIX there is no latch to enforce (no flock, no installer): always None, never an error."""
++    if fcntl is None:
++        return None
+     try:
+         raw = _secure_read(Path(path), set(ACTIVATION_OWNERS))
+     except FileNotFoundError:
+@@ -133,7 +164,7 @@ def account_lock(root: Path, *, timeout: float = 2.0):
+     d = _state_root(root)
+     d.mkdir(parents=True, exist_ok=True, mode=0o700)
+     try:
+-        fd = os.open(d / LOCK_FILE, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
++        fd = os.open(d / LOCK_FILE, os.O_CREAT | os.O_RDWR | _CLOEXEC | _NOFOLLOW, 0o600)
+     except OSError as exc:
+         raise DrainRefused('unknown-state', f'admission lock unavailable: {type(exc).__name__}') from exc
+     deadline = time.monotonic() + timeout
+@@ -180,14 +211,17 @@ def _read_json(path: Path, owners: set | None = None) -> dict:
+ def install_state(root: Path, ident: Identity) -> None:
+     """Installer only: immutable install binding (O_EXCL) plus an open latch at generation 0."""
+     d = _state_root(root)
++    owners = _trusted(ident.uid)
+     with account_lock(root):
+         d.mkdir(parents=True, exist_ok=True, mode=0o700)
++        _adopt_dir(d, owners)
+         (d / LEASE_DIR).mkdir(mode=0o700, exist_ok=True)
++        _adopt_dir(d / LEASE_DIR, owners)
+         binding = {'version': 1, 'iid': ident.iid, 'node_epoch': ident.node_epoch}
+         try:
+-            fd = os.open(d / INSTALL_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
++            fd = os.open(d / INSTALL_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _NOFOLLOW, 0o600)
+         except FileExistsError:
+-            if _read_json(d / INSTALL_FILE, _trusted(ident.uid)) != binding:
++            if _read_json(d / INSTALL_FILE, owners) != binding:
+                 raise DrainRefused('identity-mismatch', 'install binding differs') from None
+         else:
+             try:
+@@ -261,7 +295,7 @@ def apply_request(root: Path, ident: Identity, req: dict, *, now_ms: int | None
+             new, gen, att = 'draining', req['generation'], req['attempt']
+         if new is None:
+             raise DrainRefused('identity-mismatch', f'illegal {req["op"]} from {phase}')
+-        if new == 'sealed' and busy_leases(root):
++        if new == 'sealed' and busy_leases(root, _trusted(ident.uid)):
+             raise DrainRefused('draining', 'live work leases prevent seal')
+         receipt = {'phase': new, 'generation': gen, 'attempt': att, 'request_id': req['request_id'], 'hash': digest}
+         _write_atomic(d / LATCH_FILE, _latch_doc(ident, new, gen, att,
+@@ -300,7 +334,7 @@ class WorkLease:
+ def lease_busy(path: Path) -> bool:
+     """Busy only if an independent fresh flock fails (metadata existence is not busy)."""
+     try:
+-        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
++        fd = os.open(path, os.O_RDWR | _NOFOLLOW | _CLOEXEC)
+     except FileNotFoundError:
+         return False
+     try:
+@@ -313,8 +347,11 @@ def lease_busy(path: Path) -> bool:
+         os.close(fd)
+ 
+ 
+-def busy_leases(root: Path) -> int:
++def busy_leases(root: Path, owners: set | None = None) -> int:
++    """Count flocked leases. The lease dir itself must be trusted: a swapped or writable-by-others dir
++    could hide live leases, so it reads as unknown-state, never as zero."""
+     d = _state_root(root) / LEASE_DIR
++    _check_dir(d, _trusted() if owners is None else owners)
+     try:
+         return sum(1 for p in d.iterdir() if p.name.endswith('.lease') and lease_busy(p))
+     except OSError as exc:
+@@ -333,8 +370,9 @@ def acquire_lease(root: Path, ident: Identity, purpose: str, *, parent: WorkLeas
+                 or _parent_from_fd(root, parent.fd, boot=ident.boot) is None):
+             raise DrainRefused('draining')
+         ld = d / LEASE_DIR
++        _check_dir(ld, _trusted(ident.uid))
+         name = uuid.uuid4().hex + '.lease'
+-        fd = os.open(ld / name, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
++        fd = os.open(ld / name, os.O_CREAT | os.O_EXCL | os.O_RDWR | _CLOEXEC | _NOFOLLOW, 0o600)
+         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+         os.write(fd, _canon({'version': 1, 'boot': ident.boot, 'pid': os.getpid(), 'purpose': purpose}))
+         os.fsync(fd)
+@@ -345,7 +383,7 @@ def seal_precheck(root: Path, ident: Identity) -> bool:
+     """True when no lease is busy; callers then request op=seal. Positive leases keep the latch draining."""
+     with account_lock(root):
+         read_latch(root, ident)
+-        return busy_leases(root) == 0
++        return busy_leases(root, _trusted(ident.uid)) == 0
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -403,6 +441,15 @@ def _activation_root(act: dict) -> Path:
+     return Path(act['home']) / '.hermes'
+ 
+ 
++def census_root() -> tuple[Path, set]:
++    """(state root, trusted owners) the census must read: the same root ``admit`` writes leases under.
++    Not activated: this account's policy root (nothing is enforced, so nothing else can hold leases)."""
++    act = load_activation()
++    if act is None:
++        return _state_base(), _trusted()
++    return _activation_root(act), _trusted(act['uid'])
++
++
+ def _inherited_parent(root: Path):
+     local = _authority.get()
+     if local is not None and local.fd is not None:
+diff --git a/hermes_cli/worker_drain_spawn_inventory.json b/hermes_cli/worker_drain_spawn_inventory.json
+index a618f0af2e..cfb434a093 100644
+--- a/hermes_cli/worker_drain_spawn_inventory.json
++++ b/hermes_cli/worker_drain_spawn_inventory.json
+@@ -65,6 +65,11 @@
+    "routed": 0,
+    "status": "pending"
+   },
++  "agent/shell_hooks.py": {
++   "direct": 0,
++   "routed": 1,
++   "status": "fenced"
++  },
+   "agent/skill_preprocessing.py": {
+    "direct": 1,
+    "routed": 0,
+@@ -105,6 +110,11 @@
+    "routed": 0,
+    "status": "pending"
+   },
++  "batch_runner.py": {
++   "direct": 2,
++   "routed": 0,
++   "status": "pending"
++  },
+   "cli.py": {
+    "direct": 1,
+    "routed": 0,
+@@ -117,7 +127,7 @@
+   },
+   "cron/scheduler.py": {
+    "direct": 1,
+-   "routed": 0,
++   "routed": 1,
+    "status": "pending"
+   },
+   "cron/scheduler_script.py": {
+@@ -607,7 +617,7 @@
+   },
+   "hermes_cli/local_runtime/processes.py": {
+    "direct": 0,
+-   "routed": 1,
++   "routed": 2,
+    "status": "fenced"
+   },
+   "hermes_cli/local_runtime/supervisor.py": {
+@@ -712,7 +722,7 @@
+   },
+   "hermes_cli/process_identity.py": {
+    "direct": 1,
+-   "routed": 1,
++   "routed": 2,
+    "status": "pending"
+   },
+   "hermes_cli/profiles.py": {
+@@ -1275,6 +1285,11 @@
+    "routed": 0,
+    "status": "pending"
+   },
++  "tools/browser_launcher.py": {
++   "direct": 0,
++   "routed": 1,
++   "status": "fenced"
++  },
+   "tools/browser_lightpanda.py": {
+    "direct": 2,
+    "routed": 0,
+@@ -1312,7 +1327,7 @@
+   },
+   "tools/computer_use/cua_backend_session.py": {
+    "direct": 0,
+-   "routed": 1,
++   "routed": 2,
+    "status": "fenced"
+   },
+   "tools/computer_use/doctor.py": {
+@@ -1335,6 +1350,11 @@
+    "routed": 0,
+    "status": "pending"
+   },
++  "tools/environments/base_output.py": {
++   "direct": 0,
++   "routed": 1,
++   "status": "fenced"
++  },
+   "tools/environments/docker.py": {
+    "direct": 4,
+    "routed": 0,
+@@ -1345,6 +1365,11 @@
+    "routed": 0,
+    "status": "pending"
+   },
++  "tools/environments/local.py": {
++   "direct": 0,
++   "routed": 1,
++   "status": "fenced"
++  },
+   "tools/environments/reattach.py": {
+    "direct": 2,
+    "routed": 0,
+@@ -1397,14 +1422,19 @@
+   },
+   "tools/process_registry.py": {
+    "direct": 2,
+-   "routed": 0,
++   "routed": 2,
+    "status": "pending"
+   },
+-  "tools/process_registry_survivable.py": {
++  "tools/process_registry_ownership.py": {
+    "direct": 0,
+    "routed": 1,
+    "status": "fenced"
+   },
++  "tools/process_registry_survivable.py": {
++   "direct": 0,
++   "routed": 2,
++   "status": "fenced"
++  },
+   "tools/process_registry_termination.py": {
+    "direct": 1,
+    "routed": 0,
+@@ -1487,7 +1517,7 @@
+   },
+   "tui_gateway/host_supervisor.py": {
+    "direct": 1,
+-   "routed": 0,
++   "routed": 1,
+    "status": "pending"
+   },
+   "tui_gateway/methods_complete_helpers.py": {
+@@ -1499,7 +1529,16 @@
+    "direct": 1,
+    "routed": 0,
+    "status": "pending"
++  },
++  "tui_gateway/methods_tools.py": {
++   "direct": 0,
++   "routed": 2,
++   "status": "fenced"
+   }
+  },
++ "incomplete_seams": {
++  "gateway/session_worker_spawn.py": "acquire_process runs a caller-supplied spawn callable with no drain lease; its one caller spawns in gateway/session_managed_worker.py (pending)",
++  "tools/registry.py": "registry.dispatch takes no drain lease: a tool handler is covered only where its own spawn site is fenced; handlers that spawn through a pending file run unfenced"
++ },
+  "version": 1
+ }
+diff --git a/tests/hermes_cli/test_worker_drain_composed.py b/tests/hermes_cli/test_worker_drain_composed.py
+index 18f9a62864..42e9367255 100644
+--- a/tests/hermes_cli/test_worker_drain_composed.py
++++ b/tests/hermes_cli/test_worker_drain_composed.py
+@@ -4,9 +4,14 @@ Real: ``machine_persistent_jobs.collect``, the manifest census, lease adapter (r
+ (real sqlite outbox + sync lock), ``fresh`` and ``send_compatible``. Stand-ins: the Board accepts the sample,
+ the registry stores it, and ``scale_in_allowed`` models the consumer contract (exact integer zero, fresh,
+ for the exact instance id). The real Board/registry/scaler live in the state repo and are NOT exercised here.
++
++INCOMPLETE: the card's item (f) asks for this composition against the real scaler fence of item (e)
++(card t_eeeeee0000000030, not built yet). Until that lands this is a contract test of the core producer
++side only; it is not evidence that the scaler gates termination on these samples.
+ """
+ from __future__ import annotations
+ 
++import os
+ import sqlite3
+ import time
+ 
+@@ -56,7 +61,7 @@ def node(tmp_path, monkeypatch):
+     monkeypatch.setattr(capacity, 'policy_root', lambda: tmp_path)
+     monkeypatch.setattr(capacity, 'occupied_owners', lambda *a, **k: set())
+     monkeypatch.setattr(worker_account_boards, 'paths', lambda: [board])
+-    monkeypatch.setattr(fence, 'load_activation', lambda path=None: {'iid': IID})
++    monkeypatch.setattr(fence, 'load_activation', lambda path=None: {'iid': IID, 'uid': os.getuid(), 'home': str(tmp_path)})  # windows-footgun: ok
+     monkeypatch.setattr(census, 'observe_processes', lambda *a, **k: census.Observation(census.ZERO))
+     return tmp_path, board
+ 
+diff --git a/tests/hermes_cli/test_worker_drain_hardening.py b/tests/hermes_cli/test_worker_drain_hardening.py
+index a6d8d64b02..b4378fdc52 100644
+--- a/tests/hermes_cli/test_worker_drain_hardening.py
++++ b/tests/hermes_cli/test_worker_drain_hardening.py
+@@ -73,6 +73,87 @@ def test_state_dir_must_be_a_real_private_directory(root, tmp_path):
+     refuses(f.read_latch, root, IDENT)
+ 
+ 
++def test_install_adopts_the_group_writable_dir_the_update_fence_left(tmp_path):
++    # Real workers: admission_fence created core-update under umask 0002 long before the first install.
++    d = tmp_path / 'core-update'
++    d.mkdir()
++    d.chmod(0o2775)
++    (d / f.LEASE_DIR).mkdir()
++    (d / f.LEASE_DIR).chmod(0o777)
++    f.install_state(tmp_path, IDENT)
++    assert d.stat().st_mode & 0o7777 == 0o2755 and (d / f.LEASE_DIR).stat().st_mode & 0o777 == 0o755
++    assert f.read_latch(tmp_path, IDENT)['phase'] == 'open'
++    lease = f.acquire_lease(tmp_path, IDENT, 'x')
++    assert f.busy_leases(tmp_path) == 1
++    lease.close()
++    f.install_state(tmp_path, IDENT)  # idempotent re-install over the adopted dir
++    assert f.seal_precheck(tmp_path, IDENT) is True
++
++
++def test_install_refuses_loudly_when_the_dir_cannot_be_trusted(tmp_path, monkeypatch):
++    real = tmp_path / 'real'
++    (real / 'core-update').mkdir(parents=True)
++    root = tmp_path / 'root'
++    root.mkdir()
++    (root / 'core-update').symlink_to(real / 'core-update')
++    refuses(f.install_state, root, IDENT)  # symlinked state dir: never chmod through it
++    assert not (real / 'core-update' / f.INSTALL_FILE).exists()
++    other = tmp_path / 'other'
++    (other / 'core-update').mkdir(parents=True)
++    monkeypatch.setattr(f, '_trusted', lambda uid=None: {os.getuid() + 12345})  # windows-footgun: ok
++    refuses(f.install_state, other, IDENT)  # foreign owner: not ours to tighten
++    assert not (other / 'core-update' / f.INSTALL_FILE).exists()
++
++
++def test_lease_dir_must_be_trusted_or_the_count_is_unknown(root):
++    ld = root / 'core-update' / f.LEASE_DIR
++    lease = f.acquire_lease(root, IDENT, 'x')
++    ld.chmod(0o777)
++    refuses(f.busy_leases, root)  # never a guessed zero
++    refuses(f.acquire_lease, root, IDENT, 'y')
++    refuses(f.seal_precheck, root, IDENT)
++    ld.chmod(0o700)
++    assert f.busy_leases(root) == 1
++    lease.close()
++    moved = root / 'moved-leases'
++    ld.rename(moved)
++    ld.symlink_to(moved)
++    refuses(f.busy_leases, root)
++
++
++def test_not_activated_or_not_posix_is_a_noop_never_an_error(tmp_path, monkeypatch):
++    absent = tmp_path / 'absent.json'
++    assert f.load_activation(absent) is None and f.admit('x', activation_path=absent) is None
++    # Windows has neither flag; the module-level fallbacks keep the absent-file path working.
++    monkeypatch.delattr(os, 'O_NOFOLLOW')
++    monkeypatch.delattr(os, 'O_CLOEXEC')
++    assert f.load_activation(absent) is None and f.admit('x', activation_path=absent) is None
++    # Off POSIX (no fcntl) nothing can be enforced: even a present file is a no-op, not a refusal.
++    present = tmp_path / 'act.json'
++    present.write_text('not json', encoding='utf-8')
++    monkeypatch.setattr(f, 'fcntl', None)
++    assert f.load_activation(present) is None and f.admit('x', activation_path=present) is None
++
++
++def test_census_reads_the_root_admit_writes_under(tmp_path, monkeypatch):
++    from hermes_cli import worker_drain_census as census
++    home = tmp_path / 'home'
++    state = home / '.hermes'
++    state.mkdir(parents=True)
++    f.install_state(state, IDENT)
++    act = {'uid': os.getuid(), 'home': str(home)}  # windows-footgun: ok
++    monkeypatch.setattr(f, 'load_activation', lambda path=None: act)
++    monkeypatch.setattr(f, '_state_base', lambda: tmp_path / 'roots-own-home')  # where a root heartbeat would look
++    monkeypatch.setattr(f.os, 'geteuid', lambda: 0)
++    lease = f.acquire_lease(state, f.Identity(IDENT.iid, IDENT.boot, IDENT.node_epoch, uid=act['uid']), 'x')
++    assert f.census_root()[0] == state
++    assert census.observe_leases() == census.Observation(census.POSITIVE, 1)
++    lease.close()
++    assert census.observe_leases() == census.Observation(census.ZERO)
++    monkeypatch.setattr(f.os, 'geteuid', lambda: os.getuid() + 12345)  # windows-footgun: ok
++    assert census.observe_leases().state == census.UNKNOWN  # foreign uid: refused, never zero
++
++
+ def test_foreign_owner_is_refused(root, monkeypatch):
+     # Trust is {root, effective uid, activated uid}; a state file owned by anyone else is unknown.
+     monkeypatch.setattr(f.os, 'geteuid', lambda: os.getuid() + 12345)  # windows-footgun: ok
+diff --git a/tests/hermes_cli/test_worker_drain_source_scan.py b/tests/hermes_cli/test_worker_drain_source_scan.py
+index 0d9e77bc70..b6d62d5f53 100644
+--- a/tests/hermes_cli/test_worker_drain_source_scan.py
++++ b/tests/hermes_cli/test_worker_drain_source_scan.py
+@@ -8,6 +8,12 @@ after fencing a seam. The inventory is a ratchet, not a proof of completeness:
+   file, fails the test until the author fences it or consciously adds it to the inventory.
+ * A pending file that has since been fenced must be promoted, so the pending list only shrinks.
+ * ``REQUIRED_SEAMS`` names the seams the drain design owes; each must be fenced or explicitly pending.
++* ``INCOMPLETE_SEAMS`` names owed seams the scan cannot see (no raw spawn of their own) that hold no
++  lease yet. They are written into the inventory so the gap is on record.
++
++The scan resolves ``import subprocess as x`` / ``from subprocess import Popen`` aliases. It does not see
++a spawn function passed as a value (``spawn=subprocess.Popen``), ``getattr`` or third-party launchers
++other than the MCP SDK names; those are covered only where REQUIRED_SEAMS names them.
+ """
+ from __future__ import annotations
+ 
+@@ -27,11 +33,8 @@ OS_FUNCS = {'fork', 'forkpty', 'system', 'popen', 'posix_spawn', 'posix_spawnp',
+             'spawnv', 'spawnve', 'spawnvp', 'spawnvpe'}
+ ASYNC_FUNCS = {'create_subprocess_exec', 'create_subprocess_shell', 'subprocess_exec', 'subprocess_shell'}
+ 
+-# Seams the drain design owes, by file path (glob-free exact prefixes). Each must be present in the
+-# inventory as fenced or pending; "pending" is an honest INCOMPLETE marker, not an exemption.
+-# Seams with no raw spawn call: they reach a subprocess only through fenced wrappers or other seams.
+-NO_DIRECT_SPAWN = {'registry.dispatch', 'gateway session worker', 'shell_hooks', 'terminal local env',
+-                   'survivable fd transport'}
++# Seams the drain design owes, by exact file path or directory prefix. Each must be present in the
++# inventory (fenced or pending) or be an explicit INCOMPLETE seam below. Nothing passes by default.
+ FENCED_BY_THIS_CHANGE = ('agent/shell_hooks.py', 'cron/scheduler.py', 'tools/mcp_tool_transport.py',
+                          'tools/computer_use/cua_backend_session.py', 'tools/process_registry.py',
+                          'tools/process_registry_survivable.py', 'tools/environments/local.py',
+@@ -39,6 +42,9 @@ FENCED_BY_THIS_CHANGE = ('agent/shell_hooks.py', 'cron/scheduler.py', 'tools/mcp
+ REQUIRED_SEAMS = {
+     'registry.dispatch': 'tools/registry.py',
+     'gateway session worker': 'gateway/session_worker_spawn.py',
++    'gateway managed worker spawn': 'gateway/session_managed_worker.py',
++    'platform adapters': 'gateway/platforms',
++    'web actions': 'hermes_cli/web_routers',
+     'mcp stdio': 'tools/mcp_tool_transport.py',
+     'cua': 'tools/computer_use/cua_backend_session.py',
+     'shell_hooks': 'agent/shell_hooks.py',
+@@ -48,30 +54,70 @@ REQUIRED_SEAMS = {
+     'terminal local env': 'tools/environments/local.py',
+     'pty': 'hermes_cli/pty_bridge.py',
+ }
+-
++# Owed seams with NO raw spawn call in their own file, so the scan cannot see them, and no drain lease
++# either. They are INCOMPLETE, recorded in the inventory, and stay listed until the file carries the
++# fence (the test then fails so the entry is removed with a real test of the new fence).
++INCOMPLETE_SEAMS = {
++    'tools/registry.py': 'registry.dispatch takes no drain lease: a tool handler is covered only where its own '
++                         'spawn site is fenced; handlers that spawn through a pending file run unfenced',
++    'gateway/session_worker_spawn.py': 'acquire_process runs a caller-supplied spawn callable with no drain lease; '
++                                       'its one caller spawns in gateway/session_managed_worker.py (pending)',
++}
+ 
+ ROUTERS = {'admit', 'popen_worker', 'admitted_reservation', '_drain_admit'}
++SPAWN_MODULES = {'subprocess': SUBPROCESS_FUNCS, 'os': OS_FUNCS, 'pty': {'fork', 'spawn'},
++                 'asyncio': ASYNC_FUNCS, 'asyncio.subprocess': ASYNC_FUNCS}
++SDK_SPAWNERS = {'stdio_client', 'open_process'}
+ 
+ 
+ def _name(node) -> str:
+     return node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else ''
+ 
+ 
+-def _is_spawn(node: ast.Call) -> bool:
++def _aliases(tree: ast.AST) -> tuple[dict, dict]:
++    """(module aliases, imported-function aliases) for the whole file, function-local imports included.
++
++    ``import subprocess as _sp`` -> {'_sp': 'subprocess'}; ``from subprocess import Popen as P`` ->
++    {'P': ('subprocess', 'Popen')}. File-wide rather than scoped: a name bound to a spawn module anywhere
++    in the file is treated as that module everywhere, which can only over-count.
++    """
++    mods = {m: m for m in SPAWN_MODULES if '.' not in m}
++    funcs: dict = {}
++    for node in ast.walk(tree):
++        if isinstance(node, ast.Import):
++            for a in node.names:
++                if a.name in SPAWN_MODULES:
++                    mods[a.asname or a.name.split('.')[0]] = a.name if a.asname else a.name.split('.')[0]
++        elif isinstance(node, ast.ImportFrom) and node.level == 0:
++            for a in node.names:
++                if node.module in SPAWN_MODULES and a.name in SPAWN_MODULES[node.module]:
++                    funcs[a.asname or a.name] = (node.module, a.name)
++                elif f'{node.module}.{a.name}' in SPAWN_MODULES:  # from asyncio import subprocess as sp
++                    mods[a.asname or a.name] = f'{node.module}.{a.name}'
++    return mods, funcs
++
++
++def _is_spawn(node: ast.Call, aliases: tuple[dict, dict] | None = None) -> bool:
++    mods, funcs = aliases or ({m: m for m in SPAWN_MODULES if '.' not in m}, {})
+     fn = node.func
+     if isinstance(fn, ast.Name):
+-        return fn.id in {'stdio_client', 'open_process'}
++        return fn.id in SDK_SPAWNERS or fn.id in funcs
+     if not isinstance(fn, ast.Attribute):
+         return False
+     base, name = _name(fn.value), fn.attr
+-    return bool((base == 'subprocess' and name in SUBPROCESS_FUNCS) or (base == 'os' and name in OS_FUNCS)
+-                or (base == 'pty' and name in {'fork', 'spawn'}) or name in ASYNC_FUNCS
+-                or name in {'stdio_client', 'open_process'}
++    module = mods.get(base, '') if isinstance(fn.value, ast.Name) else base
++    return bool(name in SPAWN_MODULES.get(module, ()) or name in ASYNC_FUNCS or name in SDK_SPAWNERS
+                 or (name == 'spawn' and base in {'PtyProcess', 'ptyprocess'}))
+ 
+ 
+ def _routed_function(fn) -> bool:
+-    """A function is a drain seam if it is decorated ``fenced`` or itself calls an admission router."""
++    """A function counts as a drain seam if it is decorated ``fenced`` or calls an admission router
++    anywhere in its body, nested functions included.
++
++    This is a ratchet heuristic, not a proof: every raw spawn in such a function is counted as routed
++    even if a particular spawn runs before the admission, on another branch, or after the lease closed.
++    Whether a given spawn holds the lease is established by the seam's own behaviour test.
++    """
+     for dec in fn.decorator_list:
+         target = dec.func if isinstance(dec, ast.Call) else dec
+         if 'fenced' in _name(target):
+@@ -82,12 +128,17 @@ def _routed_function(fn) -> bool:
+ def _spawn_sites(tree: ast.AST) -> tuple[int, int]:
+     """(direct, routed): raw spawn calls outside / inside a function that admits through the fence."""
+     direct = routed = 0
++    aliases = _aliases(tree)
+ 
+     def visit(node, in_seam):
+         nonlocal direct, routed
+         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+             in_seam = in_seam or _routed_function(node)
+-        if isinstance(node, ast.Call) and _is_spawn(node):
++            if any('fenced' in _name(d.func if isinstance(d, ast.Call) else d) for d in node.decorator_list):
++                routed += 1  # a ``@fenced`` entry point is a seam even when the spawn is in a helper it calls
++        if isinstance(node, ast.Call) and _name(node.func) == 'popen_worker':
++            routed += 1  # the fence's own launcher: the spawn callable is passed as a value, not called here
++        elif isinstance(node, ast.Call) and _is_spawn(node, aliases):
+             if in_seam:
+                 routed += 1
+             else:
+@@ -121,10 +172,29 @@ def _inventory() -> dict:
+ 
+ def write() -> None:
+     found = scan()
+-    doc = {'version': 1, 'files': {k: found[k] for k in sorted(found)}}
++    doc = {'version': 1, 'files': {k: found[k] for k in sorted(found)}, 'incomplete_seams': INCOMPLETE_SEAMS}
+     INVENTORY.write_text(json.dumps(doc, indent=1, sort_keys=True) + '\n', encoding='utf-8')
+ 
+ 
++def _count(src: str) -> tuple[int, int]:
++    return _spawn_sites(ast.parse(src))
++
++
++def test_scan_resolves_import_aliases():
++    assert _count('import subprocess as _sp\n_sp.run(["x"])') == (1, 0)
++    assert _count('def f():\n import subprocess as _subprocess\n _subprocess.run(["x"])') == (1, 0)
++    assert _count('from subprocess import Popen\nPopen(["x"])') == (1, 0)
++    assert _count('from subprocess import check_output as co\nco(["x"])') == (1, 0)
++    assert _count('import os as _os\n_os.system("x")') == (1, 0)
++    assert _count('from os import execv\nexecv("x", [])') == (1, 0)
++    assert _count('from asyncio import subprocess as asp\nasync def f():\n await asp.create_subprocess_exec("x")') == (1, 0)
++    assert _count('from asyncio import create_subprocess_exec as cse\nasync def f():\n await cse("x")') == (1, 0)
++    # not spawns: same attribute names on unrelated objects, and a plain local called run
++    assert _count('import re\nre.run = 1\nclass A:\n def run(self): pass\nA().run()\ndef run(): pass\nrun()') == (0, 0)
++    assert _count('import subprocess as sp\ndef f():\n lease = admit("x")\n sp.Popen(["x"])') == (0, 1)
++    assert _count('import subprocess\ndef f():\n return popen_worker(subprocess.Popen, ["x"])') == (0, 1)
++
++
+ def test_no_new_or_grown_spawn_site_escapes_inventory():
+     inv, found = _inventory()['files'], scan()
+     new = sorted(set(found) - set(inv))
+@@ -143,22 +213,55 @@ def test_status_matches_source_so_pending_only_shrinks():
+     assert not gone, f'inventoried file no longer has spawn sites: regenerate: {gone}'
+ 
+ 
++def _has_fence(prefix: str) -> bool:
++    """The file (or any file under the directory) imports the drain fence module. An import, not a
++    substring: ``admit`` alone also matches ``admitted`` and ``admission``."""
++    path = REPO / prefix
++    for p in ([path] if path.is_file() else sorted(path.rglob('*.py'))):
++        for node in ast.walk(ast.parse(p.read_text(encoding='utf-8-sig'))):
++            if isinstance(node, ast.ImportFrom) and (node.module or '').endswith('worker_drain_fence'):
++                return True
++            if isinstance(node, ast.ImportFrom) and any(a.name == 'worker_drain_fence' for a in node.names):
++                return True
++            if isinstance(node, ast.Import) and any(a.name.endswith('worker_drain_fence') for a in node.names):
++                return True
++    return False
++
++
+ def test_required_seams_are_accounted_for():
+-    """Every owed seam is inventoried (fenced or pending), carries the fence, or has a stated reason."""
+-    inv = _inventory()['files']
++    """Every owed seam is in the inventory (fenced or pending) or is a recorded INCOMPLETE seam.
++
++    There is no pass-by-default: a seam with no raw spawn and no fence must be named in
++    INCOMPLETE_SEAMS, and that entry is itself checked below.
++    """
++    doc = _inventory()
++    inv = doc['files']
+     missing = {}
+     for label, prefix in REQUIRED_SEAMS.items():
+-        path = REPO / prefix
+-        assert path.exists(), f'{label}: {prefix} moved; update REQUIRED_SEAMS'
+-        if any(k == prefix or k.startswith(prefix.rstrip('/') + '/') for k in inv):
+-            continue
+-        text = '\n'.join(p.read_text(encoding='utf-8-sig') for p in ([path] if path.is_file() else path.rglob('*.py')))
+-        if label in NO_DIRECT_SPAWN and not any(m in text for m in ROUTERS | {'drain_fenced'}):
+-            continue
+-        if any(m in text for m in ROUTERS | {'drain_fenced'}):
+-            continue
+-        missing[label] = prefix
+-    assert not missing, f'required drain seams neither inventoried nor fenced: {missing}'
++        assert (REPO / prefix).exists(), f'{label}: {prefix} moved; update REQUIRED_SEAMS'
++        inventoried = any(k == prefix or k.startswith(prefix.rstrip('/') + '/') for k in inv)
++        if not inventoried and prefix not in INCOMPLETE_SEAMS:
++            missing[label] = prefix
++    assert not missing, f'required drain seams neither inventoried nor recorded INCOMPLETE: {missing}'
++    assert doc.get('incomplete_seams') == INCOMPLETE_SEAMS, 'regenerate the inventory (--write)'
++
++
++def test_incomplete_seams_are_really_unfenced_and_unscanned():
++    """An INCOMPLETE entry is honest only while the file has no raw spawn (else it belongs to the
++    scanned inventory) and no fence (else it is done: delete the entry and prove the fence)."""
++    found = scan()
++    for prefix in INCOMPLETE_SEAMS:
++        assert prefix in REQUIRED_SEAMS.values(), prefix
++        assert prefix not in found, f'{prefix} now has a raw spawn: inventory it instead'
++        assert not _has_fence(prefix), f'{prefix} now carries the drain fence: remove it from INCOMPLETE_SEAMS'
++
++
++def test_known_unfenced_required_seams_are_pending_not_fenced():
++    """The handoff may only call these INCOMPLETE; the inventory must agree."""
++    inv = _inventory()['files']
++    for prefix in ('gateway/session_managed_worker.py', 'gateway/platforms', 'hermes_cli/web_routers'):
++        entries = {k: v for k, v in inv.items() if k == prefix or k.startswith(prefix + '/')}
++        assert entries and any(v['status'] == 'pending' for v in entries.values()), prefix
+ 
+ 
+ def test_pending_inventory_is_the_honest_incomplete_list():
+@@ -168,9 +271,10 @@ def test_pending_inventory_is_the_honest_incomplete_list():
+ 
+ 
+ def test_seams_fenced_by_this_change_stay_fenced():
++    inv = _inventory()['files']
+     for rel in FENCED_BY_THIS_CHANGE:
+-        text = (REPO / rel).read_text(encoding='utf-8-sig')
+-        assert any(m in text for m in ROUTERS | {'drain_fenced'}), rel
++        assert _has_fence(rel), rel
++        assert inv[rel]['routed'] > 0, f'{rel}: no spawn in it goes through the fence any more'
+ 
+ 
+ def test_cron_run_registration_is_fenced_by_a_drain_lease():
+diff --git a/tools/computer_use/cua_backend_session.py b/tools/computer_use/cua_backend_session.py
+index f79d92f598..da5e42e7c6 100644
+--- a/tools/computer_use/cua_backend_session.py
++++ b/tools/computer_use/cua_backend_session.py
+@@ -102,9 +102,11 @@ def _cli_run_json(cmd: list[str], env: dict[str, str], name: str, timeout: float
+     backoff, last_err = 0.5, ""
+     for attempt in range(_CLI_ATTEMPTS):
+         try:
+-            proc = _subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+-                                   timeout=max(15.0, timeout), creationflags=windows_hide_flags(), env=env,
+-                                   stdin=_subprocess.DEVNULL, check=False)
++            # [daveey] bounded CLI call: lease held until run() returns; a drain refusal is a spawn failure.
++            from hermes_cli.worker_drain_fence import popen_worker
++            proc = popen_worker(_subprocess.run, cmd, drain_purpose='cua.cli', capture_output=True, text=True,
++                                encoding="utf-8", errors="replace", timeout=max(15.0, timeout),
++                                creationflags=windows_hide_flags(), env=env, stdin=_subprocess.DEVNULL, check=False)
+         except Exception as e:  # pragma: no cover - subprocess spawn failure
+             raise RuntimeError(f"cua-driver CLI fallback for {name} failed to spawn: {e}") from e
+         out, err = (proc.stdout or "").strip(), proc.stderr or ""
+-- 
+2.43.0
+

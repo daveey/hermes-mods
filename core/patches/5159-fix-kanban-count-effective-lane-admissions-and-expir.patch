@@ -1,0 +1,239 @@
+From 35fdc051014279f463ded56c20bc0924b291ab17 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:07:26 +0000
+Subject: [PATCH] fix(kanban): count effective lane admissions and expire stale
+ skips [daveey]
+
+Review 5990728120 found two PR behavior defects at e5b7280382.
+Why the cap failed open: enforcement mapped unknown tenants to the default lane,
+but admission accounting compared their raw event lane. Map current and legacy
+admission receipts with the same policy and preserve distinct-card accounting,
+re-lane exclusion and local midnight. Thread explicit report/enforcement policies.
+Why running cards showed quota: historical dispatch skips outlived claims and
+launches and were evaluated before running state. End skip observations at
+claim/launch/completion/reopen boundaries; inspect only the latest skip and
+prefer running over dispatch-wait evidence.
+
+Proof: 10 new persisted regression failures on reviewed head; 14 now green,
+including operator's exact reproductions, alias/legacy/midnight and current-skip
+controls. Nine consumer files: 189 passed, 0 failed. Eight mutants killed with
+14-test unmutated baseline; full scripts/check: 21 checks ok. Read-only replay
+of hub boards and sync-shadow daily admission rows found zero changed raw-lane
+mappings (default shadow 400 rows, hub default 252). No production caps enabled.
+---
+ hermes_cli/kanban_lane_daily_limits.py       | 17 ++--
+ hermes_cli/kanban_lanes.py                   |  4 +-
+ hermes_cli/kanban_lanes_flow.py              |  9 +-
+ tests/hermes_cli/test_kanban_flow_review4.py | 94 ++++++++++++++++++++
+ 4 files changed, 112 insertions(+), 12 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_flow_review4.py
+
+diff --git a/hermes_cli/kanban_lane_daily_limits.py b/hermes_cli/kanban_lane_daily_limits.py
+index 7f09caea13..1726dbc01e 100644
+--- a/hermes_cli/kanban_lane_daily_limits.py
++++ b/hermes_cli/kanban_lane_daily_limits.py
+@@ -3,19 +3,22 @@ import json
+ import time
+ 
+ 
+-def cards_today(conn, lane, *, now=None):
+-    """Count actual admissions, once per card/lane/day; re-laning is not admission."""
++def cards_today(conn, lane, *, now=None, pol=None):
++    """Count admissions in the effective lane, including legacy/unconfigured tenants."""
+     from hermes_cli import kanban_lanes as lanes
+ 
+-    return conn.execute(
+-        "SELECT COUNT(DISTINCT task_id) FROM task_events WHERE created_at >= ? "
+-        "AND json_extract(payload, '$.lane') = ? AND (kind = 'lane_admitted' OR "
++    pol = lanes.safe_policy() if pol is None else pol
++    effective = pol.lane_of if pol is not None else lambda name: name
++    rows = conn.execute(
++        "SELECT DISTINCT task_id, json_extract(payload, '$.lane') FROM task_events WHERE created_at >= ? "
++        "AND (kind = 'lane_admitted' OR "
+         "(kind = 'lane_assigned' AND (json_extract(payload, '$.admitted') = 1 OR "
+         "(json_type(payload, '$.admitted') IS NULL AND json_type(payload, '$.from') IS NULL "
+         "AND COALESCE(json_extract(payload, '$.would_gate'), 0) = 0 AND EXISTS "
+         "(SELECT 1 FROM task_events c WHERE c.task_id=task_events.task_id AND c.kind='created' "
+         "AND json_extract(c.payload, '$.status') IN ('ready', 'todo'))))))",
+-        (lanes.day_start(now), lane)).fetchone()[0]
++        (lanes.day_start(now),))
++    return len({tid for tid, recorded in rows if effective(recorded) == effective(lane)})
+ 
+ 
+ def exempt(conn, lane, opts):
+@@ -40,7 +43,7 @@ def reason(conn, pol, lane_name, opts, *, now=None):
+     now = time.time() if now is None else now
+     if lane.usd_per_day is not None and lanes.spent_today(conn, pol, lane.name, now=now) >= lane.usd_per_day:
+         return "limit:usd_per_day"
+-    if lane.cards_per_day is not None and cards_today(conn, lane.name, now=now) >= lane.cards_per_day:
++    if lane.cards_per_day is not None and cards_today(conn, lane.name, now=now, pol=pol) >= lane.cards_per_day:
+         return "limit:cards_per_day"
+     return None
+ 
+diff --git a/hermes_cli/kanban_lanes.py b/hermes_cli/kanban_lanes.py
+index e219de7f67..f056bb2bb1 100644
+--- a/hermes_cli/kanban_lanes.py
++++ b/hermes_cli/kanban_lanes.py
+@@ -478,11 +478,11 @@ def admitted_today(conn, lane: str, *, now: Optional[float] = None) -> int:
+         (ADMITTED, day_start(now), lane)).fetchone()[0]
+ 
+ 
+-def cards_today(conn, lane: str, *, now: Optional[float] = None) -> int:
++def cards_today(conn, lane: str, *, now: Optional[float] = None, pol=None) -> int:
+     """Actual admissions since local midnight, including manual budget-exempt releases."""
+     from hermes_cli.kanban_lane_daily_limits import cards_today as count
+ 
+-    return count(conn, lane, now=now)
++    return count(conn, lane, now=now, pol=pol)
+ 
+ 
+ def spent_today(conn, pol: Policy, lane: str, *, now: Optional[float] = None) -> float:
+diff --git a/hermes_cli/kanban_lanes_flow.py b/hermes_cli/kanban_lanes_flow.py
+index 10f540e15a..55f4ef3ae4 100644
+--- a/hermes_cli/kanban_lanes_flow.py
++++ b/hermes_cli/kanban_lanes_flow.py
+@@ -100,6 +100,8 @@ def classify_step(card: dict) -> str:
+ 
+ def _skip_reason(card: dict) -> Optional[str]:
+     for event in reversed(card.get("events") or ()):
++        if event.get("kind") in ("claimed", "spawned", "worker_bound", "completed", "reopened"):
++            return None
+         if event.get("kind") != "dispatch_skipped":
+             continue
+         reason = _payload(event).get("reason") or event.get("reason")
+@@ -108,6 +110,7 @@ def _skip_reason(card: dict) -> Optional[str]:
+             return "quota"
+         if reason in ("waiting_for_worker_capacity", "skipped_ineligible") or "waiting_for_worker_capacity" in detail:
+             return "slot"
++        return None  # Only the newest skip in this waiting episode is authoritative.
+     return None
+ 
+ 
+@@ -124,13 +127,13 @@ def classify_reason(card: dict, step: str) -> str:
+         return "dep"
+     if card.get("status") == "scheduled":
+         return "time"
++    if step == "running":
++        return "run"
+     skip = _skip_reason(card)
+     if skip:
+         return skip
+     if step in _LANDING_STEPS:
+         return "review"
+-    if step == "running":
+-        return "run"
+     if step == "ready":
+         return "slot"
+     if step == "waiting":
+@@ -310,7 +313,7 @@ def snapshot(conn, *, window: str = "6h", now: Optional[float] = None, pol=None)
+             "run_hours": round(row["run_seconds"] / 3600, 1),
+             "cost_usd": row["cost_usd"],
+             "limits": {"cards_per_day": spec.cards_per_day, "usd_per_day": spec.usd_per_day},
+-            "usage": {"cards_today": lanes.cards_today(conn, name, now=now),
++            "usage": {"cards_today": lanes.cards_today(conn, name, now=now, pol=pol),
+                       "usd_today": lanes.spent_today(conn, pol, name, now=now)},
+         }
+     return {"window": window, "cards": cards, "lanes": out_lanes}
+diff --git a/tests/hermes_cli/test_kanban_flow_review4.py b/tests/hermes_cli/test_kanban_flow_review4.py
+new file mode 100644
+index 0000000000..22e8e4e966
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_flow_review4.py
+@@ -0,0 +1,94 @@
++"""Persisted effective-lane and dispatch-episode regressions."""
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_lanes as lanes
++from hermes_cli import kanban_lanes_flow as flow
++from tests.hermes_cli import test_kanban_lanes as base
++
++conn = base.conn
++configured = base.configured
++person = base.person
++
++
++@pytest.mark.parametrize("legacy", [False, True])
++def test_default_cap_counts_unknown_and_explicit_lanes(conn, configured, monkeypatch, legacy):
++    clock = [lanes.day_start() + 3600]
++    monkeypatch.setattr(time, "time", lambda: clock[0])
++    mapping = json.loads(json.dumps(base.LANES))
++    mapping["other"]["cards_per_day"] = 2
++    configured(mapping)
++    first = kb.create_task(conn, title="legacy", assignee="default", tenant="legacy-project", created_by="user")
++    if legacy:
++        conn.execute("UPDATE task_events SET payload=json_remove(payload, '$.admitted') WHERE task_id=? AND kind=?",
++                     (first, lanes.ASSIGNED))
++        conn.commit()
++    second = kb.create_task(conn, title="explicit", assignee="default", tenant="other", created_by="user")
++    held = kb.create_task(conn, title="unknown", assignee="default", tenant="another-project", created_by="user")
++    assert base._task(conn, second)["status"] == "ready"
++    assert base._task(conn, held)["status"] == "triage"
++    report = flow.snapshot(conn)
++    assert report["lanes"]["other"]["usage"]["cards_today"] == 2
++    assert next(c for c in report["cards"] if c["id"] == held)["reason"] == "limit:cards_per_day"
++    clock[0] += 86400
++    kb.recompute_ready(conn)
++    assert base._task(conn, held)["status"] == "ready"
++    assert lanes.cards_today(conn, "other") == 1
++
++
++@pytest.mark.parametrize("boundary", ["claimed", "spawned", "worker_bound", "completed", "reopened", "dispatch_skipped"])
++def test_old_quota_skip_does_not_cross_episode(conn, configured, boundary):
++    configured()
++    tid = base._ready_in(conn, "myapp", "work")
++    kb._append_event(conn, tid, "dispatch_skipped", {"reason": "llm_paced"})
++    kb._append_event(conn, tid, boundary, {"reason": "unrelated"})
++    conn.commit()
++    card = next(c for c in flow.snapshot(conn)["cards"] if c["id"] == tid)
++    assert card["reason"] == "slot"
++
++
++@pytest.mark.parametrize("skip", ["llm_paced", "waiting_for_worker_capacity"])
++def test_running_precedes_stale_skip(conn, configured, skip):
++    configured()
++    tid = base._ready_in(conn, "myapp", "work")
++    kb._append_event(conn, tid, "dispatch_skipped", {"reason": skip})
++    conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
++    conn.commit()
++    card = next(c for c in flow.snapshot(conn)["cards"] if c["id"] == tid)
++    assert (card["step"], card["reason"]) == ("running", "run")
++
++
++def test_unknown_tenant_consumes_default_lane_cap(conn, configured):
++    mapping = json.loads(json.dumps(base.LANES))
++    mapping["other"]["cards_per_day"] = 1
++    configured(mapping)
++    first = kb.create_task(conn, title="first", assignee="default", tenant="legacy-project", created_by="user")
++    second = kb.create_task(conn, title="second", assignee="default", tenant="legacy-project", created_by="user")
++    assert base._task(conn, first)["status"] == "ready"
++    assert base._task(conn, second)["status"] == "triage"
++
++
++def test_running_card_does_not_keep_historical_quota_reason(conn, configured):
++    configured()
++    tid = base._ready_in(conn, "myapp", "running")
++    kb._append_event(conn, tid, "dispatch_skipped", {"reason": "llm_paced"})
++    kb._append_event(conn, tid, "claimed", {})
++    conn.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
++    conn.commit()
++    card = next(c for c in flow.snapshot(conn)["cards"] if c["id"] == tid)
++    assert card["step"] == "running"
++    assert card["reason"] == "run"
++
++
++@pytest.mark.parametrize("skip,expected", [("llm_paced", "quota"), ("waiting_for_worker_capacity", "slot")])
++def test_current_episode_retains_skip(conn, configured, skip, expected):
++    configured()
++    tid = base._ready_in(conn, "myapp", "work")
++    kb._append_event(conn, tid, "claimed", {})
++    kb._append_event(conn, tid, "dispatch_skipped", {"reason": skip})
++    conn.commit()
++    card = next(c for c in flow.snapshot(conn)["cards"] if c["id"] == tid)
++    assert card["reason"] == expected
+-- 
+2.43.0
+

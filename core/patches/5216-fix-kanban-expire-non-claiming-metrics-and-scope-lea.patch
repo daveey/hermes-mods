@@ -1,0 +1,293 @@
+From b67cd8cf1520e86c5441c522e9bbee9badabfd95 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 14:05:43 +0000
+Subject: [PATCH] fix(kanban): expire non-claiming metrics and scope lease
+ refusals [daveey]
+
+A stale claiming=0 metric survived indefinitely in portable placement. Match the
+Board fresh window (90 seconds, milliseconds) with coordination future skew;
+thread one optional now through both consumers. Preserve machine pins and bare
+pickup semantics. Unknown/malformed timestamps do not veto placement.
+
+Treat Board not_claiming grants as recorder-only refusals and retain their
+placement capacity evidence, not a fleet-wide verdict.
+
+Reason-consumer audit:
+- kanban_dispatch_skip._RECORDER_ONLY: add; the recorder cannot lease it.
+- kanban_capacity_evidence._task_reasons: add to per-machine placement evidence.
+- kanban_db_dispatch.DispatchResult: examples in documentation, no exhaustive
+  validator; arbitrary Board claim refusal strings are already retained.
+- kanban_dispatch_expected_holds: do not add. Its foreign set denotes excluded
+  label rows, not transient self-claim shutdown; preserve stuck accounting for
+  an unexplained non-claiming dispatcher, rather than calling it an expected hold.
+- kanban_worker_node.eligible: do not add. This is a preflight of durable labels,
+  pins and holds. The Board owns grant-time claiming freshness; consulting this
+  machine's own cached claiming bit could perpetuate the hold after recovery.
+- kanban_db_dispatch_preclaim: labels_mismatch alone emits a fleet-unplaceable
+  diagnostic; not_claiming proves no missing labels and must not emit it.
+- kanban_diagnostics and kanban_label_backlog: explanatory label mismatch text,
+  no refusal allowlists; no change.
+- remaining pinned_only hits in sync routes, sessions_cmd and state maintenance
+  describe registry/session fields, not Board refusal enumerations.
+
+Tests first: freshness suite failed 24 cases on base, then passed; skip suite
+failed all 3 new cases before implementation. Existing giveup fixture metrics
+now carry fresh at values; assertions and pin/bare pickup behavior unchanged.
+---
+ hermes_cli/kanban_capacity_evidence.py      |  2 +-
+ hermes_cli/kanban_dispatch_skip.py          |  2 +-
+ hermes_cli/kanban_move.py                   | 19 ++++++--
+ hermes_cli/kanban_placement.py              |  6 +--
+ tests/hermes_cli/test_claim_gate_giveup.py  | 10 ++--
+ tests/hermes_cli/test_claiming_freshness.py | 54 +++++++++++++++++++++
+ tests/hermes_cli/test_not_claiming_skip.py  | 21 ++++++++
+ 7 files changed, 100 insertions(+), 14 deletions(-)
+ create mode 100644 tests/hermes_cli/test_claiming_freshness.py
+ create mode 100644 tests/hermes_cli/test_not_claiming_skip.py
+
+diff --git a/hermes_cli/kanban_capacity_evidence.py b/hermes_cli/kanban_capacity_evidence.py
+index 7b967e89ba..778a71ef31 100644
+--- a/hermes_cli/kanban_capacity_evidence.py
++++ b/hermes_cli/kanban_capacity_evidence.py
+@@ -74,7 +74,7 @@ def _task_reasons(result, tid, reference):
+         if task == tid:
+             reasons.append(_reason("placement", native, reference))
+     for task, native in result.claim_deferred:
+-        if task == tid and native in {"labels_mismatch", "pinned_only", "offline"}:
++        if task == tid and native in {"labels_mismatch", "pinned_only", "offline", "not_claiming"}:
+             reasons.append(_reason("placement", native, reference))
+     if tid in result.rate_limited:
+         # A reaped submitter can refuse before its managed worker ever starts.
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+index 39c4a23615..de3e2f1708 100644
+--- a/hermes_cli/kanban_dispatch_skip.py
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -347,7 +347,7 @@ def is_ordering(skip: Optional[dict[str, Any]]) -> bool:
+ # The details a skip carries when it says only that the machine which recorded it cannot lease the card: the Board's
+ # eligibility refusals for that machine (``kanban_worker_node.eligible``) and its own unreachable Board. A tuple, not
+ # a set: a synced payload's detail may be any JSON value.
+-_RECORDER_ONLY = ("labels_mismatch", "pinned_only", "held", "offline")
++_RECORDER_ONLY = ("labels_mismatch", "pinned_only", "held", "offline", "not_claiming")
+ 
+ 
+ def recorder_cannot_lease(skip: dict[str, Any]) -> bool:
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index 572442d714..b779296ced 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -51,11 +51,13 @@ from __future__ import annotations
+ import contextlib
+ import json
+ import sqlite3
++import time
+ from typing import Any, Mapping, Optional
+ 
+ DEFAULT_MAX_MOVES = 3
+ MOVED_EVENT = "moved"
+ UNPUSHED_HERE = "unpushed_state_here"
++CLAIMING_FRESH_S = 90  # Board fresh(metrics.at, now) window; metrics.at is milliseconds.
+ 
+ 
+ class MoveRefused(ValueError):
+@@ -94,7 +96,7 @@ def history(conn: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
+ 
+ 
+ def matching_machines(runs_on: list[str], machines: Mapping[str, Mapping[str, Any]], *, me: str,
+-                      exclude_me: bool = True) -> list[str]:
++                      exclude_me: bool = True, now: Optional[float] = None) -> list[str]:
+     """Active, unheld registry machines carrying every label; running moves exclude ``me``.
+ 
+     A machine that has published ``metrics.claiming == 0`` is not taking portable cards. A pin to
+@@ -102,19 +104,28 @@ def matching_machines(runs_on: list[str], machines: Mapping[str, Mapping[str, An
+     """
+     from hermes_cli import kanban_worker_node as wn
+     out = []
++    now = time.time() if now is None else now
+     for name, entry in machines.items():
+         if (exclude_me and name == me) or not entry or entry.get("state", "active") != "active" or entry.get("hold"):
+             continue
+-        if _not_claiming(entry) and f"machine:{name}" not in runs_on:
++        if _not_claiming(entry, now=now) and f"machine:{name}" not in runs_on:
+             continue
+         if set(runs_on) <= wn.effective_labels(entry, name):
+             out.append(name)
+     return sorted(out)
+ 
+ 
+-def _not_claiming(entry: Mapping[str, Any]) -> bool:
++def _not_claiming(entry: Mapping[str, Any], now: Optional[float] = None) -> bool:
++    from hermes_cli.kanban_placement_coordination import SKEW_S
+     metrics = entry.get("metrics")
+-    return isinstance(metrics, dict) and metrics.get("claiming") == 0
++    if not isinstance(metrics, dict) or metrics.get("claiming") != 0:
++        return False
++    at = metrics.get("at")
++    if type(at) not in (int, float):
++        return False
++    now = time.time() if now is None else now
++    # Ordered bounds reject NaN/infinities too, without converting oversized integers to float.
++    return (now - CLAIMING_FRESH_S) * 1000 <= at <= (now + SKEW_S) * 1000
+ 
+ 
+ def _requirement_matches(matches, machines, requires, skills, *, me=None, assignee=None):
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 4b92ba46d9..94b65d6537 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -295,15 +295,15 @@ def label_machines(label: str | Iterable[str], machines: Optional[dict] = None)
+     return sorted(name for name, entry in machines.items()
+                   if isinstance(entry, dict) and entry.get("state", "active") == "active" and not entry.get("hold")
+                   and ("pickup" not in entry or wn.advertises_pickup(entry)) and _fresh(entry, now)
+-                  and _claiming_for(name, entry, wanted)
++                  and _claiming_for(name, entry, wanted, now=now)
+                   and registry_carries(entry, wanted))
+ 
+ 
+-def _claiming_for(name: str, entry: dict, wanted: set) -> bool:
++def _claiming_for(name: str, entry: dict, wanted: set, now: Optional[float] = None) -> bool:
+     """A non-claiming machine leaves a portable label set. A pin stays only when ``machine:<name>`` is in
+     ``wanted``. A bare-name pickup passes an empty set, so that carve-out does not keep it."""
+     from hermes_cli.kanban_move import _not_claiming
+-    if not _not_claiming(entry):
++    if not _not_claiming(entry, now=now):
+         return True
+     return f"machine:{name}" in wanted
+ 
+diff --git a/tests/hermes_cli/test_claim_gate_giveup.py b/tests/hermes_cli/test_claim_gate_giveup.py
+index 6c562c4eca..c95cc87c58 100644
+--- a/tests/hermes_cli/test_claim_gate_giveup.py
++++ b/tests/hermes_cli/test_claim_gate_giveup.py
+@@ -56,14 +56,14 @@ def test_open_round_still_counts_as_claiming(gate):
+ 
+ def test_portable_match_drops_a_machine_that_is_not_claiming():
+     pool = {
+-        "worker-1": {"state": "active", "labels": ["pool:worker"], "metrics": {"claiming": 0}},
++        "worker-1": {"state": "active", "labels": ["pool:worker"], "metrics": {"claiming": 0, "at": time.time() * 1000}},
+         "worker-a1": {"state": "active", "labels": ["pool:worker"], "metrics": {"claiming": 1}},
+     }
+     assert matching_machines(["pool:worker"], pool, me="hub", exclude_me=False) == ["worker-a1"]
+ 
+ 
+ def test_machine_pin_keeps_a_non_claiming_worker():
+-    pool = {"worker-1": {"state": "active", "labels": ["pool:worker"], "metrics": {"claiming": 0}}}
++    pool = {"worker-1": {"state": "active", "labels": ["pool:worker"], "metrics": {"claiming": 0, "at": time.time() * 1000}}}
+     assert matching_machines(["machine:worker-1"], pool, me="hub", exclude_me=False) == ["worker-1"]
+ 
+ 
+@@ -71,7 +71,7 @@ def test_label_machines_drops_a_non_claiming_pool_worker():
+     seen = int(time.time() * 1000)
+     machines = {
+         "worker-1": {"state": "active", "labels": ["pool:worker"], "pickup": "all",
+-                     "last_seen": seen, "metrics": {"claiming": 0}},
++                     "last_seen": seen, "metrics": {"claiming": 0, "at": time.time() * 1000}},
+         "worker-a1": {"state": "active", "labels": ["pool:worker"], "pickup": "all",
+                       "last_seen": seen, "metrics": {"claiming": 1}},
+     }
+@@ -83,7 +83,7 @@ def test_label_machines_keeps_a_pinned_non_claiming_worker():
+     seen = int(time.time() * 1000)
+     machines = {
+         "worker-1": {"state": "active", "labels": ["pool:worker", "machine:worker-1"], "pickup": "all",
+-                     "last_seen": seen, "metrics": {"claiming": 0}},
++                     "last_seen": seen, "metrics": {"claiming": 0, "at": time.time() * 1000}},
+     }
+     assert label_machines({"pool:worker", "machine:worker-1"}, machines) == ["worker-1"]
+ 
+@@ -92,7 +92,7 @@ def test_bare_name_pickup_drops_a_non_claiming_worker():
+     """A bare-name pickup passes an empty wanted set, so the machine: pin does not keep it."""
+     seen = int(time.time() * 1000)
+     entry = {"state": "active", "labels": ["pool:worker", "machine:worker-1"], "pickup": "all",
+-             "last_seen": seen, "metrics": {"claiming": 0}}
++             "last_seen": seen, "metrics": {"claiming": 0, "at": time.time() * 1000}}
+     assert label_machines((), {"worker-1": entry}) == []
+     entry["metrics"] = {"claiming": 1}
+     assert label_machines((), {"worker-1": entry}) == ["worker-1"]
+diff --git a/tests/hermes_cli/test_claiming_freshness.py b/tests/hermes_cli/test_claiming_freshness.py
+new file mode 100644
+index 0000000000..0b55a7dc2d
+--- /dev/null
++++ b/tests/hermes_cli/test_claiming_freshness.py
+@@ -0,0 +1,54 @@
++"""Only recent Board metrics can refuse portable placement."""
++import pytest
++
++from hermes_cli import kanban_move as move
++from hermes_cli import kanban_placement as placement
++from hermes_cli.kanban_placement_coordination import SKEW_S
++
++NOW = 1_800_000_000.0
++
++
++@pytest.mark.parametrize("at,refuses", [
++    (NOW * 1000, True),
++    ((NOW - 90) * 1000, True),
++    ((NOW - 90.001) * 1000, False),
++    (None, False),
++    ("1800000000000", False),
++    (True, False),
++    (float("nan"), False),
++    (float("inf"), False),
++    (float("-inf"), False),
++    ((NOW + SKEW_S) * 1000, True),
++    ((NOW + SKEW_S + .001) * 1000, False),
++], ids=["fresh", "old-boundary", "stale", "missing", "string", "bool", "nan", "inf", "negative-inf",
++        "skew-boundary", "future"])
++@pytest.mark.parametrize("route", ["move", "labels", "bare-pickup", "pin"])
++def test_claiming_metrics_freshness(monkeypatch, at, refuses, route):
++    monkeypatch.setattr("time.time", lambda: NOW)
++    entry = {"state": "active", "labels": ["pool:worker", "machine:worker-1"],
++             "pickup": "all", "last_seen": NOW * 1000, "metrics": {"claiming": 0}}
++    if at is not None:
++        entry["metrics"]["at"] = at
++    machines = {"worker-1": entry}
++    if route == "move":
++        matches = move.matching_machines(["pool:worker"], machines, me="hub")
++    else:
++        wanted = () if route == "bare-pickup" else ["machine:worker-1"] if route == "pin" else "pool:worker"
++        matches = placement.label_machines(wanted, machines)
++    assert matches == ([] if refuses and route != "pin" else ["worker-1"])
++
++
++def test_older_core_missing_claiming_is_not_a_refusal(monkeypatch):
++    monkeypatch.setattr("time.time", lambda: NOW)
++    entry = {"labels": ["pool:worker"], "last_seen": NOW * 1000, "metrics": {"at": NOW * 1000}}
++    assert move.matching_machines(["pool:worker"], {"worker-1": entry}, me="hub") == ["worker-1"]
++    assert placement.label_machines("pool:worker", {"worker-1": entry}) == ["worker-1"]
++
++
++@pytest.mark.parametrize("metrics", [None, [], {"claiming": 1, "at": NOW * 1000},
++                                    {"claiming": 0, "at": 10 ** 400}])
++def test_unknown_or_out_of_window_metrics_do_not_refuse(metrics):
++    entry = {"labels": ["pool:worker"], "metrics": metrics}
++    assert not move._not_claiming(entry, now=NOW)
++    assert move.matching_machines(["pool:worker"], {"worker-1": entry}, me="hub", now=NOW) == ["worker-1"]
++    assert placement._claiming_for("worker-1", entry, {"pool:worker"}, now=NOW)
+diff --git a/tests/hermes_cli/test_not_claiming_skip.py b/tests/hermes_cli/test_not_claiming_skip.py
+new file mode 100644
+index 0000000000..057c3237d5
+--- /dev/null
++++ b/tests/hermes_cli/test_not_claiming_skip.py
+@@ -0,0 +1,21 @@
++"""Board not_claiming refusals describe only the recording machine."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli.kanban_capacity_evidence import _task_reasons
++from hermes_cli.kanban_dispatch_skip import recorder_cannot_lease
++
++
++@pytest.mark.parametrize("reason", ["skipped_ineligible", "claim_deferred"])
++def test_not_claiming_is_recorder_only(reason):
++    assert recorder_cannot_lease({"reason": reason, "detail": "not_claiming"})
++
++
++def test_not_claiming_lease_refusal_is_placement_evidence():
++    result = SimpleNamespace(skipped_ineligible=[], claim_deferred=[("card", "not_claiming")],
++                             rate_limited=[], clock_held={}, respawn_guarded=[])
++    reasons = _task_reasons(result, "card", "tick")
++    assert len(reasons) == 1
++    assert reasons[0]["native_code"] == "not_claiming"
++    assert reasons[0]["code"] == "capacity.placement"
+-- 
+2.43.0
+

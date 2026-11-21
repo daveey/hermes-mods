@@ -1,0 +1,148 @@
+From 1a1d7d5ec72c69ef58691cf6b97541de40080bf9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:40:19 +0000
+Subject: [PATCH] fix(kanban): back off a rejected claiming metric so the next
+ report keeps CPU [daveey]
+
+A Board that accepts the CPU triple and rejects claiming answered 400 on
+every report. The retry dropped CPU and nothing remembered the rejection,
+so the stored row never held CPU. Skip claiming for the same window as a
+rejected counter, and send a fresh CPU sample on the next report.
+
+Review t_eeeeee0000000025 on a4daf8358c0a.
+---
+ hermes_cli/machine_drain_metrics.py      | 20 +++++++++++-------
+ hermes_cli/machine_metrics.py            |  8 +++++++-
+ tests/hermes_cli/test_machine_metrics.py | 26 +++++++++++++++++++++++-
+ 3 files changed, 45 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/machine_drain_metrics.py b/hermes_cli/machine_drain_metrics.py
+index 597fbf99f6..a05f27dd8e 100644
+--- a/hermes_cli/machine_drain_metrics.py
++++ b/hermes_cli/machine_drain_metrics.py
+@@ -38,7 +38,7 @@ def collect():
+ ADDITIVE_FIELDS = ("drain_active", "drain_until_ms", "cpu_busy_pct", "cpu_busy_window_ms", "cpu_busy_sample_end_ms") + ADMISSION_FIELDS
+ 
+ 
+-def send_compatible(send, sample, on_counters_rejected=None):
++def send_compatible(send, sample, on_counters_rejected=None, on_claiming_rejected=None):
+     """Old Boards reject unknown metrics atomically; downgrade each optional generation once.
+ 
+     Only a 400 on a sample that carried an additive field is retried; any other error (timeouts included) is raised
+@@ -67,25 +67,31 @@ def send_compatible(send, sample, on_counters_rejected=None):
+         if any(k in sample for k in persistent):
+             from hermes_cli.machine_cpu_metrics import FIELDS as CPU
+             return send_compatible(send, {k: v for k, v in sample.items()
+-                                          if k not in persistent and k not in CPU}, on_counters_rejected)
++                                          if k not in persistent and k not in CPU},
++                                    on_counters_rejected, on_claiming_rejected)
+         if "claiming" in sample:
+-            # Newest field. An older Board rejects it atomically; drop it once and
+-            # keep counters, drain and admission for the next generation.
++            # Newest field. Remember the rejection so the next fresh report can
++            # omit it and keep a CPU sample the Board already accepts.
++            if on_claiming_rejected is not None:
++                on_claiming_rejected()
+             from hermes_cli.machine_cpu_metrics import FIELDS as CPU
+             return send_compatible(send, {k: v for k, v in sample.items()
+-                                          if k != "claiming" and k not in CPU}, on_counters_rejected)
++                                          if k != "claiming" and k not in CPU},
++                                    on_counters_rejected, on_claiming_rejected)
+         if "tokens_by_model" in sample:
+             # A scalar-capable Board may predate the model map. Keep its counters
+             # enabled, and never restamp the already attempted CPU sample.
+             from hermes_cli.machine_cpu_metrics import FIELDS as CPU
+             return send_compatible(send, {k: v for k, v in sample.items()
+-                                          if k != "tokens_by_model" and k not in CPU}, on_counters_rejected)
++                                          if k != "tokens_by_model" and k not in CPU},
++                                    on_counters_rejected, on_claiming_rejected)
+         if any(k in sample for k in COUNTERS) and "unknown field" in str(exc):
+             if on_counters_rejected is not None:
+                 on_counters_rejected()
+             # CPU busy fields are never resent (above), on this retry either.
+             from hermes_cli.machine_cpu_metrics import FIELDS as CPU
+-            return send_compatible(send, {k: v for k, v in sample.items() if k not in COUNTERS and k not in CPU})
++            return send_compatible(send, {k: v for k, v in sample.items() if k not in COUNTERS and k not in CPU},
++                                    on_counters_rejected, on_claiming_rejected)
+         if not any(k in sample for k in ADDITIVE_FIELDS):
+             raise
+         return send({k: v for k, v in sample.items() if k not in ADDITIVE_FIELDS})
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 867ededdf1..e2a9aeb9c0 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -304,6 +304,7 @@ class Reporter:
+         self.cpu_take_fn = cpu_take_fn
+         self.next_at = 0.0
+         self.counters_off_until = 0.0  # a Board without throughput counters 400s them: skip until then
++        self.claiming_off_until = 0.0  # a Board that rejects claiming: skip it so the next report can keep CPU
+         # The sync loop (report_due) and the anchored sender thread (report_tick, machine_metrics_sender) share one
+         # Reporter: one report at a time (non-blocking), and report starts at least REPORT_EVERY_S / 2 apart (the
+         # loop's next_at is always a full period after the latest start; the sender checks started_at).
+@@ -395,12 +396,17 @@ class Reporter:
+             if now < self.counters_off_until:  # this Board rejected them lately: the normal report only
+                 from hermes_cli.machine_throughput_metrics import FIELDS
+                 sample = {k: v for k, v in sample.items() if k not in FIELDS and k != "tokens_by_model"}
++            if now < self.claiming_off_until:
++                sample.pop("claiming", None)
+ 
+             def counters_rejected() -> None:
+                 self.counters_off_until = now + UNSUPPORTED_RETRY_S
++
++            def claiming_rejected() -> None:
++                self.claiming_off_until = now + UNSUPPORTED_RETRY_S
+             self.started_at = now
+             with timing.span("send"):  # preserve the transport's existing hard 2 s budget
+-                send_compatible(send, sample, counters_rejected)
++                send_compatible(send, sample, counters_rejected, claiming_rejected)
+             self.sent_at = self.clock()  # a failed send left the row as it was: it is no keepalive
+             return True
+         except Exception as exc:  # health: allow BLE001 -- load reporting must never stop kanban sync
+diff --git a/tests/hermes_cli/test_machine_metrics.py b/tests/hermes_cli/test_machine_metrics.py
+index fd67694043..5fb1d50ee2 100644
+--- a/tests/hermes_cli/test_machine_metrics.py
++++ b/tests/hermes_cli/test_machine_metrics.py
+@@ -285,6 +285,29 @@ def test_collect_attaches_cached_throughput_counters(tmp_path, monkeypatch):
+ COUNTERS = {"tokens_io_total": 45, "tokens_cache_total": 310, "sessions_started_total": 3, "sessions_ended_total": 2}
+ 
+ 
++def test_rejected_claiming_backs_off_so_the_next_report_keeps_cpu():
++    """A Board that accepts CPU and rejects claiming must store a fresh CPU sample on the next report."""
++    sent, now = [], [1000.0]
++    cpu = {"cpu_busy_pct": 12.5, "cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": 1}
++
++    def board(value):
++        sent.append(dict(value))
++        if "claiming" in value:
++            raise ksc.HubError(400, "unknown field(s): claiming")
++
++    r = mm.Reporter(board, collect_fn=lambda: {"cpus": 4, "drain_active": 0, "claiming": 1, **cpu},
++                    clock=lambda: now[0])
++    assert r.report_due()
++    assert "cpu_busy_pct" in sent[0] and "claiming" in sent[0]
++    assert "cpu_busy_pct" not in sent[1] and "claiming" not in sent[1]
++    assert r.claiming_off_until == now[0] + mm.UNSUPPORTED_RETRY_S
++    now[0] += mm.REPORT_EVERY_S
++    assert r.report_due() and len(sent) == 3
++    assert sent[2]["cpu_busy_pct"] == 12.5 and "claiming" not in sent[2]
++    now[0] = 1000.0 + mm.UNSUPPORTED_RETRY_S
++    assert r.report_due() and sent[3]["claiming"] == 1
++
++
+ def test_board_without_counters_gets_the_normal_report_and_is_not_asked_again_for_600s():
+     sent, now = [], [1000.0]
+     sample = {"cpus": 4, "drain_active": 0, "claiming": 1, **COUNTERS}
+@@ -298,8 +321,9 @@ def test_board_without_counters_gets_the_normal_report_and_is_not_asked_again_fo
+     without_claiming = {k: v for k, v in sample.items() if k != "claiming"}
+     assert sent == [sample, without_claiming, {"cpus": 4, "drain_active": 0}]
+     assert r.counters_off_until == now[0] + mm.UNSUPPORTED_RETRY_S
++    assert r.claiming_off_until == now[0] + mm.UNSUPPORTED_RETRY_S
+     now[0] += mm.REPORT_EVERY_S
+-    assert r.report_due() and sent[3:] == [{"cpus": 4, "drain_active": 0, "claiming": 1}]
++    assert r.report_due() and sent[3:] == [{"cpus": 4, "drain_active": 0}]
+     now[0] = 1000.0 + mm.UNSUPPORTED_RETRY_S
+     assert r.report_due() and sent[4] == sample  # asks again after the backoff, claiming included
+ 
+-- 
+2.43.0
+

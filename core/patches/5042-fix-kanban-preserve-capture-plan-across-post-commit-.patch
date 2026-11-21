@@ -1,0 +1,156 @@
+From bbd93d4c24d3bc5f23a1d8b11c7b9e74d0a6c683 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 22:05:38 +0000
+Subject: [PATCH] fix(kanban): preserve capture plan across post-commit
+ failures [daveey]
+
+Review 5984010060 found that journal.arm commits before its status read.
+The previous return-based armed flag could erase a committed capture's plan.
+Use SQLite's transactional schema cookie to distinguish committed table
+creation/replacement from rollback, including same-id same-millisecond
+replacement. Keep the plan if rollback cannot be established. Explicitly
+roll back interrupted open transactions before checking the cookie.
+
+Regression: OSError and KeyboardInterrupt after real commit, with and without
+same-id replacement; pre-commit failures restore both journal and plan.
+Also pin the two surviving review mutants: dispatcher lease remains held
+until cancelled close completes, and every required fcntl attribute is checked.
+
+Proof: post-commit regression red on 0e5a50c27c; both surviving mutants killed
+(4 failed cases). Restored focused suite green; 78 consumer files / 1167 tests
+passed; full scripts/check passed. No live capture or default changes.
+---
+ scripts/kanban_fairness.py                    | 12 ++++-
+ .../test_kanban_dispatcher_capture_cancel.py  |  9 +++-
+ ...est_kanban_fairness_activation_platform.py |  7 ++-
+ .../test_kanban_fairness_arm_rollback.py      | 47 +++++++++++++++++++
+ 4 files changed, 70 insertions(+), 5 deletions(-)
+
+diff --git a/scripts/kanban_fairness.py b/scripts/kanban_fairness.py
+index fa85489b2f..827f7bdbac 100644
+--- a/scripts/kanban_fairness.py
++++ b/scripts/kanban_fairness.py
+@@ -102,8 +102,16 @@ def _arm(args) -> int:
+     armed = False
+     try:
+         with _connect(db) as conn:
+-            state = journal.arm(conn, args.capture_id, replace=args.replace)
+-            armed = True
++            schema_before = conn.execute("PRAGMA schema_version").fetchone()[0]
++            # arm always creates (or replaces) its tables transactionally. The
++            # schema cookie witnesses commit even for same-id, same-ms replacement.
++            armed = True  # Keep the plan unless rollback is positively established.
++            try:
++                state = journal.arm(conn, args.capture_id, replace=args.replace)
++            except BaseException:
++                conn.rollback()  # Also discard a transaction interrupted by Ctrl-C.
++                armed = conn.execute("PRAGMA schema_version").fetchone()[0] != schema_before
++                raise
+             store.drain(conn, out)
+     except BaseException:
+         # Budget admission comes first; only roll back before the journal is armed.
+diff --git a/tests/gateway/test_kanban_dispatcher_capture_cancel.py b/tests/gateway/test_kanban_dispatcher_capture_cancel.py
+index f708774fa2..07c0e9aca3 100644
+--- a/tests/gateway/test_kanban_dispatcher_capture_cancel.py
++++ b/tests/gateway/test_kanban_dispatcher_capture_cancel.py
+@@ -261,8 +261,13 @@ def test_cancel_during_close_releases_lease_and_session_not_open(monkeypatch):
+         task = asyncio.create_task(_held(runner, lease))
+         await asyncio.to_thread(entered.wait, 5)
+         task.cancel()
+-        await asyncio.sleep(0)
+-        await asyncio.gather(_expect_cancelled(task), asyncio.to_thread(proceed.wait, 5))
++        try:
++            await asyncio.sleep(0)
++            assert released == [], "lease released before capture.close completed"
++            assert runner._kanban_dispatcher_lock_handle is lease.handle
++            assert session.open
++        finally:
++            await asyncio.gather(_expect_cancelled(task), asyncio.to_thread(proceed.wait, 5))
+ 
+     asyncio.run(run())
+     assert session.close_calls == 1
+diff --git a/tests/hermes_cli/test_kanban_fairness_activation_platform.py b/tests/hermes_cli/test_kanban_fairness_activation_platform.py
+index 8e5c99c11f..11fc95e716 100644
+--- a/tests/hermes_cli/test_kanban_fairness_activation_platform.py
++++ b/tests/hermes_cli/test_kanban_fairness_activation_platform.py
+@@ -10,13 +10,18 @@ from hermes_cli import kanban_fairness_activation as activation
+ from hermes_cli import kanban_fairness_runtime as runtime
+ 
+ 
+-@pytest.mark.parametrize("missing", ["O_NONBLOCK", "O_NOFOLLOW", "O_DIRECTORY", "fcntl"])
++@pytest.mark.parametrize("missing", ["O_NONBLOCK", "O_NOFOLLOW", "O_DIRECTORY", "fcntl",
++                                     "flock", "LOCK_EX", "LOCK_UN"])
+ @pytest.mark.parametrize("enabled", [True, False])
+ def test_boot_checks_platform_before_capture_io(tmp_path, monkeypatch, caplog, missing, enabled):
+     cfg = {"kanban": {"fairness_capture": {"enabled": enabled, "capture_id": "fixture",
+                                            "directory": str(tmp_path / "capture")}}}
+     if missing == "fcntl":
+         monkeypatch.setitem(sys.modules, "fcntl", None)
++    elif missing in ("flock", "LOCK_EX", "LOCK_UN"):
++        import fcntl
++        proxy = SimpleNamespace(**{key: value for key, value in vars(fcntl).items() if key != missing})
++        monkeypatch.setitem(sys.modules, "fcntl", proxy)
+     else:
+         # Do not remove flags from the global os module used by pytest/pathlib.
+         proxy = SimpleNamespace(**{key: value for key, value in vars(os).items() if key != missing})
+diff --git a/tests/hermes_cli/test_kanban_fairness_arm_rollback.py b/tests/hermes_cli/test_kanban_fairness_arm_rollback.py
+index f4b72c2ed7..a89d1a8143 100644
+--- a/tests/hermes_cli/test_kanban_fairness_arm_rollback.py
++++ b/tests/hermes_cli/test_kanban_fairness_arm_rollback.py
+@@ -81,6 +81,53 @@ def test_drain_failure_preserves_successfully_armed_plan(db, tmp_path, monkeypat
+     assert _journal_state(db)["capture_id"] == "one"
+ 
+ 
++@pytest.mark.parametrize("error", [OSError, KeyboardInterrupt])
++@pytest.mark.parametrize("replace", [False, True])
++def test_post_commit_failure_keeps_committed_plan(db, tmp_path, monkeypatch, error, replace):
++    out = tmp_path / "out"
++    if replace:
++        assert _arm(db, out, "one") == 0
++        # Same capture id and clock: neither is a reliable commit witness.
++        monkeypatch.setattr(journal, "_NOW_MS", str(_journal_state(db)["armed_ms"]))
++
++    def fail_status(conn):
++        raise error("after commit")
++
++    monkeypatch.setattr(journal, "_open_status", fail_status)
++    args = ("--replace", "--clock-error-s", "7") if replace else ()
++    if error is KeyboardInterrupt:
++        with pytest.raises(KeyboardInterrupt):
++            _arm(db, out, "one", *args)
++    else:
++        assert _arm(db, out, "one", *args) == 3
++    plan = json.loads((out / PLAN).read_text())
++    assert plan["capture_id"] == _journal_state(db)["capture_id"] == "one"
++    if replace:
++        assert plan["assumptions"]["clock_error_s"] == 7
++
++
++@pytest.mark.parametrize("error", [OSError, KeyboardInterrupt])
++def test_pre_commit_failure_restores_plan_and_journal(db, tmp_path, monkeypatch, error):
++    out = tmp_path / "out"
++    assert _arm(db, out, "one") == 0
++    prior = (out / PLAN).read_bytes()
++    before = _journal_state(db)
++
++    def fail_triggers(conn):
++        raise error("before commit")
++
++    original_triggers = journal._triggers
++    monkeypatch.setattr(journal, "_triggers", fail_triggers)
++    if error is KeyboardInterrupt:
++        with pytest.raises(KeyboardInterrupt):
++            _arm(db, out, "two", "--replace")
++    else:
++        assert _arm(db, out, "two", "--replace") == 3
++    monkeypatch.setattr(journal, "_triggers", original_triggers)
++    assert (out / PLAN).read_bytes() == prior
++    assert _journal_state(db) == before
++
++
+ def test_refused_replacement_restores_the_prior_plan(db, tmp_path):
+     out = tmp_path / "out"
+     assert _arm(db, out, "one") == 0
+-- 
+2.43.0
+

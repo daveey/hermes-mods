@@ -1,0 +1,660 @@
+From e4fd7587390a189fa2726896a7809979858d1e2d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 22:19:51 +0000
+Subject: [PATCH] fix(sync): remove per-round macOS power-probe forks [daveey]
+
+Why: the never-ending kanban sync executor item calls host_fully_awake
+once per round. Its pmset/ioreg subprocesses fork the large multithreaded
+Mac gateway; the owner measured about42ms calling-thread CPU per spawn,
+explaining the roughly2%-core residual. Submission/completion scopes
+cannot publish a never-ending item's remainder until it returns.
+
+Read current power assertions, providing power source and clamshell via
+IOKit/CoreFoundation. Cache only ABI bindings, never the verdict: preserve
+DarkWake semantics, error-is-awake policy, and CLI fallback if the native
+ABI is unavailable. All sync/tick/cron callers use the shared entry point.
+Use a residual sync.round/loop scope per completed iteration so nested
+board passes retain their CPU and the ongoing executor's remainder is
+named before shutdown. No scheduling, deadlines or active streams cached.
+
+Also pass only the operation's own exception to diagnostic Scope.__exit__,
+not an ambient caller exception. Pin real error booking and malformed
+WorkItem fallback (the retained R5/I4 review gaps).
+
+Proof:
+- Baseline round/ambient tests RED:2 failed,1 passed.
+- Baseline native-route tests RED:4 failed,1 passed.
+-32 directly importing/reference suites:748 passed,0 failed,14 skipped.
+- Full staged scripts/check --base origin/main passed.
+-19 exact-anchor mutants killed; final baseline57 passed/1 skipped.
+  The initial number-type survivor exposed a masked fixture; the strengthened
+  active-assertion control kills it before the independent lid guard.
+- Native ABI/error/release policy unit tests and a macOS-only real native
+  smoke test; actual macOS execution and post-deploy CPU gates remain owed.
+- Real executor remains pending during snapshot; real board Pass and Scope
+  both retain their names/CPU without double booking.
+- Apple pmset.m show_assertions_system_aggregates prints the raw integer;
+  PMAssertions.c copyAggregateValuesDictionary/getAssertionLevel supplies
+  0/1. This is distinct from individual assertion-level constants.
+
+Live acceptance remains on t_eeeeee0000000019: natural deployment only,
+>=3000s uptime, idle same-process snapshot window; run_forever-thread
+residual<0.1%core, round overhead<5ms, pool unnamed share<5%. No live
+CPU improvement is claimed by the offline tests.
+---
+ cron/macos_awake.py                           | 113 +++++++++++++
+ cron/restart_rerun.py                         |   8 +
+ hermes_cli/kanban_sync_cpu.py                 |   2 +
+ hermes_cli/loop_accounting.py                 |   6 +-
+ tests/cron/test_awake_native_route.py         |  60 +++++++
+ tests/cron/test_macos_awake.py                | 149 ++++++++++++++++++
+ tests/cron/test_restart_rerun.py              |   1 +
+ tests/hermes_cli/test_kanban_sync_cpu.py      |   2 +
+ .../test_kanban_sync_replica_age.py           |   1 +
+ .../test_loop_accounting_completion.py        |   6 +-
+ .../test_loop_accounting_sync_round.py        | 126 +++++++++++++++
+ 11 files changed, 471 insertions(+), 3 deletions(-)
+ create mode 100644 cron/macos_awake.py
+ create mode 100644 tests/cron/test_awake_native_route.py
+ create mode 100644 tests/cron/test_macos_awake.py
+ create mode 100644 tests/hermes_cli/test_loop_accounting_sync_round.py
+
+diff --git a/cron/macos_awake.py b/cron/macos_awake.py
+new file mode 100644
+index 0000000000..25e7a5df90
+--- /dev/null
++++ b/cron/macos_awake.py
+@@ -0,0 +1,113 @@
++"""Read macOS power state without forking a large gateway. [daveey]
++
++Cache ABI bindings only: every call queries current assertions/power/lid state.
++IOPMCopyAssertionsStatus and IOPSGetProvidingPowerSourceType are the APIs used by
++pmset itself. Copy/Create objects are released; Get results are borrowed.
++"""
++from contextlib import contextmanager
++import ctypes as C
++from functools import lru_cache
++
++
++class _Power:
++    def __init__(self):
++        self.cf = C.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
++        self.io = C.CDLL('/System/Library/Frameworks/IOKit.framework/IOKit')
++        pointer, uint = C.c_void_p, C.c_uint32
++        signatures = (
++            (self.cf, 'CFRelease', None, [pointer]),
++            (self.cf, 'CFGetTypeID', C.c_ulong, [pointer]),
++            (self.cf, 'CFStringCreateWithCString', pointer, [pointer, C.c_char_p, uint]),
++            (self.cf, 'CFDictionaryGetValue', pointer, [pointer, pointer]),
++            (self.cf, 'CFNumberGetTypeID', C.c_ulong, []),
++            (self.cf, 'CFNumberGetValue', C.c_bool, [pointer, C.c_long, pointer]),
++            (self.cf, 'CFBooleanGetTypeID', C.c_ulong, []),
++            (self.cf, 'CFBooleanGetValue', C.c_bool, [pointer]),
++            (self.cf, 'CFStringGetCString', C.c_bool, [pointer, C.c_void_p, C.c_long, uint]),
++            (self.io, 'IOPMCopyAssertionsStatus', C.c_int32, [C.POINTER(pointer)]),
++            (self.io, 'IOPSCopyPowerSourcesInfo', pointer, []),
++            (self.io, 'IOPSGetProvidingPowerSourceType', pointer, [pointer]),
++            (self.io, 'IOServiceMatching', pointer, [C.c_char_p]),
++            (self.io, 'IOServiceGetMatchingService', uint, [uint, pointer]),
++            (self.io, 'IORegistryEntryCreateCFProperty', pointer, [uint, pointer, pointer, uint]),
++            (self.io, 'IOObjectRelease', C.c_int32, [uint]),
++        )
++        for lib, name, result, args in signatures:
++            fn = getattr(lib, name)
++            fn.restype, fn.argtypes = result, args
++
++    @contextmanager
++    def owned(self, value):
++        try:
++            yield value
++        finally:
++            if value:
++                self.cf.CFRelease(value)
++
++    def key(self, text):
++        value = self.cf.CFStringCreateWithCString(None, text, 0x08000100)
++        if not value:
++            raise OSError('cannot allocate power-state key')
++        return self.owned(value)
++
++    def active(self):
++        result = C.c_void_p()
++        status = self.io.IOPMCopyAssertionsStatus(C.byref(result))
++        with self.owned(result.value) as assertions:
++            if status or not assertions:
++                raise OSError('cannot read power assertions')
++            with self.key(b'UserIsActive') as key:
++                value = self.cf.CFDictionaryGetValue(assertions, key)
++                if not value:
++                    return False  # pmset likewise falls through on a missing assertion
++                number = C.c_int32()
++                if (self.cf.CFGetTypeID(value) != self.cf.CFNumberGetTypeID()
++                        or not self.cf.CFNumberGetValue(value, 3, C.byref(number))):
++                    raise OSError('invalid power assertion')
++                return number.value == 1
++
++    def on_ac(self):
++        with self.owned(self.io.IOPSCopyPowerSourcesInfo()) as info:
++            if not info:
++                raise OSError('cannot read power sources')
++            value = self.io.IOPSGetProvidingPowerSourceType(info)
++            buf = C.create_string_buffer(128)
++            if not value or not self.cf.CFStringGetCString(value, buf, len(buf), 0x08000100):
++                raise OSError('cannot read providing power source')
++            return buf.value == b'AC Power'
++
++    def lid_closed(self):
++        matching = self.io.IOServiceMatching(b'IOPMrootDomain')
++        if not matching:
++            raise OSError('cannot create root-domain matching dictionary')
++        # IOServiceGetMatchingService consumes the matching dictionary, even on failure.
++        entry = self.io.IOServiceGetMatchingService(0, matching)
++        if not entry:
++            raise OSError('cannot read power root domain')
++        try:
++            with self.key(b'AppleClamshellState') as key:
++                with self.owned(self.io.IORegistryEntryCreateCFProperty(entry, key, None, 0)) as value:
++                    if not value:
++                        return False  # desktops have no clamshell
++                    if self.cf.CFGetTypeID(value) != self.cf.CFBooleanGetTypeID():
++                        raise OSError('invalid clamshell property')
++                    return bool(self.cf.CFBooleanGetValue(value))
++        finally:
++            self.io.IOObjectRelease(entry)
++
++    def awake(self):
++        return self.active() or (self.on_ac() and not self.lid_closed())
++
++
++@lru_cache(maxsize=1)
++def _bindings():
++    try:
++        return _Power()
++    except (OSError, AttributeError):
++        return None  # unavailable ABI: retain the existing command-line fallback
++
++
++def fully_awake():
++    """Current verdict, or None if native APIs are unavailable; read errors propagate."""
++    power = _bindings()
++    return None if power is None else power.awake()
+diff --git a/cron/restart_rerun.py b/cron/restart_rerun.py
+index ea1b27b967..f5ec147633 100644
+--- a/cron/restart_rerun.py
++++ b/cron/restart_rerun.py
+@@ -89,6 +89,11 @@ def _on_macos() -> bool:
+     return os_family() == "darwin"
+ 
+ 
++def _native_fully_awake():
++    from cron.macos_awake import fully_awake
++    return fully_awake()
++
++
+ def host_fully_awake() -> bool:
+     """False only on macOS when the host is provably not fully awake (a DarkWake or Power Nap):
+     no ``UserIsActive`` assertion and not lid-open on AC. Any other platform, and any probe
+@@ -97,6 +102,9 @@ def host_fully_awake() -> bool:
+     if not _on_macos():
+         return True
+     try:
++        native = _native_fully_awake()
++        if native is not None:
++            return native
+         for line in _pmset("assertions").splitlines():
+             parts = line.split()
+             if len(parts) == 2 and parts[0] == "UserIsActive":
+diff --git a/hermes_cli/kanban_sync_cpu.py b/hermes_cli/kanban_sync_cpu.py
+index e69613233c..9ea5a557bc 100644
+--- a/hermes_cli/kanban_sync_cpu.py
++++ b/hermes_cli/kanban_sync_cpu.py
+@@ -76,6 +76,8 @@ def iterations(keep_running):
+     with ExitStack() as scope:
+         def rounds():
+             while keep_running():
++                if loop_accounting.scopes_enabled():
++                    scope.enter_context(loop_accounting.Scope("sync.round/loop"))
+                 scope.enter_context(service("loop"))
+                 yield
+                 scope.close()
+diff --git a/hermes_cli/loop_accounting.py b/hermes_cli/loop_accounting.py
+index 37494e47ad..9358745fc2 100644
+--- a/hermes_cli/loop_accounting.py
++++ b/hermes_cli/loop_accounting.py
+@@ -919,11 +919,15 @@ def _run_scoped(name: str, fn: Callable, *args: Any, **kwargs: Any) -> Any:
+         observed.__enter__()
+     except Exception:  # health: allow BLE001 -- diagnostics cannot prevent the operation
+         return fn(*args, **kwargs)
++    outcome = (None, None, None)
+     try:
+         return fn(*args, **kwargs)
++    except BaseException:
++        outcome = sys.exc_info()
++        raise
+     finally:
+         try:
+-            observed.__exit__(*sys.exc_info())
++            observed.__exit__(*outcome)
+         except Exception:  # health: allow BLE001 -- never replace results/errors or retry the operation
+             logger.debug("loop accounting: scope booking failed", exc_info=True)
+ 
+diff --git a/tests/cron/test_awake_native_route.py b/tests/cron/test_awake_native_route.py
+new file mode 100644
+index 0000000000..ade7965364
+--- /dev/null
++++ b/tests/cron/test_awake_native_route.py
+@@ -0,0 +1,60 @@
++"""Fresh native power-state reads replace repeated forks, not verdict freshness."""
++import subprocess
++
++import pytest
++
++from cron import restart_rerun as rerun
++from hermes_cli import kanban_sync_outbox_age as outbox
++from hermes_cli import kanban_sync_replica_age as replica
++
++
++@pytest.mark.parametrize('awake', [False, True])
++def test_thirty_rounds_use_fresh_native_state_without_spawning(monkeypatch, awake):
++    calls = []
++    spawns = []
++    monkeypatch.setattr(rerun, '_on_macos', lambda: True)
++    def native():
++        calls.append(1)
++        return awake
++    def spawn(*args, **kwargs):
++        spawns.append(args)
++        raise OSError('unexpected fork')
++    monkeypatch.setattr(rerun, '_native_fully_awake', native, raising=False)
++    monkeypatch.setattr(rerun.subprocess, 'run', spawn)
++    # Exercise the production round entry; no boards means no unrelated DB IO.
++    for _ in range(30):
++        outbox.after_round([], [])
++    assert len(calls) == 30
++    assert spawns == []
++    assert replica.fully_awake() is awake
++    assert rerun.host_fully_awake() is awake
++
++
++def test_native_verdict_is_not_cached(monkeypatch):
++    values = iter([False, True, False])
++    monkeypatch.setattr(rerun, '_on_macos', lambda: True)
++    monkeypatch.setattr(rerun, '_native_fully_awake', lambda: next(values), raising=False)
++    assert [rerun.host_fully_awake() for _ in range(3)] == [False, True, False]
++
++
++def test_native_error_reads_awake_without_fallback_fork(monkeypatch):
++    monkeypatch.setattr(rerun, '_on_macos', lambda: True)
++    def broken():
++        raise OSError('native read error')
++    monkeypatch.setattr(rerun, '_native_fully_awake', broken, raising=False)
++    monkeypatch.setattr(rerun.subprocess, 'run', lambda *a, **k: pytest.fail('error must not fork'))
++    assert rerun.host_fully_awake()
++
++
++def test_unavailable_native_retains_subprocess_fallback(monkeypatch):
++    monkeypatch.setattr(rerun, '_on_macos', lambda: True)
++    monkeypatch.setattr(rerun, '_native_fully_awake', lambda: None, raising=False)
++    monkeypatch.setattr(rerun, '_pmset', lambda what: 'UserIsActive 0' if what == 'assertions' else 'AC Power')
++    monkeypatch.setattr(rerun, '_lid_closed', lambda: False)
++    assert rerun.host_fully_awake()
++    monkeypatch.setattr(rerun, '_lid_closed', lambda: True)
++    assert not rerun.host_fully_awake()
++    def broken(what):
++        raise subprocess.SubprocessError('fallback failure')
++    monkeypatch.setattr(rerun, '_pmset', broken)
++    assert rerun.host_fully_awake()
+diff --git a/tests/cron/test_macos_awake.py b/tests/cron/test_macos_awake.py
+new file mode 100644
+index 0000000000..be8d4a12c6
+--- /dev/null
++++ b/tests/cron/test_macos_awake.py
+@@ -0,0 +1,149 @@
++"""Native ABI ownership and power-policy parity; native smoke runs on macOS CI."""
++import ctypes as C
++from types import SimpleNamespace
++
++import pytest
++
++from cron import macos_awake as native
++
++
++class Function:
++    def __init__(self, fn):
++        self.fn = fn
++    def __call__(self, *args):
++        return self.fn(*args)
++
++
++@pytest.fixture
++def api(monkeypatch):
++    state = SimpleNamespace(active=0, ac=b'AC Power', closed=False, error=None,
++                            released=[], entries=[], calls=[], keys={}, next_key=100)
++    def key(_allocator, text, _encoding):
++        state.next_key += 1
++        state.keys[state.next_key] = text
++        return 0 if state.error == 'key' else state.next_key
++    def assertions(out):
++        state.calls.append('assertions')
++        C.cast(out, C.POINTER(C.c_void_p))[0] = 0 if state.error == 'null_assertions' else 10
++        return 1 if state.error == 'assertions' else 0
++    def number(_value, kind, out):
++        assert kind == 3
++        C.cast(out, C.POINTER(C.c_int32))[0] = state.active
++        return state.error != 'number'
++    def text(_value, buf, _size, _encoding):
++        buf.value = state.ac
++        return state.error != 'text'
++    def matching_service(port, matching):
++        assert port == 0 and matching == 40
++        state.calls.append('lid')
++        return 0 if state.error == 'entry' else 41
++    def type_id(value):
++        return 99 if state.error == 'type' or (state.error == 'lid_type' and value == 42) else {11: 1, 42: 2}[value]
++    cf = SimpleNamespace(**{name: Function(fn) for name, fn in {
++        'CFRelease': state.released.append,
++        'CFGetTypeID': type_id,
++        'CFStringCreateWithCString': key,
++        'CFDictionaryGetValue': lambda d, k: 0 if state.error == 'missing_assertion' else 11,
++        'CFNumberGetTypeID': lambda: 1,
++        'CFNumberGetValue': number,
++        'CFBooleanGetTypeID': lambda: 2,
++        'CFBooleanGetValue': lambda v: state.closed,
++        'CFStringGetCString': text,
++    }.items()})
++    io = SimpleNamespace(**{name: Function(fn) for name, fn in {
++        'IOPMCopyAssertionsStatus': assertions,
++        'IOPSCopyPowerSourcesInfo': lambda: 0 if state.error == 'info' else 20,
++        'IOPSGetProvidingPowerSourceType': lambda info: 0 if state.error == 'source' else 21,
++        'IOServiceMatching': lambda name: 0 if state.error == 'matching' else 40,
++        'IOServiceGetMatchingService': matching_service,
++        'IORegistryEntryCreateCFProperty': lambda *args: 0 if state.error == 'missing_lid' else 42,
++        'IOObjectRelease': state.entries.append,
++    }.items()})
++    monkeypatch.setattr(native.C, 'CDLL', lambda path: cf if 'CoreFoundation' in path else io)
++    native._bindings.cache_clear()
++    yield state, cf, io
++    native._bindings.cache_clear()
++
++
++@pytest.mark.parametrize('active,ac,closed,expected', [
++    (1, b'Battery Power', True, True), (0, b'AC Power', False, True),
++    (0, b'AC Power', True, False), (0, b'Battery Power', False, False),
++    (0, b'UPS Power', False, False), (255, b'Battery Power', True, False),
++])
++def test_native_policy_and_owned_references(api, active, ac, closed, expected):
++    state, cf, io = api
++    state.active, state.ac, state.closed = active, ac, closed
++    assert native.fully_awake() is expected
++    assert state.released.count(10) == 1
++    assert 11 not in state.released and 21 not in state.released  # borrowed
++    assert all(state.released.count(k) == 1 for k in state.keys)
++    if active == 1:
++        assert state.calls == ['assertions']
++        assert 20 not in state.released
++    else:
++        assert state.released.count(20) == 1
++        if ac == b'AC Power':
++            assert state.released.count(42) == 1 and state.entries == [41]
++    assert io.IOPMCopyAssertionsStatus.argtypes == [C.POINTER(C.c_void_p)]
++    assert io.IOPSCopyPowerSourcesInfo.restype is C.c_void_p
++    assert io.IOServiceGetMatchingService.restype is C.c_uint32
++    assert cf.CFNumberGetValue.argtypes == [C.c_void_p, C.c_long, C.c_void_p]
++
++
++@pytest.mark.parametrize('error', ['assertions', 'key', 'type', 'number', 'info', 'source',
++                                 'text', 'matching', 'entry', 'null_assertions', 'lid_type'])
++def test_native_read_errors_release_and_propagate(api, error):
++    state, _cf, _io = api
++    state.error = error
++    # A missing number type guard must not be masked by the later lid guard.
++    # With an active value, the mutant would return before examining the lid.
++    state.active = 1 if error == 'type' else 0
++    with pytest.raises(OSError):
++        native.fully_awake()
++    assert state.released.count(10) == int(error != 'null_assertions')
++    assert len(state.released) == len(set(state.released))
++    if 41 in state.entries:
++        assert state.entries == [41]
++
++
++@pytest.mark.parametrize('error', ['missing_assertion', 'missing_lid'])
++def test_missing_optional_state_matches_command_policy(api, error):
++    state, _cf, _io = api
++    state.error = error
++    assert native.fully_awake()
++
++
++def test_bindings_only_are_cached(api):
++    state, _cf, _io = api
++    power = native._bindings()
++    assert native.fully_awake()
++    state.closed = True
++    assert not native.fully_awake()
++    state.active = 1
++    assert native.fully_awake()
++    assert native._bindings() is power
++    assert state.calls.count('assertions') == 3
++
++
++@pytest.mark.parametrize('failure', [OSError('missing library'), AttributeError('missing symbol')])
++def test_unavailable_api_selects_fallback(monkeypatch, failure):
++    def missing():
++        raise failure
++    monkeypatch.setattr(native, '_Power', missing)
++    native._bindings.cache_clear()
++    try:
++        assert native.fully_awake() is None
++    finally:
++        native._bindings.cache_clear()
++
++
++@pytest.mark.platforms('macos')
++def test_actual_native_power_read_never_spawns(monkeypatch):
++    import subprocess
++    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: pytest.fail('native query spawned'))
++    native._bindings.cache_clear()
++    try:
++        assert native._bindings() is not None
++        assert isinstance(native.fully_awake(), bool)
++    finally:
++        native._bindings.cache_clear()
+diff --git a/tests/cron/test_restart_rerun.py b/tests/cron/test_restart_rerun.py
+index f8474ef1a6..7feea71856 100644
+--- a/tests/cron/test_restart_rerun.py
++++ b/tests/cron/test_restart_rerun.py
+@@ -967,6 +967,7 @@ def test_full_wake_probe_reads_pmset_assertions(monkeypatch):
+ 
+     # The probe's parsing, host-independent: _on_macos is the seam, never the interpreter's platform.
+     monkeypatch.setattr(restart_rerun, "_on_macos", lambda: True)
++    monkeypatch.setattr(restart_rerun, "_native_fully_awake", lambda: None)
+     outputs = {}
+     monkeypatch.setattr(restart_rerun, "_pmset", lambda what: outputs[what])
+     monkeypatch.setattr(restart_rerun, "_lid_closed", lambda: outputs["lid"])
+diff --git a/tests/hermes_cli/test_kanban_sync_cpu.py b/tests/hermes_cli/test_kanban_sync_cpu.py
+index 4fd0331e2c..f61bf38648 100644
+--- a/tests/hermes_cli/test_kanban_sync_cpu.py
++++ b/tests/hermes_cli/test_kanban_sync_cpu.py
+@@ -16,6 +16,8 @@ def measured(monkeypatch):
+     monkeypatch.setattr(cpu.time, "thread_time", lambda: clock[0])
+     monkeypatch.setattr(cpu.loop_accounting, "record", lambda name, **kw: records.append((name, kw)))
+     monkeypatch.setattr(cpu, "_local", threading.local())
++    # This fixture measures the partition's stats, not residual scope booking.
++    monkeypatch.setattr(cpu.loop_accounting, "scopes_enabled", lambda: False)
+     return clock, records
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_replica_age.py b/tests/hermes_cli/test_kanban_sync_replica_age.py
+index b2bd25fd04..601bbd86fe 100644
+--- a/tests/hermes_cli/test_kanban_sync_replica_age.py
++++ b/tests/hermes_cli/test_kanban_sync_replica_age.py
+@@ -578,6 +578,7 @@ def test_real_probe_failure_reads_awake(live, kanban_home, monkeypatch):
+     def unavailable(*args):
+         raise OSError("pmset unavailable")
+ 
++    monkeypatch.setattr(restart_rerun, "_native_fully_awake", lambda: None)
+     monkeypatch.setattr(restart_rerun, "_pmset", unavailable)
+     host = Host(kanban_home, _pt("2026-11-14 08:00:00"))
+     host.round(head=True)
+diff --git a/tests/hermes_cli/test_loop_accounting_completion.py b/tests/hermes_cli/test_loop_accounting_completion.py
+index d2e13c2cf0..5a021828d7 100644
+--- a/tests/hermes_cli/test_loop_accounting_completion.py
++++ b/tests/hermes_cli/test_loop_accounting_completion.py
+@@ -131,7 +131,7 @@ def test_item_hook_restores_and_disabled_scopes_leave_no_rows(monkeypatch):
+     assert _WorkItem.run is original
+ 
+ 
+-@pytest.mark.parametrize('shape', ['legacy', 'task', 'unknown'])
++@pytest.mark.parametrize('shape', ['legacy', 'task', 'unknown', 'malformed'])
+ def test_item_shapes_keep_original_invocation(monkeypatch, shape):
+     from concurrent.futures.thread import _WorkItem
+     from types import SimpleNamespace
+@@ -152,10 +152,12 @@ def test_item_shapes_keep_original_invocation(monkeypatch, shape):
+         item.fn, item.args = job, ()
+     elif shape == 'task':
+         item.task = (job, (), {})
++    elif shape == 'malformed':
++        item.task = (job, ())
+     assert _WorkItem.run(item, 'context', extra=3) == 42
+     assert seen == [(item, ('context',), {'extra': 3})]
+     rows = la.counters()
+-    if shape == 'unknown':
++    if shape in ('unknown', 'malformed'):
+         assert rows == {}
+     else:
+         assert rows['executor_item/' + la._callable_name(job)]['runs'] == 1
+diff --git a/tests/hermes_cli/test_loop_accounting_sync_round.py b/tests/hermes_cli/test_loop_accounting_sync_round.py
+new file mode 100644
+index 0000000000..170b90fc04
+--- /dev/null
++++ b/tests/hermes_cli/test_loop_accounting_sync_round.py
+@@ -0,0 +1,126 @@
++"""A perpetual executor item must publish completed rounds before it returns."""
++from concurrent.futures import ThreadPoolExecutor
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_sync_cpu as cpu
++from hermes_cli import kanban_sync_timing as timing
++from hermes_cli import loop_accounting as la
++
++
++@pytest.fixture(autouse=True)
++def accounting():
++    la.stop()
++    la.reset()
++    yield
++    la.uninstrument()
++    la.reset()
++
++
++def burn(seconds):
++    end = time.thread_time() + seconds
++    while time.thread_time() < end:
++        pass
++
++
++@pytest.mark.parametrize('board_kind', ['scope', 'pass'])
++def test_running_executor_publishes_round_residual_once(monkeypatch, board_kind):
++    monkeypatch.setattr(timing._DIAG, 'board_start', lambda *a: None)
++    monkeypatch.setattr(timing._DIAG, 'board_end', lambda *a: None)
++    la.instrument_executors()
++    published = threading.Event()
++    release = threading.Event()
++    rounds_done = 0
++
++    def keep_running():
++        if rounds_done:
++            published.set()
++            assert release.wait(10)
++            return False
++        return True
++
++    def job():
++        nonlocal rounds_done
++        with cpu.iterations(keep_running) as rounds:
++            for _ in rounds:
++                burn(0.03)
++                if board_kind == 'scope':
++                    with la.Scope('sync.board/test'):
++                        burn(0.03)
++                else:
++                    results = []
++                    token = timing.board_start('test', results)
++                    try:
++                        burn(0.03)
++                    finally:
++                        timing.board_end(token, results)
++                rounds_done += 1
++
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        future = pool.submit(job)
++        try:
++            assert published.wait(10)
++            assert not future.done()
++            snap = la.snapshot()
++            rows = la.counters()
++            assert rows['sync.round/loop']['runs'] == 1
++            assert 0.025 <= rows['sync.round/loop']['cpu_s'] < 0.055
++            assert 0.025 <= rows['sync.board/test']['cpu_s'] < 0.055
++            assert snap['process']['accounted_cpu_s'] == pytest.approx(
++                rows['sync.round/loop']['cpu_s'] + rows['sync.board/test']['cpu_s'], abs=0.005)
++        finally:
++            release.set()
++        future.result(timeout=10)
++    rows = la.counters()
++    name = la._callable_name(job)
++    assert rows['thread/' + name]['cpu_s'] < 0.015
++    assert rows['executor_item/' + name]['cpu_s'] < 0.015
++
++
++def test_success_in_ambient_except_does_not_book_error():
++    def job():
++        return 42
++    try:
++        raise KeyError('ambient')
++    except KeyError:
++        assert la.scoped_call('thread', job)() == 42
++    row = la.counters()['thread/' + la._callable_name(job)]
++    assert row['errors'] == 0
++
++
++def test_operation_failure_books_its_own_error():
++    failure = ValueError('own error')
++    def job():
++        raise failure
++    with pytest.raises(ValueError) as caught:
++        la.scoped_call('thread', job)()
++    assert caught.value is failure
++    row = la.counters()['thread/' + la._callable_name(job)]
++    assert row['errors'] == 1
++    assert row['error_kinds'] == {'ValueError': 1}
++
++
++@pytest.mark.parametrize('enabled', [False, True])
++@pytest.mark.parametrize('raises', [False, True])
++def test_round_toggle_and_exception_cleanup(monkeypatch, enabled, raises):
++    monkeypatch.setattr(la, 'scopes_enabled', lambda: enabled)
++    failure = ValueError('round failure')
++    def run():
++        with cpu.iterations(lambda: True) as rounds:
++            next(rounds)
++            if raises:
++                raise failure
++    if raises:
++        with pytest.raises(ValueError) as caught:
++            run()
++        assert caught.value is failure
++    else:
++        run()
++    rows = la.counters()
++    assert ('sync.round/loop' in rows) is enabled
++    if enabled:
++        assert rows['sync.round/loop']['runs'] == 1
++        assert rows['sync.round/loop']['errors'] == int(raises)
++    assert cpu._local.frames == ()
+-- 
+2.43.0
+

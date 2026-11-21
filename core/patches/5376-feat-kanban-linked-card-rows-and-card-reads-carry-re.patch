@@ -1,0 +1,171 @@
+From 55a5d1612186399833382aab88b0f2804412db45 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 03:26:16 +0000
+Subject: [PATCH] feat(kanban): linked-card rows and card reads carry
+ ready_since for the wait-for-worker age [daveey]
+
+The session panel says a ready card is 'waiting for a worker' but not for how long. Local session_tasks rows,
+replica rows (replica_cards) and GET /tasks/:id now carry the Board-synced tasks.ready_since (ms); boards
+without the column read None.
+---
+ hermes_cli/kanban_chat_links.py               |  2 +
+ hermes_cli/kanban_session_activity.py         |  2 +-
+ plugins/kanban/dashboard/plugin_api.py        |  9 ++
+ .../test_kanban_ready_since_rows.py           | 85 +++++++++++++++++++
+ 4 files changed, 97 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_kanban_ready_since_rows.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index d618ad550e..ec3835a345 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -584,6 +584,7 @@ def _read_replica_links(conn: sqlite3.Connection, gateway: str, profile: str) ->
+     rows = [dict(r) for r in conn.execute(
+         "SELECT l.task_id AS id, t.id AS task_row, t.title, t.status, t.assignee, t.created_at, t.started_at, "
+         f"t.priority, t.block_kind, t.human_request, t.created_on, {placement_select(conn, 't')}, "
++        f"{placement_select(conn, 't', ('ready_since',))}, "
+         f"l.chat_session, l.chat_profile, l.kind {optional_select(conn)} "
+         "FROM task_chat_links l LEFT JOIN tasks t ON t.id = l.task_id "
+         "WHERE l.chat_gateway = ? AND l.chat_profile = ? AND l.released = 0 "
+@@ -836,6 +837,7 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+                 "title": r["title"], "status": (DONE_PENDING_RELEASE if not missing and status == "done" else UNKNOWN)
+                 if unknown else status, "assignee": r["assignee"],
+                 "created_at": r["created_at"], "started_at": r["started_at"], "priority": r["priority"],
++                "ready_since": r.get("ready_since"),  # ms, when the Board last saw it become ready
+                 "block_kind": r["block_kind"], "human_request": _decoded_request(r["human_request"]), "id": tid,
+                 "board": board,
+                 "gateway": owner, "key": key, "session": r["chat_session"], "session_id": r["chat_session"],
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 2a37fe19ca..34567ef99a 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1552,7 +1552,7 @@ def blocked_task_counts() -> dict[str, int]:
+ # ``review`` (also waiting on a human). [daveey]
+ LISTED_STATUSES = tuple(dict.fromkeys(ACTIVE_STATUSES + BLOCKED_STATUSES + ("review",)))
+ _TASK_FIELDS = ("id", "title", "status", "assignee", "session_id", "created_at", "started_at", "block_kind", "human_request",
+-                "current_run_id", "last_heartbeat_at")
++                "current_run_id", "last_heartbeat_at", "ready_since")
+ 
+ 
+ def _board_slug(path: Path) -> str:
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 4fc07662aa..6a140ab743 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -409,6 +409,14 @@ def get_task(
+     raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+ 
+ 
++def _ready_since(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
++    """When the card last became ready (ms, the Board's synced column); None on a board without it."""
++    if "ready_since" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++        return None
++    row = conn.execute("SELECT ready_since FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    return row[0] if row else None
++
++
+ def _task_detail(conn: sqlite3.Connection, task: kanban_db.Task, run_state_type: Optional[str],
+                  run_state_name: Optional[str]) -> dict[str, Any]:
+     """The GET /tasks/:id payload for ``task`` read from ``conn`` (the live file or the board replica)."""
+@@ -417,6 +425,7 @@ def _task_detail(conn: sqlite3.Connection, task: kanban_db.Task, run_state_type:
+     task_d = _task_dict(
+         task, latest_summary=kanban_db.latest_summary(conn, task_id),
+         current_run_started_at=kanban_db.current_run_started_ats(conn, [task_id]).get(task_id))
++    task_d["ready_since"] = _ready_since(conn, task_id)
+     links = _links_for(conn, task_id)
+     child_summaries = kanban_db.latest_summaries(conn, links["children"])
+     children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
+diff --git a/tests/hermes_cli/test_kanban_ready_since_rows.py b/tests/hermes_cli/test_kanban_ready_since_rows.py
+new file mode 100644
+index 0000000000..79b9fb760b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_ready_since_rows.py
+@@ -0,0 +1,85 @@
++"""Linked-card rows and card reads carry ``ready_since`` (ms), so the session panel can say how long a ready card
++has waited for a worker. Boards without the Board-synced column read None, never fail."""
++
++from __future__ import annotations
++
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_session_activity as activity
++from tests.hermes_cli import test_kanban_chat_links as fixtures
++from tests.hermes_cli import test_kanban_session_outcome_tasks as outcome
++from tests.hermes_cli.test_kanban_session_outcome_tasks import _connect, _insert_task
++from tests.plugins import test_kanban_link_tasks as card_api
++
++READY_MS = 1_795_209_437_664
++
++board_root = outcome.kanban_root
++
++
++@pytest.fixture
++def board_api(tmp_path, monkeypatch):
++    from pathlib import Path
++
++    from fastapi import FastAPI
++    from fastapi.testclient import TestClient
++
++    from hermes_cli import kanban_db as kb
++    (tmp_path / ".hermes").mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    app = FastAPI()
++    app.include_router(card_api._load_plugin_router(), prefix="/api/plugins/kanban")
++    return TestClient(app)
++
++
++@pytest.mark.parametrize("has_column", [True, False])
++def test_local_session_task_row_carries_ready_since(board_root, has_column):
++    conn = _connect(board_root / "kanban.db")
++    extra = {}
++    if has_column:
++        conn.execute("ALTER TABLE tasks ADD COLUMN ready_since INTEGER")
++        extra["ready_since"] = READY_MS
++    _insert_task(conn, "t_ready", "ready", "s1", **extra)
++    conn.commit()
++    conn.close()
++    rows = activity.session_tasks(["s1"])
++    assert [r["id"] for r in rows] == ["t_ready"]
++    assert rows[0]["ready_since"] == (READY_MS if has_column else None)
++
++
++@pytest.mark.parametrize("has_column", [True, False])
++def test_replica_row_carries_ready_since(tmp_path, monkeypatch, has_column):
++    path = tmp_path / "replica.db"
++    fixtures._replica(path, [("child", "child", "ready", fixtures.OTHER)], [("child", fixtures.ME, "s1", "created", 0)])
++    if has_column:
++        with sqlite3.connect(path) as conn:
++            conn.execute("ALTER TABLE tasks ADD COLUMN ready_since INTEGER")
++            conn.execute("UPDATE tasks SET ready_since=?", (READY_MS,))
++    monkeypatch.setattr(activity, "_remote_links", lambda **kw: [])
++    monkeypatch.setattr(activity, "_board_db_paths", list)
++    monkeypatch.setattr(activity, "_remote_cards", lambda ids, statuses, stale_ok: links.replica_cards(
++        ids, fixtures.ME, statuses, replicas=[("default", path)]))
++    links._reset_for_tests()
++    rows = activity.session_tasks(["s1"])
++    assert len(rows) == 1 and rows[0]["source"] == "replica"
++    assert rows[0]["ready_since"] == (READY_MS if has_column else None)
++
++
++def test_card_read_carries_ready_since(board_api):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="Ready card")
++        with kbc.write_txn(conn):
++            if "ready_since" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++                conn.execute("ALTER TABLE tasks ADD COLUMN ready_since INTEGER")
++            conn.execute("UPDATE tasks SET ready_since=? WHERE id=?", (READY_MS, tid))
++    finally:
++        conn.close()
++    detail = board_api.get(f"/api/plugins/kanban/tasks/{tid}").json()
++    assert detail["task"]["ready_since"] == READY_MS
+-- 
+2.43.0
+

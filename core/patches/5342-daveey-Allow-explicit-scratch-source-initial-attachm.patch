@@ -1,0 +1,586 @@
+From 9490d4abf66ea6c15f254d166a2765819efaea51 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:01:37 +0000
+Subject: [PATCH] [daveey] Allow explicit scratch source initial attachment at
+ ending tools
+
+Reuse the dispatcher-bound registration and receipt pipeline for complete, review, block, schedule, continue and move. Attach before artifact staging; preserve pending observations, immutable identities and implementation-only claims. Reject capability routing combinations rather than silently discarding explicit source. Replays validate identity without resending revision-zero attach after publication.
+
+Proof: disabled-boundary RED; six-ending composed publication and receipt controls, all source consumers 700 passed across 42 files, docs drift included; three focused mutants killed with clean baseline; full check 21 passed on own diff. Short independent code review findings addressed. Live ending-initial rollout acceptance remains separately owned by this card.
+---
+ hermes_cli/kanban_source_registration.py      |   5 +-
+ .../test_kanban_source_ending_initial.py      | 255 ++++++++++++++++++
+ tools/kanban_tools.py                         |  51 ++--
+ tools/kanban_tools_park_args.py               |  28 ++
+ tools/kanban_tools_schemas.py                 |  16 ++
+ tools/kanban_tools_source.py                  |  15 ++
+ website/docs/user-guide/features/kanban.md    |  16 +-
+ 7 files changed, 356 insertions(+), 30 deletions(-)
+ create mode 100644 tests/tools/test_kanban_source_ending_initial.py
+
+diff --git a/hermes_cli/kanban_source_registration.py b/hermes_cli/kanban_source_registration.py
+index 4f6e84b88c..db379e8772 100644
+--- a/hermes_cli/kanban_source_registration.py
++++ b/hermes_cli/kanban_source_registration.py
+@@ -248,7 +248,10 @@ def register_initial(conn: sqlite3.Connection, task_id: str, source_path: str, *
+         run = board.AttachedRun(run_id, task_id, uid, "initial", 0, branch, path, head, None, "pending", machine, 2,
+                                 identity)
+     run = _persist_observation(conn, run)
+-    _attach_settled(conn, run, "initial")
++    # Replaying an explicit ending after publication must not re-attach revision
++    # zero. Identity and live-run checks above still run on every replay.
++    if run.state != "attached":
++        _attach_settled(conn, run, "initial")
+     return board.attached_run(conn, run_id)
+ 
+ 
+diff --git a/tests/tools/test_kanban_source_ending_initial.py b/tests/tools/test_kanban_source_ending_initial.py
+new file mode 100644
+index 0000000000..25ef691937
+--- /dev/null
++++ b/tests/tools/test_kanban_source_ending_initial.py
+@@ -0,0 +1,255 @@
++"""The first source registration may be the bound worker's completion call."""
++import importlib
++import json
++import subprocess
++from pathlib import Path
++from unittest.mock import Mock
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_source_artifacts as artifacts
++from hermes_cli import kanban_source_board as board
++from tests.hermes_cli import test_kanban_source_registration as registration_helpers
++from tests.hermes_cli.test_kanban_source_publish import _leaving_op
++from tests.hermes_cli.test_kanban_sync_attachments import BlobService
++from tests.tools.test_kanban_source_heartbeat import _bind
++from tools import kanban_tools as kt
++
++setup = registration_helpers.setup
++
++
++_PARK = "SCHEDULED_UNTIL=2099-01-01T00:00:00Z wait"
++# name: (handler, args, core module, core attr, landed status, carries artifacts)
++ENDINGS = {
++    "complete": ("_handle_complete", {"summary": "Completed source work and preserved its report"},
++                 "hermes_cli.kanban_db", "complete_task", "done", True),
++    "request_review": ("_handle_request_review", {"summary": "Implemented; please review"},
++                       "hermes_cli.kanban_db", "request_review", "review", True),
++    "block": ("_handle_block", {"kind": "time", "reason": _PARK, "clock_only": True},
++              "hermes_cli.kanban_db", "block_task", "scheduled", False),
++    "schedule": ("_handle_schedule", {"reason": _PARK, "clock_only": True},
++                 "hermes_cli.kanban_db", "schedule_task", "scheduled", False),
++    "continue": ("_handle_continue", {"checkpoint": "done so far; resume later"},
++                 "hermes_cli.kanban_continuation", "continue_task", "ready", False),
++    "move": ("_handle_move", {"runs_on": ["pool:worker"], "reason": "needs another machine",
++                              "checkpoint": "resume elsewhere"},
++             "hermes_cli.kanban_move", "move_task", "ready", False),
++}
++
++
++@pytest.mark.parametrize("ending", list(ENDINGS))
++@pytest.mark.parametrize("prior_state", ["none", "attached", "published"])
++def test_ending_registers_initial_source_before_ending_preflight(ending, prior_state, setup, tmp_path, monkeypatch):
++    handler, base_args, core_mod, core_attr, landed, with_artifacts = ENDINGS[ending]
++    conn, boundary, tid, source, scratch, _home, clone = setup
++    from hermes_cli import kanban_sync_client as client
++    client.ensure_identity(conn, "default", "worker")
++    run_id = kb.get_task(conn, tid).current_run_id
++    _bind(monkeypatch, conn, tid, run_id, "owner")
++    # Keep real Git validation and publication, but route the fixture's GitHub
++    # URL to a local bare repository (no network, no production source changes).
++    origin = tmp_path / "origin.git"
++    subprocess.run(["git", "clone", "--bare", str(clone), str(origin)],
++                   check=True, capture_output=True)
++    registration_helpers.git(clone, "remote", "set-url", "origin", str(origin))
++    from hermes_cli import kanban_source_clones as clones
++    monkeypatch.setattr(clones, "canonical_github", lambda url: "example/source" if url == str(origin) else None)
++    service = BlobService()
++    blob_hub = service.hub("worker")
++    blob_hub.leases = boundary.hub.leases
++    boundary.hub = blob_hub
++    # A bounded HTTP transport is the only additional external boundary seam;
++    # metadata outbox push, selection, snapshot, and blob transfer remain real.
++    monkeypatch.setattr(artifacts, "bounded_transport", lambda hub, bound: hub)
++    from hermes_cli import kanban_sync_attachments as blobs
++    read = blobs._read
++
++    def read_fixture(path, row, board_id):
++        try:
++            return read(path, row, board_id)
++        except ValueError as exc:
++            raise AssertionError(f"fixture blob read failed: {exc}; path={path}; board={board_id}") from exc
++
++    monkeypatch.setattr(blobs, "_read", read_fixture)
++    monkeypatch.setattr("psutil.process_iter", lambda: iter(()))
++    from hermes_cli import kanban_worker_node as nodes
++    monkeypatch.setattr(nodes, "registry", lambda **kw: {"machines": {
++        "destination": {"state": "active", "pickup": "all", "labels": ["pool:worker"]},
++    }})
++    heartbeat = Mock(side_effect=AssertionError("completion must not call kanban_heartbeat"))
++    monkeypatch.setattr(kt, "_handle_heartbeat", heartbeat)
++    report = scratch / "report.txt"
++    report.write_bytes(b"completion-only source evidence")
++    assert board.attached_run(conn, run_id) is None
++    assert boundary.actions("source_attach", "publish_source") == []
++
++    # Observe admission at core entry without replacing the real completion or
++    # its source preflight. Check after it returns, so RED exercises the ending.
++    core = importlib.import_module(core_mod)
++    real_core = getattr(core, core_attr)
++    admitted = []
++
++    def observe_core(*args, **kwargs):
++        run = board.attached_run(conn, run_id)
++        admitted.append((run, artifacts.selected(conn, tid, run.run_uid) if run else None))
++        return real_core(*args, **kwargs)
++
++    monkeypatch.setattr(core, core_attr, observe_core)
++    args = {"task_id": tid, **base_args, "source_path": str(source)}
++    if with_artifacts:
++        args["artifacts"] = [str(report)]
++    if prior_state != "none":
++        from hermes_cli import kanban_source_registration as registration
++        from hermes_cli import kanban_source_preflight as preflight
++        from tools.kanban_tools_source import stage_completion
++        prior = registration.register_initial(conn, tid, str(source), expected_run_id=run_id)
++        if prior_state == "published":
++            if with_artifacts:
++                stage_completion(conn, tid, {"artifacts": [str(report)]}, expected_run_id=run_id)
++            assert preflight.compute_receipt(conn, tid, prior)["state"] == "published"
++    out = json.loads(getattr(kt, handler)(args))
++    heartbeat.assert_not_called()
++    assert out.get("ok") is True, out
++    assert kb.get_task(conn, tid).status == landed
++    assert len(admitted) == 1, "must traverse the real ending core exactly once"
++    run_at_preflight, chosen_at_preflight = admitted[0]
++    assert run_at_preflight is not None, (
++        f"{ending}(source_path) finished without initial attachment before core preflight; "
++        f"response={out!r}, source_actions={boundary.actions('source_attach', 'publish_source')!r}"
++    )
++    assert (run_at_preflight.mode, run_at_preflight.state, run_at_preflight.path) == (
++        "initial", "attached", str(source))
++    assert run_at_preflight.source_protocol == 2
++    if with_artifacts:
++        assert len(chosen_at_preflight) == 1, "artifact selection must precede source preflight"
++    else:
++        assert chosen_at_preflight is None, "no selection is distinct from explicitly selecting []"
++    run = board.attached_run(conn, run_id)
++    assert artifacts.selected(conn, tid, run.run_uid) == chosen_at_preflight
++    assert run.manifest["version"] == 2
++    assert run.manifest["source_kind"] == "scratch_external"
++    assert run.manifest["manifest_revision"] == 1
++    assert run.manifest["artifacts"] == (chosen_at_preflight or [])
++    assert boundary.actions("source_attach", "publish_source") == ["source_attach", "publish_source"]
++    assert boundary.body("source_attach")["mode"] == "initial"
++    assert boundary.body("publish_source")["expected_revision"] == 0
++    receipts = [op["fields"]["source_receipt"] for op in _leaving_op(conn, tid, landed)
++                if "source_receipt" in op["fields"]]
++    assert len(receipts) == 1, "the ending must carry exactly one source receipt"
++    receipt = receipts[0]
++    assert (receipt["state"], receipt["manifest_revision"], receipt["run_uid"]) == (
++        "unchanged" if prior_state == "published" else "published", 1, run.run_uid)
++    if with_artifacts:
++        assert service.blobs[chosen_at_preflight[0]["attachment_uid"]] == b"completion-only source evidence"
++        assert Path(kb.list_attachments(conn, tid)[0].stored_path).read_bytes() == b"completion-only source evidence"
++    else:
++        assert service.blobs == {} and kb.list_attachments(conn, tid) == []
++
++
++@pytest.mark.parametrize("ending", list(ENDINGS))
++@pytest.mark.parametrize("identity", ["foreign", "unbound", "stale", "operator"])
++def test_ending_rejects_unbound_source_before_any_side_effect(ending, identity, setup, monkeypatch):
++    handler, base_args, _, _, _, _ = ENDINGS[ending]
++    conn, boundary, tid, source, _, _, _ = setup
++    run_id = kb.get_task(conn, tid).current_run_id
++    _bind(monkeypatch, conn, tid, run_id, identity)
++    out = json.loads(getattr(kt, handler)({"task_id": tid, **base_args, "source_path": str(source)}))
++    assert "error" in out, out
++    assert kb.get_task(conn, tid).status == "running"
++    assert board.attached_run(conn, run_id) is None
++    assert boundary.actions("source_attach", "publish_source") == []
++    assert kb.list_attachments(conn, tid) == []
++
++
++@pytest.mark.parametrize("ending", list(ENDINGS))
++def test_unanswered_ending_initial_keeps_pending_and_does_not_end(ending, setup, monkeypatch):
++    handler, base_args, _, _, _, _ = ENDINGS[ending]
++    conn, boundary, tid, source, _, _, _ = setup
++    run_id = kb.get_task(conn, tid).current_run_id
++    _bind(monkeypatch, conn, tid, run_id, "owner")
++    boundary.offline.add("source_attach")
++    out = json.loads(getattr(kt, handler)({"task_id": tid, **base_args, "source_path": str(source)}))
++    assert "error" in out, out
++    assert kb.get_task(conn, tid).status == "running"
++    run = board.attached_run(conn, run_id)
++    assert run is not None and run.state == "pending" and run.path == str(source)
++    assert boundary.actions("publish_source") == []
++    assert kb.list_attachments(conn, tid) == []
++
++
++@pytest.mark.parametrize("path", [None, "", " ", "relative/worktree", 7])
++def test_ending_explicit_path_must_be_absolute_nonempty(path, setup):
++    from tools.kanban_tools_source import register_for_ending
++    conn, boundary, tid, _, _, _, _ = setup
++    run_id = kb.get_task(conn, tid).current_run_id
++    with pytest.raises(ValueError, match="absolute path"):
++        register_for_ending(conn, tid, {"source_path": path}, worker_task=tid, expected_run_id=run_id)
++    assert board.attached_run(conn, run_id) is None
++    assert boundary.actions("source_attach") == []
++
++
++def test_omitted_ending_path_does_not_discover_any_source(setup, monkeypatch):
++    from tools import kanban_tools_source as source_tools
++    conn, boundary, tid, _, _, _, _ = setup
++    tripwire = Mock(side_effect=AssertionError("omitted source must not register"))
++    monkeypatch.setattr(source_tools, "heartbeat_source", tripwire)
++    source_tools.register_for_ending(conn, tid, {}, worker_task=tid,
++                                     expected_run_id=kb.get_task(conn, tid).current_run_id)
++    tripwire.assert_not_called()
++    assert boundary.actions("source_attach") == []
++
++
++def test_ending_cannot_replace_existing_source_identity(setup, monkeypatch):
++    from hermes_cli import kanban_source_registration as registration
++    conn, boundary, tid, source, scratch, _, _ = setup
++    run = registration.register_initial(conn, tid, str(source))
++    _bind(monkeypatch, conn, tid, run.run_id, "owner")
++    calls = len(boundary.calls)
++    out = json.loads(kt._handle_complete({"task_id": tid, "summary": "done",
++                                         "source_path": str(scratch)}))
++    assert "error" in out, out
++    assert kb.get_task(conn, tid).status == "running"
++    assert board.attached_run(conn, run.run_id) == run
++    assert len(boundary.calls) == calls
++
++
++def test_only_approved_ending_schemas_expose_source_path():
++    from tools import kanban_tools_schemas as schemas
++    for ending in ENDINGS:
++        schema = getattr(schemas, f"KANBAN_{ending.upper()}_SCHEMA")
++        assert "source_path" in schema["parameters"]["properties"]
++    assert "source_path" not in schemas.KANBAN_REQUEST_CHANGES_SCHEMA["parameters"]["properties"]
++
++
++@pytest.mark.parametrize("ending", ["block", "schedule"])
++def test_capability_routing_never_silently_drops_explicit_source(ending, setup, monkeypatch):
++    conn, boundary, tid, source, _, _, _ = setup
++    run_id = kb.get_task(conn, tid).current_run_id
++    _bind(monkeypatch, conn, tid, run_id, "owner")
++    route = Mock(side_effect=AssertionError("must refuse before creating an owner or parking"))
++    monkeypatch.setattr(kt, "_route_needs", route)
++    out = json.loads(getattr(kt, ENDINGS[ending][0])({
++        "task_id": tid, "reason": "needs remote access", "needs": ["ssh:example"], "source_path": str(source),
++    }))
++    assert "source_path cannot be combined" in out["error"], out
++    route.assert_not_called()
++    assert kb.get_task(conn, tid).status == "running"
++    assert board.attached_run(conn, run_id) is None
++    assert boundary.actions("source_attach") == []
++
++
++@pytest.mark.parametrize("ending", list(ENDINGS))
++def test_reviewer_ending_cannot_initial_attach(ending, setup, monkeypatch):
++    from tests.hermes_cli.test_kanban_source_initial_lane import review_lane
++    conn, boundary, tid, source, _, _, _ = setup
++    run_id = kb.get_task(conn, tid).current_run_id
++    _bind(monkeypatch, conn, tid, run_id, "owner")
++    review_lane(conn, tid)
++    handler, base_args, _, _, _, _ = ENDINGS[ending]
++    out = json.loads(getattr(kt, handler)({"task_id": tid, **base_args, "source_path": str(source)}))
++    assert "error" in out, out
++    assert kb.get_task(conn, tid).status == "running"
++    assert board.attached_run(conn, run_id) is None
++    assert boundary.actions("source_attach") == []
++
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 69c68aa1b5..2787d2c82a 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -900,7 +900,9 @@ def _handle_complete(args: dict, **kw) -> str:
+         goal_verification = _goal_gate("kanban_complete", task, tid, (summary or result or "").strip(), conn=conn)
+         try:
+             event_mark = _kc.event_mark(conn, tid)  # a refusal's own pr_acceptance event lands above it
+-            from tools.kanban_tools_source import stage_completion
++            from tools.kanban_tools_source import register_for_ending, stage_completion
++            register_for_ending(conn, tid, args, worker_task=os.environ.get("HERMES_KANBAN_TASK"),
++                                expected_run_id=run_id)
+             metadata = stage_completion(conn, tid, metadata, expected_run_id=run_id)
+             ok = kb.complete_task(
+                 conn, tid, result=result, summary=summary, metadata=metadata,
+@@ -974,30 +976,8 @@ def _handle_complete(args: dict, **kw) -> str:
+ 
+ 
+ def _awaiting_arg(args: dict, wake: tuple) -> tuple[Optional[dict], tuple]:
+-    """``(awaiting, wake)``: the declared producer (``kanban_awaiting``), and the park's probe
+-    with ``hermes kanban wait-check`` filled in for a card wait that brought none. [daveey]"""
+-    from hermes_cli import kanban_awaiting as kaw
+-
+-    try:
+-        awaiting = kaw.normalize(args.get("awaiting"))
+-    except kaw.AwaitingError as exc:
+-        raise _Reject(str(exc), exc.code) from exc
+-    if awaiting and awaiting["kind"] == "human":
+-        exc = kaw.human_error(os.environ.get("HERMES_KANBAN_TASK") or "",
+-                              " ".join(str(args.get(k) or "") for k in ("reason", "checkpoint")) + " "
+-                              + str(awaiting.get("why") or ""))
+-        raise _Reject(str(exc), exc.code)
+-    probe = None if wake[0] else kaw.card_probe(awaiting)
+-    if probe:
+-        from hermes_cli import kanban_wake_check as kwc
+-        wake = (probe, kwc.normalize_every(None), wake[2])
+-    elif not wake[0] and kaw.declared_chat_wait(awaiting):
+-        wake = (wake[0], wake[1], True)  # its comment probe is added in the park txn (kanban_awaiting.park_probe)
+-    try:
+-        kaw.confirm_remote(awaiting, hint=" ".join(str(x) for x in (wake[0], args.get("reason"), args.get("checkpoint")) if x))
+-    except kaw.AwaitingError as exc:
+-        raise _Reject(str(exc), exc.code) from exc
+-    return awaiting, wake
++    from tools.kanban_tools_park_args import _awaiting_arg as awaiting_arg
++    return awaiting_arg(args, wake)
+ 
+ 
+ def _route_needs(op: str, args: dict, tid: str, reason: Optional[str]) -> Optional[str]:
+@@ -1075,6 +1055,8 @@ def _handle_block(args: dict, **kw) -> str:
+     reason = _redact(
+         _require_text(args, "reason", "reason is required — explain what input you need"))
+     kind = args.get("kind")
++    _check(not (args.get("needs") and "source_path" in args),
++           "source_path cannot be combined with capability routing (needs); register it first with kanban_heartbeat")
+     routed = _route_needs("block", args, tid, reason)
+     if routed is not None:
+         return routed
+@@ -1108,6 +1090,9 @@ def _handle_block(args: dict, **kw) -> str:
+                     human_request=args.get("human_request"))
+         _check(*ask_checks(args.get("human_request"), context=filing_context(conn, tid)))  # lint + probe [daveey]
+         from hermes_cli.kanban_cli_actor import tool_actor
++        from tools.kanban_tools_source import register_for_ending
++        register_for_ending(conn, tid, args, worker_task=os.environ.get("HERMES_KANBAN_TASK"),
++                            expected_run_id=_worker_run_id(tid))
+         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
+                            actor=tool_actor(worker_task=_own_task_env(tid, "HERMES_KANBAN_TASK")),
+                            blocker_id=blocker_id, wake_check=wake[0], check_every=wake[1], awaiting=awaiting,
+@@ -1156,6 +1141,8 @@ def _handle_schedule(args: dict, **kw) -> str:
+     raw_reason = args.get("reason")
+     _check(raw_reason is None or isinstance(raw_reason, str), "reason must be a string")
+     reason = _redact(raw_reason.strip()) if raw_reason and raw_reason.strip() else None
++    _check(not (args.get("needs") and "source_path" in args),
++           "source_path cannot be combined with capability routing (needs); register it first with kanban_heartbeat")
+     routed = _route_needs("schedule", args, tid, reason)
+     if routed is not None:
+         return routed
+@@ -1175,6 +1162,9 @@ def _handle_schedule(args: dict, **kw) -> str:
+         from hermes_cli import kanban_watch as kwatch
+         raw_watch = args.get("watch")
+         _check(raw_watch is None or isinstance(raw_watch, bool), "watch must be true or false")
++        from tools.kanban_tools_source import register_for_ending
++        register_for_ending(conn, tid, args, worker_task=os.environ.get("HERMES_KANBAN_TASK"),
++                            expected_run_id=_worker_run_id(tid))
+         ok = kb.schedule_task(
+             conn, tid, watch=kwatch.resolve(conn, tid, raw_watch), reason=reason,
+             expected_run_id=_worker_run_id(tid),
+@@ -1219,6 +1209,9 @@ def _handle_continue(args: dict, **kw) -> str:
+         wake = _wake_check_args(args, conn=conn, tid=tid)
+         awaiting, wake = _awaiting_arg(args, wake)
+         _park_guard(conn, tid, "continue", wake, resume_after=int(raw_after or 0))
++        from tools.kanban_tools_source import register_for_ending
++        register_for_ending(conn, tid, args, worker_task=os.environ.get("HERMES_KANBAN_TASK"),
++                            expected_run_id=_worker_run_id(tid))
+         res = continue_task(conn, tid, checkpoint=checkpoint, resume_after_seconds=int(raw_after or 0),
+                             expected_run_id=_worker_run_id(tid), metadata=metadata, awaiting=awaiting,
+                             wake_check=wake[0], check_every=wake[1], clock_only=wake[2],
+@@ -1242,6 +1235,7 @@ def _handle_move(args: dict, **kw) -> str:
+     Another card: only the origin repin of a worker-first card the caller's task created (kanban_creator_repin)."""
+     from hermes_cli import kanban_creator_repin as kcr
+     if kcr.other_card(args):
++        _check("source_path" not in args, "source_path is only valid for the owning worker's ending")
+         return kcr.tool_repin(args, board=_board, check=_check, ok=_ok, reject_child=_reject_delegated_child_mutation)
+     tid = _worker_guard("kanban_move", args)
+     checkpoint = _redact(_require_text(
+@@ -1252,6 +1246,9 @@ def _handle_move(args: dict, **kw) -> str:
+     _check(isinstance(runs_on, list) and runs_on, "runs_on must be a non-empty list of labels, e.g. ['pool:worker']")
+     from hermes_cli.kanban_move import move_task
+     with _board(args.get("board")) as (kb, conn):
++        from tools.kanban_tools_source import register_for_ending
++        register_for_ending(conn, tid, args, worker_task=os.environ.get("HERMES_KANBAN_TASK"),
++                            expected_run_id=_worker_run_id(tid))
+         res = move_task(conn, tid, runs_on=runs_on, reason=reason, checkpoint=checkpoint, expected_run_id=_worker_run_id(tid),
+                         force=bool(args.get("force")), host_reason=args.get("host_reason"))
+         _check(res.get("ok"), f"could not move {tid}: {res.get('error')}")
+@@ -1294,7 +1291,9 @@ def _handle_request_review(args: dict, **kw) -> str:
+         _goal_gate("kanban_request_review", kb.get_task(conn, tid), tid, summary, conn=conn)
+         run_id = _worker_run_id(tid)
+         try:
+-            from tools.kanban_tools_source import stage_completion
++            from tools.kanban_tools_source import register_for_ending, stage_completion
++            register_for_ending(conn, tid, args, worker_task=os.environ.get("HERMES_KANBAN_TASK"),
++                                expected_run_id=run_id)
+             metadata = stage_completion(conn, tid, metadata, expected_run_id=run_id)
+             ok, fail_reason = kb.request_review(
+                 conn, tid, summary=summary, metadata=metadata, reviewer=reviewer,
+diff --git a/tools/kanban_tools_park_args.py b/tools/kanban_tools_park_args.py
+index efdb8c5825..987cf24f48 100644
+--- a/tools/kanban_tools_park_args.py
++++ b/tools/kanban_tools_park_args.py
+@@ -15,6 +15,34 @@ def _check(cond: Any, message: str, rejection: Optional[str] = None) -> None:
+     check(cond, message, rejection)
+ 
+ 
++def _awaiting_arg(args: dict, wake: tuple) -> tuple[Optional[dict], tuple]:
++    """``(awaiting, wake)``: declared producer and the park's optional card probe."""
++    import os
++    from tools.kanban_tools import _Reject
++    from hermes_cli import kanban_awaiting as kaw
++
++    try:
++        awaiting = kaw.normalize(args.get("awaiting"))
++    except kaw.AwaitingError as exc:
++        raise _Reject(str(exc), exc.code) from exc
++    if awaiting and awaiting["kind"] == "human":
++        exc = kaw.human_error(os.environ.get("HERMES_KANBAN_TASK") or "",
++                              " ".join(str(args.get(k) or "") for k in ("reason", "checkpoint")) + " "
++                              + str(awaiting.get("why") or ""))
++        raise _Reject(str(exc), exc.code)
++    probe = None if wake[0] else kaw.card_probe(awaiting)
++    if probe:
++        from hermes_cli import kanban_wake_check as kwc
++        wake = (probe, kwc.normalize_every(None), wake[2])
++    elif not wake[0] and kaw.declared_chat_wait(awaiting):
++        wake = (wake[0], wake[1], True)  # its comment probe is added in the park txn (kanban_awaiting.park_probe)
++    try:
++        kaw.confirm_remote(awaiting, hint=" ".join(str(x) for x in (wake[0], args.get("reason"), args.get("checkpoint")) if x))
++    except kaw.AwaitingError as exc:
++        raise _Reject(str(exc), exc.code) from exc
++    return awaiting, wake
++
++
+ def _blocker_id_arg(args: dict) -> Optional[str]:
+     """Validated ``blocker_id`` (shared external blocker slug) or None. [daveey]"""
+     raw = args.get("blocker_id")
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 880ad0f547..364a065fc5 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -180,6 +180,16 @@ def _completion_receipt_schema() -> dict[str, Any]:
+     }
+ 
+ 
++_ENDING_SOURCE_PATH = {
++    "source_path": _prop("string", (
++        "Optional absolute path to this scratch task's ONE owned linked worktree in a configured clone. "
++        "The dispatcher-bound worker may explicitly attach it for the first time during this ending, "
++        "before artifact staging and source publication. Omit to preserve the existing source; "
++        "never selects an unrelated tree or changes an already attached source identity."
++    )),
++}
++
++
+ KANBAN_COMPLETE_SCHEMA = _schema(
+     "kanban_complete",
+     (
+@@ -209,6 +219,7 @@ KANBAN_COMPLETE_SCHEMA = _schema(
+         "what each scope's disposition is, with evidence and remaining work."
+     ),
+     {
++        **_ENDING_SOURCE_PATH,
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+         "summary": _prop("string", (
+                 "Human-readable handoff, 1-3 sentences. Appears in "
+@@ -462,6 +473,7 @@ KANBAN_BLOCK_SCHEMA = _schema(
+         "a parent link (kanban_link), not a park."
+     ),
+     {
++        **_ENDING_SOURCE_PATH,
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+         "reason": _prop("string", (
+                 "The human's unblock instructions. Lead with the ask, not "
+@@ -527,6 +539,7 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
+         "pass clear_blocker=true only when you saw the wall gone."
+     ),
+     {
++        **_ENDING_SOURCE_PATH,
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+         "reason": _prop("string", (
+             "Optional reason or machine-readable wake-up marker recorded on "
+@@ -573,6 +586,7 @@ KANBAN_MOVE_SCHEMA = _schema(
+         "leaves, not state on another one."
+     ),
+     {
++        **_ENDING_SOURCE_PATH,
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+         "runs_on": {"type": "array", "items": {"type": "string"}, "description": (
+             "Labels the next machine must have, e.g. [\"pool:worker\"] (any worker with a free slot: the default "
+@@ -613,6 +627,7 @@ KANBAN_CONTINUE_SCHEMA = _schema(
+         "with a one-line reply; do not call more tools."
+     ),
+     {
++        **_ENDING_SOURCE_PATH,
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+         "checkpoint": _prop("string", (
+             "Everything the next run needs to resume without re-deriving it: "
+@@ -652,6 +667,7 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
+         "free-form 'review-required:' reason."
+     ),
+     {
++        **_ENDING_SOURCE_PATH,
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+         "summary": _prop("string", (
+                 "What was implemented and how it was verified, in one or "
+diff --git a/tools/kanban_tools_source.py b/tools/kanban_tools_source.py
+index dbf72a4799..6258fd59bd 100644
+--- a/tools/kanban_tools_source.py
++++ b/tools/kanban_tools_source.py
+@@ -42,6 +42,21 @@ def heartbeat_source(conn, task_id, args, *, worker_task, expected_run_id):
+             "path": run.path if run else None, "artifacts": len(chosen or [])}
+ 
+ 
++def register_for_ending(conn, task_id, args, *, worker_task, expected_run_id):
++    """Explicit first attachment in the owning worker's ending, before staging/receipt.
++
++    No source_path means no new adoption. A refused or uncertain attach raises,
++    retaining the durable observation and leaving the ending unperformed.
++    """
++    if "source_path" not in args:
++        return
++    path = args["source_path"]
++    if not isinstance(path, str) or not path.strip() or not Path(path).is_absolute():
++        raise ValueError("source_path must be a non-empty absolute path")
++    heartbeat_source(conn, task_id, {"source_path": path},
++                     worker_task=worker_task, expected_run_id=expected_run_id)
++
++
+ def stage_completion(conn, task_id, metadata, *, expected_run_id):
+     """Called after worker ownership, foreign-card and completion gates.
+ 
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 3871c66fc8..60204bc413 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -858,9 +858,19 @@ moves. As the worker:
+    (drop `-b` if the branch already exists). The clone must pass the same proof
+    as above (GitHub `origin`, no rewrites), and a path another active card uses
+    is refused.
+-3. Register it from the live run with `kanban_heartbeat(source_path=<path>)`.
+-   Only an implementation run may register a first source (a review run may only
+-   resume one), and a replay with the same path is harmless.
++3. Register it from the live run with `kanban_heartbeat(source_path=<path>)`,
++   or supply the absolute `source_path` for the first time on `kanban_complete`,
++   `kanban_request_review`, `kanban_block`, `kanban_schedule`, `kanban_continue`
++   or `kanban_move`. These tool calls register before selected artifact staging
++   and the existing source-publication preflight. Only the dispatcher-bound
++   implementation worker may register a first source (a review run may only
++   resume one). Replaying the same identity is harmless, including after
++   publication; changing an attached identity is refused. Omit `source_path`
++   to leave source selection unchanged: unrelated trees are never discovered.
++   An unanswered attachment stays pending and the ending is not performed.
++   `source_path` cannot be combined with capability routing (`needs`) on block
++   or schedule; register with heartbeat first in that case. This does not add
++   CLI registration or a `source_path` argument to `kanban_request_changes`.
+ 4. Optionally carry up to 32 files that are not in Git with
+    `kanban_heartbeat(artifacts=[...])` (or `artifacts` on the ending call). Each
+    call replaces the selection with byte snapshots taken at that moment; `[]`
+-- 
+2.43.0
+

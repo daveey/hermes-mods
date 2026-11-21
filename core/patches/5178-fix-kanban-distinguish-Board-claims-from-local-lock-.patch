@@ -1,0 +1,107 @@
+From f7f3d5588cc41a7ce3da73d09b3a90bb151d6ff2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 11:29:13 +0000
+Subject: [PATCH] fix(kanban): distinguish Board claims from local lock
+ receipts [daveey]
+
+Historical selfwork recovery must use the exact portable run's Board holder receipt, including nullable SQL run_id, instead of the latest local bookkeeping claimed event. Ignore only receipts without authority fields; preserve latest exact-run wrong-holder veto and reject conflicting payload run UIDs. Legacy integer-bound holder receipts remain supported.
+
+Proof: production-shaped RED 6 passed/3 failed; GREEN all 19 selfwork suites 461 passed; full scripts/check 21 OK. Four guard mutants killed (portable lookup, local lock shadow, run mismatch, latest-holder selection). Exact retained sw-00000000 request remains unchanged and unrecovered pending deployment.
+---
+ hermes_cli/kanban_selfwork_forward.py         | 11 +++-
+ .../test_kanban_selfwork_forward_claims.py    | 53 +++++++++++++++++++
+ 2 files changed, 62 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_selfwork_forward_claims.py
+
+diff --git a/hermes_cli/kanban_selfwork_forward.py b/hermes_cli/kanban_selfwork_forward.py
+index 00c7b10bd1..bc833500fc 100644
+--- a/hermes_cli/kanban_selfwork_forward.py
++++ b/hermes_cli/kanban_selfwork_forward.py
+@@ -201,9 +201,15 @@ def _historical_proof(origin, creator, gateway, request):
+             raise ValueError('self_work_creator_unauthorized')
+         if ended is not None and (type(ended) not in (int, float) or not math.isfinite(ended) or at > ended):
+             raise ValueError('self_work_creator_unauthorized')
++        # Board claims carry portable run_uid/holder; local claimed receipts
++        # carry only lock bookkeeping and must not shadow that authority.
+         claimed = conn.execute(
+-            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",
+-            (creator['task_id'], run_id)).fetchone()
++            """SELECT payload FROM task_events WHERE task_id=? AND kind='claimed'
++               AND (run_id=? OR (run_id IS NULL AND json_extract(payload,'$.run_uid')=?))
++               AND (json_type(payload,'$.holder') IS NOT NULL
++                    OR json_type(payload,'$.run_uid') IS NOT NULL)
++               ORDER BY id DESC LIMIT 1""",
++            (creator['task_id'], run_id, creator['run_uid'])).fetchone()
+         if claimed is None:
+             raise ValueError('self_work_creator_unauthorized')
+         try:
+@@ -211,6 +217,7 @@ def _historical_proof(origin, creator, gateway, request):
+         except (TypeError, ValueError):
+             raise ValueError('self_work_creator_unauthorized') from None
+         if (not isinstance(data, dict) or data.get('holder') != sender[3:]
++                or ('run_uid' in data and data['run_uid'] != creator['run_uid'])
+                 or not isinstance(data.get('holder'), str) or not _ID.fullmatch(data['holder'])):
+             raise ValueError('self_work_creator_unauthorized')
+         return proof
+diff --git a/tests/hermes_cli/test_kanban_selfwork_forward_claims.py b/tests/hermes_cli/test_kanban_selfwork_forward_claims.py
+new file mode 100644
+index 0000000000..0a59a5d78f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_selfwork_forward_claims.py
+@@ -0,0 +1,53 @@
++"""Historical authority uses Board claims, not local lock bookkeeping."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_selfwork_forward as forward
++from tests.hermes_cli import test_kanban_selfwork_forward as helpers
++
++case = helpers.case
++
++
++def _claim(tid, run_id, payload):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect_closing
++    with connect_closing(kb.kanban_db_path('default')) as conn:
++        conn.execute("INSERT INTO task_events(task_id,run_id,kind,payload,created_at) VALUES(?,?,?,?,1)",
++                     (tid, run_id, 'claimed', json.dumps(payload)))
++        conn.commit()
++
++
++@pytest.mark.parametrize('board_run_id', [None, 1])
++def test_board_claim_survives_local_lock_receipt(case, tmp_path, monkeypatch, board_run_id):
++    tid = helpers._seed_local_creator(tmp_path, monkeypatch, current=False)
++    request = helpers._local_request(case, tid)
++    helpers._journal_rejected(tmp_path, monkeypatch, request)
++    _claim(tid, board_run_id, {'holder': 'worker-gw', 'run_uid': 'run', 'expires': 101000})
++    _claim(tid, 1, {'lock': 'worker:123', 'expires': 900, 'run_id': 1})
++    assert forward.receive(request)['code'] == 'self_work_forward_authorized'
++
++
++@pytest.mark.parametrize('payload', [
++    {'holder': 'other-gw', 'run_uid': 'run'},
++    {'holder': 'worker-gw', 'run_uid': 'other'},
++    {'run_uid': 'run'},
++])
++@pytest.mark.parametrize('board_run_id', [None, 1])
++def test_wrong_board_authority_refused(case, tmp_path, monkeypatch, payload, board_run_id):
++    tid = helpers._seed_local_creator(tmp_path, monkeypatch, current=False)
++    request = helpers._local_request(case, tid)
++    helpers._journal_rejected(tmp_path, monkeypatch, request)
++    _claim(tid, board_run_id, payload)
++    _claim(tid, 1, {'lock': 'worker:123', 'expires': 900, 'run_id': 1})
++    with pytest.raises(ValueError, match='self_work_creator_unauthorized'):
++        forward.receive(request)
++
++
++def test_latest_exact_run_holder_vetoes_earlier_claim(case, tmp_path, monkeypatch):
++    tid = helpers._seed_local_creator(tmp_path, monkeypatch, current=False, holder='worker-gw')
++    request = helpers._local_request(case, tid)
++    helpers._journal_rejected(tmp_path, monkeypatch, request)
++    _claim(tid, None, {'holder': 'other-gw', 'run_uid': 'run'})
++    with pytest.raises(ValueError, match='self_work_creator_unauthorized'):
++        forward.receive(request)
+-- 
+2.43.0
+

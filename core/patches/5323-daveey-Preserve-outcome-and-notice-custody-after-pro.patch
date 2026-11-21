@@ -1,0 +1,608 @@
+From 10abc54003077afb8ae9960f184327e8e91c40f1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 21:17:13 +0000
+Subject: [PATCH] [daveey] Preserve outcome and notice custody after proven
+ supersession
+
+Problem: the hub audit chat remained unresolved{notice_tail} after the
+notice guarantee stamped its last blocked notice superseded and refreshed.
+An older creator-decision notice was immediately behind it.
+
+Why 1: outcome derivation did not recognize guarantee settlement, so its
+successful refresh persisted notice_tail again.
+Why 2: discovery selected the physical last row and excluded its final stamp,
+stranding an older unanswered notice behind that row.
+Why 3: creator-decision retirement lacked current local event/park proof;
+scheduled alone does not distinguish a chat wait from a CI wait.
+Root (happened): settlement producer and projection/discovery disagreed.
+Root (not caught): tests checked stamp/no wake instead of immediate persisted
+outcome, consecutive notices and mixed-content preservation.
+Recurrence: stale-decision suppression already stamped/refreshed notices but
+did not settle outcome projection or preserve earlier custody.
+
+Share a content-bound whole-row receipt between projection and discovery.
+Mint it only after exact local source rendering covers all content and current
+task/park proof establishes settlement. Legacy superseded stamps require the
+same conservative proof before lazy upgrade. Mixed batches, replay wrappers,
+folded unrelated text, foreign/unprovable sources stay visible; appending text
+invalidates a receipt. Bound exceptional history lookup to the existing tail
+window and stop at real turn/unsettled boundaries. Require non-chat parks after
+the creator decision. Optional source failures fail closed without finalizing
+retry custody. Do not manufacture chat turns or force outcomes.
+
+Proof:
+- Original RED: four failures before edits; revised regression suite 67 passed.
+- Direct consumers: 46 files, 1256 passed; split-module scanner 3 passed.
+- Mutation v2: 18/18 killed across history/projection and whole-row proof;
+  baselines 39 and 28 passed; all four sources restored byte-exact to archive.
+- scripts/check: all 21 checks passed on final source.
+- Read-only hub replay: 12 stores, 39 relevant rows, 8 legacy stamps not
+  automatically transparent; 11 provable upgrades (8 creator, 3 blocked),
+  0 already transparent, 0 current tail changes. Unprovable rows stay visible.
+- Original chat naturally got a genuine assistant reply at 20:16Z before this
+  unpublished fix and subsequently waited on real review. No injected turn,
+  transcript edit or post-change live recovery is claimed from that event.
+---
+ hermes_state_outcome.py                       |   6 +-
+ tests/tui_gateway/test_notice_supersession.py | 208 +++++++++++++++++-
+ tui_gateway/notice_guarantee.py               |  30 ++-
+ tui_gateway/notice_history.py                 | 144 ++++++++----
+ 4 files changed, 327 insertions(+), 61 deletions(-)
+
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 41c2fddf50..c330212a2e 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -519,10 +519,8 @@ def _completion_note(row: dict) -> Optional[dict]:
+     # notices. Card ownership still supplies decision/wait outcomes independently;
+     # an incidental recipient resumes classification of its own preceding turn.
+     if isinstance(meta, dict) and row.get("display_kind") == _NOTICE_KIND:
+-        closeout = meta.get("closeout")
+-        if meta.get("outcome_informational") is True or (
+-            isinstance(closeout, dict) and closeout.get("state") == "superseded"
+-        ):
++        from tui_gateway.notice_history import settled_notice
++        if meta.get("outcome_informational") is True or settled_notice(row):
+             return meta
+     return meta if isinstance(meta, dict) and meta.get("completion_note") else None
+ 
+diff --git a/tests/tui_gateway/test_notice_supersession.py b/tests/tui_gateway/test_notice_supersession.py
+index ff3dea5c13..eeae511cf8 100644
+--- a/tests/tui_gateway/test_notice_supersession.py
++++ b/tests/tui_gateway/test_notice_supersession.py
+@@ -6,6 +6,7 @@ import pytest
+ 
+ import hermes_state_outcome as so
+ from tui_gateway import notice_guarantee as ng
++from tui_gateway import notice_history as nh
+ from tests.tui_gateway import test_notice_guarantee as helpers
+ 
+ CHAT = helpers.CHAT
+@@ -15,6 +16,49 @@ _run = helpers._run
+ db = helpers.db
+ 
+ 
++def _settled(db, text):
++    return _notice(db, text, closeout={"state": "superseded", "settled_content_sha256": nh.content_digest(text)})
++
++
++def _retired_block(db, *, extra="", replay=False):
++    import contextlib
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tui_gateway.session_notifications import _format_kanban_event_text
++
++    with contextlib.closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="retired ask", assignee="worker")
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "blocked", {"reason": "old failure", "kind": "dependency"})
++            event = kb.list_events(conn, tid)[-1]
++            conn.execute("UPDATE tasks SET status='blocked', block_kind='dependency' WHERE id=?", (tid,))
++        task = kb.get_task(conn, tid)
++        text = _format_kanban_event_text({"task_id": tid}, task, event, "default")
++        keys = [f"default:{event.id}"]
++        if extra == "batch":
++            other = kb.create_task(conn, title="unrelated work", assignee="worker")
++            with kb.write_txn(conn):
++                kb._append_event(conn, other, "completed", {"summary": "Needs an independent verification."})
++            e2 = kb.list_events(conn, other)[-1]
++            text += "\n" + _format_kanban_event_text({"task_id": other}, kb.get_task(conn, other), e2, "default")
++            keys.append(f"default:{e2.id}")
++        elif extra:
++            text += "\nPlease answer an unrelated human request."
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='running', block_kind=NULL WHERE id=?", (tid,))
++    meta = {"board": "default", "task_id": tid, "kanban_event_keys": keys, "stale": True}
++    if replay:
++        from types import SimpleNamespace
++        from tui_gateway.automation_replay import replay_payload
++        items = [SimpleNamespace(text=text, display_kind="kanban_notice", display_metadata=meta,
++                                 failed_at=time.time() - 600, cause="test failure", attempt=0),
++                 SimpleNamespace(text="An unrelated process needs inspection.", display_kind="process_complete",
++                                 display_metadata={}, failed_at=time.time() - 600, cause="test failure", attempt=0)]
++        text, kind, meta = replay_payload(items)
++        assert kind == "kanban_notice"
++    return _notice(db, text, **meta)
++
++
+ @pytest.mark.parametrize("earlier", ["reply", "request", "notice", "failure"])
+ def test_superseded_tail_preserves_preceding_obligation(db, earlier):
+     if earlier == "reply":
+@@ -25,7 +69,7 @@ def test_superseded_tail_preserves_preceding_obligation(db, earlier):
+         old = _notice(db, "An unrelated card needs an agent decision.")
+     else:
+         db.append_message(CHAT, "assistant", "The turn failed.", finish_reason="error")
+-    _notice(db, "An outdated remote blocked notice.", stale=True)
++    _retired_block(db)
+     out, calls = _run(db)
+     assert calls == [] and out[0]["result"] == "superseded"
+     outcome = so.get_outcome(CHAT, db=db)
+@@ -40,7 +84,7 @@ def test_superseded_tail_preserves_preceding_obligation(db, earlier):
+ 
+ def test_preceding_deferred_notice_is_retried_beneath_superseded_tail(db):
+     old = _notice(db, "An unrelated card finished.")
+-    _notice(db, "An outdated blocked notice.", closeout={"state": "superseded"})
++    _settled(db, "An outdated blocked notice.")
+     _out, calls = _run(db, verdict="busy")
+     assert calls == [(CHAT, old)]
+     assert _closeout(db, old) == "deferred"
+@@ -50,7 +94,7 @@ def test_preceding_deferred_notice_is_retried_beneath_superseded_tail(db):
+ 
+ 
+ @pytest.mark.parametrize("case", ["ci", "running", "chat", "composite", "remote", "missing", "wrong_kind", "bad_id",
+-                                  "missing_park", "missing_awaiting", "malformed_park", "missing_event", "missing_board"])
++                                  "missing_park", "missing_awaiting", "malformed_park", "missing_event", "missing_board", "old_park"])
+ def test_creator_decision_supersession_requires_current_local_proof(db, case):
+     import contextlib
+ 
+@@ -62,10 +106,12 @@ def test_creator_decision_supersession_requires_current_local_proof(db, case):
+     with contextlib.closing(kbc.connect()) as conn:
+         tid = kb.create_task(conn, title="audit delivery", assignee="worker")
+         with kb.write_txn(conn):
++            if case == "old_park":
++                kb._append_event(conn, tid, "scheduled", {"awaiting": {"kind": "ci", "ref": "obsolete"}})
+             kb._append_event(conn, tid, "decision_requested", {"why": "Repair or withdraw?"})
+             event = kb.list_events(conn, tid)[-1]
+             awaiting = {"kind": "chat" if case == "chat" else "ci", "ref": "test-run"}
+-            if case != "missing_park":
++            if case not in ("missing_park", "old_park"):
+                 kb._append_event(conn, tid, "scheduled", {} if case == "missing_awaiting" else {"awaiting": awaiting})
+             if case == "malformed_park":
+                 conn.execute("UPDATE task_events SET payload = 'null' WHERE task_id = ? AND kind = 'scheduled'", (tid,))
+@@ -89,7 +135,7 @@ def test_creator_decision_supersession_requires_current_local_proof(db, case):
+     if case == "composite":
+         text += "\nAlso investigate an unrelated user's question."
+     old = _notice(db, text, **meta)
+-    _notice(db, "Already settled blocked notice.", closeout={"state": "superseded"})
++    _settled(db, "Already settled blocked notice.")
+     out, calls = _run(db)
+     if case in ("ci", "running"):
+         assert calls == [] and out[0]["result"] == "superseded"
+@@ -102,7 +148,8 @@ def test_creator_decision_supersession_requires_current_local_proof(db, case):
+ 
+ @pytest.mark.parametrize("state", ["superseded", "claimed", "started", "error", "deferred", "busy", "self", None])
+ def test_only_final_supersession_is_informational(state):
+-    row = {"role": "user", "display_kind": "kanban_notice", "display_metadata": {"closeout": {"state": state}}}
++    row = {"role": "user", "content": "settled", "display_kind": "kanban_notice",
++           "display_metadata": {"closeout": {"state": state, "settled_content_sha256": nh.content_digest("settled")}}}
+     assert (so._completion_note(row) is not None) is (state == "superseded")
+     row["role"] = "assistant"
+     assert so._completion_note(row) is None
+@@ -123,9 +170,154 @@ def test_history_stops_at_nonsettled_boundaries(db, only, boundary):
+         _notice(db, "A failed close-out remains visible.", closeout={"state": "error"})
+     else:
+         for _ in range(2 if boundary == "chain" else so._TAIL_ROWS):
+-            _notice(db, "Settled intermediate notice.", closeout={"state": "superseded"})
+-    _notice(db, "Settled physical tail.", closeout={"state": "superseded"})
++            _settled(db, "Settled intermediate notice.")
++    _settled(db, "Settled physical tail.")
+     found = ng.candidates(db, time.time(), only=only)
+     assert [c["msg_id"] for c in found] == ([old] if boundary == "chain" else [])
+ 
+ 
++@pytest.mark.parametrize("shape", ["batch", "folded", "replay", "legacy", "changed_after_receipt"])
++def test_unproven_supersession_never_hides_whole_row(db, shape):
++    old = _notice(db, "Older unrelated ask.")
++    row = _retired_block(db, extra="batch" if shape == "legacy" else shape if shape in ("batch", "folded") else "",
++                         replay=shape == "replay")
++    if shape == "legacy":
++        ng._stamp(db, row, "superseded")
++    else:
++        _run(db)
++    if shape == "changed_after_receipt":
++        db._write_rowcount("UPDATE messages SET content = content || ? WHERE id = ?",
++                           ("\nUnrelated human request folded later.", row))
++    stored = dict(db._read_one("SELECT role, content, display_kind, display_metadata FROM messages WHERE id=?", (row,)))
++    assert so._completion_note(stored) is None
++    assert nh.settled_notice(stored) is False
++    assert old not in [c["msg_id"] for c in ng.candidates(db, time.time())]
++    assert so.refresh_outcomes_quietly([CHAT], "notice", db=db) == 1
++    assert so.get_outcome(CHAT, db=db)["reason"] == "notice_tail"
++
++
++@pytest.mark.parametrize("failure", ["event_read", "task_read", "park_read"])
++def test_creator_source_read_failure_remains_retryable(db, monkeypatch, failure):
++    import contextlib
++    import sqlite3
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tui_gateway.session_notifications import _format_kanban_event_text
++
++    with contextlib.closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="creator question", assignee="worker")
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "decision_requested", {"why": "Repair or withdraw?"})
++            event = kb.list_events(conn, tid)[-1]
++            kb._append_event(conn, tid, "scheduled", {"awaiting": {"kind": "ci", "ref": "test-run"}})
++            conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++        text = _format_kanban_event_text({"task_id": tid}, kb.get_task(conn, tid), event, "default")
++    row = _notice(db, text, board="default", task_id=tid, event_ids=[event.id])
++    original_connect, original_get = kbc.connect, kb.get_task
++    failed = []
++
++    class Source:
++        def __init__(self, conn):
++            self.conn = conn
++
++        def __getattr__(self, key):
++            return getattr(self.conn, key)
++
++        def execute(self, sql, args=()):
++            target = "SELECT * FROM task_events" if failure == "event_read" else "SELECT payload FROM task_events"
++            if failure != "task_read" and target in sql and not failed:
++                failed.append(failure)
++                raise sqlite3.OperationalError("injected source read failure")
++            return self.conn.execute(sql, args)
++
++    def get_task(conn, task_id):
++        if failure == "task_read" and not failed:
++            failed.append(failure)
++            raise sqlite3.OperationalError("injected task read failure")
++        return original_get(conn, task_id)
++
++    monkeypatch.setattr(kbc, "connect", lambda *args, **kwargs: Source(original_connect(*args, **kwargs)))
++    monkeypatch.setattr(kb, "get_task", get_task)
++    _out, calls = _run(db, verdict="busy")
++    assert failed == [failure]
++    assert calls == [(CHAT, row)]
++    assert _closeout(db, row) == "deferred"  # not the guarantee's terminal error stamp
++    retry = json.loads(db._read_one("SELECT display_metadata FROM messages WHERE id=?", (row,))[0])["closeout"]["retry_at"]
++    out, calls = _run(db, now=retry + 1)
++    assert calls == [] and out[0]["result"] == "superseded"
++
++
++def test_provable_legacy_supersession_is_lazily_upgraded(db):
++    older = _notice(db, "Still awaiting another answer.")
++    row = _retired_block(db)
++    ng._stamp(db, row, "superseded")
++    out, calls = _run(db)
++    assert calls == [] and out[0]["msg_id"] == row and out[0]["result"] == "superseded"
++    assert ng.candidates(db, time.time())[0]["msg_id"] == older
++    assert so.get_outcome(CHAT, db=db)["reason"] == "notice_tail"
++
++
++@pytest.mark.parametrize("failure", [OSError, TypeError, AttributeError, RuntimeError])
++def test_creator_unavailable_source_cannot_become_final_error(db, monkeypatch, failure):
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli.kanban_decision_ask import notice_text
++
++    cand = {"sid": CHAT, "content": notice_text({}),
++            "meta": {"board": "default", "task_id": "t_example", "event_ids": [1]}}
++
++    def unavailable(**kwargs):
++        raise failure("injected unavailable source")
++
++    monkeypatch.setattr(kbc, "connect", unavailable)
++    assert nh.creator_superseded(cand) is False
++
++
++@pytest.mark.parametrize("case", ["valid", "remote", "missing_keys", "not_list", "bad_type", "duplicate", "too_many",
++                                  "bad_key", "missing_event", "missing_board", "wrong_kind", "still_blocked", "missing_task",
++                                  "null_payload", "read_error"])
++def test_whole_row_receipt_requires_all_local_source_proof(db, monkeypatch, case):
++    import contextlib
++    from hermes_cli import kanban_db_connect as kbc
++
++    row = _retired_block(db)
++    cand = ng.candidates(db, time.time())[0]
++    assert cand["msg_id"] == row
++    meta = cand["meta"]
++    if case == "remote":
++        meta["gateway"] = "foreign"
++    elif case == "missing_keys":
++        meta.pop("kanban_event_keys")
++    elif case == "not_list":
++        meta["kanban_event_keys"] = "default:1"
++    elif case == "bad_type":
++        meta["kanban_event_keys"] = [True]
++    elif case == "duplicate":
++        meta["kanban_event_keys"] *= 2
++    elif case == "too_many":
++        meta["kanban_event_keys"] = [f"default:{n}" for n in range(51)]
++    elif case == "bad_key":
++        meta["kanban_event_keys"] = ["not-a-local-event"]
++    elif case == "missing_event":
++        meta["kanban_event_keys"] = ["default:9999999"]
++    elif case == "missing_board":
++        meta["kanban_event_keys"] = ["missing-board:1"]
++    elif case == "read_error":
++        def unavailable(**kwargs):
++            raise OSError("injected source unavailable")
++        monkeypatch.setattr(kbc, "connect", unavailable)
++    elif case != "valid":
++        with contextlib.closing(kbc.connect()) as conn:
++            eid = int(meta["kanban_event_keys"][0].split(":")[-1])
++            if case == "wrong_kind":
++                conn.execute("UPDATE task_events SET kind='completed' WHERE id=?", (eid,))
++            elif case == "still_blocked":
++                conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (meta["task_id"],))
++            elif case == "missing_task":
++                from hermes_cli import kanban_db as kb
++                monkeypatch.setattr(kb, "get_task", lambda *_: None)
++            else:
++                conn.execute("UPDATE task_events SET payload='null' WHERE id=?", (eid,))
++            conn.commit()
++    assert nh.whole_row_settled(cand) is (case == "valid")
++
++
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+index 601c0ef641..40aa5f7f5d 100644
+--- a/tui_gateway/notice_guarantee.py
++++ b/tui_gateway/notice_guarantee.py
+@@ -8,7 +8,9 @@ unloaded sweeper's loop therefore looks, in every profile store, for chats whose
+ 
+ - a "blocked" notice whose card has moved on since (answered, rescheduled, done, archived) never wakes: it is
+   stamped ``closeout.state = "superseded"`` and the chat's outcome is refreshed. Superseded user notices are
+-  transparent to outcome derivation and candidate discovery, so an older unanswered notice keeps its custody;
++  transparent to outcome derivation and candidate discovery only with a content-bound whole-row source proof,
++  so an older unanswered notice keeps its custody without hiding mixed batches. A legacy stamp can acquire
++  that proof lazily; an unprovable row remains visible;
+ - a creator-decision notice is superseded only with an exact local source-event/render match and proof its
+   card left the chat wait (a scheduled card must explicitly name a different producer). Mixed/foreign/unknown
+   rows remain unanswered;
+@@ -97,7 +99,7 @@ def _reset_refreshed_for_tests() -> None:
+     _refreshed.clear()
+ 
+ _CANDIDATES_SQL = """
+-SELECT s.id AS sid, m.id AS msg_id, m.role, m.timestamp, m.content, m.display_metadata,
++SELECT s.id AS sid, m.id AS msg_id, m.role, m.timestamp, m.content, m.display_kind, m.display_metadata,
+        {last_active} AS last_active
+   FROM sessions s
+   JOIN messages m ON m.id = (SELECT id FROM messages WHERE session_id = s.id AND active = 1
+@@ -111,7 +113,7 @@ SELECT s.id AS sid, m.id AS msg_id, m.role, m.timestamp, m.content, m.display_me
+ # ``idx_messages_kanban_notice``) instead of the last message of every session; ``m.id = (...)`` keeps the
+ # "a notice is the chat's last active message" test. 5.5x less work on a 1.3M-message store.
+ _CANDIDATES_INDEXED_SQL = """
+-SELECT s.id AS sid, m.id AS msg_id, m.role, m.timestamp, m.content, m.display_metadata,
++SELECT s.id AS sid, m.id AS msg_id, m.role, m.timestamp, m.content, m.display_kind, m.display_metadata,
+        {last_active} AS last_active
+   FROM (SELECT session_id, MAX(id) AS nid FROM messages INDEXED BY idx_messages_kanban_notice
+          WHERE display_kind = 'kanban_notice' AND active = 1 AND role IN ('user', 'assistant', 'tool')
+@@ -160,9 +162,12 @@ def candidates(db: Any, now: float, only: Optional[set[str]] = None) -> list[dic
+     else:
+         rows = candidate_rows(db, sql)
+     out = []
+-    from tui_gateway.notice_history import preceding_candidate
++    from tui_gateway.notice_history import preceding_candidate, settled_notice, whole_row_settled
+ 
+     for row in rows:
++        if row["last_active"] is not None and row["last_active"] < now - LOOKBACK_S and not _deferred_due(
++                _decode(row["display_metadata"]), now):
++            continue
+         row = preceding_candidate(db, row)
+         # Cache structure, not age: a notice can become due (or expire) without a commit.
+         meta = _decode(row["display_metadata"])
+@@ -174,9 +179,13 @@ def candidates(db: Any, now: float, only: Optional[set[str]] = None) -> list[dic
+             continue
+         if row["timestamp"] > now - GRACE_S:
+             continue
+-        if "closeout" not in meta or deferred_due or _legacy_busy(meta):
+-            out.append({"sid": str(row["sid"]), "msg_id": int(row["msg_id"]), "content": str(row["content"] or ""),
+-                        "meta": meta, "raw_meta": row["display_metadata"]})
++        cand = {"sid": str(row["sid"]), "msg_id": int(row["msg_id"]), "content": str(row["content"] or ""),
++                "meta": meta, "raw_meta": row["display_metadata"]}
++        closeout = meta.get("closeout")
++        reprovable = (isinstance(closeout, dict) and closeout.get("state") == "superseded"
++                      and not settled_notice(row) and whole_row_settled(cand))
++        if "closeout" not in meta or deferred_due or _legacy_busy(meta) or reprovable:
++            out.append(cand)
+     return out
+ 
+ 
+@@ -310,7 +319,12 @@ def superseded(cand: dict) -> bool:
+ 
+ def _supersede(db: Any, cand: dict, now: float) -> str:
+     """Stamp the notice ``superseded`` (compare-and-swap like a claim) and refresh the chat's outcome."""
+-    meta = {**cand["meta"], "closeout": {"state": "superseded", "at": now, "pid": os.getpid()}}
++    from tui_gateway.notice_history import content_digest, whole_row_settled
++
++    closeout = {"state": "superseded", "at": now, "pid": os.getpid()}
++    if whole_row_settled(cand):
++        closeout["settled_content_sha256"] = content_digest(cand["content"])
++    meta = {**cand["meta"], "closeout": closeout}
+     with notice_writer(db) as wdb:
+         if wdb._write_rowcount("UPDATE messages SET display_metadata = ? WHERE id = ? AND display_metadata IS ?",
+                                (json.dumps(meta, ensure_ascii=False), cand["msg_id"], cand["raw_meta"])) != 1:
+diff --git a/tui_gateway/notice_history.py b/tui_gateway/notice_history.py
+index d2dedf0ac6..f1d70bdc58 100644
+--- a/tui_gateway/notice_history.py
++++ b/tui_gateway/notice_history.py
+@@ -1,21 +1,38 @@
+-"""Follow settled notice tails without hiding the preceding obligation. [daveey]"""
++"""Follow proven settled notice tails without hiding other input. [daveey]"""
+ from __future__ import annotations
+ 
++import hashlib
+ from typing import Any
+ 
+ 
+-def preceding_candidate(db: Any, row: Any) -> dict:
+-    """Only superseded notice rows are transparent, never replies or failed wakes.
++def content_digest(content: str) -> str:
++    return hashlib.sha256(content.encode("utf-8")).hexdigest()
++
+ 
+-    Bound the exceptional lookup to the same window as outcome derivation. Normal
+-    discovery keeps its indexed scan and does no extra reads.
++def settled_notice(row: dict) -> bool:
++    """Only a whole-row receipt admits transparency; legacy stamps are not proof.
++
++    A blocked event can share a batch (or replay) with unrelated input. Neither
++    stale flags nor a historical whole-row superseded stamp attest that input.
++    Bind the admission to content so later alternation folding invalidates it.
+     """
+-    from hermes_state_outcome import _TAIL_ROWS
+     from tui_gateway.notice_fanout import _decode
+ 
++    meta = _decode(row.get("display_metadata"))
++    closeout = meta.get("closeout")
++    content = row.get("content")
++    return (row.get("role") == "user" and row.get("display_kind") == "kanban_notice"
++            and isinstance(content, str) and isinstance(closeout, dict)
++            and closeout.get("state") == "superseded"
++            and closeout.get("settled_content_sha256") == content_digest(content))
++
++
++def preceding_candidate(db: Any, row: Any) -> dict:
++    """Traverse proven settlement only, within outcome derivation's tail bound."""
++    from hermes_state_outcome import _TAIL_ROWS
++
+     row = dict(row)
+-    closeout = _decode(row["display_metadata"]).get("closeout")
+-    if row["role"] != "user" or not isinstance(closeout, dict) or closeout.get("state") != "superseded":
++    if not settled_notice(row):
+         return row
+     previous = db._read_all(
+         "SELECT id AS msg_id, role, timestamp, content, display_kind, display_metadata FROM messages "
+@@ -24,19 +41,13 @@ def preceding_candidate(db: Any, row: Any) -> dict:
+     for earlier in previous:
+         if earlier["role"] != "user" or earlier["display_kind"] != "kanban_notice":
+             return row
+-        closeout = _decode(earlier["display_metadata"]).get("closeout")
+-        if not isinstance(closeout, dict) or closeout.get("state") != "superseded":
++        if not settled_notice(dict(earlier)):
+             return {**row, **dict(earlier)}
+     return row
+ 
+ 
+ def creator_superseded(cand: dict) -> bool:
+-    """Retire only an exact local producer row whose creator question is no longer pending.
+-
+-    Revalidate the event and rendered content: a folded row may carry unrelated
+-    input while retaining the original notice metadata. Missing provenance fails
+-    closed, as does a current chat park (scheduled alone is not proof of settlement).
+-    """
++    """Exact local creator rendering plus proof the card left its chat wait."""
+     import contextlib
+ 
+     from hermes_cli import kanban_db as kb
+@@ -52,30 +63,81 @@ def creator_superseded(cand: dict) -> bool:
+     if not isinstance(events, list) or len(events) != 1 or type(events[0]) is not int or not tid or not board:
+         return False
+     try:
+-        conn = kbc.connect(board=board)
+-    except ValueError:
++        with contextlib.closing(kbc.connect(board=board)) as conn:
++            row = conn.execute("SELECT * FROM task_events WHERE id = ? AND task_id = ? AND kind = ?",
++                               (events[0], tid, "decision_requested")).fetchone()
++            task = kb.get_task(conn, tid)
++            if row is None or task is None:
++                return False
++            event = kb.Event.from_row(row)
++            rendered = server._format_kanban_event_text({"task_id": tid, "chat_id": cand["sid"]}, task, event, board)
++            if cand["content"] != rendered:
++                return False
++            if task.status != "scheduled":
++                return True
++            park = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND id > ? AND kind IN "
++                                "('scheduled', 'continued') ORDER BY id DESC LIMIT 1", (tid, events[0])).fetchone()
++            if park is None:
++                return False
++            import json
++            try:
++                payload = json.loads(park[0] or "{}")
++            except (ValueError, TypeError):
++                return False
++            awaiting = payload.get("awaiting") if isinstance(payload, dict) else None
++            return isinstance(awaiting, dict) and awaiting.get("kind") in ("ci", "deploy", "card", "external", "clock", "resource")
++    except Exception:  # health: allow BLE001 -- unavailable/malformed source is never settlement evidence
++        # No settlement proof on a transient source failure; normal wake custody remains.
+         return False
+-    with contextlib.closing(conn):
+-        row = conn.execute("SELECT * FROM task_events WHERE id = ? AND task_id = ? AND kind = ?",
+-                           (events[0], tid, "decision_requested")).fetchone()
+-        task = kb.get_task(conn, tid)
+-        if row is None or task is None:
+-            return False
+-        event = kb.Event.from_row(row)
+-        rendered = server._format_kanban_event_text({"task_id": tid, "chat_id": cand["sid"]}, task, event, board)
+-        if cand["content"] != rendered:
+-            return False
+-        if task.status != "scheduled":
+-            return True
+-        park = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind IN "
+-                            "('scheduled', 'continued') ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+-        if park is None:
+-            return False
+-        import json
+-        try:
+-            payload = json.loads(park[0] or "{}")
+-        except (ValueError, TypeError):
+-            return False
+-        awaiting = payload.get("awaiting") if isinstance(payload, dict) else None
+-        return isinstance(awaiting, dict) and awaiting.get("kind") in ("ci", "deploy", "card", "external", "clock", "resource")
+ 
++
++def whole_row_settled(cand: dict) -> bool:
++    """Revalidate every local source event, then require an exact complete rendering.
++
++    No regex or stale flag proves purity. Replay wrappers and folded text cannot
++    equal the source rendering. Foreign and old provenance-free rows fail closed.
++    """
++    import contextlib
++    from copy import copy
++
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tui_gateway import server
++    from tui_gateway.notice_guarantee import _is_remote
++
++    meta = cand["meta"]
++    if _is_remote(meta):
++        return False
++    if creator_superseded(cand):
++        return True
++    keys = meta.get("kanban_event_keys")
++    if not isinstance(keys, list) or not keys or len(keys) > 50 or not all(isinstance(k, str) for k in keys):
++        return False
++    if len(set(keys)) != len(keys):
++        return False
++    rendered = []
++    try:
++        for key in keys:
++            board, sep, eid = key.rpartition(":")
++            if not sep or not board or not eid.isdecimal():
++                return False
++            with contextlib.closing(kbc.connect(board=board)) as conn:
++                row = conn.execute("SELECT * FROM task_events WHERE id = ?", (int(eid),)).fetchone()
++                if row is None:
++                    return False
++                event = kb.Event.from_row(row)
++                task = kb.get_task(conn, event.task_id)
++                if event.kind != "blocked" or task is None or task.status in ("blocked", "triage"):
++                    return False
++                # Rebuild only fields the block producer reads from this event's
++                # snapshot. Changed title/assignee or old missing request data can
++                # reject a valid old block; they must never admit unrelated text.
++                task = copy(task)
++                task.status = "blocked"
++                task.human_request = event.payload.get("human_request")
++                task.block_kind = event.payload.get("kind")
++                rendered.append(server._format_kanban_event_text(
++                    {"task_id": event.task_id, "chat_id": cand["sid"]}, task, event, board))
++        return all(isinstance(text, str) for text in rendered) and cand["content"] == "\n".join(rendered)
++    except Exception:  # health: allow BLE001 -- optional proof must not turn a source failure into a final error
++        return False
+-- 
+2.43.0
+

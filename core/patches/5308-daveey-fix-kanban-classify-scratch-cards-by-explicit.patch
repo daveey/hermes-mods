@@ -1,0 +1,334 @@
+From 12b5cf54db4fcee30582aa6247254b366e832d53 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:23:56 +0000
+Subject: [PATCH] [daveey] fix(kanban): classify scratch cards by explicit lane
+ provenance
+
+---
+ hermes_cli/kanban_lane_matching.py            | 34 +++++++
+ hermes_cli/kanban_lane_reclassify.py          | 55 +++++++++++
+ hermes_cli/kanban_lanes.py                    | 18 +++-
+ hermes_cli/kanban_lanes_cli.py                |  4 +
+ hermes_cli/kanban_parser.py                   |  2 +
+ tests/hermes_cli/test_kanban_lane_matching.py | 95 +++++++++++++++++++
+ .../features/kanban-worker-lanes.md           | 19 ++++
+ 7 files changed, 222 insertions(+), 5 deletions(-)
+ create mode 100644 hermes_cli/kanban_lane_matching.py
+ create mode 100644 hermes_cli/kanban_lane_reclassify.py
+ create mode 100644 tests/hermes_cli/test_kanban_lane_matching.py
+
+diff --git a/hermes_cli/kanban_lane_matching.py b/hermes_cli/kanban_lane_matching.py
+new file mode 100644
+index 0000000000..0afb3aa561
+--- /dev/null
++++ b/hermes_cli/kanban_lane_matching.py
+@@ -0,0 +1,34 @@
++"""Pure, bounded lane matching of structured card provenance. [daveey]"""
++from __future__ import annotations
++
++import json
++from pathlib import PurePosixPath
++
++
++def skill_names(raw) -> set[str]:
++    if isinstance(raw, str):
++        try:
++            raw = json.loads(raw)
++        except (ValueError, TypeError):
++            return set()
++    return {s for s in raw if isinstance(s, str)} if isinstance(raw, (list, tuple)) else set()
++
++
++def repo_names(opts: dict) -> set[str]:
++    """Exact repo basename, or the repo immediately before a .worktrees directory.
++
++    Never scan arbitrary ancestors: /src/hermes/ask-eve is Ask Eve, not Hermes.
++    No filesystem/Git/network access is needed during a creation transaction.
++    """
++    names = set()
++    for value in (opts.get("project_repo"), opts.get("workspace_path")):
++        if not isinstance(value, str) or not value:
++            continue
++        parts = PurePosixPath(value.rstrip("/")).parts
++        if not parts:
++            continue
++        names.add(parts[-1].removesuffix(".git"))
++        for index, part in enumerate(parts):
++            if part == ".worktrees" and index:
++                names.add(parts[index - 1])
++    return names
+diff --git a/hermes_cli/kanban_lane_reclassify.py b/hermes_cli/kanban_lane_reclassify.py
+new file mode 100644
+index 0000000000..526846bc51
+--- /dev/null
++++ b/hermes_cli/kanban_lane_reclassify.py
+@@ -0,0 +1,55 @@
++"""Re-evaluate default/inherited lane labels without changing execution custody. [daveey]"""
++from __future__ import annotations
++
++from hermes_cli import kanban_lanes as lanes
++
++
++def reclassify(conn, *, apply: bool = False) -> list[dict]:
++    """Dry run by default; existing admissions/holds, priorities and terminal history stay intact.
++
++    Rules can relabel a previously unclassified/inherited default-lane card, including
++    into a gated lane: this is accounting repair, not admission or gate release.
++    Explicit user/planner assignments and prior rule decisions are never overwritten.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_lanes_plan as plan
++
++    pol = lanes.policy()
++    if pol is None:
++        raise ValueError("no lanes configured")
++    changes = []
++    with kb.write_txn(conn):
++        rows = conn.execute(
++            "SELECT * FROM tasks WHERE tenant = ? AND status NOT IN ('done', 'archived') ORDER BY created_at, id",
++            (pol.default,)).fetchall()
++        for row in rows:
++            if plan.lane_source(conn, row["id"]) not in ("unclassified", "inherited"):
++                continue
++            opts = dict(row)
++            opts["_stored_card"] = True
++            if opts.get("project_id"):
++                _project, _obj, repo, _kind = kb._resolve_project_link(
++                    conn, opts["project_id"], None, opts["workspace_kind"], opts["workspace_path"])
++                opts["project_repo"] = repo
++            lane = lanes._rule_lane(pol, opts)
++            if lane is None or lane == pol.default:
++                continue
++            change = {"id": row["id"], "title": row["title"], "from": row["tenant"], "lane": lane,
++                      "status": row["status"]}
++            changes.append(change)
++            if apply:
++                conn.execute("UPDATE tasks SET tenant = ? WHERE id = ?", (lane, row["id"]))
++                kb._append_event(conn, row["id"], lanes.ASSIGNED,
++                                 {"lane": lane, "from": row["tenant"], "source": "rule",
++                                  "reason": "re-evaluated stored provenance; existing admission/holds unchanged"})
++    return changes
++
++
++def command(args) -> int:
++    import json
++    from hermes_cli import kanban_db_connect as kbc
++
++    with kbc.connect_closing() as conn:
++        changes = reclassify(conn, apply=args.apply)
++    print(json.dumps({"applied": args.apply, "changes": changes}, indent=2))
++    return 0
+diff --git a/hermes_cli/kanban_lanes.py b/hermes_cli/kanban_lanes.py
+index a4666c1ece..ec5157c9c8 100644
+--- a/hermes_cli/kanban_lanes.py
++++ b/hermes_cli/kanban_lanes.py
+@@ -87,6 +87,8 @@ class Lane:
+     key_prefixes: tuple = ()
+     repos: frozenset = frozenset()
+     self_work: bool = False
++    title_patterns: tuple = ()
++    skills: frozenset = frozenset()
+     gate_exempt: tuple = ()
+     never_admit: tuple = ()
+ 
+@@ -162,8 +164,8 @@ def _lane(name, raw) -> Lane:
+     if max_workers is not None and (type(max_workers) is not int or max_workers < 0):
+         raise ValueError(f"lane {name}: max_workers must be a nonnegative integer")
+     match = raw.get("match") or {}
+-    if not isinstance(match, dict) or set(match) - {"creators", "key_prefixes", "repos", "self_work"}:
+-        raise ValueError(f"lane {name}: match takes creators, key_prefixes, repos, self_work")
++    if not isinstance(match, dict) or set(match) - {"creators", "key_prefixes", "repos", "self_work", "title_patterns", "skills"}:
++        raise ValueError(f"lane {name}: match takes creators, key_prefixes, repos, self_work, title_patterns, skills")
+     return Lane(
+         name=name, share=float(share), gated=raw.get("gated") is True, admit_per_day=per_day,
+         cards_per_day=cards_per_day, max_workers=max_workers,
+@@ -172,6 +174,8 @@ def _lane(name, raw) -> Lane:
+         creators=frozenset(_strings(match.get("creators"), "match.creators")),
+         key_prefixes=_strings(match.get("key_prefixes"), "match.key_prefixes"),
+         repos=frozenset(_strings(match.get("repos"), "match.repos")), self_work=match.get("self_work") is True,
++        title_patterns=_patterns(match.get("title_patterns"), "match.title_patterns"),
++        skills=frozenset(_strings(match.get("skills"), "match.skills")),
+         gate_exempt=_patterns(raw.get("gate_exempt"), "gate_exempt"),
+         never_admit=_patterns(raw.get("never_admit"), "never_admit"))
+ 
+@@ -266,11 +270,15 @@ def _key_matches(lane: Lane, key) -> bool:
+ 
+ 
+ def _rule_lane(pol: Policy, opts: dict) -> Optional[str]:
+-    repos = {os.path.basename(str(p).rstrip("/")) for p in (opts.get("project_repo"), opts.get("workspace_path"))
+-             if p}
++    from hermes_cli.kanban_lane_matching import repo_names, skill_names
++
++    repos = repo_names(opts)
++    skills = skill_names(opts.get("skills"))
+     for lane in pol.lanes.values():
+         if (opts.get("created_by") in lane.creators or _key_matches(lane, opts.get("idempotency_key"))
+-                or (lane.self_work and opts.get("self_work") is not None) or repos & lane.repos):
++                or (lane.self_work and opts.get("self_work") is not None) or repos & lane.repos
++                or skills & lane.skills
++                or any(p.search(opts.get("title") or "") for p in lane.title_patterns)):
+             return lane.name
+     return None
+ 
+diff --git a/hermes_cli/kanban_lanes_cli.py b/hermes_cli/kanban_lanes_cli.py
+index e6ba745c1e..6f93951d51 100644
+--- a/hermes_cli/kanban_lanes_cli.py
++++ b/hermes_cli/kanban_lanes_cli.py
+@@ -276,6 +276,10 @@ def command(args: argparse.Namespace) -> int:
+     if action is None:
+         args.hours, args.local = 6.0, False
+     try:
++        if action == "reclassify":
++            from hermes_cli.kanban_lane_reclassify import command as reclassify_command
++
++            return reclassify_command(args)
+         return _ACTIONS[action](args)
+     except ValueError as exc:
+         print(f"lanes: {exc}", file=sys.stderr)
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index a0c5ff33a6..2e3a5bd73a 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -700,6 +700,8 @@ _SPECS = [
+              help="Cards waiting at a lane gate, oldest first"),
+         _cmd("unclassified", [_arg("--limit", type=int, default=200), _json_flag()],
+              help="Open cards no rule or parent placed in a lane"),
++        _cmd("reclassify", [_arg("--apply", action="store_true"), _json_flag()],
++             help="Preview rule matches for default-lane open cards; --apply repairs labels, not admissions"),
+         _cmd("assign", [_TASK_ID, _arg("lane"), _reason("Why the card belongs there"),
+                         _arg("--source", choices=("given", "llm"), default="given")], help="Move a card to a lane"),
+         _cmd("admit", [_TASK_ID, _reason("Why it should run now")], help="Release a card held at a lane gate"),
+diff --git a/tests/hermes_cli/test_kanban_lane_matching.py b/tests/hermes_cli/test_kanban_lane_matching.py
+new file mode 100644
+index 0000000000..047ddd96fb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_lane_matching.py
+@@ -0,0 +1,95 @@
++"""Lane provenance rules and non-admitting accounting repair."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_lanes as lanes
++from hermes_cli.kanban_lane_reclassify import reclassify
++from tests.hermes_cli import test_kanban_lanes as helpers
++
++conn = helpers.conn
++person = helpers.person
++configured = helpers.configured
++
++
++@pytest.mark.parametrize("opts", [
++    {"project_repo": "https://github.com/example/hermes-agent.git"},
++    {"workspace_path": "/src/hermes-agent/.worktrees/card"},
++    {"workspace_path": "/src/hermes-agent"},
++])
++def test_repo_identity(opts):
++    pol = lanes.parse({"lanes": helpers.LANES})
++    assert lanes._rule_lane(pol, opts) == "hermes"
++
++
++@pytest.mark.parametrize("raw", [["core-dev"], '["core-dev"]'])
++def test_exact_skill_rule(raw):
++    pol = lanes.parse({"lanes": {"hermes": {"match": {"skills": ["core-dev"]}}, "other": {}}})
++    assert lanes._rule_lane(pol, {"skills": raw}) == "hermes"
++
++
++def test_title_rule_and_other_regressions():
++    pol = lanes.parse({"lanes": {"hermes": {"match": {"title_patterns": [r"^Desktop:"]}}, "other": {}}})
++    assert lanes._rule_lane(pol, {"title": "Desktop: sidebar dot", "created_by": "default"}) == "hermes"
++    for opts in ({"title": "Ask Eve admin", "created_by": "default"},
++                 {"title": "Buy a desktop computer"}, {"skills": '["core-dev-extra"]'},
++                 {"skills": '{"core-dev":true}'}, {"skills": "malformed"}):
++        assert lanes._rule_lane(pol, opts) is None
++
++
++def test_no_arbitrary_repo_ancestor_match():
++    pol = lanes.parse({"lanes": helpers.LANES})
++    assert lanes._rule_lane(pol, {"workspace_path": "/src/hermes-agent/ask-eve"}) is None
++
++
++def test_bad_pattern_rejected():
++    with pytest.raises(ValueError, match="title_patterns"):
++        lanes.parse({"lanes": {"other": {"match": {"title_patterns": ["["]}}}})
++
++
++@pytest.mark.parametrize("status,block_kind", [
++    ("running", None), ("blocked", "needs_input"), ("scheduled", "time"),
++    ("triage", "containment"), ("triage", lanes.GATE_KIND), ("done", None), ("archived", None),
++])
++def test_reclassification_never_changes_execution_state(conn, configured, status, block_kind):
++    tid = kb.create_task(conn, title="Desktop: state", assignee="default", created_by="user")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status=?, block_kind=? WHERE id=?", (status, block_kind, tid))
++    mapping = {**helpers.LANES, "hermes": {"gated": True, "match": {"title_patterns": ["^Desktop:"]}}}
++    configured(mapping)
++    changes = reclassify(conn, apply=True)
++    assert bool(changes) == (status not in ("done", "archived"))
++    row = conn.execute("SELECT status, block_kind FROM tasks WHERE id=?", (tid,)).fetchone()
++    assert tuple(row) == (status, block_kind)
++
++
++def test_new_rules_still_honor_creation_gate_and_explicit_user_lane(conn, configured):
++    mapping = {**helpers.LANES, "hermes": {"gated": True, "match": {"title_patterns": ["^Desktop:"]}}}
++    configured(mapping)
++    parent = kb.create_task(conn, title="parent", assignee="default", created_by="user")
++    tid = kb.create_task(conn, title="Desktop: state", assignee="default", created_by="default", creator_task_id=parent)
++    assert tuple(conn.execute("SELECT tenant,status FROM tasks WHERE id=?", (tid,)).fetchone()) == ("hermes", "triage")
++    explicit = kb.create_task(conn, title="Desktop: state", assignee="default", created_by="user", tenant="other")
++    assert conn.execute("SELECT tenant FROM tasks WHERE id=?", (explicit,)).fetchone()[0] == "other"
++
++
++def test_reclassification_preserves_custody_and_manual_labels(conn, configured):
++    ids = [kb.create_task(conn, title="Desktop: dot", assignee="default", created_by="user") for _ in range(3)]
++    lanes.assign(conn, ids[1], "other", source="given", reason="explicit")
++    lanes.assign(conn, ids[2], "other", source="llm", reason="planner")
++    before = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (ids[0],)).fetchone())
++    mapping = dict(helpers.LANES)
++    mapping["hermes"] = {**mapping["hermes"], "match": {"title_patterns": ["^Desktop:"]}}
++    configured(mapping)
++    changes = reclassify(conn)
++    assert [c["id"] for c in changes] == [ids[0]]
++    assert dict(conn.execute("SELECT * FROM tasks WHERE id=?", (ids[0],)).fetchone()) == before
++    assert reclassify(conn, apply=True) == changes
++    after = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (ids[0],)).fetchone())
++    assert after.pop("tenant") == "hermes"
++    before.pop("tenant")
++    # Synced write bookkeeping may advance, but execution state must not change.
++    for key in ("status", "priority", "block_kind", "claim_lock", "claim_expires", "worker_pid", "current_run_id"):
++        assert after[key] == before[key]
++    assert reclassify(conn, apply=True) == []
++    assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind IN (?, ?)",
++                            (ids[0], lanes.GATED, lanes.ADMITTED)).fetchone()
+diff --git a/website/docs/user-guide/features/kanban-worker-lanes.md b/website/docs/user-guide/features/kanban-worker-lanes.md
+index 51470fce5d..a5e16a0755 100644
+--- a/website/docs/user-guide/features/kanban-worker-lanes.md
++++ b/website/docs/user-guide/features/kanban-worker-lanes.md
+@@ -9,6 +9,25 @@ This page is the contract. It exists for two audiences:
+ 
+ If you're writing the worker code itself — the agent that runs *inside* a lane — the kanban lifecycle and reference details are injected into the worker's system prompt automatically (the `KANBAN_GUIDANCE` block in [`agent/prompt_builder.py`](https://github.com/NousResearch/hermes-agent/blob/main/agent/prompt_builder.py)).
+ 
++## Project-lane classification (fork)
++
++Project lanes (`kanban.admission.lanes`) are separate from executor profiles below.
++Each lane's `match` accepts OR-ed `creators`, `key_prefixes`, `repos`, `self_work`,
++`skills` (exact pinned skill names), and `title_patterns` (case-insensitive regular
++expressions over the title only). Repos match a basename, an optional `.git` suffix,
++or the repository immediately before `/.worktrees/`; arbitrary ancestor directories
++and mentions in the body do not count. Explicit user lane choices still win.
++
++Use `hermes kanban lanes reclassify --json` to preview new rule matches for open
++cards in the default lane whose latest assignment was unclassified or inherited.
++`--apply` repairs those labels with an audited `source=rule` assignment. It does not
++change priorities, lifecycle, claims, existing admission or holds, including containment;
++it never admits a held card. Manual/planner assignments, previous rule assignments,
++and completed/archived history are left alone. Run it on each owning board, not a
++read-only fleet replica. Usage is charged by the current card label, so repaired
++open cards also move their trailing-window run-hours; terminal history does not.
++Deploy matcher support before publishing policy keys to older clients.
++
+ ## The hierarchy
+ 
+ ```text
+-- 
+2.43.0
+

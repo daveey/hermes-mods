@@ -1,0 +1,278 @@
+From 6a94a9e1411f351af9ee8581537864b1897ad67b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 09:20:29 +0000
+Subject: [PATCH] fix(kanban): stabilize contained-strand clock and close
+ review gaps [daveey]
+
+Use the archive transition rather than later comments for archived authorities. Skip chat link scans for already escalated episodes. Show containment age while the authority is open. Exercise replica-only authority status, retained home/worker copies, unresolved holds and producer/run boundaries.
+---
+ hermes_cli/kanban_contained_wait.py           | 16 +--
+ hermes_cli/kanban_triage_sweep.py             |  7 +-
+ hermes_cli/kanban_wait_info.py                |  2 +-
+ .../test_kanban_contained_strand.py           |  3 +
+ .../test_kanban_contained_strand_review.py    | 98 +++++++++++++++++++
+ .../hermes_cli/test_kanban_triage_replica.py  | 40 +++++---
+ 6 files changed, 139 insertions(+), 27 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_contained_strand_review.py
+
+diff --git a/hermes_cli/kanban_contained_wait.py b/hermes_cli/kanban_contained_wait.py
+index 54edb29805..8faaf4cf2f 100644
+--- a/hermes_cli/kanban_contained_wait.py
++++ b/hermes_cli/kanban_contained_wait.py
+@@ -31,14 +31,14 @@ def _json(raw: Any) -> dict:
+ 
+ 
+ def _local_status(conn: sqlite3.Connection, ids: list[str]) -> dict[str, tuple[str, Optional[float]]]:
+-    """``{id: (status, finished_at)}`` for cards this board file holds. ``finished_at`` is ``completed_at``, else the
+-    newest event (an archived card keeps no completion time)."""
++    """``{id: (status, finished_at)}`` using the terminal transition, never later comments."""
+     out: dict[str, tuple[str, Optional[float]]] = {}
+     marks = ",".join("?" * len(ids))
+     for tid, status, done_at, last in conn.execute(
+             f"SELECT t.id, t.status, t.completed_at, (SELECT MAX(e.created_at) FROM task_events e "
+-            f"WHERE e.task_id = t.id) FROM tasks t WHERE t.id IN ({marks})", ids):
+-        out[str(tid)] = (str(status), done_at or last)
++            f"WHERE e.task_id = t.id AND e.kind = CASE t.status WHEN 'archived' THEN 'archived' "
++            f"ELSE 'completed' END) FROM tasks t WHERE t.id IN ({marks})", ids):
++        out[str(tid)] = (str(status), last if status == "archived" else done_at)
+     return out
+ 
+ 
+@@ -52,14 +52,8 @@ def _replica_status(ids: list[str]) -> dict[str, tuple[str, Optional[float]]]:
+         if not rest:
+             break
+ 
+-        def read(conn: sqlite3.Connection, rest=rest) -> list:
+-            return conn.execute(
+-                f"SELECT t.id, t.status, t.completed_at, (SELECT MAX(e.created_at) FROM task_events e "
+-                f"WHERE e.task_id = t.id) FROM tasks t WHERE t.id IN ({','.join('?' * len(rest))})", rest).fetchall()
+-
+         try:
+-            for tid, status, done_at, last in with_reader(path, read):
+-                out[str(tid)] = (str(status), done_at or last)
++            out.update(with_reader(path, lambda conn: _local_status(conn, rest)))
+         except sqlite3.Error:
+             continue
+     return out
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index fd7fc44593..b1ab8e5e04 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -132,10 +132,13 @@ def escalate_stranded_contained(conn: sqlite3.Connection, *, now: Optional[float
+     from hermes_cli.kanban_origin import gateway_name
+     from hermes_cli.kanban_wake_check import foreign_ids
+ 
+-    stranded = stranded_contained(conn, now=now)
++    skipped = foreign_ids(conn) if skip is None else skip
++    stranded = [card for card in stranded_contained(conn, now=now)
++                if card["id"] not in skipped and not conn.execute(
++                    "SELECT 1 FROM tasks WHERE idempotency_key = ?",
++                    (f"containment-strand:{card['id']}:{card['episode']}",)).fetchone()]
+     if not stranded:
+         return []
+-    skipped = foreign_ids(conn) if skip is None else skip
+     try:
+         linked = {link["task_id"] for link in _local_links(conn, gateway_name()).values() if not link.get("released")}
+     except Exception:
+diff --git a/hermes_cli/kanban_wait_info.py b/hermes_cli/kanban_wait_info.py
+index d5418cb351..1b04c26f29 100644
+--- a/hermes_cli/kanban_wait_info.py
++++ b/hermes_cli/kanban_wait_info.py
+@@ -159,7 +159,7 @@ def describe_contained(info: dict[str, Any], *, now: Optional[float] = None) ->
+     done_at = epoch_s(authority.get("at"))
+     shown = {"episode": info["episode"], "authority": {"id": authority["id"], "status": authority["status"]},
+              "producer": {"id": producer["id"], "status": producer["status"]} if producer else None}
+-    base = {"wait_state": "waiting", "waiting_since": done_at, "agent_owned": False, "agent_owned_certain": True,
++    base = {"wait_state": "waiting", "waiting_since": done_at if done_at is not None else epoch_s(info.get("contained_at")), "agent_owned": False, "agent_owned_certain": True,
+             "premise": None, "contained": shown}
+     if authority["status"] not in ("done", "archived"):
+         return {**base, "waiting_on": f"release by card {authority['id']} ({authority['status']})"}
+diff --git a/tests/hermes_cli/test_kanban_contained_strand.py b/tests/hermes_cli/test_kanban_contained_strand.py
+index 8e94689248..fde522d276 100644
+--- a/tests/hermes_cli/test_kanban_contained_strand.py
++++ b/tests/hermes_cli/test_kanban_contained_strand.py
+@@ -29,6 +29,9 @@ def _contained(conn, *, producer=False):
+ 
+ def _finish(conn, task, status="done", at=NOW - 45 * MIN):
+     conn.execute("UPDATE tasks SET status=?, completed_at=?, current_run_id=NULL WHERE id=?", (status, at, task))
++    if status == "archived" and at is not None:
++        kb._append_event(conn, task, "archived", {})
++        conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='archived'", (at, task))
+ 
+ 
+ def _wait(conn, task, now=NOW) -> dict:
+diff --git a/tests/hermes_cli/test_kanban_contained_strand_review.py b/tests/hermes_cli/test_kanban_contained_strand_review.py
+new file mode 100644
+index 0000000000..63065fb942
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_contained_strand_review.py
+@@ -0,0 +1,98 @@
++"""Regression probes from the contained-strand exact-head review. [daveey]"""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_contained_wait as cw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_wait_info as kwi
++from tests.hermes_cli import test_kanban_contained_strand as h
++
++board = h.board
++
++
++def test_archived_clock_ignores_later_comments(board):
++    relay, authority, _ = h._contained(board)
++    h._finish(board, authority, "archived", at=None)
++    kb._append_event(board, authority, "archived", {})
++    board.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='archived'",
++                  (h.NOW - 3600, authority))
++    before = h._wait(board, relay)
++    assert before["agent_owned"] is True
++    kb._append_event(board, authority, "commented", {})
++    board.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='commented'",
++                  (h.NOW - 60, authority))
++    after = h._wait(board, relay)
++    assert after["agent_owned"] is True
++    assert after["waiting_since"] == h.NOW - 3600
++    assert after["premise"] == before["premise"]
++
++
++def test_already_escalated_episode_does_not_rescan_chat_links(board, monkeypatch):
++    from hermes_cli import kanban_chat_links
++    _relay, authority, _ = h._contained(board)
++    h._finish(board, authority)
++    assert len(h.sweep.escalate_stranded_contained(board, now=h.NOW)) == 1
++
++    def forbidden(*args):
++        pytest.fail("already escalated episode scanned chat links")
++
++    monkeypatch.setattr(kanban_chat_links, "_local_links", forbidden)
++    assert h.sweep.escalate_stranded_contained(board, now=h.NOW + 3600) == []
++
++
++def test_unresolved_episode_is_not_described(board):
++    relay, _, _ = h._contained(board)
++    # A malformed successor containment makes the reducer unresolved, even though
++    # the valid original marker remains among its episodes.
++    event = board.execute("SELECT uid, task_id, kind, payload, created_at FROM task_events "
++                          "WHERE task_id=? AND kind='contained'", (relay,)).fetchone()
++    with sqlite3.connect(":memory:") as conn:
++        conn.execute("CREATE TABLE task_events(uid TEXT, task_id TEXT, kind TEXT, payload TEXT, created_at REAL)")
++        conn.execute("INSERT INTO task_events VALUES (?, ?, ?, ?, ?)", tuple(event))
++        conn.execute("INSERT INTO task_events VALUES ('bad', ?, 'contained', '{\"version\":999}', ?)",
++                     (relay, event[4] + 1))
++        assert cw._active_episode(conn, relay, event[0]) is None
++
++
++def test_missing_local_authority_is_read_from_real_replica(board, tmp_path, monkeypatch):
++    from hermes_cli import kanban_board_replica_refs as refs
++    path = tmp_path / "replica.db"
++    with sqlite3.connect(path) as conn:
++        conn.executescript("CREATE TABLE tasks(id TEXT, status TEXT, completed_at REAL);"
++                           "CREATE TABLE task_events(task_id TEXT, kind TEXT, created_at REAL);")
++        conn.execute("INSERT INTO tasks VALUES ('t_1123456789abcdef', 'done', ?)", (h.NOW - 3600,))
++    monkeypatch.setattr(refs, "_replica_paths", lambda: [path])
++    assert cw.statuses(board, ["t_1123456789abcdef"]) == {
++        "t_1123456789abcdef": ("done", h.NOW - 3600)}
++
++
++def test_old_producer_run_does_not_allow_wake(board):
++    relay, authority, producer = h._contained(board, producer=True)
++    h._finish(board, authority)
++    at = board.execute("SELECT created_at FROM task_events WHERE task_id=? AND kind='contained'",
++                       (relay,)).fetchone()[0]
++    board.execute("INSERT INTO task_runs(task_id,status,outcome,started_at,ended_at) "
++                  "VALUES (?, 'done', 'completed', ?, ?)", (producer, at - 20, at - 10))
++    assert h._wait(board, relay)["agent_owned"] is False
++
++
++@pytest.mark.parametrize("status", ["done", "archived"])
++def test_terminal_producer_without_new_run_is_stranded(board, status):
++    relay, authority, producer = h._contained(board, producer=True)
++    h._finish(board, authority)
++    h._finish(board, producer, status)
++    assert h._wait(board, relay)["agent_owned"] is True
++
++
++def test_non_triage_replica_does_not_use_contained_facts():
++    assert kwi.describe_replica({"status": "ready", "contained": {
++        "episode": "episode", "authority": {"id": "authority", "status": "done", "at": h.NOW - 3600}
++    }}, now=h.NOW) is None
++
++
++def test_open_authority_shows_containment_age(board):
++    relay, _, _ = h._contained(board)
++    at = board.execute("SELECT created_at FROM task_events WHERE task_id=? AND kind='contained'",
++                       (relay,)).fetchone()[0]
++    assert h._wait(board, relay)["waiting_since"] == at
+diff --git a/tests/hermes_cli/test_kanban_triage_replica.py b/tests/hermes_cli/test_kanban_triage_replica.py
+index cc17bde5f8..4601485cfe 100644
+--- a/tests/hermes_cli/test_kanban_triage_replica.py
++++ b/tests/hermes_cli/test_kanban_triage_replica.py
+@@ -72,12 +72,15 @@ def test_worker_sweep_does_not_escalate_a_retained_contained_copy(gws):
+     home, worker, target = _retained_pair(gws)
+     now = int(time.time())
+     finished = now - 45 * 60
+-    worker.enter()
+-    authority = kb.create_task(worker.conn, title="done authority", assignee="default")
+-    worker.conn.execute(
++    home.enter()
++    authority = kb.create_task(home.conn, title="done authority", assignee="default")
++    home.conn.execute(
+         "UPDATE tasks SET status='done', completed_at=?, current_run_id=NULL WHERE id=?",
+         (finished, authority),
+     )
++    home.round()
++    worker.round()
++    assert kb.get_task(worker.conn, authority) is None
+     home_name = home.name
+     payload = {
+         "version": 1,
+@@ -85,16 +88,22 @@ def test_worker_sweep_does_not_escalate_a_retained_contained_copy(gws):
+         "policy": {"version": 1, "authority": {"gateway": home_name, "board": "default", "task_id": authority}},
+         "producer_baseline": None,
+     }
+-    with kb.write_txn(worker.conn):
+-        kb._append_event(worker.conn, target, "contained", payload)
+-        uid = worker.conn.execute(
+-            "SELECT uid FROM task_events WHERE task_id=? AND kind='contained' ORDER BY id DESC LIMIT 1",
+-            (target,),
+-        ).fetchone()[0]
+-        worker.conn.execute(
+-            "UPDATE tasks SET status='triage', containment_episode=?, current_run_id=NULL WHERE id=?",
+-            (uid, target),
+-        )
++    for gateway in (home, worker):
++        gateway.enter()
++        with kb.write_txn(gateway.conn):
++            kb._append_event(gateway.conn, target, "contained", payload)
++            uid = gateway.conn.execute(
++                "SELECT uid FROM task_events WHERE task_id=? AND kind='contained' ORDER BY id DESC LIMIT 1",
++                (target,),
++            ).fetchone()[0]
++            gateway.conn.execute(
++                "UPDATE tasks SET status='triage', containment_episode=?, current_run_id=NULL WHERE id=?",
++                (uid, target),
++            )
++    # Read the authority through the worker's real Board replica, not a stub.
++    from hermes_cli import kanban_contained_wait
++    worker.enter()
++    assert kanban_contained_wait.read(worker.conn, [target])[target]["authority"]["status"] == "done"
+     created = ts.escalate_stranded_contained(worker.conn, now=now)
+     assert created == []
+     assert worker.conn.execute(
+@@ -104,6 +113,11 @@ def test_worker_sweep_does_not_escalate_a_retained_contained_copy(gws):
+     assert worker.conn.execute(
+         "SELECT COUNT(*) FROM tasks WHERE created_by='triage-sweep'"
+     ).fetchone()[0] == 0
++    home.enter()
++    ts.sweep_stale_triage(home.conn, now=now + ts.TRIAGE_STALE_SECONDS + 1)
++    assert home.conn.execute(
++        "SELECT COUNT(*) FROM tasks WHERE created_by='triage-sweep'"
++    ).fetchone()[0] == 1
+ 
+ 
+ @pytest.mark.parametrize("legacy", [False, True])
+-- 
+2.43.0
+

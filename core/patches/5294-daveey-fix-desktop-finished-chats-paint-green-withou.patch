@@ -1,0 +1,398 @@
+From 4690bb07385ca8b2ec6726e7bd851b6c0dcc8270 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 16:55:19 +0000
+Subject: [PATCH] [daveey] fix(desktop): finished chats paint green without
+ being opened
+
+Problem: in an example Desktop sidebar most finished chats show no green stripe and turn
+green only once navigated to (Admin's screenshots, example incident).
+
+Why 1: an idle stored-done row paints `done` only if
+useWorkSourceUnavailable() is false; for every unopened row it was true.
+  evidence: session-dot-state.ts sessionStatusStripe gate (sourceUnavailable
+  && !userBlocked ...), session-row-stripe.tsx calls the hook per row.
+Why 2: the hook required a positive, current-epoch read of all five work
+sources (lineage, tasks, process, subagent, control) for EVERY row.
+  evidence: use-work-source-unavailable.ts -> !workSourceAuthorityComplete().
+Why 3: process / subagent / control are read only for the displayed chat
+(session-control.ts refreshSessionControl for the open runtime), so no other
+row can ever collect them: unread == unavailable kept them grey until opened,
+when the reads ran and green appeared.
+Root (happened): PR #1697 (ddb2e8b16e11, "unavailable authoritative work
+source holds done") made "never read" mean "unavailable" for all rows, a
+fail-closed rule designed around the focused chat and applied to rows that
+are structurally never read.
+Root (not caught): its tests certified rows by hand-feeding all five reads
+(certifyRow in session-row.test.tsx, capture()/succeed() elsewhere), and the
+one unread-row test asserted the grey stripe as intended behaviour; no test
+modelled an unfocused row as the app actually leaves it (no reads).
+Recurrence: first time for this cause.
+
+Fix:
+- The displayed chat (main pane or a tile: runtime role a/t, new
+  workSourceSessionDisplayed) keeps the strict rule: every source must be
+  positively read for its current authority; a rebind still revokes proof.
+- Any other row is vetoed only by evidence: a pending or failed read of its
+  CURRENT authority epoch, or a route with no live authority (socket closed /
+  not tracked) (new workSourceVetoed). A source never read for it, or a read
+  from an obsolete epoch, is no evidence: its stored outcome decides, as
+  before #1697. An unknown owner still vetoes.
+
+Tests (RED on main, GREEN here):
+- session-row: stored-done row with no reads paints `done`; a pending current
+  read holds it `waiting`.
+- session-tab-accent: unread authority no longer vetoes a stored-done tab.
+- session-control-authority-routing: undisplayed unread row keeps `done`, a
+  pending current read greys it; the strict primary-replacement / mirror-
+  rebind / unread-before-first-poll cases now run on the displayed chat.
+- work-source-secondary-authority: after a real reconnect an old failed reply
+  cannot veto, a fresh failed read does; closed socket still vetoes.
+Proof: vitest src/store src/lib src/app/chat 737 files / 7711 tests pass;
+tsc --noEmit clean for apps/desktop/src.
+---
+ .../src/app/chat/session-tab-accent.test.tsx  |  4 +--
+ .../src/app/chat/sidebar/session-row.test.tsx | 32 +++++++++++++++++--
+ .../src/lib/use-work-source-unavailable.ts    | 23 +++++++------
+ .../session-control-authority-routing.test.ts | 26 ++++++++++++++-
+ apps/desktop/src/store/session-work-source.ts | 31 ++++++++++++++++++
+ apps/desktop/src/store/work-source-owner.ts   | 17 ++++++++++
+ .../work-source-secondary-authority.test.ts   | 28 +++++++++++-----
+ 7 files changed, 137 insertions(+), 24 deletions(-)
+
+diff --git a/apps/desktop/src/app/chat/session-tab-accent.test.tsx b/apps/desktop/src/app/chat/session-tab-accent.test.tsx
+index 9a0578f7b7..62262085d2 100644
+--- a/apps/desktop/src/app/chat/session-tab-accent.test.tsx
++++ b/apps/desktop/src/app/chat/session-tab-accent.test.tsx
+@@ -209,10 +209,10 @@ describe('session tab underline', () => {
+     expect(container.querySelector('[data-session-tab-accent="done"]')).toBeNull()
+   })
+ 
+-  it('unread authority still vetoes a stored-done tab with a known owner', () => {
++  it('unread authority does not veto a stored-done tab: only a pending or failed read does', () => {
+     $unavailableWorkSources.set({})
+     const { container } = render(tab({ ...row, outcome: { kind: 'done', source: 'derived', at: 1000 } }))
+-    expect(container.querySelector('[data-session-tab-accent="done"]')).toBeNull()
++    expect(container.querySelector('[data-session-tab-accent="done"]')).not.toBeNull()
+   })
+ 
+   it('does not finish an unread stored tab whose row is missing', () => {
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row.test.tsx b/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
+index 679dafc987..fda7682db8 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
+@@ -198,7 +198,7 @@ const noop = vi.fn()
+ 
+ // Existing chrome tests assume authoritative source reads; establish them through
+ // the real SDK/owner/transport seam, not by suppressing the mounted hook.
+-function certifyRow(session: SessionInfo): void {
++function certifyRow(session: SessionInfo, reads = true): void {
+   const connectionId = session.connection_id || 'local'
+   const profile = session.profile || 'default'
+   $connectionsRegistry.set({
+@@ -218,6 +218,10 @@ function certifyRow(session: SessionInfo): void {
+   setPrimaryGatewayConnection({ connectionId })
+   setSessionOwnerHint(session.id, { connectionId, profile })
+ 
++  if (!reads) {
++    return
++  }
++
+   for (const source of ['lineage', 'tasks', 'process', 'subagent', 'control'] as const) {
+     const token = sessionsHost.beginWorkSourceRead({ connectionId, profile, storedSessionId: session.id, source })
+     sessionsHost.reportWorkSourceRead({ ...token, available: true })
+@@ -251,16 +255,38 @@ const renderRow = (
+ describe('idle sidebar authoritative source failures', () => {
+   afterEach(() => $unavailableWorkSources.set({}))
+ 
+-  it('does not certify a stored done row whose sources were never read', () => {
++  // Process / subagent / control are read only for the open chat, so every other row has no reads at all. Treating
++  // that as unknown painted every chat but the focused one grey, and green only once navigated to.
++  it('paints a stored done row green when its sources were never read (an unfocused chat)', () => {
+     const session = makeSession({
+       title: 'Unread authority',
+       message_count: 2,
+       outcome: { kind: 'done', source: 'derived', at: 1000 }
+     })
+ 
++    certifyRow(session, false)
++    const { container } = renderRow(session, { unreadAuthority: true })
++    expect(container.querySelector('[data-sidebar-stripe]')?.getAttribute('data-sidebar-stripe')).toBe('done')
++  })
++
++  it('holds a stored done row off green while a read of its current authority is pending', () => {
++    const session = makeSession({
++      title: 'Pending authority',
++      message_count: 2,
++      outcome: { kind: 'done', source: 'derived', at: 1000 }
++    })
++
++    certifyRow(session, false)
++    act(() => {
++      sessionsHost.beginWorkSourceRead({
++        connectionId: 'local',
++        profile: 'default',
++        storedSessionId: 's1',
++        source: 'process'
++      })
++    })
+     const { container } = renderRow(session, { unreadAuthority: true })
+     expect(container.querySelector('[data-sidebar-stripe]')?.getAttribute('data-sidebar-stripe')).toBe('waiting')
+-    expect(session.outcome?.kind).toBe('done')
+   })
+ 
+   it.each(['tasks', 'process', 'subagent'] as const)(
+diff --git a/apps/desktop/src/lib/use-work-source-unavailable.ts b/apps/desktop/src/lib/use-work-source-unavailable.ts
+index 9f714971ca..1b02db30ab 100644
+--- a/apps/desktop/src/lib/use-work-source-unavailable.ts
++++ b/apps/desktop/src/lib/use-work-source-unavailable.ts
+@@ -2,16 +2,19 @@ import { useStore } from '@nanostores/react'
+ import { useEffect } from 'react'
+ 
+ import { $sessions, knownSessionOwner, lineageAliases } from '@/store/session'
+-import { $unavailableWorkSources, workSourceAuthorityComplete } from '@/store/session-work-source'
++import { $unavailableWorkSources, workSourceAuthorityComplete, workSourceVetoed } from '@/store/session-work-source'
+ import {
+   $workSourceAuthorityRevision,
+   peekWorkSourceAuthorityForSession,
+   qualifiedWorkSourceOwner,
+-  workSourceAuthorityForSession
++  workSourceAuthorityForSession,
++  workSourceSessionDisplayed
+ } from '@/store/work-source-owner'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+-/** Failed, pending and unread sources veto even an idle stored-done row. */
++/** The displayed chat needs every work source positively read for its current authority; any other row is vetoed
++ *  only by a pending or failed read of its current authority. Process / subagent / control are read only for the
++ *  displayed chat, so demanding proof everywhere painted every other finished chat grey, green only once opened. */
+ export function useWorkSourceUnavailable(row: SessionInfo | null | undefined): boolean {
+   'use no memo'
+   const sources = useStore($unavailableWorkSources)
+@@ -38,12 +41,12 @@ export function useWorkSourceUnavailable(row: SessionInfo | null | undefined): b
+   }
+ 
+   const authority = peekWorkSourceAuthorityForSession(owner.connectionId, owner.profile, row.id)
++  const ids = lineageAliases(row.id, sessions)
+ 
+-  return !workSourceAuthorityComplete(
+-    owner.connectionId,
+-    owner.profile,
+-    lineageAliases(row.id, sessions),
+-    authority,
+-    sources
+-  )
++  // The displayed chat gets every source read, so it must earn green by positive proof (a rebind revokes it).
++  if (workSourceSessionDisplayed(owner.connectionId, owner.profile, row.id)) {
++    return !workSourceAuthorityComplete(owner.connectionId, owner.profile, ids, authority, sources)
++  }
++
++  return workSourceVetoed(owner.connectionId, owner.profile, ids, authority, sources)
+ }
+diff --git a/apps/desktop/src/store/session-control-authority-routing.test.ts b/apps/desktop/src/store/session-control-authority-routing.test.ts
+index 257f5b7896..fc3cb111df 100644
+--- a/apps/desktop/src/store/session-control-authority-routing.test.ts
++++ b/apps/desktop/src/store/session-control-authority-routing.test.ts
+@@ -136,6 +136,7 @@ describe('control authority at the real idle row hook', () => {
+   it('revokes completed reads on primary replacement without waiting for another poll', async () => {
+     const row = makeSessionInfo({ id: 'stored-chat', profile: 'default', connection_id: 'local', outcome: DONE })
+     setSessions([row])
++    $activeSessionId.set('rt-main') // the displayed chat needs positive proof
+     await refreshSessionControl('rt-main')
+ 
+     const reads = (['lineage', 'tasks', 'process', 'subagent'] as const).map(source =>
+@@ -164,6 +165,7 @@ describe('control authority at the real idle row hook', () => {
+       })
+       expect(stripe(result.current)).not.toBe('done')
+     } finally {
++      $activeSessionId.set(null)
+       unmount()
+     }
+   })
+@@ -191,6 +193,7 @@ describe('control authority at the real idle row hook', () => {
+   it('rejects pending SDK runtime proof after a mirror binding changes but preserves durable proofs', () => {
+     const row = makeSessionInfo({ id: 'stored-chat', profile: 'default', connection_id: 'local', outcome: DONE })
+     setSessions([row])
++    $activeSessionId.set('rt-main') // the displayed chat needs positive proof
+ 
+     const reads = (['lineage', 'tasks', 'process', 'subagent', 'control'] as const).map(source =>
+       sessionsHost.beginWorkSourceRead({ connectionId: 'local', profile: 'default', storedSessionId: row.id, source })
+@@ -220,6 +223,7 @@ describe('control authority at the real idle row hook', () => {
+       })
+       expect(stripe(result.current)).toBe('done')
+     } finally {
++      $activeSessionId.set(null)
+       unmount()
+     }
+   })
+@@ -297,13 +301,33 @@ describe('control authority at the real idle row hook', () => {
+     }
+   })
+ 
+-  it('unread required sources cannot certify stored done before the first poll', () => {
++  it('unread required sources cannot certify the displayed chat before the first poll', () => {
+     const row = makeSessionInfo({ id: 'stored-chat', profile: 'default', connection_id: 'local', outcome: DONE })
+     setSessions([row])
++    $activeSessionId.set('rt-main')
+     const { result, unmount } = renderHook(() => useWorkSourceUnavailable(row))
+ 
+     try {
+       expect(stripe(result.current)).not.toBe('done')
++    } finally {
++      $activeSessionId.set(null)
++      unmount()
++    }
++  })
++
++  // Only the displayed chat polls process / subagent / control, so an unread source is no evidence for any other row:
++  // its stored outcome decides. Requiring proof there kept finished chats grey until navigated to.
++  it('an undisplayed row with unread sources keeps its stored done on a live route', () => {
++    const row = makeSessionInfo({ id: 'stored-chat', profile: 'default', connection_id: 'local', outcome: DONE })
++    setSessions([row])
++    const { result, unmount } = renderHook(() => useWorkSourceUnavailable(row))
++
++    try {
++      expect(stripe(result.current)).toBe('done')
++      act(() => {
++        sessionsHost.beginWorkSourceRead({ connectionId: 'local', profile: 'default', storedSessionId: row.id, source: 'tasks' })
++      })
++      expect(stripe(result.current)).not.toBe('done') // a pending current read still holds it
+     } finally {
+       unmount()
+     }
+diff --git a/apps/desktop/src/store/session-work-source.ts b/apps/desktop/src/store/session-work-source.ts
+index 2de04fde41..17203b5be5 100644
+--- a/apps/desktop/src/store/session-work-source.ts
++++ b/apps/desktop/src/store/session-work-source.ts
+@@ -84,6 +84,37 @@ export function workSourceUnavailable(
+   )
+ }
+ 
++/** Whether a read that actually ran for the row's CURRENT authority is pending or failed. Only that evidence holds an
++ *  idle row off green. A source nobody read for this row (process / subagent / control are read only for the open
++ *  chat) or a read from an obsolete epoch is no evidence either way: the row's own backend stamps decide, as for any
++ *  unfocused row. Requiring positive proof instead made every chat except the open one grey, and green only while
++ *  focused. A route with no live authority (socket not open, or not yet tracked) vetoes: nothing it reports is current. */
++export function workSourceVetoed(
++  connectionId: string | undefined,
++  profile: string | undefined,
++  ids: readonly string[],
++  authority: WorkSourceAuthority,
++  observations: Observations = $unavailableWorkSources.get()
++): boolean {
++  if (!connectionId || !profile || authority.durable === null || authority.runtime === null) {
++    return true
++  }
++
++  return ids.some(storedSessionId =>
++    requiredSources.some(source => {
++      const observation = observations[key({ connectionId, profile, storedSessionId, source })]
++
++      if (!observation || observation.available) {
++        return false
++      }
++
++      const expected = source === 'lineage' || source === 'tasks' ? authority.durable : authority.runtime
++
++      return observation.authorityEpoch === undefined || observation.authorityEpoch === expected
++    })
++  )
++}
++
+ /** Missing, pending, failed and obsolete reads cannot authorize idle green.
+  * Completion itself still comes from the outcome/unfinished-work derivation. */
+ export function workSourceAuthorityComplete(
+diff --git a/apps/desktop/src/store/work-source-owner.ts b/apps/desktop/src/store/work-source-owner.ts
+index 5c71253beb..3515072f90 100644
+--- a/apps/desktop/src/store/work-source-owner.ts
++++ b/apps/desktop/src/store/work-source-owner.ts
+@@ -408,6 +408,23 @@ export function peekWorkSourceAuthorityForSession(
+   return { durable: entry.durable, runtime: entry.runtime }
+ }
+ 
++/** Whether the session is on screen (the main pane or a tile) through this owner's route. Only a displayed chat gets
++ *  every work source read, so only it must earn green by positive proof; any other row is judged on its own backend
++ *  stamps plus whatever pending or failed read it has. */
++export function workSourceSessionDisplayed(connectionId: string, profile: string, storedSessionId: string): boolean {
++  const runtimes = tracked.get(scopeKey({ connectionId, profile, routeKey: '' }, storedSessionId))?.runtimes
++
++  if (!runtimes) {
++    return false
++  }
++
++  try {
++    return (JSON.parse(runtimes) as Array<[string, string]>).some(([, roles]) => /[at]/.test(roles))
++  } catch {
++    return true
++  }
++}
++
+ /** Test-only: how many times the owner-row candidate index was rebuilt. */
+ export function _ownerIndexBuildsForTests(): number {
+   return ownerIndexBuilds
+diff --git a/apps/desktop/src/store/work-source-secondary-authority.test.ts b/apps/desktop/src/store/work-source-secondary-authority.test.ts
+index 09e1b36a8b..1e3bf57951 100644
+--- a/apps/desktop/src/store/work-source-secondary-authority.test.ts
++++ b/apps/desktop/src/store/work-source-secondary-authority.test.ts
+@@ -77,6 +77,12 @@ function succeed(reads: ReturnType<typeof capture>) {
+   }
+ }
+ 
++function fail(reads: ReturnType<typeof capture>) {
++  for (const read of reads) {
++    sessionsHost.reportWorkSourceRead({ ...read, available: false })
++  }
++}
++
+ beforeEach(async () => {
+   vi.useFakeTimers()
+   vi.stubGlobal('WebSocket', AuthoritySocket)
+@@ -154,8 +160,9 @@ it('mounting a previously unread secondary row does not update another row durin
+   const second = render(createElement(NewlyMountedRow))
+ 
+   try {
+-    expect(first.container.textContent).toBe('true')
+-    expect(second.container.textContent).toBe('true')
++    // Unread rows on a live route are no longer vetoed; the point here is no render-phase publication.
++    expect(first.container.textContent).toBe('false')
++    expect(second.container.textContent).toBe('false')
+     expect(renderPublications).toEqual([])
+     expect(errors.mock.calls.flat().join(' ')).not.toContain('Cannot update a component')
+   } finally {
+@@ -264,15 +271,17 @@ it.each([
+     // Closing one live socket vetoes that route only.
+     act(() => remoteDefaultSocket.close())
+     expect(mounted.result.current).toEqual([false, true, false])
+-    // Replies captured before the close stay rejected after the real reconnect...
++    // After the real reconnect the pre-close reads are another epoch: no evidence, so the undisplayed row falls back
++    // to its stored outcome, and an old FAILED reply cannot veto it...
+     await act(async () => {
+       await vi.advanceTimersByTimeAsync(5000)
+     })
+-    act(() => succeed(reads[1]))
+-    expect(mounted.result.current).toEqual([false, true, false])
+-    // ...and only a fresh complete read set on the healthy route recovers green.
+-    act(() => succeed(readFor(remoteDefault)))
+     expect(mounted.result.current).toEqual([false, false, false])
++    act(() => fail(reads[1]))
++    expect(mounted.result.current).toEqual([false, false, false])
++    // ...while a fresh failed read on that route vetoes it alone.
++    act(() => fail(readFor(remoteDefault)))
++    expect(mounted.result.current).toEqual([false, true, false])
+   } finally {
+     mounted.unmount()
+   }
+@@ -292,7 +301,10 @@ it('revokes a mounted secondary owner on close and rejects old replies after rea
+       await vi.advanceTimersByTimeAsync(5000)
+     })
+     expect(AuthoritySocket.instances.at(-1)!.readyState).toBe(AuthoritySocket.OPEN)
+-    act(() => succeed(reads))
++    // Pre-close replies are another epoch: an old failure cannot veto the undisplayed row, a fresh one does.
++    act(() => fail(reads))
++    expect(result.current).toBe(false)
++    act(() => fail(capture()))
+     expect(result.current).toBe(true)
+     act(() => succeed(capture()))
+     expect(result.current).toBe(false)
+-- 
+2.43.0
+

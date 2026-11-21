@@ -1,0 +1,163 @@
+From 952fbe5b7ef30a3a145e24c3e6890e0c05ffad07 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 04:06:36 +0000
+Subject: [PATCH] feat(kanban): stamp run_model on session-linked cards for the
+ Desktop running row [daveey]
+
+The newest run's model: attested session models when the run has ended, else its newest run_route
+(concrete pin or class:<tier>). Display-only; failed reads stamp nothing.
+---
+ hermes_cli/kanban_run_model.py                | 56 +++++++++++++++++++
+ .../kanban_session_activity_card_details.py   |  2 +
+ tests/hermes_cli/test_kanban_run_model.py     | 56 +++++++++++++++++++
+ 3 files changed, 114 insertions(+)
+ create mode 100644 hermes_cli/kanban_run_model.py
+ create mode 100644 tests/hermes_cli/test_kanban_run_model.py
+
+diff --git a/hermes_cli/kanban_run_model.py b/hermes_cli/kanban_run_model.py
+new file mode 100644
+index 0000000000..dedb47cbc5
+--- /dev/null
++++ b/hermes_cli/kanban_run_model.py
+@@ -0,0 +1,56 @@
++"""Which model a listed card's newest run uses, for the Desktop running row. [daveey]
++
++``run_model`` is display-only, read from the card's own events for its newest run:
++- ``run_models_attested`` (the concrete session models, recorded once the run ends) wins;
++- otherwise the newest ``run_route`` names the routed model: a concrete pin, or a class such as
++  ``class:deep`` that the worker resolves at spawn (the board has no concrete model until attestation).
++A failed read or a run with no route event stamps nothing.
++"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++from typing import Any, Optional
++
++_KINDS = ("run_route", "run_models_attested")
++
++
++def _model(kind: str, raw: Any) -> Optional[str]:
++    try:
++        payload = json.loads(raw or "{}")
++    except (TypeError, ValueError):
++        return None
++    if not isinstance(payload, dict):
++        return None
++    if kind == "run_models_attested":
++        models = [str(m).strip() for m in payload.get("session_models") or [] if str(m or "").strip()]
++        return ", ".join(dict.fromkeys(models)) or None
++    model = str(payload.get("model") or "").strip()
++    return model or None
++
++
++def add_run_models(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]) -> None:
++    """Stamp ``run_model`` on each listed card from its newest run's route/attestation events."""
++    if not found:
++        return
++    ids = list(found)
++    try:
++        got = conn.execute(
++            f"SELECT task_id, run_id, kind, payload FROM task_events WHERE task_id IN ({','.join('?' for _ in ids)}) "
++            f"AND run_id IS NOT NULL AND kind IN ({','.join('?' for _ in _KINDS)}) ORDER BY id",
++            [*ids, *_KINDS]).fetchall()
++    except sqlite3.Error:
++        return
++    best: dict[str, tuple[int, bool, str]] = {}  # task -> (run_id, attested, model)
++    for task_id, run_id, kind, payload in got:
++        model = _model(kind, payload)
++        if model is None:
++            continue
++        attested = kind == "run_models_attested"
++        prev = best.get(task_id)
++        if prev is None or run_id > prev[0] or (run_id == prev[0] and (attested or not prev[1])):
++            best[task_id] = (run_id, attested, model)
++    for task_id, (_, _, model) in best.items():
++        if task_id in found:
++            found[task_id]["run_model"] = model
+diff --git a/hermes_cli/kanban_session_activity_card_details.py b/hermes_cli/kanban_session_activity_card_details.py
+index 849d1abe26..a2d2b60a84 100644
+--- a/hermes_cli/kanban_session_activity_card_details.py
++++ b/hermes_cli/kanban_session_activity_card_details.py
+@@ -8,6 +8,7 @@ import sqlite3
+ from typing import Any
+ 
+ from hermes_cli.kanban_run_machine import add_run_machines
++from hermes_cli.kanban_run_model import add_run_models
+ 
+ _PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+ _NOTE_CHARS = 200
+@@ -64,6 +65,7 @@ def _add_card_details(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]
+     for task_id, (_, url) in prs.items():
+         found[task_id]["pr_url"] = url
+     add_run_machines(conn, found)  # where each card runs: the strip's hub/worker mark
++    add_run_models(conn, found)  # which model its newest run uses (route class/pin, or attested models)
+     _add_blocked_upstream(conn, found)
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_run_model.py b/tests/hermes_cli/test_kanban_run_model.py
+new file mode 100644
+index 0000000000..3455983653
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_run_model.py
+@@ -0,0 +1,56 @@
++"""Which model a listed card's newest run uses, for the Desktop running row (``kanban_run_model``). [daveey]"""
++
++import json
++import sqlite3
++
++from hermes_cli.kanban_run_model import add_run_models
++
++
++def _conn(events):
++    conn = sqlite3.connect(":memory:")
++    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER, kind TEXT, "
++                 "payload TEXT)")
++    conn.executemany("INSERT INTO task_events (task_id, run_id, kind, payload) VALUES (?, ?, ?, ?)",
++                     [(t, r, k, json.dumps(p) if isinstance(p, dict) else p) for t, r, k, p in events])
++    return conn
++
++
++def _stamp(events, ids=("t1",)):
++    found = {i: {"id": i} for i in ids}
++    add_run_models(_conn(events), found)
++    return {i: c.get("run_model") for i, c in found.items()}
++
++
++def test_route_class_and_pin():
++    assert _stamp([("t1", 1, "run_route", {"model": "class:deep"})]) == {"t1": "class:deep"}
++    assert _stamp([("t1", 1, "run_route", {"model": "claude-opus-5-5"})]) == {"t1": "claude-opus-5-5"}
++
++
++def test_newest_run_wins_and_attestation_beats_route():
++    events = [
++        ("t1", 1, "run_route", {"model": "class:standard"}),
++        ("t1", 1, "run_models_attested", {"session_models": ["gpt-6-astra"]}),
++        ("t1", 2, "run_route", {"model": "class:deep"}),
++    ]
++    assert _stamp(events) == {"t1": "class:deep"}  # run 2 is live: its route, not run 1's attestation
++    events.append(("t1", 2, "run_models_attested", {"session_models": ["claude-opus-5-5", "claude-opus-5-5"]}))
++    events.append(("t1", 2, "run_route", {"model": "class:standard"}))  # a later route never beats attestation
++    assert _stamp(events) == {"t1": "claude-opus-5-5"}
++
++
++def test_reroute_within_a_run_takes_the_newest_route():
++    assert _stamp([("t1", 3, "run_route", {"model": "claude-fable-5-2"}),
++                   ("t1", 3, "run_route", {"model": "gpt-6.1-sol"})]) == {"t1": "gpt-6.1-sol"}
++
++
++def test_nothing_usable_stamps_nothing():
++    assert _stamp([("t1", 1, "run_route", "{bad"), ("t1", 1, "run_route", {"model": ""}),
++                   ("t1", None, "run_route", {"model": "x"}), ("t2", 1, "run_route", {"model": "y"})],
++                  ids=("t1",)) == {"t1": None}
++
++
++def test_old_board_without_events_table():
++    conn = sqlite3.connect(":memory:")
++    found = {"t1": {"id": "t1"}}
++    add_run_models(conn, found)
++    assert "run_model" not in found["t1"]
+-- 
+2.43.0
+

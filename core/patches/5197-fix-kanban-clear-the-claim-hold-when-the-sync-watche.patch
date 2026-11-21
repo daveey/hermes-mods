@@ -1,0 +1,322 @@
+From 4326c1b9e9fbb6f7fa943b89dcfe2ab0b942840e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 07:02:41 +0000
+Subject: [PATCH] fix(kanban): clear the claim hold when the sync watcher gives
+ up
+
+A crashed sync loop left loop_expected set, so the dispatcher deferred every claim with sync_first_round and a portable card stayed eligible only for that machine.
+
+When supervision will not restart the watcher, clear that hold. Publish metrics.claiming=0 while the gate is closed, and drop that machine from portable eligibility. A machine pin stays.
+---
+ gateway/kanban_watchers.py                 |  10 +-
+ gateway/run_startup.py                     |   4 +-
+ hermes_cli/kanban_move.py                  |  13 ++-
+ hermes_cli/kanban_placement.py             |   9 ++
+ hermes_cli/kanban_sync_claims.py           |  18 ++++
+ hermes_cli/machine_drain_metrics.py        |   2 +-
+ hermes_cli/machine_metrics.py              |   2 +
+ tests/hermes_cli/test_claim_gate_giveup.py | 113 +++++++++++++++++++++
+ tests/hermes_cli/test_machine_metrics.py   |   3 +-
+ 9 files changed, 169 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_claim_gate_giveup.py
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 2cf8c03df5..b11160dcb0 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -509,7 +509,7 @@ class GatewayKanbanWatchersMixin:
+         from hermes_cli import kanban_db_sync as _sync
+         if not _sync.sync_enabled():
+             return
+-        from hermes_cli.kanban_sync_claims import loop_expected
++        from hermes_cli.kanban_sync_claims import loop_abandoned, loop_expected
+         loop_expected()  # this gateway's dispatcher claims nothing until its sync loop's first round reaches the head
+         from hermes_cli import kanban_db as _kb
+         from hermes_cli import kanban_sync_client as _ksc
+@@ -519,6 +519,7 @@ class GatewayKanbanWatchersMixin:
+         self._kanban_sync_lease = lease
+         while self._running:
+             if not await self._acquire_kanban_lease(lease):
++                loop_abandoned()  # this watcher is not coming back; do not freeze claims
+                 return
+             # Each tenure gets its own latching stop flag: after release the lease is idle again and
+             # should_yield() reads False, so a bare lambda would revive this tenure's daemon FeedWatcher
+@@ -539,4 +540,11 @@ class GatewayKanbanWatchersMixin:
+                 stopped.set()
+                 lease.release()
+             if not yielded:
++                loop_abandoned()  # the loop ended and will not be respawned
+                 return  # the loop ended on its own (stop, or sync unavailable): don't spin on it
++
++
++def sync_watcher_gave_up(_name: str = "") -> None:
++    """The supervised sync watcher will not be restarted. Clear the claim hold."""
++    from hermes_cli.kanban_sync_claims import loop_abandoned
++    loop_abandoned()
+diff --git a/gateway/run_startup.py b/gateway/run_startup.py
+index 7920f5d1bc..e584e019b5 100644
+--- a/gateway/run_startup.py
++++ b/gateway/run_startup.py
+@@ -1615,8 +1615,10 @@ class GatewayStartupMixin:
+ 
+     def _start_spawn_background_watchers(self) -> None:
+         """Spawn the long-lived supervised background watchers."""
++        from gateway.kanban_watchers import sync_watcher_gave_up
+         for method in self._PRE_RECONNECT_WATCHERS:
+-            self._spawn_supervised(getattr(self, method), method[1:])
++            give_up = sync_watcher_gave_up if method == "_kanban_sync_watcher" else None
++            self._spawn_supervised(getattr(self, method), method[1:], on_give_up=give_up)
+         if self._failed_platforms:
+             logger.info(
+                 "Starting reconnection watcher for %d failed platform(s): %s",
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index fc03570eb1..572442d714 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -95,17 +95,28 @@ def history(conn: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
+ 
+ def matching_machines(runs_on: list[str], machines: Mapping[str, Mapping[str, Any]], *, me: str,
+                       exclude_me: bool = True) -> list[str]:
+-    """Active, unheld registry machines carrying every label; running moves exclude ``me``."""
++    """Active, unheld registry machines carrying every label; running moves exclude ``me``.
++
++    A machine that has published ``metrics.claiming == 0`` is not taking portable cards. A pin to
++    that machine (``machine:<name>`` in ``runs_on``) stays, because a batch or worktree may be there.
++    """
+     from hermes_cli import kanban_worker_node as wn
+     out = []
+     for name, entry in machines.items():
+         if (exclude_me and name == me) or not entry or entry.get("state", "active") != "active" or entry.get("hold"):
+             continue
++        if _not_claiming(entry) and f"machine:{name}" not in runs_on:
++            continue
+         if set(runs_on) <= wn.effective_labels(entry, name):
+             out.append(name)
+     return sorted(out)
+ 
+ 
++def _not_claiming(entry: Mapping[str, Any]) -> bool:
++    metrics = entry.get("metrics")
++    return isinstance(metrics, dict) and metrics.get("claiming") == 0
++
++
+ def _requirement_matches(matches, machines, requires, skills, *, me=None, assignee=None):
+     """Move-only attestation gate, using the Board worker contract's capability/skill labels.
+ 
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 6da4cfe02c..d7fbc9dedd 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -295,9 +295,18 @@ def label_machines(label: str | Iterable[str], machines: Optional[dict] = None)
+     return sorted(name for name, entry in machines.items()
+                   if isinstance(entry, dict) and entry.get("state", "active") == "active" and not entry.get("hold")
+                   and ("pickup" not in entry or wn.advertises_pickup(entry)) and _fresh(entry, now)
++                  and _claiming_for(name, entry, wanted)
+                   and registry_carries(entry, wanted))
+ 
+ 
++def _claiming_for(name: str, entry: dict, wanted: set) -> bool:
++    """A non-claiming machine leaves a portable label set. A pin to that machine stays."""
++    from hermes_cli.kanban_move import _not_claiming
++    if not _not_claiming(entry):
++        return True
++    return f"machine:{name}" in wanted
++
++
+ def registry_carries(entry: dict, wanted: set) -> bool:
+     """True when registry ``entry`` carries every label in ``wanted``. ``labels`` must be a list of str
+     (coordination's ``_carries``); missing or null is the empty set; any other shape fails closed. [daveey]"""
+diff --git a/hermes_cli/kanban_sync_claims.py b/hermes_cli/kanban_sync_claims.py
+index cb688f5977..70477df487 100644
+--- a/hermes_cli/kanban_sync_claims.py
++++ b/hermes_cli/kanban_sync_claims.py
+@@ -92,6 +92,24 @@ def loop_stopped() -> None:
+             _log.warning("kanban sync: cannot remove stopped claim gate", exc_info=True)
+ 
+ 
++def loop_abandoned() -> None:
++    """Supervision will not restart the sync loop. A crashed loop must not freeze claims."""
++    with _STATE.lock:
++        _STATE.expected = False
++        _STATE.logged.clear()
++    loop_stopped()
++
++
++def claiming_bit() -> int:
++    """1 when this process may claim, 0 while its sync gate is closed and no round is open."""
++    with _STATE.lock:
++        if _STATE.open:
++            return 1
++        if _STATE.expected or _STATE.loop:
++            return 0
++    return 1
++
++
+ def note_round(slug: str, path: Any, *, at_head: bool) -> None:
+     """A round on this board completed; ``at_head``: its replica and live pulls reached the feed head."""
+     if not at_head:
+diff --git a/hermes_cli/machine_drain_metrics.py b/hermes_cli/machine_drain_metrics.py
+index 671702b6c5..996495cd3a 100644
+--- a/hermes_cli/machine_drain_metrics.py
++++ b/hermes_cli/machine_drain_metrics.py
+@@ -34,7 +34,7 @@ def collect():
+ 
+ # Fields newer Boards accept and older Boards reject (400, atomically). CPU busy fields are never resent: the
+ # compatibility retry strips them, so an old CPU sample is never re-stamped as fresh.
+-ADDITIVE_FIELDS = ("drain_active", "drain_until_ms", "cpu_busy_pct", "cpu_busy_window_ms", "cpu_busy_sample_end_ms") + ADMISSION_FIELDS
++ADDITIVE_FIELDS = ("drain_active", "drain_until_ms", "claiming", "cpu_busy_pct", "cpu_busy_window_ms", "cpu_busy_sample_end_ms") + ADMISSION_FIELDS
+ 
+ 
+ def send_compatible(send, sample, on_counters_rejected=None):
+diff --git a/hermes_cli/machine_metrics.py b/hermes_cli/machine_metrics.py
+index 9de9ab19be..867ededdf1 100644
+--- a/hermes_cli/machine_metrics.py
++++ b/hermes_cli/machine_metrics.py
+@@ -235,6 +235,8 @@ def collect(disk_path: Optional[Path] = None) -> dict[str, Any]:
+     from hermes_cli import machine_persistent_jobs
+     out.update(machine_persistent_jobs.collect())
+     out.update(machine_drain_metrics.collect())
++    from hermes_cli.kanban_sync_claims import claiming_bit
++    out["claiming"] = claiming_bit()
+     out.update(machine_throughput_metrics.cached_counters())
+     try:
+         out["cpu_load1"] = round(os.getloadavg()[0], 2)
+diff --git a/tests/hermes_cli/test_claim_gate_giveup.py b/tests/hermes_cli/test_claim_gate_giveup.py
+new file mode 100644
+index 0000000000..bc52a44f82
+--- /dev/null
++++ b/tests/hermes_cli/test_claim_gate_giveup.py
+@@ -0,0 +1,113 @@
++"""A crashed sync watcher must not freeze claims, and a non-claiming machine must leave portable eligibility."""
++import time
++
++import pytest
++
++from hermes_cli import kanban_sync_claims as claims
++from hermes_cli.kanban_move import matching_machines
++from hermes_cli.kanban_placement import label_machines
++
++
++def _save():
++    with claims._STATE.lock:
++        return claims._STATE.expected, claims._STATE.loop, dict(claims._STATE.open), set(claims._STATE.logged)
++
++
++def _restore(saved):
++    expected, loop, open_, logged = saved
++    with claims._STATE.lock:
++        claims._STATE.expected = expected
++        claims._STATE.loop = loop
++        claims._STATE.open.clear()
++        claims._STATE.open.update(open_)
++        claims._STATE.logged.clear()
++        claims._STATE.logged.update(logged)
++
++
++@pytest.fixture
++def gate():
++    saved = _save()
++    with claims._STATE.lock:
++        claims._STATE.expected = False
++        claims._STATE.loop = False
++        claims._STATE.open.clear()
++        claims._STATE.logged.clear()
++    yield
++    _restore(saved)
++
++
++def test_give_up_clears_the_claim_hold(gate):
++    claims.loop_expected()
++    assert claims.claiming_bit() == 0
++    claims.loop_abandoned()
++    with claims._STATE.lock:
++        assert claims._STATE.expected is False
++        assert claims._STATE.loop is False
++    assert claims.claiming_bit() == 1
++
++
++def test_open_round_still_counts_as_claiming(gate):
++    with claims._STATE.lock:
++        claims._STATE.expected = True
++        claims._STATE.loop = True
++        claims._STATE.open["/board"] = "default"
++    assert claims.claiming_bit() == 1
++
++
++def test_portable_match_drops_a_machine_that_is_not_claiming():
++    pool = {
++        "worker-1": {"state": "active", "labels": ["pool:worker"], "metrics": {"claiming": 0}},
++        "worker-a1": {"state": "active", "labels": ["pool:worker"], "metrics": {"claiming": 1}},
++    }
++    assert matching_machines(["pool:worker"], pool, me="hub", exclude_me=False) == ["worker-a1"]
++
++
++def test_machine_pin_keeps_a_non_claiming_worker():
++    pool = {"worker-1": {"state": "active", "labels": ["pool:worker"], "metrics": {"claiming": 0}}}
++    assert matching_machines(["machine:worker-1"], pool, me="hub", exclude_me=False) == ["worker-1"]
++
++
++def test_label_machines_drops_a_non_claiming_pool_worker():
++    seen = int(time.time() * 1000)
++    machines = {
++        "worker-1": {"state": "active", "labels": ["pool:worker"], "pickup": "all",
++                     "last_seen": seen, "metrics": {"claiming": 0}},
++        "worker-a1": {"state": "active", "labels": ["pool:worker"], "pickup": "all",
++                      "last_seen": seen, "metrics": {"claiming": 1}},
++    }
++    assert label_machines("pool:worker", machines) == ["worker-a1"]
++
++
++def test_sync_watcher_give_up_is_wired():
++    from gateway.run_startup import GatewayStartupMixin
++
++    seen = []
++
++    class Runner:
++        _PRE_RECONNECT_WATCHERS = GatewayStartupMixin._PRE_RECONNECT_WATCHERS
++        _POST_RECONNECT_WATCHERS = ()
++        _failed_platforms = ()
++
++        def _spawn_supervised(self, factory, name, **kwargs):
++            seen.append((name, kwargs.get("on_give_up")))
++
++        def _spawn_reconnect_watcher(self):
++            return None
++
++        def _scale_to_zero_should_arm(self):
++            return False
++
++        def _log_scale_to_zero_not_armed_reason(self):
++            return None
++
++        def _drain_control_watcher(self):
++            return None
++
++        def __getattr__(self, name):
++            return lambda: None
++
++    GatewayStartupMixin._start_spawn_background_watchers(Runner())
++    wired = {name: callback for name, callback in seen}
++    assert wired["kanban_sync_watcher"] is not None
++    assert wired["kanban_dispatcher_watcher"] is None
++    assert wired["kanban_sync_watcher"].__name__ == "sync_watcher_gave_up"
+diff --git a/tests/hermes_cli/test_machine_metrics.py b/tests/hermes_cli/test_machine_metrics.py
+index 60f46a73f1..4dfbcadf7a 100644
+--- a/tests/hermes_cli/test_machine_metrics.py
++++ b/tests/hermes_cli/test_machine_metrics.py
+@@ -33,10 +33,11 @@ def test_collect_reads_this_machine(tmp_path: Path):
+     assert 0 < out["disk_free_gb"] <= out["disk_total_gb"]
+     assert 0 <= out["mem_used_pct"] <= 100  # this platform's reader (linux or macos)
+     assert set(out) <= {"cpu_load1", "cpus", "mem_used_pct", "disk_free_gb", "disk_total_gb", "active_card_runs",
+-                        "drain_active", "drain_until_ms", "tokens_by_model",
++                        "drain_active", "drain_until_ms", "claiming", "tokens_by_model",
+                         "persistent_jobs", "persistent_jobs_at_ms", *mt.FIELDS}
+     assert out["active_card_runs"] is None or out["active_card_runs"] >= 0
+     assert out.get("drain_active") in (None, 0, 1)  # omitted when the hold marker cannot be read
++    assert out.get("claiming") in (0, 1)
+     assert "drain_until_ms" not in out or out.get("drain_active") == 1
+ 
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,991 @@
+From 51d34a30e35c65559b1edd80426a113e59bd002c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 04:13:58 +0000
+Subject: [PATCH] fix: one open-human-ask predicate for the badge, stored
+ outcome and session stripe
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[daveey] card_is_open_human_ask is shared by the count filter, replica bucket, _card_items and the row field
+needs_you. sessionStatusStripe paints stuck first whenever an ask is open (unless ⌘B-parked). Card
+block/unblock/complete/archive refresh origin/shepherd chats' stored outcomes post-commit.
+desktop_stripe_report logs stripe-invariant-violation.
+---
+ .../app/chat/sidebar/session-row-stripe.tsx   |   6 +-
+ apps/desktop/src/lib/session-outcome.test.ts  |   6 +-
+ .../src/store/session-dot-state.test.ts       | 101 +++++++++++--
+ apps/desktop/src/store/session-dot-state.ts   |  78 +++++++---
+ .../src/types/hermes-session-activity.ts      |   3 +
+ hermes_cli/desktop_stripe_report.py           |   9 ++
+ hermes_cli/kanban_activity_identity.py        |   1 +
+ hermes_cli/kanban_db_archive.py               |  17 +++
+ hermes_cli/kanban_open_asks.py                |  53 +++++++
+ hermes_cli/kanban_outcome_refresh.py          | 102 +++++++++++++
+ hermes_cli/kanban_session_activity.py         |  15 +-
+ hermes_state_outcome.py                       |   5 +-
+ .../test_desktop_stripe_invariant.py          |  32 ++++
+ ..._kanban_card_transition_outcome_refresh.py | 141 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_open_asks.py     |  86 +++++++++++
+ 15 files changed, 610 insertions(+), 45 deletions(-)
+ create mode 100644 hermes_cli/kanban_open_asks.py
+ create mode 100644 hermes_cli/kanban_outcome_refresh.py
+ create mode 100644 tests/hermes_cli/test_desktop_stripe_invariant.py
+ create mode 100644 tests/hermes_cli/test_kanban_card_transition_outcome_refresh.py
+ create mode 100644 tests/hermes_cli/test_kanban_open_asks.py
+
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx b/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
+index 16e6fa6773..d828cb8e04 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
+@@ -88,7 +88,11 @@ export function useSessionRowStripe(
+     recordStripeTransition(session, statusStripe, dotState)
+   }, [session, statusStripe, dotState, promptInputsKey])
+ 
+-  return { outcomePainted: outcomePaintsStripe(dotState, userBlocked) && statusStripe === outcomeStripe(session.outcome), statusStripe, userBlocked }
++  // Only explain the stripe with the outcome when it actually painted it: open asks and unfinished work override it.
++  const outcomePainted =
++    outcomePaintsStripe(dotState, userBlocked) && statusStripe === outcomeStripe(session.outcome)
++
++  return { outcomePainted, statusStripe, userBlocked }
+ }
+ 
+ /** [daveey] Stripes drawn as a small glyph in the stripe's place: a cron loop, or the card glyph for kanban waits. */
+diff --git a/apps/desktop/src/lib/session-outcome.test.ts b/apps/desktop/src/lib/session-outcome.test.ts
+index afe4ee3830..c4cbe86aac 100644
+--- a/apps/desktop/src/lib/session-outcome.test.ts
++++ b/apps/desktop/src/lib/session-outcome.test.ts
+@@ -78,10 +78,10 @@ describe('sessionStatusStripe with a stored outcome', () => {
+     ['unresolved', 'attention']
+   ] as const)('%s paints %s', (kind, stripe) => {
+     expect(outcomeStripe(OUTCOMES[kind])).toBe(stripe)
+-    // Wins over every derived input that would otherwise paint something else, except that a stored
+-    // `done` never hides known unfinished work (blocked/waiting cards, background work): that stays non-green.
++    // Open asks always paint red; without an ask, stored done still cannot hide unfinished work.
+     const held = kind === 'done'
+-    expect(sessionStatusStripe('idle', true, false, 3, true, 'stuck', 2, 4, 1, OUTCOMES[kind])).toBe(held ? sessionStatusStripe('idle', true, false, 3, true, 'stuck', 2, 4, 1) : stripe)
++    expect(sessionStatusStripe('idle', true, false, 0, true, null, 2, 4, 1, OUTCOMES[kind])).toBe(held ? sessionStatusStripe('idle', true, false, 0, true, null, 2, 4, 1) : stripe)
++    expect(sessionStatusStripe('idle', true, false, 3, true, 'stuck', 2, 4, 1, OUTCOMES[kind])).toBe('stuck')
+     expect(sessionStatusStripe('background', false, false, 0, false, null, 0, 0, 0, OUTCOMES[kind])).toBe(held ? sessionStatusStripe('background', false, false, 0, false, null, 0, 0, 0) : stripe)
+     expect(sessionStatusStripe('unread', true, false, 0, false, null, 0, 0, 0, OUTCOMES[kind])).toBe(stripe)
+   })
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index 6e63477baa..68698b4510 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -139,33 +139,32 @@ describe('sessionStatusStripe', () => {
+     expect(sessionStatusStripe('idle', false)).toBeNull()
+   })
+ 
+-  it('paints stuck (red) when kanban cards the session created are blocked, unless a turn is working', () => {
+-    for (const state of ['idle', 'unread', 'background', 'draft'] as const) {
++  it('paints stuck (red) when kanban cards the session created are blocked, even while a turn is working', () => {
++    for (const state of ['idle', 'unread', 'background', 'draft', 'working'] as const) {
+       expect(sessionStatusStripe(state, true, false, 2)).toBe('stuck')
+     }
+ 
+-    expect(sessionStatusStripe('working', true, false, 1)).toBeNull()
+     expect(sessionStatusStripe('idle', true, true, 1)).toBe('blocked')
+     expect(sessionStatusStripe('idle', true, false, 0)).toBe('done')
+   })
+ 
+-  it('paints periodic (grey loop) for a session owning a live cron job, unless a prompt waits', () => {
++  it('paints periodic (grey loop) for a session owning a live cron job, unless a prompt waits or an ask is open', () => {
+     for (const state of ['idle', 'unread', 'working', 'background', 'stalled'] as const) {
+       expect(sessionStatusStripe(state, true, false, 0, true)).toBe('periodic')
+     }
+ 
+-    expect(sessionStatusStripe('idle', true, false, 3, true)).toBe('periodic')
++    expect(sessionStatusStripe('idle', true, false, 3, true)).toBe('stuck')
+     expect(sessionStatusStripe('needs-input', true, false, 0, true)).toBe('stuck')
+     expect(sessionStatusStripe('idle', true, true, 0, true)).toBe('blocked')
+   })
+ 
+-  it('[daveey] a PR waiting on my review is red; on others for <24h is grey; working wins', () => {
++  it('[daveey] a PR waiting on my review is red; on others for <24h is grey; red even while working', () => {
+     for (const state of ['idle', 'unread', 'background'] as const) {
+       expect(sessionStatusStripe(state, true, false, 0, false, 'stuck')).toBe('stuck')
+       expect(sessionStatusStripe(state, true, false, 0, false, 'parked')).toBe('blocked')
+     }
+ 
+-    expect(sessionStatusStripe('working', true, false, 0, false, 'stuck')).toBeNull()
++    expect(sessionStatusStripe('working', true, false, 0, false, 'stuck')).toBe('stuck')
+     expect(sessionStatusStripe('working', true, false, 0, false, 'parked')).toBeNull()
+     expect(sessionStatusStripe('needs-input', true, false, 0, false, 'parked')).toBe('stuck')
+     expect(sessionStatusStripe('idle', true, true, 0, false, 'stuck')).toBe('blocked')
+@@ -859,10 +858,10 @@ describe('kanbanStripeCounts', () => {
+     expect(sessionStatusStripe(withRowActivity('idle', row), true, false, counts.blocked, false, null, 0, counts.waiting)).toBe('stuck')
+   })
+ 
+-  it('held plus live: a live turn still is not red, but a background row is', () => {
++  it('held plus live: a held ask is red for a working turn too (the invariant)', () => {
+     const row = { kanban_observed_at: Date.now() / 1000, kanban_active: 2, kanban_parked: 0, kanban_held: 1 }
+     const counts = kanbanStripeCounts(row)
+-    expect(sessionStatusStripe('working', true, false, counts.blocked, false, null, 0, counts.waiting)).toBeNull()
++    expect(sessionStatusStripe('working', true, false, counts.blocked, false, null, 0, counts.waiting)).toBe('stuck')
+     expect(sessionStatusStripe(withRowActivity('idle', row), true, false, counts.blocked, false, null, 0, counts.waiting)).toBe('stuck')
+   })
+ 
+@@ -1165,10 +1164,10 @@ describe('stuckReasons and the red report', () => {
+     expect(stuckReasons({ ...row, review_wait: 'stuck', review_wait_pr: 'o/r#9' }, 'idle')).toEqual(['review:o/r#9'])
+     expect(stuckReasons({ ...row, review_wait: 'stuck' }, 'idle')).toEqual(['review:?'])
+     expect(stuckReasons({ ...row, outcome: { kind: 'decision' } } as never, 'idle')).toEqual(['outcome:decision'])
+-    // A working turn beats cards, reviews and the stored outcome, exactly as sessionStatusStripe does.
++    // An open ask (a blocked card here) is red whatever the dot says; the outcome only covers the non-red stripes.
+     expect(
+       stuckReasons({ ...row, kanban_blocked: 1, outcome: { kind: 'decision' }, review_wait: 'stuck' } as never, 'working')
+-    ).toEqual([])
++    ).toEqual(['kanban-blocked:1', 'review:?'])
+     expect(stuckReasons({ ...row, review_wait: 'parked', outcome: { kind: 'done' } } as never, 'idle')).toEqual([])
+   })
+ 
+@@ -1207,3 +1206,83 @@ describe('stuckReasons and the red report', () => {
+     expect(() => recordStripeTransition({ ...row, id: 'x' }, 'stuck', 'stalled', 1_000)).not.toThrow()
+   })
+ })
++
++describe('open human ask invariant (blocked > 0 && !parked => stuck)', () => {
++  const dots = ['background', 'draft', 'idle', 'needs-input', 'stalled', 'unread', 'working'] as const
++  const kinds = [null, 'done', 'running', 'waiting', 'decision', 'unknown-kind'] as const
++  const outcomeOf = (kind: (typeof kinds)[number]) => (kind ? ({ kind } as unknown as SessionInfo['outcome']) : null)
++
++  // Seeded generator: the property must hold for every combination, not a few hand-picked ones.
++  const rng = (seed: number) => () => (seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296
++
++  it('paints stuck whenever a human ask is open and the row is not parked, whatever outcome/periodic/dot say', () => {
++    const next = rng(20261120)
++    const bools = [false, true]
++    const reviews = [null, 'parked', 'stuck'] as const
++
++    const cases = dots.flatMap(dot =>
++      kinds.flatMap(kind =>
++        bools.flatMap(periodic =>
++          bools.flatMap(hasTurns =>
++            bools.flatMap(parked => reviews.map(review => ({ dot, hasTurns, kind, parked, periodic, review })))
++          )
++        )
++      )
++    )
++
++    for (const { dot, hasTurns, kind, parked, periodic, review } of cases) {
++      const blocked = 1 + Math.floor(next() * 5)
++      const waiting = Math.floor(next() * 3)
++
++      const stripe = sessionStatusStripe(
++        dot,
++        hasTurns,
++        parked,
++        blocked,
++        periodic,
++        review,
++        Math.floor(next() * 2),
++        waiting,
++        0,
++        outcomeOf(kind)
++      )
++
++      expect(stripe, `${dot}/${kind}/periodic=${periodic}/parked=${parked}/review=${review}`).toBe(
++        parked ? 'blocked' : 'stuck'
++      )
++    }
++
++    expect(cases.length).toBeGreaterThan(400)
++  })
++
++  it('does not paint red from the invariant when no ask is open', () => {
++    for (const kind of ['done', 'running', 'waiting'] as const) {
++      expect(sessionStatusStripe('idle', true, false, 0, false, null, 0, 0, 0, outcomeOf(kind))).not.toBe('stuck')
++    }
++  })
++
++  it('counts needs_you authoritatively and falls back to kanban_blocked + kanban_held without it', () => {
++    const base = { kanban_active: 2, kanban_parked: 0 }
++
++    expect(kanbanStripeCounts({ ...base, kanban_blocked: 2, needs_you: [] }).blocked).toBe(0)
++
++    expect(
++      kanbanStripeCounts({ ...base, needs_you: [{ kind: 'card', question: 'q', ref: 'default/t_a' }] } as never).blocked
++    ).toBe(1)
++
++    expect(kanbanStripeCounts({ ...base, kanban_blocked: 1, kanban_held: 2 }).blocked).toBe(3)
++  })
++
++  it('reports an invariant violation for a non-red stripe that has an open ask', () => {
++    const report = vi.fn()
++    setStripeReasonReporter(report)
++    resetStripeTransitionLog()
++
++    recordStripeTransition({ id: 'inv', kanban_blocked: 2 } as never, 'done', 'idle', 1_000)
++    expect(report.mock.calls[0].slice(1)).toEqual(['done', null, ['needs_you:2']])
++
++    recordStripeTransition({ id: 'ok', kanban_blocked: 2 } as never, 'stuck', 'idle', 1_000)
++    expect(report.mock.calls[1][3]).not.toContain('needs_you:2')
++    setStripeReasonReporter(null)
++  })
++})
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index b00562431c..59e4c3d652 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -381,6 +381,13 @@ const derivedStatusStripe = (
+   )
+ }
+ 
++/** [daveey] The invariant's test, shared by the stripe and the violation report. */
++export const hasOpenHumanAsk = (
++  userBlocked: boolean,
++  kanbanBlocked: number,
++  reviewWait: null | ReviewWait | undefined
++): boolean => !userBlocked && (kanbanBlocked > 0 || reviewWait === 'stuck')
++
+ /** [daveey] Whether a stored outcome may paint the stripe: a ⌘B park or the chat's own live turn beats it, but work
+  *  that outlives the turn (a running card, a background job) does not. The stripe's tooltip must use this same test,
+  *  or a red decision stripe on a chat whose card is running shows no question. */
+@@ -405,6 +412,13 @@ export const sessionStatusStripe = (
+   kanbanExternal = 0,
+   kanbanExternalDown = 0
+ ): null | SessionStatusStripe => {
++  // [daveey] The one invariant: an open human ask (blocked/held cards, `needs_you`, an outstanding execution ask, a
++  // stuck review) is red unless the user ⌘B-parked the row. Outcome, periodic and working only choose among the
++  // non-red stripes below (the badge and the stripe once disagreed through each of those precedence edges).
++  if (hasOpenHumanAsk(userBlocked, kanbanBlocked, reviewWait)) {
++    return 'stuck'
++  }
++
+   if (outcomePaintsStripe(state, userBlocked)) {
+     const fromOutcome = outcomeStripe(outcome)
+     // Completion is historical intent, not permission to hide current unfinished/unknown work.
+@@ -447,6 +461,7 @@ type KanbanCounts = Pick<SessionInfo, 'kanban_active' | 'kanban_blocked' | 'kanb
+       | 'kanban_external_down'
+       | 'kanban_external_unknown'
+       | 'kanban_stalled'
++      | 'needs_you'
+     >
+   >
+ 
+@@ -477,7 +492,10 @@ export const kanbanStripeCounts = (
+   // Optional execution evidence only adds: asks (even retained by an expired entry) are red, current waits are grey,
+   // current running/queued work defers the grey wait exactly like a live card does.
+   const exec = rowExecution(row, nowSeconds)
+-  const blocked = (row.kanban_blocked ?? 0) + (row.kanban_held ?? 0) + (exec ? Math.max(exec.needsUser, exec.outstanding) : 0)
++  // `needs_you` (one backend predicate, same snapshot as the counts) is authoritative when the backend stamps it;
++  // an older backend falls back to the blocked-card count.
++  const asks = row.needs_you === undefined ? (row.kanban_blocked ?? 0) : row.needs_you.length
++  const blocked = asks + (row.kanban_held ?? 0) + (exec ? Math.max(exec.needsUser, exec.outstanding) : 0)
+   const execLive = exec?.live ?? 0
+   const execWaiting = exec?.waiting ?? 0
+   const ext = kanbanExternalStripeCounts(row, nowSeconds)
+@@ -951,31 +969,31 @@ export function stuckReasons(
+     reasons.push('stalled')
+   }
+ 
+-  if (dotState !== 'working') {
+-    const counts = kanbanStripeCounts(row, nowSeconds)
++  // [daveey] Open asks are red whatever the dot says (a working turn no longer hides them), so their reasons are
++  // always listed.
++  const counts = kanbanStripeCounts(row, nowSeconds)
+ 
+-    if (counts.blocked > 0) {
+-      const exec = rowExecution(row, nowSeconds)
+-      const parts = [`kanban-blocked:${counts.blocked}`]
++  if (counts.blocked > 0) {
++    const exec = rowExecution(row, nowSeconds)
++    const parts = [`kanban-blocked:${counts.blocked}`]
+ 
+-      if (row.kanban_blocked_on?.length) {
+-        parts.push(`on=${row.kanban_blocked_on.join(',')}`)
+-      }
+-
+-      if ((row.kanban_held ?? 0) > 0) {
+-        parts.push(`held=${row.kanban_held}`)
+-      }
+-
+-      if (exec && Math.max(exec.needsUser, exec.outstanding) > 0) {
+-        parts.push(`asks=${Math.max(exec.needsUser, exec.outstanding)}`)
+-      }
++    if (row.kanban_blocked_on?.length) {
++      parts.push(`on=${row.kanban_blocked_on.join(',')}`)
++    }
+ 
+-      reasons.push(parts.join(' '))
++    if ((row.kanban_held ?? 0) > 0) {
++      parts.push(`held=${row.kanban_held}`)
+     }
+ 
+-    if (row.review_wait === 'stuck') {
+-      reasons.push(`review:${row.review_wait_pr ?? '?'}`)
++    if (exec && Math.max(exec.needsUser, exec.outstanding) > 0) {
++      parts.push(`asks=${Math.max(exec.needsUser, exec.outstanding)}`)
+     }
++
++    reasons.push(parts.join(' '))
++  }
++
++  if (row.review_wait === 'stuck') {
++    reasons.push(`review:${row.review_wait_pr ?? '?'}`)
+   }
+ 
+   if (!hasOwnLiveTurn(dotState) && outcomeStripe(row.outcome) === 'stuck') {
+@@ -1013,6 +1031,19 @@ export const setStripeReasonReporter = (reporter: null | StripeReasonReporter):
+   stripeReasonReporter = reporter
+ }
+ 
++/** [daveey] The reason string a non-red stripe reports while the row has an open human ask and is not ⌘B-parked (the
++ *  backend logs `stripe-invariant-violation <sid>` for it). `stripe` is already the result of `sessionStatusStripe`,
++ *  so this fires only when some caller bypassed the invariant. */
++function stripeInvariantViolation(row: StripeTraceRow, stripe: null | SessionStatusStripe, nowSeconds: number): null | string {
++  if (stripe === 'stuck' || stripe === 'blocked') {
++    return null
++  }
++
++  const asks = kanbanStripeCounts(row, nowSeconds).blocked + (row.review_wait === 'stuck' ? 1 : 0)
++
++  return asks > 0 ? `needs_you:${asks}` : null
++}
++
+ function reportStripeReason(
+   row: StripeTraceRow,
+   stripe: null | SessionStatusStripe,
+@@ -1088,6 +1119,7 @@ export function recordStripeTransition(
+     const entry = stripeTrace.get(key)
+     const reasons = stripe === 'stuck' ? stuckReasons(row, dotState, now / 1000) : []
+     const reasonsKey = reasons.join('|')
++    const violation = stripeInvariantViolation(row, stripe, now / 1000)
+ 
+     if (!entry) {
+       stripeTrace.set(key, { emitted: [], reasonsKey, stripe, suppressed: 0 })
+@@ -1096,6 +1128,8 @@ export function recordStripeTransition(
+       // explain later: report it, though the log still skips first sightings.
+       if (stripe === 'stuck') {
+         reportStripeReason(row, stripe, null, reasons)
++      } else if (violation) {
++        reportStripeReason(row, stripe, null, [violation])
+       }
+ 
+       return
+@@ -1111,6 +1145,10 @@ export function recordStripeTransition(
+     entry.reasonsKey = reasonsKey
+     entry.emitted = entry.emitted.filter(at => now - at < STRIPE_TRANSITION_WINDOW_MS)
+ 
++    if (violation) {
++      reportStripeReason(row, stripe, from, [violation])
++    }
++
+     if (entry.emitted.length >= STRIPE_TRANSITION_LOG_CAP_PER_MIN) {
+       entry.suppressed += 1
+ 
+diff --git a/apps/desktop/src/types/hermes-session-activity.ts b/apps/desktop/src/types/hermes-session-activity.ts
+index 4d483be3da..69b0597682 100644
+--- a/apps/desktop/src/types/hermes-session-activity.ts
++++ b/apps/desktop/src/types/hermes-session-activity.ts
+@@ -47,6 +47,9 @@ export interface SessionActivityFields {
+   kanban_blocked?: number
+   /** Owner-qualified blocked card keys, from the same snapshot as kanban_blocked (capped). */
+   kanban_blocked_on?: string[]
++  /** [daveey] The open human asks (blocked/triage cards with a validated human_request), from the same snapshot as
++   *  `kanban_blocked`. Present only when non-empty, then its length is the authoritative ask count; absent = fall back to `kanban_blocked`. */
++  needs_you?: { kind: string; question: string; ref: string }[]
+   /** [daveey] How many of `kanban_active` nobody is working: scheduled on a timed/event wake, blocked on a
+    *  non-human kind, or todo behind an unfinished parent. Stamped (even 0) whenever `kanban_active` is, so its
+    *  absence means a backend that predates it. */
+diff --git a/hermes_cli/desktop_stripe_report.py b/hermes_cli/desktop_stripe_report.py
+index 1b183c0d5d..6786de7f29 100644
+--- a/hermes_cli/desktop_stripe_report.py
++++ b/hermes_cli/desktop_stripe_report.py
+@@ -46,6 +46,12 @@ def _clean_reasons(reasons: Iterable[Any]) -> list[str]:
+     return out
+ 
+ 
++def invariant_violated(stripe: Optional[str], reasons: Iterable[str]) -> bool:
++    """True when the Desktop reported a stripe that is neither red (``stuck``) nor a ⌘B park (``blocked``) together
++    with a ``needs_you:<n>`` reason: an open human ask that did not paint red (``sessionStatusStripe``'s invariant)."""
++    return stripe not in ("stuck", "blocked") and any(str(r).startswith("needs_you:") for r in reasons or ())
++
++
+ def record(home: Path, session_id: str, stripe: Optional[str], reasons: Iterable[Any], *,
+            previous: Optional[str] = None, now: Optional[float] = None) -> dict[str, Any]:
+     """Append one report and log it. ``stripe`` None means the row has no stripe (``none``)."""
+@@ -58,6 +64,9 @@ def record(home: Path, session_id: str, stripe: Optional[str], reasons: Iterable
+     }
+     logger.info("desktop stripe report: session=%s %s->%s reasons=%s", entry["session_id"], entry["previous"],
+                 entry["stripe"], ",".join(entry["reasons"]) or "-")
++    if invariant_violated(entry["stripe"], entry["reasons"]):
++        logger.warning("stripe-invariant-violation %s stripe=%s reasons=%s", entry["session_id"], entry["stripe"],
++                       ",".join(entry["reasons"]))
+     path = report_path(home)
+     line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
+     with _lock:
+diff --git a/hermes_cli/kanban_activity_identity.py b/hermes_cli/kanban_activity_identity.py
+index c3cdf3e98d..ba9321aec9 100644
+--- a/hermes_cli/kanban_activity_identity.py
++++ b/hermes_cli/kanban_activity_identity.py
+@@ -104,5 +104,6 @@ def mark_unknown(rows):
+         row.pop("kanban_observed_at", None)
+         row.pop("kanban_waiting_on", None)
+         row.pop("kanban_blocked_on", None)
++        row.pop("needs_you", None)
+         row["kanban_unknown"] = True
+     return rows
+diff --git a/hermes_cli/kanban_db_archive.py b/hermes_cli/kanban_db_archive.py
+index a938b84101..ebe22d6006 100644
+--- a/hermes_cli/kanban_db_archive.py
++++ b/hermes_cli/kanban_db_archive.py
+@@ -4,7 +4,10 @@ from __future__ import annotations
+ import sqlite3
+ from typing import Callable, Optional
+ 
++from hermes_cli.kanban_outcome_refresh import refreshes_origin_outcomes
+ 
++
++@refreshes_origin_outcomes
+ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via: Optional[str] = None,
+                  event_extra: Optional[dict] = None, comment: Optional[tuple[str, str]] = None,
+                  precondition: Optional[Callable[[sqlite3.Connection], Optional[str]]] = None) -> bool:
+@@ -78,3 +81,17 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None, via:
+     forward_archive(conn, task_id)
+     return True
+ 
++
++
++def _install_outcome_refresh() -> None:  # reads the module-level ``_kb`` bound below
++    """[daveey] Wrap the block/unblock/complete transitions (defined in the kanban_db facade, which only imports
++    this tail module) so each refreshes the origin chats' stored outcomes after commit. Idempotent."""
++    for name in ("block_task", "unblock_task", "complete_task"):
++        fn = getattr(_kb, name)
++        if not getattr(fn, "_refreshes_outcomes", False):
++            setattr(_kb, name, refreshes_origin_outcomes(fn))
++
++
++from hermes_cli import kanban_db as _kb  # at the tail: kanban_db imports this module back
++
++_install_outcome_refresh()
+diff --git a/hermes_cli/kanban_open_asks.py b/hermes_cli/kanban_open_asks.py
+new file mode 100644
+index 0000000000..db0b297190
+--- /dev/null
++++ b/hermes_cli/kanban_open_asks.py
+@@ -0,0 +1,53 @@
++"""The one predicate for "this card is an open human ask", and the ``needs_you`` row field built from it.
++
++[daveey] The sidebar badge (``kanban_blocked``), the stored session outcome (``_card_items`` decisions) and the
++Desktop stripe each used to work out "is a human being asked something?" separately, so a card could count in one
++and not the other and the stripe went non-red while the row still showed blocked cards. Every consumer now calls
++``card_is_open_human_ask``; the row stamps ``needs_you`` from the same snapshot as ``kanban_blocked`` and the Desktop
++paints red whenever it is non-empty (``sessionStatusStripe``).
++"""
++
++from __future__ import annotations
++
++import json
++from typing import Any, Iterable, Optional
++
++BLOCKED_STATUSES = ("blocked", "triage")
++
++
++def card_is_open_human_ask(status: Any, block_kind: Any, human_request: Any) -> bool:
++    """A card parked (``blocked``/``triage``) on a validated ``human_request``. ``human_request`` may be the decoded
++    dict or its stored JSON text; anything undecodable is not an ask."""
++    if status not in BLOCKED_STATUSES:
++        return False
++    from hermes_cli.kanban_human_request import needs_human
++
++    if isinstance(human_request, str):
++        try:
++            human_request = json.loads(human_request)
++        except ValueError:
++            return False
++    return needs_human(human_request, kind=block_kind)
++
++
++def open_human_asks(card_refs: Iterable[str], count: int) -> list[dict[str, str]]:
++    """``needs_you`` entries for one row: one ``card`` entry per open ask. ``card_refs`` are the owner-qualified
++    keys (``<board>/<id>``) of the blocked cards of the row's lineage, from the snapshot that supplies ``count``
++    (``kanban_blocked``). When the snapshot knows fewer keys than it counted (an older replica row without a key), the
++    entries are padded with a ref-less one, so ``len(needs_you)`` never undercounts the badge."""
++    refs = sorted({str(r) for r in card_refs if r})
++    out = [{"kind": "card", "ref": ref, "question": ""} for ref in refs]
++    out += [{"kind": "card", "ref": "", "question": ""} for _ in range(max(0, int(count) - len(refs)))]
++    return out
++
++
++def stamp_needs_you(row: dict, ids: Iterable[str], remote_keys: dict) -> None:
++    """Stamp ``row['needs_you']`` from the snapshot that stamped ``kanban_blocked`` (same ids, same predicate).
++    Absent when empty, like every other count: the Desktop then falls back to ``kanban_blocked``, also absent."""
++    asks = open_human_asks(
++        (key for sid in ids for key, bucket, _ in remote_keys.get(sid, ()) if bucket == "blocked"),
++        int(row.get("kanban_blocked") or 0))
++    if asks:
++        row["needs_you"] = asks
++    else:
++        row.pop("needs_you", None)
+diff --git a/hermes_cli/kanban_outcome_refresh.py b/hermes_cli/kanban_outcome_refresh.py
+new file mode 100644
+index 0000000000..46efcc0660
+--- /dev/null
++++ b/hermes_cli/kanban_outcome_refresh.py
+@@ -0,0 +1,102 @@
++"""Post-commit outcome refresh for a card's origin and shepherd chats.
++
++[daveey] A chat's stored ``sessions.outcome_json`` used to refresh only on chat triggers (turn end, reap, notice,
++mute) and from the card-change poller (``tui_gateway.notice_fanout``), so a card block/unblock/complete/archive left
++the stored outcome stale until the next poll tick: the stripe kept painting a withdrawn ask (or missed a new one).
++``refreshes_origin_outcomes`` wraps those four transitions; after the transition commits (never inside a caller's
++open transaction) it refreshes each linked chat's outcome with the same ``card_change`` trigger the poller uses.
++
++The refresh runs only inside a process that owns chat sessions (the TUI gateway has ``tui_gateway.server`` loaded):
++a worker or CLI process leaves it to the gateway's poller. It is best-effort and off-thread: a failure is logged and
++never changes the transition's result.
++"""
++
++from __future__ import annotations
++
++import functools
++import logging
++import sqlite3
++import sys
++from typing import Any, Callable
++
++logger = logging.getLogger(__name__)
++
++
++def linked_chats(conn: sqlite3.Connection, task_id: str) -> list[str]:
++    """The chats whose row counts this card: its creating chat and each ``tui`` subscriber that owns its progress
++    (``create``/``shepherd`` — a touch-only subscriber does not), minus released links."""
++    from hermes_cli.kanban_session_activity import _counted_sub_clause
++
++    chats: list[str] = []
++    row = conn.execute("SELECT session_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is not None and row[0]:
++        chats.append(str(row[0]))
++    try:
++        chats += [str(r[0]) for r in conn.execute(
++            f"SELECT s.chat_id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id WHERE s.task_id = ? "
++            f"AND LOWER(s.platform) = 'tui' AND s.chat_id != '' AND {_counted_sub_clause(conn)}", (task_id,))]
++    except sqlite3.Error:  # board predates notify subscriptions
++        pass
++    released: set[str] = set()
++    try:
++        released = {str(r[0]) for r in conn.execute(
++            "SELECT chat_session, MIN(released) FROM task_chat_links WHERE task_id = ? GROUP BY chat_session",
++            (task_id,)) if r[1]}
++    except sqlite3.Error:  # boards that never synced have no link table
++        pass
++    return [c for c in dict.fromkeys(chats) if c not in released]
++
++
++def refresh_chats(chats: list[str]) -> int:
++    """Refresh each chat's stored outcome (trigger ``card_change``); returns how many refreshed. Never raises."""
++    done = 0
++    for chat in chats:
++        try:
++            from hermes_state_outcome import refresh_outcomes_quietly
++            from tui_gateway import kanban_unloaded as ku
++            from tui_gateway.notice_fanout import chat_skip_reason
++
++            with ku.find_session_db(chat) as (db, tip):
++                if db is None or chat_skip_reason(db, chat) is not None:
++                    continue
++                done += refresh_outcomes_quietly([tip or chat], "card_change", db=db)
++        except Exception:  # health: allow BLE001 -- best-effort, the poller is the backstop
++            logger.warning("card-transition outcome refresh failed for %s", chat, exc_info=True)
++    return done
++
++
++def owns_chat_sessions() -> bool:
++    """True in a process that owns chat sessions (the TUI gateway has ``tui_gateway.server`` loaded)."""
++    return "tui_gateway.server" in sys.modules
++
++
++def after_transition(conn: sqlite3.Connection, task_id: str) -> None:
++    """Refresh the card's linked chats off-thread. Skips when the caller still holds a transaction (the state would
++    not be durable yet) and in processes that own no chat sessions."""
++    try:
++        if conn.in_transaction or not owns_chat_sessions():
++            return
++        chats = linked_chats(conn, task_id)
++        if chats:
++            from agent.memory_provider import spawn_context_thread
++
++            spawn_context_thread(refresh_chats, name="card-transition-outcome", args=(chats,)).start()
++    except Exception:  # health: allow BLE001 -- never break a transition
++        logger.debug("card-transition outcome refresh skipped for %s", task_id, exc_info=True)
++
++
++def refreshes_origin_outcomes(fn: Callable[..., Any]) -> Callable[..., Any]:
++    """Decorator for ``(conn, task_id, ...)`` transitions: after a truthy result, :func:`after_transition`."""
++
++    @functools.wraps(fn)
++    def wrapper(*args: Any, **kwargs: Any) -> Any:
++        result = fn(*args, **kwargs)
++        if result:
++            conn = args[0] if args else kwargs.get("conn")
++            task_id = args[1] if len(args) > 1 else kwargs.get("task_id")
++            if conn is not None and task_id:
++                after_transition(conn, str(task_id))
++        return result
++
++    wrapper._refreshes_outcomes = True  # type: ignore[attr-defined]
++    return wrapper
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 0c83a6afbd..5e2e342474 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -46,7 +46,8 @@ from hermes_cli.kanban_session_activity_card_details import _add_card_details
+ from hermes_cli.kanban_watch import not_watch_sql as _not_watch
+ from hermes_cli.kanban_links_refresh import ScopeRefresher
+ from hermes_cli import kanban_links_narrow as _links_narrow
+-from hermes_cli.kanban_session_wait_rows import _describe_waits, _local_wait_info, _local_wait_rows, _stored_needs_human
++from hermes_cli.kanban_session_wait_rows import _describe_waits, _local_wait_info, _local_wait_rows
++from hermes_cli.kanban_open_asks import card_is_open_human_ask, stamp_needs_you
+ import contextlib
+ import json
+ import logging
+@@ -146,10 +147,10 @@ def _status_filter(conn: sqlite3.Connection, statuses: tuple[str, ...]) -> tuple
+     """
+     ph = ",".join("?" for _ in statuses)
+     cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+-    conn.create_function("kanban_needs_human", 2, _stored_needs_human, deterministic=True)
++    conn.create_function("kanban_open_ask", 3, card_is_open_human_ask, deterministic=True)
+     evidence = "t.human_request" if "human_request" in cols else "NULL"
+     kind = "t.block_kind" if "block_kind" in cols else "NULL"
+-    human = f"kanban_needs_human({evidence}, {kind})"
++    human = f"kanban_open_ask(t.status, {kind}, {evidence})"
+     parked = "t.status IN ('blocked', 'triage')"
+     if statuses == BLOCKED_STATUSES:
+         return f"({parked} AND {human})", ()
+@@ -272,7 +273,7 @@ def _parked_on(conn: sqlite3.Connection) -> tuple[dict[str, int], dict[str, int]
+         return {}, {}
+     info: dict[str, tuple[str, bool]] = {
+         str(tid): (status, bool(human)) for tid, status, human in conn.execute(
+-            f"SELECT t.id, t.status, kanban_needs_human({evidence}, {kind}) FROM tasks t "
++            f"SELECT t.id, t.status, kanban_open_ask(t.status, {kind}, {evidence}) FROM tasks t "
+             f"WHERE t.status NOT IN ({','.join('?' * len(_FINISHED_STATUSES))})", _FINISHED_STATUSES)}
+     parents: dict[str, list[str]] = {}
+     try:
+@@ -521,13 +522,12 @@ def _self_gateway(conn: sqlite3.Connection) -> str:
+ 
+ 
+ def _replica_bucket(task: dict[str, Any]) -> str | None:
+-    """'active' | 'blocked' | None, by the same rules as ``_status_filter`` for local boards. ``human_request`` may be
+-    the decoded dict or the stored JSON text (``_stored_needs_human`` reads both). [daveey]"""
++    """'active' | 'blocked' | None, by the same rules as ``_status_filter`` for local boards. [daveey]"""
+     status = task.get("status")
+     if status in PENDING_RELEASE_STATUSES and task.get("unfinished"):  # closed, release not yet verified
+         return "active"
+     if status in BLOCKED_STATUSES:
+-        return "blocked" if _stored_needs_human(task.get("human_request"), task.get("block_kind")) else "active"
++        return "blocked" if card_is_open_human_ask(status, task.get("block_kind"), task.get("human_request")) else "active"
+     return "active" if status in ACTIVE_STATUSES else None
+ 
+ 
+@@ -1921,6 +1921,7 @@ def annotate_kanban_activity(rows: list[dict[str, Any]], *, display: bool = Fals
+                 row[key] = n
+             else:
+                 row.pop(key, None)
++        stamp_needs_you(row, ids, remote_keys)  # [daveey] the open human asks, same snapshot/predicate as kanban_blocked
+         # [daveey] The open card ids the chat waits on (lineage-wide, capped): the sidebar's "waiting on N cards".
+         open_ids = {tid for sid in ids for tid in waiting.get(sid, ())}
+         # Plugin sources (pending close-outs) must not recount local OR scoped remote obligations.
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index dc4b385961..07b8facbd9 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -326,7 +326,7 @@ def _gateway_running(home: Path) -> bool:
+ def _card_items(ids: list[str]) -> tuple[list[dict], list[dict]]:
+     """(decision items, waits) from the cards these chats created or shepherd: a card parked on a
+     validated ``human_request`` is a decision, every other open card is a wait."""
+-    from hermes_cli.kanban_human_request import needs_human
++    from hermes_cli.kanban_open_asks import card_is_open_human_ask
+     from hermes_cli.kanban_session_activity import LISTED_STATUSES, session_outcome_tasks
+ 
+     decisions, waits = [], []
+@@ -346,8 +346,7 @@ def _card_items(ids: list[str]) -> tuple[list[dict], list[dict]]:
+                 request = json.loads(request)
+         status = str(card.get("status") or "")
+         wait = card.get("wait") if isinstance(card.get("wait"), dict) else {}
+-        human = status in ("blocked", "triage") and (
+-            needs_human(request, kind=card.get("block_kind")))
++        human = card_is_open_human_ask(status, card.get("block_kind"), request)
+         if human:
+             req = request if isinstance(request, dict) else {}
+             decisions.append({"id": f"card:{tid}", "question": _str(req.get("action")) or _str(card.get("title")),
+diff --git a/tests/hermes_cli/test_desktop_stripe_invariant.py b/tests/hermes_cli/test_desktop_stripe_invariant.py
+new file mode 100644
+index 0000000000..3e7ba13099
+--- /dev/null
++++ b/tests/hermes_cli/test_desktop_stripe_invariant.py
+@@ -0,0 +1,32 @@
++"""``stripe-invariant-violation <sid>``: a non-red stripe reported while the row has an open human ask."""
++
++from __future__ import annotations
++
++import logging
++
++import pytest
++
++from hermes_cli import desktop_stripe_report as report
++
++
++@pytest.mark.parametrize("stripe,reasons,violated", [
++    ("done", ["needs_you:2"], True),
++    ("waiting", ["needs_you:1"], True),
++    ("periodic", ["needs_you:1"], True),
++    ("none", ["needs_you:3"], True),
++    (None, ["needs_you:1"], True),
++    ("stuck", ["needs_you:2", "kanban-blocked:2"], False),
++    ("blocked", ["needs_you:1"], False),  # a deliberate ⌘B park
++    ("done", [], False),
++    ("done", ["something-else"], False),
++])
++def test_invariant_violated(stripe, reasons, violated):
++    assert report.invariant_violated(stripe, reasons) is violated
++
++
++def test_record_logs_the_violation_for_the_session(tmp_path, caplog):
++    with caplog.at_level(logging.WARNING, logger=report.logger.name):
++        report.record(tmp_path, "sess-1", "done", ["needs_you:2"], previous="stuck")
++        report.record(tmp_path, "sess-2", "stuck", ["kanban-blocked:2"], previous="done")
++    lines = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
++    assert len(lines) == 1 and lines[0].startswith("stripe-invariant-violation sess-1")
+diff --git a/tests/hermes_cli/test_kanban_card_transition_outcome_refresh.py b/tests/hermes_cli/test_kanban_card_transition_outcome_refresh.py
+new file mode 100644
+index 0000000000..b5d7edd481
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_card_transition_outcome_refresh.py
+@@ -0,0 +1,141 @@
++"""A card block/unblock/complete/archive refreshes the origin chat's stored outcome after commit.
++
++[daveey] The stored ``sessions.outcome_json`` used to refresh only on chat triggers and the card-change poll, so the
++stripe kept painting a withdrawn ask until the next tick. ``refreshes_origin_outcomes`` wraps the four transitions.
++"""
++
++from __future__ import annotations
++
++import threading
++import types
++
++import pytest
++
++import hermes_state_outcome as outcome
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_outcome_refresh as refresh
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli.kanban_db_connect import connect
++from tests.hermes_cli import test_kanban_session_outcome_tasks as helpers
++
++kanban_root = helpers.kanban_root
++
++REQUEST = helpers.HUMAN_REQUEST
++
++
++@pytest.fixture
++def board(kanban_root, monkeypatch):
++    monkeypatch.setattr(refresh, "owns_chat_sessions", lambda: True)  # pretend: the TUI gateway process
++    conn = connect(kanban_root / "kanban.db")
++    yield conn
++    conn.close()
++
++
++@pytest.fixture
++def seen(monkeypatch):
++    calls: list[list[str]] = []
++    done = threading.Event()
++
++    def fake(chats):
++        calls.append(list(chats))
++        done.set()
++        return len(chats)
++
++    monkeypatch.setattr(refresh, "refresh_chats", fake)
++    return types.SimpleNamespace(calls=calls, done=done)
++
++
++def _wait(seen):
++    assert seen.done.wait(5), "no post-commit outcome refresh"
++    seen.done.clear()
++
++
++def test_block_unblock_archive_each_refresh_the_origin_chat(board, seen):
++    task = kb.create_task(board, title="Deploy", assignee="worker", session_id="chat-1")
++    assert kb.block_task(board, task, kind="needs_input", human_request=REQUEST)
++    _wait(seen)
++    assert kb.unblock_task(board, task)
++    _wait(seen)
++    assert kb.archive_task(board, task)
++    _wait(seen)
++    assert seen.calls == [["chat-1"]] * 3
++
++
++def test_complete_refreshes_the_origin_chat(board, seen):
++    task = kb.create_task(board, title="Do", assignee="worker", session_id="chat-1")
++    assert kb.complete_task(board, task, summary="done")
++    _wait(seen)
++    assert seen.calls == [["chat-1"]]
++
++
++def test_a_refused_transition_refreshes_nothing(board, seen):
++    task = kb.create_task(board, title="Do", assignee="worker", session_id="chat-1")
++    assert not kb.unblock_task(board, task)  # ready, not blocked
++    assert not seen.done.wait(0.3)
++
++
++def test_shepherd_subscribers_refresh_but_touch_subscribers_do_not(board, seen):
++    task = kb.create_task(board, title="Do", assignee="worker", session_id="origin")
++    board.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, delivery_metadata, created_at) "
++                  "VALUES (?, 'tui', 'shepherd', '{\"reason\": \"shepherd\"}', 1)", (task,))
++    board.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, delivery_metadata, created_at) "
++                  "VALUES (?, 'tui', 'toucher', '{\"reason\": \"touch\"}', 1)", (task,))
++    board.commit()
++    assert kb.block_task(board, task, kind="needs_input", human_request=REQUEST)
++    _wait(seen)
++    assert seen.calls == [["origin", "shepherd"]]
++
++
++def test_no_refresh_inside_a_callers_open_transaction(board, seen):
++    task = kb.create_task(board, title="Do", assignee="worker", session_id="chat-1")
++    board.execute("BEGIN")
++    refresh.after_transition(board, task)
++    board.execute("ROLLBACK")
++    assert not seen.done.wait(0.3)
++
++
++def test_a_process_without_chat_sessions_leaves_it_to_the_poller(board, seen, monkeypatch):
++    monkeypatch.setattr(refresh, "owns_chat_sessions", lambda: False)
++    task = kb.create_task(board, title="Do", assignee="worker", session_id="chat-1")
++    assert kb.block_task(board, task, kind="needs_input", human_request=REQUEST)
++    assert not seen.done.wait(0.3)
++
++
++def test_refresh_chats_refreshes_the_tip_with_the_card_change_trigger(monkeypatch):
++    import contextlib
++
++    from tui_gateway import kanban_unloaded as ku
++    from tui_gateway import notice_fanout
++
++    calls = []
++
++    @contextlib.contextmanager
++    def find(chat):
++        yield (object(), "tip-of-" + chat)
++
++    monkeypatch.setattr(ku, "find_session_db", find)
++    monkeypatch.setattr(notice_fanout, "chat_skip_reason", lambda db, chat: "archived" if chat == "old" else None)
++    monkeypatch.setattr(outcome, "refresh_outcomes_quietly",
++                        lambda sids, trigger, db=None: calls.append((list(sids), trigger)) or len(list(sids)))
++    assert refresh.refresh_chats(["chat-1", "old"]) == 1
++    assert calls == [(["tip-of-chat-1"], "card_change")]
++
++
++def test_archiving_a_blocked_card_withdraws_the_decision_from_the_outcome(kanban_root):
++    """The live case: an archived card left ``outcome:decision`` / ``kanban-blocked`` behind."""
++    conn = connect(kanban_root / "kanban.db")
++    try:
++        task = kb.create_task(conn, title="Deploy", assignee="worker", session_id="chat-1")
++        assert kb.block_task(conn, task, kind="needs_input", human_request=REQUEST)
++        ksa._reset_cache_for_tests()
++        decisions, _ = outcome._card_items(["chat-1"])
++        assert [d["card_id"] for d in decisions] == [task]
++        assert kb.archive_task(conn, task)
++        ksa._reset_cache_for_tests()
++        decisions, waits = outcome._card_items(["chat-1"])
++        assert decisions == [] and waits == []
++        rows = [{"id": "chat-1"}]
++        ksa.annotate_kanban_activity(rows)
++        assert "needs_you" not in rows[0] and "kanban_blocked" not in rows[0]
++    finally:
++        conn.close()
+diff --git a/tests/hermes_cli/test_kanban_open_asks.py b/tests/hermes_cli/test_kanban_open_asks.py
+new file mode 100644
+index 0000000000..0bc789b3b2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_open_asks.py
+@@ -0,0 +1,86 @@
++"""One open-human-ask predicate: the badge count, the outcome's decisions and ``needs_you`` agree for every card.
++
++[daveey] The sidebar badge (``kanban_blocked``), the stored outcome (``_card_items`` decisions) and the Desktop stripe
++once worked out "is a human asked?" separately. This pins that they agree for every combination of card status x
++block_kind x human_request, on the local read, the replica bucket and the row annotation.
++"""
++
++from __future__ import annotations
++
++import json
++
++import pytest
++
++import hermes_state_outcome as outcome
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli.kanban_open_asks import card_is_open_human_ask, open_human_asks
++from tests.hermes_cli import test_kanban_session_outcome_tasks as helpers
++
++kanban_root = helpers.kanban_root
++
++STATUSES = ("blocked", "triage", "todo", "ready", "running", "scheduled", "review")
++KINDS = (None, "needs_input", "capability", "transient", "dependency")
++REQUESTS = {
++    "none": None,
++    "valid": helpers.HUMAN_REQUEST,
++    "valid-json-text": json.dumps(helpers.HUMAN_REQUEST),
++    "incomplete": {"action": "incomplete"},
++    "broken-text": "{broken",
++}
++
++
++def _board(root, rows):
++    conn = helpers._connect(root / "kanban.db")
++    conn.execute("ALTER TABLE tasks ADD COLUMN completed_at REAL")  # the done-evidence read needs it
++    for tid, status, request, kind in rows:
++        helpers._insert_task(conn, tid, status, "chat", request=request, block_kind=kind)
++    conn.commit()
++    conn.close()
++    ksa._reset_cache_for_tests()
++
++
++@pytest.mark.parametrize("status", STATUSES)
++@pytest.mark.parametrize("kind", KINDS)
++@pytest.mark.parametrize("request_name", sorted(REQUESTS))
++def test_badge_outcome_and_needs_you_agree(kanban_root, status, kind, request_name):
++    request = REQUESTS[request_name]
++    expected = card_is_open_human_ask(status, kind, request)
++    _board(kanban_root, [("t1", status, request, kind)])
++    assert (ksa.blocked_task_counts().get("chat", 0) == 1) is expected  # the badge's own read
++    assert (ksa._replica_bucket({"status": status, "block_kind": kind, "human_request": request}) == "blocked") is expected
++
++    rows = [{"id": "chat"}]
++    ksa.annotate_kanban_activity(rows)
++    assert rows[0].get("kanban_blocked", 0) == int(expected)
++    assert len(rows[0].get("needs_you", [])) == int(expected)
++
++    decisions, _waits = outcome._card_items(["chat"])
++    assert len(decisions) == int(expected)
++    if expected:
++        assert rows[0]["needs_you"][0]["kind"] == "card"
++        assert rows[0]["needs_you"][0]["ref"].endswith("t1")
++        assert decisions[0]["card_id"] == "t1"
++
++
++def test_a_validated_ask_needs_a_blocked_status():
++    """A stale ``human_request`` on a card that moved on is not an ask."""
++    for status in ("todo", "ready", "running", "scheduled", "review", "done", "archived"):
++        assert not card_is_open_human_ask(status, "needs_input", helpers.HUMAN_REQUEST)
++    for status in ("blocked", "triage"):
++        assert card_is_open_human_ask(status, "needs_input", helpers.HUMAN_REQUEST)
++
++
++def test_needs_you_never_undercounts_the_badge():
++    assert open_human_asks([], 0) == []
++    assert [e["ref"] for e in open_human_asks(["default/t_b", "default/t_a", "default/t_a"], 2)] == [
++        "default/t_a", "default/t_b"]
++    padded = open_human_asks(["default/t_a"], 3)  # a replica row that carried no key
++    assert len(padded) == 3 and padded[0]["ref"] == "default/t_a" and padded[2]["ref"] == ""
++
++
++def test_row_without_asks_carries_no_needs_you_and_no_blocked_count(kanban_root):
++    _board(kanban_root, [("t1", "running", None, None)])
++    rows = [{"id": "chat"}]
++    ksa.annotate_kanban_activity(rows)
++    assert "needs_you" not in rows[0]
++    assert "kanban_blocked" not in rows[0]
+-- 
+2.43.0
+

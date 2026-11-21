@@ -1,0 +1,356 @@
+From 3b7ea14cf75c8c951ffe13e64d13440f5db8adac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:29:41 +0000
+Subject: [PATCH] fix(kanban): skip walled reviews at pickup and bound deferral
+ events [daveey]
+
+Problem: a pickup worker copied walled review cards every tick (16 imports
+in 8 ticks) and starved a pinned eligible card; two workers with different
+wall deadlines appended one review_route_deferred event per sync cycle.
+
+Why 1: _evaluate had no pre-copy check for review_provider_wall, unlike
+quota_held/paced. Evidence: deleting the _review_walled call reopens 16
+imports / 8 ticks.
+Why 2: hold wrote review_route_deferred, not respawn_guarded, so
+board_hold did not treat the card as already held. Pickup then spent
+budget copying it.
+Why 3: de-dupe compared only the newest payload with this host's
+{reason, until}; two hosts with different deadlines always appended.
+Evidence: newest-only mutant grows 24 events over 12 cycles; unique
+payloads stay at 2.
+Why 4: _tick_skips listed named result buckets and start_gate.word
+ignores review_provider_wall, so ready-wait notices read skip_unrecorded.
+
+Root (happened): the new pre-claim hold was not wired into pickup's
+pre-copy pattern or the skip/event cross-host bound.
+Root (not caught): original regressions were single-host dispatch only;
+no two-gateway pickup or two-deadline event test.
+
+Countermeasures:
+- pickup_hold + _review_walled before copy (quota_hold skip, fail open)
+- append review_route_deferred only when that payload is new on the card
+- record dispatch_skipped from clock_held so notices name the wall
+
+Proof: 40 admission/pickup tests green; three mutants red; 201 consumer
+tests; scripts/check 21 green.
+---
+ hermes_cli/kanban_dispatch_skip.py            | 15 ++-
+ hermes_cli/kanban_review_admission.py         | 25 ++++-
+ hermes_cli/kanban_worker_node.py              | 19 ++++
+ .../test_kanban_pickup_review_wall.py         | 96 +++++++++++++++++++
+ .../test_kanban_review_wall_admission.py      | 66 +++++++++++++
+ 5 files changed, 214 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_review_wall.py
+
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+index de3e2f1708..2db05dbb22 100644
+--- a/hermes_cli/kanban_dispatch_skip.py
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -10,7 +10,7 @@ guessed a quota wall and parked the card. The tick logs had rotated, so the real
+   ONE ``dispatch_skipped {reason, detail, until?}`` event per (card, reason, detail) per ready episode for every
+   row the tick passed over: ``skipped_ineligible``, ``capsule_refused``, ``no_progress_held``,
+   ``per_profile_capped``, ``claim_deferred`` (Board lease refusals and this host's admission-gate refusals, told
+-  apart by the deferral's ``origin``), ``owner_down``, ``pinned_quota_wall`` and ``llm_paced``.
++  apart by the deferral's ``origin``), ``owner_down``, ``pinned_quota_wall``, ``llm_paced`` and ``review_provider_wall``.
+   A (reason, detail) the episode already holds adds nothing, unless the newest row is a timed hold (``until``)
+   it replaces (:func:`_supersedes_timed`); a new one appends. At most :data:`MAX_PER_EPISODE` per
+   episode, so two dispatchers that disagree cannot grow a card's history without bound.
+@@ -92,8 +92,9 @@ def _anchor(conn: sqlite3.Connection, task_id: str) -> str:
+ 
+ 
+ def _key(reason: Any, detail: Any, until: Any) -> tuple[Any, Any, Any]:
+-    # A moved reset is news for a quota hold (the notice names it); other reasons key on reason + detail.
+-    return (reason, detail, until if reason == PINNED_QUOTA_WALL else None)
++    # A moved reset is news for a timed wall (the notice names it); other reasons key on reason + detail.
++    from hermes_cli.kanban_review_admission import REASON as REVIEW_WALL
++    return (reason, detail, until if reason in (PINNED_QUOTA_WALL, REVIEW_WALL) else None)
+ 
+ 
+ def _skip_key(skip: dict[str, Any]) -> tuple[Any, Any, Any]:
+@@ -231,6 +232,10 @@ def _tick_skips(result: Any) -> list[tuple[str, str, Any, Optional[float], dict[
+     from hermes_cli.kanban_start_gate import SKIP_REASON, word  # a plugin held the start (kanban_start_gate)
+     out += [(tid, SKIP_REASON, word(reason), None, {}) for tid, reason in getattr(result, "respawn_guarded", ())
+             if word(reason)]
++    from hermes_cli.kanban_review_admission import REASON as REVIEW_WALL
++    out += [(tid, REVIEW_WALL, None, pair[1], {})
++            for tid, pair in getattr(result, "clock_held", {}).items()
++            if isinstance(pair, tuple) and len(pair) == 2 and pair[0] == REVIEW_WALL]
+     return out
+ 
+ 
+@@ -306,6 +311,7 @@ def _stamp(epoch: Any, now: Optional[float] = None) -> str:
+ _WORDS = {
+     PINNED_QUOTA_WALL: "held: pinned model {detail} quota-walled",
+     LLM_PACED: "held: LLM quota pacing ({detail} pool)",
++    "review_provider_wall": "held: independent review routes walled on this host",
+     "start_gate": "held: a plugin start gate holds card starts ({detail})",
+     "per_profile_capped": "skipped: assignee {detail} is at its per-profile worker cap",
+     "skipped_ineligible": "skipped: this machine cannot lease it ({detail})",
+@@ -370,6 +376,9 @@ def advice(skip: dict[str, Any], *, now: Optional[float] = None) -> str:
+     if skip.get("reason") == PINNED_QUOTA_WALL:
+         return ("it starts on its own when that wall resets. Re-pin it (`hermes kanban set-model <id> ...`) only if it "
+                 "cannot wait; priority changes do not clear a quota wall. Do not run its work outside the dispatcher")
++    if skip.get("reason") == "review_provider_wall":
++        return ("it starts on its own when an independent reviewer is available on this host; priority changes do not "
++                "clear a reviewer wall. Do not run its work outside the dispatcher")
+     return ("resolve that dispatcher skip reason; priority changes do not clear it. "
+             "Do not run its work outside the dispatcher")
+ 
+diff --git a/hermes_cli/kanban_review_admission.py b/hermes_cli/kanban_review_admission.py
+index 59bce86252..4a974b0dc6 100644
+--- a/hermes_cli/kanban_review_admission.py
++++ b/hermes_cli/kanban_review_admission.py
+@@ -24,7 +24,7 @@ def hold(conn, task_id, result, *, lane, dry_run):
+             return False
+         review.resolve_review_model(conn, task, load_tier_config())
+     except review.ReviewRouteDeferred as exc:
+-        payload = {"reason": REASON, "until": exc.until}
++        payload = {"reason": REASON, "until": int(exc.until)}
+     except review.ReviewModelUnavailable:
+         return False
+     except Exception:
+@@ -38,8 +38,25 @@ def hold(conn, task_id, result, *, lane, dry_run):
+     result.respawn_guarded.append((task_id, REASON))
+     if not dry_run:
+         with kb.write_txn(conn):
+-            row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=? "
+-                               "ORDER BY id DESC LIMIT 1", (task_id, EVENT)).fetchone()
+-            if row is None or kb._json_dict(row[0]) != payload:
++            seen = [kb._json_dict(r[0]) for r in conn.execute(
++                "SELECT payload FROM task_events WHERE task_id=? AND kind=?", (task_id, EVENT))]
++            if payload not in seen:
+                 kb._append_event(conn, task_id, EVENT, payload)
+     return True
++
++
++def pickup_hold(replica, card):
++    """Read-only twin of :func:`hold`: the wall's ``until`` when this machine's dispatcher would defer
++    ``card``, else None. Records nothing; any fault returns None (fail open)."""
++    try:
++        from types import SimpleNamespace
++        result = SimpleNamespace(clock_held={}, respawn_guarded=[])
++        if not hold(replica, card["id"], result, lane=card["status"], dry_run=True):
++            return None
++        held = result.clock_held.get(card["id"])
++        return None if not held else held[1]
++    except Exception:  # health: allow BLE001 -- a hold prediction must never stop a pickup
++        logging.getLogger(__name__).warning(
++            "kanban review admission: pickup hold check failed for %s; copying ungoverned",
++            card["id"] if card is not None else None, exc_info=True)
++        return None
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index 00a7813c9f..48e6a4e1d7 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -629,6 +629,8 @@ def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *
+                               profile_exists=profile_exists)
+         if reason is None:
+             reason = _quota_held(replica, card)
++        if reason is None:
++            reason = _review_walled(replica, card)
+         if reason is None:
+             reason = _paced(conn, replica, card)
+         hold = kph.board_hold(replica, card) if reason is None else None
+@@ -649,6 +651,23 @@ def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *
+     return picked, skips
+ 
+ 
++def _review_walled(replica: sqlite3.Connection, card: sqlite3.Row) -> Optional[tuple[str, Optional[str]]]:
++    """[daveey] ``(\"quota_hold\", detail)`` when local dispatch would defer this review on a host-local
++    reviewer wall (``kanban_review_admission.pickup_hold``). Judged before the copy: a walled review
++    would only be copied, held, evicted and copied again each tick, while taking the pickup budget."""
++    from hermes_cli.kanban_review_admission import REASON, pickup_hold
++    try:
++        until = pickup_hold(replica, card)
++    except Exception:  # health: allow BLE001 -- a hold prediction must never stop a pickup
++        _log.warning("kanban worker node: review wall check for %s failed", card["id"], exc_info=True)
++        return None
++    if until is None:
++        return None
++    from datetime import UTC, datetime
++    when = f" until {datetime.fromtimestamp(until, UTC):%Y-%m-%dT%H:%M:%SZ}"
++    return "quota_hold", f"{REASON}{when} (local dispatch would hold it)"
++
++
+ def _paced(conn: sqlite3.Connection, replica: sqlite3.Connection, card: sqlite3.Row,
+            ) -> Optional[tuple[str, Optional[str]]]:
+     """[daveey] ``("other", detail)`` when this machine's dispatcher would pace-hold ``card`` (a candidate pool at
+diff --git a/tests/hermes_cli/test_kanban_pickup_review_wall.py b/tests/hermes_cli/test_kanban_pickup_review_wall.py
+new file mode 100644
+index 0000000000..c985dc3d55
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_review_wall.py
+@@ -0,0 +1,96 @@
++"""Pickup spends no budget on a review the local dispatcher would defer on a reviewer wall.
++
++PR #3783 review: three walled review cards ahead of a pinned eligible card filled every pickup
++batch. Each tick copied them, local dispatch held them, the next tick evicted and copied them
++again (16 imports in 8 ticks at max_spawn=2), and the pinned card never copied.
++"""
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_llm_pacing_dispatch as pacing
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli import kanban_provider_walls as walls
++from hermes_cli import kanban_review_model as review
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_worker_node as support
++
++svc = support.svc
++gws = support.gws
++PIN = [f"machine:{support.WORKER}"]
++RESET = 1_800_007_200
++
++
++def _imports(monkeypatch):
++    seen: list[str] = []
++    real = wn.import_cards
++
++    def counting(conn, replica, ids):
++        done = real(conn, replica, ids)
++        seen.extend(done)
++        return done
++    monkeypatch.setattr(wn, "import_cards", counting)
++    return seen
++
++
++def _wall(monkeypatch):
++    monkeypatch.setattr(tier, "load_tier_config", lambda: {"enabled": True})
++    monkeypatch.setattr(review, "implementer_models", lambda *_a: {"gpt-6-astra", "gpt-6.1-sol"})
++    monkeypatch.setattr(review, "independent_routes", lambda *_a, **_kw: iter([
++        ("claude-fable-5-2", "anthropic"), ("claude-opus-5-5", "anthropic")]))
++    monkeypatch.setattr(review, "registry_refusal", lambda *_a: None)
++    monkeypatch.setattr(walls, "active_walls", lambda **_kw: {"anthropic": RESET})
++    monkeypatch.setattr(walls, "live_quota_wall", lambda *_a: None)
++    monkeypatch.setattr(pacing, "held_pools", lambda *_a: {})
++
++
++def _review(hub, *, title, priority, runs_on):
++    hub.enter()
++    tid = kb.create_task(hub.conn, title=title, assignee="default", priority=priority, runs_on=runs_on)
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
++    hub.round()
++    return tid
++
++
++def _status(conn, tid):
++    t = kb.get_task(conn, tid)
++    return t.status if t else None
++
++
++def test_walled_review_cards_do_not_starve_a_pinned_card(gws, monkeypatch):
++    _wall(monkeypatch)
++    hub, worker = gws
++    imports = _imports(monkeypatch)
++    walled = [_review(hub, title=f"Independent exact-head review {i}", priority=1000 - i,
++                      runs_on=["linux"] if i % 2 else PIN) for i in range(3)]
++    pinned = support._hub_card(hub, title="pinned, eligible", priority=0, runs_on=PIN)
++    worker.round()
++    imports.clear()
++    for _ in range(8):
++        worker.round()
++        worker.tick(max_spawn=2)
++    assert imports == [pinned]
++    assert _status(worker.conn, pinned) == "running"
++    assert all(_status(worker.conn, tid) is None for tid in walled)
++
++
++def test_a_failed_review_wall_check_copies_as_before(gws, monkeypatch):
++    _wall(monkeypatch)
++    hub, worker = gws
++    tid = _review(hub, title="Independent exact-head review", priority=10, runs_on=PIN)
++    worker.round()
++    worker.enter()
++    from hermes_cli import kanban_review_admission as admission
++
++    def boom(*a, **kw):
++        raise RuntimeError("config unreadable")
++    monkeypatch.setattr(admission, "pickup_hold", boom, raising=False)
++    assert wn.pickup(worker.conn, budget=1) == [tid]
++
++
++def test_an_unwalled_review_is_copied(gws, monkeypatch):
++    _wall(monkeypatch)
++    monkeypatch.setattr(walls, "active_walls", lambda **_kw: {})
++    hub, worker = gws
++    tid = _review(hub, title="Independent exact-head review", priority=10, runs_on=PIN)
++    worker.round()
++    worker.enter()
++    assert wn.pickup(worker.conn, budget=1) == [tid]
+diff --git a/tests/hermes_cli/test_kanban_review_wall_admission.py b/tests/hermes_cli/test_kanban_review_wall_admission.py
+index a4572cb1f1..e44afedf49 100644
+--- a/tests/hermes_cli/test_kanban_review_wall_admission.py
++++ b/tests/hermes_cli/test_kanban_review_wall_admission.py
+@@ -139,3 +139,69 @@ def test_preclaim_resolver_error_does_not_abort_dispatch(
+                             (tid,)).fetchone()[0] == 1
+         assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='review_route_deferred'",
+                             (tid,)).fetchone()[0] == 0
++
++
++def _review_routes(monkeypatch, *, walls_fn):
++    from hermes_cli import kanban_review_admission as admission
++
++    monkeypatch.setattr(tier, "load_tier_config", lambda: {"enabled": True})
++    monkeypatch.setattr(review, "implementer_models", lambda *_a: {"author-model"})
++    monkeypatch.setattr(review, "independent_routes", lambda *_a, **_kw: iter([
++        ("claude-opus-5-5", "anthropic")]))
++    monkeypatch.setattr(review, "registry_refusal", lambda *_a: None)
++    monkeypatch.setattr(walls, "active_walls", walls_fn)
++    monkeypatch.setattr(walls, "live_quota_wall", lambda *_a: None)
++    monkeypatch.setattr(pacing, "held_pools", lambda *_a: {})
++    return admission
++
++
++def test_two_hosts_with_different_deadlines_append_one_event_each(board, monkeypatch):
++    untils = [RESET, RESET + 60]
++    host = [untils[0]]
++    admission = _review_routes(monkeypatch, walls_fn=lambda **_kw: {"anthropic": host[0]})
++    monkeypatch.setattr(kb.time, "time", lambda: START)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="Build", assignee="a")
++        for _ in range(12):
++            for until in untils:
++                host[0] = until
++                admission.hold(conn, tid, dispatch.DispatchResult(), lane="review", dry_run=False)
++        payloads = [kb._json_dict(r[0]) for r in conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, admission.EVENT))]
++        assert payloads == [{"reason": admission.REASON, "until": until} for until in untils]
++
++
++def test_one_host_deferral_stays_one_event_across_cycles(board, monkeypatch):
++    admission = _review_routes(monkeypatch, walls_fn=lambda **_kw: {"anthropic": RESET})
++    monkeypatch.setattr(kb.time, "time", lambda: START)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="Build", assignee="a")
++        for _ in range(12):
++            admission.hold(conn, tid, dispatch.DispatchResult(), lane="review", dry_run=False)
++        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
++                            (tid, admission.EVENT)).fetchone()[0] == 1
++
++
++def test_review_wall_hold_records_a_dispatch_skip(board, monkeypatch, all_assignees_spawnable):
++    from hermes_cli import kanban_dispatch_skip as skips
++    from hermes_cli import kanban_queue_position as qp
++
++    monkeypatch.setattr(kb.time, "time", lambda: START)
++    monkeypatch.setattr(tier, "load_tier_config", lambda: {"enabled": True})
++    monkeypatch.setattr(review, "implementer_models", lambda *_a: {"gpt-6.1-sol"})
++    monkeypatch.setattr(review, "independent_routes", lambda *_a, **_kw: iter([
++        ("claude-opus-5-5", "anthropic")]))
++    monkeypatch.setattr(review, "registry_refusal", lambda *_a: None)
++    monkeypatch.setattr(walls, "active_walls", lambda **_kw: {"anthropic": RESET})
++    monkeypatch.setattr(walls, "live_quota_wall", lambda *_a: None)
++    monkeypatch.setattr(pacing, "held_pools", lambda *_a: {})
++    monkeypatch.setattr(qp, "_running_and_limit", lambda *_a: (0, 7))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="Independent exact-head review", assignee="a")
++        res = dispatch.dispatch_once(conn, spawn_fn=lambda task, _ws: None)
++        assert skips._tick_skips(res)
++        skip = skips.latest(conn, tid)
++        assert skip is not None and skip["reason"] == "review_provider_wall" and skip["until"] == RESET
++        place = qp.position(conn, kb.get_task(conn, tid))
++        assert skips.notice_fields(place, 31 * 60) == {
++            "dispatch_skip": {"reason": "review_provider_wall", "until": RESET}}
+-- 
+2.43.0
+

@@ -1,0 +1,495 @@
+From 758f2337a68a89d823b3dedce6bfb6d338422c08 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:03:59 +0000
+Subject: [PATCH] fix(kanban-sync): validate absent foreign dependency
+ endpoints [daveey]
+
+A partitioned live database deliberately omits foreign-origin tasks. Recovery
+previously required both local endpoint rows before consulting authenticated
+Board rows or the complete replica, so valid foreign links refused as missing.
+Do not import tasks to satisfy this predicate: bind absent endpoint custody to
+same-head authenticated evidence, immutable foreign origin, positive replica
+version and validated containment context instead.
+
+Snapshot replica rows/link/cursor/hold predicates transactionally, bind them to
+the preview token and immutable receipt, and recheck after evidence and inside
+the local apply/settlement transaction. Preserve local/canonical containment,
+work/lease checks, exact rejected operations/history/tombstone, enrolled
+identity, completed refresh/empty feed, reason/token CAS and 30-second budget.
+No task, lifecycle, lease, dependency or canonical writes are authorized.
+
+Proof: unchanged recovery 102 tests; foreign suite 31 tests; 44 consumer files,
+1521 tests passed, zero failed. Whole-tree scripts/check: 21 checks, green.
+Final acceptance test RED on original recovery: missing_endpoint; GREEN on
+this source. Includes certified stop/release/renewal, provenance/version,
+replica/head races, work/lease races and lifecycle/no-materialization assertions.
+Operational recovery and deployed proof remain with t_eeeeee0000000021.
+---
+ hermes_cli/kanban_sync_dependency_delete.py   |  28 +-
+ hermes_cli/kanban_sync_dependency_foreign.py  |  54 ++++
+ .../test_kanban_sync_dependency_foreign.py    | 272 ++++++++++++++++++
+ .../kanban-dependency-delete-recovery.md      |  19 +-
+ 4 files changed, 366 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_dependency_foreign.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_dependency_foreign.py
+
+diff --git a/hermes_cli/kanban_sync_dependency_delete.py b/hermes_cli/kanban_sync_dependency_delete.py
+index 565be76394..b6edf15a3b 100644
+--- a/hermes_cli/kanban_sync_dependency_delete.py
++++ b/hermes_cli/kanban_sync_dependency_delete.py
+@@ -11,6 +11,7 @@ import sqlite3
+ from pathlib import Path
+ 
+ from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_dependency_foreign as foreign
+ from hermes_cli import kanban_sync_reserved_key as keys
+ from hermes_cli.kanban_db_connect import write_txn
+ 
+@@ -70,7 +71,7 @@ def _snapshot(conn, uid):
+ def _local(snap, uid, *, settlement=False):
+     parent, child = _ids(uid)
+     _require(snap["link"] == [{"parent_id": parent, "child_id": child}], "local_link_changed")
+-    _require(len(snap["tasks"]) == 2, "missing_endpoint")
++    # Missing rows are admitted only by the full replica/authenticated proof.
+     _require(not any(snap["held"]), "local_containment_hold")
+     _require(not snap["endpoint_ops"], "endpoint_local_work")
+     _require(bool(snap["ops"]), "no_rejected_deletes")
+@@ -128,6 +129,10 @@ def _proof(conn, hub, board, uid, snap, *, refresh=True):
+                  "shadow_link_changed")
+     finally:
+         shadow.close()
++    replica = foreign.snapshot(board, hub.ident.gateway, uid, snap)
++    if replica is not None:
++        _require(replica["cursor"] == head, "replica_inputs_changed")
++        _require(replica["link"] == snap["link"], "shadow_link_changed")
+     empty = _empty(hub, board, head)
+     link = _evidence(hub, board, "task_links", uid, head)
+     parent, child = _ids(uid)
+@@ -135,19 +140,28 @@ def _proof(conn, hub, board, uid, snap, *, refresh=True):
+     endpoints = []
+     for task in sorted((parent, child)):
+         e = _evidence(hub, board, "tasks", task, head)
+-        local = next(t for t in snap["tasks"] if t["id"] == task)
+-        _require(e["row"].get("id") == task and e["row"].get("created_on") == local["created_on"]
+-                 and local["sync_version"] == e["row"]["version"], "endpoint_identity_changed")
++        local = next((t for t in snap["tasks"] if t["id"] == task), None)
++        _require(e["row"].get("id") == task, "endpoint_identity_changed")
++        if local is not None:
++            _require(e["row"].get("created_on") == local["created_on"]
++                     and local["sync_version"] == e["row"]["version"], "endpoint_identity_changed")
+         c = context(hub, board, task)
++        if local is None:
++            foreign.validate(e["row"], replica, hub.ident.gateway, c)
+         _require(c["held"] is False and e["row"].get("containment_episode") is None, "canonical_containment_hold")
+         endpoints.append(e["row"])
+     _empty(hub, board, head)
+-    return {"link": link["row"], "endpoints": endpoints, "cut": empty}
++    proof = {"link": link["row"], "endpoints": endpoints, "cut": empty}
++    if replica is not None:
++        proof["foreign"] = replica
++    foreign.recheck(board, hub.ident.gateway, uid, snap, proof)
++    return proof
+ 
+ 
+ def _token(hub, board, uid, reason, snap, proof):
+     return keys._sha({"v": 1, "board": board, "uid": uid, "endpoint": keys._endpoint(hub), "reason": reason,
+-                      "snapshot": snap, "link": proof["link"], "endpoints": proof["endpoints"]})
++                      "snapshot": snap, "link": proof["link"], "endpoints": proof["endpoints"],
++                      **({"foreign": proof["foreign"]} if "foreign" in proof else {})})
+ 
+ 
+ def _prepare(conn, hub, board, uid, reason):
+@@ -184,6 +198,7 @@ def apply(conn, hub, board, uid, expect, reason):
+             _require(keys._fresh(started), "evidence_expired")
+             _require(keys._identity_refusal(conn, hub, board) is None, "sync_identity_changed")
+             _require(_snapshot(conn, uid) == snap, "local_inputs_changed")
++            foreign.recheck(board, hub.ident.gateway, uid, snap, proof)
+             _schema(conn)
+             raw = keys._canon(snap)
+             conn.execute(f"INSERT INTO {TABLE} VALUES (?,?,?,?,?,?,?,?)",
+@@ -225,6 +240,7 @@ def settle(conn, hub, board, op, receipt):
+             _require(keys._fresh(started), "evidence_expired")
+             _require(keys._identity_refusal(conn, hub, board) is None, "sync_identity_changed")
+             _require(_snapshot(conn, op["row_uid"]) == snap, "local_inputs_changed")
++            foreign.recheck(board, hub.ident.gateway, op["row_uid"], snap, proof)
+             _require(receipt_for_op(conn, op) == receipt, "receipt_changed")
+             conn.execute("DELETE FROM kanban_sync_outbox WHERE op_id=? AND state='rejected'", (op["op_id"],))
+         report.update(classification="superseded", action="retired", proof="immutable dependency recovery receipt")
+diff --git a/hermes_cli/kanban_sync_dependency_foreign.py b/hermes_cli/kanban_sync_dependency_foreign.py
+new file mode 100644
+index 0000000000..53ef208053
+--- /dev/null
++++ b/hermes_cli/kanban_sync_dependency_foreign.py
+@@ -0,0 +1,54 @@
++"""Read-only full-replica custody for absent, foreign-origin link endpoints.
++
++The replica is evidence, never a source of task imports into the live partition.
++Reads are transaction-bound; no network call occurs in either database's txn.
++"""
++from __future__ import annotations
++
++
++def snapshot(board, gateway, uid, local):
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    from hermes_cli.kanban_containment_connections import held
++    from hermes_cli.kanban_db_sync import sync_state
++
++    absent = sorted(set(recovery._ids(uid)) - {t["id"] for t in local["tasks"]})
++    if not absent:
++        return None
++    shadow = client.open_shadow(board, gateway)
++    try:
++        shadow.execute("BEGIN")
++        state = sync_state(shadow)
++        tasks = [dict(row) for task in absent for row in shadow.execute("SELECT * FROM tasks WHERE id=?", (task,))]
++        links = recovery._rows(shadow, "SELECT * FROM task_links WHERE parent_id=? AND child_id=?", recovery._ids(uid))
++        return {"cursor": state["cursor"], "tasks": tasks, "held": [held(shadow, t) for t in absent], "link": links}
++    finally:
++        if shadow.in_transaction:
++            shadow.rollback()
++        shadow.close()
++
++
++def validate(row, replica, gateway, context):
++    from hermes_cli.kanban_sync_dependency_delete import _require
++    from hermes_cli.kanban_containment_policy import identity
++
++    origin = row.get("created_on")
++    # A missing own-origin (or legacy origin-less) endpoint is still missing.
++    _require(isinstance(origin, str) and bool(origin) and origin != gateway, "missing_endpoint")
++    identity({"board": context["board"], "gateway": origin, "task_id": row.get("id")})
++    copies = [t for t in replica["tasks"] if t["id"] == row.get("id")]
++    _require(len(copies) == 1, "missing_endpoint_replica")
++    task = copies[0]
++    _require(task["created_on"] == origin and type(task["sync_version"]) is int
++             and task["sync_version"] == row["version"], "endpoint_identity_changed")
++    _require(context["target"]["gateway"] == origin, "endpoint_context_changed")
++    _require(not any(replica["held"]), "replica_containment_hold")
++    _require(all(task.get(key) == row.get(key) for key in
++                 ("status", "lease_holder", "lease_expires", "containment_episode")), "endpoint_replica_changed")
++
++
++def recheck(board, gateway, uid, local, proof):
++    from hermes_cli.kanban_sync_dependency_delete import _require
++
++    if "foreign" in proof:
++        _require(snapshot(board, gateway, uid, local) == proof["foreign"], "replica_inputs_changed")
+diff --git a/tests/hermes_cli/test_kanban_sync_dependency_foreign.py b/tests/hermes_cli/test_kanban_sync_dependency_foreign.py
+new file mode 100644
+index 0000000000..3e962ba6dc
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_dependency_foreign.py
+@@ -0,0 +1,272 @@
++"""Partitioned endpoint proof never imports a task or authorizes an old unlink."""
++import contextlib
++import json
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_sync_dependency_delete as r
++from tests.hermes_cli import test_kanban_sync_dependency_delete as base
++
++BOARD, ME, rows = base.BOARD, base.ME, base.rows
++case = base.case
++
++FOREIGN = "worker-1"
++REASON = "retain foreign dependency"
++
++
++@pytest.fixture
++def foreign(case, monkeypatch):
++    live, hub, svc, _uid, parent, _child = case
++    canonical = svc.board(BOARD)["rows"]["tasks"][parent]
++    canonical["created_on"] = FOREIGN
++    svc._put(svc.board(BOARD), "tasks", parent, {"status": "done"}, FOREIGN, None,
++             "9999999999999-0000-worker-1")
++    live.execute("PRAGMA foreign_keys=OFF")
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying=1")
++        live.execute("DELETE FROM tasks WHERE id=?", (parent,))
++        live.execute("UPDATE kanban_sync_state SET applying=0")
++    original = hub.containment_context
++    monkeypatch.setattr(hub, "containment_context", lambda b, t, p=None: {
++        **original(b, t, p), "target": {"board": b, "gateway": FOREIGN if t == parent else ME, "task_id": t}})
++    return case
++
++
++def protected(live):
++    return {t: rows(live, t) for t in ("tasks", "task_links", "task_events", "task_runs")}
++
++
++def test_certified_release_then_renewal_in_full_replica(foreign, monkeypatch):
++    # Authenticated transport double + real certificate cache/guard/apply path.
++    # This is fixture-only evidence, not authority to resume any live task.
++    from hermes_cli import kanban_containment_replica as cert
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_containment_connections import held
++    from hermes_cli.kanban_containment_state import fingerprint
++    from tests.hermes_cli import test_kanban_containment_canonical as wire
++    live, hub, svc, uid, parent, _ = foreign
++    assert r.plan(live, hub, BOARD, uid, REASON)["eligible"]
++    shadow = client.open_shadow(BOARD, ME)
++    head = sync.sync_state(shadow)["cursor"]
++    stop, payload, episode = wire.operation()
++    payload["target"].update(board=BOARD, gateway=FOREIGN, task_id=parent)
++    payload["policy"]["authority"].update(board=BOARD)
++    stop.update(task=parent, payload=payload)
++    release, _, _ = wire.operation("resume_contained")
++    release.update(task=parent, payload={"version": 1, "episode": episode,
++        "containment_sha256": fingerprint(payload), "resume_status": "ready",
++        "evidence": {"kind": "authority", "authority": payload["policy"]["authority"], "run_uid": sync.uuid7()}})
++    proofs = {}
++    for op in (stop, release):
++        e = wire.evidence(op, payload, episode)
++        e["board"] = BOARD
++        e["row"].update(task_id=parent, created_at=1)
++        proofs[op["event_uid"]] = e
++    original = hub.row_evidence
++    monkeypatch.setattr(hub, "row_evidence", lambda b, t, u: proofs[u] if t == "task_events" else original(b, t, u))
++    def project(op):
++        change = client._row_change("task_events", proofs[op["event_uid"]]["row"])
++        cert.certify_page(shadow, hub, BOARD, [change])
++        sync.apply_remote_changes(shadow, [change], new_cursor=head, board=BOARD, observers=False)
++    before = protected(live)
++    try:
++        project(stop)
++        assert held(shadow, parent)
++        assert r.plan(live, hub, BOARD, uid, REASON).get("reason") == "replica_containment_hold"
++        project(release)
++        assert not held(shadow, parent)
++        # Mirror the natural release's canonical task row in the feed as well.
++        svc._put(svc.board(BOARD), "tasks", parent, {"status": "ready"}, FOREIGN, None,
++                 "9999999999999-0001-worker-1")
++        p = r.plan(live, hub, BOARD, uid, REASON)
++        assert p["eligible"], p
++        assert r.apply(live, hub, BOARD, uid, p["token"], REASON)["action"] == "applied"
++        # The release's task feed advanced the replica; retain its fresh cut.
++        head = sync.sync_state(shadow)["cursor"]
++        # A successor episode is not covered by that prior release or receipt.
++        renewed = {**stop, "event_uid": sync.uuid7(), "client_op_id": sync.uuid7()}
++        e = wire.evidence(renewed, payload, renewed["event_uid"])
++        e["board"] = BOARD
++        e["row"].update(task_id=parent, created_at=2)
++        proofs[renewed["event_uid"]] = e
++        project(renewed)
++        op = rows(live, "kanban_sync_outbox")[0]
++        result = r.settle(live, hub, BOARD, op, r.receipt_for_op(live, op))
++        assert result["action"] == "retained" and result["proof"] == "replica_containment_hold", result
++        assert len(rows(live, "kanban_sync_outbox")) == 3
++        assert protected(live) == before
++    finally:
++        shadow.close()
++
++
++def test_foreign_preview_apply_settle_never_materializes_or_writes_lifecycle(foreign):
++    live, hub, _, uid, parent, _ = foreign
++    before = protected(live)
++    writes = []
++    live.set_trace_callback(writes.append)
++    p = r.plan(live, hub, BOARD, uid, REASON)
++    assert p["eligible"], p
++    assert protected(live) == before
++    assert r.apply(live, hub, BOARD, uid, p["token"], REASON)["action"] == "applied"
++    receipt = rows(live, r.TABLE)[0]
++    assert json.loads(receipt["evidence_json"])["foreign"]["tasks"][0]["id"] == parent
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    reports = resolve_rejections(live, hub, BOARD)
++    assert len(reports) == 3 and all(x["action"] == "retired" for x in reports), reports
++    assert protected(live) == before
++    assert not live.execute("SELECT 1 FROM tasks WHERE id=?", (parent,)).fetchone()
++    lifecycle = ("TASKS", "TASK_LINKS", "TASK_EVENTS", "TASK_RUNS")
++    assert not [s for s in writes if s.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
++                and any(f" {t} " in s.upper() for t in lifecycle)]
++
++
++@pytest.mark.parametrize("where", ["local", "canonical", "replica"])
++def test_foreign_valid_held_reaches_containment_refusal(foreign, monkeypatch, where):
++    live, hub, _, uid, parent, child = foreign
++    if where == "local":
++        with kbc.write_txn(live):
++            live.execute("UPDATE kanban_sync_state SET applying=1")
++            live.execute("UPDATE tasks SET containment_episode='renewed' WHERE id=?", (child,))
++            live.execute("UPDATE kanban_sync_state SET applying=0")
++    elif where == "canonical":
++        original = hub.containment_context
++        monkeypatch.setattr(hub, "containment_context", lambda *a: {**original(*a), "held": a[1] == parent})
++    else:
++        assert not client._pull_replica(BOARD, hub, ME, diagnostic=True).busy
++        shadow = client.open_shadow(BOARD, ME)
++        with kbc.write_txn(shadow):
++            shadow.execute("UPDATE kanban_sync_state SET applying=1")
++            shadow.execute("UPDATE tasks SET containment_episode='renewed' WHERE id=?", (parent,))
++            shadow.execute("UPDATE kanban_sync_state SET applying=0")
++        shadow.close()
++        monkeypatch.setattr(client, "_pull_replica", lambda *a, **kw: client.Pulled())
++    before = protected(live)
++    p = r.plan(live, hub, BOARD, uid, REASON)
++    assert p.get("reason") in ("local_containment_hold", "canonical_containment_hold", "replica_containment_hold"), p
++    assert protected(live) == before
++    assert len(rows(live, "kanban_sync_outbox")) == 3
++    assert rows(live, "kanban_sync_tombstones")
++
++
++@pytest.mark.parametrize("defect", ["local_origin", "missing_origin", "wrong_origin", "wrong_version", "missing_replica",
++                                  "context_origin", "zero_version", "bool_version", "replica_origin", "replica_lease"])
++def test_foreign_provenance_required(foreign, monkeypatch, defect):
++    live, hub, _, uid, parent, _ = foreign
++    assert not client._pull_replica(BOARD, hub, ME, diagnostic=True).busy
++    monkeypatch.setattr(client, "_pull_replica", lambda *a, **kw: client.Pulled())
++    shadow = client.open_shadow(BOARD, ME)
++    if defect == "missing_replica":
++        shadow.execute("PRAGMA foreign_keys=OFF")
++        with kbc.write_txn(shadow):
++            shadow.execute("UPDATE kanban_sync_state SET applying=1")
++            shadow.execute("DELETE FROM tasks WHERE id=?", (parent,))
++            shadow.execute("UPDATE kanban_sync_state SET applying=0")
++    elif defect in ("replica_origin", "replica_lease"):
++        with kbc.write_txn(shadow):
++            shadow.execute("UPDATE kanban_sync_state SET applying=1")
++            if defect == "replica_origin": shadow.execute("UPDATE tasks SET created_on='wrong' WHERE id=?", (parent,))
++            else: shadow.execute("UPDATE tasks SET lease_holder='new-holder' WHERE id=?", (parent,))
++            shadow.execute("UPDATE kanban_sync_state SET applying=0")
++    shadow.close()
++    original = hub.row_evidence
++    def evidence(b, table, task):
++        e = original(b, table, task)
++        if table == "tasks" and task == parent:
++            if defect == "local_origin": e["row"]["created_on"] = ME
++            if defect == "missing_origin": e["row"]["created_on"] = None
++            if defect == "wrong_origin": e["row"]["created_on"] = "other"
++            if defect == "wrong_version": e["row"]["version"] += 1
++            if defect == "zero_version": e["row"]["version"] = 0
++            if defect == "bool_version": e["row"]["version"] = True
++        return e
++    monkeypatch.setattr(hub, "row_evidence", evidence)
++    if defect == "context_origin":
++        old = hub.containment_context
++        monkeypatch.setattr(hub, "containment_context", lambda *a: {
++            **old(*a), "target": {"board": BOARD, "gateway": "wrong", "task_id": a[1]}})
++    before = protected(live)
++    p = r.plan(live, hub, BOARD, uid, REASON)
++    assert not p["eligible"], p
++    assert protected(live) == before
++
++
++@pytest.mark.parametrize("phase", ["preview", "apply", "settle"])
++@pytest.mark.parametrize("change", ["cursor", "version", "held", "link"])
++def test_foreign_replica_cas_at_evidence_or_writer_boundary(foreign, monkeypatch, phase, change):
++    live, hub, _, uid, parent, _ = foreign
++    p = r.plan(live, hub, BOARD, uid, REASON)
++    assert p["eligible"], p
++    if phase == "settle":
++        assert r.apply(live, hub, BOARD, uid, p["token"], REASON)["action"] == "applied"
++    def move():
++        shadow = client.open_shadow(BOARD, ME)
++        with kbc.write_txn(shadow):
++            shadow.execute("UPDATE kanban_sync_state SET applying=1")
++            if change == "cursor": shadow.execute("UPDATE kanban_sync_state SET cursor=cursor+1")
++            if change == "version": shadow.execute("UPDATE tasks SET sync_version=sync_version+1 WHERE id=?", (parent,))
++            if change == "held": shadow.execute("UPDATE tasks SET containment_episode='renewed' WHERE id=?", (parent,))
++            if change == "link": shadow.execute("DELETE FROM task_links WHERE parent_id=?", (parent,))
++            shadow.execute("UPDATE kanban_sync_state SET applying=0")
++        shadow.close()
++    if phase == "preview":
++        old = hub.containment_context
++        def context(*a):
++            result = old(*a)
++            if a[1] == parent: move()
++            return result
++        monkeypatch.setattr(hub, "containment_context", context)
++    else:
++        transaction = r.write_txn
++        @contextlib.contextmanager
++        def interleaved(conn):
++            move()
++            with transaction(conn):
++                yield
++        monkeypatch.setattr(r, "write_txn", interleaved)
++    before = protected(live)
++    if phase == "preview":
++        result = r.plan(live, hub, BOARD, uid, REASON)
++    elif phase == "apply":
++        result = r.apply(live, hub, BOARD, uid, p["token"], REASON)
++    else:
++        op = rows(live, "kanban_sync_outbox")[0]
++        result = r.settle(live, hub, BOARD, op, r.receipt_for_op(live, op))
++    assert result["action"] in ("refused", "retained"), result
++    assert result.get("reason", result.get("proof")) == "replica_inputs_changed", result
++    assert protected(live) == before
++    assert len(rows(live, "kanban_sync_outbox")) == 3
++
++
++@pytest.mark.parametrize("change", ["work", "materialize", "lease", "renewed_hold"])
++def test_foreign_endpoint_work_and_lease_races_refuse_old_preview(foreign, monkeypatch, change):
++    live, hub, svc, uid, parent, _ = foreign
++    p = r.plan(live, hub, BOARD, uid, REASON)
++    assert p["eligible"], p
++    if change == "work":
++        with kbc.write_txn(live):
++            live.execute("INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,op,fields,hlc,created_at) "
++                         "VALUES ('new','tasks',?,'upsert','{}','',9999)", (parent,))
++    elif change == "materialize":
++        original = hub.containment_context
++        def context(*a):
++            c = original(*a)
++            if a[1] == parent:
++                with kbc.write_txn(live):
++                    live.execute("UPDATE kanban_sync_state SET applying=1")
++                    live.execute("INSERT OR IGNORE INTO tasks(id,title,status,created_by,created_at,created_on) "
++                                 "VALUES (?,'foreign','done','fixture',0,?)", (parent, FOREIGN))
++                    live.execute("UPDATE kanban_sync_state SET applying=0")
++            return c
++        monkeypatch.setattr(hub, "containment_context", context)
++    elif change == "lease":
++        svc._put(svc.board(BOARD), "tasks", parent, {"lease_holder": "worker-2", "lease_expires": 9999999999999},
++                 FOREIGN, None, "9999999999999-0001-worker-1")
++    else:
++        original = hub.containment_context
++        monkeypatch.setattr(hub, "containment_context", lambda *a: {**original(*a), "held": True})
++    result = r.apply(live, hub, BOARD, uid, p["token"], REASON)
++    assert result["action"] == "refused", result
++    assert rows(live, "kanban_sync_tombstones")
++    assert len(rows(live, "kanban_sync_outbox")) >= 3
+diff --git a/website/docs/user-guide/features/kanban-dependency-delete-recovery.md b/website/docs/user-guide/features/kanban-dependency-delete-recovery.md
+index 9835494b5f..9ab3f48f8d 100644
+--- a/website/docs/user-guide/features/kanban-dependency-delete-recovery.md
++++ b/website/docs/user-guide/features/kanban-dependency-delete-recovery.md
+@@ -26,7 +26,8 @@ sync identity matching the local board/gateway and binds its nonsecret endpoint
+ - The local and refreshed replica link must already exist with exactly the requested parent and child.
+ - Every operation for that link must be a rejected empty-fields DELETE with the exact Board refusal
+   `containment_hold: use scoped resume-contained; generic writes cannot satisfy containment`.
+-  Both endpoint task rows must exist, with no endpoint task outbox work.
++  Endpoint task outbox work is forbidden, including work for an endpoint absent locally.
++  Each endpoint must either exist locally or qualify as an absent foreign-origin endpoint below.
+ - The only eligible tombstone is this link's, with its deletion clock equal to the latest covered DELETE.
+   Matching `unlinked` history must remain available and is copied into the receipt without rewriting its payload.
+ - Both canonical endpoint rows and the link must be live, with valid versions/identities. Endpoint origin and
+@@ -42,6 +43,22 @@ sync identity matching the local board/gateway and binds its nonsecret endpoint
+ This is a bounded observation, not an atomic reservation or a distributed Board lock.
+ No server mutation is sent. Operators must recheck authoritative state after recovery.
+ 
++### Absent foreign endpoints
++
++The live database intentionally contains only this gateway's partition. Recovery never imports
++a foreign task to satisfy eligibility. Instead, an absent endpoint must exist in the completed
++full replica and in authenticated live row evidence at the same empty-feed cut. Its nonblank,
++valid `created_on` must be foreign to the enrolled gateway and match the replica; its positive
++version must match the replica's settled version. The validated containment context must name
++that same origin, board and task. Status, containment marker and lease mirror must agree too.
++An absent own-origin or origin-less task still refuses `missing_endpoint`.
++
++The replica's endpoint rows, link, cursor and certified containment predicates are read in one
++transaction, bound into the preview token/receipt, and compared again after evidence reads and
++inside the local apply/settlement transaction. Replica movement requires fresh evidence. Local,
++replica or canonical active containment (including a renewed episode) refuses recovery; a
++certified natural release or no hold is required. This command cannot authorize that release.
++
+ ## Writes and audit custody
+ 
+ Apply atomically inserts one host-local `kanban_sync_dependency_recoveries` receipt and clears only the exact
+-- 
+2.43.0
+

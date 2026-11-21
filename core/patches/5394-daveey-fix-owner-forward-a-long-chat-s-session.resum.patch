@@ -1,0 +1,146 @@
+From 47ecb69e491c6f99366041567f72a7d029c38e1a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 04:55:57 +0000
+Subject: [PATCH] [daveey] fix(owner-forward): a long chat's session.resume
+ answer no longer refuses every Desktop send
+
+Problem: on demo-b-hub (example incident) every Desktop send to a busy gateway-owned chat
+failed with "The gateway is running a turn in this chat and the gateway refused it. Nothing was sent."
+agent.log: repeated forward failures across example sessions, each
+preceded by `ws closed ... client_disconnect(code=1009,reason=frame with more than 1 MiB of data exceeds
+limit of 1048576 bytes)`.
+
+Why 1: the relay's first RPC, session.resume, returned GatewayClientError(DISCONNECTED) -- owner_forward.py:140.
+Why 2: the owner's answer carries the chat's whole history (larger than 1 MiB) and the client socket closed
+  with 1009 (message too big).
+Why 3: connect_owner dialed with max_size=2**20 (websockets' 1 MiB default), while every other
+  session.resume caller (gateway_client.connect_gateway) allows 8 MiB, and owner_forward itself raised
+  the cap only for forward_rpc's attachment answers.
+Root (happened): the relay's frame cap was sized for small RPC answers, not for the history-carrying
+  attach answer it always sends first; any chat whose transcript grows past 1 MiB could never receive a
+  forwarded prompt while the gateway owned it.
+Root (not caught): every owner-forward test replaces connect_owner with an in-process client, so no
+  test ever crossed a real WebSocket with a realistic resume answer.
+Recurrence: first time (owner_forward introduced in RT-37; f14c135d42e9 last touched it).
+
+Countermeasures:
+- symptom/root: connect_owner defaults to no frame cap (loopback owner on this host); forward_rpc keeps
+  its explicit cap.
+- detection: tests/tui_gateway/test_owner_forward_large_resume.py drives the real connect_owner over a
+  real loopback WebSocket with a 64 KiB and a 2 MiB resume answer. RED on main (1009, DISCONNECTED),
+  GREEN here; all 11 owner-forward test files pass (124 tests).
+---
+ .../test_owner_forward_large_resume.py        | 80 +++++++++++++++++++
+ tui_gateway/owner_forward.py                  |  7 +-
+ 2 files changed, 85 insertions(+), 2 deletions(-)
+ create mode 100644 tests/tui_gateway/test_owner_forward_large_resume.py
+
+diff --git a/tests/tui_gateway/test_owner_forward_large_resume.py b/tests/tui_gateway/test_owner_forward_large_resume.py
+new file mode 100644
+index 0000000000..2de3cedd26
+--- /dev/null
++++ b/tests/tui_gateway/test_owner_forward_large_resume.py
+@@ -0,0 +1,80 @@
++"""A forwarded Desktop prompt reaches the owner even when the chat's history is large.
++
++The relay attaches with ``session.resume``, whose answer carries the whole transcript. On the hub a
++long chat's answer was 1.2-1.75 MB, past websockets' 1 MiB default frame cap: the client closed with
++1009 and every Desktop send to that busy chat was refused as "the gateway refused it". This drives
++the real ``connect_owner`` over a real loopback WebSocket, with only the ticket call stubbed.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++
++def _serve_owner(resume_bytes: int):
++    """A loopback owner answering ``session.resume`` with ``resume_bytes`` of history."""
++    from hermes_cli.gateway_client import GATEWAY_WS_PROTOCOL
++    from websockets.asyncio.server import serve
++
++    ready, stop = threading.Event(), None
++    state: dict = {}
++
++    async def handler(ws):
++        async for raw in ws:
++            frame = json.loads(raw)
++            method, rid = frame.get("method"), frame.get("id")
++            if method == "session.resume":
++                result = {"session_id": "live-owner", "messages": [{"role": "user", "content": "x" * resume_bytes}]}
++            elif method == "prompt.submit":
++                state["submitted"] = frame["params"]
++                result = {"status": "queued", "admission_id": "adm-1"}
++            else:
++                result = {}
++            await ws.send(json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}))
++            if method == "prompt.submit":
++                await ws.send(json.dumps({"jsonrpc": "2.0", "method": "event", "params": {
++                    "type": "message.complete", "admission_id": "adm-1", "payload": {"text": "done"}}}))
++
++    def run():
++        nonlocal stop
++        loop = asyncio.new_event_loop()
++        stop = loop.create_future()
++
++        async def main():
++            async with serve(handler, "127.0.0.1", 0, subprotocols=[GATEWAY_WS_PROTOCOL], max_size=None) as server:
++                state["port"] = server.sockets[0].getsockname()[1]
++                ready.set()
++                await stop
++        loop.run_until_complete(main())
++
++    thread = threading.Thread(target=run, daemon=True)
++    thread.start()
++    assert ready.wait(10)
++    return state, thread, lambda: stop.get_loop().call_soon_threadsafe(stop.set_result, None)
++
++
++@pytest.mark.parametrize("resume_bytes", [64 * 1024, 2 * 1024 * 1024])
++def test_a_long_chat_history_does_not_refuse_the_forwarded_prompt(monkeypatch, tmp_path, resume_bytes):
++    from hermes_cli import gateway_client
++    from tui_gateway import owner_forward
++
++    state, thread, shutdown = _serve_owner(resume_bytes)
++    try:
++        endpoint = SimpleNamespace(api_origin=f"http://127.0.0.1:{state['port']}")
++        monkeypatch.setattr(gateway_client, "_session_ticket", lambda *_a, **_k: "ticket")
++        monkeypatch.setattr(owner_forward, "discover_owner", lambda _home: endpoint)
++        emitted = []
++        session = {"session_key": "stored-key"}
++        receipt = owner_forward.forward_prompt("sid", session, "Rename to Appendage.",
++                                               emit=lambda *a: emitted.append(a), home=tmp_path)
++        assert receipt["status"] == "queued" and receipt["admission_id"] == "adm-1"
++        assert state["submitted"]["session_id"] == "live-owner"
++        assert state["submitted"]["text"] == "Rename to Appendage."
++    finally:
++        shutdown()
++        thread.join(10)
+diff --git a/tui_gateway/owner_forward.py b/tui_gateway/owner_forward.py
+index 64dfe5979f..cbb05714e0 100644
+--- a/tui_gateway/owner_forward.py
++++ b/tui_gateway/owner_forward.py
+@@ -76,10 +76,13 @@ def discover_owner(home: Path):
+ 
+ 
+ @contextlib.asynccontextmanager
+-async def connect_owner(home: Path, endpoint, *, scope=None, max_size: int = 2 ** 20):
++async def connect_owner(home: Path, endpoint, *, scope=None, max_size: int | None = None):
+     """A ``GatewayClient`` on ``endpoint``, the ready gateway serving ``home``; ``scope``: the
+     ticket's profile scope (``"host"``: the one native Desktop holds); ``max_size``: the largest
+-    answer frame accepted (websockets' 1 MiB default)."""
++    answer frame accepted. [daveey] Uncapped by default: the relay's ``session.resume`` answer carries
++    the chat's whole history (1.2-1.75 MB on long hub chats), and websockets' 1 MiB default closed the
++    socket (1009), so every Desktop send to that busy chat was refused. The owner is this host's own
++    loopback gateway."""
+     from hermes_cli.gateway_client import GATEWAY_WS_PROTOCOL, GatewayClient, _session_ticket, gateway_ws_target
+     from websockets.asyncio.client import connect
+ 
+-- 
+2.43.0
+

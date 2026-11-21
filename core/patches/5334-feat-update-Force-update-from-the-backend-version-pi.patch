@@ -1,0 +1,1507 @@
+From 05e22f25fce67e09e9bb29b715005819d5be278a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 14:54:36 -0800
+Subject: [PATCH] feat(update): Force update from the backend version pill
+ [daveey]
+
+A user-typed turn whose marker has auto_continue=false kept its running tool
+call through hermes-sync's core-update drain (not_resumable_reason declined the
+pause and the mid-tool cancel), so its admission reservation stayed open and the
+apply was "not launchable (admission reservations busy)": in an example incident that
+held the gateway update until the turn ended. Right-clicking the backend version pill now
+offers "Force update", which pushes the pending update through now.
+
+Core (contract shared with hermes-sync):
+- hermes_cli/core_update_force.py: <root>/core-update/force-request
+  {"version": 1, "requested_at", "expires_at": requested_at + 1800, "by"},
+  written atomically; missing/garbage/expired reads as no request.
+  running_turn_count() counts live session_turn_leases rows read-only.
+- admission_fence.pause_forced(): the live pause request carries
+  "force": true (request_pause(..., force=True) writes it).
+- tui_gateway/update_pause.py: under a forced pause a non-resumable turn's
+  in-flight calls are cancelled after the same MID_TOOL_GRACE_S and the
+  boundary hook ends the turn with FORCED_STOP_REASON. Nothing keeps its
+  marker, so it ends like a stopped turn and is not continued (the user
+  re-sends it). Pending approvals/clarifies of such a turn are withdrawn with
+  a notice saying so. Resumable turns pause and auto-continue as before.
+- GET/POST /api/hermes/update/force: available when hermes-sync owes an update
+  here (the /api/hermes/update/progress signal), running turn count, pending
+  request; POST writes the request (by = token principal or "dashboard"),
+  409 when no update is owed.
+
+Desktop:
+- StatusbarItem.contextMenuItems: the right-clicked item's actions head the
+  bar's existing context menu. The backend pill offers "Force update": GET,
+  confirm with the running-turn count, POST, success or error toast; the
+  server's message and no confirm when no update can be forced.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/desktop/electron/connection-config.ts    |   2 +
+ apps/desktop/src/api/system.ts                |  20 +++
+ .../app/shell/force-backend-update.test.ts    | 102 +++++++++++
+ .../src/app/shell/force-backend-update.ts     |  44 +++++
+ .../shell/hooks/use-statusbar-items.test.tsx  |  24 +++
+ .../app/shell/hooks/use-statusbar-items.tsx   |  14 +-
+ .../app/shell/statusbar-context-menu.test.tsx |  46 +++++
+ .../src/app/shell/statusbar-controls.tsx      |  64 ++++++-
+ apps/desktop/src/i18n/en.ts                   |   2 +
+ apps/desktop/src/i18n/en_force_update.ts      |  16 ++
+ apps/desktop/src/i18n/overlay-gaps.json       |   9 +-
+ apps/desktop/src/i18n/types.ts                |   3 +
+ apps/desktop/src/i18n/types_force_update.ts   |  14 ++
+ apps/desktop/src/types/hermes.ts              |  25 +++
+ hermes_cli/admission_fence.py                 |  21 ++-
+ hermes_cli/core_update_force.py               |  81 +++++++++
+ hermes_cli/web_routers/actions.py             |  47 +++++
+ tests/hermes_cli/serve_handler_ledger.json    |   4 +-
+ .../hermes_cli/test_admission_fence_pause.py  |  43 +++++
+ tests/hermes_cli/test_core_update_force.py    | 139 ++++++++++++++
+ tests/tui_gateway/test_update_pause_forced.py | 169 ++++++++++++++++++
+ .../test_update_pause_forced_prompts.py       |  75 ++++++++
+ tui_gateway/update_pause.py                   |  38 +++-
+ tui_gateway/update_pause_approval.py          |   9 +-
+ .../docs/user-guide/features/web-dashboard.md |   1 +
+ 25 files changed, 994 insertions(+), 18 deletions(-)
+ create mode 100644 apps/desktop/src/app/shell/force-backend-update.test.ts
+ create mode 100644 apps/desktop/src/app/shell/force-backend-update.ts
+ create mode 100644 apps/desktop/src/i18n/en_force_update.ts
+ create mode 100644 apps/desktop/src/i18n/types_force_update.ts
+ create mode 100644 hermes_cli/core_update_force.py
+ create mode 100644 tests/hermes_cli/test_core_update_force.py
+ create mode 100644 tests/tui_gateway/test_update_pause_forced.py
+ create mode 100644 tests/tui_gateway/test_update_pause_forced_prompts.py
+
+diff --git a/apps/desktop/electron/connection-config.ts b/apps/desktop/electron/connection-config.ts
+index 3ef08011b4..74bcedea19 100644
+--- a/apps/desktop/electron/connection-config.ts
++++ b/apps/desktop/electron/connection-config.ts
+@@ -709,6 +709,8 @@ const LOCAL_PRIMARY_SCOPED_ROUTES = new Set([
+   'GET /api/portal',
+   'GET /api/hermes/update/check',
+   'GET /api/hermes/update/progress',
++  'GET /api/hermes/update/force',
++  'POST /api/hermes/update/force',
+   'POST /api/local-models/activate',
+   'GET /api/dashboard/themes',
+   'PUT /api/dashboard/theme',
+diff --git a/apps/desktop/src/api/system.ts b/apps/desktop/src/api/system.ts
+index 5cb32746bc..2a068a7f43 100644
+--- a/apps/desktop/src/api/system.ts
++++ b/apps/desktop/src/api/system.ts
+@@ -10,6 +10,8 @@ import type {
+   CuratorStatusResponse,
+   DebugShareResponse,
+   ElevenLabsVoicesResponse,
++  ForceUpdateResponse,
++  ForceUpdateState,
+   MemoryProviderConfig,
+   MemoryProviderOAuthStatus,
+   MemoryStatusResponse
+@@ -162,6 +164,24 @@ export function updateHermes(): Promise<ActionResponse> {
+   })
+ }
+ 
++/** [daveey] "Force update" on the backend version pill: whether hermes-sync owes an update on the active backend's
++ *  host, how many turns forcing it would stop, and any request already pending. */
++export function getForceUpdateState(): Promise<ForceUpdateState> {
++  return hermesApi<ForceUpdateState>({
++    ...profileScoped(),
++    path: '/api/hermes/update/force'
++  })
++}
++
++/** Ask hermes-sync to apply the pending core update now: running turns stop at their next step boundary. */
++export function forceHermesUpdate(): Promise<ForceUpdateResponse> {
++  return hermesApi<ForceUpdateResponse>({
++    ...profileScoped(),
++    path: '/api/hermes/update/force',
++    method: 'POST'
++  })
++}
++
+ /** [daveey] The host's own background core update (hermes-sync); `{ progress: null }` when none is owed.
+  *  `scope` pins the host: `{ connectionId: 'local' }` for this machine, omitted for the active backend.
+  *  A 10 s background poll: passive (never cold-starts a backend) and never `foreground` (that would count as
+diff --git a/apps/desktop/src/app/shell/force-backend-update.test.ts b/apps/desktop/src/app/shell/force-backend-update.test.ts
+new file mode 100644
+index 0000000000..22286f20c8
+--- /dev/null
++++ b/apps/desktop/src/app/shell/force-backend-update.test.ts
+@@ -0,0 +1,102 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import { en } from '@/i18n/en'
++import { $confirmRequest, settleConfirm } from '@/store/confirm'
++import { $notifications, clearNotifications } from '@/store/notifications'
++
++import { forceBackendUpdate } from './force-backend-update'
++
++const api = vi.hoisted(() => ({ forceHermesUpdate: vi.fn(), getForceUpdateState: vi.fn() }))
++
++vi.mock('@/api/system', () => api)
++
++const copy = en.shell.statusbar.forceUpdate
++
++async function untilConfirmAsked() {
++  await vi.waitFor(() => expect($confirmRequest.get()).not.toBeNull())
++
++  return $confirmRequest.get()!
++}
++
++beforeEach(() => {
++  api.getForceUpdateState.mockResolvedValue({ available: true, pending: null, running_turns: 3 })
++  api.forceHermesUpdate.mockResolvedValue({ expires_at: 1800, ok: true, requested_at: 0, running_turns: 3 })
++})
++
++afterEach(() => {
++  settleConfirm(false)
++  $confirmRequest.set(null)
++  clearNotifications()
++  $notifications.set([])
++  vi.clearAllMocks()
++})
++
++describe('forceBackendUpdate', () => {
++  it('confirms with the running-turn count, POSTs on confirm and reports the request', async () => {
++    const done = forceBackendUpdate(copy)
++    const asked = await untilConfirmAsked()
++
++    expect(asked.title).toBe('Force the backend update now?')
++    expect(asked.description).toBe(
++      '3 running turns will be stopped. Turns that can resume continue after the update; others need to be sent again.'
++    )
++    expect(api.forceHermesUpdate).not.toHaveBeenCalled()
++
++    settleConfirm(true, asked)
++    await done
++
++    expect(api.forceHermesUpdate).toHaveBeenCalledTimes(1)
++    expect($notifications.get()[0]).toMatchObject({
++      kind: 'success',
++      message: 'Update requested; the backend restarts within a few minutes'
++    })
++  })
++
++  it('names one running turn, and says when none is running', () => {
++    expect(copy.confirmBody(1)).toMatch(/^1 running turn will be stopped\./)
++    expect(copy.confirmBody(0)).toMatch(/^No turns are running right now\./)
++  })
++
++  it('does not POST when the confirm is cancelled', async () => {
++    const done = forceBackendUpdate(copy)
++
++    settleConfirm(false, await untilConfirmAsked())
++    await done
++
++    expect(api.forceHermesUpdate).not.toHaveBeenCalled()
++    expect($notifications.get()).toEqual([])
++  })
++
++  it('shows an error toast with the server message when the POST fails', async () => {
++    api.forceHermesUpdate.mockRejectedValue(new Error('409: {"detail":"No background core update is pending"}'))
++    const done = forceBackendUpdate(copy)
++
++    settleConfirm(true, await untilConfirmAsked())
++    await done
++
++    const toast = $notifications.get()[0]
++
++    expect(toast?.kind).toBe('error')
++    expect(`${toast?.title ?? ''} ${toast?.message ?? ''} ${toast?.detail ?? ''}`).toContain(
++      'No background core update is pending'
++    )
++  })
++
++  it('shows the server message and asks nothing when no update can be forced', async () => {
++    api.getForceUpdateState.mockResolvedValue({
++      available: false,
++      message: 'No background core update is pending on this host.',
++      pending: null,
++      running_turns: 2
++    })
++
++    await forceBackendUpdate(copy)
++
++    expect($confirmRequest.get()).toBeNull()
++    expect(api.forceHermesUpdate).not.toHaveBeenCalled()
++    expect($notifications.get()[0]).toMatchObject({
++      kind: 'warning',
++      message: 'No background core update is pending on this host.'
++    })
++  })
++})
+diff --git a/apps/desktop/src/app/shell/force-backend-update.ts b/apps/desktop/src/app/shell/force-backend-update.ts
+new file mode 100644
+index 0000000000..b067023541
+--- /dev/null
++++ b/apps/desktop/src/app/shell/force-backend-update.ts
+@@ -0,0 +1,44 @@
++import { forceHermesUpdate, getForceUpdateState } from '@/api/system'
++import type { ForceUpdateCopy } from '@/i18n/types_force_update'
++import { confirm } from '@/store/confirm'
++import { notify, notifyError } from '@/store/notifications'
++
++/** [daveey] "Force update" from the backend version pill's context menu: read how many turns forcing the host's
++ *  pending core update would stop, confirm, then ask hermes-sync to apply it now (`POST /api/hermes/update/force`).
++ *  When no update is owed the server's reason is shown and nothing is asked. */
++export async function forceBackendUpdate(copy: ForceUpdateCopy): Promise<void> {
++  let state: Awaited<ReturnType<typeof getForceUpdateState>>
++
++  try {
++    state = await getForceUpdateState()
++  } catch (error) {
++    notifyError(error, copy.failed)
++
++    return
++  }
++
++  if (!state.available) {
++    notify({ kind: 'warning', message: state.message || copy.failed })
++
++    return
++  }
++
++  const confirmed = await confirm({
++    cancelLabel: copy.cancelLabel,
++    confirmLabel: copy.confirmLabel,
++    description: copy.confirmBody(state.running_turns),
++    destructive: true,
++    title: copy.confirmTitle
++  })
++
++  if (!confirmed) {
++    return
++  }
++
++  try {
++    await forceHermesUpdate()
++    notify({ kind: 'success', message: copy.requested })
++  } catch (error) {
++    notifyError(error, copy.failed)
++  }
++}
+diff --git a/apps/desktop/src/app/shell/hooks/use-statusbar-items.test.tsx b/apps/desktop/src/app/shell/hooks/use-statusbar-items.test.tsx
+index 560bd5cace..48a0c5d72c 100644
+--- a/apps/desktop/src/app/shell/hooks/use-statusbar-items.test.tsx
++++ b/apps/desktop/src/app/shell/hooks/use-statusbar-items.test.tsx
+@@ -187,6 +187,30 @@ describe('statusbar update channel vocabulary', () => {
+   })
+ })
+ 
++describe('statusbar Force update (hermes-sync)', () => {
++  it('offers Force update on the backend pill context menu and not on the client pill', () => {
++    act(() => {
++      $connection.set({ mode: 'remote' } as never)
++      $desktopVersion.set({
++        appVersion: '0.23.1',
++        electronVersion: '37',
++        hermesRoot: '/h',
++        nodeVersion: '22',
++        platform: 'darwin'
++      })
++      $updateStatus.set({ behind: 0, supported: true })
++    })
++
++    const items = renderStatusbarItems().statusbarItems
++    const backend = items.find(item => item.id === 'version-backend')
++    const client = items.find(item => item.id === 'version-client')
++
++    expect(backend?.contextMenuItems?.map(action => action.label)).toEqual([en.shell.statusbar.forceUpdate.menuItem])
++    expect(client).toBeDefined()
++    expect(client?.contextMenuItems ?? []).toEqual([])
++  })
++})
++
+ describe('statusbar background core update (hermes-sync)', () => {
+   const desktop = {
+     appVersion: '0.23.1',
+diff --git a/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx b/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx
+index 832b00a82f..05ad5d751d 100644
+--- a/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx
++++ b/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx
+@@ -9,6 +9,7 @@ import type { CommandCenterSection } from '@/app/command-center'
+ import { toggleTerminalPane } from '@/app/right-sidebar/terminal/reveal-focus'
+ import { useApprovalModeStatusbarItem } from '@/app/shell/approval-mode-menu'
+ import { ContextMeterDetail, ContextUsagePanel } from '@/app/shell/context-usage-panel'
++import { forceBackendUpdate } from '@/app/shell/force-backend-update'
+ import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
+ import { useChangeWorkspaceItem } from '@/app/shell/hooks/use-change-workspace'
+ import { useCompactConversation } from '@/app/shell/hooks/use-compact-conversation'
+@@ -135,7 +136,8 @@ function versionItem(
+   applying: boolean,
+   toggleLabel: string,
+   hidden = false,
+-  background: BackgroundUpdateView | null = null
++  background: BackgroundUpdateView | null = null,
++  contextMenuItems?: StatusbarItem['contextMenuItems']
+ ): StatusbarItem {
+   // An apply Desktop started owns the pill; a host's own background update shows only otherwise.
+   const bg = applying ? null : background
+@@ -148,6 +150,7 @@ function versionItem(
+     // `relative` anchors the bar to the pill's button; it rides the icon slot because the label sits in a
+     // truncating (overflow-hidden) span that would clip anything drawn under the text.
+     className: cn((status.hasUpdate || busy) && 'text-primary hover:text-primary', bg?.bar && 'relative'),
++    contextMenuItems,
+     hidden: status.unknown || hidden,
+     icon: bg?.bar ? (
+       <>
+@@ -541,7 +544,14 @@ export function useStatusbarItems({
+ 
+     const background = describeBackgroundUpdate(backendUpdateProgress, Date.now(), copy.backgroundUpdate)
+ 
+-    return versionItem('backend', status, applying, copy.toggleBackendVersion, false, background)
++    // [daveey] Right-click: push the host's pending core update through now (hermes-sync), stopping running turns.
++    const forceUpdate = {
++      id: 'force-update',
++      label: copy.forceUpdate.menuItem,
++      onSelect: () => void forceBackendUpdate(copy.forceUpdate)
++    }
++
++    return versionItem('backend', status, applying, copy.toggleBackendVersion, false, background, [forceUpdate])
+   }, [
+     backendUpdateProgress,
+     cloudOwnsUpdates.backend,
+diff --git a/apps/desktop/src/app/shell/statusbar-context-menu.test.tsx b/apps/desktop/src/app/shell/statusbar-context-menu.test.tsx
+index dcce183c9a..80a59b6506 100644
+--- a/apps/desktop/src/app/shell/statusbar-context-menu.test.tsx
++++ b/apps/desktop/src/app/shell/statusbar-context-menu.test.tsx
+@@ -58,3 +58,49 @@ describe('statusbar context menu coordination', () => {
+     expect($contextMenu.get()).toBeNull()
+   })
+ })
++
++describe('statusbar item context actions', () => {
++  const onForce = vi.fn()
++
++  const items = [
++    {
++      contextMenuItems: [{ id: 'force-update', label: 'Force update', onSelect: onForce }],
++      id: 'version-backend',
++      label: 'backend v1',
++      toggleLabel: 'Backend version',
++      variant: 'action' as const
++    },
++    { id: 'version-client', label: 'client v1', toggleLabel: 'Client version', variant: 'action' as const }
++  ]
++
++  function rightClick(target: HTMLElement) {
++    fireEvent.pointerDown(target, { button: 2, ctrlKey: false, pointerType: 'mouse' })
++    fireEvent.contextMenu(target, { button: 2 })
++  }
++
++  it('heads the menu with the right-clicked item’s own actions and runs them', async () => {
++    render(
++      <MemoryRouter>
++        <StatusbarControls items={items} />
++      </MemoryRouter>
++    )
++
++    rightClick(screen.getByText('backend v1'))
++    fireEvent.click(await screen.findByRole('menuitem', { name: 'Force update' }))
++
++    expect(onForce).toHaveBeenCalledTimes(1)
++  })
++
++  it('does not offer them for another item', async () => {
++    render(
++      <MemoryRouter>
++        <StatusbarControls items={items} />
++      </MemoryRouter>
++    )
++
++    rightClick(screen.getByText('client v1'))
++
++    expect(await screen.findByRole('menuitemcheckbox', { name: 'Client version' })).toBeTruthy()
++    expect(screen.queryByRole('menuitem', { name: 'Force update' })).toBeNull()
++  })
++})
+diff --git a/apps/desktop/src/app/shell/statusbar-controls.tsx b/apps/desktop/src/app/shell/statusbar-controls.tsx
+index 0be4d5b97f..1ed6607046 100644
+--- a/apps/desktop/src/app/shell/statusbar-controls.tsx
++++ b/apps/desktop/src/app/shell/statusbar-controls.tsx
+@@ -87,6 +87,9 @@ export interface StatusbarItem {
+    *  center, update/version pills) would strand the user if they could be
+    *  hidden from the surface that hides them. */
+   lockedVisible?: boolean
++  /** Actions shown at the top of the bar's right-click menu when the
++   *  right-click lands on this item (e.g. the backend pill's "Force update"). */
++  contextMenuItems?: readonly StatusbarMenuItem[]
+ }
+ 
+ export interface StatusbarSelectModifiers {
+@@ -101,9 +104,25 @@ interface StatusbarControlsProps extends ComponentProps<'footer'> {
+   items?: readonly StatusbarItem[]
+ }
+ 
+-export function StatusbarControls({ className, leftItems = [], items = [], ...props }: StatusbarControlsProps) {
++export function StatusbarControls({
++  className,
++  leftItems = [],
++  items = [],
++  onContextMenuCapture,
++  ...props
++}: StatusbarControlsProps) {
+   const navigate = useNavigate()
+   const hiddenIds = useStore($statusbarHiddenIds)
++  // The item a right-click landed on: its own actions head the bar's one context menu.
++  const [contextItemId, setContextItemId] = useState<null | string>(null)
++
++  const contextActions = useMemo(
++    () =>
++      [...leftItems, ...items]
++        .find(item => item.id === contextItemId)
++        ?.contextMenuItems?.filter(action => !action.hidden) ?? [],
++    [contextItemId, items, leftItems]
++  )
+ 
+   const visible = (item: StatusbarItem) =>
+     !item.hidden && (item.lockedVisible || !item.toggleLabel || !hiddenIds.includes(item.id))
+@@ -117,6 +136,11 @@ export function StatusbarControls({ className, leftItems = [], items = [], ...pr
+             className
+           )}
+           data-slot="statusbar"
++          onContextMenuCapture={event => {
++            const target = event.target instanceof Element ? event.target.closest('[data-statusbar-item]') : null
++            setContextItemId(target?.getAttribute('data-statusbar-item') ?? null)
++            onContextMenuCapture?.(event)
++          }}
+           {...props}
+         >
+           {/* `overflow-x-clip` (not `overflow-x-auto`) so a wide status item — for
+@@ -135,7 +159,7 @@ export function StatusbarControls({ className, leftItems = [], items = [], ...pr
+           </div>
+         </footer>
+       </ContextMenuTrigger>
+-      <StatusbarVisibilityMenu hiddenIds={hiddenIds} items={items} leftItems={leftItems} />
++      <StatusbarVisibilityMenu actions={contextActions} hiddenIds={hiddenIds} items={items} leftItems={leftItems} />
+     </ContextMenu>
+   )
+ }
+@@ -145,10 +169,12 @@ export function StatusbarControls({ className, leftItems = [], items = [], ...pr
+  *  menu reads like the surface it edits. Hiding the whole bar lives at the
+  *  bottom — VS Code puts it on the same context menu. */
+ function StatusbarVisibilityMenu({
++  actions,
+   hiddenIds,
+   items,
+   leftItems
+ }: {
++  actions: readonly StatusbarMenuItem[]
+   hiddenIds: readonly string[]
+   items: readonly StatusbarItem[]
+   leftItems: readonly StatusbarItem[]
+@@ -175,6 +201,23 @@ function StatusbarVisibilityMenu({
+ 
+   return (
+     <ContextMenuContent className="w-52">
++      {actions.length > 0 && (
++        <>
++          {actions.map(action => (
++            <ContextMenuItem
++              className={action.className}
++              disabled={action.disabled}
++              key={action.id}
++              onSelect={() => action.onSelect?.()}
++              title={action.title}
++            >
++              {action.icon}
++              <span className="truncate">{action.label}</span>
++            </ContextMenuItem>
++          ))}
++          <ContextMenuSeparator />
++        </>
++      )}
+       {toggles.length > 0 && (
+         <>
+           <ContextMenuLabel>{copy.customizeTitle}</ContextMenuLabel>
+@@ -261,7 +304,12 @@ const StatusbarItemView = memo(function StatusbarItemView({
+     // way profile-switcher.tsx stacks Popover/ContextMenu/Tooltip triggers.
+     const trigger = (
+       <DropdownMenuTrigger asChild>
+-        <button className={cn(STATUSBAR_ACTION_CLASS, item.className)} disabled={item.disabled} type="button">
++        <button
++          className={cn(STATUSBAR_ACTION_CLASS, item.className)}
++          data-statusbar-item={item.id}
++          disabled={item.disabled}
++          type="button"
++        >
+           {content}
+         </button>
+       </DropdownMenuTrigger>
+@@ -333,6 +381,7 @@ const StatusbarItemView = memo(function StatusbarItemView({
+             'inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem] text-(--ui-text-tertiary)',
+             item.className
+           )}
++          data-statusbar-item={item.id}
+         >
+           {content}
+         </div>
+@@ -343,7 +392,13 @@ const StatusbarItemView = memo(function StatusbarItemView({
+   if (item.href || item.variant === 'link') {
+     return (
+       <Tip label={tooltipLabel}>
+-        <a className={cn(STATUSBAR_ACTION_CLASS, item.className)} href={item.href} rel="noreferrer" target="_blank">
++        <a
++          className={cn(STATUSBAR_ACTION_CLASS, item.className)}
++          data-statusbar-item={item.id}
++          href={item.href}
++          rel="noreferrer"
++          target="_blank"
++        >
+           {content}
+         </a>
+       </Tip>
+@@ -354,6 +409,7 @@ const StatusbarItemView = memo(function StatusbarItemView({
+     <Tip label={tooltipLabel}>
+       <button
+         className={cn(STATUSBAR_ACTION_CLASS, item.className)}
++        data-statusbar-item={item.id}
+         disabled={item.disabled}
+         onClick={event => {
+           if (item.to) {
+diff --git a/apps/desktop/src/i18n/en.ts b/apps/desktop/src/i18n/en.ts
+index 76fa824aa7..f8e9145e78 100644
+--- a/apps/desktop/src/i18n/en.ts
++++ b/apps/desktop/src/i18n/en.ts
+@@ -17,6 +17,7 @@ import { enErrorCodes } from './en_error_codes'
+ import { enErrorLayers } from './en_error_layers'
+ import { enExternalOpenFailed } from './en_external_open'
+ import { enFirstRun } from './en_first_run'
++import { enForceUpdate } from './en_force_update'
+ import { enGatewayHost } from './en_gateway_host'
+ import { enLocalModels } from './en_local_models'
+ import { enMemoryLayers } from './en_memory_layers'
+@@ -4173,6 +4174,7 @@ export const en: Translations = {
+       update: 'update',
+       updateInProgress: 'Update in progress',
+       backgroundUpdate: enBackgroundUpdate,
++      forceUpdate: enForceUpdate,
+       commitsBehind: (count, branch) => `${count} commit${count === 1 ? '' : 's'} behind ${branch}`,
+       releaseAvailable: (tag: string) => `Version ${tag} is available.`,
+       desktopVersion: version => `Hermes Desktop v${version}`,
+diff --git a/apps/desktop/src/i18n/en_force_update.ts b/apps/desktop/src/i18n/en_force_update.ts
+new file mode 100644
+index 0000000000..246ab48e69
+--- /dev/null
++++ b/apps/desktop/src/i18n/en_force_update.ts
+@@ -0,0 +1,16 @@
++import type { ForceUpdateCopy } from './types_force_update'
++
++export const enForceUpdate: ForceUpdateCopy = {
++  menuItem: 'Force update',
++  confirmTitle: 'Force the backend update now?',
++  confirmBody: runningTurns =>
++    `${
++      runningTurns === 0
++        ? 'No turns are running right now.'
++        : `${runningTurns} running turn${runningTurns === 1 ? '' : 's'} will be stopped.`
++    } Turns that can resume continue after the update; others need to be sent again.`,
++  confirmLabel: 'Force update',
++  cancelLabel: 'Cancel',
++  requested: 'Update requested; the backend restarts within a few minutes',
++  failed: 'Could not force the backend update'
++}
+diff --git a/apps/desktop/src/i18n/overlay-gaps.json b/apps/desktop/src/i18n/overlay-gaps.json
+index 166795bece..6a90d35682 100644
+--- a/apps/desktop/src/i18n/overlay-gaps.json
++++ b/apps/desktop/src/i18n/overlay-gaps.json
+@@ -2377,5 +2377,12 @@
+   "shell.statusbar.backgroundUpdate.tooltipPastCap": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+   "shell.statusbar.backgroundUpdate.tooltipApplying": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+   "shell.statusbar.backgroundUpdate.tooltipBlocked": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+-  "shell.statusbar.backgroundUpdate.waitingOn": ["ar","de","es","fr","ja","ru","zh","zh-hant"]
++  "shell.statusbar.backgroundUpdate.waitingOn": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "shell.statusbar.forceUpdate.menuItem": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "shell.statusbar.forceUpdate.confirmTitle": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "shell.statusbar.forceUpdate.confirmBody": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "shell.statusbar.forceUpdate.confirmLabel": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "shell.statusbar.forceUpdate.cancelLabel": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "shell.statusbar.forceUpdate.requested": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "shell.statusbar.forceUpdate.failed": ["ar","de","es","fr","ja","ru","zh","zh-hant"]
+ }
+diff --git a/apps/desktop/src/i18n/types.ts b/apps/desktop/src/i18n/types.ts
+index eb3019c603..4a60767e7e 100644
+--- a/apps/desktop/src/i18n/types.ts
++++ b/apps/desktop/src/i18n/types.ts
+@@ -22,6 +22,7 @@ import type { CronControlCopy } from './types_cron_control'
+ import type { GatewayGroupOpenCopy, SkillDeepLinkCopy } from './types_deep_links'
+ import type { ExternalOpenFailedCopy } from './types_external_open'
+ import type { FirstRunCopy } from './types_first_run'
++import type { ForceUpdateCopy } from './types_force_update'
+ import type { GatewayHostTranslations } from './types_gateway_host'
+ import type { MemoryLayersTranslations } from './types_memory_layers'
+ import type { ModelMenuTranslations } from './types_model_menu'
+@@ -3622,6 +3623,8 @@ export interface Translations extends NoticeTranslations {
+       updateInProgress: string
+       /** [daveey] A core update the host runs on its own (hermes-sync). */
+       backgroundUpdate: BackgroundUpdateCopy
++      /** [daveey] "Force update" on the backend version pill's context menu. */
++      forceUpdate: ForceUpdateCopy
+       commitsBehind: (count: number, branch: string) => string
+       releaseAvailable: (tag: string) => string
+       desktopVersion: (version: string) => string
+diff --git a/apps/desktop/src/i18n/types_force_update.ts b/apps/desktop/src/i18n/types_force_update.ts
+new file mode 100644
+index 0000000000..4707a400fe
+--- /dev/null
++++ b/apps/desktop/src/i18n/types_force_update.ts
+@@ -0,0 +1,14 @@
++/** [daveey] Copy for "Force update" on the backend version pill's context menu: push a pending core update the
++ *  host runs on its own (hermes-sync) through now, stopping running turns. Part of `Translations['shell']['statusbar']`. */
++export interface ForceUpdateCopy {
++  /** The context-menu item on the backend version pill. */
++  menuItem: string
++  confirmTitle: string
++  /** Confirm body; `runningTurns` is how many turns the backend is running right now. */
++  confirmBody: (runningTurns: number) => string
++  confirmLabel: string
++  cancelLabel: string
++  requested: string
++  /** Toast title when the request (or the status read before it) failed. */
++  failed: string
++}
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index dd5564f059..1cc8ebbb41 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -1529,6 +1529,31 @@ export interface ActionResponse {
+   already_running?: boolean
+ }
+ 
++/** [daveey] A live "Force update" request (`<root>/core-update/force-request`), epoch seconds. */
++export interface ForceUpdateRequest {
++  version: number
++  requested_at: number
++  expires_at: number
++  by: string
++}
++
++/** `GET /api/hermes/update/force`: whether hermes-sync owes an update on this host, and what forcing it stops. */
++export interface ForceUpdateState {
++  available: boolean
++  running_turns: number
++  pending: ForceUpdateRequest | null
++  /** Why it is unavailable (only when `available` is false). */
++  message?: string
++}
++
++/** `POST /api/hermes/update/force` (a 409 with `detail` when no update is owed). */
++export interface ForceUpdateResponse {
++  ok: boolean
++  requested_at: number
++  expires_at: number
++  running_turns: number
++}
++
+ export interface UpdateReceiptSummary {
+   outcome: 'running' | 'success' | 'partial' | 'failed' | 'refused' | string
+   started_at: string | null
+diff --git a/hermes_cli/admission_fence.py b/hermes_cli/admission_fence.py
+index 89b1ff6774..7aae811e10 100644
+--- a/hermes_cli/admission_fence.py
++++ b/hermes_cli/admission_fence.py
+@@ -345,12 +345,27 @@ def pause_requested(home):
+         return False
+ 
+ 
+-def request_pause(home, *, expires_at, pid=None):
++def pause_forced(home):
++    """[daveey] The live pause request (``pause_requested``) carries ``"force": true``: hermes-sync's drainer is
++    serving a "Force update" request (``hermes_cli.core_update_force``), so turns the next backend would not
++    auto-continue stop at their next step boundary too. Never raises."""
++    if not pause_requested(home):
++        return False
++    try:
++        body = json.loads((Path(home) / "core-update" / PAUSE_REQUEST).read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return False
++    return isinstance(body, dict) and body.get("force") is True
++
++
++def request_pause(home, *, expires_at, pid=None, force=False):
+     root = Path(home) / "core-update"
+     root.mkdir(parents=True, exist_ok=True)
+     tmp = root / f".{PAUSE_REQUEST}.{os.getpid()}.tmp"
+-    tmp.write_text(json.dumps({"version": 1, "pid": pid or os.getpid(), "requested_at": time.time(),
+-                               "expires_at": float(expires_at)}) + "\n", encoding="utf-8")
++    body = {"version": 1, "pid": pid or os.getpid(), "requested_at": time.time(), "expires_at": float(expires_at)}
++    if force:
++        body["force"] = True
++    tmp.write_text(json.dumps(body) + "\n", encoding="utf-8")
+     os.replace(tmp, root / PAUSE_REQUEST)
+ 
+ 
+diff --git a/hermes_cli/core_update_force.py b/hermes_cli/core_update_force.py
+new file mode 100644
+index 0000000000..d637aa3faf
+--- /dev/null
++++ b/hermes_cli/core_update_force.py
+@@ -0,0 +1,81 @@
++"""[daveey] "Force update" request: push a pending core update through now, without waiting on running turns.
++
++Desktop's version pill offers it (``POST /api/hermes/update/force``). The request is one JSON file beside the
++drain's pause request, ``<root>/core-update/force-request``::
++
++    {"version": 1, "requested_at": <epoch s>, "expires_at": <requested_at + FORCE_TTL_S>, "by": "<principal>"}
++
++hermes-sync reads it directly (no core call), so the format is the contract: keep it backward compatible. While
++it serves a force request its drainer stamps ``"force": true`` on the pause request, and every turn then stops at
++its next step boundary, including turns the next backend would not auto-continue
++(``hermes_cli.admission_fence.pause_forced``, ``tui_gateway.update_pause``). hermes-sync deletes the file after a
++successful apply or once it has expired; a missing, unparseable or expired file is no request.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import os
++import time
++from pathlib import Path
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++FORCE_REQUEST = "force-request"
++FORCE_TTL_S = 1800.0
++
++
++def _path(root: Path | str) -> Path:
++    return Path(root) / "core-update" / FORCE_REQUEST
++
++
++def write_force_request(root: Path | str, by: str) -> dict:
++    """Write (or refresh) the force request atomically; returns its body."""
++    path = _path(root)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    now = time.time()
++    body = {"version": 1, "requested_at": now, "expires_at": now + FORCE_TTL_S, "by": str(by)}
++    tmp = path.with_name(f".{FORCE_REQUEST}.{os.getpid()}.tmp")
++    tmp.write_text(json.dumps(body) + "\n", encoding="utf-8")
++    os.replace(tmp, path)
++    return body
++
++
++def read_force_request(root: Path | str, now: Optional[float] = None) -> Optional[dict]:
++    """The live force request, or None when there is none, it is unreadable or malformed, or it has expired."""
++    try:
++        body: Any = json.loads(_path(root).read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return None
++    if not isinstance(body, dict):
++        return None
++    try:
++        expires_at = float(body["expires_at"])
++        requested_at = float(body["requested_at"])
++    except (KeyError, TypeError, ValueError):
++        return None
++    if expires_at <= (time.time() if now is None else now):
++        return None
++    return {"version": body.get("version"), "requested_at": requested_at, "expires_at": expires_at,
++            "by": str(body.get("by") or "")}
++
++
++def running_turn_count(home: Path | str, now: Optional[float] = None) -> int:
++    """Turns holding a live cross-process turn lease in ``home``'s state.db (read-only); 0 when unreadable."""
++    from hermes_cli.sqlite_safe_read import connect_tracked
++
++    db_path = Path(home) / "state.db"
++    if not db_path.exists():
++        return 0
++    try:
++        conn = connect_tracked(f"{db_path.resolve().as_uri()}?mode=ro", tracking_path=db_path, uri=True, timeout=2.0)
++        try:
++            row = conn.execute("SELECT COUNT(*) FROM session_turn_leases WHERE expires_at > ?",
++                               (time.time() if now is None else now,)).fetchone()
++        finally:
++            conn.close()
++    except Exception:
++        logger.warning("core-update force: could not count running turns in %s", db_path, exc_info=True)
++        return 0
++    return int(row[0] or 0) if row else 0
+diff --git a/hermes_cli/web_routers/actions.py b/hermes_cli/web_routers/actions.py
+index cd3adb4a08..fed50167ac 100644
+--- a/hermes_cli/web_routers/actions.py
++++ b/hermes_cli/web_routers/actions.py
+@@ -15,6 +15,7 @@ from pathlib import Path
+ from typing import Any, Dict, List, Optional
+ 
+ from fastapi import APIRouter, HTTPException, Request
++from fastapi.responses import JSONResponse
+ 
+ from hermes_cli.config import format_docker_update_message, recommended_update_command_for_method
+ from hermes_cli.update_contract import COMMIT_BUILD_UPDATE_MESSAGE, is_commit_build
+@@ -295,6 +296,52 @@ async def hermes_update_progress():
+     return {"progress": await asyncio.to_thread(read_progress)}
+ 
+ 
++_FORCE_UNAVAILABLE_MESSAGE = ("No background core update is pending on this host, so there is nothing to force. "
++                               "Force update only applies to an update hermes-sync is waiting to apply here.")
++
++
++def _force_update_state() -> dict[str, Any]:
++    """[daveey] What Desktop's "Force update" needs: whether hermes-sync has an update owed here (the same signal
++    as the version pill's ``/api/hermes/update/progress``), the turns it would stop, and any live request."""
++    from hermes_cli.core_update_force import read_force_request, running_turn_count
++    from hermes_cli.core_update_progress import read_progress
++    from hermes_constants import get_default_hermes_root
++
++    root = get_default_hermes_root()
++    available = read_progress() is not None
++    state: dict[str, Any] = {"available": available, "running_turns": running_turn_count(get_hermes_home()),
++                             "pending": read_force_request(root)}
++    if not available:
++        state["message"] = _FORCE_UNAVAILABLE_MESSAGE
++    return state
++
++
++@router.get("/api/hermes/update/force")
++async def hermes_update_force_state():
++    """``{"available", "running_turns", "pending"}`` for Desktop's "Force update" confirm (``message`` when
++    unavailable). See hermes_cli.core_update_force."""
++    return await asyncio.to_thread(_force_update_state)
++
++
++@router.post("/api/hermes/update/force")
++async def hermes_update_force(request: Request):
++    """Ask hermes-sync to push the pending core update through now: running turns stop at their next step
++    boundary (resumable ones continue after the update). Writes ``<root>/core-update/force-request``."""
++    from hermes_cli.core_update_force import write_force_request
++    from hermes_constants import get_default_hermes_root
++
++    state = await asyncio.to_thread(_force_update_state)
++    if not state["available"]:
++        # 409 with ``detail`` (what Desktop's error toast reads) and the ``ok: false`` shape of the update refusals.
++        return JSONResponse(status_code=409, content={"ok": False, "error": "force_update_unavailable",
++                                                      "message": state["message"], "detail": state["message"]})
++    principal = getattr(getattr(request.state, "token_principal", None), "principal", None) or "dashboard"
++    body = await asyncio.to_thread(write_force_request, get_default_hermes_root(), str(principal))
++    _log.info("Hermes core update FORCE requested by %s (%d running turn(s))", principal, state["running_turns"])
++    return {"ok": True, "requested_at": body["requested_at"], "expires_at": body["expires_at"],
++            "running_turns": state["running_turns"]}
++
++
+ @router.get("/api/hermes/update/check")
+ async def check_hermes_update(force: bool = False, profile: Optional[str] = None):
+     """Report whether a Hermes update is available, without applying it.
+diff --git a/tests/hermes_cli/serve_handler_ledger.json b/tests/hermes_cli/serve_handler_ledger.json
+index e11af2600f..27688f6dd5 100644
+--- a/tests/hermes_cli/serve_handler_ledger.json
++++ b/tests/hermes_cli/serve_handler_ledger.json
+@@ -2,7 +2,7 @@
+  "counts": {
+   "http": {
+    "keep-host-wide": 1,
+-   "undecided": 352
++   "undecided": 354
+   },
+   "rpc": {
+    "authority": 114,
+@@ -109,6 +109,7 @@
+   {"current_path": "hermes_cli.web_routers.status:get_health", "decision": "undecided", "handler": "GET /api/health", "kind": "http", "ref": ""},
+   {"current_path": "hermes_cli.web_routers.status:get_health_idle", "decision": "undecided", "handler": "GET /api/health/idle", "kind": "http", "ref": ""},
+   {"current_path": "hermes_cli.web_routers.actions:check_hermes_update", "decision": "undecided", "handler": "GET /api/hermes/update/check", "kind": "http", "ref": ""},
++  {"current_path": "hermes_cli.web_routers.actions:hermes_update_force_state", "decision": "undecided", "handler": "GET /api/hermes/update/force", "kind": "http", "ref": ""},
+   {"current_path": "hermes_cli.web_routers.actions:hermes_update_progress", "decision": "undecided", "handler": "GET /api/hermes/update/progress", "kind": "http", "ref": ""},
+   {"current_path": "hermes_cli.web_routers.actions:get_update_receipt", "decision": "undecided", "handler": "GET /api/hermes/update/receipt", "kind": "http", "ref": ""},
+   {"current_path": "hermes_cli.web_routers.status:get_host_identity", "decision": "undecided", "handler": "GET /api/host/identity", "kind": "http", "ref": ""},
+@@ -267,6 +268,7 @@
+   {"current_path": "hermes_cli.web_routers.git:git_worktree_remove_route", "decision": "undecided", "handler": "POST /api/git/worktree/remove", "kind": "http", "ref": ""},
+   {"current_path": "hermes_cli.web_routers.status:post_health_retirement", "decision": "undecided", "handler": "POST /api/health/retirement", "kind": "http", "ref": ""},
+   {"current_path": "hermes_cli.web_routers.actions:update_hermes", "decision": "undecided", "handler": "POST /api/hermes/update", "kind": "http", "ref": ""},
++  {"current_path": "hermes_cli.web_routers.actions:hermes_update_force", "decision": "undecided", "handler": "POST /api/hermes/update/force", "kind": "http", "ref": ""},
+   {"current_path": "hermes_cli.web_routers.local_models:local_models_activate", "decision": "undecided", "handler": "POST /api/local-models/activate", "kind": "http", "ref": ""},
+   {"current_path": "hermes_cli.web_routers.local_models:local_models_download", "decision": "undecided", "handler": "POST /api/local-models/download", "kind": "http", "ref": ""},
+   {"current_path": "hermes_cli.web_routers.local_models:local_models_download_browsed", "decision": "undecided", "handler": "POST /api/local-models/download-browsed", "kind": "http", "ref": ""},
+diff --git a/tests/hermes_cli/test_admission_fence_pause.py b/tests/hermes_cli/test_admission_fence_pause.py
+index 3f4867534f..c9b0117fb1 100644
+--- a/tests/hermes_cli/test_admission_fence_pause.py
++++ b/tests/hermes_cli/test_admission_fence_pause.py
+@@ -59,3 +59,46 @@ def test_clear_removes_the_request(tmp_path):
+     af.clear_pause_request(tmp_path)
+     assert af.pause_requested(tmp_path) is False
+     af.clear_pause_request(tmp_path)  # idempotent
++
++
++# ── [daveey] "Force update": the drainer stamps ``"force": true`` on the pause request ────────────────
++
++
++def test_forced_request_under_the_hold_is_forced(tmp_path):
++    _hold(tmp_path)
++    af.request_pause(tmp_path, expires_at=time.time() + 60, force=True)
++    assert af.pause_requested(tmp_path) is True and af.pause_forced(tmp_path) is True
++    body = json.loads((tmp_path / "core-update" / "pause-request").read_text())
++    assert body["force"] is True
++
++
++def test_unforced_request_is_not_forced(tmp_path):
++    _hold(tmp_path)
++    af.request_pause(tmp_path, expires_at=time.time() + 60)
++    assert af.pause_requested(tmp_path) is True and af.pause_forced(tmp_path) is False
++    assert "force" not in json.loads((tmp_path / "core-update" / "pause-request").read_text())
++
++
++def test_force_must_be_literally_true(tmp_path):
++    _hold(tmp_path)
++    (tmp_path / "core-update" / "pause-request").write_text(
++        json.dumps({"version": 1, "expires_at": time.time() + 60, "force": "yes"}))
++    assert af.pause_requested(tmp_path) is True and af.pause_forced(tmp_path) is False
++
++
++def test_expired_forced_request_is_not_forced(tmp_path):
++    _hold(tmp_path)
++    af.request_pause(tmp_path, expires_at=time.time() - 1, force=True)
++    assert af.pause_forced(tmp_path) is False
++
++
++def test_forced_request_without_the_hold_is_not_forced(tmp_path):
++    af.request_pause(tmp_path, expires_at=time.time() + 60, force=True)
++    assert af.pause_forced(tmp_path) is False
++
++
++def test_forced_check_never_raises_on_garbage(tmp_path):
++    _hold(tmp_path)
++    (tmp_path / "core-update" / "pause-request").write_text("[1, 2]")
++    assert af.pause_forced(tmp_path) is False
++    assert af.pause_forced(tmp_path / "missing") is False
+diff --git a/tests/hermes_cli/test_core_update_force.py b/tests/hermes_cli/test_core_update_force.py
+new file mode 100644
+index 0000000000..2c0e4994ef
+--- /dev/null
++++ b/tests/hermes_cli/test_core_update_force.py
+@@ -0,0 +1,139 @@
++"""[daveey] "Force update" from Desktop's version pill: ``<root>/core-update/force-request`` asks hermes-sync to
++push the pending core update through now. Its JSON is the cross-repo contract (hermes-sync reads it directly), and
++``GET/POST /api/hermes/update/force`` report and write it."""
++from __future__ import annotations
++
++import asyncio
++import json
++import socket
++import sqlite3
++import time
++import types
++
++import pytest
++
++from hermes_cli import core_update_force as cuf
++from hermes_state import SessionDB
++
++
++def test_write_then_read_round_trips_the_contract(tmp_path):
++    before = time.time()
++    body = cuf.write_force_request(tmp_path, "daveey")
++    on_disk = json.loads((tmp_path / "core-update" / "force-request").read_text())
++    assert on_disk == body
++    assert set(body) == {"version", "requested_at", "expires_at", "by"}
++    assert body["version"] == 1 and body["by"] == "daveey"
++    assert before <= body["requested_at"] <= time.time()
++    assert body["expires_at"] == pytest.approx(body["requested_at"] + 1800)
++    assert cuf.read_force_request(tmp_path) == body
++    assert not [p for p in (tmp_path / "core-update").iterdir() if p.name != "force-request"]  # no tmp left
++
++
++def test_missing_request_reads_as_none(tmp_path):
++    assert cuf.read_force_request(tmp_path) is None
++
++
++def test_expired_request_reads_as_none(tmp_path):
++    body = cuf.write_force_request(tmp_path, "dashboard")
++    assert cuf.read_force_request(tmp_path, now=body["expires_at"] - 1) is not None
++    assert cuf.read_force_request(tmp_path, now=body["expires_at"]) is None
++    assert cuf.read_force_request(tmp_path, now=body["expires_at"] + 60) is None
++
++
++@pytest.mark.parametrize("text", ["{not json", "[1, 2]", "null", json.dumps({"version": 1, "by": "x"}),
++                                  json.dumps({"requested_at": "soon", "expires_at": 9e12}),
++                                  json.dumps({"requested_at": 1.0, "expires_at": None})])
++def test_garbage_reads_as_none(tmp_path, text):
++    (tmp_path / "core-update").mkdir()
++    (tmp_path / "core-update" / "force-request").write_text(text)
++    assert cuf.read_force_request(tmp_path) is None
++
++
++def test_running_turn_count_counts_only_live_leases(tmp_path):
++    db = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        for key in ("live", "expired", "other-live"):
++            db.create_session(session_id=key, source="tui", model="test/model")
++            assert db.try_acquire_session_turn_lease(key, f"holder-{key}", ttl_seconds=300)
++    finally:
++        db.close()
++    with sqlite3.connect(tmp_path / "state.db") as conn:
++        conn.execute("UPDATE session_turn_leases SET expires_at=? WHERE holder=?", (time.time() - 60, "holder-expired"))
++    assert cuf.running_turn_count(tmp_path) == 2
++    assert cuf.running_turn_count(tmp_path, now=time.time() + 3600) == 0
++
++
++def test_running_turn_count_is_zero_without_a_readable_db(tmp_path, caplog):
++    assert cuf.running_turn_count(tmp_path) == 0  # no state.db at all
++    (tmp_path / "state.db").write_text("not a database")
++    with caplog.at_level("WARNING", logger="hermes_cli.core_update_force"):
++        assert cuf.running_turn_count(tmp_path) == 0
++    assert any("could not count running turns" in r.getMessage() and r.exc_info for r in caplog.records)
++
++
++# ── The REST routes ──────────────────────────────────────────────────────────────────────────────────
++
++
++@pytest.fixture
++def root(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    (home / "cache" / "core-update").mkdir(parents=True)
++    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    return home
++
++
++def _owe_update(root):
++    now = int(time.time())  # window.json carries whole seconds
++    (root / "cache" / "core-update" / "window.json").write_text(json.dumps(dict(
++        version=1, host=socket.gethostname().split(".")[0], observed_at=now - 5, window_at=now - 300,
++        state="draining", state_since=now - 300, drain_bound_s=7200, last_update_at=now - 5000, writer="drainer")))
++
++
++def _request(principal=None):
++    state = types.SimpleNamespace()
++    if principal:
++        state.token_principal = types.SimpleNamespace(principal=principal)
++    return types.SimpleNamespace(state=state)
++
++
++def _live_turn(root):
++    db = SessionDB(db_path=root / "state.db")
++    try:
++        db.create_session(session_id="busy", source="tui", model="test/model")
++        assert db.try_acquire_session_turn_lease("busy", "holder-busy", ttl_seconds=300)
++    finally:
++        db.close()
++
++
++def test_routes_when_hermes_sync_owes_an_update(root):
++    from hermes_cli.web_routers import actions
++
++    _owe_update(root)
++    _live_turn(root)
++    state = asyncio.run(actions.hermes_update_force_state())
++    assert state == {"available": True, "running_turns": 1, "pending": None}
++
++    result = asyncio.run(actions.hermes_update_force(_request("token:desktop")))
++    assert result["ok"] is True and result["running_turns"] == 1
++    assert result["expires_at"] == pytest.approx(result["requested_at"] + 1800)
++    on_disk = json.loads((root / "core-update" / "force-request").read_text())
++    assert on_disk["by"] == "token:desktop" and on_disk["requested_at"] == result["requested_at"]
++    assert asyncio.run(actions.hermes_update_force_state())["pending"] == on_disk
++
++    asyncio.run(actions.hermes_update_force(_request()))
++    assert json.loads((root / "core-update" / "force-request").read_text())["by"] == "dashboard"
++
++
++def test_routes_when_no_update_is_owed(root):
++    from hermes_cli.web_routers import actions
++
++    state = asyncio.run(actions.hermes_update_force_state())
++    assert state["available"] is False and state["running_turns"] == 0 and state["pending"] is None
++    assert "nothing to force" in state["message"]
++
++    response = asyncio.run(actions.hermes_update_force(_request("token:desktop")))
++    assert response.status_code == 409
++    body = json.loads(response.body)
++    assert body["ok"] is False and body["message"] == state["message"] == body["detail"]
++    assert not (root / "core-update" / "force-request").exists()
+diff --git a/tests/tui_gateway/test_update_pause_forced.py b/tests/tui_gateway/test_update_pause_forced.py
+new file mode 100644
+index 0000000000..7a6ca4db9f
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_forced.py
+@@ -0,0 +1,169 @@
++"""[daveey] "Force update": while hermes-sync serves a force request its pause request carries ``"force": true``.
++
++A turn the next backend would not auto-continue (``not_resumable_reason``: a user-typed turn with
++``auto_continue=false``, resume on startup off, ...) used to keep its running tool call and its admission
++reservation through the whole drain, so the update waited on it (example stalled-update incident). Under a forced
++pause its in-flight calls are cancelled after the same ``MID_TOOL_GRACE_S`` and the turn ends at the next step
++boundary with ``FORCED_STOP_REASON``: nothing keeps its marker, so it ends like a stopped turn and is not continued
++(the user sends it again). Resumable turns pause and auto-continue exactly as without force.
++
++Same harness as ``test_update_pause_mid_tool``: a real ``AIAgent`` turn, real tool executor, real SessionDB and the
++gateway's real hook and watcher; only the model and the tool bodies are fakes.
++"""
++
++from __future__ import annotations
++
++import logging
++import time
++
++from hermes_cli import admission_fence as af
++from tests.tui_gateway import test_update_pause_mid_tool as mid
++from tests.tui_gateway.test_update_pause_mid_tool import (
++    CFG, STAMP, TOOL_CAP_S, _Agent, _call, _durable_tools, _long_call, _make_agent, _response, _run_turn, _session,
++)
++from agent import update_pause_cancel
++from tui_gateway import server
++from tui_gateway import update_pause as up
++from tui_gateway.turn_marker import read_turn_marker, record_turn_start
++
++home = mid.home
++_quiet = mid._quiet
++NOT_RESUMABLE = {"desktop": {"auto_continue": dict(CFG["desktop"]["auto_continue"], resume_on_startup=False)}}
++
++
++def _request_pause(root, *, force):
++    af.set_hold(root)
++    af.request_pause(root, expires_at=time.time() + 120, force=force)
++
++
++def _not_resumable(monkeypatch):
++    monkeypatch.setattr(server, "_load_cfg", lambda: NOT_RESUMABLE)
++
++
++def test_forced_pause_cancels_a_non_resumable_turns_call_and_ends_the_turn(home, tmp_path, monkeypatch, caplog):
++    _not_resumable(monkeypatch)
++    record_turn_start(home, "session-key", "run the long job")
++    agent = _make_agent(tmp_path, "long_job")
++    session = _session(agent, home)
++    _request_pause(home, force=True)
++    monkeypatch.setattr("model_tools.handle_function_call", lambda *a, **k: _long_call())
++
++    started = time.monotonic()
++    with caplog.at_level(logging.INFO, logger="tui_gateway.update_pause"):
++        result = _run_turn(agent, session, [_response(_call("long_job", "call_1")), _response(), _response()])
++
++    assert time.monotonic() - started < TOOL_CAP_S / 2  # cancelled after the grace, not run to its own end
++    assert agent.client.chat.completions.create.call_count == 1  # the turn ends: no model call after the cancel
++    assert result["interrupted"] is True and result["paused_for_update"] == up.FORCED_STOP_REASON
++    assert STAMP.match(_durable_tools(home)["call_1"])  # the cancelled call's result is persisted
++    assert not agent._interrupt_requested
++    messages = [r.getMessage() for r in caplog.records]
++    assert any("core-update pause (forced): session session-key cancels the running tool call(s)" in m
++               for m in messages)
++    assert "core-update pause (forced): session session-key stops its non-resumable turn " \
++           "(desktop.auto_continue.resume_on_startup is off)" in messages
++
++    # Not a pause: the session keeps no marker for a continuation, and the turn end retires it like a Stop's.
++    assert not up.pause_stands(session, "session-key", result)
++    assert "_update_pause_marker_key" not in session
++    marker = read_turn_marker(home, "session-key")
++    assert marker.get("reason") != up.PAUSE_REASON
++    server._retire_turn_marker(session, "session-key")
++    assert read_turn_marker(home, "session-key") is None
++
++
++def test_forced_pause_ends_a_non_resumable_turn_at_the_next_boundary(home, tmp_path, monkeypatch):
++    _not_resumable(monkeypatch)
++    record_turn_start(home, "session-key", "p")
++    agent = _make_agent(tmp_path, "quick")
++    _request_pause(home, force=True)
++    monkeypatch.setattr("model_tools.handle_function_call", lambda *a, **k: "quick result")
++    result = _run_turn(agent, _session(agent, home), [_response(_call("quick", "call_1")), _response()])
++    assert result["paused_for_update"] == up.FORCED_STOP_REASON and result["interrupted"] is True
++    assert _durable_tools(home)["call_1"] == "quick result"  # finished calls keep their real results
++    assert agent.client.chat.completions.create.call_count == 1
++
++
++def test_unforced_pause_still_leaves_a_non_resumable_turn_running(home, tmp_path, monkeypatch):
++    _not_resumable(monkeypatch)
++    monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 0.05)
++    record_turn_start(home, "session-key", "p")
++    agent = _make_agent(tmp_path, "long_job")
++    _request_pause(home, force=False)
++
++    def _one_second(*_a, **_k):
++        time.sleep(1.0)  # health: allow HX013 -- the call must outlast the grace, so a cancel would land in it
++        return "ran to the end"
++
++    monkeypatch.setattr("model_tools.handle_function_call", _one_second)
++    result = _run_turn(agent, _session(agent, home), [_response(_call("long_job", "call_1")), _response()])
++    assert _durable_tools(home)["call_1"] == "ran to the end"
++    assert not result.get("paused_for_update") and result["completed"] is True
++    assert agent.client.chat.completions.create.call_count == 2
++
++
++def test_forced_pause_pauses_a_resumable_turn_exactly_as_before(home, tmp_path, monkeypatch):
++    record_turn_start(home, "session-key", "run the long job")
++    agent = _make_agent(tmp_path, "long_job")
++    session = _session(agent, home)
++    _request_pause(home, force=True)
++    monkeypatch.setattr("model_tools.handle_function_call", lambda *a, **k: _long_call())
++    result = _run_turn(agent, session, [_response(_call("long_job", "call_1")), _response()])
++    assert result["paused_for_update"] == up.PAUSE_REASON
++    assert STAMP.match(_durable_tools(home)["call_1"])
++    marker = read_turn_marker(home, "session-key")
++    assert marker["reason"] == up.PAUSE_REASON and marker["pauses"] == 1
++    assert session["_update_pause_marker_key"] == "session-key"  # kept for the continuation
++    server._retire_turn_marker(session, "session-key")
++    assert read_turn_marker(home, "session-key") is not None
++
++
++# ── The watcher's poll and the boundary hook, unit by unit ────────────────────────────────────────────
++
++
++def _step(home, agent, state, monkeypatch, now):
++    monkeypatch.setattr(up, "_mono", lambda: now)
++    return up.mid_tool_cancel_step(_session(agent, home), "session-key", agent, state)
++
++
++def test_poll_cancels_a_non_resumable_call_only_when_forced(home, monkeypatch):
++    _not_resumable(monkeypatch)
++    monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 30.0)
++    record_turn_start(home, "session-key", "p")
++    _request_pause(home, force=False)
++    agent, state = _Agent(), {}
++    vars(agent)["_update_pause_in_flight"] = {"c1": 0.0}
++    assert _step(home, agent, state, monkeypatch, 10.0) is None  # first sighting
++    assert _step(home, agent, state, monkeypatch, 100.0) is None and agent.interrupts == []  # declined
++    assert state["declined"] == "desktop.auto_continue.resume_on_startup is off"
++
++    _request_pause(home, force=True)  # the drainer starts serving a force request
++    assert _step(home, agent, state, monkeypatch, 100.0) == ["c1"]
++    assert agent.interrupts == [update_pause_cancel.CANCEL_TOOL_REASON]
++
++
++def test_forced_poll_keeps_the_grace(home, monkeypatch):
++    _not_resumable(monkeypatch)
++    monkeypatch.setattr(up, "MID_TOOL_GRACE_S", 30.0)
++    record_turn_start(home, "session-key", "p")
++    _request_pause(home, force=True)
++    agent, state = _Agent(), {}
++    vars(agent)["_update_pause_in_flight"] = {"c1": 50.0}
++    assert _step(home, agent, state, monkeypatch, 60.0) is None
++    assert _step(home, agent, state, monkeypatch, 89.9) is None and agent.interrupts == []  # 30 s after sighting
++    assert _step(home, agent, state, monkeypatch, 90.0) == ["c1"]
++
++
++def test_hook_stops_a_non_resumable_turn_only_when_forced(home, monkeypatch):
++    _not_resumable(monkeypatch)
++    record_turn_start(home, "session-key", "p")
++    session = _session(_Agent(), home)
++    hook = up.boundary_pause_hook(session, "session-key")
++    _request_pause(home, force=False)
++    assert hook() is None
++    _request_pause(home, force=True)
++    assert hook() == up.FORCED_STOP_REASON
++    assert "_update_pause_marker_key" not in session  # nothing kept for a continuation
++    assert read_turn_marker(home, "session-key").get("reason") != up.PAUSE_REASON
++    af.clear_pause_request(home)
++    assert hook() is None  # no request, no stop
+diff --git a/tests/tui_gateway/test_update_pause_forced_prompts.py b/tests/tui_gateway/test_update_pause_forced_prompts.py
+new file mode 100644
+index 0000000000..8e25da24f8
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_forced_prompts.py
+@@ -0,0 +1,75 @@
++"""[daveey] "Force update": a non-resumable turn blocked on a pending approval or clarify never reaches a step
++boundary, so a forced pause withdraws those prompts too (with a notice that the turn does not continue), exactly as
++an unforced pause does for a resumable turn. The incident's turn was user-typed with ``auto_continue=false``."""
++
++from __future__ import annotations
++
++import time
++
++from agent import update_pause_cancel
++from hermes_cli import admission_fence as af
++from tests.tui_gateway import test_update_pause_clarify as helpers
++from tests.tui_gateway.test_update_pause_approval import _cleanup, _pending
++from tools import approval
++from tui_gateway import update_pause as up
++from tui_gateway.turn_marker import read_turn_marker, record_turn_start
++
++env = helpers.env
++
++
++def _opted_out(env):
++    record_turn_start(env.home, "session-key", "the prompt", auto_continue=False)
++
++
++def _forced_pause(root):
++    af.set_hold(root)
++    af.request_pause(root, expires_at=time.time() + 120, force=True)
++
++
++def test_forced_pause_withdraws_an_opted_out_turns_approval(env, monkeypatch):
++    _opted_out(env)
++    thread, box, settled = _pending(monkeypatch, "session-key")
++    try:
++        assert update_pause_cancel.in_flight(env.session["agent"]) == {}
++        _forced_pause(env.home)
++        up.mid_tool_cancel_step(env.session, "session-key", env.session["agent"], {})
++        thread.join(2)
++        assert not thread.is_alive(), "a pending approval still blocks the forced update"
++        assert box["result"]["choice"] is None
++        assert "does not continue automatically" in box["result"]["cancelled"]
++        assert approval.list_gateway_approvals("session-key") == []
++        assert settled == ["session_closed"]
++    finally:
++        _cleanup(thread, box, "session-key")
++
++
++def test_unforced_pause_keeps_an_opted_out_turns_approval(env, monkeypatch):
++    _opted_out(env)
++    thread, box, settled = _pending(monkeypatch, "session-key")
++    try:
++        helpers._request_pause(env.home)
++        up.mid_tool_cancel_step(env.session, "session-key", env.session["agent"], {})
++        assert approval.has_blocking_approval("session-key") and settled == []
++    finally:
++        _cleanup(thread, box, "session-key")
++
++
++def test_forced_pause_withdraws_an_opted_out_turns_clarify_and_stops_the_turn(env):
++    _opted_out(env)
++    helpers._request_pause(env.home)
++    assert up.clarify_pause_provider("session-key", "tc1") is None  # unforced: the clarify stays
++
++    _forced_pause(env.home)
++    early = up.clarify_pause_provider("session-key", "tc1")
++    assert early is not None and early.result["status"] == up.CLARIFY_PAUSE_STATUS
++    assert early.result["notice"] == up.CLARIFY_FORCED_NOTICE
++    # The boundary right after it ends the turn, without a pause a continuation would pick up.
++    assert env.session["agent"].step_boundary_pause() == up.FORCED_STOP_REASON
++    assert read_turn_marker(env.home, "session-key").get("reason") != up.PAUSE_REASON
++
++
++def test_forced_pause_withdraws_a_resumable_turns_clarify_with_the_usual_notice(env):
++    _forced_pause(env.home)
++    early = up.clarify_pause_provider("session-key", "tc1")
++    assert early is not None and early.result["notice"] == up.CLARIFY_PAUSE_NOTICE
++    assert env.session["agent"].step_boundary_pause() == up.PAUSE_REASON
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index 1538c3adfd..76eff20ef8 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -15,7 +15,8 @@ A continuation's pre-turn and pre-first-request pauses (t_01a1d31bf400d56c) make
+ (``drain_retry_pending``, at most ``PARK_MAX_S``) without having taken a step. That is the intended bound: a
+ window that cannot apply should not keep re-running the same request.
+ 
+-A turn the next backend would not auto-continue is never paused. A paused turn whose window ends without
++A turn the next backend would not auto-continue is never paused (a forced pause stops it instead:
++``FORCED_STOP_REASON``). A paused turn whose window ends without
+ an update (expired, apply refused) continues in place (``start_in_place_watcher``), unless its pause
+ budget is spent and the drainer still runs. Drainer exit/cancellation releases that wait automatically, and
+ so does ``PARK_MAX_S`` since the pause: a paused turn never waits on a drainer that cannot apply. A turn
+@@ -64,9 +65,15 @@ PAUSE_RESTARTS_FRESHNESS = True
+ # own grace), a still-running call of an auto-continuable turn
+ # is cancelled through the user-Stop interrupt path (``start_mid_tool_cancel``), its result is persisted as
+ # ``interrupted_tool_result`` and the turn pauses at the step boundary right after it, as ``boundary_pause_hook``
+-# does. Turns ``not_resumable_reason`` rejects are never cancelled.
++# does. Turns ``not_resumable_reason`` rejects are never cancelled, unless the pause is forced (below).
+ MID_TOOL_CANCEL = True
+ MID_TOOL_GRACE_S = 30.0
++# [daveey] "Force update" (hermes_cli.core_update_force): while the pause request carries ``"force": true``
++# (``admission_fence.pause_forced``), a turn ``not_resumable_reason`` rejects is no longer left running: its
++# in-flight calls are cancelled after the same grace and the hook ends it at the next step boundary with this
++# reason. Nothing keeps its marker, so it ends like a stopped turn and is not continued: the user re-sends it.
++# Resumable turns pause and auto-continue exactly as without force.
++FORCED_STOP_REASON = "core_update_forced_stop"
+ MID_TOOL_POLL_S = 1.0
+ WATCH_POLL_S = 5.0
+ WATCH_MAX_S = 6 * 3600.0
+@@ -147,6 +154,15 @@ def pause_requested(session: dict) -> bool:
+         return False
+ 
+ 
++def pause_forced(session: dict) -> bool:
++    from hermes_cli.admission_fence import pause_forced as forced
++    try:
++        return forced(_root(session))
++    except Exception:
++        logger.debug("core-update pause: force flag unreadable", exc_info=True)
++        return False
++
++
+ def not_resumable_reason(session: dict, marker_key: str) -> str | None:
+     """None when the next backend will auto-continue this turn (the startup sweep's rules); else why not."""
+     from tui_gateway import server
+@@ -289,6 +305,9 @@ def boundary_pause_hook(session: dict, marker_key: str, *, carried: bool = False
+         if user_stop_pending(session):  # before the marker is stamped or any job stopped; rechecked below
+             return None
+         why = not_resumable_reason(session, marker_key)
++        if why and pause_forced(session):
++            logger.info("core-update pause (forced): session %s stops its non-resumable turn (%s)", marker_key, why)
++            return FORCED_STOP_REASON
+         if why:
+             if not declined:
+                 declined.append(why)
+@@ -464,7 +483,10 @@ def mid_tool_cancel_step(session: dict, marker_key: str, agent: Any, state: dict
+     if not running or now - max(seen, max(running.values())) < MID_TOOL_GRACE_S:
+         return None
+     why = not_resumable_reason(session, marker_key)
+-    if why:
++    if why and pause_forced(session):
++        logger.info("core-update pause (forced): session %s cancels the running tool call(s) of its non-resumable "
++                    "turn (%s)", marker_key, why)
++    elif why:
+         if state.get("declined") != why:
+             state["declined"] = why
+             logger.info("core-update pause: session %s keeps its running tool call (%s)", marker_key, why)
+@@ -504,6 +526,9 @@ def start_mid_tool_cancel(session: dict, marker_key: str, agent: Any) -> Callabl
+ CLARIFY_PAUSE_STATUS = "paused_for_update"
+ CLARIFY_PAUSE_NOTICE = ("Hermes is pausing this turn at a step boundary for an update, so this question was "
+                         "withdrawn unanswered. The turn continues automatically after the update: ask it again then.")
++# A forced update stops a turn that will not continue automatically: the user sends the request again.
++CLARIFY_FORCED_NOTICE = ("A forced Hermes update is stopping this turn, so this question was withdrawn unanswered. "
++                         "The turn does not continue automatically; the user will send the request again.")
+ _clarify_provider_lock = threading.Lock()
+ _clarify_provider_installed = False
+ 
+@@ -527,12 +552,15 @@ def clarify_pause_provider(session_id: str, tool_call_id: str):
+     if session is None or getattr(session.get("agent"), "step_boundary_pause", None) is None:
+         return None
+     marker_key = str(session.get("session_key") or "")
+-    if not marker_key or not pause_requested(session) or not_resumable_reason(session, marker_key):
++    if not marker_key or not pause_requested(session):
++        return None
++    stops = bool(not_resumable_reason(session, marker_key))  # the forced pause ends it unpaused
++    if stops and not pause_forced(session):
+         return None
+     from tools.clarify_early import EarlyAnswer
+     logger.info("core-update pause: session %s withdrew a pending clarify to pause for a Hermes update", marker_key)
+     return EarlyAnswer({"status": CLARIFY_PAUSE_STATUS, "outcome": CLARIFY_PAUSE_STATUS,
+-                        "notice": CLARIFY_PAUSE_NOTICE}, commit=lambda: None)
++                        "notice": CLARIFY_FORCED_NOTICE if stops else CLARIFY_PAUSE_NOTICE}, commit=lambda: None)
+ 
+ 
+ def install_clarify_pause_provider() -> None:
+diff --git a/tui_gateway/update_pause_approval.py b/tui_gateway/update_pause_approval.py
+index 703cbb3613..7a249415a1 100644
+--- a/tui_gateway/update_pause_approval.py
++++ b/tui_gateway/update_pause_approval.py
+@@ -3,6 +3,8 @@ from tools import approval
+ 
+ NOTICE = ("Hermes is pausing this turn for an update. This approval was withdrawn unanswered; "
+           "the command was not approved. Ask for approval again after the turn continues.")
++FORCED_NOTICE = ("A forced Hermes update is stopping this turn. This approval was withdrawn unanswered; "
++                 "the command was not approved. The turn does not continue automatically.")
+ 
+ 
+ def withdraw_for_update(session: dict, marker_key: str, agent) -> None:
+@@ -17,9 +19,12 @@ def withdraw_for_update(session: dict, marker_key: str, agent) -> None:
+     if getattr(agent, "step_boundary_pause", None) is None or getattr(agent, "_interrupt_requested", False):
+         return
+     pending = approval.list_gateway_approvals(marker_key)
+-    if not pending or up.not_resumable_reason(session, marker_key):
++    if not pending:
++        return
++    stops = bool(up.not_resumable_reason(session, marker_key))  # the forced pause ends it unpaused
++    if stops and not up.pause_forced(session):
+         return
+     for item in pending:
+-        if approval.withdraw_gateway_approval(marker_key, item["request_id"], NOTICE):
++        if approval.withdraw_gateway_approval(marker_key, item["request_id"], FORCED_NOTICE if stops else NOTICE):
+             up.logger.info("core-update pause: session %s withdrew pending approval %s unanswered",
+                            marker_key, item["request_id"])
+diff --git a/website/docs/user-guide/features/web-dashboard.md b/website/docs/user-guide/features/web-dashboard.md
+index 9a7d573e6b..56a04d51f0 100644
+--- a/website/docs/user-guide/features/web-dashboard.md
++++ b/website/docs/user-guide/features/web-dashboard.md
+@@ -680,6 +680,7 @@ same auth gate as the rest of `/api/`.
+ | `GET /api/system/stats` | Host stats — OS, CPU, memory, disk, uptime |
+ | `GET /api/hermes/update/check` | Report update availability (commits behind, install method) without applying. For git installs that are behind, also returns a `commits` list (`sha`, `summary`, `author`, `at`) of what's changed. `?force=1` busts the 24h cache (the check goes through the GitHub API, never `git fetch`) |
+ | `GET /api/hermes/update/progress` | This host's background core update from `hermes-sync`: `{progress: null}` when none is owed, else `state` (`batching` / `draining` / `applying` / `blocked`), `due_at`, `state_since`, `elapsed_s` (host clock), the drainer's `cap_s` and what it is `waiting_on`. Polled by Desktop's version pill |
++| `GET /api/hermes/update/force` · `POST /api/hermes/update/force` | "Force update" (Desktop's backend version pill): `GET` reports `{available, running_turns, pending}` (`available` when `hermes-sync` owes an update here, as `/progress` reports; `message` when not); `POST` writes `core-update/force-request` so `hermes-sync` applies it now, stopping running turns at their next step boundary (resumable ones continue after the update). `409` when no update is owed |
+ | `GET /api/curator` · `PUT .../paused` · `POST .../run` | Skill-curator status + pause/resume + run |
+ | `GET /api/portal` | Nous Portal auth + Tool Gateway routing (read-only) |
+ | `POST /api/ops/prompt-size` · `/dump` · `/config-migrate` | Diagnostics (backgrounded) |
+-- 
+2.43.0
+

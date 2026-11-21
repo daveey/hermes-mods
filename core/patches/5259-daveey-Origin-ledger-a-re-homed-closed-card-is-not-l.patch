@@ -1,0 +1,200 @@
+From 4d3106fc3f219b73adda7010afe0214858c2115c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 16:23:17 +0000
+Subject: [PATCH] [daveey] Origin ledger: a re-homed closed card is not left
+ unknown when its old owner's gateway name is reused
+
+A scaled-in worker's gateway name was reused by a new instance. The name stayed listed, so the
+removed-owner rule never applied, and the new instance never published the card: its binding stayed
+unknown for good and blocked the origin chat's session_outcome.
+
+Fix: a listed, non-local owner that publishes no record of the card is treated like a removed one.
+Another gateway publishing the same (board, id, created_at) drops the binding; otherwise, with the owner's
+exact scope heartbeat fresh and readable, a stored done/archived observation is final. An open one,
+an offline/unreadable scope, a stale replica and this gateway's own cards are unchanged.
+
+Proof: tests/hermes_cli/test_kanban_origin_reused_owner_name.py: 3 red on main, 12 green; 101 origin
+consumer files (2107 tests) green.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_origin_ledger.py            |  21 ++++
+ .../test_kanban_origin_reused_owner_name.py   | 117 ++++++++++++++++++
+ 2 files changed, 138 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_origin_reused_owner_name.py
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 7f767dd018..17a2d8649e 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -514,6 +514,21 @@ class _Publications:
+         return False
+ 
+ 
++def _reused_owner(elsewhere: _Publications, owner: dict, task: dict, *, absent: bool, scope_live: bool) -> bool | None:
++    """``_removed_owner`` for an owner whose gateway NAME is still listed but no longer publishes the card (a scaled-in
++    worker's name reused by a new instance: a done, re-homed card stayed unknown for good). [daveey]
++
++    None when another gateway publishes the same card (board, id, created_at): re-homed, binding not projected. True
++    when no one does, the owner's exact scope heartbeat is fresh and readable (``scope_live``) and the card is absent
++    from it, and the stored observation is closed (done or archived): that is its final word. False otherwise: an
++    open stored observation, an offline or unreadable owner, or a record the owner still publishes is unchanged."""
++    if not absent:
++        return False
++    if elsewhere.has_other(owner, task):
++        return None
++    return bool(scope_live and task.get('status') in ('done', 'archived'))
++
++
+ def _lock_busy(exc: sqlite3.Error) -> bool:
+     code = getattr(exc, "sqlite_errorcode", None)
+     if code is not None:
+@@ -589,6 +604,7 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                 # even when the replica version has not advanced.
+                 released = bool(released and _owner_evidence(task).get('verified') is True)
+                 current = settled = False
++                absent = scope_live = False
+                 if fresh and source is not None:
+                     row = source.execute(
+                         "SELECT version,data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
+@@ -617,9 +633,14 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                     live = (_recent(heartbeat, now, window)
+                             or _recent(_owner_evidence(task).get('observed_at'), now))
+                     current = current and readable and live
++                    absent = row is None
++                    scope_live = readable and _recent(heartbeat, now, window)
+                 # [daveey] An owner the Board removed (``_removed_owner``): a re-homed card's binding is dropped, and
+                 # otherwise its stored observation is its last word (``final``), as a current record would be.
+                 final = _removed_owner(elsewhere, listed, owner, task, (gateway, profile))
++                if final is False and listed and owner['gateway'] in listed \
++                        and (owner['gateway'], owner['profile']) != (gateway, profile):
++                    final = _reused_owner(elsewhere, owner, task, absent=absent, scope_live=scope_live)
+                 if final is None:
+                     continue
+                 if (owner['gateway'], owner['profile']) == (gateway, profile):
+diff --git a/tests/hermes_cli/test_kanban_origin_reused_owner_name.py b/tests/hermes_cli/test_kanban_origin_reused_owner_name.py
+new file mode 100644
+index 0000000000..2cd058939a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_reused_owner_name.py
+@@ -0,0 +1,117 @@
++"""A re-homed card's owner gateway NAME is reused by a new instance: the old binding must not stay unknown. [daveey]
++
++Example incident: a worker was scaled in and its done card re-homed; a new instance reused the old gateway name.
++The name stayed listed, so the removed-owner rule never applied, and the new instance never published the card: the
++binding stayed unknown for good and its chat could not declare session_outcome done.
++"""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_origin_ledger as ledger
++from tests.hermes_cli.test_kanban_origin_creation import board as board  # noqa: PLC0414 -- pytest fixture
++from tests.hermes_cli.test_kanban_origin_ledger import world as world  # noqa: PLC0414 -- pytest fixture
++from tests.hermes_cli.test_kanban_release_survives_owner_offline import (
++    _bound_done, _origin_profile as _origin_profile, _project, _rehash,  # noqa: PLC0414 -- autouse fixture
++)
++
++NOW = 5001
++
++
++def _reuse_name(replica, *, beat=5000, other=False, task=None, binding=None):
++    """The owner name stays listed with a fresh heartbeat for its scope, but publishes no record of the card."""
++    with sqlite3.connect(replica) as db:
++        db.execute("DELETE FROM replica WHERE gw='owner' AND coll='tasks'")
++        info = json.loads(db.execute("SELECT data FROM replica WHERE gw='owner' AND coll='gateway'").fetchone()[0])
++        info['task_scopes'][0]['observed_at'] = beat  # the scope the collector announced, beating again
++        db.execute("UPDATE replica SET data=?, version=7 WHERE gw='owner' AND coll='gateway'", (json.dumps(info),))
++        db.execute("UPDATE meta SET v=? WHERE k='last_ok'", (str(NOW - 1),))
++        if other:
++            moved = {k: v for k, v in task.items() if k != 'origin_observation'} | {'gateway': 'hub', 'status': 'archived'}
++            key = '/'.join((binding['owner']['profile'], binding['owner']['board'], binding['owner']['task_id']))
++            db.execute("INSERT INTO replica VALUES ('hub','tasks',?,1,?)", (key, json.dumps(moved)))
++
++
++def _setup(world, *, other, verified=True, status_edit=None):
++    path, replica = _bound_done(world, verified_completion=verified)
++    _, _, binding = world
++    with sqlite3.connect(replica) as db:
++        task = json.loads(db.execute("SELECT data FROM replica WHERE coll='tasks' AND gw='owner'").fetchone()[0])
++        task['created_at'] = 1234
++        task = _rehash(task)
++        db.execute("UPDATE replica SET data=?, version=6 WHERE coll='tasks' AND gw='owner'", (json.dumps(task),))
++    _project(path, replica, 1001)  # the ledger stores the owner's last record
++    return path, replica, binding, task
++
++
++def test_a_rehomed_card_drops_the_binding_when_the_owner_name_is_reused(world, board):
++    path, replica, binding, task = _setup(world, other=True)
++    _reuse_name(replica, other=True, task=task, binding=binding)
++    rows = ledger.project(path, replica=replica, gateway='origin', profile='default', now=NOW)
++    assert rows == [], 'another gateway publishes the same card: the binding to the reused name is not projected'
++
++
++def test_another_card_reusing_the_id_does_not_drop_the_binding(world, board):
++    path, replica, binding, task = _setup(world, other=True)
++    _reuse_name(replica, other=True, task={**task, 'created_at': 9999}, binding=binding)
++    rows = ledger.project(path, replica=replica, gateway='origin', profile='default', now=NOW)
++    assert len(rows) == 1 and rows[0]['unfinished'] is False, 'no other publisher of THIS card: stored done is final'
++
++
++def test_a_done_card_absent_from_a_live_reused_owner_is_finished(world, board):
++    path, replica, _, _ = _setup(world, other=False)
++    _reuse_name(replica)
++    row = _project(path, replica, NOW)
++    assert (row['status'], row['unfinished']) == ('done', False)
++
++
++def test_an_open_stored_observation_stays_unknown(world, board):
++    from hermes_cli import kanban_db_connect as kbc
++    from tests.hermes_cli.test_kanban_origin_evidence import create_bound, publish_observed
++    from tests.hermes_cli.test_kanban_origin_ledger import accept
++    path, replica, binding = world
++    with kbc.connect_closing() as conn:
++        create_bound(conn, binding)
++        publish_observed(conn, replica, binding, version=3)
++        accept(world)
++    _project(path, replica, 1001)
++    _reuse_name(replica)
++    row = _project(path, replica, NOW)
++    assert (row['status'], row['unfinished']) == ('unknown', True)
++
++
++@pytest.mark.parametrize('fault', ['stale-heartbeat', 'no-scope', 'scope-not-ok', 'bad-info', 'no-info', 'stale-replica'])
++def test_an_offline_or_unreadable_owner_scope_stays_unknown(world, board, fault):
++    path, replica, _, _ = _setup(world, other=False)
++    _reuse_name(replica, beat=1000 if fault == 'stale-heartbeat' else 5000)
++    with sqlite3.connect(replica) as db:
++        info = json.loads(db.execute("SELECT data FROM replica WHERE gw='owner' AND coll='gateway'").fetchone()[0])
++        if fault == 'no-scope':
++            info['task_scopes'] = []
++        elif fault == 'scope-not-ok':
++            info['task_scopes'][0]['state'] = 'error'
++        if fault == 'bad-info':
++            db.execute("UPDATE replica SET data='{' WHERE gw='owner' AND coll='gateway'")
++        elif fault == 'no-info':
++            # still listed by another record of the owner, but with no inventory
++            db.execute("DELETE FROM replica WHERE gw='owner' AND coll='gateway'")
++            db.execute("INSERT INTO replica VALUES ('owner','tasks','work/build/t_unrelated',1,'{}')")
++        else:
++            db.execute("UPDATE replica SET data=? WHERE gw='owner' AND coll='gateway'", (json.dumps(info),))
++        if fault == 'stale-replica':
++            db.execute("UPDATE meta SET v='1000' WHERE k='last_ok'")
++    row = _project(path, replica, NOW if fault != 'stale-replica' else NOW + 37 * 3600)
++    assert row['status'] == 'unknown' and row['unfinished'] and row['stale']
++
++
++def test_an_owner_that_still_publishes_the_card_is_unchanged(world, board):
++    """Its own record is current evidence; the new rule applies only to a card the owner does not publish."""
++    path, replica, _, _ = _setup(world, other=False)
++    with sqlite3.connect(replica) as db:
++        db.execute("UPDATE meta SET v=? WHERE k='last_ok'", (str(NOW - 1),))
++        db.execute("UPDATE replica SET data=json_set(data,'$.status','running'), version=8 "
++                   "WHERE gw='owner' AND coll='tasks'")
++    row = _project(path, replica, NOW)
++    assert row['reported_status'] == 'running' and row['unfinished'] is True
++
+-- 
+2.43.0
+

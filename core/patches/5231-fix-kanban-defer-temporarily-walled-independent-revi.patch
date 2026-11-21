@@ -1,0 +1,290 @@
+From 20c76ca81a42f8e983d0eb7acaa4e3136190e86b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 12:04:20 +0000
+Subject: [PATCH] fix(kanban): defer temporarily walled independent reviews
+ before claim [daveey]
+
+Review dispatch was claiming cards with no independent reviewer available on
+this host, then escalating three identical resolution failures into gave_up.
+
+Why 1: route resolution rejected temporary provider walls only after claim.
+Why 2: temporary walls/holds and permanent provenance/policy failures shared
+ReviewModelUnavailable without a deadline-bearing admission result.
+Why 3: preclaim admission checked fresh implementation pins, not independent
+review routes; repeated unavailable reviews deliberately exhausted deferrals.
+Root (happened): temporary review availability lacked a typed preclaim wait.
+Root (not caught): skip tests excluded the review lane without exercising a
+complete implementer set whose remaining independent routes were all walled.
+Recurrence: Build A and Build B both hit the same three-deferral escalation.
+
+Resolve the same independent routes before claim and record host-local wait
+telemetry without creating runs or changing card status/failure budgets.
+Track earliest route availability, with max overlapping wall/hold deadlines
+per route. Keep structural errors on their existing path. Preserve the typed
+temporary refusal through the tier wrapper so a wall racing preflight cannot
+exhaust permanent admission deferrals.
+
+Proof:
+- Original core source: 8 new dispatch regression cases FAILED.
+- Fixed source: 72 files, 1602 tests passed, 0 failed, including 15 new cases.
+- scripts/check --base origin/main: all 21 checks passed.
+- Cases cover review and downstream ready lanes, provider/pacing/live walls,
+  overlap deadlines, unwalled pickup, dry runs, expiry, alternate reviewers,
+  registry refusal, structural absence, earliest release and postcheck race.
+---
+ hermes_cli/kanban_db_dispatch_admission.py    |  3 +
+ hermes_cli/kanban_model_tier.py               |  4 +-
+ hermes_cli/kanban_review_admission.py         | 40 ++++++++
+ hermes_cli/kanban_review_model.py             | 32 +++++-
+ .../test_kanban_review_wall_admission.py      | 98 +++++++++++++++++++
+ 5 files changed, 173 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_review_admission.py
+ create mode 100644 tests/hermes_cli/test_kanban_review_wall_admission.py
+
+diff --git a/hermes_cli/kanban_db_dispatch_admission.py b/hermes_cli/kanban_db_dispatch_admission.py
+index a9adc826a7..9be0be0a64 100644
+--- a/hermes_cli/kanban_db_dispatch_admission.py
++++ b/hermes_cli/kanban_db_dispatch_admission.py
+@@ -28,6 +28,9 @@ def lane_admission_refused(conn: sqlite3.Connection, task_id: str, assignee: str
+     if (code := dispatch_refusal(conn, task_id, assignee, spawn_fn, dry_run=dry_run)) is not None:
+         result.capsule_refused.append((task_id, code))
+         return True
++    from hermes_cli.kanban_review_admission import hold as review_hold
++    if review_hold(conn, task_id, result, lane=lane, dry_run=dry_run):
++        return True
+     if budget_refused(conn, task_id, result, dry_run=dry_run):
+         return True
+     # A fresh card pinned to a quota-walled model would only spawn into the wall (kanban_dispatch_skip). [daveey]
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index ff58b2cb2c..3c0cc5b5b8 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -466,8 +466,8 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+         model, provider, reason = resolve_dispatch_tier(conn, task, lane=lane, cfg=cfg)
+     except Exception as exc:
+         if is_review:
+-            from hermes_cli.kanban_review_model import ReviewModelUnavailable
+-            raise ReviewModelUnavailable(f"Review model resolution failed: {exc}") from exc
++            from hermes_cli.kanban_review_model import resolution_error
++            raise resolution_error(exc) from exc
+         from hermes_cli.kanban_pace_reroute import lose as _lose_pace_offer
+         _lose_pace_offer(getattr(task, "id", ""), f"route resolution failed: {type(exc).__name__}")
+         logger.warning("kanban model tier: resolve failed for %s (%s)", getattr(task, "id", "?"), exc,
+diff --git a/hermes_cli/kanban_review_admission.py b/hermes_cli/kanban_review_admission.py
+new file mode 100644
+index 0000000000..64c205242c
+--- /dev/null
++++ b/hermes_cli/kanban_review_admission.py
+@@ -0,0 +1,40 @@
++"""Host-local, deadline-bearing review admission before claims. [daveey]"""
++from __future__ import annotations
++
++from hermes_cli import kanban_review_model as review
++
++EVENT = "review_route_deferred"
++REASON = "review_provider_wall"
++
++
++def hold(conn, task_id, result, *, lane, dry_run):
++    """Defer only proven temporary exhaustion, not missing provenance/policy errors.
++
++    Resolve with the same host-local policy as spawn. Leave status and run/failure
++    budgets untouched so another host with an available reviewer can claim it.
++    """
++    import sqlite3
++
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_model_tier import load_tier_config
++
++    task = kb.get_task(conn, task_id)
++    if task is None or not review.is_review_run(conn, task, lane):
++        return False
++    try:
++        review.resolve_review_model(conn, task, load_tier_config())
++    except review.ReviewRouteDeferred as exc:
++        payload = {"reason": REASON, "until": exc.until}
++    except (review.ReviewModelUnavailable, sqlite3.Error):
++        return False  # retain structural admission error handling
++    else:
++        return False
++    result.clock_held[task_id] = (REASON, payload["until"])
++    result.respawn_guarded.append((task_id, REASON))
++    if not dry_run:
++        with kb.write_txn(conn):
++            row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=? "
++                               "ORDER BY id DESC LIMIT 1", (task_id, EVENT)).fetchone()
++            if row is None or kb._json_dict(row[0]) != payload:
++                kb._append_event(conn, task_id, EVENT, payload)
++    return True
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index e15387f0ed..9dcd3845c5 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -170,6 +170,20 @@ class ReviewModelUnavailable(ModelRoutingError):
+     """No independent reviewer is configured; do not spawn the implementer's model."""
+ 
+ 
++class ReviewRouteDeferred(ReviewModelUnavailable):
++    """Independent reviewers exist, but this host must wait for a known deadline."""
++
++    def __init__(self, detail, until):
++        super().__init__(detail)
++        self.until = until
++
++
++def resolution_error(exc):
++    """Preserve deadline-bearing refusals through the tier's contextual error wrapper."""
++    return exc if isinstance(exc, ReviewRouteDeferred) else ReviewModelUnavailable(
++        f"Review model resolution failed: {exc}")
++
++
+ def _handoff(conn, task):
+     """``(run_id, metadata)`` of the latest review handoff, or ``(None, {})``."""
+     # Metadata belongs to the handoff run, not to the Task row. Read only the
+@@ -288,6 +302,8 @@ def admission_refusal(conn, task_id, exc):
+     A host that cannot place the worker (no restart-safe scope) or an unavailable independent reviewer is
+     infrastructure: retried with the budget untouched, until ``deferral_exhausted`` sends the review to a block."""
+     from tools.process_registry import RestartSafeScopeUnavailable
++    if isinstance(exc, ReviewRouteDeferred):
++        return True, False, None  # a wall appearing after preflight never exhausts reviewer admission
+     if isinstance(exc, ReviewModelUnavailable) and deferral_exhausted(conn, task_id, str(exc)):
+         return False, True, {"admission_refusal": "review_model_unavailable", "deferrals": DEFERRAL_LIMIT}
+     from hermes_cli.kanban_pace_reroute import OfferLost  # a lapsed pace move: requeue for a fresh judgment
+@@ -354,11 +370,21 @@ def resolve_review_model(conn, task, cfg):
+     from hermes_cli.kanban_model_tier import infer_provider
+     from hermes_cli.kanban_pin_reroute import is_mandatory_pin
+     now = time.time()
+-    walled = {**pw.active_walls(now=now), **held_pools(cfg.get("llm_pacing"), now)}
++    walls = pw.active_walls(now=now)
++    holds = held_pools(cfg.get("llm_pacing"), now)
++    waits = []
+ 
+     def _unavailable(model, provider):
+         norm = pw._norm(provider)
+-        return not norm or norm == "auto" or norm in walled or bool(pw.live_quota_wall(norm, model))
++        if not norm or norm == "auto":
++            return True
++        deadlines = [value for value in (walls.get(norm), holds.get(norm), pw.live_quota_wall(norm, model))
++                     if isinstance(value, (int, float)) and value > now]
++        if deadlines:
++            if registry_refusal(model, provider, assignee) is None:
++                waits.append(max(deadlines))  # a route needs ALL its overlapping walls/holds to clear
++            return True
++        return False
+ 
+     # A concrete, independent handoff override is honored unless its pool is held or walled (the fast return
+     # used to skip that check and run the reviewer into the hold/wall): then the next independent route takes it.
+@@ -397,4 +423,6 @@ def resolve_review_model(conn, task, cfg):
+     detail = f"No eligible {levels} review model distinct from {sorted(excluded)!r}"
+     if refusal and override:
+         detail = f"review_model {override[0]!r} is refused here ({refusal.code}); {detail}"
++    if waits:
++        raise ReviewRouteDeferred(detail, min(waits))
+     raise ReviewModelUnavailable(detail)
+diff --git a/tests/hermes_cli/test_kanban_review_wall_admission.py b/tests/hermes_cli/test_kanban_review_wall_admission.py
+new file mode 100644
+index 0000000000..bfe03cc0bd
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_review_wall_admission.py
+@@ -0,0 +1,98 @@
++"""Temporary reviewer unavailability must not consume claim/failure budgets."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli import kanban_provider_walls as walls
++from hermes_cli import kanban_review_model as review
++from hermes_cli import kanban_llm_pacing_dispatch as pacing
++from tests.hermes_cli.test_kanban_quota_episode import board as board  # noqa: PLC0414
++
++START = 1_800_000_000
++RESET = START + 7200
++
++
++@pytest.mark.parametrize("source", ["wall", "hold", "live", "overlap"])
++@pytest.mark.parametrize("lane", ["review", "ready"])
++def test_walled_review_not_claimed_and_unwalled_host_claims(
++        board, monkeypatch, all_assignees_spawnable, source, lane):
++    clock = [START]
++    monkeypatch.setattr(kb.time, "time", lambda: clock[0])
++    monkeypatch.setattr(tier, "load_tier_config", lambda: {"enabled": True})
++    monkeypatch.setattr(review, "implementer_models", lambda *_a: {"gpt-6-astra", "gpt-6.1-sol"})
++    monkeypatch.setattr(review, "independent_routes", lambda *_a: iter([
++        ("claude-fable-5-2", "anthropic"), ("claude-opus-5-5", "anthropic")]))
++    monkeypatch.setattr(review, "registry_refusal", lambda *_a: None)
++    blocked = [True]
++    monkeypatch.setattr(walls, "active_walls", lambda **_kw: (
++        {"anthropic": RESET} if blocked[0] and source in ("wall", "overlap") else {}))
++    monkeypatch.setattr(pacing, "held_pools", lambda *_a: (
++        {"anthropic": RESET - 60 if source == "overlap" else RESET}
++        if blocked[0] and source in ("hold", "overlap") else {}))
++    monkeypatch.setattr(walls, "live_quota_wall", lambda *_a: (
++        RESET if blocked[0] and source == "live" else None))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="Independent exact-head review" if lane == "ready" else "Build B",
++                             assignee="a")
++        if lane == "review":
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
++        seen = []
++        for _ in range(review.DEFERRAL_LIMIT + 2):
++            res = dispatch.dispatch_once(conn, spawn_fn=lambda task, _ws: seen.append(task.id))
++            assert seen == []
++            assert res.clock_held[tid] == ("review_provider_wall", RESET)
++            task = kb.get_task(conn, tid)
++            assert task.status == lane and not task.claim_lock
++            assert task.consecutive_failures == 0
++            clock[0] += 301
++        assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id=?", (tid,)).fetchone()[0] == 0
++        kinds = [r[0] for r in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))]
++        assert "claimed" not in kinds and "gave_up" not in kinds and "spawn_failed" not in kinds
++        deferred = [kb._json_dict(r[0]) for r in conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind='review_route_deferred'", (tid,))]
++        assert deferred == [{"reason": "review_provider_wall", "until": RESET}]
++        # Same card on a host with an available independent route (no card mutation needed).
++        blocked[0] = False
++        dispatch.dispatch_once(conn, spawn_fn=lambda task, _ws: seen.append(task.id))
++        assert seen == [tid]
++
++
++@pytest.mark.parametrize("case", ["alternate", "expiry", "dry_run", "structural", "registry", "race", "earliest"])
++def test_review_wait_boundaries(board, monkeypatch, case):
++    from hermes_cli import kanban_review_admission as admission
++
++    monkeypatch.setattr(kb.time, "time", lambda: START)
++    monkeypatch.setattr(tier, "load_tier_config", lambda: {"enabled": True})
++    monkeypatch.setattr(review, "implementer_models", lambda *_a: {"author-model"})
++    routes = [("claude-opus-5-5", "anthropic")]
++    if case in ("alternate", "earliest"):
++        routes.append(("gpt-6.1-sol", "openai-codex"))
++    if case == "structural":
++        routes = []
++    monkeypatch.setattr(review, "independent_routes", lambda *_a: iter(routes))
++    monkeypatch.setattr(review, "registry_refusal", lambda *_a: "refused" if case == "registry" else None)
++    walled = {"anthropic": START - 1 if case == "expiry" else RESET}
++    if case == "earliest":
++        walled["openai-codex"] = RESET - 300
++    monkeypatch.setattr(walls, "active_walls", lambda **_kw: walled)
++    monkeypatch.setattr(walls, "live_quota_wall", lambda *_a: None)
++    monkeypatch.setattr(pacing, "held_pools", lambda *_a: {})
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="Build", assignee="a")
++        result = dispatch.DispatchResult()
++        held = admission.hold(conn, tid, result, lane="review", dry_run=case == "dry_run")
++        assert held == (case in ("dry_run", "race", "earliest"))
++        events = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
++                              (tid, admission.EVENT)).fetchall()
++        assert bool(events) == (case in ("race", "earliest"))
++        if case == "earliest":
++            assert result.clock_held[tid] == (admission.REASON, RESET - 300)
++        if case == "race":
++            task = kb.get_task(conn, tid)
++            with pytest.raises(review.ReviewRouteDeferred) as caught:
++                tier.apply_model_tier(conn, task, lane="review", cfg={"enabled": True})
++            monkeypatch.setattr(review, "deferral_exhausted", lambda *_a: True)
++            assert review.admission_refusal(conn, tid, caught.value) == (True, False, None)
+-- 
+2.43.0
+

@@ -1,0 +1,141 @@
+From 6ea0bbe70d42fd4547dbd5bae768be3a63de4794 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 20:56:34 +0000
+Subject: [PATCH] [daveey] fix(desktop): stripe lineage comes from every loaded
+ row list
+
+Round-2 review (PR #3806 review 5998970322): a row listed only in
+$messagingSessions or $cronSessions built its alias set from $sessions alone,
+so a chat displayed through an alias painted done with no reads, and a failed
+current read under an alias did not veto.
+
+The hook now builds the lineage from ownerLookupSessionRows() (recents, cron,
+messaging, project tree, unlisted owner rows) and subscribes to each. A row in
+no loaded list gets no tracked authority, so the no-live-authority veto holds
+it as on base.
+
+Tests: messaging-only and cron-only rows keep both rules (RED on 3398ced27c,
+GREEN here); mutant 'recents only' killed. vitest src/store src/lib
+src/app/chat 737 files / 7716 tests pass; tsc clean.
+---
+ .../src/lib/use-work-source-unavailable.ts    | 25 +++++++++++--
+ .../session-control-authority-routing.test.ts | 37 ++++++++++++++++++-
+ 2 files changed, 58 insertions(+), 4 deletions(-)
+
+diff --git a/apps/desktop/src/lib/use-work-source-unavailable.ts b/apps/desktop/src/lib/use-work-source-unavailable.ts
+index 66f55bf7c1..c7eb1b451b 100644
+--- a/apps/desktop/src/lib/use-work-source-unavailable.ts
++++ b/apps/desktop/src/lib/use-work-source-unavailable.ts
+@@ -1,7 +1,16 @@
+ import { useStore } from '@nanostores/react'
+ import { useEffect } from 'react'
+ 
+-import { $sessions, knownSessionOwner, lineageAliases } from '@/store/session'
++import { $projectTree } from '@/store/project-tree'
++import {
++  $cronSessions,
++  $messagingSessions,
++  $sessions,
++  $unlistedSessionOwnerRows,
++  knownSessionOwner,
++  lineageAliases,
++  ownerLookupSessionRows
++} from '@/store/session'
+ import { $unavailableWorkSources, workSourceAuthorityComplete, workSourceVetoed } from '@/store/session-work-source'
+ import {
+   $workSourceAuthorityRevision,
+@@ -18,13 +27,18 @@ import type { SessionInfo } from '@/types/hermes'
+ export function useWorkSourceUnavailable(row: SessionInfo | null | undefined): boolean {
+   'use no memo'
+   const sources = useStore($unavailableWorkSources)
+-  const sessions = useStore($sessions)
++  // A row may live only in the cron / messaging slice or the project tree: its lineage comes from every loaded row.
++  useStore($sessions)
++  useStore($cronSessions)
++  useStore($messagingSessions)
++  useStore($projectTree)
++  useStore($unlistedSessionOwnerRows)
+   useStore($workSourceAuthorityRevision)
+ 
+   const owner = row ? qualifiedWorkSourceOwner(knownSessionOwner([row], row.id)) : undefined
+   const connectionId = owner?.connectionId
+   const profile = owner?.profile
+-  const ids = row ? lineageAliases(row.id, sessions) : []
++  const ids = row ? rowLineage(row) : []
+   // Every lineage member is tracked: the runtime on screen and reads may hold any of them (compression rotates the
+   // tip), and only a tracked id gets an authority epoch and runtime roles that republish the revision on change.
+   const trackedIds = ids.join('\u0000')
+@@ -57,3 +71,8 @@ export function useWorkSourceUnavailable(row: SessionInfo | null | undefined): b
+     peekWorkSourceAuthorityForSession(owner.connectionId, owner.profile, id)
+   )
+ }
++
++/** A row in no loaded list gets no tracked authority, so the no-live-authority veto holds it as before. */
++function rowLineage(row: SessionInfo): string[] {
++  return lineageAliases(row.id, ownerLookupSessionRows())
++}
+diff --git a/apps/desktop/src/store/session-control-authority-routing.test.ts b/apps/desktop/src/store/session-control-authority-routing.test.ts
+index da5be2eb40..86f6b00d02 100644
+--- a/apps/desktop/src/store/session-control-authority-routing.test.ts
++++ b/apps/desktop/src/store/session-control-authority-routing.test.ts
+@@ -7,7 +7,7 @@ import { sessionsHost } from '@/sdk/sessions'
+ import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import { $gateway, setPrimaryGateway, setPrimaryGatewayConnection } from '@/store/gateway'
+ import { $profiles } from '@/store/profile'
+-import { $activeSessionId, _resetSessionOwnerHintsForTests, setSessions } from '@/store/session'
++import { $activeSessionId, $cronSessions, $messagingSessions, _resetSessionOwnerHintsForTests, setSessions } from '@/store/session'
+ import { $sessionControlBySession, clearAllSessionControl, refreshSessionControl } from '@/store/session-control'
+ import { sessionStatusStripe } from '@/store/session-dot-state'
+ import { $sessionTiles, clearAllSessionStates, publishSessionState } from '@/store/session-states'
+@@ -57,6 +57,8 @@ describe('control authority at the real idle row hook', () => {
+     clearAllSessionStates()
+     $sessionTiles.set([])
+     setSessions([])
++    $messagingSessions.set([])
++    $cronSessions.set([])
+     $unavailableWorkSources.set({})
+     $profiles.set([])
+     $gateway.set(null as never)
+@@ -378,6 +380,39 @@ describe('control authority at the real idle row hook', () => {
+     }
+   })
+ 
++  it.each([
++    ['messaging', $messagingSessions],
++    ['cron', $cronSessions]
++  ] as const)('a row listed only in the %s slice keeps both lineage rules', (_slice, slice) => {
++    const row = aliasRow()
++    setSessions([])
++    slice.set([row])
++    $activeSessionId.set('rt-main')
++    const { result, unmount } = renderHook(() => useWorkSourceUnavailable(row))
++
++    try {
++      // Displayed through the alias: no reads is no proof.
++      expect(stripe(result.current)).not.toBe('done')
++      act(() => $activeSessionId.set(null))
++      expect(stripe(result.current)).toBe('done')
++      // Undisplayed: a failed current read under the alias vetoes.
++      act(() => {
++        const read = sessionsHost.beginWorkSourceRead({
++          connectionId: 'local',
++          profile: 'default',
++          storedSessionId: 'stored-chat',
++          source: 'tasks'
++        })
++
++        sessionsHost.reportWorkSourceRead({ ...read, available: false })
++      })
++      expect(stripe(result.current)).not.toBe('done')
++    } finally {
++      $activeSessionId.set(null)
++      unmount()
++    }
++  })
++
+   it('a read begun while the route had no authority still holds an undisplayed row once it is live', () => {
+     const row = makeSessionInfo({ id: 'stored-chat', profile: 'default', connection_id: 'local', outcome: DONE })
+     setSessions([row])
+-- 
+2.43.0
+

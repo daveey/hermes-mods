@@ -1,0 +1,254 @@
+From 8073cc944c78532a83ac5791a384c82a716fa055 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 21:48:33 +0000
+Subject: [PATCH] [daveey] Reject torn drain identities and pin init package
+ provenance
+
+---
+ cron/scheduler_tick.py                        |  6 +++
+ hermes_cli/worker_drain_baseline.py           | 19 ++++++--
+ hermes_cli/worker_drain_census.py             | 15 ++++--
+ .../test_worker_drain_cron_degrade.py         | 26 ++++++++++
+ .../test_worker_drain_identity_races.py       | 42 +++++++++++++++++
+ .../test_worker_drain_init_provenance.py      | 47 +++++++++++++++++++
+ 6 files changed, 148 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_worker_drain_cron_degrade.py
+ create mode 100644 tests/hermes_cli/test_worker_drain_identity_races.py
+ create mode 100644 tests/hermes_cli/test_worker_drain_init_provenance.py
+
+diff --git a/cron/scheduler_tick.py b/cron/scheduler_tick.py
+index 712e65fb24..6500c51793 100644
+--- a/cron/scheduler_tick.py
++++ b/cron/scheduler_tick.py
+@@ -125,15 +125,20 @@ def update_admission():
+     (unwritable root) fails open: cron must not stop because the fence file is unavailable, and the drainer
+     reads such a root as busy anyway.
+     """
++    # Preserve the updater's legacy availability policy, but never retain a
++    # host-process exemption when it cannot prove lease coverage.
++    from hermes_cli.worker_drain_capability import revoke
+     try:
+         from hermes_cli import admission_fence
+         from hermes_cli.admission_fence import AdmissionBusy, SUPPORTED
+         from hermes_cli.backend_retirement import BUSY_WAIT_S
+         from hermes_cli.worker_drain_fence import DrainRefused, lease_scope
+     except ImportError:
++        revoke('cron admission import unavailable')
+         yield True
+         return
+     if not SUPPORTED:
++        revoke('cron admission unsupported')
+         yield True
+         return
+     from cron import scheduler as _sched
+@@ -155,6 +160,7 @@ def update_admission():
+         yield False
+         return
+     except (OSError, TimeoutError) as exc:
++        revoke('cron admission unavailable')
+         logger.debug("Cron update admission unavailable (%s); dispatching", exc)
+         yield True
+         return
+diff --git a/hermes_cli/worker_drain_baseline.py b/hermes_cli/worker_drain_baseline.py
+index 141a02b2e5..67fc06cd30 100644
+--- a/hermes_cli/worker_drain_baseline.py
++++ b/hermes_cli/worker_drain_baseline.py
+@@ -37,9 +37,13 @@ def load_manifest(path) -> dict:
+             raise ValueError('manifest shape')
+         names = set()
+         for unit in doc['units']:
++            digest_keys = ('package_sha256', 'exe_sha256') if unit['kind'] == 'init' else ('fragment_sha256', 'exe_sha256')
+             if (not UNIT_RE.fullmatch(unit['name']) or unit['name'] in names
+                     or unit['kind'] not in ('infrastructure', 'hermes', 'init')
+-                    or any(not re.fullmatch('[0-9a-f]{64}', unit[k]) for k in ('fragment_sha256', 'exe_sha256'))):
++                    or any(not re.fullmatch('[0-9a-f]{64}', unit[k]) for k in digest_keys)
++                    or (unit['kind'] == 'init' and (unit['name'] != 'init.scope'
++                        or 'user' in unit or not Path(unit['package_path']).is_absolute()
++                        or '..' in Path(unit['package_path']).parts))):
+                 raise ValueError('unit shape')
+             names.add(unit['name'])
+         return doc
+@@ -66,11 +70,18 @@ def unit_state(unit: dict) -> dict:
+ 
+ def _unit_entry(unit, state, proc_root, ident, manifest):
+     try:
+-        pid = '1' if unit['kind'] == 'init' and unit['name'] == 'init.scope' else state['MainPID']
++        if unit['kind'] == 'init':
++            if unit['name'] != 'init.scope' or not Path(unit['package_path']).is_absolute():
++                raise ValueError('invalid init declaration')
++            pid = '1'
++            if file_digest(unit['package_path']) != unit['package_sha256']:
++                raise ValueError('init package changed')
++        else:
++            pid = state['MainPID']
++            if file_digest(state['FragmentPath']) != unit['fragment_sha256']:
++                raise ValueError('unit package changed')
+         if not pid.isdigit() or int(pid) <= 0:
+             raise ValueError('no live MainPID')
+-        if file_digest(state['FragmentPath']) != unit['fragment_sha256']:
+-            raise ValueError('unit package changed')
+         entry = census.process_identity(proc_root, pid)
+         if entry[3] != state['ControlGroup'] or not entry[3]:
+             raise ValueError('unit cgroup mismatch')
+diff --git a/hermes_cli/worker_drain_census.py b/hermes_cli/worker_drain_census.py
+index 07fcfc7084..daaa0f7139 100644
+--- a/hermes_cli/worker_drain_census.py
++++ b/hermes_cli/worker_drain_census.py
+@@ -114,9 +114,18 @@ def baseline_is_live(base: Baseline) -> bool:
+ 
+ 
+ def process_identity(proc_root: str, pid: str) -> tuple:
+-    fields = _read(f'{proc_root}/{pid}/stat').rsplit(')', 1)[1].split()
+-    return (int(pid), int(fields[19]), os.stat(f'{proc_root}/{pid}').st_uid,
+-            _read_cgroup(proc_root, pid), os.readlink(f'{proc_root}/{pid}/exe'))
++    def sample():
++        fields = _read(f'{proc_root}/{pid}/stat').rsplit(')', 1)[1].split()
++        return (int(pid), int(fields[19]), os.stat(f'{proc_root}/{pid}').st_uid,
++                _read_cgroup(proc_root, pid), os.readlink(f'{proc_root}/{pid}/exe'))
++
++    # procfs is not a transactional snapshot. Reject a restart, exec, uid or
++    # cgroup transition observed while assembling the identity, never mix it
++    # with an older trusted tuple. CPU/state fields may change normally.
++    before = sample()
++    if before != sample():
++        raise ValueError('process changed during identity read')
++    return before
+ 
+ 
+ def _entry_identity(e: dict) -> tuple:
+diff --git a/tests/hermes_cli/test_worker_drain_cron_degrade.py b/tests/hermes_cli/test_worker_drain_cron_degrade.py
+new file mode 100644
+index 0000000000..c2a97ced6b
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_cron_degrade.py
+@@ -0,0 +1,26 @@
++"""Legacy cron fail-open cannot leave an activated daemon exempt from /proc."""
++import pytest
++
++from cron import scheduler_tick as tick
++from hermes_cli import admission_fence
++from hermes_cli import worker_drain_capability as cap
++
++
++@pytest.mark.parametrize('unavailable', ['unsupported', 'reserve_oserror'])
++def test_failopen_revokes_exemption_before_dispatch(monkeypatch, unavailable):
++    from cron import scheduler
++    from hermes_cli import backend_retirement
++    events = []
++    monkeypatch.setattr(cap, 'revoke', lambda reason: events.append('revoked'))
++    monkeypatch.setattr(admission_fence, 'SUPPORTED', unavailable != 'unsupported')
++    monkeypatch.setattr(scheduler, '_get_hermes_home', lambda: '/fixture/home')
++    monkeypatch.setattr(backend_retirement, 'BUSY_WAIT_S', 0.01)
++
++    def reserve(*a, **kw):
++        raise OSError('fixture fence unavailable')
++
++    monkeypatch.setattr(admission_fence, 'reserve', reserve)
++    with tick.update_admission() as allowed:
++        assert allowed
++        events.append('dispatch')
++    assert events == ['revoked', 'dispatch']
+diff --git a/tests/hermes_cli/test_worker_drain_identity_races.py b/tests/hermes_cli/test_worker_drain_identity_races.py
+new file mode 100644
+index 0000000000..526c9d6037
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_identity_races.py
+@@ -0,0 +1,42 @@
++"""A procfs identity assembled across a restart or exec is not evidence of idle."""
++import pytest
++
++from hermes_cli import worker_drain_census as census
++from tests.hermes_cli.test_worker_drain_baseline import process
++
++pytestmark = pytest.mark.platforms('linux')
++
++
++@pytest.mark.parametrize('change', ['start', 'cgroup', 'exe'])
++def test_identity_change_during_read_is_unknown(tmp_path, monkeypatch, change):
++    process(tmp_path)
++    original = census._read
++    reads = []
++
++    def read(path):
++        value = original(path)
++        if str(path).endswith('/10/stat'):
++            reads.append(path)
++        # The second stat read starts the revalidation pass. Inject an exec or
++        # migration after the first complete sample (not into Path's realpath).
++        if str(path).endswith('/10/stat') and len(reads) == 2:
++            if change == 'start':
++                process(tmp_path, start=101)
++                value = original(path)
++            elif change == 'cgroup':
++                (tmp_path / '10' / 'cgroup').write_text('0::/other\n')
++            else:
++                (tmp_path / '10' / 'exe').unlink()
++                (tmp_path / '10' / 'exe').symlink_to('/usr/sbin/other')
++        return value
++
++    monkeypatch.setattr(census, '_read', read)
++    with pytest.raises(ValueError, match='process changed'):
++        census.process_identity(str(tmp_path), '10')
++
++
++def test_stable_identity_remains_usable(tmp_path):
++    process(tmp_path)
++    entry = census.process_identity(str(tmp_path), '10')
++    assert entry[0:2] == (10, 100)
++    assert entry[3:] == ('/system.slice/idle.service', '/usr/sbin/idled')
+diff --git a/tests/hermes_cli/test_worker_drain_init_provenance.py b/tests/hermes_cli/test_worker_drain_init_provenance.py
+new file mode 100644
+index 0000000000..f432adee6a
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_init_provenance.py
+@@ -0,0 +1,47 @@
++"""PID1 provenance is authored package content, not a nonexistent unit fragment."""
++import json
++import os
++
++import pytest
++
++from hermes_cli import worker_drain_baseline as producer
++from hermes_cli import worker_drain_fence as fence
++from tests.hermes_cli.test_worker_drain_baseline import process
++
++pytestmark = pytest.mark.platforms('linux')
++
++
++@pytest.mark.parametrize('changes', [{}, {'name': 'other.service'}, {'user': 'somebody'},
++                                     {'package_path': 'relative'}, {'package_path': '/a/../b'}])
++def test_init_manifest_has_explicit_package_contract(monkeypatch, changes):
++    unit = {'name': 'init.scope', 'kind': 'init', 'package_path': '/image/systemd-package',
++            'package_sha256': '0' * 64, 'exe_sha256': '1' * 64, **changes}
++    monkeypatch.setattr(fence, '_secure_read', lambda *a: json.dumps({'version': 1, 'units': [unit]}))
++    if changes:
++        with pytest.raises(producer.CaptureRefused, match='untrusted'):
++            producer.load_manifest('/manifest')
++    else:
++        assert producer.load_manifest('/manifest')['units'] == [unit]
++
++
++def test_package_pinned_init_does_not_need_fragment(tmp_path, monkeypatch):
++    process(tmp_path, pid=1, exe='/usr/lib/systemd/systemd')
++    package = tmp_path / 'package-manifest'
++    package.write_bytes(b'image package systemd=1\n')
++    unit = {'name': 'init.scope', 'kind': 'init', 'package_path': str(package),
++            'package_sha256': producer.file_digest(package), 'exe_sha256': 'exe-hash'}
++    digest = producer.file_digest
++    monkeypatch.setattr(producer, 'file_digest', lambda p: 'exe-hash' if str(p).endswith('/1/exe') else digest(p))
++    state = {'MainPID': '0', 'ControlGroup': '/system.slice/idle.service', 'FragmentPath': ''}
++    entry = producer._unit_entry(unit, state, str(tmp_path), fence.Identity('iid', 'boot', 'epoch'), {})
++    assert entry['pid'] == 1 and entry['uid'] == os.getuid()
++    package.write_bytes(b'changed package\n')
++    with pytest.raises(producer.CaptureRefused, match='provenance'):
++        producer._unit_entry(unit, state, str(tmp_path), fence.Identity('iid', 'boot', 'epoch'), {})
++
++
++def test_init_cannot_be_declared_as_arbitrary_service(tmp_path):
++    unit = {'name': 'arbitrary.service', 'kind': 'init', 'package_path': '/x',
++            'package_sha256': '0' * 64, 'exe_sha256': '1' * 64}
++    with pytest.raises(producer.CaptureRefused, match='provenance'):
++        producer._unit_entry(unit, {'MainPID': '10', 'FragmentPath': '/x'}, str(tmp_path), None, {})
+-- 
+2.43.0
+

@@ -1,0 +1,336 @@
+From de3c034cfc696766c8ce55215bb5fddbcbac82c9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 20:33:35 +0000
+Subject: [PATCH] [daveey] WIP: reproduce superseded notice outcome and custody
+ gaps
+
+Preserve investigation for t_eeeeee0000000033; NOT READY TO SHIP.
+
+Reproduced four RED failures before edits. The current bounded candidate and
+projection implementation passes 46 consumer files (1227 tests), 38 new cases,
+three split-module guards and scripts/check's 21 checks. Nine behavior mutants
+are killed after aging turn-boundary fixtures to avoid grace-window masking.
+Read-only hub replay examined 30 relevant notices across 12 stores; nine final
+superseded rows and nine exact creator notices change classification.
+
+Independent precommit reasoning found a release blocker: making every legacy
+superseded row transparent can hide unrelated events in mixed notice batches.
+Before publication/review/ship, bind settlement proof to pure source content and
+preserve legacy mixed notices. Also fail closed on transient creator source-read
+errors instead of allowing the outer guarantee to stamp a final error.
+
+The original chat naturally received a genuine close-out reply during diagnosis;
+this unpublished code did not recover it. No messages were injected into it.
+---
+ hermes_state_outcome.py                       |   8 +-
+ tests/tui_gateway/test_notice_supersession.py | 131 ++++++++++++++++++
+ tui_gateway/notice_guarantee.py               |  18 ++-
+ tui_gateway/notice_history.py                 |  81 +++++++++++
+ 4 files changed, 232 insertions(+), 6 deletions(-)
+ create mode 100644 tests/tui_gateway/test_notice_supersession.py
+ create mode 100644 tui_gateway/notice_history.py
+
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 07b8facbd9..41c2fddf50 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -518,8 +518,12 @@ def _completion_note(row: dict) -> Optional[dict]:
+     # The notice guarantee also deliberately suppresses turns for validated human
+     # notices. Card ownership still supplies decision/wait outcomes independently;
+     # an incidental recipient resumes classification of its own preceding turn.
+-    if isinstance(meta, dict) and row.get("display_kind") == _NOTICE_KIND and meta.get("outcome_informational") is True:
+-        return meta
++    if isinstance(meta, dict) and row.get("display_kind") == _NOTICE_KIND:
++        closeout = meta.get("closeout")
++        if meta.get("outcome_informational") is True or (
++            isinstance(closeout, dict) and closeout.get("state") == "superseded"
++        ):
++            return meta
+     return meta if isinstance(meta, dict) and meta.get("completion_note") else None
+ 
+ 
+diff --git a/tests/tui_gateway/test_notice_supersession.py b/tests/tui_gateway/test_notice_supersession.py
+new file mode 100644
+index 0000000000..ff3dea5c13
+--- /dev/null
++++ b/tests/tui_gateway/test_notice_supersession.py
+@@ -0,0 +1,131 @@
++"""Supersession settles a notice, not the unanswered turn preceding it."""
++import json
++import time
++
++import pytest
++
++import hermes_state_outcome as so
++from tui_gateway import notice_guarantee as ng
++from tests.tui_gateway import test_notice_guarantee as helpers
++
++CHAT = helpers.CHAT
++_closeout = helpers._closeout
++_notice = helpers._notice
++_run = helpers._run
++db = helpers.db
++
++
++@pytest.mark.parametrize("earlier", ["reply", "request", "notice", "failure"])
++def test_superseded_tail_preserves_preceding_obligation(db, earlier):
++    if earlier == "reply":
++        db.append_message(CHAT, "assistant", "The audit finished and all requested checks passed with no work remaining.")
++    elif earlier == "request":
++        db.append_message(CHAT, "user", "Please inspect another card.")
++    elif earlier == "notice":
++        old = _notice(db, "An unrelated card needs an agent decision.")
++    else:
++        db.append_message(CHAT, "assistant", "The turn failed.", finish_reason="error")
++    _notice(db, "An outdated remote blocked notice.", stale=True)
++    out, calls = _run(db)
++    assert calls == [] and out[0]["result"] == "superseded"
++    outcome = so.get_outcome(CHAT, db=db)
++    if earlier == "reply":
++        assert outcome["kind"] == "done"
++    else:
++        assert outcome["kind"] == "unresolved"
++        assert outcome["reason"] == {"request": "interrupted", "notice": "notice_tail", "failure": "turn_failed"}[earlier]
++    if earlier == "notice":
++        assert ng.candidates(db, time.time())[0]["msg_id"] == old
++
++
++def test_preceding_deferred_notice_is_retried_beneath_superseded_tail(db):
++    old = _notice(db, "An unrelated card finished.")
++    _notice(db, "An outdated blocked notice.", closeout={"state": "superseded"})
++    _out, calls = _run(db, verdict="busy")
++    assert calls == [(CHAT, old)]
++    assert _closeout(db, old) == "deferred"
++    meta = json.loads(db._read_one("SELECT display_metadata FROM messages WHERE id = ?", (old,))[0])
++    _out, calls = _run(db, now=meta["closeout"]["retry_at"] + 1)
++    assert calls == [(CHAT, old)]
++
++
++@pytest.mark.parametrize("case", ["ci", "running", "chat", "composite", "remote", "missing", "wrong_kind", "bad_id",
++                                  "missing_park", "missing_awaiting", "malformed_park", "missing_event", "missing_board"])
++def test_creator_decision_supersession_requires_current_local_proof(db, case):
++    import contextlib
++
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tui_gateway.session_notifications import _format_kanban_event_text
++
++    db.append_message(CHAT, "assistant", "The requested audit finished and every check passed with no changes required.")
++    with contextlib.closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title="audit delivery", assignee="worker")
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, "decision_requested", {"why": "Repair or withdraw?"})
++            event = kb.list_events(conn, tid)[-1]
++            awaiting = {"kind": "chat" if case == "chat" else "ci", "ref": "test-run"}
++            if case != "missing_park":
++                kb._append_event(conn, tid, "scheduled", {} if case == "missing_awaiting" else {"awaiting": awaiting})
++            if case == "malformed_park":
++                conn.execute("UPDATE task_events SET payload = 'null' WHERE task_id = ? AND kind = 'scheduled'", (tid,))
++            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", ("running" if case == "running" else "scheduled", tid))
++        task = kb.get_task(conn, tid)
++        text = _format_kanban_event_text({"task_id": tid}, task, event, "default")
++        if case == "wrong_kind":
++            with kb.write_txn(conn):
++                conn.execute("UPDATE task_events SET kind = 'completed' WHERE id = ?", (event.id,))
++    meta = {"board": "default", "task_id": tid, "event_ids": [event.id]}
++    if case == "remote":
++        meta["gateway"] = "foreign-gateway"
++    if case == "missing":
++        meta["task_id"] = "t_missing"
++    if case == "bad_id":
++        meta["event_ids"] = [True]
++    if case == "missing_event":
++        meta["event_ids"] = [999999]
++    if case == "missing_board":
++        meta["board"] = "missing-board"
++    if case == "composite":
++        text += "\nAlso investigate an unrelated user's question."
++    old = _notice(db, text, **meta)
++    _notice(db, "Already settled blocked notice.", closeout={"state": "superseded"})
++    out, calls = _run(db)
++    if case in ("ci", "running"):
++        assert calls == [] and out[0]["result"] == "superseded"
++        assert _closeout(db, old) == "superseded"
++        assert so.get_outcome(CHAT, db=db)["kind"] == "done"
++    else:
++        assert calls == [(CHAT, old)]
++        assert _closeout(db, old) == "started"
++
++
++@pytest.mark.parametrize("state", ["superseded", "claimed", "started", "error", "deferred", "busy", "self", None])
++def test_only_final_supersession_is_informational(state):
++    row = {"role": "user", "display_kind": "kanban_notice", "display_metadata": {"closeout": {"state": state}}}
++    assert (so._completion_note(row) is not None) is (state == "superseded")
++    row["role"] = "assistant"
++    assert so._completion_note(row) is None
++    row["role"], row["display_kind"] = "user", "user_text"
++    assert so._completion_note(row) is None
++
++
++@pytest.mark.parametrize("only", [None, {CHAT}])
++@pytest.mark.parametrize("boundary", ["assistant", "user", "tool", "failed_notice", "chain", "too_long"])
++def test_history_stops_at_nonsettled_boundaries(db, only, boundary):
++    old = _notice(db, "Still owed a close-out.")
++    if boundary in ("assistant", "user", "tool"):
++        row = db.append_message(CHAT, boundary, "A later turn boundary.")
++        # Make the boundary old enough for discovery: a young row's grace check
++        # would mask a missing history-stop guard.
++        db._write_rowcount("UPDATE messages SET timestamp = ? WHERE id = ?", (time.time() - 600, row))
++    elif boundary == "failed_notice":
++        _notice(db, "A failed close-out remains visible.", closeout={"state": "error"})
++    else:
++        for _ in range(2 if boundary == "chain" else so._TAIL_ROWS):
++            _notice(db, "Settled intermediate notice.", closeout={"state": "superseded"})
++    _notice(db, "Settled physical tail.", closeout={"state": "superseded"})
++    found = ng.candidates(db, time.time(), only=only)
++    assert [c["msg_id"] for c in found] == ([old] if boundary == "chain" else [])
++
++
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+index cf84d27f43..601c0ef641 100644
+--- a/tui_gateway/notice_guarantee.py
++++ b/tui_gateway/notice_guarantee.py
+@@ -7,7 +7,11 @@ unloaded sweeper's loop therefore looks, in every profile store, for chats whose
+ ``kanban_notice`` older than ``GRACE_S`` with no live turn, and:
+ 
+ - a "blocked" notice whose card has moved on since (answered, rescheduled, done, archived) never wakes: it is
+-  stamped ``closeout.state = "superseded"`` and the chat's outcome is refreshed;
++  stamped ``closeout.state = "superseded"`` and the chat's outcome is refreshed. Superseded user notices are
++  transparent to outcome derivation and candidate discovery, so an older unanswered notice keeps its custody;
++- a creator-decision notice is superseded only with an exact local source-event/render match and proof its
++  card left the chat wait (a scheduled card must explicitly name a different producer). Mixed/foreign/unknown
++  rows remain unanswered;
+ - a notice about a card blocked on a human never wakes: its owner's outcome reads ``decision``; an incidental
+   recipient with no owning obligation preserves its preceding turn's outcome through an informational marker;
+ - otherwise the notice row is claimed (``display_metadata.closeout``, compare-and-swap on the row, so exactly one
+@@ -93,7 +97,7 @@ def _reset_refreshed_for_tests() -> None:
+     _refreshed.clear()
+ 
+ _CANDIDATES_SQL = """
+-SELECT s.id AS sid, m.id AS msg_id, m.timestamp, m.content, m.display_metadata,
++SELECT s.id AS sid, m.id AS msg_id, m.role, m.timestamp, m.content, m.display_metadata,
+        {last_active} AS last_active
+   FROM sessions s
+   JOIN messages m ON m.id = (SELECT id FROM messages WHERE session_id = s.id AND active = 1
+@@ -107,7 +111,7 @@ SELECT s.id AS sid, m.id AS msg_id, m.timestamp, m.content, m.display_metadata,
+ # ``idx_messages_kanban_notice``) instead of the last message of every session; ``m.id = (...)`` keeps the
+ # "a notice is the chat's last active message" test. 5.5x less work on a 1.3M-message store.
+ _CANDIDATES_INDEXED_SQL = """
+-SELECT s.id AS sid, m.id AS msg_id, m.timestamp, m.content, m.display_metadata,
++SELECT s.id AS sid, m.id AS msg_id, m.role, m.timestamp, m.content, m.display_metadata,
+        {last_active} AS last_active
+   FROM (SELECT session_id, MAX(id) AS nid FROM messages INDEXED BY idx_messages_kanban_notice
+          WHERE display_kind = 'kanban_notice' AND active = 1 AND role IN ('user', 'assistant', 'tool')
+@@ -156,7 +160,10 @@ def candidates(db: Any, now: float, only: Optional[set[str]] = None) -> list[dic
+     else:
+         rows = candidate_rows(db, sql)
+     out = []
++    from tui_gateway.notice_history import preceding_candidate
++
+     for row in rows:
++        row = preceding_candidate(db, row)
+         # Cache structure, not age: a notice can become due (or expire) without a commit.
+         meta = _decode(row["display_metadata"])
+         deferred_due = _deferred_due(meta, now)
+@@ -283,7 +290,10 @@ def superseded(cand: dict) -> bool:
+     meta = cand["meta"]
+     stale = bool(meta.get("stale"))  # only ever set on blocked notices, by the fan-out
+     blocked = sorted(set(_BLOCKED_LINE.findall(cand["content"])))
+-    if not blocked or _is_remote(meta):
++    from tui_gateway.notice_history import creator_superseded
++    if not blocked:
++        return stale or (not _is_remote(meta) and creator_superseded(cand))
++    if _is_remote(meta):
+         return stale
+     keys = [str(k) for k in meta.get("kanban_event_keys") or () if ":" in str(k) and not str(k).startswith("remote:")]
+     board = meta.get("board") or (keys[0].rsplit(":", 1)[0] if keys else None)
+diff --git a/tui_gateway/notice_history.py b/tui_gateway/notice_history.py
+new file mode 100644
+index 0000000000..d2dedf0ac6
+--- /dev/null
++++ b/tui_gateway/notice_history.py
+@@ -0,0 +1,81 @@
++"""Follow settled notice tails without hiding the preceding obligation. [daveey]"""
++from __future__ import annotations
++
++from typing import Any
++
++
++def preceding_candidate(db: Any, row: Any) -> dict:
++    """Only superseded notice rows are transparent, never replies or failed wakes.
++
++    Bound the exceptional lookup to the same window as outcome derivation. Normal
++    discovery keeps its indexed scan and does no extra reads.
++    """
++    from hermes_state_outcome import _TAIL_ROWS
++    from tui_gateway.notice_fanout import _decode
++
++    row = dict(row)
++    closeout = _decode(row["display_metadata"]).get("closeout")
++    if row["role"] != "user" or not isinstance(closeout, dict) or closeout.get("state") != "superseded":
++        return row
++    previous = db._read_all(
++        "SELECT id AS msg_id, role, timestamp, content, display_kind, display_metadata FROM messages "
++        "WHERE session_id = ? AND active = 1 AND role IN ('user', 'assistant', 'tool') "
++        "AND id < ? ORDER BY id DESC LIMIT ?", (row["sid"], row["msg_id"], _TAIL_ROWS - 1))
++    for earlier in previous:
++        if earlier["role"] != "user" or earlier["display_kind"] != "kanban_notice":
++            return row
++        closeout = _decode(earlier["display_metadata"]).get("closeout")
++        if not isinstance(closeout, dict) or closeout.get("state") != "superseded":
++            return {**row, **dict(earlier)}
++    return row
++
++
++def creator_superseded(cand: dict) -> bool:
++    """Retire only an exact local producer row whose creator question is no longer pending.
++
++    Revalidate the event and rendered content: a folded row may carry unrelated
++    input while retaining the original notice metadata. Missing provenance fails
++    closed, as does a current chat park (scheduled alone is not proof of settlement).
++    """
++    import contextlib
++
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli.kanban_decision_ask import notice_text
++    from tui_gateway import server
++
++    if notice_text({}).split("\n", 1)[0] not in cand["content"]:
++        return False
++    meta = cand["meta"]
++    events = meta.get("event_ids")
++    tid, board = meta.get("task_id"), meta.get("board")
++    if not isinstance(events, list) or len(events) != 1 or type(events[0]) is not int or not tid or not board:
++        return False
++    try:
++        conn = kbc.connect(board=board)
++    except ValueError:
++        return False
++    with contextlib.closing(conn):
++        row = conn.execute("SELECT * FROM task_events WHERE id = ? AND task_id = ? AND kind = ?",
++                           (events[0], tid, "decision_requested")).fetchone()
++        task = kb.get_task(conn, tid)
++        if row is None or task is None:
++            return False
++        event = kb.Event.from_row(row)
++        rendered = server._format_kanban_event_text({"task_id": tid, "chat_id": cand["sid"]}, task, event, board)
++        if cand["content"] != rendered:
++            return False
++        if task.status != "scheduled":
++            return True
++        park = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind IN "
++                            "('scheduled', 'continued') ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++        if park is None:
++            return False
++        import json
++        try:
++            payload = json.loads(park[0] or "{}")
++        except (ValueError, TypeError):
++            return False
++        awaiting = payload.get("awaiting") if isinstance(payload, dict) else None
++        return isinstance(awaiting, dict) and awaiting.get("kind") in ("ci", "deploy", "card", "external", "clock", "resource")
++
+-- 
+2.43.0
+

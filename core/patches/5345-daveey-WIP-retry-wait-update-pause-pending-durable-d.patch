@@ -1,0 +1,179 @@
+From f8d1d280e6a37c7059a4dc0e83e14e103bf790b7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 04:07:31 +0000
+Subject: [PATCH] [daveey] WIP retry-wait update pause: pending durable
+ deadline custody
+
+---
+ agent/turn_api_error.py                       |  17 +--
+ agent/turn_recovery.py                        |   7 ++
+ .../test_update_pause_retry_wait.py           | 104 ++++++++++++++++++
+ 3 files changed, 121 insertions(+), 7 deletions(-)
+ create mode 100644 tests/tui_gateway/test_update_pause_retry_wait.py
+
+diff --git a/agent/turn_api_error.py b/agent/turn_api_error.py
+index 1a748e7d6f..c7433ca10d 100644
+--- a/agent/turn_api_error.py
++++ b/agent/turn_api_error.py
+@@ -485,13 +485,16 @@ def settle_unrecovered_error(
+     )
+     # Same preserve-redirect rule as the invalid-response wait: a steering correction
+     # must survive backoff, not die as "Operation interrupted".
+-    _interrupted = interruptible_backoff_sleep(
+-        agent, wait_time, _retry, messages=messages, conversation_history=conversation_history,
+-        api_call_count=api_call_count,
+-        abort_message="Interrupt detected during retry wait, aborting.",
+-        interrupt_text=f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries}).",
+-        activity_label=f"error retry backoff ({retry_count}/{max_retries})",
+-    )
++    # The failed request's context has exited, but its retry wait is still at the same
++    # boundary. Keep it visible to the update watcher without broadening eligibility.
++    with update_pause_cancel.model_request_in_flight(agent, messages, api_call_count=api_call_count):
++        _interrupted = interruptible_backoff_sleep(
++            agent, wait_time, _retry, messages=messages, conversation_history=conversation_history,
++            api_call_count=api_call_count,
++            abort_message="Interrupt detected during retry wait, aborting.",
++            interrupt_text=f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries}).",
++            activity_label=f"error retry backoff ({retry_count}/{max_retries})",
++        )
+     if _interrupted is not None:
+         return _verdict("return", _interrupted)
+     if _retry.restart_with_redirected_messages:
+diff --git a/agent/turn_recovery.py b/agent/turn_recovery.py
+index 1fbc130b81..e533a62a96 100644
+--- a/agent/turn_recovery.py
++++ b/agent/turn_recovery.py
+@@ -37,6 +37,8 @@ from agent.turn_failure_copy import (
+ )
+ from agent.route_verdicts import route_visit
+ from agent.turn_retry_state import TurnRetryState
++from agent import update_pause_cancel
++from agent.turn_api_call import yield_to_update_pause
+ from agent.turn_recovery_codex import _codex_soft_failure_error, _is_codex_token_expired, _recover_stale_codex_reasoning
+ from hermes_constants import display_hermes_home
+ from utils import base_url_host_matches
+@@ -1407,6 +1409,11 @@ def interruptible_backoff_sleep(
+     _touch_counter = 0
+     while time.time() < sleep_end:
+         if agent._interrupt_requested:
++            # Preserve the update-owned cancel for begin_iteration's boundary pause;
++            # generic interrupt handling would clear it and append a terminal Stop row.
++            if _retry is not None and update_pause_cancel.model_yield_requested(agent):
++                yield_to_update_pause(_retry)
++                return None
+             if _retry is not None and agent.clear_interrupt(preserve_redirect=True):
+                 _retry.restart_with_redirected_messages = True
+                 return None
+diff --git a/tests/tui_gateway/test_update_pause_retry_wait.py b/tests/tui_gateway/test_update_pause_retry_wait.py
+new file mode 100644
+index 0000000000..f1c308cbb9
+--- /dev/null
++++ b/tests/tui_gateway/test_update_pause_retry_wait.py
+@@ -0,0 +1,104 @@
++"""A progressed turn in API-error backoff remains a resumable update boundary."""
++from __future__ import annotations
++
++import threading
++import time
++
++import httpx
++import pytest
++from openai import RateLimitError
++
++from agent import turn_api_error, update_pause_cancel
++from hermes_cli import admission_fence as af
++from tui_gateway import update_pause as up
++from tui_gateway.turn_marker import read_turn_marker, record_turn_start
++from tests.tui_gateway import test_update_pause_model_request as helpers
++
++home = helpers.home
++_quiet = helpers._quiet
++
++
++@pytest.mark.parametrize("mode", ["boundary", "first", "continuation", "stop", "opt_out"])
++def test_api_error_backoff_pause_custody(home, tmp_path, monkeypatch, mode):
++    agent = helpers._make_agent(tmp_path)
++    first = mode in {"first", "continuation"}
++    if mode == "continuation":
++        agent.update_pause_first_request = True
++    if mode == "opt_out":
++        monkeypatch.setattr(helpers.server, "_load_cfg", lambda: {"desktop": {"auto_continue": {"enabled": False}}})
++    record_turn_start(home, "session-key", "run the quick job")
++    session = {"agent": agent, "session_key": "session-key", "profile_home": str(home),
++               "history_lock": threading.Lock()}
++    entered = threading.Event()
++    issued = threading.Event()
++    calls = []
++    request = httpx.Request("POST", "https://example.com/chat")
++    error = RateLimitError("rate limited", response=httpx.Response(429, request=request), body=None)
++
++    def provider(*args, **kwargs):
++        calls.append(1)
++        if len(calls) == 1 and not first:
++            return helpers._response(helpers._call("call_1"))
++        if len(calls) == (1 if first else 2):
++            raise error
++        return helpers._response()
++
++    real_sleep = turn_api_error.interruptible_backoff_sleep
++
++    def observed_sleep(*args, **kwargs):
++        entered.set()
++        assert issued.wait(5)
++        return real_sleep(*args, **kwargs)
++
++    def pause():
++        if entered.wait(5):
++            af.set_hold(home)
++            af.request_pause(home, expires_at=time.time() + 120)
++            issued.set()
++
++    if mode == "stop":
++        real_cancel = update_pause_cancel.cancel
++
++        def stop_after_cancel(*args, **kwargs):
++            cancelled = real_cancel(*args, **kwargs)
++            if cancelled:
++                agent.interrupt()
++            return cancelled
++
++        monkeypatch.setattr(update_pause_cancel, "cancel", stop_after_cancel)
++
++    agent._interruptible_api_call = provider
++    monkeypatch.setattr("model_tools.handle_function_call", lambda *a, **k: "quick result")
++    monkeypatch.setattr(turn_api_error, "compute_error_backoff", lambda *a, **k: 3.0)
++    monkeypatch.setattr(turn_api_error, "interruptible_backoff_sleep", observed_sleep)
++    reservation = af.reserve(home)
++    assert reservation is not None
++    producer = threading.Thread(target=pause)
++    producer.start()
++    agent.step_boundary_pause = up.boundary_pause_hook(session, "session-key")
++    stop = up.start_mid_tool_cancel(session, "session-key", agent)
++    try:
++        result = agent.run_conversation("run the quick job")
++    finally:
++        stop()
++        producer.join(6)
++        reservation.close()
++    assert not producer.is_alive()
++    assert entered.is_set() and issued.is_set()
++    if mode in {"first", "opt_out"}:
++        assert not result.get("paused_for_update")
++        assert result["final_response"] == "done"
++        assert len(calls) == (2 if first else 3)
++        return
++    if mode == "stop":
++        assert not result.get("paused_for_update")
++        assert result["interrupted"] is True
++        assert len(calls) == 2
++        return
++    assert result.get("paused_for_update") == up.PAUSE_REASON
++    assert len(calls) == (1 if first else 2)
++    assert result["messages"][-1]["role"] == ("user" if first else "tool")
++    assert af.state(home)["reservations"] == 0
++    assert (read_turn_marker(home, "session-key") or {}).get("reason") == up.PAUSE_REASON
++    assert not agent._interrupt_requested
++    assert update_pause_cancel.in_flight(agent) == {}
+-- 
+2.43.0
+

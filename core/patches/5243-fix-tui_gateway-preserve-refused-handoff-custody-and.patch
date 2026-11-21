@@ -1,0 +1,258 @@
+From db5c91fb7b5290eb36fbc878e4874e73b9248235 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:56:10 +0000
+Subject: [PATCH] fix(tui_gateway): preserve refused handoff custody and
+ cancellation fences [daveey]
+
+---
+ .../test_automation_replay_handoff.py         | 72 ++++++++++++++-----
+ tui_gateway/automation_replay.py              | 37 +++++++---
+ tui_gateway/producer_admission.py             |  4 +-
+ 3 files changed, 84 insertions(+), 29 deletions(-)
+
+diff --git a/tests/tui_gateway/test_automation_replay_handoff.py b/tests/tui_gateway/test_automation_replay_handoff.py
+index 4d52314f25..ce1e4ee942 100644
+--- a/tests/tui_gateway/test_automation_replay_handoff.py
++++ b/tests/tui_gateway/test_automation_replay_handoff.py
+@@ -258,12 +258,13 @@ def test_successor_replays_handed_off_mixed_delivery_exactly_once_in_exact_profi
+     assert kw["profiles"] == [None]  # tmp home is not under profiles/: the launch store, never a scan
+ 
+ 
+-def test_refused_admission_retains_custody_for_the_next_pass(wired, monkeypatch):
++@pytest.mark.parametrize("blocked", ["busy", "refused"])
++def test_refused_admission_retains_custody_for_the_next_pass(wired, monkeypatch, blocked):
+     _arm_mixed(wired.path.parent)
+     monkeypatch.setattr(ar, "stale_code_reason", lambda: "superseded")
+     ar._fire(KEY)
+     monkeypatch.setattr(ar, "stale_code_reason", lambda: None)
+-    verdicts = iter(["busy"] * 20 + ["started"])
++    verdicts = iter([blocked] * 20 + ["started"])
+     wake = lambda *a, **k: next(verdicts)
+     for _ in range(20):
+         assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000.0) == 1
+@@ -307,7 +308,7 @@ def test_launch_profile_chat_hands_off_and_fences_via_the_launch_home(wired, mon
+ def test_failing_batch_is_bounded_not_rewoken_every_pass(wired, monkeypatch):
+     wired.publish(KEY, [item(due=0)])
+     calls = []
+-    for verdict in ("error", "refused"):
++    for verdict in ("error",):
+         for _ in range(50):
+             ar.consume_handoffs([wired.path.parent], wake=lambda *a, **k: calls.append(1) or verdict, now=5000.0)
+         assert len(calls) <= ar.HANDOFF_FAILURES_MAX and not wired.owners()
+@@ -318,9 +319,11 @@ def test_failing_batch_is_bounded_not_rewoken_every_pass(wired, monkeypatch):
+ def test_build_failure_with_local_replay_settles_instead_of_double_owning(wired, monkeypatch):
+     wired.publish(KEY, [item(due=0)])
+ 
+-    def wake(*a, **k):  # the real wake's build failure arms a local replay before returning "error"
+-        ar.schedule(KEY, text="x", display_kind="kanban_notice", display_metadata={}, due=9e9, cause="build",
+-                    persisted=False, now=1000.0, profile_home=wired.path.parent)
++    def wake(owner, text, **kw):
++        ar.replay_failed_wake(owner, text, {
++            "profile_home": wired.path.parent,
++            "agent_failure": {"failure_resets_at": ar.time.time() + 3600},
++        }, kw["display_kind"], kw["display_metadata"], "build")
+         return "error"
+ 
+     assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000.0) == 1
+@@ -389,12 +392,19 @@ def test_seam_wake_resumes_only_in_the_given_profile(monkeypatch):
+     assert resumed == [None, "a", "b"]
+ 
+ 
+-def test_seam_turn_success_and_user_stop_call_cancel_durable():
+-    import inspect
+-    from tui_gateway import prompt_turn, session_lifecycle
+-    assert "cancel_durable" in inspect.getsource(prompt_turn._run_admitted_prompt)
+-    src = inspect.getsource(session_lifecycle._interrupt_session_turn)
+-    assert 'reason == "user_stop"' in src and "stop=True" in src
++@pytest.mark.parametrize("reason", ["user_stop", "backend_exit", "lease_takeover"])
++def test_user_stop_but_not_shutdown_fences_replays(wired, monkeypatch, reason):
++    from tui_gateway import server
++    session = {"session_key": KEY, "profile_home": wired.path.parent,
++               "history_lock": threading.RLock(), "running": False}
++    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _: False)
++    monkeypatch.setattr(server, "_clear_pending", lambda *a, **kw: None)
++    monkeypatch.setattr(server, "_cancel_background_review_on_stop", lambda *a: None)
++    monkeypatch.setattr(server, "_announce_cancelled_gateway_approvals", lambda *a, **kw: None)
++    monkeypatch.setattr("tools.approval.resolve_gateway_approval", lambda *a, **kw: None)
++    wired.publish(KEY, [item(due=0)])
++    server._interrupt_session_turn("ui", session, reason=reason)
++    assert bool(wired.owners()) == (reason != "user_stop")
+ 
+ 
+ def test_durable_success_and_stop_fences(wired):
+@@ -406,10 +416,34 @@ def test_durable_success_and_stop_fences(wired):
+     assert wired.claim(KEY, 300, "h2", lambda _: False) is None
+ 
+ 
+-def test_cancel_durable_never_creates_tables(tmp_path):
+-    home = tmp_path / "h"
+-    home.mkdir()
+-    sqlite3.connect(home / "state.db").close()
+-    ar.cancel_durable(home, (KEY,), 1.0, stop=True)
+-    with sqlite3.connect(home / "state.db") as conn:
+-        assert conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0
++@pytest.mark.parametrize("stop", [False, True])
++def test_cancel_before_first_publication_fences_late_items(wired, stop):
++    ar.cancel_durable(wired.path.parent, (KEY,), 60.0, stop=stop)
++    wired.publish(KEY, [item(created=50)])
++    assert wired.claim(KEY, 100, "successor", lambda _: False) is None
++
++
++def test_stop_cancels_local_unpersisted_delivery(wired):
++    ar.schedule(KEY, text="x", display_kind="kanban_notice", display_metadata={}, due=100,
++                cause="q", persisted=False, now=50, profile_home=wired.path.parent)
++    ar.cancel_durable(wired.path.parent, (KEY,), 60, stop=True)
++    assert not ar.pending(KEY)
++
++
++def test_unrelated_local_retry_does_not_dispose_of_failed_handoff(wired):
++    wired.publish(KEY, [item(due=0)])
++    ar.schedule(KEY, text="other", display_kind="kanban_notice", display_metadata={}, due=9e9,
++                cause="q", persisted=False, now=50, profile_home=wired.path.parent)
++    ar.consume_handoffs([wired.path.parent], wake=lambda *a, **k: "error", now=5000)
++    assert wired.owners() == [KEY]
++
++
++def test_named_launch_profile_is_consumed(monkeypatch, tmp_path):
++    from tui_gateway import producer_admission as pa
++    home = tmp_path / "profiles" / "work"
++    seen = []
++    monkeypatch.setattr("hermes_constants.get_process_hermes_home", lambda: home)
++    monkeypatch.setattr(pa, "_server", lambda: types.SimpleNamespace(_readopt_wake_profiles=lambda: [None]))
++    monkeypatch.setattr(ar, "consume_handoffs", lambda homes, **kw: seen.extend(homes))
++    pa._consume_replay_handoffs()
++    assert seen == [home]
+diff --git a/tui_gateway/automation_replay.py b/tui_gateway/automation_replay.py
+index 5bdc3d1434..dc74f272a9 100644
+--- a/tui_gateway/automation_replay.py
++++ b/tui_gateway/automation_replay.py
+@@ -82,6 +82,7 @@ class _Item:
+     failed_at: float
+     attempt: int = 0  # replays this delivery already had (a wall-refused replay re-armed: ``rewall_due``)
+     id: str = field(default_factory=lambda: uuid.uuid4().hex)  # stable identity across a retirement handoff
++    source_batch: str | None = None  # only a rewall of this exact durable wake transfers custody
+ 
+ 
+ @dataclass
+@@ -240,9 +241,11 @@ def replay_failed_wake(key: str, text: str, session: dict, display_kind: str | N
+                                                                  retries=replay_attempt(meta)))
+             return
+         body, inner, failed_at, attempt = _unwrap_replay(text, meta, now)
++        marker = meta[REPLAY_METADATA_KEY]
++        source_batch = marker.get("batch_id") if isinstance(marker, dict) else None
+         schedule(key, text=body, display_kind=str(display_kind), display_metadata=inner, due=due,
+                  cause=f"{label}: {cause}", persisted=False, attempt=attempt, failed_at=failed_at,
+-                 profile_home=session.get("profile_home"))
++                 profile_home=session.get("profile_home"), source_batch=source_batch)
+         return
+     due = replay_due(now, resets_at)
+     schedule(key, text=text, display_kind=str(display_kind), display_metadata=meta, due=due,
+@@ -344,7 +347,7 @@ def _cancel_timer(entry: _Entry) -> None:
+ def schedule(session_key: str, *, text: str, display_kind: str, display_metadata: dict | None, due: float,
+              cause: str, persisted: bool, now: float | None = None,
+              fire: Callable[[str], None] | None = None, attempt: int = 0, failed_at: float | None = None,
+-             profile_home: Any = None) -> bool:
++             profile_home: Any = None, source_batch: str | None = None) -> bool:
+     """Arm (or join) this chat's one pending replay. True when it is pending after the call. ``attempt`` is the
+     replays the delivery already had (a wall-refused replay re-armed), ``failed_at`` its first failure."""
+     key = str(session_key or "")
+@@ -353,6 +356,7 @@ def schedule(session_key: str, *, text: str, display_kind: str, display_metadata
+     now = time.time() if now is None else now
+     item = _Item(text, display_kind, dict(display_metadata or {}), persisted, cause,
+                  now if failed_at is None else failed_at, attempt)
++    item.source_batch = source_batch
+     fire = fire or _fire
+     home = _home_of(profile_home)
+     with _lock:
+@@ -636,13 +640,23 @@ def _has_journal(home: Any) -> bool:
+ def cancel_durable(home: Any, keys: Any, through: float, *, stop: bool = False) -> None:
+     """A successful turn (context started at ``through``) or an explicit Stop fences handed-off custody."""
+     home = _home_of(home)
+-    if not home or not _has_journal(home):
++    if not home or not (Path(home) / "state.db").is_file():
+         return
++    keys = tuple(dict.fromkeys(str(k) for k in keys if k))
++    if stop:
++        with _lock:
++            for key in keys:
++                entry = _entries.get(key)
++                if entry is not None and entry.home == home:
++                    entry.items = [i for i in entry.items if i.failed_at > through]
++                    if not entry.items:
++                        _cancel_timer(entry)
++                        del _entries[key]
+     try:
+         from tui_gateway.automation_replay_handoff import Journal
+         journal = Journal(home)
+-        for key in dict.fromkeys(k for k in keys if k):
+-            journal.cancel(str(key), through, stop=stop)
++        for key in keys:
++            journal.cancel(key, through, stop=stop)
+     except Exception:  # health: allow BLE001 -- a fence that cannot be written must not break the turn
+         logger.warning("automation-replay: durable cancel failed", exc_info=True)
+ 
+@@ -661,7 +675,7 @@ def _holder_alive(holder: str) -> bool:
+         return False
+ 
+ 
+-HANDOFF_FAILURES_MAX = 3  # error/refused verdicts one batch gets before the successor gives it up
++HANDOFF_FAILURES_MAX = 3  # failed builds/dispatches; ownership refusals retain custody
+ _failures: dict[str, int] = {}
+ _consume_mu = threading.Lock()
+ 
+@@ -669,7 +683,7 @@ _consume_mu = threading.Lock()
+ def consume_handoffs(homes: list, wake: Callable[..., str] | None = None, now: float | None = None) -> int:
+     """The successor's pass: replay every due handed-off delivery through the ordinary wake admission, in the exact
+     profile that owns it. Returns how many batches ran. A busy admission leaves the batch pending (the
+-    predecessor spent no budget); error/refused verdicts are bounded (``HANDOFF_FAILURES_MAX``) and a build failure
++    predecessor spent no budget); error verdicts are bounded (``HANDOFF_FAILURES_MAX``) and a build failure
+     that already armed a local replay settles the batch (one owner). Delivery is at-least-once: a crash between the
+     wake and settlement replays once more (marked and bounded). Storage errors are contained per batch."""
+     if stale_code_reason() or not _consume_mu.acquire(blocking=False):
+@@ -718,6 +732,7 @@ def _run_batch(journal, batch: dict, owner: str, profile: str | None, wake) -> N
+     try:
+         items = [_item_from(d) for d in json.loads(batch["payload"])]
+         text, kind, meta = replay_payload(items)
++        meta[REPLAY_METADATA_KEY]["batch_id"] = batch["id"]
+         if wake is None:
+             from tui_gateway import server
+             wake = server._wake_session_turn
+@@ -727,14 +742,18 @@ def _run_batch(journal, batch: dict, owner: str, profile: str | None, wake) -> N
+         logger.warning("automation-replay: handed-off replay of %s raised", owner, exc_info=True)
+         verdict = "error"
+     bid = batch["id"]
+-    if verdict == "busy":
++    if verdict in ("busy", "refused"):
++        # Refusal is an admission/ownership wait, not a model failure: the retiring
++        # predecessor may retain the slot for its entire drain. Never discard custody.
+         journal.release(batch)
+         return
+     if verdict not in ("started", "missing"):
+         with _lock:
+             _failures[bid] = _failures.get(bid, 0) + 1
+             tries = _failures[bid]
+-            local = bool(_entries.get(owner))  # the failed wake already armed a local replay: it owns the delivery
++            entry = _entries.get(owner)
++            local = bool(entry and entry.home == str(journal.path.parent) and
++                         any(i.source_batch == bid for i in entry.items))
+         if not local and tries < HANDOFF_FAILURES_MAX:
+             journal.release(batch)
+             return
+diff --git a/tui_gateway/producer_admission.py b/tui_gateway/producer_admission.py
+index d3b8833e17..75e37e2692 100644
+--- a/tui_gateway/producer_admission.py
++++ b/tui_gateway/producer_admission.py
+@@ -356,7 +356,9 @@ def _consume_replay_handoffs() -> None:
+     try:
+         from tui_gateway import automation_replay
+         server = _server()
+-        homes = [_profile_home(p) for p in server._readopt_wake_profiles()]
++        from hermes_constants import get_process_hermes_home
++        homes = [Path(get_process_hermes_home()) if p is None else _profile_home(p)
++                 for p in server._readopt_wake_profiles()]
+         automation_replay.consume_handoffs([h for h in homes if h is not None])
+     except Exception:
+         logger.warning("automation-replay handoff pass failed", exc_info=True)
+-- 
+2.43.0
+

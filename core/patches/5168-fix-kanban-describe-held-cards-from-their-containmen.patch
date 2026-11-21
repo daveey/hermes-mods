@@ -1,0 +1,540 @@
+From 67e353a64ec4cd57ba4227e7e36d3acce6731b4c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 04:21:10 +0000
+Subject: [PATCH] fix(kanban): describe held cards from their containment
+ episode; wake or escalate once the authority finished [daveey]
+
+A card that contained itself sits in triage with containment_episode set. kanban_wait_info described it from an older
+park event (intake triage, not agent-owned), so the owner wake never fired, and the triage sweep skips held cards.
+5 of the 6 contained cards on the hub (11-19/20) stranded this way: the named authority had completed or been
+archived without releasing (plan review t_eeeeee000000001d, F3).
+
+- kanban_contained_wait.read: per held triage card, the unreleased episode (kanban_containment_state.reduce_events),
+  authority/producer status (board file, else Board replica; unknown counts as open) and when the authority finished.
+- kanban_wait_info.describe_contained: wait.contained = {episode, authority: {id, status}, producer: {id, status}|None}.
+  Authority open or producer open: not agent-owned. Authority done/archived 30+ min and no open producer: agent-owned,
+  certain, stalled at once, dated from the authority's completion; premise = (contained, episode, authority status,
+  authority completion), so the existing owner wake fires once per episode per authority completion.
+- sweep_stale_triage: a stranded held card with no chat link gets one supervisor card, key
+  containment-strand:<task>:<episode>, plus a comment on the held card; no event on the held card.
+
+Tests: tests/hermes_cli/test_kanban_contained_strand.py (RED on main: 9 of 10 fail; GREEN here). 20 files importing
+the touched modules pass (469 tests). scripts/check --base origin/main ok.
+
+Not in this change: the hermes-mods owner_wake.py wake text for contained cards (names the authority exits) and
+remote rows: describe_replica reads card["contained"] when a projection supplies it; no projection fills it yet.
+---
+ hermes_cli/kanban_contained_wait.py           | 155 ++++++++++++++++++
+ hermes_cli/kanban_session_wait_rows.py        |  18 ++
+ hermes_cli/kanban_triage_sweep.py             |  69 ++++++++
+ hermes_cli/kanban_wait_info.py                |  34 ++++
+ .../test_kanban_contained_strand.py           | 143 ++++++++++++++++
+ 5 files changed, 419 insertions(+)
+ create mode 100644 hermes_cli/kanban_contained_wait.py
+ create mode 100644 tests/hermes_cli/test_kanban_contained_strand.py
+
+diff --git a/hermes_cli/kanban_contained_wait.py b/hermes_cli/kanban_contained_wait.py
+new file mode 100644
+index 0000000000..54edb29805
+--- /dev/null
++++ b/hermes_cli/kanban_contained_wait.py
+@@ -0,0 +1,155 @@
++"""What a contained (held) triage card waits on, read from its ``contained`` episode. [daveey]
++
++A card that contained itself sits in ``triage`` with ``tasks.containment_episode`` set. Only the episode's authority
++card (or a producer's new completed run) can release it. Its newest park event is an older, unrelated one, so
++``kanban_wait_info`` described it as plain intake triage: not agent-owned, never woken. Once the authority finished
++(done/archived) nothing was left to release it (as seen in an example containment incident).
++
++``read`` returns, per contained card, the facts ``kanban_wait_info.describe_contained`` judges against the clock:
++the episode uid, the authority and producer cards with their status (the board file first, else a Board replica),
++and when the authority finished. Reuses ``kanban_containment_state.reduce_events`` to pick the unreleased episode.
++Read-only; any lookup failure leaves the card undescribed (the old behaviour) rather than guessing.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import sqlite3
++from typing import Any, Iterable, Optional
++
++logger = logging.getLogger(__name__)
++
++TERMINAL = ("done", "archived")
++
++
++def _json(raw: Any) -> dict:
++    try:
++        value = json.loads(raw) if isinstance(raw, str) else raw
++    except ValueError:
++        return {}
++    return value if isinstance(value, dict) else {}
++
++
++def _local_status(conn: sqlite3.Connection, ids: list[str]) -> dict[str, tuple[str, Optional[float]]]:
++    """``{id: (status, finished_at)}`` for cards this board file holds. ``finished_at`` is ``completed_at``, else the
++    newest event (an archived card keeps no completion time)."""
++    out: dict[str, tuple[str, Optional[float]]] = {}
++    marks = ",".join("?" * len(ids))
++    for tid, status, done_at, last in conn.execute(
++            f"SELECT t.id, t.status, t.completed_at, (SELECT MAX(e.created_at) FROM task_events e "
++            f"WHERE e.task_id = t.id) FROM tasks t WHERE t.id IN ({marks})", ids):
++        out[str(tid)] = (str(status), done_at or last)
++    return out
++
++
++def _replica_status(ids: list[str]) -> dict[str, tuple[str, Optional[float]]]:
++    out: dict[str, tuple[str, Optional[float]]] = {}
++    if not ids:
++        return out
++    from hermes_cli.kanban_board_replica_refs import _replica_paths, with_reader
++    for path in _replica_paths():
++        rest = [i for i in ids if i not in out]
++        if not rest:
++            break
++
++        def read(conn: sqlite3.Connection, rest=rest) -> list:
++            return conn.execute(
++                f"SELECT t.id, t.status, t.completed_at, (SELECT MAX(e.created_at) FROM task_events e "
++                f"WHERE e.task_id = t.id) FROM tasks t WHERE t.id IN ({','.join('?' * len(rest))})", rest).fetchall()
++
++        try:
++            for tid, status, done_at, last in with_reader(path, read):
++                out[str(tid)] = (str(status), done_at or last)
++        except sqlite3.Error:
++            continue
++    return out
++
++
++def statuses(conn: sqlite3.Connection, ids: Iterable[str]) -> dict[str, tuple[str, Optional[float]]]:
++    want = list(dict.fromkeys(ids))
++    if not want:
++        return {}
++    try:
++        found = _local_status(conn, want)
++    except sqlite3.Error:
++        found = {}
++    missing = [i for i in want if i not in found]
++    if missing:
++        try:
++            found.update(_replica_status(missing))
++        except Exception:  # replica unreadable: unknown status counts as open
++            logger.debug("contained wait: replica status lookup failed", exc_info=True)
++    return found
++
++
++def _producer_released(conn: sqlite3.Connection, producer: str, since: Any) -> bool:
++    """The producer has a completed run newer than the containment (same board file only; elsewhere unknown)."""
++    try:
++        return bool(conn.execute(
++            "SELECT 1 FROM task_runs WHERE task_id = ? AND outcome = 'completed' AND ended_at > ? LIMIT 1",
++            (producer, since or 0)).fetchone())
++    except sqlite3.Error:
++        return False
++
++
++def _active_episode(conn: sqlite3.Connection, tid: str, marker: str) -> Optional[dict]:
++    from hermes_cli.kanban_containment_connections import verifier
++    from hermes_cli.kanban_containment_state import reduce_events
++    cursor = conn.execute("SELECT uid, task_id, kind, payload, created_at FROM task_events WHERE task_id = ? "
++                          "AND kind IN ('contained', 'containment_released')", (tid,))
++    names = [c[0] for c in cursor.description]
++    events = [dict(zip(names, row)) for row in cursor]
++    hold = reduce_events(events, verify_release=lambda r, s: verifier(conn, r, s))
++    if hold is None or hold.unresolved or marker not in hold.episodes:
++        return None
++    return next((e for e in events if e["kind"] == "contained" and e["uid"] == marker), None)
++
++
++def read(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
++    """``{task_id: contained facts}`` for the held triage cards among ``task_ids``::
++
++        {episode, contained_at, authority: {id, status, at}, producer: {id, status, released} | None}
++
++    ``at`` is when the authority finished (None while open or unknown). Cards that are not held are absent."""
++    ids = [str(t) for t in dict.fromkeys(task_ids)]
++    if not ids:
++        return {}
++    try:
++        if "containment_episode" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++            return {}
++        marks = ",".join("?" * len(ids))
++        rows = conn.execute(f"SELECT id, containment_episode FROM tasks WHERE status = 'triage' "
++                            f"AND containment_episode IS NOT NULL AND id IN ({marks})", ids).fetchall()
++    except sqlite3.Error:
++        return {}
++    stops: dict[str, tuple[dict, dict]] = {}
++    for tid, marker in rows:
++        try:
++            stop = _active_episode(conn, str(tid), str(marker))
++        except Exception:
++            logger.debug("contained wait: episode read failed for %s", tid, exc_info=True)
++            continue
++        spec = _json((_json(stop.get("payload")) if stop else {}).get("policy"))
++        authority = (spec.get("authority") or {}).get("task_id")
++        if stop is None or not authority:
++            continue
++        stops[str(tid)] = (stop, spec)
++    need = [spec["authority"]["task_id"] for _, spec in stops.values()]
++    need += [spec["producer"]["task_id"] for _, spec in stops.values() if isinstance(spec.get("producer"), dict)]
++    known = statuses(conn, need)
++    out: dict[str, dict[str, Any]] = {}
++    for tid, (stop, spec) in stops.items():
++        a_id = spec["authority"]["task_id"]
++        a_status, a_at = known.get(a_id, ("unknown", None))
++        info: dict[str, Any] = {
++            "episode": stop["uid"], "contained_at": stop.get("created_at"),
++            "authority": {"id": a_id, "status": a_status, "at": a_at if a_status in TERMINAL else None},
++            "producer": None}
++        producer = spec.get("producer")
++        if isinstance(producer, dict) and producer.get("task_id"):
++            p_id = producer["task_id"]
++            p_status = known.get(p_id, ("unknown", None))[0]
++            info["producer"] = {"id": p_id, "status": p_status,
++                                "released": _producer_released(conn, p_id, stop.get("created_at"))}
++        out[tid] = info
++    return out
+diff --git a/hermes_cli/kanban_session_wait_rows.py b/hermes_cli/kanban_session_wait_rows.py
+index d5630dc2cd..4a26178168 100644
+--- a/hermes_cli/kanban_session_wait_rows.py
++++ b/hermes_cli/kanban_session_wait_rows.py
+@@ -8,6 +8,7 @@ composes both. [daveey]
+ from __future__ import annotations
+ 
+ import json
++import logging
+ import sqlite3
+ from typing import Any, Iterable
+ 
+@@ -67,9 +68,23 @@ def _local_wait_rows(conn: sqlite3.Connection, task_ids: Iterable[str]) -> tuple
+                 events[str(tid)] = (kind, payload, at)
+         except sqlite3.Error:  # board predates task_events
+             break
++    _overlay_contained(conn, parked, events)
+     return parked, events
+ 
+ 
++def _overlay_contained(conn: sqlite3.Connection, parked: dict[str, tuple], events: dict[str, tuple]) -> None:
++    """A held triage card is described from its ``contained`` episode, not from an older park event. [daveey]"""
++    triage = [t for t, row in parked.items() if row[0] == "triage"]
++    if not triage:
++        return
++    try:
++        from hermes_cli import kanban_contained_wait
++        for tid, info in kanban_contained_wait.read(conn, triage).items():
++            events[tid] = ("contained", {"contained": info}, info.get("contained_at"))
++    except Exception:  # display-only: the card keeps its ordinary triage description
++        logging.getLogger(__name__).debug("contained wait read failed", exc_info=True)
++
++
+ def _describe_waits(parked: dict[str, tuple], events: dict[str, tuple], now: float | None = None,
+                     ) -> dict[str, dict[str, Any]]:
+     from hermes_cli import kanban_wait_info as kwi
+@@ -77,6 +92,9 @@ def _describe_waits(parked: dict[str, tuple], events: dict[str, tuple], now: flo
+     out: dict[str, dict[str, Any]] = {}
+     for tid, (status, kind, request, awaiting) in parked.items():
+         ev_kind, payload, at = events.get(tid, (None, None, None))
++        if ev_kind == "contained" and isinstance(payload, dict) and status == "triage":
++            out[tid] = kwi.describe_contained(payload["contained"], now=now)
++            continue
+         try:
+             human = _stored_needs_human(request, kind)
+         except Exception:
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index a726cdcbce..fdb29841ba 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -102,6 +102,71 @@ def _cap(conn: sqlite3.Connection, row, now: int) -> str:
+     return sup_id
+ 
+ 
++def stranded_contained(conn: sqlite3.Connection, *, now: Optional[float] = None) -> list[dict]:
++    """Held triage cards whose authority finished 30+ min ago with nobody left to release them, from the
++    ``kanban_wait_info.describe_contained`` judgment: ``[{id, title, tenant, episode, wait}]``. Read-only."""
++    from hermes_cli import kanban_contained_wait, kanban_wait_info as kwi
++    try:
++        ids = [r[0] for r in conn.execute("SELECT id FROM tasks WHERE status = 'triage' AND containment_episode IS NOT NULL")]
++    except sqlite3.Error:
++        return []
++    out = []
++    for tid, info in kanban_contained_wait.read(conn, ids).items():
++        wait = kwi.describe_contained(info, now=now)
++        if wait["agent_owned"]:
++            row = conn.execute("SELECT title, tenant FROM tasks WHERE id = ?", (tid,)).fetchone()
++            out.append({"id": tid, "title": row[0], "tenant": row[1], "episode": info["episode"], "wait": wait})
++    return out
++
++
++def escalate_stranded_contained(conn: sqlite3.Connection, *, now: Optional[float] = None) -> list[str]:
++    """A stranded contained card with a chat is woken by the owner wake (``wait.agent_owned``); one with NO chat has
++    no owner, so it gets one board-supervisor card per containment episode (key ``containment-strand:<task>:<episode>``)
++    plus a comment on the held card. Writes no event on the held card (its history is containment custody). Returns
++    the supervisor card ids created this call. [daveey]"""
++    from hermes_cli.kanban_chat_links import _local_links
++    from hermes_cli.kanban_origin import gateway_name
++
++    stranded = stranded_contained(conn, now=now)
++    if not stranded:
++        return []
++    try:
++        linked = {link["task_id"] for link in _local_links(conn, gateway_name()).values() if not link.get("released")}
++    except Exception:
++        logger.warning("kanban: containment strand check could not read chat links", exc_info=True)
++        return []
++    created: list[str] = []
++    for card in stranded:
++        tid, episode = card["id"], card["episode"]
++        if tid in linked:
++            continue
++        key = f"containment-strand:{tid}:{episode}"
++        if conn.execute("SELECT 1 FROM tasks WHERE idempotency_key = ?", (key,)).fetchone():
++            continue
++        wait, shown = card["wait"], card["wait"]["contained"]
++        body = (
++            f"Card {tid} ({card['title']!r}) is held by containment episode {episode} and no chat owns it. Its "
++            f"authority card {shown['authority']['id']} is {shown['authority']['status']}, so nothing will release it: "
++            f"{wait['waiting_on']}.\n\nThe held card cannot be archived, promoted, completed, unblocked or unlinked. "
++            "The exits are `kanban_resume_contained(task_id, episode, kind='authority')` from a live run of the "
++            f"authority (reopen {shown['authority']['id']} first if it is done), or `kind='producer'` once the producer "
++            "has a new completed run. If the hold is deliberate (a spend or decision hold), say so on this card and "
++            f"close it. Record what you did as a comment on {tid}."
++        )
++        try:
++            sup_id = _kb.create_task(
++                conn, title=f"Contained card stranded: {card['title']}"[:200], body=body,
++                assignee=_supervisor_profile(), created_by="triage-sweep", workspace_kind="scratch",
++                idempotency_key=key, tenant=card["tenant"])
++            _kb.add_comment(conn, tid, "triage-sweep",
++                            f"Containment episode {episode} is stranded (authority {shown['authority']['id']} is "
++                            f"{shown['authority']['status']}) and no chat owns this card. Supervisor card {sup_id} owns it.")
++            created.append(sup_id)
++        except Exception:
++            logger.exception("kanban: containment strand escalation failed for %s", tid)
++    return created
++
++
+ def sweep_stale_triage(
+     conn: sqlite3.Connection, *, default_assignee: Optional[str] = None,
+     older_than: int = TRIAGE_STALE_SECONDS, now: Optional[int] = None,
+@@ -112,6 +177,10 @@ def sweep_stale_triage(
+     in ``TRIAGE_SWEEP_CAP_WINDOW`` it is capped instead (see :func:`_cap`). Cards with an open human
+     request, or an open kernel recovery card for their current park, are left alone. Returns swept task ids."""
+     now = int(now if now is not None else time.time())
++    try:
++        escalate_stranded_contained(conn, now=now)  # held cards no chat owns: their authority finished
++    except Exception:
++        logger.exception("kanban: containment strand escalation failed")
+     cutoff = now - older_than
+     swept: list[str] = []
+     rows = conn.execute(
+diff --git a/hermes_cli/kanban_wait_info.py b/hermes_cli/kanban_wait_info.py
+index 7738225701..d5418cb351 100644
+--- a/hermes_cli/kanban_wait_info.py
++++ b/hermes_cli/kanban_wait_info.py
+@@ -27,6 +27,9 @@ from typing import Any, Optional
+ 
+ 
+ STALL_AFTER_S = 2 * 3600
++# A contained card whose authority finished is stranded once this long has passed (a reopen-and-release attempt
++# right after the authority completes is recovery, not a strand).
++CONTAINED_STRAND_AFTER_S = 30 * 60
+ 
+ # Producers that change the awaited condition without an agent acting (a card that runs, a CI run, a deploy, a
+ # vendor/ticket, the clock, an internal resource gate whose own probe resumes the card once its reading drops).
+@@ -145,6 +148,34 @@ def premise_key(kind: str, status: str, reason: Any = "", awaiting: Optional[dic
+     return f"{kind}:{hashlib.sha1(basis.encode()).hexdigest()[:12]}"
+ 
+ 
++def describe_contained(info: dict[str, Any], *, now: Optional[float] = None) -> dict[str, Any]:
++    """Wait info for a held card from its ``contained`` episode (``kanban_contained_wait.read``). The wait object
++    carries ``contained: {episode, authority: {id, status}, producer: {id, status} | None}`` (unknown status counts as
++    open). Authority open: waits on its release. Authority done/archived with the producer still open: waits on the
++    producer. Authority finished for CONTAINED_STRAND_AFTER_S and no open producer: agent-owned and stalled at once,
++    dated from the authority's completion, premise (contained, episode, authority status, authority completion)."""
++    now = time.time() if now is None else now
++    authority, producer = info["authority"], info.get("producer")
++    done_at = epoch_s(authority.get("at"))
++    shown = {"episode": info["episode"], "authority": {"id": authority["id"], "status": authority["status"]},
++             "producer": {"id": producer["id"], "status": producer["status"]} if producer else None}
++    base = {"wait_state": "waiting", "waiting_since": done_at, "agent_owned": False, "agent_owned_certain": True,
++            "premise": None, "contained": shown}
++    if authority["status"] not in ("done", "archived"):
++        return {**base, "waiting_on": f"release by card {authority['id']} ({authority['status']})"}
++    if producer and producer["status"] not in ("done", "archived") and not producer.get("released"):
++        return {**base, "waiting_on": f"producer card {producer['id']} ({producer['status']}), then its release"}
++    if done_at is None or now - done_at < CONTAINED_STRAND_AFTER_S:
++        return {**base, "waiting_on": f"release by card {authority['id']} ({authority['status']})"}
++    key = json.dumps(["contained", info["episode"], authority["status"], done_at])
++    exits = ("reopen it and resume the episode, or resume as producer after a new completed producer run"
++             if authority["status"] == "done" and not producer else
++             "no supported exit exists" if not producer else "resume as producer after a new completed run")
++    return {**base, "wait_state": "stalled", "agent_owned": True,
++            "waiting_on": f"an agent to release it: authority {authority['id']} is {authority['status']} ({exits})",
++            "premise": f"contained:{hashlib.sha1(key.encode()).hexdigest()[:12]}"}
++
++
+ def describe(status: Any, *, block_kind: Any = None, human: bool = False, park: Any = None,
+              park_kind: Any = None, since: Any = None, awaiting: Any = None, reason: Any = None,
+              now: Optional[float] = None) -> Optional[dict[str, Any]]:
+@@ -266,6 +297,9 @@ def describe_replica(card: dict[str, Any], *, now: Optional[float] = None) -> Op
+     if status == "triage":
+         outcome = "gave_up" if outcome in _FAILED_RUN_OUTCOMES else (
+             "block_loop_detected" if outcome == "blocked" else outcome)
++    contained = card.get("contained") if status == "triage" else None
++    if isinstance(contained, dict):
++        return describe_contained(contained, now=now)
+     return describe(status, block_kind=card.get("block_kind"), human=human,
+                     park={"wake_check": card.get("wake_check"), "reason": park.get("reason") or "",
+                           "wake_at": park.get("wake_at"), "unknown_producer": not published},
+diff --git a/tests/hermes_cli/test_kanban_contained_strand.py b/tests/hermes_cli/test_kanban_contained_strand.py
+new file mode 100644
+index 0000000000..8e94689248
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_contained_strand.py
+@@ -0,0 +1,143 @@
++"""A contained card whose authority finished is described as stranded, woken once, and escalated when no chat owns it. [daveey]
++
++Replays the 11-19/20 hub strands: cards that contained themselves naming an authority that then completed (or was
++archived) without releasing, so the held card sat in triage with no owner.
++"""
++from __future__ import annotations
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_triage_sweep as sweep
++from hermes_cli import kanban_wait_info as kwi
++from hermes_cli.kanban_session_wait_rows import _local_wait_info
++from tests.hermes_cli import test_kanban_containment_lifecycle as helpers
++
++board = helpers.board
++NOW = 1_800_000_000.0
++MIN = 60
++KEY = "idempotency_key LIKE 'containment-strand:%'"
++
++
++def _contained(conn, *, producer=False):
++    relay, _consumer, authority, target, spec = helpers.setup(conn)
++    prod = None
++    if producer:
++        prod = kb.create_task(conn, title="Producer fixture", assignee="default")
++        spec = {**spec, "producer": {**target, "task_id": prod}}
++    helpers.contain(conn, relay, target, spec)
++    return relay, authority, prod
++
++
++def _finish(conn, task, status="done", at=NOW - 45 * MIN):
++    conn.execute("UPDATE tasks SET status=?, completed_at=?, current_run_id=NULL WHERE id=?", (status, at, task))
++
++
++def _wait(conn, task, now=NOW) -> dict:
++    wait = _local_wait_info(conn, [task], now=now).get(task)
++    assert wait is not None
++    return wait
++
++
++def test_authority_done_over_30_min_is_agent_owned_and_stalled_at_once(board):
++    relay, authority, _ = _contained(board)
++    _finish(board, authority, at=NOW - 31 * MIN)
++    wait = _wait(board, relay)
++    assert wait["agent_owned"] is True and wait["agent_owned_certain"] is True
++    assert wait["wait_state"] == "stalled" and wait["waiting_since"] == NOW - 31 * MIN
++    assert wait["premise"].startswith("contained:")
++    ep = board.execute("SELECT containment_episode FROM tasks WHERE id=?", (relay,)).fetchone()[0]
++    assert wait["contained"] == {"episode": ep, "authority": {"id": authority, "status": "done"}, "producer": None}
++    assert authority in wait["waiting_on"]
++
++
++def test_authority_done_under_30_min_does_not_wake(board):
++    relay, authority, _ = _contained(board)
++    _finish(board, authority, at=NOW - 10 * MIN)
++    wait = _wait(board, relay)
++    assert wait["agent_owned"] is False and wait["premise"] is None and wait["wait_state"] == "waiting"
++
++
++def test_open_authority_is_not_agent_owned(board):
++    relay, authority, _ = _contained(board)
++    wait = _wait(board, relay)
++    assert wait["agent_owned"] is False and wait["premise"] is None
++    assert wait["waiting_on"] == f"release by card {authority} (running)"
++    assert wait["contained"]["authority"] == {"id": authority, "status": "running"}
++
++
++def test_open_producer_keeps_waiting_on_the_producer(board):
++    relay, authority, prod = _contained(board, producer=True)
++    _finish(board, authority, "archived")
++    wait = _wait(board, relay)
++    assert wait["agent_owned"] is False and prod in wait["waiting_on"]
++    assert wait["contained"]["producer"]["id"] == prod
++
++
++def test_producer_with_a_newer_completed_run_leaves_the_card_stranded(board):
++    relay, authority, prod = _contained(board, producer=True)
++    _finish(board, authority, "archived")
++    board.execute("INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
++                  "VALUES (?, 'done', 'completed', ?, ?)", (prod, NOW - 50 * MIN, NOW - 40 * MIN))
++    assert _wait(board, relay)["agent_owned"] is True
++
++
++def test_premise_is_stable_per_episode_and_changes_when_the_authority_completes_again(board):
++    relay, authority, _ = _contained(board)
++    _finish(board, authority, at=NOW - 60 * MIN)
++    first = _wait(board, relay)["premise"]
++    assert _wait(board, relay, now=NOW + 3600)["premise"] == first  # second tick: same premise, no new wake
++    _finish(board, authority, at=NOW - 40 * MIN)  # reopened, release attempt failed, completed again
++    assert _wait(board, relay)["premise"] != first
++
++
++def test_replica_row_with_contained_facts_is_described_the_same_way():
++    card = {"status": "triage", "contained": {
++        "episode": "019a98b4-0000-7000-8000-000000000001", "contained_at": NOW - 3600,
++        "authority": {"id": "t_1123456789abcdef", "status": "archived", "at": NOW - 40 * MIN}, "producer": None}}
++    wait = kwi.describe_replica(card, now=NOW)
++    assert wait["agent_owned"] is True and wait["contained"]["authority"]["status"] == "archived"
++    assert "no supported exit exists" in wait["waiting_on"]
++
++
++def test_no_chat_gets_one_supervisor_card_per_episode_and_no_duplicate(board):
++    relay, authority, _ = _contained(board)
++    _finish(board, authority, at=NOW - 60 * MIN)
++    created = sweep.escalate_stranded_contained(board, now=NOW)
++    assert len(created) == 1
++    cards = board.execute(f"SELECT id, body, idempotency_key FROM tasks WHERE {KEY}").fetchall()
++    assert [c["id"] for c in cards] == created
++    ep = board.execute("SELECT containment_episode FROM tasks WHERE id=?", (relay,)).fetchone()[0]
++    assert cards[0]["idempotency_key"] == f"containment-strand:{relay}:{ep}"
++    assert relay in cards[0]["body"] and authority in cards[0]["body"] and "kanban_resume_contained" in cards[0]["body"]
++    assert sweep.escalate_stranded_contained(board, now=NOW + 3600) == []  # second tick
++    assert board.execute(f"SELECT COUNT(*) FROM tasks WHERE {KEY}").fetchone()[0] == 1
++    assert board.execute("SELECT COUNT(*) FROM task_comments WHERE task_id=? AND author='triage-sweep'",
++                         (relay,)).fetchone()[0] == 1
++
++
++def test_open_authority_or_a_linked_chat_creates_no_card(board):
++    relay, authority, _ = _contained(board)
++    assert sweep.escalate_stranded_contained(board, now=NOW) == []  # authority open
++    _finish(board, authority, at=NOW - 60 * MIN)
++    board.execute("UPDATE tasks SET session_id='20261120_000000_abcdef' WHERE id=?", (relay,))
++    assert sweep.escalate_stranded_contained(board, now=NOW) == []  # a chat owns it: the owner wake handles it
++    assert board.execute(f"SELECT COUNT(*) FROM tasks WHERE {KEY}").fetchone()[0] == 0
++    assert [c["id"] for c in sweep.stranded_contained(board, now=NOW)] == [relay]
++
++
++def test_escalation_writes_no_event_on_the_held_card(board):
++    relay, authority, _ = _contained(board)
++    _finish(board, authority, at=NOW - 60 * MIN)
++    before = board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind != 'commented'",
++                           (relay,)).fetchone()[0]
++    sweep.escalate_stranded_contained(board, now=NOW)
++    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind != 'commented'",
++                         (relay,)).fetchone()[0] == before
++
++
++def test_the_dispatcher_triage_sweep_runs_the_escalation_once(board):
++    relay, authority, _ = _contained(board)
++    _finish(board, authority, at=NOW - 60 * MIN)
++    sweep.sweep_stale_triage(board, now=int(NOW))
++    sweep.sweep_stale_triage(board, now=int(NOW) + 3600)
++    assert board.execute(f"SELECT COUNT(*) FROM tasks WHERE {KEY}").fetchone()[0] == 1
++    assert board.execute("SELECT status FROM tasks WHERE id=?", (relay,)).fetchone()[0] == "triage"  # still held
+-- 
+2.43.0
+

@@ -1,0 +1,217 @@
+From 59b895c894451a3276a97c7f8e04fc3db594d788 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 17:03:23 +0000
+Subject: [PATCH] fix(state): refuse reopening a compression parent under a
+ live turn lease [daveey]
+
+reopen_session() on a session stamped end_reason='compression' clears the
+stamp. The turn-lease key is the compression root, found by walking
+parent_session_id while the parent is stamped compression, so every
+descendant's key silently moved from the root to the child. A holder
+admitted on the root key then read "missing lease row" on its next
+transcript flush and a turn it validly owned was refused
+(session_persistence_failed:turn_lease).
+
+The reopen now runs the guard every other lease-less transcript mutation
+runs: a live row refuses (retryable busy), a stale row is reclaimed, a
+parked update turn refuses. It never inserts or migrates a row, so
+released, never-acquired and superseded holders still refuse and the
+absence-based fence is unchanged. Reopening a session that is not a
+compression parent is unchanged.
+
+Why: found by exhaustive depth-2 model check of acquire/refresh/flush/
+release/rotate/reopen/end over the real SessionDB; the only
+valid-owner-refused counterexample reachable from a compression lineage.
+NOT attributed to Desktop incident 20000101_000000_00000b: that session
+has no parent, so its key was its own id.
+
+Proof: tests/hermes_state/test_reopen_compression_parent_turn_lease.py,
+4 of 6 fail on origin/main (missing lease row for the valid owner), 6/6
+pass; controls: released/never-acquired holder refuses without inserting
+a row, stale row reclaimed, non-compression reopen unchanged, Event-ordered
+two-connection reopen vs owner flush. Regression: 324 files / 4221 tests
+(hermes_state, reopen callers in gateway/tui_gateway/cli) passed.
+
+Hermes-Card: t_eeeeee000000002b
+---
+ hermes_state_sessions.py                      |   9 ++
+ ...st_reopen_compression_parent_turn_lease.py | 147 ++++++++++++++++++
+ 2 files changed, 156 insertions(+)
+ create mode 100644 tests/hermes_state/test_reopen_compression_parent_turn_lease.py
+
+diff --git a/hermes_state_sessions.py b/hermes_state_sessions.py
+index b8c552f33a..ebe5372da6 100644
+--- a/hermes_state_sessions.py
++++ b/hermes_state_sessions.py
+@@ -516,6 +516,15 @@ class SessionSessionsMixin:
+ 
+     def _reopen_session_conn(self, conn, session_id: str) -> None:
+         """Reopen on the caller's transaction, preserving queue and lineage invariants."""
++        ended = conn.execute("SELECT end_reason FROM sessions WHERE id = ?", (session_id,)).fetchone()
++        if ended is not None and ended["end_reason"] == "compression":
++            # Clearing a compression parent's stamp cuts the lineage: the turn-lease key (the compression
++            # root, walked while the parent is stamped) of every descendant moves from this root to the
++            # child, so a holder admitted on the old key would read "missing lease row" on its next flush
++            # and lose a turn it validly owns. A lease-less mutation of the root must not run under a live
++            # turn: refuse it like every other one (a stale row is reclaimed, a parked turn is refused).
++            self._check_transcript_write_guards(
++                conn, session_id, None, reject_active_turn_lease=True, allow_closed_compression_parent=True)
+         self._retire_undrained_queue_rows_conn(conn, session_id)
+         conn.execute(
+             "UPDATE sessions AS child SET model_config = json_set("
+diff --git a/tests/hermes_state/test_reopen_compression_parent_turn_lease.py b/tests/hermes_state/test_reopen_compression_parent_turn_lease.py
+new file mode 100644
+index 0000000000..3124cb709d
+--- /dev/null
++++ b/tests/hermes_state/test_reopen_compression_parent_turn_lease.py
+@@ -0,0 +1,147 @@
++"""Reopening a compression parent must not orphan a live turn lease (valid-owner loss).
++
++The turn-lease key is the compression root, found by walking ``parent_session_id`` while the parent is
++stamped ``end_reason='compression'``. ``reopen_session(parent)`` clears that stamp, so the key of every
++descendant silently moves from the root to the child: the holder admitted on the root key then reads
++"missing lease row" on its next flush and a turn it validly owns is refused. These tests drive the real
++SessionDB acquire / flush / release / reopen boundaries, in both orders, and keep every fence intact.
++"""
++
++from __future__ import annotations
++
++import os
++import threading
++
++import pytest
++
++from hermes_state import SessionDB
++from hermes_state_errors import SessionTurnLeaseLostError
++
++
++def _holder(name: str) -> str:
++    return f"pid={os.getpid()}:turn={name}"
++
++
++def _lease_rows(db):
++    with db._read_ctx() as conn:
++        return [tuple(r) for r in conn.execute("SELECT conversation_id, holder FROM session_turn_leases")]
++
++
++def _compressed(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("root", source="desktop")
++    db.end_session("root", "compression")
++    db.create_session("tip", source="desktop", parent_session_id="root")
++    return db
++
++
++def _flush(db, holder, text):
++    return db.append_messages_batch("tip", [{"role": "assistant", "content": text}], turn_lease_holder=holder)
++
++
++def test_reopen_of_compression_parent_is_refused_under_a_live_turn_and_the_owner_survives(tmp_path):
++    db = _compressed(tmp_path)
++    owner = _holder("owner")
++    assert db.try_acquire_session_turn_lease("tip", owner, ttl_seconds=60)
++    assert _flush(db, owner, "first") == 1
++
++    with pytest.raises(SessionTurnLeaseLostError, match="active turn lease"):
++        db.reopen_session("root")
++
++    # The refused reopen changed nothing: the lineage is still cut at the compression stamp.
++    assert db.get_session("root")["end_reason"] == "compression"
++    assert db._session_turn_lease_key("tip") == "root"
++    assert _flush(db, owner, "second") == 1  # the valid owner is not refused
++    assert [m["content"] for m in db.get_messages("tip")] == ["first", "second"]  # no loss, no duplicate
++    assert _lease_rows(db) == [("root", owner)]
++
++
++def test_refused_reopen_keeps_the_released_and_stale_writer_fences(tmp_path):
++    db = _compressed(tmp_path)
++    owner, stranger = _holder("owner"), _holder("stranger")
++    assert db.try_acquire_session_turn_lease("tip", owner, ttl_seconds=60)
++    with pytest.raises(SessionTurnLeaseLostError):
++        db.reopen_session("root")
++    with pytest.raises(SessionTurnLeaseLostError, match="turn lease lost"):
++        _flush(db, stranger, "never authorized")  # a never-acquired holder still refuses
++
++    db.release_session_turn_lease("tip", owner)
++    assert _lease_rows(db) == []
++    with pytest.raises(SessionTurnLeaseLostError, match="missing lease row"):
++        _flush(db, owner, "after release")  # a released holder still refuses ...
++    assert _lease_rows(db) == []  # ... and never re-inserts a missing row
++    assert db.get_messages("tip") == []
++
++
++def test_reopen_proceeds_after_release_and_a_new_turn_owns_the_new_key(tmp_path):
++    db = _compressed(tmp_path)
++    first, second = _holder("first"), _holder("second")
++    assert db.try_acquire_session_turn_lease("tip", first, ttl_seconds=60)
++    db.release_session_turn_lease("tip", first)
++
++    db.reopen_session("root")  # idle lineage: reopening is unchanged
++    assert db.get_session("root")["end_reason"] is None
++    assert db.try_acquire_session_turn_lease("tip", second, ttl_seconds=60)
++    assert _flush(db, second, "after reopen") == 1
++    with pytest.raises(SessionTurnLeaseLostError):
++        _flush(db, first, "superseded")  # the earlier holder stays fenced out
++    db.release_session_turn_lease("tip", second)
++
++
++def test_reopen_reclaims_a_stale_row_like_every_lease_less_writer(tmp_path):
++    db = _compressed(tmp_path)
++    old = _holder("old")
++    assert db.try_acquire_session_turn_lease("tip", old, ttl_seconds=0.1)
++    db._execute_write(lambda conn: conn.execute("UPDATE session_turn_leases SET expires_at = 1.0"))
++
++    db.reopen_session("root")
++    assert db.get_session("root")["end_reason"] is None
++    assert _lease_rows(db) == []  # the stale row was deleted, which also fences the old holder
++    with pytest.raises(SessionTurnLeaseLostError, match="missing lease row"):
++        _flush(db, old, "late flush of a dead turn")
++
++
++def test_reopen_of_a_session_that_is_not_a_compression_parent_is_unchanged_under_a_live_turn(tmp_path):
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("solo", source="desktop")
++    db.end_session("solo", "ws_orphan_reap")  # an automatic stamp, not a lineage cut
++    owner = _holder("owner")
++    assert db.try_acquire_session_turn_lease("solo", owner, ttl_seconds=60)
++
++    db.reopen_session("solo")  # the key is "solo" before and after: nothing to protect, nothing refused
++    assert db.append_messages_batch(
++        "solo", [{"role": "assistant", "content": "still mine"}], turn_lease_holder=owner) == 1
++    db.release_session_turn_lease("solo", owner)
++
++
++def test_concurrent_reopen_and_acquire_serialize_to_one_valid_owner(tmp_path):
++    """Event-ordered: the reopen is attempted while the owner is mid-turn (after its first flush, before
++    its second); the owner's second flush must land, and the reopen succeeds only after release."""
++    db = _compressed(tmp_path)
++    other = SessionDB(tmp_path / "state.db")  # a second connection, as a second process would use
++    owner = _holder("owner")
++    flushed_first, reopen_attempted, results = threading.Event(), threading.Event(), {}
++
++    def reopener():
++        assert flushed_first.wait(5)
++        try:
++            other.reopen_session("root")
++            results["reopen_mid_turn"] = "reopened"
++        except SessionTurnLeaseLostError:
++            results["reopen_mid_turn"] = "refused"
++        reopen_attempted.set()
++
++    thread = threading.Thread(target=reopener, daemon=True)
++    thread.start()
++    assert db.try_acquire_session_turn_lease("tip", owner, ttl_seconds=60)
++    assert _flush(db, owner, "one") == 1
++    flushed_first.set()
++    assert reopen_attempted.wait(5)
++    assert _flush(db, owner, "two") == 1
++    db.release_session_turn_lease("tip", owner)
++    thread.join(5)
++
++    assert results == {"reopen_mid_turn": "refused"}
++    other.reopen_session("root")  # after release it goes through
++    assert db.get_session("root")["end_reason"] is None
++    assert [m["content"] for m in db.get_messages("tip")] == ["one", "two"]
+-- 
+2.43.0
+

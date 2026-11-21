@@ -1,0 +1,168 @@
+From e32baf1db57ca546161cbecdd4dc855ffbf72b4f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 18:43:25 -0800
+Subject: [PATCH] fix(kanban): placement requeue loops still escalate on the
+ third identical park [daveey]
+
+Exempting declared clocks without a wake probe from the repeat-park escalation (623c14d2fcb) removed the only
+bound on the placement forwarder's requeue loops (request still queued, refused with no local fallback, failed
+forward step): each parks on a declared clock via _park_clock and would re-queue every 10 min forever.
+
+- kanban_awaiting.gate / schedule_task: count_repeats (system re-park loops only) keeps the escalation for a
+  declared clock; its premise ignores the why, which carries per-attempt detail, as the old bare clock did.
+- _park_clock passes it. Agent-declared clocks stay exempt.
+- CLI --awaiting help: clock needs --awaiting-why.
+- Tests: each of the three loops escalates on its third requeue (red without the fix).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_awaiting.py             | 12 ++++++--
+ hermes_cli/kanban_db_schedule.py          |  6 +++-
+ hermes_cli/kanban_parser.py               |  2 +-
+ hermes_cli/kanban_placement_forward.py    |  3 ++
+ tests/hermes_cli/test_kanban_placement.py | 37 +++++++++++++++++++++++
+ 5 files changed, 55 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 6ae8925479..90795b481b 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -1085,9 +1085,13 @@ def probe_fire_reparks(conn: sqlite3.Connection, task_id: str, premise: str, pro
+ 
+ def gate(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optional[str],
+          wake_check: Optional[str] = None, clock_only: bool = False, op: str = "schedule",
+-         wake_in: Optional[int] = None, blocker_id: Optional[str] = None) -> dict:
++         wake_in: Optional[int] = None, blocker_id: Optional[str] = None, count_repeats: bool = False) -> dict:
+     """``resolve`` plus re-park escalation: the record to store on the parking event.
+ 
++    ``count_repeats``: a system re-park loop (``kanban_placement_forward._park_clock``) whose declared clock must
++    still escalate on the third identical park, as every clock did before declared clocks were exempted; its
++    premise ignores the ``why`` (which carries the per-attempt detail), so the loop is counted as one premise.
++
+     Raises ``RepeatedPark`` on the third park in a row on one premise. Card waits (their producer
+     is accountable), clock waits with no wake probe (declared or a short pacing continue: a clock is its own
+     producer), shared-blocker waits (the blocker's probe ends them) and re-parks after the
+@@ -1099,13 +1103,15 @@ def gate(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Optio
+     record = resolve(conn, task_id, awaiting=awaiting, reason=reason, wake_check=wake_check,
+                      clock_only=clock_only, op=op, wake_in=wake_in, blocker_id=blocker_id)
+     if (record["kind"] == "card" or record.get("shared_blocker")
+-            or (record["kind"] == "clock" and not (wake_check and str(wake_check).strip()))):
++            or (record["kind"] == "clock" and not count_repeats and not (wake_check and str(wake_check).strip()))):
+         # A clock is its own producer: re-parking a recurring cooldown on a stable why is not a stuck premise.
+         # A clock that also carries a wake probe keeps the probe's escalations (the fire cap catches a probe
+         # looser than the worker's own check, t_f6d930b7; deadline-only wakes are a stuck premise).
+         # A shared-blocker wait is ended by the blocker's own probe, which one card per interval runs.
+         return record
+-    record["premise"] = premise_hash(record, reason, wake_check)
++    record["premise"] = premise_hash(
++        {k: v for k, v in record.items() if k != "why"} if count_repeats and record["kind"] == "clock" else record,
++        reason, wake_check)
+     if record["kind"] == RESOURCE:
+         # A governor/pool hold is internal and transient: its probe resumes the card when the reading drops.
+         # Escalating it made "Unstick" cards for a premise nobody can act on (bb t_01a19f5cca30ed12), and on a
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index 1ec413390b..883df77f3f 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -20,6 +20,7 @@ def schedule_task(
+     clear_blocker: bool = False, comment: Optional[tuple[str, str]] = None,
+     blocker_id: Optional[str] = None, blocker_provider: Optional[str] = None,
+     blocker_model: Optional[str] = None, blocker_lane: Optional[str] = None, watch: bool = False,
++    count_repeats: bool = False,
+ ) -> bool:
+     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable) until its wake
+     (``SCHEDULED_UNTIL=`` in the reason, else ``kanban_timed_park.DEFAULT_WAKE_SECONDS``) or an
+@@ -32,6 +33,8 @@ def schedule_task(
+     ``comment`` (``(author, body)``) is written in the same txn and only when the park lands
+     (``kanban_reason_comment``); ``human_answer_refusal`` explains the human-answer refusal.
+     ``watch`` stamps the park a watch (``kanban_watch``): it does not hold its chat open while parked.
++    ``count_repeats`` (system re-park loops only): a declared clock still escalates on its third identical park
++    (``kanban_awaiting.gate``).
+     Triage parks reset the dispatcher failure streak without an intermediate dispatchable
+     status; block-loop recurrence evidence is retained, as on unblock."""
+     from hermes_cli.kanban_reason_comment import reason_comment
+@@ -45,7 +48,8 @@ def schedule_task(
+         from hermes_cli import kanban_wake_check as kwc
+         try:
+             record = kaw.gate(conn, task_id, awaiting=awaiting, reason=reason, wake_check=wake_check,
+-                              clock_only=clock_only, op="schedule", blocker_id=blocker_id)
++                              clock_only=clock_only, op="schedule", blocker_id=blocker_id,
++                              count_repeats=count_repeats)
+         except kaw.RepeatedPark as rp:
+             return noted.keep(kaw.escalate(conn, task_id, record=rp.record, reason=reason,
+                                            expected_run_id=expected_run_id) is not None)
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 06916543d7..be2cfd8248 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -117,7 +117,7 @@ def _WAKE_CHECK_ARGS():
+              help="A pure time wait with nothing to probe (soak window, calendar date)"),
+         _arg("--awaiting", dest="awaiting", default=None, metavar="KIND:REF|JSON",
+              help="Who produces the condition: card:<task id> (JSON adds gateway/board), ci:<run id>, "
+-                  "deploy:<id>, external:<vendor/ticket>, clock:<window>, chat:<owning orchestrator> (with --awaiting-why "
++                  "deploy:<id>, external:<vendor/ticket>, clock:[<window>] (needs --awaiting-why <why this time>), chat:<owning orchestrator> (with --awaiting-why "
+                   "<the question>; wakes the card's subscribed chat), resource:<gate> (an internal "
+                   "governor/pool hold; needs --wake-check, never escalates, backs off). Required: a scheduled "
+                   "wait needs a wake reason. A park with no --awaiting, no --wake-check and no live card in its "
+diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
+index 2ede1752a3..bebf7c7f0b 100644
+--- a/hermes_cli/kanban_placement_forward.py
++++ b/hermes_cli/kanban_placement_forward.py
+@@ -703,6 +703,9 @@ class Forwarder:
+         ok = kb.schedule_task(
+             self.conn, self.task_id, expected_run_id=self.run_id, clock_only=True,
+             awaiting={"kind": "clock", "why": f"deferred placement retry: {why}"[:600]},
++            # [daveey] A requeue loop (request still queued, refused with no local fallback, a failed forward
++            # step) is bounded by the repeat-park escalation: the third requeue goes to an owner card.
++            count_repeats=True,
+             reason=f"SCHEDULED_UNTIL={_iso(self.now() + REQUEUE_SECONDS)} {why} (deferred placement)")
+         return "requeued" if ok else "park-refused"
+ 
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index af0f3c72d1..419030a3a8 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -1993,3 +1993,40 @@ def test_archived_producer_is_not_parked_on(mac, monkeypatch):
+         monkeypatch.setattr(kaw, "confirm_remote", archived)
+         with pytest.raises(kaw.AwaitingError):
+             f.run()
++
++
++@pytest.mark.parametrize("loop", ["queued", "refused_no_fallback", "step_failed"])
++def test_placement_requeue_loops_escalate_on_the_third_requeue(mac, monkeypatch, loop):
++    """The forwarder's requeue loops park on a declared clock (``_park_clock``). Declared clocks are exempt from the
++    repeat-park escalation for agents, but these system loops pass ``count_repeats``: the third requeue goes to an
++    owner card instead of re-queueing every 10 min forever. The per-attempt detail in the why (an exception text)
++    does not split the premise. [daveey]"""
++    from hermes_cli import kanban_awaiting as kaw
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    if loop == "refused_no_fallback":  # a qualified origin's card: no local fallback, so _cancel re-parks
++        real_state = kpf.state
++        monkeypatch.setattr(kpf, "state", lambda c, t: {**(real_state(c, t) or {}), "origin_gateway": "elsewhere"})
++    actions = []
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        for n in range(3):
++            f = _forwarder(conn, child, mac, monkeypatch, await_tid=None)
++            if loop == "queued":
++                actions.append(f.run())
++            elif loop == "refused_no_fallback":
++                actions.append(f._cancel(f"hub refused the card: attempt {n}"))
++            else:
++                actions.append(f._park_clock(f"forward step failed (RuntimeError: timeout {n}); retrying"))
++            if n < 2:
++                assert kb.get_task(conn, child).status == "scheduled", (n, actions)
++                kb.unblock_task(conn, child)
++                kb.recompute_ready(conn)
++        kinds = [e.kind for e in kb.list_events(conn, child)]
++        assert kinds.count("scheduled") == 2 and kaw.ESCALATED_EVENT in kinds, (actions, kinds)
++        assert kb.get_task(conn, child).status == "todo"
+-- 
+2.43.0
+

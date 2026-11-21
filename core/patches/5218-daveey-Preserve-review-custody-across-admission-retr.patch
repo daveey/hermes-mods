@@ -1,0 +1,381 @@
+From 1cf650360ed874cb10d27ca0877207c2b272a797 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:32:56 +0000
+Subject: [PATCH] [daveey] Preserve review custody across admission retry parks
+
+Review admission exhaustion was recorded as gave_up. Timed scheduling then
+forgot the review phase, so a wake escalated to a deep implementer and its
+no-code re-handoff consumed another independent reviewer.
+
+Preserve the resumable phase in schedule/unblock, exclude typed admission
+refusals (and narrow legacy equivalents) from implementation escalation,
+and retain original author custody for repeated immutable merged PR/head/
+merge identities. Unknown/changed artifacts and intervening executed work
+remain author evidence; no blanket review_requested exemption.
+
+Proof:
+- Regression RED reproduced author pollution, phase loss, and deep retry.
+- 578 tests passed, 1 skipped across 28 review/tier/park/wake consumer files.
+- 13/13 distinct mutants killed; two initial survivors gained repeated-
+  invalid-identity controls and were killed on rerun.
+- scripts/check --base origin/main: all 21 checks pass.
+- Read-only replay over 20 hub board/shadow DBs, deduped by task/run UID:
+  only the example card's model re-handoffs are exempted; 25 review-admission
+  gave_up receipts stop counting as implementation failures. Inspected
+  every changed input; no implementation failure was exempted.
+
+Hotspots: kanban_review_model.py overlaps review-author-custody; kanban_db.py
+changes only two existing lines for scheduled phase readback/unblock.
+---
+ hermes_cli/kanban_db.py                       |   4 +-
+ hermes_cli/kanban_db_schedule.py              |   8 +-
+ hermes_cli/kanban_model_tier.py               |  15 +-
+ hermes_cli/kanban_review_model.py             |   4 +
+ hermes_cli/kanban_review_retry.py             |  62 +++++++
+ .../test_kanban_review_retry_custody.py       | 174 ++++++++++++++++++
+ 6 files changed, 258 insertions(+), 9 deletions(-)
+ create mode 100644 hermes_cli/kanban_review_retry.py
+ create mode 100644 tests/hermes_cli/test_kanban_review_retry_custody.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 31c38b2967..9cc9f15589 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1886,7 +1886,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
+     row = conn.execute(
+         "SELECT payload FROM task_events "
+         "WHERE task_id = ? AND kind IN ("
+-        "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
++        "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', 'scheduled', "
+         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
+         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'owner_restart_lost', 'contained', 'containment_released'"
+         ") ORDER BY id DESC LIMIT 1", (task_id,),
+@@ -3278,7 +3278,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str, *, comment: Optional[tu
+             if held or precondition is not None and precondition(conn):
+                 return False
+             resume_status = (_resume_status_from_events(conn, task_id)
+-                             if _task_status(conn, task_id) in ("blocked", "triage") else "ready")
++                             if _task_status(conn, task_id) in ("blocked", "triage", "scheduled") else "ready")
+             _reclaim_dangling_run(
+                 conn, task_id, statuses=("blocked", "scheduled", "triage"), now=now,
+                 note="invariant recovery on unblock",
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index 8dbddb8a89..d7d5bb3f87 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -58,6 +58,12 @@ def schedule_task(
+         payload["wake_at"], reason = kdw.apply(record, payload["wake_at"], reason, now=int(_time.time()))
+         reason, check_every = kaw.resource_apply(record, reason, check_every)
+         payload["reason"] = reason
++        task = _kb.get_task(conn, task_id)
++        source_status = (_kb._retry_status_for_run(conn, task_id) if task and task.status == 'running'
++                         else _kb._resume_status_from_events(conn, task_id))
++        if task and task.status == 'review':
++            source_status = 'review'
++        payload['resume_status'] = source_status
+         if watch:
+             payload["watch"] = True
+         wake_check, check_every = kwc.validate_park(
+@@ -74,7 +80,7 @@ def schedule_task(
+                    claim_expires= NULL,
+                    worker_pid   = NULL
+              WHERE id = ?
+-               AND status IN ('todo', 'ready', 'running', 'blocked', 'triage')
++               AND status IN ('todo', 'ready', 'running', 'blocked', 'triage', 'review')
+         """
+         if expected_run_id is not None:
+             sql += " AND current_run_id = ?"
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 1362df51fe..ff58b2cb2c 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -66,13 +66,16 @@ def load_tier_config() -> dict[str, Any]:
+ 
+ def _prior_failure(conn: sqlite3.Connection, task_id: str, current_run_id: Optional[int]) -> Optional[str]:
+     marks = ",".join("?" for _ in FAILED_RUN_OUTCOMES)
+-    row = conn.execute(
+-        f"SELECT outcome FROM task_runs WHERE task_id = ? AND id IS NOT ? AND outcome IN ({marks}) "
+-        "ORDER BY id DESC LIMIT 1",
++    rows = conn.execute(
++        f"SELECT id, outcome, metadata, error FROM task_runs WHERE task_id = ? AND id IS NOT ? AND outcome IN ({marks}) "
++        "ORDER BY id DESC",
+         (task_id, current_run_id, *FAILED_RUN_OUTCOMES),
+-    ).fetchone()
+-    if row is not None:
+-        return f"run_{row[0]}"
++    ).fetchall()
++    from hermes_cli.kanban_review_retry import admission_gave_up
++    for row in rows:
++        if row[1] == 'gave_up' and admission_gave_up(conn, task_id, row[0], row[2], row[3]):
++            continue
++        return f"run_{row[1]}"
+     marks = ",".join("?" for _ in REWORK_EVENT_KINDS)
+     row = conn.execute(
+         f"SELECT kind FROM task_events WHERE task_id = ? AND kind IN ({marks}) ORDER BY id DESC LIMIT 1",
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index efa45b7ff7..e15387f0ed 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -91,7 +91,11 @@ def implementer_models(conn, task) -> set[str]:
+         if pin and not is_class_selector(pin) and not downstream:
+             models.add(pin)
+         if not downstream and not skilled:
++            from hermes_cli.kanban_review_retry import rehandoff_runs
++            repeats = rehandoff_runs(conn, card.id)
+             for row in conn.execute("SELECT id FROM task_runs WHERE task_id=?", (card.id,)).fetchall():
++                if row[0] in repeats:
++                    continue
+                 events = conn.execute(
+                     "SELECT kind, payload FROM task_events WHERE task_id=? AND run_id=? "
+                     "AND kind IN ('model_tier', 'run_route') ORDER BY id DESC", (card.id, row[0])).fetchall()
+diff --git a/hermes_cli/kanban_review_retry.py b/hermes_cli/kanban_review_retry.py
+new file mode 100644
+index 0000000000..eb6b657a8f
+--- /dev/null
++++ b/hermes_cli/kanban_review_retry.py
+@@ -0,0 +1,62 @@
++"""Custody for review admission retries and immutable merged-artifact re-handoffs."""
++from __future__ import annotations
++
++import json
++import re
++
++
++def _mapping(raw):
++    try:
++        value = json.loads(raw) if raw else {}
++    except (TypeError, ValueError):
++        return {}
++    return value if isinstance(value, dict) else {}
++
++
++def _artifact(metadata):
++    """Only a complete immutable merged-PR identity can prove the same deliverable."""
++    pr = metadata.get('published_pr')
++    merge, head = metadata.get('merge_commit'), metadata.get('reviewed_sha')
++    if (metadata.get('pr_state') != 'MERGED' or not isinstance(pr, str)
++            or not re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+/pull/[1-9][0-9]*', pr)
++            or any(not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha) for sha in (merge, head))):
++        return None
++    return pr, merge, head
++
++
++def rehandoff_runs(conn, task_id):
++    """Retain the first author; exempt only repeats of the same immutable deliverable.
++
++    Any intervening executed work without such a handoff resets the evidence. Admission
++    failures and synthetic operator parks have no execution receipt and do not reset it.
++    Unknown/malformed or changed handoffs are always implementation, never exemptions.
++    """
++    executed = {row[0] for row in conn.execute(
++        "SELECT DISTINCT run_id FROM task_events WHERE task_id=? "
++        "AND kind IN ('run_route', 'worker_result', 'spawned', 'owner_admitted')", (task_id,))}
++    prior = None
++    repeats = set()
++    for run_id, outcome, raw in conn.execute(
++            'SELECT id, outcome, metadata FROM task_runs WHERE task_id=? ORDER BY id', (task_id,)):
++        if outcome == 'review_requested':
++            identity = _artifact(_mapping(raw))
++            if identity is not None and identity == prior:
++                repeats.add(run_id)
++            prior = identity
++        elif run_id in executed:
++            prior = None
++    return repeats
++
++
++def admission_gave_up(conn, task_id, run_id, metadata, error):
++    """A refused review spawn is infrastructure, not a failed implementation attempt."""
++    row = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='gave_up' ORDER BY id DESC LIMIT 1",
++        (task_id, run_id)).fetchone()
++    payload = _mapping(row[0] if row else None)
++    if payload.get('admission_refusal') == 'review_model_unavailable':
++        return True
++    # Historical runs predate the typed gave_up event. Preserve all other failures.
++    meta = _mapping(metadata)
++    return (meta.get('retry_status') == 'review' and meta.get('trigger_outcome') == 'spawn_failed'
++            and isinstance(error, str) and error.startswith('Review model resolution failed: '))
+diff --git a/tests/hermes_cli/test_kanban_review_retry_custody.py b/tests/hermes_cli/test_kanban_review_retry_custody.py
+new file mode 100644
+index 0000000000..f0dfc5a975
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_review_retry_custody.py
+@@ -0,0 +1,174 @@
++"""Review admission is not implementation work; immutable re-handoffs keep author custody."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli import kanban_review_model as review
++from tests.hermes_cli import test_kanban_managed_pin_policy as managed
++from tests.hermes_cli import test_kanban_review_implementer_set as authors
++
++board = managed.board
++identity_board = authors.board
++TIER = {'default_model': 'class:standard', 'default_provider': 'auto',
++        'strong_model': 'class:deep', 'strong_provider': 'auto'}
++ARTIFACT = {
++    'published_pr': 'https://github.com/example/project/pull/12', 'pr_state': 'MERGED',
++    'merge_commit': 'a' * 40, 'reviewed_sha': 'b' * 40,
++}
++
++
++def handoff(conn, tid, model, metadata):
++    run = authors._run(conn, tid, receipt=model)
++    conn.execute("UPDATE task_runs SET outcome='review_requested', metadata=? WHERE id=?",
++                 (json.dumps(metadata), run))
++    conn.commit()
++    return run
++
++
++def test_immutable_merged_rehandoff_does_not_consume_reviewer(identity_board):
++    with authors.kbc.connect() as conn:
++        tid = authors._card(conn)
++        handoff(conn, tid, authors.ASTRA, ARTIFACT)
++        handoff(conn, tid, authors.OPUS, ARTIFACT)
++        assert review.implementer_models(conn, kb.get_task(conn, tid)) == {authors.ASTRA}
++
++
++@pytest.mark.parametrize('delta', [
++    {'merge_commit': 'c' * 40}, {'reviewed_sha': 'c' * 40},
++    {'published_pr': 'https://github.com/example/project/pull/13'},
++    {'pr_state': 'OPEN'}, {'merge_commit': None}, {'reviewed_sha': 'bad'},
++    {'published_pr': ['https://github.com/example/project/pull/12']},
++    {'published_pr': 'not-a-pr'},
++])
++def test_changed_or_unknown_artifact_keeps_author(identity_board, delta):
++    with authors.kbc.connect() as conn:
++        tid = authors._card(conn)
++        handoff(conn, tid, authors.ASTRA, ARTIFACT)
++        handoff(conn, tid, authors.OPUS, {**ARTIFACT, **delta})
++        assert review.implementer_models(conn, kb.get_task(conn, tid)) == {authors.ASTRA, authors.OPUS}
++
++
++@pytest.mark.parametrize('metadata', [
++    {**ARTIFACT, 'published_pr': 'not-a-pr'},
++    {**ARTIFACT, 'reviewed_sha': 'bad'},
++    {**ARTIFACT, 'merge_commit': None},
++    {**ARTIFACT, 'pr_state': 'OPEN'},
++    {}, [],
++])
++def test_repeated_unknown_identity_never_exempts_author(identity_board, metadata):
++    with authors.kbc.connect() as conn:
++        tid = authors._card(conn)
++        handoff(conn, tid, authors.ASTRA, metadata)
++        handoff(conn, tid, authors.OPUS, metadata)
++        assert review.implementer_models(conn, kb.get_task(conn, tid)) == {authors.ASTRA, authors.OPUS}
++
++
++def test_intervening_work_retains_next_handoff_author(identity_board):
++    with authors.kbc.connect() as conn:
++        tid = authors._card(conn)
++        handoff(conn, tid, authors.ASTRA, ARTIFACT)
++        authors._run(conn, tid, receipt=authors.GROK)
++        handoff(conn, tid, authors.OPUS, ARTIFACT)
++        assert review.implementer_models(conn, kb.get_task(conn, tid)) == {
++            authors.ASTRA, authors.GROK, authors.OPUS}
++
++
++def test_three_refusals_park_and_wake_stay_review(board, monkeypatch):
++    from hermes_cli.kanban_db_dispatch import dispatch_once
++    monkeypatch.setenv('HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS', '0')
++    conn, _ = board
++    tid = managed._hand_off_for_review(conn, {'review_model': managed.FABLE})
++    managed._receipts(conn, tid, route=('class:deep', None))
++    for _ in range(3):
++        dispatch_once(conn, spawn_fn=lambda *a: pytest.fail('unavailable reviewer spawned'), max_spawn=1)
++    assert kb.get_task(conn, tid).status == 'triage'
++    assert kb.schedule_task(conn, tid, reason='Review admission cooldown', clock_only=True,
++                            awaiting={'kind': 'clock', 'why': 'review admission cooldown'})
++    assert kb.unblock_task(conn, tid)
++    assert kb.get_task(conn, tid).status == 'review'
++
++
++def test_review_admission_gave_up_does_not_escalate_implementation(board, monkeypatch):
++    from hermes_cli.kanban_db_dispatch import dispatch_once
++    monkeypatch.setenv('HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS', '0')
++    conn, _ = board
++    tid = managed._hand_off_for_review(conn, {'review_model': managed.FABLE})
++    managed._receipts(conn, tid, route=('class:deep', None))
++    for _ in range(3):
++        dispatch_once(conn, spawn_fn=lambda *a: pytest.fail('unavailable reviewer spawned'), max_spawn=1)
++    task = kb.get_task(conn, tid)
++    result = tier.resolve_model_tier(conn, task, lane='ready', cfg=TIER)
++    assert result == ('class:standard', 'auto', 'default')
++
++
++def test_worker_gave_up_still_escalates(board):
++    conn, _ = board
++    tid = kb.create_task(conn, title='Implementation', assignee='worker')
++    run = authors._run(conn, tid, receipt=authors.OPUS)
++    conn.execute("UPDATE task_runs SET outcome='gave_up' WHERE id=?", (run,))
++    conn.commit()
++    assert tier.resolve_model_tier(conn, kb.get_task(conn, tid), lane='ready', cfg=TIER) == (
++            'class:deep', 'auto', 'retry_after_run_gave_up')
++
++
++def test_three_admission_failures_then_legacy_deep_wake_keeps_reviewer(board, monkeypatch):
++    from hermes_cli.kanban_db_dispatch import dispatch_once
++    monkeypatch.setenv('HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS', '0')
++    conn, _ = board
++    tid = managed._hand_off_for_review(conn, ARTIFACT)
++    original = review.resolve_review_model
++    with monkeypatch.context() as refusal:
++        def unavailable(*args):
++            raise review.ReviewModelUnavailable('fixture: temporary reviewer wall')
++        refusal.setattr(review, 'resolve_review_model', unavailable)
++        for _ in range(3):
++            dispatch_once(conn, spawn_fn=lambda *a: pytest.fail('refused reviewer spawned'), max_spawn=1)
++    assert kb.get_task(conn, tid).status == 'triage'
++    # Old installations lost the review lane and ran a new deep implementer.
++    handoff(conn, tid, authors.OPUS, ARTIFACT)
++    assert review.implementer_models(conn, kb.get_task(conn, tid)) == {'claude-sonnet-5-5'}
++    assert original(conn, kb.get_task(conn, tid), tier.load_tier_config())[:2] == (authors.OPUS, 'anthropic')
++
++
++@pytest.mark.parametrize('wake', ['unblock', 'timer'])
++@pytest.mark.parametrize('source', ['review', 'ready', 'running'])
++def test_schedule_unblock_preserves_source_lane(board, source, wake):
++    conn, _ = board
++    tid = kb.create_task(conn, title='Wait', assignee='worker')
++    conn.execute('UPDATE tasks SET status=? WHERE id=?', ('review' if source == 'running' else source, tid))
++    conn.commit()
++    if source == 'running':
++        assert kb.claim_review_task(conn, tid, claimer=kb._claimer_id())
++    assert kb.schedule_task(conn, tid, clock_only=True, awaiting={'kind': 'clock', 'why': 'cooldown'})
++    if wake == 'unblock':
++        assert kb.unblock_task(conn, tid)
++    else:
++        from hermes_cli.kanban_continuation import wake_due_continuations
++        payload = [event.payload for event in kb.list_events(conn, tid) if event.kind == 'scheduled'][-1]
++        assert wake_due_continuations(conn, now=payload['wake_at']) == [tid]
++    assert kb.get_task(conn, tid).status == ('ready' if source == 'ready' else 'review')
++
++
++@pytest.mark.parametrize('meta,error,expected', [
++    ({'retry_status': 'review', 'trigger_outcome': 'spawn_failed'}, 'Review model resolution failed: no peer', True),
++    ({'retry_status': 'ready', 'trigger_outcome': 'spawn_failed'}, 'Review model resolution failed: no peer', False),
++    ({'retry_status': 'review', 'trigger_outcome': 'crashed'}, 'Review model resolution failed: no peer', False),
++    ({'retry_status': 'review', 'trigger_outcome': 'spawn_failed'}, 'Worker crashed', False),
++    ([], 'Review model resolution failed: no peer', False),
++])
++def test_historical_admission_failure_is_narrow(board, meta, error, expected):
++    from hermes_cli.kanban_review_retry import admission_gave_up
++    conn, _ = board
++    assert admission_gave_up(conn, 'missing', -1, json.dumps(meta), error) is expected
++
++
++@pytest.mark.parametrize('reason,expected', [('review_model_unavailable', True), ('other', False)])
++def test_typed_admission_receipt_works_for_ready_lane_review(board, reason, expected):
++    from hermes_cli.kanban_review_retry import admission_gave_up
++    conn, _ = board
++    tid = kb.create_task(conn, title='Independent review', assignee='worker')
++    run = authors._run(conn, tid, receipt=authors.OPUS)
++    kb._append_event(conn, tid, 'gave_up', {'admission_refusal': reason}, run_id=run)
++    assert admission_gave_up(conn, tid, run, json.dumps({'retry_status': 'ready'}), 'refused') is expected
+-- 
+2.43.0
+

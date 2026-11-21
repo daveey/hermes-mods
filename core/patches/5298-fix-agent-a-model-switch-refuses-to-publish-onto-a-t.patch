@@ -1,0 +1,343 @@
+From 6fb5fcef313f5c3698eab4e30cbff015a4b668b6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 20:08:22 +0000
+Subject: [PATCH] fix(agent): a model switch refuses to publish onto a turn
+ admitted after its snapshot [daveey]
+
+The /model mirror and config.set model read session['running'] unlocked, then
+switch_runtime resolves for seconds and publishes onto the live agent. A turn
+admitted in that window ran its remaining API calls on the swapped model/client
+(pre-fix the Event-ordered custody test saw agent.model == target after the
+turn was admitted).
+
+Fix reuses turn admission: admit_durable_turn_lease publishes its holder under
+turn_admission_lock; the switch checks-and-publishes under the same lock and
+raises TurnAdmittedDuringSwitch if a holder appeared since its snapshot. The
+direct swap holds the lock too. _apply_model_switch catches the refusal and
+stashes the pick via _stash_pending_model_switch (deferred=True) so it applies
+at the next turn start.
+
+Tests: test_managed_switch_turn_custody.py (parked switch, real turn; red
+before/green after), test_model_switch_lost_turn_race.py. 251 related test
+files pass; scripts/check health ok.
+---
+ agent/agent_runtime_switch.py                 | 17 +++++-
+ agent/turn_facade_lease.py                    | 18 ++++--
+ .../agent/test_managed_switch_turn_custody.py | 53 +++++++++++++++--
+ .../test_model_switch_lost_turn_race.py       | 59 +++++++++++++++++++
+ tui_gateway/methods_config_set.py             |  3 +-
+ tui_gateway/methods_slash.py                  |  4 +-
+ tui_gateway/model_switch.py                   | 17 +++++-
+ 7 files changed, 155 insertions(+), 16 deletions(-)
+ create mode 100644 tests/tui_gateway/test_model_switch_lost_turn_race.py
+
+diff --git a/agent/agent_runtime_switch.py b/agent/agent_runtime_switch.py
+index 806e2131cd..aa425980f4 100644
+--- a/agent/agent_runtime_switch.py
++++ b/agent/agent_runtime_switch.py
+@@ -21,6 +21,11 @@ class _DeferredSessionWrites:
+         return defer
+ 
+ 
++class TurnAdmittedDuringSwitch(RuntimeError):
++    """A turn was admitted on the agent after the switch's snapshot; nothing was published.
++    Callers stash the pick for the next turn start (``_stash_pending_model_switch``)."""
++
++
+ def _stage_compressor(compressor):
+     """Delay the native compressor's durable resets until switch publication."""
+     if compressor is None:
+@@ -59,6 +64,7 @@ def _without_turn_custody(staged):
+ def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabilities):
+     """Prepare managed switches privately, then publish after the allocation commits."""
+     from agent.agent_runtime_helpers import _switch_model_runtime
++    from agent.turn_facade_lease import turn_admission_lock
+     from agent.model_routing_managed import managed_config, resolve_managed_runtime
+     from agent.model_routing_agent import persist_class_metadata
+ 
+@@ -68,8 +74,11 @@ def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabili
+         from hermes_cli.config_effective import load_user_config_effective
+         config = load_user_config_effective()
+     temporary = isinstance(getattr(agent, '_one_turn_runtime', None), dict)
++    admission = turn_admission_lock(agent)
+     if config is None and not temporary:
+-        return _switch_model_runtime(agent, model, provider, api_key, base_url, api_mode, capabilities)
++        with admission:  # swaps the live agent in place: no turn may be admitted meanwhile
++            return _switch_model_runtime(agent, model, provider, api_key, base_url, api_mode, capabilities)
++    base_holder = getattr(agent, '_active_session_turn_lease_holder', None)
+     staged = copy(agent)
+     # Switch helpers mutate these containers in place. Never expose partial work
+     # or clear live provenance while constructing a replacement.
+@@ -98,7 +107,11 @@ def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabili
+     backend = getattr(staged.context_compressor, '_session_db', None)
+     if isinstance(backend, _DeferredSessionWrites):
+         staged.context_compressor._session_db = backend.backend
+-    vars(agent).update(_without_turn_custody(vars(staged)))
++    with turn_admission_lock(agent):
++        holder = getattr(agent, '_active_session_turn_lease_holder', None)
++        if holder is not None and holder != base_holder:
++            raise TurnAdmittedDuringSwitch('a turn is active; model switch not applied')
++        vars(agent).update(_without_turn_custody(vars(staged)))
+     persist_class_metadata(agent)
+     for method, args, kwargs in ([] if temporary else compressor_writes):
+         method(*args, **kwargs)
+diff --git a/agent/turn_facade_lease.py b/agent/turn_facade_lease.py
+index 11ac1362d2..a5a544c7ec 100644
+--- a/agent/turn_facade_lease.py
++++ b/agent/turn_facade_lease.py
+@@ -70,6 +70,13 @@ def _retry_lease_release(db, session_id: str, holder: str, give_up_at: float) ->
+     )
+ 
+ 
++def turn_admission_lock(agent):
++    """The lock around publishing a turn's admission on the agent. A runtime switch holds it to check
++    that no turn was admitted since its snapshot and to publish, so a turn is admitted either before
++    that check (the switch refuses) or after the publish (it starts on the new runtime)."""
++    return agent.__dict__.setdefault("_turn_admission_lock", threading.RLock())
++
++
+ class DurableTurnLease:
+     """An admitted session turn lease plus the periodic timers that keep it alive and watch the turn.
+ 
+@@ -564,11 +571,12 @@ def admit_durable_turn_lease(
+     lease = DurableTurnLease(
+         agent, db, session_id, holder, expires_at=_committed_lease_expiry(db, session_id, holder, authority_floor),
+     )
+-    agent._active_session_turn_lease_holder = holder
+-    # [daveey] Kept after release (the active attr is cleared even when a busy store defers the release): the
+-    # turn-end outcome refresh discounts only this turn's own lease (hermes_state_outcome.turn_identity).
+-    agent._last_session_turn_lease_holder = holder
+-    agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
++    with turn_admission_lock(agent):  # a runtime switch's check-and-publish excludes this (agent_runtime_switch)
++        agent._active_session_turn_lease_holder = holder
++        # [daveey] Kept after release (the active attr is cleared even when a busy store defers the release): the
++        # turn-end outcome refresh discounts only this turn's own lease (hermes_state_outcome.turn_identity).
++        agent._last_session_turn_lease_holder = holder
++        agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
+     try:
+         # Read the row only now: the previous holder may have created or deleted it while this
+         # turn waited, so an answer from before admission can be stale either way.
+diff --git a/tests/agent/test_managed_switch_turn_custody.py b/tests/agent/test_managed_switch_turn_custody.py
+index 99b5d66916..96d75ff24a 100644
+--- a/tests/agent/test_managed_switch_turn_custody.py
++++ b/tests/agent/test_managed_switch_turn_custody.py
+@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
+ import pytest
+ 
+ from agent import agent_runtime_helpers as runtime
++from agent.agent_runtime_switch import TurnAdmittedDuringSwitch
+ from agent.turn_facade_lease import admit_durable_turn_lease
+ from hermes_state import SessionDB
+ from hermes_state_errors import SessionTurnLeaseLostError
+@@ -67,10 +68,14 @@ class PausedSwitch:
+         self.thread.start()
+         assert self.snapshotted.wait(30)
+ 
+-    def finish(self):
++    def finish(self, refused=False):
+         self.resume.set()
+         self.thread.join(30)
+-        assert not self.thread.is_alive() and self.errors == []
++        assert not self.thread.is_alive()
++        if refused:  # a turn was admitted after the snapshot: nothing is published; the caller queues the pick
++            assert [type(e) for e in self.errors] == [TurnAdmittedDuringSwitch]
++        else:
++            assert self.errors == []
+ 
+ 
+ def flush(agent, db, text):
+@@ -90,9 +95,9 @@ def test_turn_admitted_during_switch_keeps_its_lease(live):
+     admit(agent).release()                # an earlier turn: the agent now carries a cleared holder
+     switch = PausedSwitch(agent)          # snapshot: no turn, holder None
+     lease = admit(agent)                  # the unlocked running check lost the race
+-    switch.finish()
++    switch.finish(refused=True)
+     try:
+-        assert agent.model == TARGET      # the switch itself still lands
++        assert agent.model != TARGET      # refused: the turn keeps its runtime (see the runtime test below)
+         assert agent._active_session_turn_lease_holder == lease.holder
+         assert agent._last_session_turn_lease_holder == lease.holder
+         flush(agent, db, 'reply')
+@@ -111,7 +116,7 @@ def test_switch_snapshotted_in_one_turn_does_not_install_its_holder_in_the_next(
+     switch = PausedSwitch(agent)          # snapshot carries the first turn's holder
+     first.release()
+     second = admit(agent)
+-    switch.finish()
++    switch.finish(refused=True)
+     try:
+         assert agent._active_session_turn_lease_holder == second.holder
+         flush(agent, db, 'second reply')  # base: refused, "holder mismatch"
+@@ -156,3 +161,41 @@ def test_switch_reset_lands_over_a_value_set_during_the_switch(live, field, duri
+     setattr(agent, field, during)
+     switch.finish()
+     assert getattr(agent, field) == expected and agent.model == TARGET
++
++
++def runtime_of(agent):
++    """What the admitted turn's next API call is built from (read per call by the run loop)."""
++    return agent.model, agent.provider, agent.base_url, agent.client if hasattr(agent, 'client') else None
++
++
++def test_turn_admitted_during_switch_keeps_its_runtime(live):
++    agent, _db = live
++    before = runtime_of(agent)
++    switch = PausedSwitch(agent)
++    lease = admit(agent)                  # the callers' unlocked running check lost the race
++    switch.finish(refused=True)
++    try:
++        # The turn already runs on `before`; its next API call must not find another model/client.
++        assert runtime_of(agent) == before, f'swapped under the turn: {runtime_of(agent)[:3]}'
++    finally:
++        lease.release()
++
++
++def test_switch_after_turn_ended_publishes(live):
++    agent, _db = live
++    switch = PausedSwitch(agent)
++    admit(agent).release()                # admitted and finished entirely inside the window
++    switch.finish()
++    assert agent.model == TARGET
++
++
++def test_admission_waits_for_a_switch_publishing_in_place(live):
++    from agent.turn_facade_lease import turn_admission_lock
++    agent, _db = live
++    admitted, holding = threading.Event(), turn_admission_lock(agent)
++    with holding:                         # a switch mid-publish
++        thread = threading.Thread(target=lambda: (admit(agent).release(), admitted.set()), daemon=True)
++        thread.start()
++        assert not admitted.wait(0.3)     # admission cannot publish its holder meanwhile
++    assert admitted.wait(30)
++    thread.join(30)
+diff --git a/tests/tui_gateway/test_model_switch_lost_turn_race.py b/tests/tui_gateway/test_model_switch_lost_turn_race.py
+new file mode 100644
+index 0000000000..9db85c390b
+--- /dev/null
++++ b/tests/tui_gateway/test_model_switch_lost_turn_race.py
+@@ -0,0 +1,59 @@
++"""A pick whose unlocked ``running`` check lost to a turn admission is queued, not dropped or applied.
++
++``config.set model`` and the ``/model`` slash mirror read ``session["running"]`` without a lock. The
++agent's switch refuses to publish onto a turn admitted after its snapshot (``TurnAdmittedDuringSwitch``);
++the gateway then stashes the pick for the next turn start through the busy path's own stash.
++"""
++
++import threading
++import types
++
++import pytest
++
++from agent.agent_runtime_switch import TurnAdmittedDuringSwitch
++from tui_gateway import server
++
++TARGET = "claude-target"
++
++
++def _refuse(*_args, **_kwargs):
++    raise TurnAdmittedDuringSwitch("a turn started while the model switch resolved")
++
++
++@pytest.fixture
++def idle_session(monkeypatch):
++    """An idle-looking session whose agent's switch loses the race to a turn."""
++    result = types.SimpleNamespace(
++        success=True, new_model=TARGET, target_provider="anthropic", base_url="", api_key="", api_mode="",
++        warning_message="", error_message="", runtime_capabilities=None, usage_notice="")
++    guard = types.SimpleNamespace(warning_message="")
++    monkeypatch.setattr(server, "_current_model_runtime", lambda *_a, **_k: ("anthropic", "old", "", ""))
++    monkeypatch.setattr(server, "_preflight_model_switch", lambda *_a, **_k: (result, guard, {}, {}))
++    monkeypatch.setattr(server, "_merge_preflight_warning", lambda *_a, **_k: None)
++    monkeypatch.setattr(server, "_expensive_model_confirm", lambda *_a, **_k: None)
++    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a, **_k: pytest.fail("restarted after refusal"))
++    agent = types.SimpleNamespace(
++        model="old", provider="anthropic", session_id="s", _one_turn_runtime=None, switch_model=_refuse)
++    session = {"agent": agent, "session_key": "k", "history": [], "history_lock": threading.Lock(),
++               "running": False, "slash_worker": None}
++    server._sessions["sid"] = session
++    try:
++        yield session
++    finally:
++        server._sessions.pop("sid", None)
++
++
++def test_config_set_queues_the_pick(idle_session):
++    resp = server.handle_request({"id": "1", "method": "config.set",
++                                  "params": {"session_id": "sid", "key": "model", "value": TARGET}})
++    assert not resp.get("error"), resp
++    assert resp["result"]["deferred"] is True and resp["result"]["value"] == TARGET
++    assert idle_session["pending_model_switch"]["raw"] == TARGET
++    assert "model_override" not in idle_session  # nothing was recorded as applied
++
++
++def test_slash_mirror_queues_the_pick(idle_session):
++    note = server._mirror_slash_side_effects("sid", idle_session, f"/model {TARGET}")
++    assert "next turn" in note
++    assert idle_session["pending_model_switch"]["raw"] == TARGET
++    assert "model_override" not in idle_session
+diff --git a/tui_gateway/methods_config_set.py b/tui_gateway/methods_config_set.py
+index 3a512c17e4..757542bf86 100644
+--- a/tui_gateway/methods_config_set.py
++++ b/tui_gateway/methods_config_set.py
+@@ -229,7 +229,8 @@ def _set_model(rid, params, key, value, session):
+                         "Settings -> Models (Desktop)")
+     return _kv(rid, key, result["value"], warning=result["warning"],
+                confirm_required=result.get("confirm_required", False),
+-               confirm_message=result.get("confirm_message", ""), scope=result.get("scope", "session"))
++               confirm_message=result.get("confirm_message", ""), scope=result.get("scope", "session"),
++               **({"deferred": True} if result.get("deferred") else {}))
+ 
+ 
+ _FAST_WORDS = {"fast": "fast", "on": "fast", "normal": "normal", "off": "normal",
+diff --git a/tui_gateway/methods_slash.py b/tui_gateway/methods_slash.py
+index 722294a358..a2ed6151c7 100644
+--- a/tui_gateway/methods_slash.py
++++ b/tui_gateway/methods_slash.py
+@@ -480,7 +480,9 @@ def _mirror_autoprune(sid, session, agent, arg) -> str:
+ 
+ _SLASH_MIRRORS = {
+     "model": lambda sid, session, agent, arg: (
+-        _apply_model_switch(sid, session, arg).get("warning", "") if arg and agent else ""),
++        (r := _apply_model_switch(sid, session, arg)).get("warning", "")
++        or ("a turn just started: the model switch applies at the next turn" if r.get("deferred") else "")
++        if arg and agent else ""),
+     "approvals": _mirror_approvals, "personality": _mirror_personality,
+     "compress": lambda sid, session, agent, arg: (
+         _compress_live_with_feedback(sid, session, agent, arg, snapshot_kwargs=False) if agent else ""),
+diff --git a/tui_gateway/model_switch.py b/tui_gateway/model_switch.py
+index 49aa2c833d..f7aa13fca9 100644
+--- a/tui_gateway/model_switch.py
++++ b/tui_gateway/model_switch.py
+@@ -279,6 +279,9 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model:
+                 agent.__dict__.pop('_one_turn_runtime', None)
+             else:
+                 agent._one_turn_runtime = previous_once
++            from agent.agent_runtime_switch import TurnAdmittedDuringSwitch
++            if isinstance(exc, TurnAdmittedDuringSwitch):
++                raise  # nothing changed; _apply_model_switch queues the pick for the next turn start
+             # The in-place swap rolled back; restore its temporary ownership too.
+             # Abort the commit: do NOT restart the slash worker, persist runtime, append the switch marker, set
+             # a session model_override, or persist to config — all of which would otherwise leave the session
+@@ -427,8 +430,18 @@ def _apply_model_switch(
+     records_composer_override = (
+         pin_session_override and isinstance(session, dict) and not one_turn
+         and not persist_global and session.get("follow_profile_config"))
+-    _commit_recording_composer_profile(
+-        sid, session, agent, result, current_model, restore_snapshot, records_composer_override)
++    from agent.agent_runtime_switch import TurnAdmittedDuringSwitch
++    try:
++        _commit_recording_composer_profile(
++            sid, session, agent, result, current_model, restore_snapshot, records_composer_override)
++    except TurnAdmittedDuringSwitch as exc:
++        # The caller's unlocked running check lost to a turn admission: nothing was published and no
++        # session state changed, so queue the pick for the next turn start like a busy-time pick.
++        _stash_pending_model_switch(None, "model", raw_input, session, confirm_expensive_model, parsed_flags)
++        if not session.get("pending_model_switch"):
++            raise ValueError(f"{exc}; pick {result.new_model} again once the turn ends.") from exc
++        return {"value": result.new_model, "warning": "", "confirm_required": False, "deferred": True,
++                "scope": "once" if one_turn else ("global" if persist_global else "session")}
+     # PER-SESSION override so a rebuild of THIS session (/new, resume) re-derives the model.
+     # Deliberately NOT written to process-global env (HERMES_MODEL & co.): the desktop hosts
+     # every same-profile session in one process, so os.environ would leak the switch to all.
+-- 
+2.43.0
+

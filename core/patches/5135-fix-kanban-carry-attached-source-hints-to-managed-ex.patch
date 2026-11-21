@@ -1,0 +1,337 @@
+From 09f8ede8faf589b973912b3f6b5e610630515adb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 09:42:20 +0000
+Subject: [PATCH] fix(kanban): carry attached source hints to managed exec and
+ code kernels [daveey]
+
+The dispatcher supplies source_env to kanban_worker_client, which only submits a
+claim to the owner. The real agent.managed_worker is a separate gateway child
+and never inherits that environment. Reconstruct just SOURCE_PATH/COMMIT/BRANCH
+from the current attached local journal at its actual Popen boundary. Validate
+task/run/claim and clear stale inherited hints for unattached scratch. Retain
+ordinary env=None/kwargs semantics and leave scratch cwd/artifact policy alone.
+
+The execute_code exact allowlist also excluded those non-secret hints even
+when startup and terminal had them. Admit only these three names; no board,
+claim or credential grant is added.
+
+Why not caught: source tests stopped at a custom dispatcher spawn callback;
+kernel scrub tests did not compose source custody with its real child entry.
+Earlier fenced-branch repair 1d9baebbd5 kept the same memory-only transport.
+
+Proof: baseline red-3: 3 assertion failures (materialized, holder_reuse and stale
+scratch). Managed overlay alone: startup/terminal pass but execute_code fails
+both source cases. After allowlist: 3 passed. Expanded regression: 13 passed;
+real Popen -> terminal backend and execute_code kernel, plus stale/pending/
+aborted, wrong task/claim and terminal-run refusal, copied ambient env controls.
+Rendezvous consumers: 73 passed. No acceptance fixture/custody/config changes.
+
+Co-Authored-By: GPT-6.1-sol <noreply@openai.com>
+---
+ gateway/session_kanban_scope.py               |   4 +
+ gateway/session_kanban_source_env.py          |  45 +++++
+ .../fixtures/kanban_source_env_probe.py       |  45 +++++
+ .../gateway/test_kanban_source_environment.py | 158 ++++++++++++++++++
+ tools/code_execution_env.py                   |   2 +
+ 5 files changed, 254 insertions(+)
+ create mode 100644 gateway/session_kanban_source_env.py
+ create mode 100644 tests/gateway/fixtures/kanban_source_env_probe.py
+ create mode 100644 tests/gateway/test_kanban_source_environment.py
+
+diff --git a/gateway/session_kanban_scope.py b/gateway/session_kanban_scope.py
+index 7304b18fcc..ed124bbc00 100644
+--- a/gateway/session_kanban_scope.py
++++ b/gateway/session_kanban_scope.py
+@@ -142,6 +142,10 @@ def placing_spawn(spawn, policy):
+         target = resolve_run_scope(policy)  # validated before anything is spawned or consumed
+         from hermes_cli.worker_compute_capacity import managed_target, lower_priority
+         compute = managed_target(policy, target)
++        from gateway.session_kanban_source_env import source_worker_env
++        env = source_worker_env(policy, kwargs.get('env'))
++        if env is not kwargs.get('env'):
++            kwargs['env'] = env
+         rendezvous = attach_capsule_transport(policy)
+         try:
+             process = observing_spawn(spawn, rendezvous)(*args, **kwargs)
+diff --git a/gateway/session_kanban_source_env.py b/gateway/session_kanban_source_env.py
+new file mode 100644
+index 0000000000..ba9e786cdb
+--- /dev/null
++++ b/gateway/session_kanban_source_env.py
+@@ -0,0 +1,45 @@
++"""Reconstruct source hints for the actual managed exec, not its dispatcher submitter.
++
++Only the local, current run's attached journal supplies these non-secret hints. Scratch cwd and
++artifact custody remain unchanged. Nothing is copied from RPC params or a gateway's ambient source.
++"""
++from __future__ import annotations
++
++import json
++import os
++import sqlite3
++from contextlib import closing
++from pathlib import Path
++
++from hermes_state_runtime import RuntimeStoreError
++
++SOURCE_KEYS = ('HERMES_KANBAN_SOURCE_PATH', 'HERMES_KANBAN_SOURCE_COMMIT', 'HERMES_KANBAN_SOURCE_BRANCH')
++
++
++def source_worker_env(policy, env):
++    """Overlay validated attached source on a private env before Popen (including its initial environ)."""
++    if not policy or not policy.kanban_json:
++        return env
++    context = json.loads(policy.kanban_json)
++    base = os.environ if env is None else env
++    child = dict(base)
++    for key in SOURCE_KEYS:
++        child.pop(key, None)
++    from hermes_cli.kanban_source_board import attached_run
++    try:
++        with closing(sqlite3.connect(Path(context['db']).resolve().as_uri() + '?mode=ro', uri=True)) as conn:
++            source = attached_run(conn, context['run_id'])
++            if source is None or source.state != 'attached':
++                return child if any(key in base for key in SOURCE_KEYS) else env
++            task = conn.execute('SELECT status,current_run_id,claim_lock FROM tasks WHERE id=?',
++                                (context['task_id'],)).fetchone()
++            run = conn.execute('SELECT task_id,status,claim_lock,ended_at FROM task_runs WHERE id=?',
++                               (context['run_id'],)).fetchone()
++    except (OSError, sqlite3.Error, ValueError, KeyError) as exc:
++        raise RuntimeStoreError('invalid_kanban_source_claim') from exc
++    if (source.task_id != context['task_id']
++            or task != ('running', context['run_id'], context['claim_lock'])
++            or run != (context['task_id'], 'running', context['claim_lock'], None)):
++        raise RuntimeStoreError('stale_kanban_source_claim')
++    child.update({key: value for key, value in zip(SOURCE_KEYS, (source.path, source.pre_head, source.branch)) if value})
++    return child
+diff --git a/tests/gateway/fixtures/kanban_source_env_probe.py b/tests/gateway/fixtures/kanban_source_env_probe.py
+new file mode 100644
+index 0000000000..a31c294a34
+--- /dev/null
++++ b/tests/gateway/fixtures/kanban_source_env_probe.py
+@@ -0,0 +1,45 @@
++"""Disposable managed-launch child: no model, Board calls or live profile writes."""
++import json
++import os
++import sys
++from unittest.mock import patch
++
++
++def observation():
++    return {'source': {k: v for k, v in os.environ.items() if k.startswith('HERMES_KANBAN_SOURCE_')},
++            'cwd': os.getcwd()}
++
++
++def main():
++    result = {'startup': observation()}
++    if sys.argv[1] == 'tools':
++        from tools.terminal_tool import _get_env_config
++        from tools.terminal_tool_lifecycle import _create_configured_env
++        config = _get_env_config()
++        assert config['env_type'] == 'local', config
++        env = _create_configured_env(config, 'local', image=None, cwd=os.getcwd(), timeout=30,
++                                     task_id='source-env-terminal', host_cwd=None)
++        code = ('import os,json; print(json.dumps({"source":{k:v for k,v in os.environ.items() '
++                'if k.startswith("HERMES_KANBAN_SOURCE_")},"cwd":os.getcwd()}))')
++        import shlex
++        try:
++            answer = env.execute(shlex.join([sys.executable, '-c', code]))
++            assert answer['returncode'] == 0, answer
++            result['terminal'] = json.loads(answer['output'].strip())
++        finally:
++            env.cleanup()
++        from tools.code_execution_tool import execute_code
++        from tools.code_kernel import shutdown_all_kernels
++        # This disposable test authorizes only its own literal readback cell, not a live agent turn.
++        try:
++            with patch('tools.approval.check_execute_code_guard', return_value={'approved': True}):
++                answer = json.loads(execute_code(code, task_id='source-env-code', enabled_tools=[], reset=True))
++            assert answer['status'] == 'success', answer
++            result['execute_code'] = json.loads(answer['output'].strip())
++        finally:
++            shutdown_all_kernels()
++    print(json.dumps(result))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tests/gateway/test_kanban_source_environment.py b/tests/gateway/test_kanban_source_environment.py
+new file mode 100644
+index 0000000000..8994793bac
+--- /dev/null
++++ b/tests/gateway/test_kanban_source_environment.py
+@@ -0,0 +1,158 @@
++"""Source custody crosses the real managed Popen, not only the dispatcher submitter."""
++import json
++import subprocess
++import sys
++from contextlib import closing
++from dataclasses import replace
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from tests.gateway.fixtures.local_recovery_probe import child_env
++
++KEYS = ('HERMES_KANBAN_SOURCE_PATH', 'HERMES_KANBAN_SOURCE_COMMIT', 'HERMES_KANBAN_SOURCE_BRANCH')
++COMMIT = '1' * 40
++
++
++@pytest.fixture
++def claim(tmp_path, monkeypatch):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect
++    from gateway.session_contract import SessionActor
++    from gateway.session_kanban import build_kanban_policy
++    for key in ('HERMES_HOME', 'HERMES_KANBAN_HOME'):
++        monkeypatch.setenv(key, str(tmp_path))
++    for key in ('HERMES_KANBAN_DB', 'HERMES_DELEGATED_CHILD'):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setattr('hermes_cli.profiles.resolve_profile_env', lambda _: str(tmp_path))
++    kb.create_board('source-env')
++    scratch = tmp_path / 'scratch'
++    scratch.mkdir()
++    with closing(connect(board='source-env')) as conn:
++        tid = kb.create_task(conn, title='source environment regression', assignee='default')
++        task = kb.claim_task(conn, tid)
++        from hermes_cli.kanban_db_workspace import set_workspace_path
++        assert task is not None
++        set_workspace_path(conn, tid, str(scratch))
++        db = conn.execute('PRAGMA database_list').fetchone()[2]
++    actor = SessionActor('owner', str(tmp_path), frozenset({'session:create'}), 'transport')
++    connection = SimpleNamespace(authority=SimpleNamespace(profile_id=str(tmp_path)), actor=actor, native_owner=True)
++    params = dict(board='source-env', task_id=tid, run_id=task.current_run_id, claim_lock=task.claim_lock, db=db)
++    policy, _ = build_kanban_policy(connection, params, {'model': {'default': 'test', 'provider': 'custom'}})
++    # Unrelated placement/transport gates are independently covered. Real source lookup and Popen remain.
++    monkeypatch.setattr('gateway.session_kanban_scope.resolve_run_scope', lambda _: None)
++    monkeypatch.setattr('gateway.session_kanban_capsule.check_capsule_transport', lambda _: None)
++    monkeypatch.setattr('gateway.session_kanban_capsule.attach_capsule_transport', lambda _: None)
++    monkeypatch.setattr('hermes_cli.worker_compute_capacity.managed_target', lambda *a: None)
++    return SimpleNamespace(policy=policy, task=task, db=db, scratch=scratch, root=tmp_path)
++
++
++def attach(claim, mode, **changes):
++    import sqlite3
++    from hermes_cli.kanban_source_board import AttachedRun, record_run
++    with closing(sqlite3.connect(claim.db)) as conn:
++        uid = 'source-env-run'
++        run = AttachedRun(claim.task.current_run_id, claim.task.id, uid, mode, 1,
++                          'wt/source-test', str(claim.root / 'external'), COMMIT, None, 'attached',
++                          source_protocol=2)
++        record_run(conn, replace(run, **changes))
++
++
++def spawn(claim, monkeypatch, *, stale=False, probe=False):
++    from gateway.session_kanban_scope import placing_spawn
++    env = child_env()
++    home = claim.root / 'child-home'
++    home.mkdir(exist_ok=True)
++    state = home / '.hermes'
++    state.mkdir(exist_ok=True)
++    env.update(HOME=str(home), USERPROFILE=str(home), HERMES_HOME=str(state),
++               PYTHONPATH=str(Path(__file__).resolve().parents[2]), TERMINAL_CWD=str(claim.scratch))
++    if stale:
++        env.update(dict.fromkeys(KEYS, 'stale-submitters-source'))
++    script = Path(__file__).parent / 'fixtures' / 'kanban_source_env_probe.py'
++    proc = placing_spawn(subprocess.Popen, claim.policy)(
++        [sys.executable, str(script), 'tools' if probe else 'startup'], env=env, cwd=claim.scratch,
++        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
++    try:
++        out, err = proc.communicate(timeout=90)
++    except BaseException:
++        proc.kill()
++        proc.communicate()
++        raise
++    assert proc.returncode == 0, out + err
++    return json.loads(out)
++
++
++@pytest.mark.parametrize('mode', ['materialized', 'holder_reuse'])
++def test_attached_source_reaches_actual_startup_and_both_tools(claim, monkeypatch, mode):
++    attach(claim, mode)
++    expected = dict(zip(KEYS, (str(claim.root / 'external'), COMMIT, 'wt/source-test')))
++    result = spawn(claim, monkeypatch, probe=True)
++    for surface in ('startup', 'terminal', 'execute_code'):
++        assert result[surface]['source'] == expected, (surface, result)
++        assert result[surface]['cwd'] == str(claim.scratch)
++    assert result['startup']['source']['HERMES_KANBAN_SOURCE_PATH'] != str(claim.scratch)
++
++
++@pytest.mark.parametrize('state', [None, 'pending', 'aborted'])
++def test_unattached_scratch_strips_inherited_source(claim, monkeypatch, state):
++    if state is not None:
++        attach(claim, 'holder_reuse', state=state)
++    result = spawn(claim, monkeypatch, stale=True, probe=True)
++    assert all(result[surface]['source'] == {} for surface in ('startup', 'terminal', 'execute_code'))
++
++
++@pytest.mark.parametrize('change', ['source_task', 'task_claim', 'run_claim', 'run_status', 'run_ended'])
++def test_invalid_source_claim_refuses_before_spawn(claim, change):
++    import sqlite3
++    from hermes_state_runtime import RuntimeStoreError
++    from gateway.session_kanban_scope import placing_spawn
++    attach(claim, 'holder_reuse', **({'task_id': 'foreign-task'} if change == 'source_task' else {}))
++    with closing(sqlite3.connect(claim.db)) as conn:
++        mutations = {
++            'task_claim': ('UPDATE tasks SET claim_lock=? WHERE id=?', ('new-claim', claim.task.id)),
++            'run_claim': ('UPDATE task_runs SET claim_lock=? WHERE id=?', ('new-claim', claim.task.current_run_id)),
++            'run_status': ('UPDATE task_runs SET status=? WHERE id=?', ('done', claim.task.current_run_id)),
++            'run_ended': ('UPDATE task_runs SET ended_at=1 WHERE id=?', (claim.task.current_run_id,)),
++        }
++        if change in mutations:
++            conn.execute(*mutations[change])
++        conn.commit()
++    called = []
++    with pytest.raises(RuntimeStoreError, match='^stale_kanban_source_claim$'):
++        placing_spawn(lambda *a, **kw: called.append(kw), claim.policy)([], env={})
++    assert called == []
++
++
++def test_source_env_copies_ambient_and_does_not_mutate_gateway(claim, monkeypatch):
++    from gateway.session_kanban_source_env import source_worker_env
++    import os
++    attach(claim, 'holder_reuse')
++    for key in KEYS:
++        monkeypatch.setenv(key, 'stale')
++    result = source_worker_env(claim.policy, None)
++    assert result[KEYS[0]] == str(claim.root / 'external')
++    assert all(os.environ[key] == 'stale' for key in KEYS)
++    provided = {'PATH': '/usr/bin', 'HERMES_KANBAN_SOURCE_PATH': 'stale'}
++    result = source_worker_env(claim.policy, provided)
++    assert result['PATH'] == '/usr/bin' and provided[KEYS[0]] == 'stale'
++
++
++def test_non_kanban_env_unchanged():
++    from gateway.session_kanban_source_env import source_worker_env
++    env = {'HERMES_KANBAN_SOURCE_PATH': 'operator-value'}
++    assert source_worker_env(None, env) is env
++    assert source_worker_env(SimpleNamespace(kanban_json=None), None) is None
++
++
++def test_unreadable_source_database_refuses_before_spawn(claim):
++    from hermes_state_runtime import RuntimeStoreError
++    from gateway.session_kanban_scope import placing_spawn
++    context = json.loads(claim.policy.kanban_json)
++    context['db'] = str(claim.root / 'missing.db')
++    called = []
++    with pytest.raises(RuntimeStoreError, match='^invalid_kanban_source_claim$'):
++        placing_spawn(lambda *a, **kw: called.append(kw),
++                      replace(claim.policy, kanban_json=json.dumps(context)))([], env={})
++    assert called == []
+diff --git a/tools/code_execution_env.py b/tools/code_execution_env.py
+index a24c862f51..1119ad8c0a 100644
+--- a/tools/code_execution_env.py
++++ b/tools/code_execution_env.py
+@@ -40,6 +40,8 @@ def is_secret_env_name(name: str) -> bool:
+ # while still inheriting HERMES_HOME.
+ _HERMES_CHILD_ALLOWED = frozenset({
+     "HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG", "HERMES_ENV", "HERMES_DELEGATED_CHILD_CONTEXT",
++    # Non-secret source hints from the current Kanban worker; no board/claim mutation authority.
++    "HERMES_KANBAN_SOURCE_PATH", "HERMES_KANBAN_SOURCE_COMMIT", "HERMES_KANBAN_SOURCE_BRANCH",
+ })
+ 
+ # Windows-only: without these the CRT itself fails — socket.socket() raises
+-- 
+2.43.0
+

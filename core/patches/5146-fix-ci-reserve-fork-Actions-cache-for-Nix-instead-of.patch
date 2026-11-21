@@ -1,0 +1,104 @@
+From cd850bb26dbaf85a1c769087ecde350f16a5e1ce Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 11:06:34 +0000
+Subject: [PATCH] fix(ci): reserve fork Actions cache for Nix instead of Docker
+ blobs [daveey]
+
+Problem: PR #3748's first main cache was saved and restored, then no
+nix-* entry remained. An example inventory showed many entries,
+with buildkit blobs consuming nearly the entire repository cache quota.
+
+Why 1: Docker's mode=min is a final-layer selector, not a byte budget.
+Why 2: source COPY/install layers change across main commits. The gha
+backend gives blobs content-addressed keys; immutable old blobs remain.
+Why 3: imports refresh old blobs: an example cache was created well before
+its most recent access. Creation age is not LRU age.
+Why 4: Docker and Nix share one repository cache quota with no partition.
+Historical deletion is consistent with LRU competition; the listing has
+no deletion audit, so it does not prove who deleted the missing entry.
+Root (happened): the fork exports unbounded final-layer blobs into the
+same quota as Nix. Root (not caught): the prior mode=max -> min test
+asserted export mode, not isolation of the competing producer.
+Recurrence: 28ad10b8b7 limited export mode but did not limit total bytes.
+
+Disable both gha cache reads and writes only in this fork. Reads must
+stop too, otherwise old blobs get fresh LRU timestamps. Upstream keeps
+its existing policy. Builds, integration checks, runner selection,
+publishing and Nix's 5 GiB / 10-copy budgets are unchanged. Docker builds
+on fresh runners lose cross-run acceleration; no paid backend is added.
+
+Proof: new regression fails on main (3 passed, 1 failed). With guard:
+23 tests passed across test_nix_cache_budget, test_nix_cache_observations,
+and test_artifact_quota_advisory. scripts/check --base origin/main:
+21 checks ok. Live two-run Nix acceptance remains owned by
+ t_eeeeee0000000024; this fixes eviction competition, not GC's separate
+368 substituter-copy problem.
+---
+ .github/workflows/docker.yml      | 16 ++++++++--------
+ tests/ci/test_nix_cache_budget.py | 16 ++++++++++++++++
+ 2 files changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/.github/workflows/docker.yml b/.github/workflows/docker.yml
+index d1b94e0213..fb6f59d3d4 100644
+--- a/.github/workflows/docker.yml
++++ b/.github/workflows/docker.yml
+@@ -232,12 +232,12 @@ jobs:
+           tags: ${{ env.IMAGE_NAME }}:test
+           build-args: |
+             HERMES_BOT_DESKTOP=${{ matrix.variant == 'desktop' && '1' || '0' }}
+-          # Slim owns the scope; desktop reads it but never exports. Export
+-          # only final layers: mode=max's intermediate stages consumed the
+-          # repository cache quota, leaving no room for the Nix store.
+-          # Cache export is optional; backend outages must not discard a tested image.
+-          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+-          cache-to: ${{ (github.event_name != 'pull_request' && matrix.variant == 'slim') && format('type=gha,mode=min,ignore-error=true,scope=docker-{0}', matrix.arch) || '' }}
++          # Final-layer mode is not a byte budget: source layers change on
++          # every merge. In the fork those blobs filled the shared free quota
++          # and displaced Nix. Disable reads too, so old blobs age out of LRU.
++          # Upstream keeps its existing optional cache policy.
++          cache-from: ${{ github.repository != 'example-org/hermes' && format('type=gha,scope=docker-{0}', matrix.arch) || '' }}
++          cache-to: ${{ github.repository != 'example-org/hermes' && (github.event_name != 'pull_request' && matrix.variant == 'slim') && format('type=gha,mode=min,ignore-error=true,scope=docker-{0}', matrix.arch) || '' }}
+ 
+ 
+       # Run the docker-integration test suite against the freshly-built image
+@@ -414,8 +414,8 @@ jobs:
+           labels: |
+             org.opencontainers.image.revision=${{ env.CANDIDATE_COMMIT }}
+           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+-          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+-          cache-to: ${{ matrix.variant == 'slim' && format('type=gha,mode=min,ignore-error=true,scope=docker-{0}', matrix.arch) || '' }}
++          cache-from: ${{ github.repository != 'example-org/hermes' && format('type=gha,scope=docker-{0}', matrix.arch) || '' }}
++          cache-to: ${{ github.repository != 'example-org/hermes' && matrix.variant == 'slim' && format('type=gha,mode=min,ignore-error=true,scope=docker-{0}', matrix.arch) || '' }}
+ 
+       - name: Export digest
+         run: |
+diff --git a/tests/ci/test_nix_cache_budget.py b/tests/ci/test_nix_cache_budget.py
+index 55297d8529..1a42d2e00f 100644
+--- a/tests/ci/test_nix_cache_budget.py
++++ b/tests/ci/test_nix_cache_budget.py
+@@ -39,6 +39,22 @@ def test_nix_timeout_is_a_command_failure(tmp_path):
+     assert result.returncode == 124
+ 
+ 
++def test_fork_docker_cache_cannot_compete_with_nix():
++    doc = workflow('docker.yml')
++    cache_steps = [s['with'] for job in doc['jobs'].values()
++                   for s in job.get('steps', []) if 'cache-from' in s.get('with', {})]
++    assert len(cache_steps) == 2
++    for settings in cache_steps:
++        # Empty inputs disable both read and write. Reads alone refresh old
++        # buildkit blobs' LRU timestamps and can still evict the Nix archive.
++        for direction in ('cache-from', 'cache-to'):
++            value = settings[direction]
++            assert value.startswith("${{ github.repository != 'example-org/hermes' && ")
++            assert value.endswith(" || '' }}")
++        assert 'mode=min,' in settings['cache-to']
++    assert doc['permissions'] == {'contents': 'read'}
++
++
+ def test_docker_exports_final_layers_only():
+     doc = workflow('docker.yml')
+     exports = [s['with']['cache-to'] for job in doc['jobs'].values()
+-- 
+2.43.0
+

@@ -1,0 +1,112 @@
+From 126b5d8c8cc77f833548a3aa150bad570b7ced55 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 04:31:13 +0000
+Subject: [PATCH] fix(kanban): type unenrolled assignment custody reads
+ [daveey]
+
+Independent review of PR 3721 found two blocking gaps in the foreign-original
+path. load_identity() raises SyncUnavailable (a RuntimeError) on an un-enrolled
+gateway, and prepare() did not catch it, so completion failed with an untyped
+error instead of AssignmentRoutingError. Eight fail-closed inventory/sync-gate
+clauses also survived mutation against the existing custody tests.
+
+Catch SyncUnavailable with the other Board transport failures. Add parametrized
+inventory negatives (task uid, runs_complete, version, board echo, event task_id,
+deleted_at), zero-read refusals when sync is disabled or the board is unselected,
+and a newest-matching-block authority regression. Fail-closed assignment, model,
+and execution-authority checks are unchanged.
+
+Proof: RED test_unenrolled_gateway_is_typed_refusal raised SyncUnavailable;
+GREEN after the catch. Custody suite 35 passed; routing+model 124 passed.
+scripts/check and exact-head review remain required before landing.
+---
+ hermes_cli/kanban_assignment_original.py      |  3 +-
+ .../test_kanban_assignment_custody.py         | 50 ++++++++++++++++++-
+ 2 files changed, 51 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_assignment_original.py b/hermes_cli/kanban_assignment_original.py
+index f97a1ab1a1..a17f7b3e33 100644
+--- a/hermes_cli/kanban_assignment_original.py
++++ b/hermes_cli/kanban_assignment_original.py
+@@ -120,7 +120,8 @@ def prepare(conn, task_id):
+                          f'{quote(original, safe="")}/execution-evidence')
+         task, payloads = _inventory(data, board, original, task_id)
+         return OriginalObservation(task_id, key, expires, task, payloads)
+-    except (OSError, ValueError, TypeError, KeyError, client.HubError, client.Resync) as exc:
++    except (OSError, ValueError, TypeError, KeyError, client.HubError, client.Resync,
++            client.SyncUnavailable) as exc:
+         raise _invalid() from exc
+     finally:
+         if hub is not None:
+diff --git a/tests/hermes_cli/test_kanban_assignment_custody.py b/tests/hermes_cli/test_kanban_assignment_custody.py
+index 5b2182437d..706ac670d9 100644
+--- a/tests/hermes_cli/test_kanban_assignment_custody.py
++++ b/tests/hermes_cli/test_kanban_assignment_custody.py
+@@ -69,8 +69,16 @@ def test_foreign_original_completes_normally_without_materializing_it(foreign):
+     lambda e: e.update(events=[]),
+     lambda e: next(row for row in e['events'] if row['kind'] == 'blocked').update(payload='{'),
+     lambda e: e['task'].update(workspace_kind='dir', workspace_path=None),
++    lambda e: e['task'].update(uid='t_0000000000000000'),
++    lambda e: e.update(runs_complete=False),
++    lambda e: e.update(version=2),
++    lambda e: e.update(board='other'),
++    lambda e: next(row for row in e['events'] if row['kind'] == 'blocked').update(task_id='t_0000000000000000'),
++    lambda e: next(row for row in e['events'] if row['kind'] == 'blocked').update(deleted_at=1),
+ ], ids=['missing', 'unassigned', 'deleted', 'wrong-task', 'incomplete', 'missing-field',
+-        'bad-requires', 'missing-block', 'bad-block', 'missing-directory-path'])
++        'bad-requires', 'missing-block', 'bad-block', 'missing-directory-path',
++        'wrong-uid', 'runs-incomplete', 'wrong-version', 'wrong-board',
++        'wrong-event-task', 'deleted-event'])
+ def test_foreign_evidence_fails_closed(foreign, mutate):
+     conn, _, repair, _, evidence, _ = foreign
+     mutate(evidence)
+@@ -114,6 +122,46 @@ def test_foreign_model_validation_is_not_skipped(foreign, monkeypatch):
+         kb.complete_task(conn, repair, result='Verified')
+ 
+ 
++def test_unenrolled_gateway_is_typed_refusal(foreign, monkeypatch):
++    conn, _, repair, _, _, calls = foreign
++
++    def unenrolled():
++        raise client.SyncUnavailable('kanban sync: hub url, gateway name and key are all required')
++
++    monkeypatch.setattr(client, 'load_identity', unenrolled)
++    with pytest.raises(routing.AssignmentRoutingError):
++        kb.complete_task(conn, repair, result='Verified')
++    assert not calls
++    assert kb.get_task(conn, repair).status != 'done'
++
++
++@pytest.mark.parametrize('gate', ['disabled', 'unselected'])
++def test_prepare_refuses_with_zero_board_reads_when_sync_not_selected(foreign, monkeypatch, gate):
++    conn, _, repair, _, _, calls = foreign
++    if gate == 'disabled':
++        monkeypatch.setattr(sync, 'sync_config', lambda: {'enabled': False})
++    else:
++        monkeypatch.setattr(sync, 'board_selected', lambda *args: False)
++    with pytest.raises(routing.AssignmentRoutingError):
++        kb.complete_task(conn, repair, result='Verified')
++    assert not calls
++    assert kb.get_task(conn, repair).status != 'done'
++
++
++def test_newest_matching_block_is_authority(foreign):
++    conn, _, repair, _, evidence, _ = foreign
++    matching = next(row for row in evidence['events'] if row['kind'] == 'blocked')
++    older = copy.deepcopy(matching)
++    data = json.loads(older['payload'])
++    data['reason'] = 'unblock t_0000000000000000'
++    older['payload'] = json.dumps(data)
++    newer = copy.deepcopy(matching)
++    newer.update(uid='event-newer', ord=max(row['ord'] for row in evidence['events']) + 1)
++    evidence['events'].remove(matching)
++    evidence['events'].extend([older, newer])
++    assert kb.complete_task(conn, repair, result='Verified')
++
++
+ def test_board_failure_has_no_replica_fallback(foreign, monkeypatch):
+     conn, _, repair, _, _, _ = foreign
+ 
+-- 
+2.43.0
+

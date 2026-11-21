@@ -1,0 +1,671 @@
+From 37270db9a70ffe6b3d10bafb8a7a67a0ee0ccb88 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 19:17:18 -0800
+Subject: [PATCH] chore(kanban): clear the code-health blockers of the
+ wake-reason branch [daveey]
+
+- kanban_placement_forward hold/recover: the three catch-alls are deliberate never-run-here boundaries; each
+  now logs the traceback (logger.exception) instead of a bare print.
+- kanban_chat_links.replica_cards: the published-wait conditions move into _ledger_wait (CC back to 20).
+- kanban_session_activity: _park_of and _remote_wait move to kanban_session_activity_remote_wait (re-exported).
+- tests: the schedule park test moves to test_kanban_db_schedule.py; the forwarder recovery tests this branch
+  added move to test_kanban_placement_recover.py.
+
+scripts.code_health against main: 0 blocking, 0 advisory.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_chat_links.py               |  15 +-
+ hermes_cli/kanban_placement_forward.py        |  14 +-
+ hermes_cli/kanban_session_activity.py         |  27 +--
+ .../kanban_session_activity_remote_wait.py    |  32 +++
+ tests/hermes_cli/test_kanban_db.py            |  21 --
+ tests/hermes_cli/test_kanban_db_schedule.py   |  38 ++++
+ tests/hermes_cli/test_kanban_placement.py     | 171 ----------------
+ .../test_kanban_placement_recover.py          | 187 ++++++++++++++++++
+ 8 files changed, 277 insertions(+), 228 deletions(-)
+ create mode 100644 hermes_cli/kanban_session_activity_remote_wait.py
+ create mode 100644 tests/hermes_cli/test_kanban_db_schedule.py
+ create mode 100644 tests/hermes_cli/test_kanban_placement_recover.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 0ba365328b..a17e22d08f 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -642,10 +642,13 @@ def _ledger_index(stale_ok: bool = False, cards: Optional[list[dict[str, Any]]]
+ LEDGER_WAIT_FIELDS = ("park", "awaiting", "wake_check")
+ 
+ 
+-def _ledger_wait(index: tuple, owner: str, owner_profile: str, board: str, tid: str,
+-                 status: Any) -> dict[str, Any]:
+-    """The owner-published wait fields of one card from ``_ledger_index``'s third map, only when the ledger record
+-    reports the replica row's status (a park published for an earlier status is not this card's wait)."""
++def _ledger_wait(index: Optional[tuple], owner: Optional[str], owner_profile: str, board: str, tid: str,
++                 status: Any, *, named: bool = True) -> dict[str, Any]:
++    """The owner-published wait fields of one replica row from ``_ledger_index``'s third map: none unless a ledger
++    row ``named`` its owner (and the row's status is known), and only when the ledger record reports the replica
++    row's status (a park published for an earlier status is not this card's wait)."""
++    if not named or owner is None or index is None:
++        return {}
+     waits = index[2] if len(index) > 2 else {}
+     wait = waits.get((owner, owner_profile, board, tid))
+     if not wait or wait.get("_status") != status:
+@@ -873,8 +876,8 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+                 "source": "replica",
+             }
+             out[pair].update(upstream_fields(r))
+-            if named and owner is not None and not unknown and index is not None:
+-                out[pair].update(_ledger_wait(index, owner, owner_profile, board, tid, status))
++            out[pair].update(_ledger_wait(index, owner, owner_profile, board, tid, status,
++                                          named=named and not unknown))
+             if machine := run_machine(r):
+                 out[pair]["run_machine"] = machine
+             # Executor-stamped liveness of the current run (kanban_replica_execution), never the pull clock.
+diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
+index dfb1d62ef8..91d2e96f44 100644
+--- a/hermes_cli/kanban_placement_forward.py
++++ b/hermes_cli/kanban_placement_forward.py
+@@ -26,6 +26,7 @@ once, under a new request id; an overlap with another card blocks this one for a
+ from __future__ import annotations
+ 
+ import json
++import logging
+ import os
+ import shlex
+ import sqlite3
+@@ -34,6 +35,8 @@ import time
+ from datetime import datetime, timezone, UTC
+ from typing import Callable, Optional
+ 
++logger = logging.getLogger(__name__)
++
+ DEFERRED = "placement_deferred"
+ FORWARDED = "placement_forwarded"
+ CANCELLED = "placement_deferred_cancelled"
+@@ -724,8 +727,9 @@ def hold(conn: sqlite3.Connection, task_id: str, run_id: Optional[int], why: str
+               + "; fix the forward or re-place the card, then unblock it.")
+     try:
+         ok = kb.block_task(conn, task_id, kind="transient", reason=reason, expected_run_id=run_id)
+-    except Exception as exc:  # the card stays claimed; the dispatcher's crash path reclaims it, never a local run
+-        print(f"placement forward: could not block {task_id}: {exc!r}", flush=True)
++    except Exception:  # boundary: whatever the block raises, the card stays claimed (the dispatcher's crash path
++        # reclaims it) and main() exits non-zero; it is never run here, so nothing may escape to main()'s fallback.
++        logger.exception("placement forward: could not block %s", task_id)
+         return "hold-failed"
+     return "held" if ok else "hold-failed"
+ 
+@@ -737,7 +741,8 @@ def recover(conn: sqlite3.Connection, task_id: str, run_id: Optional[int], fwd:
+     the park refused, a broken board) it is held, never run here. [daveey]"""
+     try:
+         st = state(conn, task_id)
+-    except Exception:
++    except Exception:  # boundary: an unreadable placement state is "unknown", which holds the card (never a local run)
++        logger.exception("placement forward: placement state of %s unreadable", task_id)
+         st = None
+         unknown = True
+     else:
+@@ -756,7 +761,8 @@ def recover(conn: sqlite3.Connection, task_id: str, run_id: Optional[int], fwd:
+             # Already sent: a local run would duplicate it. Retry the forward later.
+             return fwd._park_clock(f"forward step failed ({type(exc).__name__}: {str(exc)[:160]}); retrying")
+         return fwd._cancel(f"forward failed: {exc!r}"[:400])
+-    except Exception as again:
++    except Exception as again:  # boundary: any failure of the requeue decides fallback-or-hold here, never escapes
++        logger.exception("placement forward: recovery of %s failed", task_id)
+         print(f"placement forward recovery failed: {again!r}", flush=True)
+         if local_ok:
+             return "fallback"
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 5c4044b983..08756f36ff 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -27,6 +27,7 @@ from hermes_cli import kanban_counts_scopes as _count_scopes
+ from hermes_cli.kanban_execution_source import transaction as _execution_transaction
+ from hermes_cli import kanban_session_activity_recent_done as _recent_done
+ from hermes_cli.kanban_session_activity_decode import _decode_replica_task
++from hermes_cli.kanban_session_activity_remote_wait import _park_of, _remote_wait  # re-exported: projection, outcome tasks
+ from hermes_cli import kanban_execution_receipt as _receipts
+ from hermes_cli.kanban_session_activity_origin_snapshot import SnapshotRootMoved as _RootMoved
+ from hermes_cli.kanban_session_activity_origin_snapshot import remote_snapshot as _remote_snapshot
+@@ -121,7 +122,6 @@ def _origin_scope() -> tuple[str, ...]:
+             os.environ.get('HERMES_MAIL_CONFIG', str(Path.home() / '.config/hermes-mail/config.json')))
+ 
+ 
+-
+ def _board_db_paths() -> list[Path]:
+     from hermes_cli import kanban_db
+ 
+@@ -666,7 +666,6 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+         return cards
+ 
+ 
+-
+ def _replica_synced(seen_at: dict[str, float], last_ok: float | None) -> tuple:
+     """Per owner gateway, the ``synced_at`` ``_project_replica`` stamps on its cards (same expression)."""
+     out = []
+@@ -777,18 +776,6 @@ def _owner_evidence_of(task: dict[str, Any]) -> dict[str, Any]:
+     return _owner_evidence(task) if isinstance(task, dict) else {}
+ 
+ 
+-def _park_of(task: dict[str, Any]) -> dict[str, Any] | None:
+-    """[daveey] The bounded park fields a replicated card's wait info needs: the park its owner published
+-    (``kanban_wait_replica.published_park``), else its last run's (``kanban_wait_info.park_fields``)."""
+-    try:
+-        from hermes_cli import kanban_wait_info as kwi
+-        if isinstance(task.get("park"), dict):
+-            return task["park"]
+-        return kwi.park_fields(task.get("run"))
+-    except Exception:  # display-only
+-        return None
+-
+-
+ def _replica_paths() -> list[Path]:
+     """The board replicas the counts read when ``kanban.sync.links_reader`` is ``replica`` (else none), so a pull
+     that changes a chat's cards invalidates the cached counts like a local board write does. [daveey]"""
+@@ -1486,18 +1473,6 @@ def stalled_task_counts() -> dict[str, int]:
+         return _stalled_cache[0]
+ 
+ 
+-def _remote_wait(card: dict[str, Any]) -> dict[str, Any] | None:
+-    """Wait info of a remote card row, computed now from its fields (never a stored copy, which would freeze the
+-    age). Stale (last-known) rows get none: they prove nothing about how long a wait has run."""
+-    if card.get("stale"):
+-        return None
+-    try:
+-        from hermes_cli import kanban_wait_info as kwi
+-        return kwi.describe_replica(card)
+-    except Exception:
+-        return None
+-
+-
+ def parked_waits(now: float | None = None) -> list[dict[str, Any]]:
+     """[daveey] Every parked card a session created or shepherds, local and on other gateways, with its wait info
+     (``kanban_wait_info``): ``{session, id, board, key, title, remote, gateway, wait}``. For the owner wake (the
+diff --git a/hermes_cli/kanban_session_activity_remote_wait.py b/hermes_cli/kanban_session_activity_remote_wait.py
+new file mode 100644
+index 0000000000..cf6ea7e92b
+--- /dev/null
++++ b/hermes_cli/kanban_session_activity_remote_wait.py
+@@ -0,0 +1,32 @@
++"""What a remote (other-gateway) card waits on, split from ``kanban_session_activity``. [daveey]
++
++Both read only the card row: ``_park_of`` picks the park fields a replicated card carries, ``_remote_wait`` turns a
++card row into wait info at read time (``kanban_wait_info.describe_replica``). Display-only: never raise.
++"""
++from __future__ import annotations
++
++from typing import Any
++
++
++def _park_of(task: dict[str, Any]) -> dict[str, Any] | None:
++    """[daveey] The bounded park fields a replicated card's wait info needs: the park its owner published
++    (``kanban_wait_replica.published_park``), else its last run's (``kanban_wait_info.park_fields``)."""
++    try:
++        from hermes_cli import kanban_wait_info as kwi
++        if isinstance(task.get("park"), dict):
++            return task["park"]
++        return kwi.park_fields(task.get("run"))
++    except Exception:  # display-only
++        return None
++
++
++def _remote_wait(card: dict[str, Any]) -> dict[str, Any] | None:
++    """Wait info of a remote card row, computed now from its fields (never a stored copy, which would freeze the
++    age). Stale (last-known) rows get none: they prove nothing about how long a wait has run."""
++    if card.get("stale"):
++        return None
++    try:
++        from hermes_cli import kanban_wait_info as kwi
++        return kwi.describe_replica(card)
++    except Exception:
++        return None
+diff --git a/tests/hermes_cli/test_kanban_db.py b/tests/hermes_cli/test_kanban_db.py
+index 0430773eb2..895e1a4ccb 100644
+--- a/tests/hermes_cli/test_kanban_db.py
++++ b/tests/hermes_cli/test_kanban_db.py
+@@ -188,27 +188,6 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
+ 
+ 
+ 
+-def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
+-    with kbc.connect() as conn:
+-        t = kb.create_task(conn, title="delayed recheck", assignee="ops")
+-        assert kb.schedule_task(conn, t, reason="run next week", clock_only=True,
+-                                awaiting={"kind": "clock", "why": "next week's run"}) is True
+-        task = kb.get_task(conn, t)
+-        assert task.status == "scheduled"
+-        assert kb.claim_task(conn, t) is None
+-
+-        events = kb.list_events(conn, t)
+-        # Every park carries a wake (default wait without a SCHEDULED_UNTIL marker). [daveey]
+-        assert any(e.kind == "scheduled" and e.payload["reason"] == "run next week"
+-                   and isinstance(e.payload.get("wake_at"), int) for e in events)
+-
+-
+-
+-
+-
+-
+-
+-
+ def test_stale_claim_reclaim_event_records_diagnostic_payload(
+     kanban_home, monkeypatch,
+ ):
+diff --git a/tests/hermes_cli/test_kanban_db_schedule.py b/tests/hermes_cli/test_kanban_db_schedule.py
+new file mode 100644
+index 0000000000..7390e3e5b6
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_db_schedule.py
+@@ -0,0 +1,38 @@
++"""``schedule_task`` parks (split from ``test_kanban_db``): a park waits on time with its wake reason. [daveey]"""
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    """Isolated HERMES_HOME with an empty kanban DB."""
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    # No external writers here; real scans can fail closed. See test_kanban_workspace_jobs.
++    from hermes_cli import kanban_workspace_jobs
++    monkeypatch.setattr(kanban_workspace_jobs.psutil, "process_iter", lambda: iter(()))
++    kb.init_db()
++    return home
++
++
++def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
++    with kbc.connect() as conn:
++        t = kb.create_task(conn, title="delayed recheck", assignee="ops")
++        assert kb.schedule_task(conn, t, reason="run next week", clock_only=True,
++                                awaiting={"kind": "clock", "why": "next week's run"}) is True
++        task = kb.get_task(conn, t)
++        assert task.status == "scheduled"
++        assert kb.claim_task(conn, t) is None
++
++        events = kb.list_events(conn, t)
++        # Every park carries a wake (default wait without a SCHEDULED_UNTIL marker). [daveey]
++        assert any(e.kind == "scheduled" and e.payload["reason"] == "run next week"
++                   and isinstance(e.payload.get("wake_at"), int) for e in events)
+diff --git a/tests/hermes_cli/test_kanban_placement.py b/tests/hermes_cli/test_kanban_placement.py
+index deaa2e7808..af0f3c72d1 100644
+--- a/tests/hermes_cli/test_kanban_placement.py
++++ b/tests/hermes_cli/test_kanban_placement.py
+@@ -1993,174 +1993,3 @@ def test_archived_producer_is_not_parked_on(mac, monkeypatch):
+         monkeypatch.setattr(kaw, "confirm_remote", archived)
+         with pytest.raises(kaw.AwaitingError):
+             f.run()
+-
+-
+-@pytest.mark.parametrize("loop", ["queued", "refused_no_fallback", "step_failed"])
+-def test_placement_requeue_loops_escalate_on_the_third_requeue(mac, monkeypatch, loop):
+-    """The forwarder's requeue loops park on a declared clock (``_park_clock``). Declared clocks are exempt from the
+-    repeat-park escalation for agents, but these system loops pass ``count_repeats``: the third requeue goes to an
+-    owner card instead of re-queueing every 10 min forever. The per-attempt detail in the why (an exception text)
+-    does not split the premise. [daveey]"""
+-    from hermes_cli import kanban_awaiting as kaw
+-    from hermes_cli import kanban_db as kb
+-    from hermes_cli import kanban_db_connect as kbc
+-    from hermes_cli import kanban_placement_forward as kpf
+-    from tools import kanban_tools as kt
+-    with kbc.connect_closing() as conn:
+-        parent = _done_parent(kb, conn)
+-    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
+-    if loop == "refused_no_fallback":  # a qualified origin's card: no local fallback, so _cancel re-parks
+-        real_state = kpf.state
+-        monkeypatch.setattr(kpf, "state", lambda c, t: {**(real_state(c, t) or {}), "origin_gateway": "elsewhere"})
+-    actions = []
+-    with kbc.connect_closing() as conn:
+-        kb.recompute_ready(conn)
+-        for n in range(3):
+-            f = _forwarder(conn, child, mac, monkeypatch, await_tid=None)
+-            if loop == "queued":
+-                actions.append(f.run())
+-            elif loop == "refused_no_fallback":
+-                actions.append(f._cancel(f"hub refused the card: attempt {n}"))
+-            else:
+-                actions.append(f._park_clock(f"forward step failed (RuntimeError: timeout {n}); retrying"))
+-            if n < 2:
+-                assert kb.get_task(conn, child).status == "scheduled", (n, actions)
+-                kb.unblock_task(conn, child)
+-                kb.recompute_ready(conn)
+-        kinds = [e.kind for e in kb.list_events(conn, child)]
+-        assert kinds.count("scheduled") == 2 and kaw.ESCALATED_EVENT in kinds, (actions, kinds)
+-        assert kb.get_task(conn, child).status == "todo"
+-
+-
+-# A hub refusal or exception text quoted in a requeue park reads like an agent wall ("permission denied", "waiting
+-# for Owner"); the wall check refused the park, main()'s retry raised again and ran a qualified-origin card here.
+-WALL_TEXT = "refused: permission denied, needs access granted; waiting for Owner to approve the profile"
+-
+-
+-@pytest.mark.parametrize("loop", ["not_live", "refused_no_fallback", "step_failed"])
+-def test_placement_requeue_parks_whatever_the_quoted_text_says(mac, monkeypatch, loop):
+-    from hermes_cli import kanban_awaiting as kaw
+-    from hermes_cli import kanban_db as kb
+-    from hermes_cli import kanban_db_connect as kbc
+-    from hermes_cli import kanban_placement_forward as kpf
+-    from tools import kanban_tools as kt
+-    assert kaw.text_wall(WALL_TEXT)  # the text an agent park would be refused for
+-    with kbc.connect_closing() as conn:
+-        parent = _done_parent(kb, conn)
+-    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
+-    if loop == "refused_no_fallback":
+-        real_state = kpf.state
+-        monkeypatch.setattr(kpf, "state", lambda c, t: {**(real_state(c, t) or {}), "origin_gateway": "elsewhere"})
+-    with kbc.connect_closing() as conn:
+-        kb.recompute_ready(conn)
+-        f = _forwarder(conn, child, mac, monkeypatch, await_tid=None)
+-        if loop == "not_live":
+-            f.live = lambda t: WALL_TEXT
+-            action = f.run()
+-        elif loop == "refused_no_fallback":
+-            action = f._cancel(f"hub refused the card: {WALL_TEXT}")
+-        else:
+-            action = f._park_clock(f"forward step failed (RuntimeError: {WALL_TEXT}); retrying")
+-        assert action == "requeued", action
+-        assert kb.get_task(conn, child).status == "scheduled"
+-
+-
+-@pytest.mark.parametrize("shape", ["qualified_origin", "already_sent"])
+-def test_main_never_runs_a_qualified_or_sent_card_locally_when_the_requeue_fails(mac, monkeypatch, shape):
+-    """main(): the forward step raises and the requeue raises too. A card with no local fallback (qualified origin)
+-    or already sent is held (blocked, agent-owned), never exec'd as a local worker. [daveey]"""
+-    from hermes_cli import kanban_db as kb
+-    from hermes_cli import kanban_db_connect as kbc
+-    from hermes_cli import kanban_placement_forward as kpf
+-    from tools import kanban_tools as kt
+-    with kbc.connect_closing() as conn:
+-        parent = _done_parent(kb, conn)
+-    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
+-    real_state = kpf.state
+-    extra = {"origin_gateway": "elsewhere"} if shape == "qualified_origin" else {"request_id": "rq-1"}
+-    monkeypatch.setattr(kpf, "state", lambda c, t: {**(real_state(c, t) or {}), **extra})
+-    with kbc.connect_closing() as conn:
+-        kb.recompute_ready(conn)
+-        claimed = kb.claim_task(conn, child)
+-    monkeypatch.setenv("HERMES_KANBAN_TASK", child)
+-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+-
+-    def boom(self, *a, **kw):
+-        raise RuntimeError(f"hub said: {WALL_TEXT}")
+-    monkeypatch.setattr(kpf.Forwarder, "run", boom)
+-    monkeypatch.setattr(kpf.Forwarder, "_park_clock", boom)
+-    monkeypatch.setattr(kpf.os, "execvp", lambda *a: pytest.fail("ran the card locally"))
+-    assert kpf.main(["--", "hermes", "worker"]) == 0
+-    with kbc.connect_closing() as conn:
+-        task = kb.get_task(conn, child)
+-        assert task.status in ("blocked", "triage") and task.block_kind == "transient", (task.status, task.block_kind)
+-        blocked = [e for e in kb.list_events(conn, child) if e.kind == "blocked"]
+-        assert blocked and "must not run here" in blocked[-1].payload["reason"]
+-
+-
+-def test_main_exits_nonzero_without_running_the_card_when_even_the_hold_fails(mac, monkeypatch):
+-    """main(): forward, requeue and the hold's block all fail. The card stays claimed for the dispatcher's crash
+-    path (exit 1); it is never exec'd here. A SCHEDULED_UNTIL= marker in the quoted error does not turn the hold
+-    into a timed park. [daveey]"""
+-    from hermes_cli import kanban_db as kb
+-    from hermes_cli import kanban_db_connect as kbc
+-    from hermes_cli import kanban_placement_forward as kpf
+-    from tools import kanban_tools as kt
+-    with kbc.connect_closing() as conn:
+-        parent = _done_parent(kb, conn)
+-    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
+-    real_state = kpf.state
+-    monkeypatch.setattr(kpf, "state", lambda c, t: {**(real_state(c, t) or {}), "request_id": "rq-1"})
+-    with kbc.connect_closing() as conn:
+-        kb.recompute_ready(conn)
+-        claimed = kb.claim_task(conn, child)
+-    monkeypatch.setenv("HERMES_KANBAN_TASK", child)
+-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+-
+-    def boom(self, *a, **kw):
+-        raise RuntimeError("hub said: retry SCHEDULED_UNTIL=2026-11-21T08:00:00Z")
+-    monkeypatch.setattr(kpf.Forwarder, "run", boom)
+-    monkeypatch.setattr(kpf.Forwarder, "_park_clock", boom)
+-    monkeypatch.setattr(kpf.os, "execvp", lambda *a: pytest.fail("ran the card locally"))
+-    # The marker alone no longer breaks the hold: it is held.
+-    assert kpf.main(["--", "hermes", "worker"]) == 0
+-    with kbc.connect_closing() as conn:
+-        task = kb.get_task(conn, child)
+-        assert task.status in ("blocked", "triage") and task.block_kind == "transient"
+-        assert "SCHEDULED_UNTIL=" not in [e for e in kb.list_events(conn, child) if e.kind == "blocked"][-1].payload["reason"]
+-
+-    # And when the block itself fails: exit 1, still no local run.
+-    child2 = json.loads(kt._handle_create({"title": "Fix the other lint", "parents": [parent]}))["task_id"]
+-    with kbc.connect_closing() as conn:
+-        kb.recompute_ready(conn)
+-        claimed2 = kb.claim_task(conn, child2)
+-    monkeypatch.setenv("HERMES_KANBAN_TASK", child2)
+-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed2.current_run_id))
+-    monkeypatch.setattr(kb, "block_task", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("board locked")))
+-    assert kpf.main(["--", "hermes", "worker"]) == 1
+-    with kbc.connect_closing() as conn:
+-        assert kb.get_task(conn, child2).status == "running"
+-
+-
+-def test_main_still_falls_back_for_an_unsent_local_card_when_cancel_fails(mac, monkeypatch):
+-    """Control: a card never sent and with a local fallback still runs here when the forward and its cancel fail."""
+-    from hermes_cli import kanban_db as kb
+-    from hermes_cli import kanban_db_connect as kbc
+-    from hermes_cli import kanban_placement_forward as kpf
+-    from tools import kanban_tools as kt
+-    with kbc.connect_closing() as conn:
+-        parent = _done_parent(kb, conn)
+-    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
+-    with kbc.connect_closing() as conn:
+-        kb.recompute_ready(conn)
+-        claimed = kb.claim_task(conn, child)
+-    monkeypatch.setenv("HERMES_KANBAN_TASK", child)
+-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+-
+-    def boom(self, *a, **kw):
+-        raise RuntimeError("transport down")
+-    monkeypatch.setattr(kpf.Forwarder, "run", boom)
+-    monkeypatch.setattr(kpf.Forwarder, "_cancel", boom)
+-    ran = []
+-    monkeypatch.setattr(kpf.os, "execvp", lambda *a: ran.append(a))
+-    assert kpf.main(["--", "hermes", "worker"]) == 1 and ran
+diff --git a/tests/hermes_cli/test_kanban_placement_recover.py b/tests/hermes_cli/test_kanban_placement_recover.py
+new file mode 100644
+index 0000000000..a4c7f4e112
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_placement_recover.py
+@@ -0,0 +1,187 @@
++"""Deferred-placement forwarder recovery (split from ``test_kanban_placement``). [daveey]
++
++The requeue loops (request still queued, refused with no local fallback, a failed forward step) park on a declared
++clock that still escalates on the third identical requeue; quoted hub/exception text never refuses that park; and
++when a forward step and its requeue both fail, ``main()`` holds a sent or qualified-origin card instead of running it
++here.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from tests.hermes_cli.test_kanban_placement import _done_parent, _forwarder
++
++pytest_plugins = ["tests.hermes_cli.test_kanban_placement"]  # its ``mac`` fixture (fake hub + board)
++
++
++@pytest.mark.parametrize("loop", ["queued", "refused_no_fallback", "step_failed"])
++def test_placement_requeue_loops_escalate_on_the_third_requeue(mac, monkeypatch, loop):
++    """The forwarder's requeue loops park on a declared clock (``_park_clock``). Declared clocks are exempt from the
++    repeat-park escalation for agents, but these system loops pass ``count_repeats``: the third requeue goes to an
++    owner card instead of re-queueing every 10 min forever. The per-attempt detail in the why (an exception text)
++    does not split the premise. [daveey]"""
++    from hermes_cli import kanban_awaiting as kaw
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    if loop == "refused_no_fallback":  # a qualified origin's card: no local fallback, so _cancel re-parks
++        real_state = kpf.state
++        monkeypatch.setattr(kpf, "state", lambda c, t: {**(real_state(c, t) or {}), "origin_gateway": "elsewhere"})
++    actions = []
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        for n in range(3):
++            f = _forwarder(conn, child, mac, monkeypatch, await_tid=None)
++            if loop == "queued":
++                actions.append(f.run())
++            elif loop == "refused_no_fallback":
++                actions.append(f._cancel(f"hub refused the card: attempt {n}"))
++            else:
++                actions.append(f._park_clock(f"forward step failed (RuntimeError: timeout {n}); retrying"))
++            if n < 2:
++                assert kb.get_task(conn, child).status == "scheduled", (n, actions)
++                kb.unblock_task(conn, child)
++                kb.recompute_ready(conn)
++        kinds = [e.kind for e in kb.list_events(conn, child)]
++        assert kinds.count("scheduled") == 2 and kaw.ESCALATED_EVENT in kinds, (actions, kinds)
++        assert kb.get_task(conn, child).status == "todo"
++
++
++# A hub refusal or exception text quoted in a requeue park reads like an agent wall ("permission denied", "waiting
++# for Owner"); the wall check refused the park, main()'s retry raised again and ran a qualified-origin card here.
++WALL_TEXT = "refused: permission denied, needs access granted; waiting for Owner to approve the profile"
++
++
++@pytest.mark.parametrize("loop", ["not_live", "refused_no_fallback", "step_failed"])
++def test_placement_requeue_parks_whatever_the_quoted_text_says(mac, monkeypatch, loop):
++    from hermes_cli import kanban_awaiting as kaw
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    assert kaw.text_wall(WALL_TEXT)  # the text an agent park would be refused for
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    if loop == "refused_no_fallback":
++        real_state = kpf.state
++        monkeypatch.setattr(kpf, "state", lambda c, t: {**(real_state(c, t) or {}), "origin_gateway": "elsewhere"})
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        f = _forwarder(conn, child, mac, monkeypatch, await_tid=None)
++        if loop == "not_live":
++            f.live = lambda t: WALL_TEXT
++            action = f.run()
++        elif loop == "refused_no_fallback":
++            action = f._cancel(f"hub refused the card: {WALL_TEXT}")
++        else:
++            action = f._park_clock(f"forward step failed (RuntimeError: {WALL_TEXT}); retrying")
++        assert action == "requeued", action
++        assert kb.get_task(conn, child).status == "scheduled"
++
++
++@pytest.mark.parametrize("shape", ["qualified_origin", "already_sent"])
++def test_main_never_runs_a_qualified_or_sent_card_locally_when_the_requeue_fails(mac, monkeypatch, shape):
++    """main(): the forward step raises and the requeue raises too. A card with no local fallback (qualified origin)
++    or already sent is held (blocked, agent-owned), never exec'd as a local worker. [daveey]"""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    real_state = kpf.state
++    extra = {"origin_gateway": "elsewhere"} if shape == "qualified_origin" else {"request_id": "rq-1"}
++    monkeypatch.setattr(kpf, "state", lambda c, t: {**(real_state(c, t) or {}), **extra})
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        claimed = kb.claim_task(conn, child)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", child)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
++
++    def boom(self, *a, **kw):
++        raise RuntimeError(f"hub said: {WALL_TEXT}")
++    monkeypatch.setattr(kpf.Forwarder, "run", boom)
++    monkeypatch.setattr(kpf.Forwarder, "_park_clock", boom)
++    monkeypatch.setattr(kpf.os, "execvp", lambda *a: pytest.fail("ran the card locally"))
++    assert kpf.main(["--", "hermes", "worker"]) == 0
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, child)
++        assert task.status in ("blocked", "triage") and task.block_kind == "transient", (task.status, task.block_kind)
++        blocked = [e for e in kb.list_events(conn, child) if e.kind == "blocked"]
++        assert blocked and "must not run here" in blocked[-1].payload["reason"]
++
++
++def test_main_exits_nonzero_without_running_the_card_when_even_the_hold_fails(mac, monkeypatch):
++    """main(): forward, requeue and the hold's block all fail. The card stays claimed for the dispatcher's crash
++    path (exit 1); it is never exec'd here. A SCHEDULED_UNTIL= marker in the quoted error does not turn the hold
++    into a timed park. [daveey]"""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    real_state = kpf.state
++    monkeypatch.setattr(kpf, "state", lambda c, t: {**(real_state(c, t) or {}), "request_id": "rq-1"})
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        claimed = kb.claim_task(conn, child)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", child)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
++
++    def boom(self, *a, **kw):
++        raise RuntimeError("hub said: retry SCHEDULED_UNTIL=2026-11-21T08:00:00Z")
++    monkeypatch.setattr(kpf.Forwarder, "run", boom)
++    monkeypatch.setattr(kpf.Forwarder, "_park_clock", boom)
++    monkeypatch.setattr(kpf.os, "execvp", lambda *a: pytest.fail("ran the card locally"))
++    # The marker alone no longer breaks the hold: it is held.
++    assert kpf.main(["--", "hermes", "worker"]) == 0
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, child)
++        assert task.status in ("blocked", "triage") and task.block_kind == "transient"
++        assert "SCHEDULED_UNTIL=" not in [e for e in kb.list_events(conn, child) if e.kind == "blocked"][-1].payload["reason"]
++
++    # And when the block itself fails: exit 1, still no local run.
++    child2 = json.loads(kt._handle_create({"title": "Fix the other lint", "parents": [parent]}))["task_id"]
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        claimed2 = kb.claim_task(conn, child2)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", child2)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed2.current_run_id))
++    monkeypatch.setattr(kb, "block_task", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("board locked")))
++    assert kpf.main(["--", "hermes", "worker"]) == 1
++    with kbc.connect_closing() as conn:
++        assert kb.get_task(conn, child2).status == "running"
++
++
++def test_main_still_falls_back_for_an_unsent_local_card_when_cancel_fails(mac, monkeypatch):
++    """Control: a card never sent and with a local fallback still runs here when the forward and its cancel fail."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_placement_forward as kpf
++    from tools import kanban_tools as kt
++    with kbc.connect_closing() as conn:
++        parent = _done_parent(kb, conn)
++    child = json.loads(kt._handle_create({"title": "Fix the flaky lint", "parents": [parent]}))["task_id"]
++    with kbc.connect_closing() as conn:
++        kb.recompute_ready(conn)
++        claimed = kb.claim_task(conn, child)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", child)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
++
++    def boom(self, *a, **kw):
++        raise RuntimeError("transport down")
++    monkeypatch.setattr(kpf.Forwarder, "run", boom)
++    monkeypatch.setattr(kpf.Forwarder, "_cancel", boom)
++    ran = []
++    monkeypatch.setattr(kpf.os, "execvp", lambda *a: ran.append(a))
++    assert kpf.main(["--", "hermes", "worker"]) == 1 and ran
+-- 
+2.43.0
+

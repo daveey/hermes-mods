@@ -1,0 +1,541 @@
+From 675514884a91e88df0040a9be050392953705407 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 21:01:22 +0000
+Subject: [PATCH] chore(state): log turn-lease custody events so a lost lease
+ names its producer [daveey]
+
+Investigation tooling for t_eeeeee000000002b, not a fix. A running Desktop turn was refused with
+'missing lease row' 3.8 s after admission (session 20000101_000000_00000b) and no log said which
+statement removed the row, or whether it was ever readable after the acquire returned.
+
+Every statement that inserts, deletes or refuses on session_turn_leases now logs one bounded line
+on hermes_state.lease_custody: claim (real INSERT rowcount and whether the holder owns the row),
+release / worker release / worker cleanup (only when a row was removed), stale reclaim on acquire
+and by a lease-less writer, the long-expired sweep (tags of the rows removed), and missing /
+mismatch refusals (WARNING, with lease-table row count and whether the session row and a parent
+exist). _execute_write settles each attempt as committed, rolled_back or commit_failed under the
+same txn tag, so an in-transaction event is never read as a commit. Admission logs a WARNING when
+the reader connection cannot see the row the acquire just reported.
+
+Keys, holders, session ids and the store path appear only as 12-hex SHA-256 tags. Nothing here
+inserts, renews or restores a lease row; a logging failure changes no admission and no refusal.
+
+Proof: tests/hermes_state/test_turn_lease_custody_events.py 9/9 (lifecycle with settlement and
+redaction, never-admitted / superseded / released holders still refused, rollback, sweep, both
+reclaims, worker release, distinct stores, admission readback, failing logger). 313 lease-related
+test files: 5108 passed, 0 failed. scripts/check: 21 checks ok.
+---
+ agent/turn_facade_lease.py                    |   2 +
+ hermes_state.py                               |   3 +
+ hermes_state_compression.py                   |  29 ++-
+ hermes_state_lease_custody.py                 | 113 ++++++++++
+ hermes_state_messages.py                      |   9 +-
+ hermes_state_runtime.py                       |   6 +-
+ hermes_state_worker_compression.py            |   3 +-
+ .../test_turn_lease_custody_events.py         | 196 ++++++++++++++++++
+ 8 files changed, 342 insertions(+), 19 deletions(-)
+ create mode 100644 hermes_state_lease_custody.py
+ create mode 100644 tests/hermes_state/test_turn_lease_custody_events.py
+
+diff --git a/agent/turn_facade_lease.py b/agent/turn_facade_lease.py
+index 0dacf0009a..22897747a4 100644
+--- a/agent/turn_facade_lease.py
++++ b/agent/turn_facade_lease.py
+@@ -426,6 +426,8 @@ def _committed_lease_expiry(db, session_id: str, holder: str, floor: float) -> f
+     if callable(reader):
+         try:
+             committed = reader(session_id, holder)
++            from hermes_state_lease_custody import admission_readback
++            admission_readback(db, session_id, holder, committed)  # absent right after admission: say so
+             if isinstance(committed, (int, float)):
+                 return float(committed)
+         except Exception:
+diff --git a/hermes_state.py b/hermes_state.py
+index 4405b6b2cf..1e64592dae 100644
+--- a/hermes_state.py
++++ b/hermes_state.py
+@@ -42,6 +42,7 @@ from hermes_state_health import (
+     write_op_name as _write_op_name,
+ )
+ import hermes_state_corruption_confirm as _corrupt_confirm
++import hermes_state_lease_custody as _lease_custody
+ from hermes_state_errors import (
+     _DELETED_WAL_GENERATION_MSG, _DISK_IO_ERROR_MARKER, _STATE_DB_CORRUPT_MSG, _STATE_DB_GENERATION_KEY,
+     _STATE_DB_REPLACED_MSG, DeletedWalGenerationError, SessionCompressionInProgressError, StateDbCorruptError,
+@@ -1118,7 +1119,9 @@ class SessionDB(
+                             stage = "commit"
+                             self._conn.commit()
+                             stage = "committed"
++                            _lease_custody.settle("committed")
+                         except BaseException:
++                            _lease_custody.settle("rolled_back" if stage != "commit" else "commit_failed")
+                             try:
+                                 self._conn.rollback()
+                             except Exception:
+diff --git a/hermes_state_compression.py b/hermes_state_compression.py
+index 41468834b4..b48ca75ee3 100644
+--- a/hermes_state_compression.py
++++ b/hermes_state_compression.py
+@@ -8,6 +8,7 @@ from __future__ import annotations
+ import json
+ import logging
+ import sqlite3
++import hermes_state_lease_custody as _custody
+ import threading
+ import time
+ from typing import Any, Dict, List, Optional, Tuple
+@@ -84,20 +85,28 @@ def _cooldown_row(exists: bool, cooldown_until, error) -> dict[str, Any]:
+ 
+ 
+ def _claim_lease_row(conn, table: str, key_col: str, key: str, holder: str, now: float, expires_at: float,
+-                     stale) -> tuple[bool, Optional[str]]:
++                     stale, custody: Optional[dict] = None) -> tuple[bool, Optional[str]]:
+     """Single-transaction lease claim: DELETE a stale holder's row (``stale(holder,
+     expires_at)``), INSERT OR IGNORE ours, then SELECT to confirm ownership (INSERT OR
+-    IGNORE gives no rowcount signal). Returns ``(acquired, reclaimed_holder)``."""
++    IGNORE gives no rowcount signal). Returns ``(acquired, reclaimed_holder)``. ``custody``
++    (turn leases only: ``store`` / ``session_id``) reports each statement as a custody event."""
+     reclaimed_holder = None
+     row = conn.execute(f"SELECT holder, expires_at FROM {table} WHERE {key_col} = ?", (key,)).fetchone()
+     if row is not None and stale(row["holder"], row["expires_at"]):
+-        conn.execute(f"DELETE FROM {table} WHERE {key_col} = ? AND holder = ?", (key, row["holder"]))
++        gone = conn.execute(f"DELETE FROM {table} WHERE {key_col} = ? AND holder = ?", (key, row["holder"])).rowcount
+         reclaimed_holder = row["holder"]
+-    conn.execute(
++        if custody is not None:
++            _custody.observe("reclaim", key, holder, row_holder=reclaimed_holder, changed=gone,
++                             why="stale_on_acquire", **custody)
++    inserted = conn.execute(
+         f"INSERT OR IGNORE INTO {table} ({key_col}, holder, acquired_at, expires_at) VALUES (?, ?, ?, ?)",
+-        (key, holder, now, expires_at))
++        (key, holder, now, expires_at)).rowcount
+     owner = conn.execute(f"SELECT holder FROM {table} WHERE {key_col} = ?", (key,)).fetchone()
+-    return owner is not None and owner["holder"] == holder, reclaimed_holder
++    owned = owner is not None and owner["holder"] == holder
++    if custody is not None:
++        _custody.observe("claim", key, holder, row_holder=owner["holder"] if owner is not None else None,
++                         changed=inserted, why=f"owned={int(owned)}", **custody)
++    return owned, reclaimed_holder
+ 
+ 
+ # Defensive bound on the forward compression-chain walk; ``seen`` guards cycles.
+@@ -764,13 +773,13 @@ class SessionCompressionMixin:
+             # behind, and nothing else revisits a conversation nobody resumes. The grace keeps the
+             # recent expiries a still-live owner can renew from a starved refresher; it is also the
+             # longest a suspended holder can go unrefreshed and still keep its lease.
+-            conn.execute("DELETE FROM session_turn_leases WHERE expires_at < ?",
+-                         (now - _TURN_LEASE_SWEEP_GRACE_S,))
++            _custody.sweep(conn, now - _TURN_LEASE_SWEEP_GRACE_S, db_path)
+             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+             return _claim_lease_row(
+                 conn, "session_turn_leases", "conversation_id", conversation_id, holder, now, expires_at,
+                 lambda h, e: (_compression_lock_holder_process_is_dead(h) or _turn_lease_abandoned(db_path, h)
+                               or lapsed_row_reclaimable(h, e, now)),
++                custody={"store": db_path, "session_id": session_id},
+             )
+         acquired, reclaimed_holder = self._execute_write(_do, patience_s=patience_s)
+         if reclaimed_holder and _turn_lease_abandoned(db_path, reclaimed_holder):
+@@ -899,9 +908,7 @@ class SessionCompressionMixin:
+         db_path = getattr(self, "db_path", None)
+         def _do(conn):
+             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+-            conn.execute(
+-                "DELETE FROM session_turn_leases WHERE conversation_id = ? AND holder = ?",
+-                (conversation_id, holder))
++            _custody.delete_row(conn, "release", conversation_id, holder, store=db_path, session_id=session_id)
+         try:
+             self._execute_write(_do, patience_s=patience_s)
+         except sqlite3.Error as exc:
+diff --git a/hermes_state_lease_custody.py b/hermes_state_lease_custody.py
+new file mode 100644
+index 0000000000..a0fca2a7f2
+--- /dev/null
++++ b/hermes_state_lease_custody.py
+@@ -0,0 +1,113 @@
++"""Bounded, nonsecret turn-lease custody events (investigation tooling) [daveey t_eeeeee000000002b].
++
++A running turn was refused with "missing lease row" seconds after admission and no log said which
++statement removed the row, or whether it was ever readable. Every statement that inserts, deletes or
++refuses on ``session_turn_leases`` reports here, so the next occurrence names its producer:
++
++- ``phase=txn`` lines are emitted INSIDE the write transaction. They are not proof of commit.
++- ``phase=committed`` / ``phase=rolled_back`` settle the events of one ``_execute_write`` attempt,
++  matched by ``txn=``. Events with no settlement line ran in a transaction this module cannot see.
++- ``phase=admission`` is the reader-connection readback right after acquisition.
++
++Observation only: nothing here inserts, renews or restores a lease row, and a logging failure never
++changes an admission or a refusal. Keys, holders, session ids and paths appear only as 12-hex SHA-256
++tags (``tag(value)``), so a line can be matched to a known id without exposing a holder capability.
++"""
++import hashlib
++import logging
++import os
++import sqlite3
++import threading
++from typing import NoReturn
++
++_LOG = logging.getLogger("hermes_state.lease_custody")
++_STATE = threading.local()
++_QUIET_WHEN_ZERO = frozenset({"sweep", "release", "worker_release", "worker_cleanup"})
++
++
++def tag(value) -> str:
++    return hashlib.sha256(str(value).encode("utf-8", errors="replace")).hexdigest()[:12] if value else "-"
++
++
++def _txn() -> str:
++    return f"{os.getpid()}.{threading.get_ident() & 0xFFFFFF:x}.{getattr(_STATE, 'serial', 0)}"
++
++
++
++
++def observe(op: str, key, holder, *, store=None, changed=None, row_holder=None, session_id=None, why=None) -> None:
++    """One custody event from inside a transaction. ``changed`` is the statement's SQL rowcount."""
++    try:
++        if changed == 0 and op in _QUIET_WHEN_ZERO:
++            return  # a no-op delete removed nothing: not a producer, and release is idempotent
++        _STATE.pending = getattr(_STATE, "pending", 0) + 1
++        level = logging.WARNING if op in ("missing", "mismatch") else logging.INFO
++        _LOG.log(
++            level,
++            "turn_lease_custody phase=txn op=%s txn=%s store=%s key=%s session=%s root_is_session=%s "
++            "holder=%s row_holder=%s changed=%s why=%s sqlite=%s",
++            op, _txn(), tag(store), tag(key), tag(session_id),
++            "-" if session_id is None else int(session_id == key),
++            tag(holder), tag(row_holder), changed if type(changed) is int else "-", why or "-",
++            sqlite3.sqlite_version,
++        )
++    except Exception:  # health: allow BLE001 -- optional diagnostics cannot change fencing
++        return
++
++
++def settle(outcome: str) -> None:
++    """Close this thread's write attempt: say whether the events above committed or rolled back."""
++    try:
++        pending = getattr(_STATE, "pending", 0)
++        if pending:
++            _LOG.info("turn_lease_custody phase=%s txn=%s events=%d", outcome, _txn(), pending)
++        _STATE.pending = 0
++        _STATE.serial = getattr(_STATE, "serial", 0) + 1
++    except Exception:  # health: allow BLE001 -- optional diagnostics cannot change fencing
++        return
++
++
++def delete_row(conn, op: str, key, holder, *, store=None, session_id=None, why=None) -> int:
++    """The existing holder-qualified DELETE, with its real rowcount reported."""
++    changed = conn.execute("DELETE FROM session_turn_leases WHERE conversation_id = ? AND holder = ?",
++                           (key, holder)).rowcount
++    observe(op, key, None, store=store, row_holder=holder, changed=changed, session_id=session_id, why=why)
++    return changed
++
++
++def sweep(conn, cutoff: float, store=None) -> None:
++    """The existing long-expired sweep, naming (as tags) up to eight of the rows it removed."""
++    rows = conn.execute("SELECT conversation_id, holder FROM session_turn_leases WHERE expires_at < ? LIMIT 8",
++                        (cutoff,)).fetchall()
++    changed = conn.execute("DELETE FROM session_turn_leases WHERE expires_at < ?", (cutoff,)).rowcount
++    for row in rows:
++        observe("sweep", row[0], None, store=store, row_holder=row[1], changed=changed)
++    if changed and not rows:
++        observe("sweep", None, None, store=store, changed=changed)
++
++
++def refuse_lost(conn, session_id, key, holder, lease, store=None) -> NoReturn:
++    """Report a holder's refused write, then raise the same refusal as before."""
++    from hermes_state_errors import SessionTurnLeaseLostError
++    reason = "missing lease row" if lease is None else "holder mismatch"
++    try:
++        rows = conn.execute("SELECT COUNT(*) FROM session_turn_leases").fetchone()[0]
++        exists = conn.execute("SELECT parent_session_id FROM sessions WHERE id = ?", (session_id,)).fetchone()
++        why = f"lease_rows={rows},session_row={int(exists is not None)},parent={int(bool(exists and exists[0]))}"
++    except sqlite3.Error:
++        why = "context_unreadable"
++    observe("missing" if lease is None else "mismatch", key, holder, store=store, session_id=session_id,
++            row_holder=lease["holder"] if lease is not None else None, why=why)
++    raise SessionTurnLeaseLostError(
++        f"Session turn lease lost; refusing transcript write for {session_id!r} ({reason})")
++
++
++def admission_readback(db, session_id, holder, committed) -> None:
++    """After acquisition returned True: was the row readable on the READER connection?"""
++    try:
++        if committed is None:
++            _LOG.warning(
++                "turn_lease_custody phase=admission op=readback_absent pid=%d store=%s session=%s holder=%s sqlite=%s",
++                os.getpid(), tag(getattr(db, "db_path", None)), tag(session_id), tag(holder), sqlite3.sqlite_version)
++    except Exception:  # health: allow BLE001 -- optional diagnostics cannot change fencing
++        return
+diff --git a/hermes_state_messages.py b/hermes_state_messages.py
+index 33f7f18fed..b1426bc550 100644
+--- a/hermes_state_messages.py
++++ b/hermes_state_messages.py
+@@ -27,6 +27,7 @@ from hermes_state_compaction_display import later_tool_copy_ids, not_a_later_too
+ from hermes_state_detached_results import SessionDetachedResultsMixin
+ from hermes_state_todo import SessionTodoResultMixin
+ from hermes_state_wake_grace import stale_turn_lease
++import hermes_state_lease_custody as _custody
+ from hermes_state_stored_reads import SessionStoredReadsMixin
+ from hermes_state_identity import (
+     _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json, _uid_list)
+@@ -248,9 +249,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin,
+             now = time.time()
+             if turn_lease_holder:
+                 if lease is None or lease["holder"] != turn_lease_holder:
+-                    reason = "missing lease row" if lease is None else "holder mismatch"
+-                    raise SessionTurnLeaseLostError(
+-                        f"Session turn lease lost; refusing transcript write for {session_id!r} ({reason})")
++                    _custody.refuse_lost(conn, session_id, conversation_id, turn_lease_holder, lease, getattr(self, "db_path", None))
+                 if float(lease["expires_at"]) <= now:
+                     # Matching-row renewal is serialized with acquisition; missing custody never renews.
+                     conn.execute("UPDATE session_turn_leases SET expires_at = ? "
+@@ -260,8 +259,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin,
+                 if not stale_turn_lease(lease, now):  # post-wake grace included (hermes_state_wake_grace)
+                     raise SessionTurnLeaseLostError(f"Session has an active turn lease; refusing transcript mutation for {session_id!r}")
+                 # Same reclaim rule as acquisition; deleting also fences a stale late flush after the mutation.
+-                conn.execute("DELETE FROM session_turn_leases WHERE conversation_id = ? AND holder = ?",
+-                    (conversation_id, lease["holder"]))
++                _custody.delete_row(conn, "reclaim", conversation_id, lease["holder"], session_id=session_id,
++                                    store=getattr(self, "db_path", None), why="stale_on_leaseless_write")
+         if not turn_lease_holder and (reject_active_turn_lease or reject_parked_turn):
+             from hermes_state_update_pause import refuse_parked_write
+             refuse_parked_write(conn, session_id, self._session_turn_lease_key_on_conn(conn, session_id))
+diff --git a/hermes_state_runtime.py b/hermes_state_runtime.py
+index 3429f49ada..abc3440cc8 100644
+--- a/hermes_state_runtime.py
++++ b/hermes_state_runtime.py
+@@ -989,12 +989,14 @@ def _worker_turn(db, conn, session_id, payload, operation):
+     if operation == 'turn.acquire':
+         value = _claim_lease_row(conn, 'session_turn_leases', 'conversation_id', key,
+             holder, now, now + ttl,
+-            lambda h, e: _compression_lock_holder_process_is_dead(h) or lapsed_row_reclaimable(h, e, now))[0]
++            lambda h, e: _compression_lock_holder_process_is_dead(h) or lapsed_row_reclaimable(h, e, now),
++            custody={"store": getattr(db, "db_path", None), "session_id": session_id})[0]
+     elif operation == 'turn.renew':
+         value = conn.execute('UPDATE session_turn_leases SET expires_at=? WHERE conversation_id=? AND holder=?',
+                              (now + ttl, key, holder)).rowcount > 0
+     else:
+-        conn.execute('DELETE FROM session_turn_leases WHERE conversation_id=? AND holder=?', (key, holder))
++        from hermes_state_lease_custody import delete_row
++        delete_row(conn, 'worker_release', key, holder, store=getattr(db, 'db_path', None), session_id=session_id)
+         value = None
+     return {'value': value}
+ 
+diff --git a/hermes_state_worker_compression.py b/hermes_state_worker_compression.py
+index 39f85859e0..7d3bf44596 100644
+--- a/hermes_state_worker_compression.py
++++ b/hermes_state_worker_compression.py
+@@ -451,7 +451,8 @@ def worker_turn_cleanup(db, conn, sid, payload):
+     key = db._session_turn_lease_key_on_conn(conn, sid)
+     if key != db._session_turn_lease_key_on_conn(conn, target):
+         raise RuntimeStoreError('permission_denied')
+-    conn.execute('DELETE FROM session_turn_leases WHERE conversation_id=? AND holder=?', (key, holder))
++    from hermes_state_lease_custody import delete_row
++    delete_row(conn, 'worker_cleanup', key, holder, store=getattr(db, 'db_path', None), session_id=sid)
+     return {'released': True}
+ 
+ 
+diff --git a/tests/hermes_state/test_turn_lease_custody_events.py b/tests/hermes_state/test_turn_lease_custody_events.py
+new file mode 100644
+index 0000000000..f5181cbcb8
+--- /dev/null
++++ b/tests/hermes_state/test_turn_lease_custody_events.py
+@@ -0,0 +1,196 @@
++"""Turn-lease custody events name every row producer and change no fencing [daveey t_eeeeee000000002b]."""
++import logging
++import os
++import time
++
++import pytest
++
++import hermes_state_lease_custody as custody
++from hermes_state import SessionDB
++from hermes_state_errors import SessionTurnLeaseLostError
++
++LOGGER = "hermes_state.lease_custody"
++MSG = [{"role": "assistant", "content": "ok"}]
++
++
++@pytest.fixture
++def db(tmp_path, caplog):
++    caplog.set_level(logging.INFO, logger=LOGGER)
++    store = SessionDB(tmp_path / "state.db")
++    yield store
++    store.close()
++
++
++def _events(caplog):
++    return [dict(part.split("=", 1) for part in r.getMessage().split()[1:])
++            for r in caplog.records if r.name == LOGGER]
++
++
++def _ops(caplog):
++    return [e.get("op") or e["phase"] for e in _events(caplog)]
++
++
++def _holder(name="turn"):
++    return f"pid={os.getpid()}:turn=private-{name}"
++
++
++def _lease_rows(db):
++    with db._read_ctx() as conn:
++        return [tuple(r) for r in conn.execute("SELECT conversation_id, holder FROM session_turn_leases")]
++
++
++def test_turn_lifecycle_is_reported_with_settlement_and_without_capabilities(db, caplog, tmp_path):
++    sid, holder = "private-session-name", _holder()
++    db.create_session(sid, source="desktop")
++    caplog.clear()
++    assert db.try_acquire_session_turn_lease(sid, holder)
++    assert db.append_messages_batch(sid, MSG, turn_lease_holder=holder) == 1
++    db.release_session_turn_lease(sid, holder)
++    with pytest.raises(SessionTurnLeaseLostError, match="missing lease row"):
++        db.append_messages_batch(sid, [{"role": "assistant", "content": "late"}], turn_lease_holder=holder)
++
++    assert _ops(caplog) == ["claim", "committed", "release", "committed", "missing", "rolled_back"]
++    claim, claimed, release, released, missing, refused = _events(caplog)
++    assert (claim["txn"], release["txn"], missing["txn"]) == (claimed["txn"], released["txn"], refused["txn"])
++    assert len({claim["txn"], release["txn"], missing["txn"]}) == 3
++    assert (claim["changed"], claim["why"], release["changed"]) == ("1", "owned=1", "1")
++    assert claim["key"] == claim["session"] == custody.tag(sid) and claim["root_is_session"] == "1"
++    assert claim["holder"] == claim["row_holder"] == release["row_holder"] == missing["holder"] == custody.tag(holder)
++    assert missing["row_holder"] == "-" and missing["why"] == "lease_rows=0,session_row=1,parent=0"
++    assert claim["store"] == custody.tag(db.db_path) != "-"
++    text = "\n".join(r.getMessage() for r in caplog.records if r.name == LOGGER)
++    assert holder not in text and sid not in text and str(tmp_path) not in text
++    assert [r.levelno for r in caplog.records if "op=missing" in r.getMessage()] == [logging.WARNING]
++    # Fencing is unchanged: the refused write did not land and no row was restored.
++    assert [m["content"] for m in db.get_messages(sid)] == ["ok"]
++    assert _lease_rows(db) == []
++
++
++def test_never_admitted_and_superseded_holders_still_refuse(db, caplog):
++    sid, owner, other = "s1", _holder("owner"), _holder("other")
++    db.create_session(sid, source="desktop")
++    with pytest.raises(SessionTurnLeaseLostError, match="missing lease row"):
++        db.append_messages_batch(sid, MSG, turn_lease_holder=other)
++    assert _lease_rows(db) == []
++    assert db.try_acquire_session_turn_lease(sid, owner)
++    caplog.clear()
++    assert not db.try_acquire_session_turn_lease(sid, other)
++    lost = _events(caplog)[0]
++    assert (lost["op"], lost["changed"], lost["why"], lost["row_holder"]) == ("claim", "0", "owned=0", custody.tag(owner))
++    caplog.clear()
++    with pytest.raises(SessionTurnLeaseLostError, match="holder mismatch"):
++        db.append_messages_batch(sid, MSG, turn_lease_holder=other)
++    mismatch = _events(caplog)[0]
++    assert (mismatch["op"], mismatch["holder"], mismatch["row_holder"]) == (
++        "mismatch", custody.tag(other), custody.tag(owner))
++    assert db.append_messages_batch(sid, MSG, turn_lease_holder=owner) == 1
++    assert _lease_rows(db) == [(sid, owner)]
++
++
++def test_a_release_that_removes_nothing_is_not_reported(db, caplog):
++    db.create_session("s1", source="desktop")
++    caplog.clear()
++    db.release_session_turn_lease("s1", _holder("stale"))
++    assert _events(caplog) == []
++
++
++def test_rolled_back_delete_is_reported_as_rolled_back(db, caplog):
++    sid, holder = "s1", _holder()
++    db.create_session(sid, source="desktop")
++    assert db.try_acquire_session_turn_lease(sid, holder)
++    caplog.clear()
++
++    def _delete_then_fail(conn):
++        assert custody.delete_row(conn, "release", sid, holder, store=db.db_path) == 1
++        raise RuntimeError("abort this transaction")
++
++    with pytest.raises(RuntimeError):
++        db._execute_write(_delete_then_fail)
++    assert _ops(caplog) == ["release", "rolled_back"]
++    assert _lease_rows(db) == [(sid, holder)]
++    assert db.append_messages_batch(sid, MSG, turn_lease_holder=holder) == 1
++
++
++def test_sweep_and_stale_reclaim_name_the_rows_they_removed(db, caplog):
++    for sid in ("old", "lapsed", "fresh"):
++        db.create_session(sid, source="desktop")
++    old, lapsed, new = _holder("old"), _holder("lapsed"), _holder("new")
++    assert db.try_acquire_session_turn_lease("old", old)
++    assert db.try_acquire_session_turn_lease("lapsed", lapsed)
++    now = time.time()
++    db._execute_write(lambda conn: conn.executemany(
++        "UPDATE session_turn_leases SET expires_at = ? WHERE conversation_id = ?",
++        [(now - 2 * 86400, "old"), (now - 5, "lapsed")]))
++    caplog.clear()
++    assert db.try_acquire_session_turn_lease("fresh", new)
++    swept = [e for e in _events(caplog) if e.get("op") == "sweep"]
++    assert [(e["key"], e["row_holder"], e["changed"]) for e in swept] == [(custody.tag("old"), custody.tag(old), "1")]
++    caplog.clear()
++    assert db.try_acquire_session_turn_lease("lapsed", new + "2")
++    reclaim, claim, settled = _events(caplog)
++    assert (reclaim["op"], reclaim["row_holder"], reclaim["changed"], reclaim["why"]) == (
++        "reclaim", custody.tag(lapsed), "1", "stale_on_acquire")
++    assert (claim["op"], claim["why"], settled["phase"], settled["events"]) == ("claim", "owned=1", "committed", "2")
++    with pytest.raises(SessionTurnLeaseLostError, match="holder mismatch"):
++        db.append_messages_batch("lapsed", MSG, turn_lease_holder=lapsed)
++
++
++def test_leaseless_writer_reclaim_and_worker_deletes_are_reported(db, caplog):
++    from hermes_state_runtime import _worker_turn
++    sid, holder = "s1", _holder()
++    db.create_session(sid, source="desktop")
++    assert db.try_acquire_session_turn_lease(sid, holder)
++    db._execute_write(lambda conn: conn.execute("UPDATE session_turn_leases SET expires_at = ?", (time.time() - 5,)))
++    caplog.clear()
++    db._execute_write(lambda conn: db._check_transcript_write_guards(conn, sid, None, reject_active_turn_lease=True))
++    assert _ops(caplog) == ["reclaim", "committed"]
++    assert next(e["why"] for e in _events(caplog)) == "stale_on_leaseless_write"
++    assert db.try_acquire_session_turn_lease(sid, holder)
++    caplog.clear()
++    db._execute_write(lambda conn: _worker_turn(db, conn, sid, {"holder": holder}, "turn.release"))
++    assert _ops(caplog) == ["worker_release", "committed"]
++    assert _lease_rows(db) == []
++
++
++def test_distinct_stores_carry_distinct_tags(db, caplog, tmp_path):
++    other = SessionDB(tmp_path / "other" / "state.db")
++    try:
++        for store in (db, other):
++            store.create_session("s1", source="desktop")
++            assert store.try_acquire_session_turn_lease("s1", _holder())
++        stores = {e["store"] for e in _events(caplog) if e.get("op") == "claim"}
++        assert stores == {custody.tag(db.db_path), custody.tag(other.db_path)} and len(stores) == 2
++    finally:
++        other.close()
++
++
++def test_admission_readback_reports_only_an_absent_row(db, caplog):
++    from agent.turn_facade_lease import LEASE_TTL_SECONDS, _committed_lease_expiry
++    sid, holder = "s1", _holder()
++    db.create_session(sid, source="desktop")
++    assert db.try_acquire_session_turn_lease(sid, holder)
++    caplog.clear()
++    assert _committed_lease_expiry(db, sid, holder, 100.0) > time.time()
++    assert _events(caplog) == []
++    db.release_session_turn_lease(sid, holder)
++    caplog.clear()
++    assert _committed_lease_expiry(db, sid, holder, 100.0) == 100.0 + LEASE_TTL_SECONDS
++    absent = _events(caplog)[0]
++    assert (absent["phase"], absent["op"], absent["holder"]) == ("admission", "readback_absent", custody.tag(holder))
++    assert _lease_rows(db) == []  # the readback never restores custody
++
++
++def test_a_failing_logger_changes_no_admission_and_no_refusal(db, monkeypatch):
++    def _fail(*args, **kwargs):
++        raise RuntimeError("logger unavailable")
++    for name in ("log", "info", "warning"):
++        monkeypatch.setattr(custody._LOG, name, _fail)
++    sid, holder = "s1", _holder()
++    db.create_session(sid, source="desktop")
++    assert db.try_acquire_session_turn_lease(sid, holder)
++    assert db.append_messages_batch(sid, MSG, turn_lease_holder=holder) == 1
++    db.release_session_turn_lease(sid, holder)
++    with pytest.raises(SessionTurnLeaseLostError, match="missing lease row"):
++        db.append_messages_batch(sid, MSG, turn_lease_holder=holder)
++    custody.admission_readback(db, sid, holder, None)
++    assert _lease_rows(db) == []
+-- 
+2.43.0
+

@@ -1,0 +1,365 @@
+From cae52d725531cb470bd09f7627fc7e43b1ae6949 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 04:15:22 +0000
+Subject: [PATCH] feat(kanban): name contained ancestors on session cards
+ [daveey]
+
+Walk local + sync-shadow replica parents for blocked_upstream, annotate
+contained triage with episode/authority, and add upstream when the nearest
+open ancestor is not blocked. Remote listed rows get the same walk.
+
+Proof: tests fail on original source; 15 blocked_upstream + 40 session_tasks
+parity tests pass. health check clean vs origin/main.
+---
+ .../kanban_session_activity_card_details.py   | 183 ++++++++++++++++--
+ hermes_cli/kanban_session_outcome_tasks.py    |   2 +
+ .../test_kanban_blocked_upstream_details.py   |  86 +++++++-
+ 3 files changed, 247 insertions(+), 24 deletions(-)
+
+diff --git a/hermes_cli/kanban_session_activity_card_details.py b/hermes_cli/kanban_session_activity_card_details.py
+index a2d2b60a84..263c83df84 100644
+--- a/hermes_cli/kanban_session_activity_card_details.py
++++ b/hermes_cli/kanban_session_activity_card_details.py
+@@ -2,9 +2,11 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
+ import re
+ import sqlite3
++from pathlib import Path
+ from typing import Any
+ 
+ from hermes_cli.kanban_run_machine import add_run_machines
+@@ -69,39 +71,178 @@ def _add_card_details(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]
+     _add_blocked_upstream(conn, found)
+ 
+ 
+-def _nearest_blocked(conn: sqlite3.Connection, task_id: str) -> dict[str, str] | None:
++def _replica_for(conn: sqlite3.Connection) -> sqlite3.Connection | None:
++    """The board's sync-shadow replica, or None. Tests may replace this."""
++    try:
++        from hermes_cli.kanban_db_sync import _db_key, board_slug_for_path
++        from hermes_cli.kanban_sync_client import shadow_path
++        key = _db_key(conn)
++        if not key:
++            return None
++        path = shadow_path(board_slug_for_path(key))
++        if not path.is_file() or Path(key).resolve() == path.resolve():
++            return None
++        replica = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
++        replica.row_factory = sqlite3.Row
++        replica._hermes_owned = True  # type: ignore[attr-defined]
++        return replica
++    except (OSError, TypeError, ValueError, sqlite3.Error):
++        return None
++
++
++def _query(src: sqlite3.Connection | None, sql: str, args: tuple, *, required: bool = False) -> list:
++    if src is None:
++        return []
++    try:
++        return src.execute(sql, args).fetchall()
++    except sqlite3.Error:
++        if required:
++            raise
++        return []
++
++
++def _task_info(conn: sqlite3.Connection, replica: sqlite3.Connection | None, task_id: str) -> dict[str, Any] | None:
++    for src in (conn, replica):
++        rows = _query(src, "SELECT id, status, containment_episode FROM tasks WHERE id=?", (task_id,))
++        if not rows:
++            rows = _query(src, "SELECT id, status FROM tasks WHERE id=?", (task_id,))
++        if rows:
++            row = rows[0]
++            episode = row["containment_episode"] if "containment_episode" in row.keys() else None
++            return {"id": row["id"], "status": row["status"], "episode": episode}
++    return None
++
++
++def _parent_ids(conn: sqlite3.Connection, replica: sqlite3.Connection | None, child: str) -> list[str]:
++    seen: set[str] = set()
++    ids: list[str] = []
++    for src, required in ((conn, True), (replica, False)):
++        for row in _query(src, "SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id",
++                          (child,), required=required):
++            parent = row[0]
++            if parent not in seen:
++                seen.add(parent)
++                ids.append(parent)
++    return ids
++
++
++def _authority(conn: sqlite3.Connection, replica: sqlite3.Connection | None,
++               task_id: str, episode: str) -> dict[str, str]:
++    auth_id = ""
++    for src in (conn, replica):
++        for row in _query(src, "SELECT payload FROM task_events WHERE task_id=? AND uid=? AND kind='contained'",
++                          (task_id, episode)):
++            raw = row[0]
++            try:
++                payload = json.loads(raw) if isinstance(raw, str) else raw
++            except (TypeError, ValueError):
++                continue
++            if isinstance(payload, dict):
++                policy = payload.get("policy")
++                authority = policy.get("authority") if isinstance(policy, dict) else None
++                if isinstance(authority, dict) and authority.get("task_id"):
++                    auth_id = str(authority["task_id"])
++                    break
++        if auth_id:
++            break
++    status = ""
++    if auth_id:
++        info = _task_info(conn, replica, auth_id)
++        status = str(info["status"]) if info else ""
++    return {"id": auth_id, "status": status}
++
++
++def _blocked_payload(conn: sqlite3.Connection, replica: sqlite3.Connection | None,
++                     parent: str, info: dict[str, Any]) -> dict[str, Any]:
++    out: dict[str, Any] = {"id": parent, "status": info["status"]}
++    episode = info.get("episode")
++    if info["status"] == "triage" and episode:
++        out["contained"] = {"episode": episode, "authority": _authority(conn, replica, parent, episode)}
++    return out
++
++
++def _nearest_blocked(conn: sqlite3.Connection, task_id: str,
++                     replica: sqlite3.Connection | None = None) -> dict[str, Any] | None:
+     """Breadth-first, so the first match is nearest; ties sort by id."""
++    blocked, _upstream = _walk(conn, task_id, replica)
++    return blocked
++
++
++def _walk(conn: sqlite3.Connection, task_id: str,
++          replica: sqlite3.Connection | None) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
+     seen = {task_id}
+     frontier = {task_id}
++    nearest_open: dict[str, str] | None = None
+     for _ in range(20):
+-        parents = {}
++        parents: dict[str, dict[str, Any]] = {}
+         for child in sorted(frontier):
+-            for parent, status in conn.execute(
+-                "SELECT t.id, t.status FROM task_links l JOIN tasks t ON t.id = l.parent_id "
+-                "WHERE l.child_id = ? ORDER BY t.id", (child,),
+-            ):
+-                if parent not in seen:
+-                    parents[parent] = status
++            for parent in _parent_ids(conn, replica, child):
++                if parent in seen or parent in parents:
++                    continue
++                info = _task_info(conn, replica, parent)
++                if info is not None:
++                    parents[parent] = info
+         if not parents:
+-            return None
++            return None, nearest_open
+         for parent in sorted(parents):
+-            if parents[parent] in {"blocked", "triage"}:
+-                return {"id": parent, "status": parents[parent]}
++            status = parents[parent]["status"]
++            if nearest_open is None and status not in {"todo", "done", "archived"}:
++                nearest_open = {"id": parent, "status": status}
++            if status in {"blocked", "triage"}:
++                return _blocked_payload(conn, replica, parent, parents[parent]), nearest_open
+         seen.update(parents)
+         frontier = set(parents)
+-    return None
++    return None, nearest_open
+ 
+ 
+ def _add_blocked_upstream(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]) -> None:
+-    """Optional local-board presentation evidence; old schemas remain readable."""
+-    for task_id, card in found.items():
+-        card.pop("blocked_upstream", None)
++    """Optional presentation evidence; old schemas remain readable. Replica fills foreign parents."""
++    replica = _replica_for(conn)
++    owned = bool(getattr(replica, "_hermes_owned", False))
++    try:
++        for task_id, card in found.items():
++            card.pop("blocked_upstream", None)
++            card.pop("upstream", None)
++            if card.get("status") in {"done", "archived", "blocked", "triage"}:
++                continue
++            try:
++                blocked, upstream = _walk(conn, task_id, replica)
++            except sqlite3.Error:
++                logging.getLogger(__name__).debug("Could not read blocked upstream for %s", task_id, exc_info=True)
++                continue
++            if blocked is not None:
++                card["blocked_upstream"] = blocked
++            elif upstream is not None:
++                card["upstream"] = upstream
++    finally:
++        if owned and replica is not None:
++            replica.close()
++
++
++def annotate_remote_upstream(cards: list[dict[str, Any]]) -> None:
++    """Walk replica graphs for listed remote rows that local details never saw."""
++    pending: dict[str, dict[str, dict[str, Any]]] = {}
++    for card in cards:
++        if not isinstance(card, dict) or "id" not in card:
++            continue
+         if card.get("status") in {"done", "archived", "blocked", "triage"}:
+             continue
+-        try:
+-            ancestor = _nearest_blocked(conn, task_id)
+-        except sqlite3.Error:
+-            logging.getLogger(__name__).debug("Could not read blocked upstream for %s", task_id, exc_info=True)
++        if "blocked_upstream" in card or "upstream" in card:
+             continue
+-        if ancestor is not None:
+-            card["blocked_upstream"] = ancestor
++        pending.setdefault(str(card.get("board") or "default"), {})[str(card["id"])] = card
++    for board, found in pending.items():
++        replica = None
++        try:
++            from hermes_cli.kanban_sync_client import shadow_path
++            path = shadow_path(board)
++            if not path.is_file():
++                continue
++            replica = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
++            replica.row_factory = sqlite3.Row
++            replica._hermes_owned = True  # type: ignore[attr-defined]
++            _add_blocked_upstream(replica, found)
++        except (OSError, TypeError, ValueError, sqlite3.Error):
++            logging.getLogger(__name__).debug("Could not annotate remote upstream for %s", board, exc_info=True)
++        finally:
++            if replica is not None:
++                replica.close()
+diff --git a/hermes_cli/kanban_session_outcome_tasks.py b/hermes_cli/kanban_session_outcome_tasks.py
+index fc1e4733b5..0cc4a89371 100644
+--- a/hermes_cli/kanban_session_outcome_tasks.py
++++ b/hermes_cli/kanban_session_outcome_tasks.py
+@@ -70,6 +70,8 @@ def append_remote_listed_cards(out: list[dict[str, Any]], ids: list[str], status
+             if wait is not None:
+                 row["wait"] = wait
+             out.append(row)
++    from hermes_cli.kanban_session_activity_card_details import annotate_remote_upstream
++    annotate_remote_upstream(out)
+ 
+ 
+ def _read_lean_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -> list[dict[str, Any]]:
+diff --git a/tests/hermes_cli/test_kanban_blocked_upstream_details.py b/tests/hermes_cli/test_kanban_blocked_upstream_details.py
+index 0935ca9b86..7b204b0879 100644
+--- a/tests/hermes_cli/test_kanban_blocked_upstream_details.py
++++ b/tests/hermes_cli/test_kanban_blocked_upstream_details.py
+@@ -1,8 +1,10 @@
+ """Blocked ancestor presentation on local session task rows."""
++import json
+ import sqlite3
+ 
+ import pytest
+ 
++from hermes_cli import kanban_session_activity_card_details as card_details
+ from hermes_cli.kanban_session_activity_card_details import _add_card_details
+ 
+ 
+@@ -10,14 +12,26 @@ from hermes_cli.kanban_session_activity_card_details import _add_card_details
+ def board():
+     conn = sqlite3.connect(":memory:")
+     conn.row_factory = sqlite3.Row
+-    conn.executescript("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT); "
+-                       "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);")
++    conn.executescript(
++        "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, containment_episode TEXT); "
++        "CREATE TABLE task_links (parent_id TEXT, child_id TEXT); "
++        "CREATE TABLE task_events (task_id TEXT, kind TEXT, uid TEXT, payload TEXT);")
+     yield conn
+     conn.close()
+ 
+ 
++def replica_board():
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.executescript(
++        "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, containment_episode TEXT); "
++        "CREATE TABLE task_links (parent_id TEXT, child_id TEXT); "
++        "CREATE TABLE task_events (task_id TEXT, kind TEXT, uid TEXT, payload TEXT);")
++    return conn
++
++
+ def details(conn, statuses, links, listed):
+-    conn.executemany("INSERT INTO tasks VALUES (?, ?)", statuses)
++    conn.executemany("INSERT INTO tasks (id, status) VALUES (?, ?)", statuses)
+     conn.executemany("INSERT INTO task_links VALUES (?, ?)", links)
+     found = {key: {"id": key, "status": dict(statuses)[key]} for key in listed}
+     _add_card_details(conn, found)
+@@ -61,3 +75,69 @@ def test_missing_links_fails_soft(board, caplog):
+         _add_card_details(board, found)
+     assert "blocked_upstream" not in found["b"]
+     assert "blocked upstream" in caplog.text.lower()
++
++
++def test_upstream_when_no_blocked_ancestor(board):
++    rows = details(board, [("a", "running"), ("b", "todo")], [("a", "b")], ["b"])
++    assert "blocked_upstream" not in rows["b"]
++    assert rows["b"]["upstream"] == {"id": "a", "status": "running"}
++
++
++def test_contained_triage_ancestor(board):
++    board.executemany("INSERT INTO tasks VALUES (?, ?, ?)",
++                      [("auth", "done", None), ("leaf", "triage", "ep-1"), ("child", "todo", None)])
++    board.execute("INSERT INTO task_links VALUES (?, ?)", ("leaf", "child"))
++    board.execute("INSERT INTO task_events VALUES (?, ?, ?, ?)",
++                  ("leaf", "contained", "ep-1", json.dumps({"policy": {"authority": {"task_id": "auth"}}})))
++    found = {"child": {"id": "child", "status": "todo"}}
++    _add_card_details(board, found)
++    assert found["child"]["blocked_upstream"] == {
++        "id": "leaf", "status": "triage",
++        "contained": {"episode": "ep-1", "authority": {"id": "auth", "status": "done"}},
++    }
++
++
++def test_foreign_parent_resolved_through_replica(board):
++    replica = replica_board()
++    replica.executemany("INSERT INTO tasks VALUES (?, ?, ?)",
++                        [("a", "blocked", None), ("b", "todo", None), ("c", "todo", None)])
++    replica.executemany("INSERT INTO task_links VALUES (?, ?)", [("a", "b"), ("b", "c")])
++    card_details._replica_for = lambda conn: replica
++    try:
++        rows = details(board, [("c", "todo")], [("b", "c")], ["c"])
++        assert rows["c"]["blocked_upstream"] == {"id": "a", "status": "blocked"}
++    finally:
++        card_details._replica_for = lambda conn: None
++        replica.close()
++
++
++def test_remote_row_annotated_through_replica(board):
++    replica = replica_board()
++    replica.executemany("INSERT INTO tasks VALUES (?, ?, ?)",
++                        [("a", "triage", "ep-1"), ("c", "todo", None)])
++    replica.execute("INSERT INTO task_links VALUES (?, ?)", ("a", "c"))
++    replica.execute("INSERT INTO task_events VALUES (?, ?, ?, ?)",
++                    ("a", "contained", "ep-1", json.dumps({"policy": {"authority": {"task_id": "auth"}}})))
++    replica.execute("INSERT INTO tasks VALUES (?, ?, ?)", ("auth", "scheduled", None))
++    card_details._replica_for = lambda conn: replica
++    try:
++        found = {"c": {"id": "c", "status": "todo"}}
++        _add_card_details(board, found)
++        assert found["c"]["blocked_upstream"] == {
++            "id": "a", "status": "triage",
++            "contained": {"episode": "ep-1", "authority": {"id": "auth", "status": "scheduled"}},
++        }
++    finally:
++        card_details._replica_for = lambda conn: None
++        replica.close()
++
++
++def test_missing_replica_fails_soft(board, caplog):
++    card_details._replica_for = lambda conn: None
++    try:
++        with caplog.at_level("DEBUG"):
++            rows = details(board, [("c", "todo")], [("b", "c")], ["c"])
++        assert "blocked_upstream" not in rows["c"]
++        assert "upstream" not in rows["c"]
++    finally:
++        card_details._replica_for = lambda conn: None
+-- 
+2.43.0
+

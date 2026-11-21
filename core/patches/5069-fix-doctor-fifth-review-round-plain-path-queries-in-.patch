@@ -1,0 +1,228 @@
+From c525c7a260b695ed35885325938c989a660cfe9b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:08:49 -0800
+Subject: [PATCH] fix(doctor): fifth review round - plain-path queries, "#" in
+ URL secrets, -u, globs
+
+- a query on a path that is not a full URL (/cb?pass=x, h/x?sid=x) and a
+  query nested in a query value are judged by name again (regression of
+  the previous commit): _mask_components hands everything after "?" to
+  _mask_query unless the "?" sits inside a password cut at the path
+- URLs: path, query and fragment go through _mask_components together, so
+  a "#" inside a symbol password no longer cuts off an innocent tail
+- the glob exception covers "*" only next to . / : - * ( ) or at the ends
+  of the token (0*%0N5Mq is a password again)
+- the any-program -u/--user rule applies only to a separate argument
+  (-url=..., -upstream=... are other flags) and keeps user:same and uid:gid
+- tests for these cases; redundant quote check in _shell_words removed;
+  _mask_components, _GENERIC_USER_FLAGS and _SECRET_FILE comments match
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_state_argv_secrets.py            | 57 +++++++++++++---------
+ tests/hermes_state/test_argv_secrets.py | 63 +++++++++++++++++++++++++
+ 2 files changed, 99 insertions(+), 21 deletions(-)
+
+diff --git a/hermes_state_argv_secrets.py b/hermes_state_argv_secrets.py
+index b1a8c2d476..11f1c4684c 100644
+--- a/hermes_state_argv_secrets.py
++++ b/hermes_state_argv_secrets.py
+@@ -86,8 +86,11 @@ _PROGRAM_SECRET_FLAGS = {
+     "curl": (("-b",), ("-b",), ("-u", "--user", "-U", "--proxy-user")), "smbclient": ((), (), ("-U", "--user")),
+     "lftp": ((), (), ("-u", "--user")),
+ }
+-# Any program: -u/--user user:pass (curl-style); a bare user or a numeric uid:gid (docker -u 1000:1000) stays.
+-_NO_FLAGS = ((), (), ("-u", "--user"))
++_NO_FLAGS = ((), (), ())
++# Any program: a separate -u/--user argument that is user:pass has its password masked (curl-style options passed
++# through env or shell text); a bare user, user:same-group (docker --user app:app) and uid:gid stay. Only as a separate
++# argument: -url=…, -upstream=… are other flags.
++_GENERIC_USER_FLAGS = frozenset({"-u", "--user"})
+ _COOKIE_FLAGS = frozenset({"-b", "--cookie", "cookie"})
+ # Programs that run a command given as their first positional argument: that program's own flags apply after it.
+ _COMMAND_WRAPPERS = frozenset({"sshpass", "sudo", "doas", "env", "nice", "nohup", "timeout", "xargs", "exec", "time",
+@@ -147,7 +150,8 @@ _NOT_USERINFO = frozenset({"mailto", "npm", "github", "gitlab", "bitbucket", "pk
+ _STRUCTURE = re.compile(r"[/?&#=;@]")  # between the components of a path or URL
+ _NAME_COLON = re.compile(r"^([A-Za-z_][\w.-]*):(\S+)$")  # name:value, judged by the name
+ _IMAGE_DIGEST = re.compile(r"^[\w.-]+@sha\d+:[0-9a-fA-F]+$")  # image@sha256:… (the long hex is still masked)
+-# A file that holds a key or credential, named after a secret flag (openssl -key server.key).
++# A file that holds a key or credential, named after a secret flag (openssl -key server.key). A secret that looks
++# exactly like such a file name (--password notes.txt) is shown, like other secrets shaped as identifiers.
+ _SECRET_FILE = re.compile(r"^[\w.-]+\.(?:key|pem|crt|cer|der|p12|pfx|jks|keystore|pub|asc|gpg|txt|json|ya?ml|env)$")
+ _NPM_SPEC = re.compile(r"^@[\w.-]+/[\w.-]+(?:@[\w.^~<>=-]+)?$")  # @playwright/mcp@latest
+ 
+@@ -302,7 +306,7 @@ def is_identifier(token: str) -> bool:
+     token = _KNOWN_ID_INSIDE.sub("id", token)  # followup:t_eeeeee0000000015:notify, hermes-kanban-t_…
+     if not _NPM_SPEC.match(token):
+         # globs (*.example.com, dir/*, gc*) and printf tokens (%r@%h:%p) are not password symbols
+-        unglobbed = re.sub(r"(?<![A-Za-z0-9])\*|\*(?![A-Za-z0-9])|%[A-Za-z]", "", token)
++        unglobbed = re.sub(r"(?:(?<=[./:\-*(])|^)\*|\*(?=[./:\-*)]|$)|%[A-Za-z]", "", token)
+         if re.search(r"[A-Za-z0-9]", unglobbed) and (
+                 re.search(r"[!^$*]", unglobbed) or len(re.findall(r"[&#%@]", unglobbed)) >= 2):
+             return False  # shell-unsafe symbols, or several of &#%@, in a name: a password, not an identifier
+@@ -419,9 +423,13 @@ def _mask_password_segments(parts: list[str], seps: list[str], bad: list[bool],
+                 bad[index] = True
+ 
+ 
+-def _mask_components(value: str) -> str:
+-    """A path or URL path keeps its structure; each component that is not an identifier is masked, base64 pieces next
+-    to a masked piece too, and a segment that is a symbol password cut into pieces as a whole."""
++def _mask_components(value: str, *, depth: int = 0) -> str:
++    """A path or URL path (with any query and fragment) keeps its structure: each path component that is not an
++    identifier is masked, base64 pieces next to a masked piece too, and a segment that is a symbol password cut into
++    pieces (# & @ %) as a whole; the query after the first "?" is judged pair by pair under its names."""
++    path, question, query = value.partition("?")
++    if question and not _password_cut_at_question(path, query):
++        return f"{_mask_components(path, depth=depth)}?{_mask_query(query, depth=depth)}"
+     parts = _STRUCTURE.split(value)
+     seps = _STRUCTURE.findall(value)
+     content_bad = [not is_identifier(part) for part in parts]
+@@ -434,6 +442,17 @@ def _mask_components(value: str) -> str:
+     return "".join(out)
+ 
+ 
++def _password_cut_at_question(path: str, query: str) -> bool:
++    """A "?" inside a symbol password, not a query: the last path piece already looks like part of a secret, and it
++    and the first query word, joined, are not a name and carry password symbols."""
++    last = path.rsplit("/", 1)[-1]
++    if not last or (is_identifier(last) and not re.search(r"[!^$*#%@&]", last)):
++        return False  # a clean path piece: the "?" starts a real query
++    first = re.split(r"[&/]", query, maxsplit=1)[0]
++    joined = f"{last}?{first}"
++    return bool(re.search(r"[!^$*#%@]", joined)) and not is_identifier(joined.replace("?", "-"))
++
++
+ def _mask_query(query: str, *, depth: int) -> str:
+     """``a=1&token=x``: each value judged whole under its name (an e-mail with "@" stays one value)."""
+     out = []
+@@ -450,21 +469,15 @@ def _mask_query(query: str, *, depth: int) -> str:
+ 
+ def _mask_url(value: str, *, depth: int = 0) -> str:
+     scheme, rest = value.split("://", 1)
+-    rest, hash_sign, fragment = rest.partition("#")
+-    rest, question, query = rest.partition("?")
+-    authority, slash, path = rest.partition("/")
++    split = re.search(r"[/?#]", rest)
++    authority, tail = (rest[: split.start()], rest[split.start():]) if split else (rest, "")
+     if "@" in authority:
+         authority = f"{MASK}@{authority.rsplit('@', 1)[1]}"  # userinfo is a credential either way
+     host = authority.rsplit("@", 1)[-1]
+     if not is_identifier(host.split(":")[0]):
+         authority = authority[: len(authority) - len(host)] + MASK
+-    shown = f"{scheme}://{authority}{slash}{_mask_components(path) if slash else ''}"
+-    if question:
+-        shown += "?" + _mask_query(query, depth=depth)
+-    if hash_sign:
+-        # after a masked piece, a "#" is most likely inside the same secret: the fragment is its tail
+-        shown += "#" + (MASK if MASK in shown or not is_identifier(fragment) else fragment)
+-    return shown
++    # path, query and fragment together: a "#" or "?" inside a secret must not cut it into innocent pieces
++    return f"{scheme}://{authority}{_mask_components(tail, depth=depth) if tail else ''}"
+ 
+ 
+ def _mask_userpass(value: str) -> str:
+@@ -474,8 +487,8 @@ def _mask_userpass(value: str) -> str:
+     if split is None:
+         return value if is_identifier(value) else MASK
+     user, sep, secret = split.groups()
+-    if user.isdigit() and secret.isdigit():
+-        return value  # uid:gid
++    if (user.isdigit() and secret.isdigit()) or (sep == ":" and user == secret):
++        return value  # uid:gid, app:app
+     return f"{user if user and is_identifier(user) else MASK}{sep}{MASK}"
+ 
+ 
+@@ -534,8 +547,6 @@ def _shell_words(text: str) -> list[tuple[str, str]] | None:
+                 current = []
+         else:
+             current.append(char)
+-    if quote or escaped:
+-        return None
+     if current:
+         raws.append("".join(current))
+     words = []
+@@ -701,6 +712,10 @@ def mask_argv_secrets(argv: list[str], *, program: str = "", _depth: int = 0) ->
+             if (shown := _pending_value(token, kind, name, depth=_depth)) is not None:
+                 out.append(shown)
+                 continue
++        if token in _GENERIC_USER_FLAGS and flags is _NO_FLAGS:
++            out.append(token)
++            pending = ("userpass", token)
++            continue
+         if (handled := _program_flag(token, flags)) is not None:
+             shown, kind = handled
+             out.append(shown)
+diff --git a/tests/hermes_state/test_argv_secrets.py b/tests/hermes_state/test_argv_secrets.py
+index 1ce2756683..51afa70dcc 100644
+--- a/tests/hermes_state/test_argv_secrets.py
++++ b/tests/hermes_state/test_argv_secrets.py
+@@ -965,3 +965,66 @@ def test_long_paths_are_judged_in_linear_time():
+     start = time.monotonic()
+     shown([value])
+     assert time.monotonic() - start < 5
++
++
++# ---- the fifth review: queries on plain paths, "#" inside URL secrets, globs, the generic -u rule -------------------
++
++
++@pytest.mark.parametrize(
++    "value, expected",
++    [
++        ("/cb?pass=sunshine", f"/cb?pass={MASK}"),
++        ("/cb?sid=sunshine", f"/cb?sid={MASK}"),
++        ("//h/x?pwd=sunshine", f"//h/x?pwd={MASK}"),
++        ("h.example.com/x?sid=sunshine", f"h.example.com/x?sid={MASK}"),
++        ("https://h/?next=/a?pass=sunshine", f"https://h/?next=/a?pass={MASK}"),
++    ],
++)
++def test_queries_are_judged_by_name_on_plain_paths_and_nested(value, expected):
++    assert shown([value]) == [expected]
++
++
++@pytest.mark.parametrize(
++    "value, secret",
++    [
++        ("https://api.example.com/v1/hook/0*%0N5Mq#4r-uGb2", "4r-uGb2"),
++        ("https://api.example.com/v1/hook/=RUVZN7R&#vdsGC+", "vdsGC"),
++    ],
++)
++def test_a_hash_inside_a_url_secret_does_not_cut_it(value, secret):
++    assert secret not in shown([value])[0]
++
++
++@pytest.mark.parametrize(
++    "value",
++    [
++        "https://h/x?email=a@b.com&page=2#top",
++        "https://github.com/org/repo/blob/main/x.py#L10",
++    ],
++)
++def test_ordinary_queries_and_fragments_are_kept(value):
++    assert shown([value]) == [value]
++
++
++def test_a_star_between_password_symbols_is_not_a_glob():
++    assert shown(["0*%0N5Mq"]) == [MASK]
++
++
++@pytest.mark.parametrize(
++    "argv, program",
++    [
++        (["-url=http://127.0.0.1:8080/x", "-upstream=host:8080"], "tool"),
++        (["run", "--user", "app:app", "img"], "docker"),
++        (["-u", "1000:1000", "img"], "docker"),
++        (["-u", "root", "id"], "sudo"),
++    ],
++)
++def test_the_generic_user_rule_leaves_users_groups_and_other_flags(argv, program):
++    assert shown(argv, program) == argv
++
++
++def test_the_generic_user_rule_masks_a_password():
++    assert shown(["CURL_ARGS=-u admin:sunshine", "./x"], "env") == [
++        f"CURL_ARGS=-u admin:{MASK}",
++        "./x",
++    ]
+-- 
+2.43.0
+

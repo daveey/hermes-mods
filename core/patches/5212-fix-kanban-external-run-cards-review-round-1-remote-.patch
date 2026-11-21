@@ -1,0 +1,1460 @@
+From 32324fa997ba8a64419c7adce35bcafdb5b42bc6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 09:28:37 +0000
+Subject: [PATCH] fix(kanban): external-run cards, review round 1: remote
+ 2-interval rule, stale failing records, auth blocker, per-ref errors, PR
+ verdict [daveey]
+
+Review round 1 of PR #3745 (head 1de163d2) found eight blocking gaps. Each has a test in
+tests/hermes_cli/test_kanban_external_review.py that failed on 1de163d2 and passes here.
+
+1. Remote shell probes: a probe another host runs is judged by its synced records alone (the 5400 s
+   ALIVE_EVERY allowance is gone), and the probe host writes one heartbeat record per interval when its board
+   syncs. A board that does not sync keeps write-on-change with task_wake_checks.last_at as freshness, so
+   test_clean_checks_do_not_append_one_event_each holds unedited. unknown > 1x, red > 2x every.
+2. Staleness applies before the failing-health return: one 5xx (or 401) then a dead host goes red after two
+   intervals instead of staying unknown for ever.
+3. auth_failed asserts service-down.<adapter>.<scope> and wakes one probe card. A missing gh login on this
+   host alone (exit 4) stays red with the hourly operator warning and wakes nobody.
+4. Classification: 404/410/422 are this card's ref (probe_broken, the card is woken, no shared blocker);
+   a non-rate-limit 403 is auth; the local quota guard / brake refusing our own call is rate_limited (never
+   red). A red failure on a scope another card reads fine wakes that card alone.
+5. PR adapter verdict: newest run per workflow, and when the base requires checks every required check must
+   exist and be complete on the head before a terminal result (no early "succeeded", no stale "cancelled").
+   With no required checks a success settles 60 s. Its reads take the sweep deadline and an injectable api.
+7. Cases 11, 13, 14 and the E2E run real cadence with jitter, the deadline wake of an external park, a
+   two-database sync and the dispatcher's own wake tick.
+
+Also: advertising hosts come from an incremental cached read (hosts_seen) instead of a 2000-event scan on
+every wait-info read; a card this host's sweep has not reached yet stays unknown (not red) for up to 4
+intervals while the host is demonstrably polling.
+
+Existing tests changed: test_kanban_external_watch case 8 (auth now wakes one probe card), case 11
+(_declared_every became _cadence), case 14 (a GitHub run is read by every gateway, so the old-host case uses
+shell probes); test_kanban_external_activity (the auth card needs a second card behind the blocker);
+test_kanban_external_adapters and test_kanban_ci_progress_pr fakes answer the new required-checks reads.
+
+Proof: red-run1-1de163d2.log (red on the reviewed head), 41 passed here; the reviewer's 15 probes: 14 pass,
+p4 asserts the old "nobody is woken" observation.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_ci_progress.py              |  88 +--
+ hermes_cli/kanban_external_adapters/github.py | 145 ++++-
+ hermes_cli/kanban_external_state.py           |  45 +-
+ hermes_cli/kanban_external_watch.py           | 138 +++--
+ .../hermes_cli/test_kanban_ci_progress_pr.py  |   5 +
+ .../test_kanban_external_activity.py          |   8 +-
+ .../test_kanban_external_adapters.py          |   6 +-
+ .../hermes_cli/test_kanban_external_review.py | 543 ++++++++++++++++++
+ .../hermes_cli/test_kanban_external_watch.py  |  25 +-
+ 9 files changed, 887 insertions(+), 116 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_external_review.py
+
+diff --git a/hermes_cli/kanban_ci_progress.py b/hermes_cli/kanban_ci_progress.py
+index d88a6259c5..9ce34151cc 100644
+--- a/hermes_cli/kanban_ci_progress.py
++++ b/hermes_cli/kanban_ci_progress.py
+@@ -70,7 +70,7 @@ import threading
+ import time
+ from concurrent.futures import Future, ThreadPoolExecutor
+ from dataclasses import dataclass, field
+-from typing import Callable, Optional
++from typing import Any, Callable, Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -675,7 +675,16 @@ def _wall_now() -> float:
+     return time.time()
+ 
+ 
+-def _record_watch(conn: sqlite3.Connection, task_id: str, watched, wall: float) -> Optional[str]:
++def _mono_now() -> float:
++    """Monotonic clock that spaces the sweeps and each card's reads; a seam, so a test can run real cadence."""
++    return time.monotonic()
++
++
++_JITTER: dict[tuple[str, str], tuple[Any, float]] = {}  # (db, task) -> (park event id, this wait's jitter factor)
++
++
++def _record_watch(conn: sqlite3.Connection, task_id: str, watched, wall: float,
++                  rand: Optional[float] = None) -> Optional[str]:
+     """[daveey] Write the poll as the card's external-watch record (and wake / assert / clear as it says). A failure
+     to record never fails the sweep. Returns the wake event kind or None."""
+     from hermes_cli import kanban_external_watch as kew
+@@ -685,37 +694,48 @@ def _record_watch(conn: sqlite3.Connection, task_id: str, watched, wall: float)
+         declared = ctx["payload"].get("watch") if isinstance(ctx["payload"].get("watch"), dict) else {}
+         return kew.apply_poll(conn, task_id, watched.poll, now=wall, adapter=watched.adapter, scope=watched.scope,
+                               every=clamp_every(declared.get("every"), DEFAULT_CI_EVERY),
+-                              service_name=watched.service_name)
++                              service_name=watched.service_name, rand=rand)
+     except (sqlite3.Error, OSError, ValueError, KeyError, TypeError):
+         logger.warning("kanban external watch: could not record the poll of %s", task_id, exc_info=True)
+         return None
+ 
+ 
+-def _due_wall(conn: sqlite3.Connection, task_id: str, wall: float) -> bool:
+-    """False while a 429's ``retry_after`` has not elapsed since the card's last record: the sweep's coarse
+-    ``RECHECK_SECONDS`` spacing alone would read a rate-limited run too soon. Otherwise the interval is
+-    ``_declared_every``."""
++def _cadence(conn: sqlite3.Connection, task_id: str, wall: float) -> tuple[int, int, Any, bool]:
++    """``(every, floor, park id, wall_ok)`` for one waiting card: seconds between its reads (the park's declared
++    ``watch.every``, never under ``MIN_EVERY``; else ``RECHECK_SECONDS``), the id of its current park (a new park
++    is read at once) and False while a 429's ``retry_after`` has not elapsed since its last record."""
+     from hermes_cli import kanban_external_watch as kew
++    from hermes_cli.kanban_external_state import MIN_EVERY, clamp_every
+     try:
+         ctx = kew.park_context(conn, task_id)
+         rec = kew.latest_record(conn, task_id, ctx["event_id"]) if ctx else None
+     except sqlite3.Error:
+-        return True
+-    return rec is None or wall >= float(rec.get("observed_at") or 0) + float(rec.get("retry_after") or 0)
++        return RECHECK_SECONDS, 0, None, True
++    watch = ((ctx or {}).get("payload") or {}).get("watch")
++    declared = isinstance(watch, dict) and watch.get("every") is not None
++    wall_ok = rec is None or wall >= float(rec.get("observed_at") or 0) + float(rec.get("retry_after") or 0)
++    return (clamp_every(watch["every"]) if declared else RECHECK_SECONDS, MIN_EVERY if declared else 0,
++            (ctx or {}).get("event_id"), wall_ok)
+ 
+ 
+-def _declared_every(conn: sqlite3.Connection, task_id: str) -> int:
+-    """Seconds between reads of this card: its park's declared ``watch.every`` (min 120), else ``RECHECK_SECONDS``."""
+-    from hermes_cli import kanban_external_watch as kew
+-    from hermes_cli.kanban_external_state import clamp_every
+-    try:
+-        ctx = kew.park_context(conn, task_id)
+-    except sqlite3.Error:
+-        return RECHECK_SECONDS
+-    watch = ((ctx or {}).get("payload") or {}).get("watch")
+-    if isinstance(watch, dict) and watch.get("every") is not None:
+-        return clamp_every(watch["every"])
+-    return RECHECK_SECONDS
++def _due(conn: sqlite3.Connection, db: str, waits: list, now: float, wall: float) -> list[tuple]:
++    """The waiting cards to read now, least recently read first: each ``every`` × its jitter factor (±10 %, drawn
++    when it was last read, so the record's ``next_due_at`` is when this returns it) after its last read."""
++    with _LOCK:
++        last_at = {task_id: _LAST_CHECK.get((db, task_id), float("-inf")) for task_id, _r, _h in waits}
++        stamps = {task_id: _JITTER.get((db, task_id)) for task_id, _r, _h in waits}
++    due = []
++    for task_id, ref, hint in waits:
++        every, floor, park_id, wall_ok = _cadence(conn, task_id, wall)
++        last, factor = last_at[task_id], 1.0
++        stamp = stamps[task_id]
++        if stamp is not None and stamp[0] != park_id:
++            last = float("-inf")  # parked again since its last read: a new wait
++        elif stamp is not None:
++            factor = stamp[1]
++        if wall_ok and now - last >= max(every * factor, floor) - 1e-3:
++            due.append((last, task_id, ref, hint, park_id))
++    return sorted(due, key=lambda d: d[:2])
+ 
+ 
+ def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None,
+@@ -734,20 +754,22 @@ def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None,
+         deadline = time.monotonic() + SWEEP_BUDGET_SECONDS
+         waits = _ci_waits(conn)
+         live = {(db, task_id) for task_id, _ref, _hint in waits}
+-        now = time.monotonic()
++        now = _mono_now()
+         wall = _wall_now()
+         with _LOCK:
+-            for key in [k for k in _LAST_CHECK if k[0] == db and k not in live]:
+-                del _LAST_CHECK[key]  # re-parked on something else, woken or gone
+-            last_at = {task_id: _LAST_CHECK.get((db, task_id), float("-inf")) for task_id, _r, _h in waits}
+-        due = sorted((last_at[task_id], task_id, ref, hint) for task_id, ref, hint in waits
+-                     if now - last_at[task_id] >= _declared_every(conn, task_id) and _due_wall(conn, task_id, wall))
+-        for checked, (_last, task_id, ref, hint) in enumerate(due):
++            for state in (_LAST_CHECK, _JITTER):
++                for key in [k for k in state if k[0] == db and k not in live]:
++                    del state[key]  # re-parked on something else, woken or gone
++        from hermes_cli import kanban_external_watch as external_watch
++        from hermes_cli.kanban_external_adapters import github as external_github
++        from hermes_cli.kanban_external_state import jitter_factor
++        for checked, (_last, task_id, ref, hint, park_id) in enumerate(_due(conn, db, waits, now, wall)):
+             if checked >= MAX_CARDS_PER_SWEEP or time.monotonic() >= deadline:
+                 break  # the rest are the least recently checked ones next sweep
++            rand = external_watch._rand()
+             with _LOCK:
+-                _LAST_CHECK[(db, task_id)] = time.monotonic()
+-            from hermes_cli.kanban_external_adapters import github as external_github
++                _LAST_CHECK[(db, task_id)] = _mono_now()
++                _JITTER[(db, task_id)] = (park_id, jitter_factor(rand))
+             watched = external_github.poll(ref, hint, parked_at=_parked_at(conn, task_id), now=wall, fetch=fetch,
+                                            fetch_runners=fetch_runners, fetch_run=fetch_run, deadline=deadline)
+             p = watched.progress if watched is not None else progress(
+@@ -764,7 +786,7 @@ def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None,
+             if p.state == NOT_STARTING and apply(conn, task_id, ref, p):
+                 woken.append(task_id)
+                 continue
+-            if watched is not None and watched.poll is not None and _record_watch(conn, task_id, watched, wall):
++            if watched is not None and watched.poll is not None and _record_watch(conn, task_id, watched, wall, rand):
+                 woken.append(task_id)
+     except Exception:
+         logger.warning("kanban ci run progress sweep failed", exc_info=True)
+@@ -822,7 +844,7 @@ def _sweep_due(db: str) -> bool:
+     if running is not None and not running.done():
+         return False
+     last = _LAST_SWEEP.get(db)
+-    return last is None or time.monotonic() - last >= SWEEP_EVERY_SECONDS
++    return last is None or _mono_now() - last >= SWEEP_EVERY_SECONDS
+ 
+ 
+ def submit_sweep(conn: sqlite3.Connection, pool, *, slots_free: int = 1) -> Optional[Future]:
+@@ -846,7 +868,7 @@ def submit_sweep(conn: sqlite3.Connection, pool, *, slots_free: int = 1) -> Opti
+         with _LOCK:
+             if not _sweep_due(db):  # another tick on this board started one while _LOCK was released
+                 return None
+-            _LAST_SWEEP[db] = time.monotonic()
++            _LAST_SWEEP[db] = _mono_now()
+             fut = pool.submit(_sweep_db, db, home)
+             _SWEEPS[db] = fut
+         return fut
+diff --git a/hermes_cli/kanban_external_adapters/github.py b/hermes_cli/kanban_external_adapters/github.py
+index e24a269f61..71533094e6 100644
+--- a/hermes_cli/kanban_external_adapters/github.py
++++ b/hermes_cli/kanban_external_adapters/github.py
+@@ -13,6 +13,7 @@ from __future__ import annotations
+ 
+ import re
+ import subprocess
++import time
+ from dataclasses import dataclass
+ from typing import Callable, Optional
+ 
+@@ -22,8 +23,16 @@ SERVICE_NAME = "GitHub Actions"
+ DEFAULT_RETRY_AFTER = 300
+ DETAIL_MAX = 300
+ _RETRY_AFTER = re.compile(r"retry[- _]after\D{0,3}(\d+)", re.IGNORECASE)
+-_RATE = re.compile(r"http 429|rate limit|secondary rate|abuse detection", re.IGNORECASE)
+-_AUTH = re.compile(r"http 401|bad credentials|authentication required|gh auth login", re.IGNORECASE)
++REQUIRED_TTL_SECONDS = 600  # a branch's required checks change rarely: one read per base per 10 min
++SETTLE_SECONDS = 60  # with no required checks: how long after the last run finished before "succeeded" is final
++_REQUIRED: dict[tuple[str, str], tuple[float, set[str]]] = {}
++_STATUS_CONCLUSION = {"success": "success", "failure": "failure", "error": "failure"}
++# The local quota guard / shared brake refusing our own call is our pacing, not GitHub's health: never red.
++_RATE = re.compile(r"http 429|rate limit|secondary rate|abuse detection|quota guard|quota brake", re.IGNORECASE)
++_AUTH = re.compile(r"http 40[13]|bad credentials|authentication required|gh auth login|resource not accessible"
++                   r"|saml", re.IGNORECASE)
++_HTTP_AUTH = re.compile(r"http 40[13]|bad credentials|resource not accessible|saml", re.IGNORECASE)
++_REF = re.compile(r"http (?:404|410|422)\b", re.IGNORECASE)  # this run/PR, not the service: deleted, gone, invalid
+ _UNREACHABLE = re.compile(r"timed out|timeout|no such host|could not resolve|temporary failure|connection (?:refused|reset)"
+                           r"|network is unreachable|dial tcp|\beof\b", re.IGNORECASE)
+ _FAILED = ("failure", "timed_out", "startup_failure", "action_required")
+@@ -52,13 +61,13 @@ def adapter_for(ref: str, hint: str = "") -> Optional[str]:
+ def classify(detail: str, *, no_credential: bool = False, gh_missing: bool = False) -> tuple[str, Optional[int]]:
+     """``(health, retry_after)`` for a GitHub read that failed with ``detail``."""
+     text = detail or ""
++    if _RATE.search(text):  # before auth: GitHub's rate limits answer 403 too
++        m = _RETRY_AFTER.search(text)
++        return "rate_limited", int(m.group(1)) if m else DEFAULT_RETRY_AFTER
+     if no_credential or _AUTH.search(text):
+         return "auth_failed", None
+-    if gh_missing:
++    if gh_missing or _REF.search(text):
+         return "probe_broken", None
+-    if _RATE.search(text):
+-        m = _RETRY_AFTER.search(text)
+-        return "rate_limited", int(m.group(1)) if m else DEFAULT_RETRY_AFTER
+     if _UNREACHABLE.search(text):
+         return "unreachable", None
+     return "down", None
+@@ -68,8 +77,11 @@ def _failed(p: kcp.Progress, adapter: str, scope: str, detail: Optional[str] = N
+     health, retry = classify(detail if detail is not None else p.detail, no_credential=p.no_credential,
+                              gh_missing=p.gh_missing)
+     text = (detail if detail is not None else p.detail) or health
++    # No usable ``gh`` login on THIS host (exit 4, an unusable broker prefix) is the host's trouble, not the
++    # service's: the card is red, the operator is warned hourly (``_warn_disabled``), and no card is woken for it.
++    host_only = health == "auth_failed" and not _HTTP_AUTH.search(text)
+     return Watched({"job": "unknown", "service": health, "detail": text[-DETAIL_MAX:], "url": None,
+-                    "retry_after": retry}, p, adapter, scope)
++                    "retry_after": retry, "host_only": host_only}, p, adapter, scope)
+ 
+ 
+ def _conclusion_job(conclusion: Optional[str]) -> str:
+@@ -103,15 +115,16 @@ def _run_job(jobs: list, repo: str, run_id: str, fetch_run: Optional[Callable])
+ def poll(ref: str, hint: str = "", *, parked_at: Optional[float] = None, now: Optional[float] = None,
+          fetch: Optional[kcp.Fetch] = None, fetch_runners: Optional[kcp.FetchRunners] = None,
+          fetch_run: Optional[Callable[[str, str], dict]] = None,
+-         deadline: Optional[float] = None) -> Optional[Watched]:
+-    """Poll the GitHub run or PR ``ref`` names; None when it names neither. Never raises."""
++         deadline: Optional[float] = None, api: Optional[Callable[[str], dict]] = None) -> Optional[Watched]:
++    """Poll the GitHub run or PR ``ref`` names; None when it names neither. Never raises. ``api`` replaces
++    ``gh api <path>`` for the PR adapter's own reads (the verdict); ``pr_progress`` keeps its own."""
+     adapter = adapter_for(ref, hint)
+     if adapter is None:
+         return None
+     try:
+         if adapter == "github_run":
+             return _poll_run(ref, hint, now, fetch, fetch_runners, fetch_run, deadline)
+-        return _poll_pr(ref, hint, parked_at, now, fetch, fetch_runners, deadline)
++        return _poll_pr(ref, hint, parked_at, now, fetch, fetch_runners, deadline, api)
+     except kcp.GhMissing as exc:
+         return _failed(kcp.Progress("unknown", gh_missing=True, detail=str(exc)), adapter, "")
+     except kcp.NoCredential as exc:
+@@ -152,18 +165,20 @@ def _poll_run(ref, hint, now, fetch, fetch_runners, fetch_run, deadline) -> Watc
+                    "github_run", scope)
+ 
+ 
+-def _poll_pr(ref, hint, parked_at, now, fetch, fetch_runners, deadline) -> Watched:
++def _poll_pr(ref, hint, parked_at, now, fetch, fetch_runners, deadline, api=None) -> Watched:
+     repo, number, sha = kcp.pr_target(ref, hint)  # type: ignore[misc]  # adapter_for proved it is a PR ref
+     url = f"https://github.com/{repo}/pull/{number}"
+     p = kcp.pr_progress(repo, number, sha, parked_at, fetch=fetch, fetch_runners=fetch_runners, now=now,
+                         deadline=deadline)
++    if p.deferred:
++        return Watched(None, p, "github_pr_checks", repo)
+     if p.state == "unknown" and not p.settling:
+         return Watched(None, p, "github_pr_checks", repo) if p.deferred else _failed(p, "github_pr_checks", repo)
+     if p.state == kcp.NOT_STARTING:
+         detail = p.detail if p.per_pr else kcp.describe(p)
+         return Watched({"job": "queued", "service": "degraded", "detail": detail[:DETAIL_MAX], "url": url,
+                         "retry_after": None}, p, "github_pr_checks", repo)
+-    api = kcp._gh_api
++    api = api or kcp._gh_api
+     try:
+         pr = api(f"repos/{repo}/pulls/{number}") or {}
+         if pr.get("state") != "open" or pr.get("merged"):
+@@ -174,23 +189,105 @@ def _poll_pr(ref, hint, parked_at, now, fetch, fetch_runners, deadline) -> Watch
+         if sha and not head.startswith(sha.lower()):
+             return Watched({"job": "unknown", "service": "ok", "detail": f"head moved off {sha[:10]}", "url": url,
+                             "retry_after": None}, p, "github_pr_checks", repo)
+-        runs = [r for r in (api(f"repos/{repo}/actions/runs?head_sha={head}&per_page=100") or {}).get(
+-            "workflow_runs") or [] if isinstance(r, dict)]
++        job, detail = _pr_verdict(api, repo, head, str((pr.get("base") or {}).get("ref") or ""), now, deadline)
++    except kcp.OverBudget as exc:
++        return Watched(None, kcp.Progress("unknown", repo, pr=number, detail=str(exc), deferred=True),
++                       "github_pr_checks", repo)
+     except kcp.NoCredential as exc:
+         return _failed(kcp.Progress("unknown", repo, no_credential=True, detail=str(exc)), "github_pr_checks", repo)
+     except kcp.GhMissing as exc:
+         return _failed(kcp.Progress("unknown", repo, gh_missing=True, detail=str(exc)), "github_pr_checks", repo)
+     except (OSError, RuntimeError, ValueError, AttributeError, subprocess.TimeoutExpired) as exc:
+         return _failed(kcp.Progress("unknown", repo, detail=str(exc)), "github_pr_checks", repo)
+-    if not runs or any(r.get("status") in _PENDING for r in runs) and not any(
+-            r.get("status") == "in_progress" for r in runs):
+-        job, detail = "queued", "checks queued" if runs else "no checks started yet"
+-    elif any(r.get("status") != "completed" for r in runs):
+-        job, detail = "running", "checks running"
+-    else:
+-        concl = [r.get("conclusion") for r in runs]
+-        job = ("failed" if any(c in _FAILED for c in concl) else "cancelled" if "cancelled" in concl
+-               else "succeeded")
+-        detail = f"checks {job}"
+     return Watched({"job": job, "service": "ok", "detail": detail, "url": url, "retry_after": None}, p,
+                    "github_pr_checks", repo)
++
++
++def _budget(deadline: Optional[float]) -> None:
++    if deadline is not None and time.monotonic() >= deadline:
++        raise kcp.OverBudget("sweep budget spent before the PR's checks were read")
++
++
++def _newest(items: list, key: Callable[[dict], object]) -> list[dict]:
++    """The newest (highest id) item per ``key``: a rerun or a superseding run replaces the attempt before it."""
++    best: dict = {}
++    for item in items:
++        if not isinstance(item, dict):
++            continue
++        k = key(item)
++        if k not in best or (item.get("id") or 0) > (best[k].get("id") or 0):
++            best[k] = item
++    return list(best.values())
++
++
++def required_checks(api: Callable[[str], dict], repo: str, base: str, deadline: Optional[float] = None) -> set[str]:
++    """Names of the checks ``base`` requires (classic protection and rulesets), cached ``REQUIRED_TTL_SECONDS``.
++    A branch that requires none answers with none; a failed read raises (the poll is a health record)."""
++    if not base:
++        return set()
++    seen = _REQUIRED.get((repo, base))
++    if seen is not None and time.monotonic() - seen[0] < REQUIRED_TTL_SECONDS:
++        return seen[1]
++    _budget(deadline)
++    branch = api(f"repos/{repo}/branches/{base}") or {}
++    checks = (branch.get("protection") or {}).get("required_status_checks") or {}
++    names = {str(c) for c in checks.get("contexts") or [] if c}
++    _budget(deadline)
++    rules = api(f"repos/{repo}/rules/branches/{base}") or []
++    for rule in rules if isinstance(rules, list) else []:
++        if isinstance(rule, dict) and rule.get("type") == "required_status_checks":
++            for check in (rule.get("parameters") or {}).get("required_status_checks") or []:
++                if isinstance(check, dict) and check.get("context"):
++                    names.add(str(check["context"]))
++    _REQUIRED[(repo, base)] = (time.monotonic(), names)
++    return names
++
++
++def _pr_verdict(api: Callable[[str], dict], repo: str, head: str, base: str, now: Optional[float],
++                deadline: Optional[float]) -> tuple[str, str]:
++    """``(job, detail)`` of a PR head's checks. Terminal only on evidence that nothing more is coming:
++
++    * the base requires checks: every required check exists on the head and its newest attempt completed. One
++      workflow finishing first is not "succeeded"; an optional workflow still running does not hold the verdict.
++    * no required checks: the newest run of every workflow completed, and for a success the newest of them
++      finished ``SETTLE_SECONDS`` ago (a later workflow may not have been created yet).
++
++    A superseded attempt (an older cancelled run of a workflow that ran again) never decides."""
++    _budget(deadline)
++    listed = (api(f"repos/{repo}/actions/runs?head_sha={head}&per_page=100") or {}).get("workflow_runs") or []
++    runs = _newest(listed, lambda r: r.get("workflow_id") or r.get("name"))
++    started = any(r.get("status") in ("in_progress", "completed") for r in runs)
++    required = required_checks(api, repo, base, deadline)
++    if required:
++        _budget(deadline)
++        checks = (api(f"repos/{repo}/commits/{head}/check-runs?per_page=100") or {}).get("check_runs") or []
++        state: dict[str, Optional[str]] = {}
++        for check in _newest(checks, lambda c: c.get("name")):
++            if check.get("name") in required:
++                done = check.get("status") == "completed"
++                state[str(check["name"])] = (check.get("conclusion") or "unknown") if done else None
++        if required - set(state):  # a required context may be a commit status, not a check run
++            _budget(deadline)
++            for st in (api(f"repos/{repo}/commits/{head}/status") or {}).get("statuses") or []:
++                if isinstance(st, dict) and st.get("context") in required and st["context"] not in state:
++                    state[str(st["context"])] = _STATUS_CONCLUSION.get(str(st.get("state")))
++        waiting = sorted(name for name in required if state.get(name) is None)
++        if waiting:
++            more = f" (+{len(waiting) - 1} more)" if waiting[1:] else ""
++            return "running" if started else "queued", f"waiting on required check '{waiting[0]}'{more}"
++        concl = list(state.values())
++    else:
++        if not runs or (any(r.get("status") in _PENDING for r in runs) and not started):
++            return "queued", "checks queued" if runs else "no checks started yet"
++        if any(r.get("status") != "completed" for r in runs):
++            return "running", "checks running"
++        concl = [r.get("conclusion") for r in runs]
++    if any(c in _FAILED for c in concl):
++        return "failed", "checks failed"
++    if "cancelled" in concl:
++        return "cancelled", "checks cancelled"
++    if not required:
++        newest = max((kcp._epoch(r.get("updated_at")) or 0) for r in runs)
++        if (time.time() if now is None else float(now)) - newest < SETTLE_SECONDS:
++            return "running", "checks settling (a later workflow may still start)"
++    return "succeeded", "checks succeeded"
+diff --git a/hermes_cli/kanban_external_state.py b/hermes_cli/kanban_external_state.py
+index b3b3cb08e9..ff472e01ec 100644
+--- a/hermes_cli/kanban_external_state.py
++++ b/hermes_cli/kanban_external_state.py
+@@ -13,9 +13,11 @@ Pure and clock-injected: no database, no network, no ``time`` calls. A watch pol
+ * ``external_unknown``: one failed/missed poll, a rate limit, a job nobody could read, or a record older than one
+   interval. Light blue with a hollow glyph.
+ * ``external_down`` (red): two consecutive down/unreachable polls, ``auth_failed`` at once (it never self-heals),
+-  a probe that broke twice, a host silent for more than two intervals (only a host that advertises
++  a probe that broke twice, a host silent for more than two intervals whatever its last record said (a host that
++  died after ONE failed poll is red too, not unknown for ever; only a host that advertises
+   ``external-watch-v1``: an older host's silence stays grey, ``derive`` returns None), or a ci/deploy/external park
+-  with nothing watching it (``watch_missing``).
++  with nothing watching it (``watch_missing``). ``host_alive`` (the reader IS the polling host and wrote other
++  records within the interval) keeps a card its own sweep has not reached yet unknown, up to ``BEHIND_MAX``.
+ * a terminal job (succeeded/failed/cancelled) sets ``wake``: the card is woken with ``external_result`` and the job
+   failing is NOT ``external_down``: that is the woken worker's business, not an outage.
+ 
+@@ -44,6 +46,8 @@ MAX_EVERY = 6 * 3600
+ DEFAULT_CI_EVERY = 300
+ JITTER = 0.10
+ DOWN_AFTER = 2  # consecutive failed polls before a down/unreachable service is red
++GRACE = 90  # a poll lands up to one dispatcher tick (60 s) plus its own read after ``next_due_at``
++BEHIND_MAX = 4  # intervals a live local host may be behind on one card before that card is red anyway
+ 
+ SERVICE_NAMES = {"github_run": "GitHub Actions", "github_pr_checks": "GitHub Actions", "shell": "external probe"}
+ 
+@@ -74,12 +78,20 @@ def next_record(prev: Optional[dict], poll: dict, *, now: float, every: Any, ada
+         retry_after = max(0, int(retry_after)) if retry_after is not None else None
+     except (TypeError, ValueError):
+         retry_after = None
+-    factor = 1 + (min(1.0, max(0.0, float(rand))) - 0.5) * 2 * JITTER
++    trouble = health in FAILING or health == "auth_failed"
++    since = (prev or {}).get("failing_since") if trouble or health == "rate_limited" else None
++    factor = jitter_factor(rand)
+     wait = max(interval * factor, MIN_EVERY, retry_after or 0)
+     return {"schema": SCHEMA, "adapter": adapter, "scope": scope, "host": host, "job": job, "service": health,
+             "detail": str(poll.get("detail") or "")[:300], "url": poll.get("url") or None,
+             "observed_at": float(now), "next_due_at": float(now) + wait, "retry_after": retry_after,
+-            "consecutive_failures": streak, "every": interval}
++            "consecutive_failures": streak, "every": interval, "jitter": factor,
++            "failing_since": since or (float(now) if trouble else None)}
++
++
++def jitter_factor(rand: Any) -> float:
++    """``rand`` in [0, 1] -> the factor in [1 - JITTER, 1 + JITTER] the next poll's interval is stretched by."""
++    return round(1 + (min(1.0, max(0.0, float(rand))) - 0.5) * 2 * JITTER, 4)
+ 
+ 
+ def _external(rec: Optional[dict], *, health: str, job: str, reason: str, adapter: str, service_name: str) -> dict:
+@@ -97,7 +109,7 @@ def _out(state: str, health: str, job: str, reason: str, rec: Optional[dict], ad
+ 
+ def derive(rec: Optional[dict], *, now: float, every: Any, since: Optional[float] = None, advertises: bool = True,
+            watch_missing: bool = False, adapter: Optional[str] = None,
+-           service_name: Optional[str] = None) -> Optional[dict]:
++           service_name: Optional[str] = None, host_alive: bool = False) -> Optional[dict]:
+     """The card's external state at ``now`` by the reader's own clock, or None (grey: nothing to say).
+ 
+     ``rec`` is the stored record (None before the first poll), ``since`` when the park began, ``advertises`` whether
+@@ -112,7 +124,7 @@ def derive(rec: Optional[dict], *, now: float, every: Any, since: Optional[float
+         if not advertises:
+             return None
+         age = now - (since if since is not None else now)
+-        if age > 2 * interval:
++        if age > 2 * interval and not (host_alive and age <= BEHIND_MAX * interval):
+             return _out(DOWN, "host_silent", "unknown", f"no check recorded {int(age // 60)} min after the park", rec,
+                         adapter, name)
+         if age > interval * (1 + JITTER):
+@@ -128,20 +140,27 @@ def derive(rec: Optional[dict], *, now: float, every: Any, since: Optional[float
+                     adapter, name, wake=True)
+     if health == "auth_failed":
+         return _out(DOWN, health, job, detail or "authentication failed", rec, adapter, name)
+-    if health in FAILING:
+-        word = "probe failed" if health == "probe_broken" else f"{health}"
+-        reason = f"{fails} failed check{'s' if fails != 1 else ''} ({word}){': ' + detail if detail else ''}"
+-        return _out(DOWN if fails >= DOWN_AFTER else UNKNOWN, health, job, reason, rec, adapter, name)
+     limited = health == "rate_limited"
+     slack = float(rec.get("retry_after") or 0) if limited else 0.0
+     age = now - float(rec.get("observed_at") or now)
+-    if age > 2 * interval + slack:
++    red = health in FAILING and fails >= DOWN_AFTER
++    if age > 2 * interval + slack and not red:
++        # Silence outranks whatever the last record said: one failed poll and then a dead host is not "unknown".
+         if not advertises:
+             return None
+-        return _out(DOWN, "host_silent", job, f"no check for {int(age // 60)} min (host silent)", rec, adapter, name)
++        mins = int(age // 60)
++        if host_alive and age <= BEHIND_MAX * interval + slack:
++            return _out(UNKNOWN, "host_silent", job, f"check overdue: this host's sweep is behind ({mins} min)", rec,
++                        adapter, name)
++        return _out(DOWN, "host_silent", job, f"no check for {mins} min (host silent)", rec, adapter, name)
++    if health in FAILING:
++        word = "probe failed" if health == "probe_broken" else f"{health}"
++        reason = f"{fails} failed check{'s' if fails != 1 else ''} ({word}){': ' + detail if detail else ''}"
++        return _out(DOWN if red else UNKNOWN, health, job, reason, rec, adapter, name)
+     if limited:
+         return _out(UNKNOWN, health, job, detail or "rate limited", rec, adapter, name)
+-    if age > interval * (1 + JITTER) + slack:
++    planned = float(rec.get("next_due_at") or 0) - float(rec.get("observed_at") or 0)
++    if age > min(max(planned, interval * (1 + JITTER)), 2 * interval) + GRACE:
+         return _out(UNKNOWN, "host_silent", job, f"last check {int(age // 60)} min ago", rec, adapter, name)
+     if job == "unknown":
+         return _out(UNKNOWN, health, job, detail or "job status unknown", rec, adapter, name)
+diff --git a/hermes_cli/kanban_external_watch.py b/hermes_cli/kanban_external_watch.py
+index 145e4b8574..cb517b7891 100644
+--- a/hermes_cli/kanban_external_watch.py
++++ b/hermes_cli/kanban_external_watch.py
+@@ -24,6 +24,7 @@ import json
+ import logging
+ import random
+ import sqlite3
++import threading
+ import time
+ from typing import Any, Iterable, Optional
+ 
+@@ -36,8 +37,9 @@ RECOVERED_EVENT = "external_recovered"
+ SERVICE_DOWN = "external_service_down"
+ BLOCKER_PREFIX = "service-down"
+ AUTHOR = "kanban-dispatcher"
+-ADVERTISED_SCAN = 2000  # newest watch events read to learn which hosts write records
+ SHELL_DEFAULT_EVERY = 900
++REF_BROKEN = "external_ref_broken"
++SERVICE_HEALTHS = ("down", "unreachable", "auth_failed")  # the service's trouble, shared by a scope's cards
+ 
+ 
+ def _json(raw: Any) -> dict:
+@@ -67,14 +69,39 @@ def latest_record(conn: sqlite3.Connection, task_id: str, after_event: int = 0)
+     return _json(row[0]) if row else None
+ 
+ 
++_HOSTS_LOCK = threading.Lock()
++_HOSTS: dict[str, tuple[int, dict[str, float]]] = {}  # board file -> (last event id read, host -> newest record)
++
++
++def hosts_seen(conn: sqlite3.Connection) -> dict[str, float]:
++    """``{host: when it last wrote a watch record}`` on this board: the hosts that advertise
++    ``external-watch-v1``. Read incrementally (only events newer than the last read, through the
++    ``(kind, task_id)`` index, no sort), because it runs on every wait-info read and session-list refresh."""
++    try:
++        row = conn.execute("PRAGMA database_list").fetchone()
++        key = str(row[2] or id(conn)) if row else str(id(conn))
++        with _HOSTS_LOCK:
++            cursor, hosts = _HOSTS.get(key, (0, {}))
++        top = conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0] or 0
++        if top < cursor:  # another database behind the same key (a test's fresh file): start over
++            cursor, hosts = 0, {}
++        hosts = dict(hosts)
++        for _eid, payload in conn.execute("SELECT id, payload FROM task_events WHERE kind = ? AND id > ?",
++                                         (WATCH_EVENT, cursor)):
++            rec = _json(payload)
++            if rec.get("host"):
++                at = float(rec.get("observed_at") or 0)
++                hosts[str(rec["host"])] = max(hosts.get(str(rec["host"]), 0.0), at)
++        with _HOSTS_LOCK:
++            _HOSTS[key] = (int(top), hosts)
++        return hosts
++    except (sqlite3.Error, TypeError, ValueError):
++        return {}
++
++
+ def advertising_hosts(conn: sqlite3.Connection) -> set[str]:
+     """Hosts seen writing watch records on this board (``external-watch-v1``)."""
+-    try:
+-        rows = conn.execute("SELECT payload FROM task_events WHERE kind = ? ORDER BY id DESC LIMIT ?",
+-                            (WATCH_EVENT, ADVERTISED_SCAN)).fetchall()
+-    except sqlite3.Error:
+-        return set()
+-    return {str(h) for h in (_json(r[0]).get("host") for r in rows) if h}
++    return set(hosts_seen(conn))
+ 
+ 
+ def own_host(conn: Optional[sqlite3.Connection]) -> str:
+@@ -108,29 +135,22 @@ def plan(conn: sqlite3.Connection, task_id: str, ctx: dict) -> Optional[dict]:
+     return {"adapter": adapter, "ref": ref, "hint": hint, "every": ks.clamp_every(watch.get("every"), default)}
+ 
+ 
+-def _shell_seen(conn: sqlite3.Connection, task_id: str, rec: dict, every: Any, local: bool) -> tuple[dict, Any]:
+-    """A shell record is written on change only, so its freshness is the newest sign the probe still runs: the
+-    check's own ``last_at`` on this host, the ``wake_check_alive`` a worker node sends every ``ALIVE_EVERY``. A
+-    probe relayed from another host is judged against that slower heartbeat plus its interval, as the lost-probe
+-    guard does, or a healthy remote probe would read as silent."""
+-    from hermes_cli import kanban_wake_check as kwc
++def _shell_seen(conn: sqlite3.Connection, task_id: str, rec: dict, every: Any) -> tuple[dict, Any]:
++    """A shell probe THIS host runs: its freshness is the check's own machine-local ``last_at`` (an unsynced
++    board writes a record on change only). A probe another host runs is judged by its records alone: that host
++    writes one per interval (``record_poll``), so the 2-interval rule holds for it too."""
+     seen = float(rec.get("observed_at") or 0)
+     try:
+         row = conn.execute("SELECT last_at FROM task_wake_checks WHERE task_id = ?", (task_id,)).fetchone()
+         seen = max(seen, float(row[0] or 0) if row else 0.0)
+-        alive = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind = ?",
+-                             (task_id, kwc.ALIVE_EVENT)).fetchone()
+-        seen = max(seen, float(alive[0] or 0) if alive else 0.0)
+     except sqlite3.Error:
+         pass
+     every = ks.clamp_every(every, SHELL_DEFAULT_EVERY)
+-    if not local:
+-        every = every + kwc.ALIVE_EVERY // 2
+     return dict(rec, observed_at=seen, next_due_at=seen + ks.clamp_every(rec.get("every"), SHELL_DEFAULT_EVERY)), every
+ 
+ 
+ def card_state(conn: sqlite3.Connection, task_id: str, *, now: Optional[float] = None,
+-               hosts: Optional[set[str]] = None, status: Optional[str] = None) -> Optional[dict]:
++               hosts: Optional[dict[str, float]] = None, status: Optional[str] = None) -> Optional[dict]:
+     """The derived external state of one card (see ``kanban_external_state.derive``), or None: not a scheduled
+     ci/deploy/external park, an old host's silence, or a deadline-only wait. Adds ``blocker_id`` / ``triage_card``
+     to ``external`` while a service-down blocker holds the card."""
+@@ -146,18 +166,23 @@ def card_state(conn: sqlite3.Connection, task_id: str, *, now: Optional[float] =
+     watch = plan(conn, task_id, ctx)
+     rec = latest_record(conn, task_id, ctx["event_id"])
+     probe_host = ctx["payload"].get("probe_host")
+-    local = not probe_host or probe_host == own_host(conn) or probe_host == "local"
+-    advertises = rec is not None or local or probe_host in (advertising_hosts(conn) if hosts is None else hosts)
++    own = own_host(conn)
++    hosts = hosts_seen(conn) if hosts is None else hosts
++    adapter = (rec or {}).get("adapter") or (watch or {}).get("adapter")
++    # A GitHub run/PR is polled by every gateway's own sweep; a shell probe only by its ``probe_host``.
++    local = adapter in ("github_run", "github_pr_checks") or not probe_host or probe_host in (own, "local")
++    advertises = rec is not None or local or probe_host in hosts
+     if rec is None and watch is None:
+         derived = ks.derive(None, now=now, every=ks.DEFAULT_CI_EVERY, since=ctx["since"], watch_missing=local,
+                             advertises=advertises)
+     else:
+         every = (rec or {}).get("every") or (watch or {}).get("every")
+-        if rec is not None and rec.get("adapter") == "shell":
+-            rec, every = _shell_seen(conn, task_id, rec, every, local)
++        if rec is not None and rec.get("adapter") == "shell" and local:
++            rec, every = _shell_seen(conn, task_id, rec, every)
++        # This host polls the card and wrote some record within the interval: it is alive, only behind here.
++        alive = local and adapter != "shell" and now - hosts.get(own, 0.0) <= ks.clamp_every(every) + ks.GRACE
+         derived = ks.derive(rec, now=now, every=every, since=ctx["since"], advertises=advertises,
+-                            adapter=(rec or {}).get("adapter") or (watch or {}).get("adapter"),
+-                            service_name=(rec or {}).get("service_name"))
++                            adapter=adapter, service_name=(rec or {}).get("service_name"), host_alive=alive)
+     if derived is not None:
+         derived["adapter"] = derived["external"]["adapter"]
+         _name_blocker(conn, derived, rec)
+@@ -167,7 +192,7 @@ def card_state(conn: sqlite3.Connection, task_id: str, *, now: Optional[float] =
+ def _name_blocker(conn: sqlite3.Connection, derived: dict, rec: Optional[dict]) -> None:
+     if derived["state"] != ks.DOWN or not rec or not rec.get("adapter") or not rec.get("scope"):
+         return
+-    if derived["health"] not in ("down", "unreachable", "auth_failed"):
++    if derived["health"] not in SERVICE_HEALTHS:
+         return
+     bid = blocker_id(rec["adapter"], rec["scope"])
+     try:
+@@ -184,7 +209,7 @@ def card_states(conn: sqlite3.Connection, task_ids: Iterable[str], *, now: Optio
+     """``{task id: derived state}`` for the scheduled external cards among ``task_ids``. Never raises."""
+     out: dict[str, dict] = {}
+     try:
+-        hosts = advertising_hosts(conn)
++        hosts = hosts_seen(conn)
+         for tid in dict.fromkeys(str(t) for t in task_ids):
+             derived = card_state(conn, tid, now=now, hosts=hosts)
+             if derived is not None:
+@@ -221,16 +246,17 @@ def record_poll(conn: sqlite3.Connection, task_id: str, poll: dict, *, now: floa
+     watch = plan(conn, task_id, ctx) or {}
+     every = ks.clamp_every(every if every is not None else (prev or {}).get("every") or watch.get("every"))
+     rec = ks.next_record(prev, poll, now=now, every=every, adapter=adapter, scope=scope,
+-                         rand=random.random() if rand is None else rand, host=own_host(conn))
++                         rand=_rand() if rand is None else rand, host=own_host(conn))
+     name = service_name or poll.get("service_name") or ks.SERVICE_NAMES.get(adapter, "external service")
+     derived = ks.derive(rec, now=now, every=every, adapter=adapter, service_name=name) or {}
+     prev_written = (prev or {}).get("state")
+     changed = (prev is None or prev_written != derived["state"] or prev.get("job") != rec["job"]
+                or prev.get("service") != rec["service"])
+-    due = prev is None or (adapter != "shell" and now - float(prev.get("observed_at") or 0) >= 0.9 * every)
+-    # A shell probe's heartbeat is not an event per check (test_clean_checks_do_not_append_one_event_each): the
+-    # check's own ``task_wake_checks.last_at`` (this host) and ``wake_check_alive`` (a worker node, every
+-    # ALIVE_EVERY) carry it; ``_shell_seen`` reads them.
++    # The heartbeat: one record per interval, so a reader on another gateway sees silence within 2 intervals.
++    # A shell probe on a board that does not sync has no such reader and its own ``task_wake_checks.last_at``
++    # is its freshness (``_shell_seen``): it writes on change only, not one event per clean check.
++    beats = adapter != "shell" or own_host(conn) != "local"
++    due = prev is None or (beats and now - float(prev.get("observed_at") or 0) >= 0.9 * every)
+     if changed or due:
+         write_record(conn, task_id, rec, derived)
+     was_down = prev_written == ks.DOWN
+@@ -272,13 +298,55 @@ def apply_poll(conn: sqlite3.Connection, task_id: str, poll: dict, *, now: float
+             if woke:
+                 kb.add_comment(conn, task_id, AUTHOR, _finished_note(rec, derived))
+             return woke
+-        if derived["state"] == ks.DOWN and derived["health"] in ("down", "unreachable") and scope:
++        health = derived["health"]
++        if derived["state"] == ks.DOWN and health in SERVICE_HEALTHS and scope and not poll.get("host_only"):
++            if _scope_answers(conn, task_id, rec):
++                return _wake_ref_broken(conn, task_id, rec, derived, cmd)
+             return _assert_blocker(conn, task_id, rec, derived)
+-        if derived["health"] in ("ok", "degraded") and scope:
++        if derived["state"] == ks.DOWN and health == "probe_broken" and adapter != "shell":
++            return _wake_ref_broken(conn, task_id, rec, derived, cmd)
++        if health in ("ok", "degraded") and scope:
+             _clear_blocker(conn, rec)
+         return None
+ 
+ 
++def _rand() -> float:
++    """Where in ±JITTER the next poll lands; the seam tests pin."""
++    return random.random()
++
++
++def _scope_answers(conn: sqlite3.Connection, task_id: str, rec: dict) -> bool:
++    """Another scheduled card on this adapter and scope read the service fine after this card began failing: the
++    trouble is this card's ref (a run only it names answers 5xx / 403), not an outage of the scope."""
++    since = float(rec.get("failing_since") or rec.get("observed_at") or 0)
++    rows = conn.execute(
++        "SELECT e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id WHERE e.kind = ? AND e.task_id != ? "
++        "AND t.status = 'scheduled' ORDER BY e.id DESC LIMIT 200", (WATCH_EVENT, task_id)).fetchall()
++    for row in rows:
++        other = _json(row[0])
++        if (other.get("adapter"), other.get("scope")) == (rec["adapter"], rec["scope"]) and other.get(
++                "service") in ("ok", "degraded") and float(other.get("observed_at") or 0) >= since:
++            return True
++    return False
++
++
++def _wake_ref_broken(conn: sqlite3.Connection, task_id: str, rec: dict, derived: dict, cmd: str) -> Optional[str]:
++    """What this card waits on cannot be read and that is not the service's doing (a deleted run: 404/410/422, or
++    a failure only this ref has). Wake this card alone, no shared blocker: nobody else is affected."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_wake_check import _wake
++    note = (f"Woken: the {derived['external']['service']} job this card waits on cannot be read "
++            f"({derived['reason']}) and that is this card's ref, not an outage of {rec.get('scope') or 'the service'}"
++            ": no shared blocker is asserted. The run or PR was probably deleted or renamed: re-park on a ref that "
++            "exists, or finish without it.")
++    woke = _wake(conn, task_id, REF_BROKEN, {"adapter": rec["adapter"], "scope": rec.get("scope"),
++                                             "health": derived["health"], "wake_check": cmd or None,
++                                             "detail": rec.get("detail") or "", "note": note})
++    if woke:
++        kb.add_comment(conn, task_id, AUTHOR, note)
++    return woke
++
++
+ def _finished_note(rec: dict, derived: dict) -> str:
+     res = _result(rec, derived)
+     where = f" ({res['url']})" if res.get("url") else ""
+@@ -340,7 +408,7 @@ def note_probe_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any,
+             return None  # a GitHub run/PR park is recorded by the CI sweep's richer adapter
+         poll = shell.poll(rc, out)
+         got = record_poll(conn, task_id, poll, now=now, adapter="shell", scope="", every=every,
+-                          service_name=poll.get("service_name"))
++                          service_name=poll.get("service_name"), rand=0.5)  # a probe runs every ``every``: no jitter
+     except (sqlite3.Error, ValueError, KeyError, TypeError):
+         logger.warning("kanban external watch: could not record the probe result of %s", task_id, exc_info=True)
+         return None
+diff --git a/tests/hermes_cli/test_kanban_ci_progress_pr.py b/tests/hermes_cli/test_kanban_ci_progress_pr.py
+index 4e223a598a..9d32bb3f9b 100644
+--- a/tests/hermes_cli/test_kanban_ci_progress_pr.py
++++ b/tests/hermes_cli/test_kanban_ci_progress_pr.py
+@@ -96,6 +96,11 @@ class Api:
+             raise RuntimeError("gh api exit 1: HTTP 403: Resource not accessible by integration")
+         if "/actions/runs?status=" in path:
+             return {"total_count": 0, "workflow_runs": []}
++        # [external-run cards] the PR adapter's verdict reads the base's required checks: this base requires none
++        if path == f"repos/{REPO}/branches/state":
++            return {"name": "state", "protected": False}
++        if path == f"repos/{REPO}/rules/branches/state":
++            return []
+         raise AssertionError(f"unexpected gh api {path}")
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_external_activity.py b/tests/hermes_cli/test_kanban_external_activity.py
+index 697528d1f4..d84e8a7c3c 100644
+--- a/tests/hermes_cli/test_kanban_external_activity.py
++++ b/tests/hermes_cli/test_kanban_external_activity.py
+@@ -33,9 +33,13 @@ def _rows_for(conn, monkeypatch, pairs, rows):
+ 
+ def test_counts_are_subsets_and_cards_carry_service_status_and_check_times(kanban_home, gh, clock, monkeypatch):
+     with kbc.connect_closing() as conn:
+-        a, b, c = park(conn, 5001), park(conn, 5002), park(conn, 5003)
+-        gh.run_modes = {"5002": "5xx", "5003": "401"}  # b: one failed poll (unknown); c: auth failure (red)
++        a, b = park(conn, 5001), park(conn, 5002)
++        # another repo's credential is refused: the first of its two cards is woken as the blocker's probe, the
++        # other stays parked and red behind it
++        other = [park(conn, n, ref=f"https://github.com/acme/other/actions/runs/{n}") for n in (5003, 5004)]
++        gh.run_modes = {"5002": "5xx", "5003": "401", "5004": "401"}  # b: one failed poll (unknown)
+         tick(conn, gh, clock, 0)
++        (c,) = [t for t in other if helpers.status(conn, t) == "scheduled"]
+         rows = _rows_for(conn, monkeypatch, [("s1", a), ("s1", b), ("s1", c), ("s2", a)],
+                          [{"id": "s1", "kanban_parked": 3}, {"id": "s3", "kanban_parked": 1}])
+         row = rows[0]
+diff --git a/tests/hermes_cli/test_kanban_external_adapters.py b/tests/hermes_cli/test_kanban_external_adapters.py
+index 6f53542576..1b9cf8227b 100644
+--- a/tests/hermes_cli/test_kanban_external_adapters.py
++++ b/tests/hermes_cli/test_kanban_external_adapters.py
+@@ -168,6 +168,9 @@ def _pr(**kw):
+ 
+ 
+ def _pr_poll(monkeypatch, routes, sha=HEAD):
++    # the verdict also reads the base's required checks (none here: an unprotected ``main``)
++    routes = {**routes, f"repos/{REPO}/branches/": {}, f"repos/{REPO}/rules/branches/": []}
++    github._REQUIRED.clear()
+     monkeypatch.setattr(kcp, "_gh_api", _api(routes))
+     return github.poll(f"{REPO}/pull/12@{sha[:12]}", now=NOW)
+ 
+@@ -182,7 +185,8 @@ def test_pr_with_running_checks_is_running(monkeypatch):
+ @pytest.mark.parametrize("conclusions,job", [(["success", "success"], "succeeded"), (["success", "failure"], "failed"),
+                                              (["cancelled"], "cancelled")])
+ def test_pr_with_finished_checks_reports_them(monkeypatch, conclusions, job):
+-    runs = {"workflow_runs": [{"id": i, "status": "completed", "conclusion": c} for i, c in enumerate(conclusions)]}
++    runs = {"workflow_runs": [{"id": i, "status": "completed", "conclusion": c, "workflow_id": i,
++                               "updated_at": _iso(600)} for i, c in enumerate(conclusions)]}
+     got = _pr_poll(monkeypatch, {f"repos/{REPO}/pulls/12": _pr(), f"repos/{REPO}/actions/runs?head_sha": runs})
+     assert got.poll["job"] == job
+ 
+diff --git a/tests/hermes_cli/test_kanban_external_review.py b/tests/hermes_cli/test_kanban_external_review.py
+new file mode 100644
+index 0000000000..a166b2dd0b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_external_review.py
+@@ -0,0 +1,543 @@
++"""External-run cards: the rules review round 1 of PR #3745 found missing. [daveey]
++
++Each test is red on the reviewed head 1de163d286: remote shell probes and the 2-interval rule, staleness of a
++failing record, the auth blocker, per-ref / quota classification, the PR verdict, real cadence with jitter, the
++deadline wake of an external park, a two-database sync and the timeline through the dispatcher's wake tick.
++"""
++from __future__ import annotations
++
++import itertools
++import json
++import sqlite3
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_ci_progress as kcp
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_external_state as ks
++from hermes_cli import kanban_external_watch as kew
++from hermes_cli import kanban_shared_blockers as ksb
++from hermes_cli import kanban_wake_check as kwc
++from hermes_cli.kanban_external_adapters import github as gha
++from tests.hermes_cli import test_kanban_external_watch as helpers
++
++EVERY, REPO, T0 = helpers.EVERY, helpers.REPO, helpers.T0
++events, park, status, tick, url = helpers.events, helpers.park, helpers.status, helpers.tick, helpers.url
++kanban_home, gh, clock = helpers.kanban_home, helpers.gh, helpers.clock
++
++
++@pytest.fixture
++def mono(monkeypatch, clock):
++    """The sweep's spacing clock follows the fake wall clock, so real cadence is what the test sees."""
++    monkeypatch.setattr(kcp, "_mono_now", lambda: clock.now)
++    return clock
++
++
++def sweep(conn, gh):
++    return kcp.sweep(conn, fetch=gh.fetch, fetch_run=gh.fetch_run, fetch_runners=lambda repo: [])
++
++
++def _edit_park(conn, tid, fn):
++    with kb.write_txn(conn):
++        row = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind='scheduled' "
++                           "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++        payload = json.loads(row[1] or "{}")
++        fn(payload)
++        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row[0]))
++
++
++def _sync_as(conn, gateway):
++    conn.execute("CREATE TABLE IF NOT EXISTS kanban_sync_state (gateway_id TEXT NOT NULL)")
++    conn.execute("DELETE FROM kanban_sync_state")
++    conn.execute("INSERT INTO kanban_sync_state (gateway_id) VALUES (?)", (gateway,))
++
++
++def _shell_apply(conn, tid, rc, out, now):
++    st = kwc.get_state(conn, tid)
++    return kwc.apply_result(conn, tid, st["cmd"], rc, out, generation=st["generation"], now=int(now))
++
++
++def _first_states(conn, tid, start, minutes, step=1):
++    first = {}
++    for m in range(0, minutes, step):
++        st = kew.card_state(conn, tid, now=start + m * 60)
++        first.setdefault(st["state"] if st else "grey", m)
++    return first
++
++
++# --- 1: a remote shell probe obeys the 2-interval rule -------------------------------------------------------
++def test_remote_shell_probe_is_unknown_after_one_interval_and_red_after_two(kanban_home):
++    """A worker-run probe (20 of 24 live parks), every=900 s: the home board reads unknown >1x, red >2x."""
++    with kbc.connect_closing() as conn:
++        tid = park(conn, kind="external", ref="a slurm job", wake_check="probe.sh")
++        _edit_park(conn, tid, lambda p: p.update(probe_host="worker-a1"))
++        now = time.time()
++        with kb.write_txn(conn):
++            conn.execute("DELETE FROM task_wake_checks WHERE task_id=?", (tid,))  # the probe runs on worker-a1
++            kb._append_event(conn, tid, kew.WATCH_EVENT, {
++                "adapter": "shell", "scope": "", "host": "worker-a1", "job": "running", "service": "ok",
++                "observed_at": now, "next_due_at": now + 900, "every": 900, "consecutive_failures": 0,
++                "state": "external_running"})
++        first = _first_states(conn, tid, now, 60)
++    assert first["external_running"] == 0
++    assert 15 < first["external_unknown"] <= 19   # >1x every (15 min), within jitter + one tick of grace
++    assert 30 <= first["external_down"] <= 31     # >2x every (30 min)
++
++
++def test_shell_probe_on_a_synced_board_heartbeats_every_interval(kanban_home):
++    """The probe host writes one record per interval (not per check faster than that), so a reader on another
++    gateway has a freshness signal at ``every``."""
++    with kbc.connect_closing() as conn:
++        _sync_as(conn, "worker-a1")
++        tid = park(conn, kind="external", ref="a slurm job", wake_check="probe.sh")
++        t = int(time.time())
++        for i in range(5):  # checks every 900 s
++            assert _shell_apply(conn, tid, 1, "", t + i * 900) is None
++        recs = events(conn, tid, kew.WATCH_EVENT)
++        assert len(recs) == 5 and {r["host"] for r in recs} == {"worker-a1"}
++        assert [round(r["observed_at"] - t) for r in recs] == [0, 900, 1800, 2700, 3600]
++
++
++def test_shell_probe_on_an_unsynced_board_writes_on_change_only(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = park(conn, kind="external", ref="a slurm job", wake_check="probe.sh")
++        t = int(time.time())
++        for i in range(5):
++            _shell_apply(conn, tid, 1, "", t + i * 900)
++        assert len(events(conn, tid, kew.WATCH_EVENT)) == 1
++        assert kew.card_state(conn, tid, now=t + 4 * 900 + 60)["state"] == "external_running"  # last_at is fresh
++
++
++# --- 2: staleness applies to failing records too -------------------------------------------------------------
++@pytest.mark.parametrize("service", ["down", "unreachable", "probe_broken", "rate_limited"])
++def test_one_failed_poll_then_silence_goes_red(service):
++    rec = ks.next_record(None, {"job": "unknown", "service": service, "detail": "x"}, now=T0, every=EVERY,
++                         adapter="github_run", scope="o/r", rand=0.5)
++    assert ks.derive(rec, now=T0 + 0.5 * EVERY, every=EVERY)["state"] == "external_unknown"
++    for k in (3, 10, 1000):
++        got = ks.derive(rec, now=T0 + k * EVERY, every=EVERY)
++        assert (got["state"], got["health"]) == ("external_down", "host_silent"), k
++
++
++def test_one_5xx_then_a_dead_host_is_red_through_the_sweep(kanban_home, gh, clock):
++    with kbc.connect_closing() as conn:
++        tid = park(conn)
++        gh.mode = "5xx"
++        tick(conn, gh, clock, 0)
++        got = [kew.card_state(conn, tid, now=clock.now + k * EVERY)["state"] for k in (0.5, 3, 10)]
++    assert got == ["external_unknown", "external_down", "external_down"]
++
++
++def test_auth_failed_stays_auth_failed_when_stale():
++    rec = ks.next_record(None, {"job": "unknown", "service": "auth_failed"}, now=T0, every=EVERY,
++                         adapter="github_run", scope="o/r", rand=0.5)
++    got = ks.derive(rec, now=T0 + 50 * EVERY, every=EVERY)
++    assert (got["state"], got["health"]) == ("external_down", "auth_failed")
++
++
++def test_a_local_sweep_that_is_behind_reads_unknown_not_host_silent():
++    rec = ks.next_record(None, {"job": "running", "service": "ok"}, now=T0, every=EVERY, adapter="github_run",
++                         scope="o/r", rand=0.5)
++    got = ks.derive(rec, now=T0 + 3 * EVERY, every=EVERY, host_alive=True)
++    assert got["state"] == "external_unknown" and "behind" in got["reason"]
++    assert ks.derive(rec, now=T0 + 3 * EVERY, every=EVERY)["state"] == "external_down"
++    # bounded: a card the live host never reaches is red after BEHIND_MAX intervals
++    assert ks.derive(rec, now=T0 + (ks.BEHIND_MAX + 0.1) * EVERY, every=EVERY, host_alive=True)["state"] == "external_down"
++
++
++def test_more_cards_than_the_sweep_budget_never_read_red(kanban_home, gh, mono, monkeypatch):
++    monkeypatch.setattr(kcp, "MAX_CARDS_PER_SWEEP", 1)
++    seen: dict[str, int] = {}
++    with kbc.connect_closing() as conn:
++        tids = [park(conn, 5000 + i) for i in range(12)]
++        for _ in range(60):
++            mono.set(mono.now + 60)
++            sweep(conn, gh)
++            for t in tids:
++                st = kew.card_state(conn, t, now=mono.now)
++                seen[st["state"]] = seen.get(st["state"], 0) + 1
++    assert "external_down" not in seen and seen.get("external_running", 0) > 0, seen
++
++
++# --- 3: auth_failed asserts the blocker and wakes one probe card ---------------------------------------------
++def test_401_asserts_one_service_down_blocker_and_wakes_one_probe(kanban_home, gh, clock):
++    with kbc.connect_closing() as conn:
++        tids = [park(conn, 6000 + i) for i in range(3)]
++        gh.mode = "401"
++        woken = tick(conn, gh, clock, 0)
++        bid = kew.blocker_id("github_run", REPO)
++        open_ = [k for k, v in ksb.blocker_states(conn).items() if k.startswith("service-down") and v.is_open]
++        assert open_ == [bid]
++        assert len(woken) == 1 and status(conn, woken[0]) == "ready"
++        assert events(conn, woken[0], kew.SERVICE_DOWN)[-1]["health"] == "auth_failed"
++        for t in tids:
++            if t == woken[0]:
++                continue
++            got = kew.card_state(conn, t, now=clock.now + 1)
++            assert (got["state"], got["health"]) == ("external_down", "auth_failed")
++            assert got["external"]["blocker_id"] == bid and got["external"]["triage_card"] == woken[0]
++        assert tick(conn, gh, clock) == []  # the blocker is open: nobody else is woken
++
++
++def test_no_login_on_this_host_is_red_but_wakes_nobody_and_asserts_no_blocker(kanban_home, gh, clock):
++    """``gh`` has no login HERE (exit 4): the host's trouble. Red, the hourly operator warning stays the remedy."""
++    with kbc.connect_closing() as conn:
++        tid = park(conn)
++
++        def no_login(repo, run_id):
++            raise kcp.NoCredential("gh api exit 4: To get started with GitHub CLI, please run: gh auth login")
++        for _ in range(3):
++            clock.set(clock.now + EVERY)
++            kcp._LAST_CHECK.clear()
++            assert kcp.sweep(conn, fetch=no_login, fetch_run=gh.fetch_run, fetch_runners=lambda repo: []) == []
++        got = kew.card_state(conn, tid, now=clock.now + 1)
++        assert (got["state"], got["health"]) == ("external_down", "auth_failed")
++        assert status(conn, tid) == "scheduled"
++        assert not [k for k in ksb.blocker_states(conn) if k.startswith("service-down")]
++
++
++# --- 4: classification ----------------------------------------------------------------------------------------
++@pytest.mark.parametrize("err,health", [
++    ("gh api exit 1: HTTP 404: Not Found (https://api.github.com/repos/x/y/actions/runs/1/jobs)", "probe_broken"),
++    ("gh api exit 1: HTTP 410: Gone", "probe_broken"),
++    ("gh api exit 1: HTTP 422: Unprocessable Entity", "probe_broken"),
++    ("gh api exit 1: HTTP 403: Resource not accessible by integration", "auth_failed"),
++    ("gh api exit 1: HTTP 401: Bad credentials", "auth_failed"),
++    ("GitHub quota guard refused/failed (Denied); inspect local attribution ledger. (exit 75)", "rate_limited"),
++    ("shared GitHub quota brake is on; CI not read this time", "rate_limited"),
++    ("gh api exit 1: HTTP 403: API rate limit exceeded for installation ID 1", "rate_limited"),
++    ("gh api exit 1: HTTP 403: You have exceeded a secondary rate limit", "rate_limited"),
++    ("gh api exit 1: HTTP 429: too many requests retry-after: 60", "rate_limited"),
++    ("gh api exit 1: HTTP 502: Bad Gateway", "down"),
++    ("gh api exit 1: HTTP 503: Service Unavailable", "down"),
++    ("Command 'gh' timed out after 20 seconds", "unreachable"),
++    ("dial tcp: lookup api.github.com: no such host", "unreachable"),
++    ("Expecting value: line 1 column 1 (char 0)", "down"),  # an outage's HTML page: the service, not the ref
++])
++def test_classify(err, health):
++    assert gha.classify(err)[0] == health
++
++
++def test_one_deleted_run_never_blocks_the_repo_and_wakes_only_itself(kanban_home, gh, clock):
++    with kbc.connect_closing() as conn:
++        bad, good = park(conn, 7001), park(conn, 7002)
++        gh.run_modes["7001"] = "404"
++        woken = []
++        for _ in range(3):
++            woken += tick(conn, gh, clock)
++            assert not [k for k in ksb.blocker_states(conn) if k.startswith("service-down")]
++        assert woken == [bad]
++        assert not events(conn, bad, kew.SERVICE_DOWN)
++        assert len(events(conn, bad, kew.REF_BROKEN)) == 1
++        assert kew.card_state(conn, good, now=clock.now + 1)["state"] == "external_running"
++        assert status(conn, good) == "scheduled"
++
++
++def test_a_failure_one_card_has_alone_is_not_a_scope_outage(kanban_home, gh, clock):
++    """Run 7101 answers 5xx while its sibling on the same repo reads fine: no repo-wide blocker."""
++    with kbc.connect_closing() as conn:
++        bad, good = park(conn, 7101), park(conn, 7102)
++        gh.run_modes["7101"] = "5xx"
++        woken = []
++        for _ in range(3):
++            woken += tick(conn, gh, clock)
++        assert not [k for k in ksb.blocker_states(conn) if k.startswith("service-down")]
++        assert woken == [bad] and not events(conn, bad, kew.SERVICE_DOWN)
++        assert events(conn, bad, kew.REF_BROKEN)[0]["health"] == "down"
++        assert status(conn, good) == "scheduled"
++
++
++def test_quota_guard_refusal_is_unknown_never_red(kanban_home, gh, clock):
++    with kbc.connect_closing() as conn:
++        tid = park(conn)
++        gh.mode = "quota"
++        for _ in range(6):
++            assert tick(conn, gh, clock, 700) == []
++            got = kew.card_state(conn, tid, now=clock.now + 1)
++            assert (got["state"], got["health"]) == ("external_unknown", "rate_limited")
++        assert not [k for k in ksb.blocker_states(conn) if k.startswith("service-down")]
++
++
++# --- 5: the PR adapter's verdict ------------------------------------------------------------------------------
++HEAD = "a" * 40
++OLD = "2026-11-20T00:00:00Z"
++
++
++def _api(runs, *, required=None, checks=None, calls=None):
++    def api(path):
++        if calls is not None:
++            calls.append(path)
++        if "/actions/runs?" in path:
++            return {"workflow_runs": runs}
++        if "/check-runs" in path:
++            return {"check_runs": checks or []}
++        if "/rules/branches/" in path:
++            return []
++        if "/branches/" in path:
++            ctx = sorted(required or [])
++            return {"protection": {"enabled": bool(ctx), "required_status_checks": {"contexts": ctx}}}
++        if "/pulls/" in path:
++            return {"state": "open", "merged": False, "mergeable": True, "mergeable_state": "clean",
++                    "head": {"sha": HEAD}, "base": {"ref": "main"}, "updated_at": OLD}
++        return {}
++    return api
++
++
++def _pr(monkeypatch, runs, **kw):
++    api = _api(runs, **kw)
++    monkeypatch.setattr(kcp, "_gh_api", api)
++    gha._REQUIRED.clear()
++    return gha.poll(f"https://github.com/{REPO}/pull/9", "", now=time.time(), api=api).poll
++
++
++def _run(i, status_, conclusion=None, name="Tests", wf=None, updated=OLD):
++    return {"id": i, "status": status_, "conclusion": conclusion, "name": name, "workflow_id": wf or name,
++            "updated_at": updated}
++
++
++def _check(i, name, status_="completed", conclusion="success"):
++    return {"id": i, "name": name, "status": status_, "conclusion": conclusion}
++
++
++def test_pr_superseded_cancelled_run_does_not_decide(monkeypatch):
++    got = _pr(monkeypatch, [_run(1, "completed", "cancelled"), _run(2, "completed", "success")])
++    assert got["job"] == "succeeded"
++    got = _pr(monkeypatch, [_run(2, "completed", "cancelled"), _run(1, "completed", "success")])
++    assert got["job"] == "cancelled"  # the newest run of the workflow is the cancelled one
++
++
++def test_pr_first_workflow_done_while_required_check_is_missing_is_not_terminal(monkeypatch):
++    runs = [_run(1, "completed", "success", name="actionlint")]
++    got = _pr(monkeypatch, runs, required={"All required checks pass (v2)"}, checks=[_check(1, "actionlint")])
++    assert got["job"] in ("queued", "running") and "required" in got["detail"]
++
++
++def test_pr_required_check_decides_the_verdict(monkeypatch):
++    runs = [_run(1, "completed", "success"), _run(2, "in_progress", name="Nightly extras")]
++    req = {"All required checks pass (v2)"}
++    got = _pr(monkeypatch, runs, required=req, checks=[_check(5, "All required checks pass (v2)")])
++    assert got["job"] == "succeeded"  # an optional workflow still running does not hold the verdict
++    got = _pr(monkeypatch, runs, required=req,
++              checks=[_check(5, "All required checks pass (v2)", conclusion="failure")])
++    assert got["job"] == "failed"
++    got = _pr(monkeypatch, runs, required=req,
++              checks=[_check(5, "All required checks pass (v2)", conclusion="failure"),
++                      _check(9, "All required checks pass (v2)", status_="in_progress", conclusion=None)])
++    assert got["job"] == "running"  # a rerun of the required check supersedes its failed attempt
++
++
++def test_pr_without_required_checks_waits_for_the_runs_to_settle(monkeypatch):
++    fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 20))
++    got = _pr(monkeypatch, [_run(1, "completed", "success", name="actionlint", updated=fresh)])
++    assert got["job"] == "running" and "settl" in got["detail"]
++    assert _pr(monkeypatch, [_run(1, "completed", "success", name="actionlint")])["job"] == "succeeded"
++    assert _pr(monkeypatch, [_run(1, "completed", "failure", name="actionlint")])["job"] == "failed"
++
++
++def test_pr_poll_reads_through_the_injected_api_and_stops_at_the_deadline(monkeypatch):
++    calls: list[str] = []
++    api = _api([_run(1, "in_progress")], calls=calls)
++    monkeypatch.setattr(kcp, "_gh_api", _api([_run(1, "in_progress")]))  # pr_progress keeps its own reads
++    gha._REQUIRED.clear()
++    w = gha.poll(f"https://github.com/{REPO}/pull/9", "", now=time.time(), api=api)
++    assert w.poll["job"] == "running" and calls
++    calls.clear()
++    w = gha.poll(f"https://github.com/{REPO}/pull/9", "", now=time.time(), api=api, deadline=time.monotonic() - 1)
++    assert w.poll is None and w.progress.deferred and not calls  # nothing recorded, read first next sweep
++
++
++# --- 7 (case 11): real cadence --------------------------------------------------------------------------------
++def test_case11_polls_are_spaced_every_plus_jitter_within_the_budget_and_stop(kanban_home, gh, mono, monkeypatch):
++    rands = iter([0.0, 1.0, 0.25, 0.75, 0.5] * 400)
++    monkeypatch.setattr(kew, "_rand", lambda: next(rands))
++    polled: dict[str, list[float]] = {}
++    orig = gh.fetch
++
++    def fetch(repo, run_id):
++        polled.setdefault(str(run_id), []).append(mono.now)
++        return orig(repo, run_id)
++    gh.fetch = fetch
++    per_sweep = []
++    with kbc.connect_closing() as conn:
++        tids = {str(3000 + i): park(conn, 3000 + i) for i in range(8)}
++        fast = park(conn, 3999)
++        _edit_park(conn, fast, lambda p: p.update(watch={"every": 5}))  # below the floor
++        for second in range(0, 3600, 5):
++            mono.set(T0 + second)
++            before = sum(len(v) for v in polled.values())
++            sweep(conn, gh)
++            per_sweep.append(sum(len(v) for v in polled.values()) - before)
++            if second == 1800:  # one card leaves ``scheduled``
++                assert kb.claim_task(conn, tids["3000"], claimer="worker") is None
++                with kb.write_txn(conn):
++                    conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tids["3000"],))
++    assert max(per_sweep) <= kcp.MAX_CARDS_PER_SWEEP                      # budget
++    gaps = [b - a for run, ts in polled.items() if run != "3999" for a, b in itertools.pairwise(ts)]
++    assert gaps and min(gaps) >= EVERY * 0.9 - 1e-6 and max(gaps) <= EVERY * 1.1 + 5  # every ± 10 % (5 s ticks)
++    assert max(gaps) - min(gaps) >= EVERY * 0.1                           # the jitter is real, not a constant
++    fast_gaps = [b - a for a, b in itertools.pairwise(polled["3999"])]
++    assert fast_gaps and min(fast_gaps) >= ks.MIN_EVERY                    # never under 120 s
++    assert max(polled["3000"]) <= T0 + 1800                               # none after leaving scheduled
++    assert all(max(ts) > T0 + 3000 for run, ts in polled.items() if run != "3000")
++
++
++def test_case11_next_due_at_is_the_time_the_sweep_really_polls(kanban_home, gh, mono, monkeypatch):
++    monkeypatch.setattr(kew, "_rand", lambda: 1.0)  # +10 %
++    with kbc.connect_closing() as conn:
++        tid = park(conn)
++        sweep(conn, gh)
++        due = events(conn, tid, kew.WATCH_EVENT)[-1]["next_due_at"]
++        assert due == pytest.approx(T0 + EVERY * 1.1)
++        calls = gh.calls
++        mono.set(due - 1)
++        sweep(conn, gh)
++        assert gh.calls == calls
++        mono.set(due)
++        sweep(conn, gh)
++        assert gh.calls > calls
++
++
++# --- 7 (case 13): a ci park's wake_at deadline still wakes ----------------------------------------------------
++def test_case13_external_park_wakes_at_its_deadline_whatever_the_watch_says(kanban_home, gh, clock):
++    from hermes_cli.kanban_continuation import pending_wake, wake_due_continuations
++    with kbc.connect_closing() as conn:
++        deadline = int(time.time()) + 6 * 3600
++        until = time.strftime("SCHEDULED_UNTIL=%Y-%m-%dT%H:%M:%SZ CI of the head", time.gmtime(deadline))
++        tid = park(conn, reason=until)
++        wake_at = pending_wake(conn, tid)["wake_at"]
++        assert abs(wake_at - deadline) <= 1
++        gh.mode = "5xx"            # GitHub is down the whole time: one card is the blocker's probe...
++        other = park(conn, 1002, reason=until)   # ...the other stays parked and red; its deadline still wakes it
++        for _ in range(3):
++            tick(conn, gh, clock)
++        still = [t for t in (tid, other) if status(conn, t) == "scheduled"]
++        assert still and kew.card_state(conn, still[0], now=clock.now + 1)["state"] == "external_down"
++        assert wake_due_continuations(conn, now=wake_at - 60) == []
++        assert set(wake_due_continuations(conn, now=wake_at + 1)) >= set(still)
++        assert status(conn, still[0]) == "ready"
++        assert kew.card_state(conn, still[0], now=clock.now + 1) is None  # no longer parked: no external state
++
++
++# --- 7 (case 14): two databases -------------------------------------------------------------------------------
++def _replicate_events(source, target, tid):
++    """What the Board sync carries for a card: its ``task_events`` rows (ids remapped). ``task_wake_checks`` is
++    machine-local and is never copied."""
++    known = {tuple(r) for r in target.execute("SELECT kind, payload, created_at FROM task_events WHERE task_id=?",
++                                              (tid,))}
++    for row in source.execute("SELECT kind, payload, created_at FROM task_events WHERE task_id=? ORDER BY id",
++                              (tid,)).fetchall():
++        if tuple(row) not in known:
++            target.execute("INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
++                           (tid, *row))
++    target.commit()
++
++
++def test_case14_worker_writes_hub_replica_derives_the_same_state_and_an_old_host_stays_grey(kanban_home, tmp_path):
++    t = int(time.time())
++    with kbc.connect_closing() as hub:
++        _sync_as(hub, "hub")
++        new = park(hub, 1, kind="external", ref="a slurm job", wake_check="probe.sh")
++        old = park(hub, 2, kind="external", ref="another job", wake_check="probe.sh")
++        _edit_park(hub, new, lambda p: p.update(probe_host="worker-a1"))
++        _edit_park(hub, old, lambda p: p.update(probe_host="worker-old"))
++        # the worker's copy of the board: a second database file with its own machine-local probe rows
++        raw = sqlite3.connect(tmp_path / "worker.db")
++        hub.backup(raw)
++        raw.close()
++        worker = kbc.connect(Path(tmp_path / "worker.db"))
++        try:
++            _sync_as(worker, "worker-a1")
++            with kb.write_txn(hub):
++                hub.execute("DELETE FROM task_wake_checks")  # the hub runs neither probe
++            assert kew.card_state(hub, old, now=t + 10) is None       # nothing heard from either host yet: grey
++            assert kew.card_state(hub, new, now=t + 10) is None
++            for i, at in enumerate((t, t + 900, t + 1800)):
++                assert _shell_apply(worker, new, 1, 'HERMES_WATCH {"job": "running", "service_name": "Slurm"}',
++                                    at) is None
++                _replicate_events(worker, hub, new)
++                mine, theirs = kew.card_state(worker, new, now=at + 30), kew.card_state(hub, new, now=at + 30)
++                assert theirs["state"] == mine["state"] == "external_running", i
++                assert theirs["external"] == mine["external"] and theirs["external"]["service"] == "Slurm"
++            # service trouble seen by the worker reads the same on the hub
++            for at in (t + 2700, t + 3600):
++                _shell_apply(worker, new, 1, 'HERMES_WATCH {"job": "running", "service": "down", "detail": "502"}', at)
++                _replicate_events(worker, hub, new)
++            assert kew.card_state(hub, new, now=t + 3630)["state"] == "external_down"
++            assert kew.card_state(hub, new, now=t + 3630)["external"] == kew.card_state(
++                worker, new, now=t + 3630)["external"]
++            _shell_apply(worker, new, 1, 'HERMES_WATCH {"job": "running"}', t + 4500)
++            _replicate_events(worker, hub, new)
++            assert kew.card_state(hub, new, now=t + 4530)["state"] == "external_running"
++            assert len(events(hub, new, kew.RECOVERED_EVENT)) == 1
++            # the worker dies: only the hub's own clock moves
++            assert kew.card_state(hub, new, now=t + 4500 + 1200)["state"] == "external_unknown"
++            got = kew.card_state(hub, new, now=t + 4500 + 1900)
++            assert (got["state"], got["health"]) == ("external_down", "host_silent")
++            # worker-old never advertised external-watch-v1: its silence stays grey, however long
++            assert kew.hosts_seen(hub).keys() == {"worker-a1"}
++            for late in (t + 10 * 900, t + 1000 * 900):
++                assert kew.card_state(hub, old, now=late) is None
++        finally:
++            worker.close()
++
++
++# --- 7: E2E through the dispatcher's wake tick ----------------------------------------------------------------
++def test_e2e_timeline_through_dispatcher_ticks(kanban_home, gh, mono, monkeypatch):
++    """queued -> running -> outage x2 -> recover -> failed, one ``wake_due_continuations`` (the dispatcher's wake
++    step: it starts the due probes and the CI sweep on the probe pool) per 60 s tick, state asserted every tick."""
++    from hermes_cli.kanban_continuation import wake_due_continuations
++
++    monkeypatch.setattr(kew, "_rand", lambda: 0.5)
++    monkeypatch.setattr(kcp, "_fetch_jobs", gh.fetch)
++    monkeypatch.setattr(kcp, "_fetch_runners", lambda repo, labels, deadline=None: [])
++    monkeypatch.setattr(kcp, "_gh_api", lambda path: gh.fetch_run(REPO, path.rsplit("/", 1)[-1]))
++    seen = []
++    with kbc.connect_closing() as conn:
++        tid = park(conn)
++        db = str(kbc._main_db_file(conn))
++        bid = kew.blocker_id("github_run", REPO)
++
++        def dispatcher_tick():
++            mono.set(mono.now + 60)
++            wake_due_continuations(conn, now=int(mono.now))
++            fut = kcp._SWEEPS.get(db)
++            if fut is not None:
++                fut.result(timeout=60)
++            st = kew.card_state(conn, tid, now=mono.now + 1)
++            row = (status(conn, tid), st["state"] if st else None, st["external"]["job"] if st else None,
++                   st["health"] if st else None)
++            seen.append(row)
++            return row
++
++        gh.job = "queued"
++        assert dispatcher_tick() == ("scheduled", "external_running", "queued", "ok")       # tick 1: first poll
++        gh.job = "in_progress"
++        for _ in range(4):                                                                   # ticks 2-5: not due
++            assert dispatcher_tick() == ("scheduled", "external_running", "queued", "ok")
++        assert dispatcher_tick() == ("scheduled", "external_running", "running", "ok")      # tick 6: 300 s later
++        gh.mode = "5xx"
++        for _ in range(4):
++            assert dispatcher_tick() == ("scheduled", "external_running", "running", "ok")
++        assert dispatcher_tick() == ("scheduled", "external_unknown", "unknown", "down")    # outage, poll 1
++        for _ in range(4):
++            assert dispatcher_tick() == ("scheduled", "external_unknown", "unknown", "down")
++        assert dispatcher_tick()[0] == "ready"                                              # outage, poll 2: red
++        assert events(conn, tid, kew.WATCH_EVENT)[-1]["state"] == "external_down"
++        assert ksb.blocker_states(conn)[bid].is_open and len(events(conn, tid, kew.SERVICE_DOWN)) == 1
++        gh.mode = None                       # the woken probe card triages; GitHub is back; it re-parks
++        assert kb.claim_task(conn, tid, claimer="worker") is not None
++        assert kb.schedule_task(conn, tid, reason="back", wake_check="false", check_every=900,
++                                awaiting={"kind": "ci", "ref": url(), "why": "test"})
++        assert dispatcher_tick() == ("scheduled", "external_running", "running", "ok")      # recovered
++        assert not ksb.blocker_states(conn)[bid].is_open
++        gh.job, gh.conclusion = "completed", "failure"
++        for _ in range(4):
++            assert dispatcher_tick() == ("scheduled", "external_running", "running", "ok")
++        assert dispatcher_tick() == ("ready", None, None, None)                             # woken within 1 tick
++        met = events(conn, tid, "condition_met")[-1]
++        assert met["external_result"]["outcome"] == "failed"
++        assert len(events(conn, tid, kew.SERVICE_DOWN)) == 1  # the failed job is a result, not an outage
++    assert not [row for row in seen if row[1] == "external_down" and row[0] == "scheduled"]
+diff --git a/tests/hermes_cli/test_kanban_external_watch.py b/tests/hermes_cli/test_kanban_external_watch.py
+index 11943dba79..e087c8c59c 100644
+--- a/tests/hermes_cli/test_kanban_external_watch.py
++++ b/tests/hermes_cli/test_kanban_external_watch.py
+@@ -62,6 +62,10 @@ class FakeGitHub:
+             raise RuntimeError("gh api exit 1: HTTP 502: Bad Gateway (https://api.github.com/)")
+         if mode == "429":
+             raise RuntimeError("gh api exit 1: HTTP 429: rate limit exceeded retry-after: 700")
++        if mode == "404":
++            raise RuntimeError("gh api exit 1: HTTP 404: Not Found (https://api.github.com/)")
++        if mode == "quota":
++            raise RuntimeError("GitHub quota guard refused/failed (Denied); inspect local attribution ledger.")
+         if mode == "401":
+             raise kcp.NoCredential("gh api exit 1: HTTP 401: Bad credentials")
+         if mode == "timeout":
+@@ -235,14 +239,17 @@ def test_case7_429_never_counts_toward_red_and_honours_retry_after(kanban_home,
+ 
+ 
+ # 8 ---------------------------------------------------------------------------------------------------------
+-def test_case8_401_is_red_at_once_without_waking(kanban_home, gh, clock):
++def test_case8_401_is_red_at_once_and_wakes_one_probe_behind_the_blocker(kanban_home, gh, clock):
+     with kbc.connect_closing() as conn:
+-        tid = park(conn)
++        tid, behind = park(conn), park(conn, 1002)
+         gh.mode = "401"
+-        tick(conn, gh, clock, 0)
+-        got = derived(conn, tid, clock)
++        (woken,) = tick(conn, gh, clock, 0)
++        (parked,) = {tid, behind} - {woken}
++        got = derived(conn, parked, clock)
+         assert (got["state"], got["health"]) == ("external_down", "auth_failed")
+-        assert status(conn, tid) == "scheduled"
++        assert status(conn, parked) == "scheduled" and status(conn, woken) == "ready"
++        assert events(conn, woken, kew.WATCH_EVENT)[-1]["state"] == "external_down"
++        assert ksb.blocker_states(conn)[kew.blocker_id("github_run", REPO)].is_open
+ 
+ 
+ # 9 ---------------------------------------------------------------------------------------------------------
+@@ -315,7 +322,7 @@ def test_case11_declared_every_has_a_floor(kanban_home, gh, clock):
+             payload = json.loads(row[1] or "{}")
+             payload["watch"] = {"every": 5}
+             conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row[0]))
+-        assert kcp._declared_every(conn, tid) == 120
++        assert kcp._cadence(conn, tid, T0)[:2] == (120, 120)
+ 
+ 
+ # 12 --------------------------------------------------------------------------------------------------------
+@@ -347,9 +354,11 @@ def test_case13_a_deadline_park_still_wakes_and_is_not_external(kanban_home):
+ 
+ # 14 --------------------------------------------------------------------------------------------------------
+ def test_case14_old_host_silence_stays_grey_and_an_advertising_host_goes_red(kanban_home, gh, clock):
++    """Shell probes another host runs (a GitHub run is read by every gateway's own sweep, so it is never grey)."""
+     with kbc.connect_closing() as conn:
+-        old, new = park(conn, 4001), park(conn, 4002)
++        old, new = (park(conn, n, kind="external", ref=f"job {n}", wake_check="probe.sh") for n in (4001, 4002))
+         with kb.write_txn(conn):
++            conn.execute("DELETE FROM task_wake_checks")  # neither probe runs on this host
+             for tid, host in ((old, "old-host"), (new, "new-host")):
+                 row = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind='scheduled'",
+                                    (tid,)).fetchone()
+@@ -357,7 +366,7 @@ def test_case14_old_host_silence_stays_grey_and_an_advertising_host_goes_red(kan
+                 payload["probe_host"] = host
+                 conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row[0]))
+             # new-host wrote one watch record at T0 (as a synced event would arrive); old-host never has
+-            kb._append_event(conn, new, kew.WATCH_EVENT, {"adapter": "github_run", "scope": REPO, "host": "new-host",
++            kb._append_event(conn, new, kew.WATCH_EVENT, {"adapter": "shell", "scope": "", "host": "new-host",
+                                                           "job": "running", "service": "ok", "observed_at": T0,
+                                                           "next_due_at": T0 + EVERY, "every": EVERY,
+                                                           "consecutive_failures": 0})
+-- 
+2.43.0
+

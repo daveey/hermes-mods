@@ -1,0 +1,304 @@
+From 4131cd3fbc57fa8d9719b47d50ccf9ab3a9a4305 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:12:51 -0800
+Subject: [PATCH] fix(tui): review fixes for the build-time quota wall card
+ [daveey]
+
+Independent review of #3846 (REQUEST_CHANGES), all findings addressed:
+- quota_refusal_wall names only one route's own refusal: a ProviderFallbackError gives None (real chains
+  list the pin then configured fallbacks; a mixed chain's cause may not be a quota), so no fallback is
+  called "pinned" and a primary's credential error keeps its generic message. Provider/model as the
+  refusal gives them, matching held_reply.
+- A build start drops an earlier build's failure_route, so a later abandoned/timed-out build or a later
+  route_refused frame never reuses a stale wall; the route is recorded after agent_error, guarded.
+- turn_error_text: a route_refused descriptor carrying `message` reads as that sentence alone (no repeated
+  /model hint), like the gateway path's final_response.
+- The surface is built with agent.error_surface._surface (provider, model, provider_label) + message.
+
+Tests (RED on the pre-review source, GREEN after): fallback chains (mixed, all walled), stale route cleared
+on a new build, own-sentence turn text, malformed route record keeps the generic card.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/model_routing_unavailable.py            | 22 ++++----
+ .../route-refused-completion.test.tsx         | 17 +++---
+ .../test_agent_init_quota_wall_card.py        | 52 ++++++++++++++++---
+ tui_gateway/methods_prompt.py                 |  8 +--
+ tui_gateway/session_registry.py               | 25 ++++++---
+ tui_gateway/user_messages.py                  | 10 +++-
+ 6 files changed, 101 insertions(+), 33 deletions(-)
+
+diff --git a/agent/model_routing_unavailable.py b/agent/model_routing_unavailable.py
+index c5763f5070..1957254ece 100644
+--- a/agent/model_routing_unavailable.py
++++ b/agent/model_routing_unavailable.py
+@@ -242,21 +242,23 @@ def quota_refusal_route(exc):
+ 
+ 
+ def quota_refusal_wall(exc):
+-    """``(provider, model, resets_at)`` when *exc*'s cause chain ends in a quota refusal that names its
+-    route (``quota_refusal_route``) and carries a finite absolute ``resets_at``, else None.
++    """``(provider, model, resets_at)`` when *exc*'s cause chain ends in one route's own quota refusal (the
++    routing pool's ``SubscriptionQuotaUnavailable``, a pinned route's wall) naming its route and a finite
++    absolute ``resets_at``, else None.
+ 
+-    For a fallback chain the reset is the terminal (last-tried) route's own. A ``retry_after`` hint is
+-    not an absolute reset and gives None. Typed only, like ``quota_refusal_route``."""
++    A fallback chain gives None: its routes are the pin plus configured fallbacks, so no one route and reset
++    describes it (a mixed chain's real cause may not be a quota at all). A ``retry_after`` hint is not an
++    absolute reset. The names are as the refusal gives them, like ``model_routing_walls.held_reply``."""
+     from hermes_cli.fallback_errors import ProviderFallbackError
+ 
+-    route = quota_refusal_route(exc)
+-    if route is None:
+-        return None
+     error = _terminal_refusal(exc)
+-    if isinstance(error, ProviderFallbackError):
+-        error = _terminal_refusal(error.failures[-1][2])
++    if error is None or isinstance(error, ProviderFallbackError) or not _is_quota_type(error):
++        return None
++    provider, model = getattr(error, "provider", None), getattr(error, "model", None)
+     reset = _finite_positive(getattr(error, "resets_at", None))
+-    return None if reset is None else (*route, reset)
++    if reset is None or not all(isinstance(v, str) and v.strip() for v in (provider, model)):
++        return None
++    return provider.strip(), model.strip(), reset
+ 
+ 
+ def is_quota_failure(exc):
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/route-refused-completion.test.tsx b/apps/desktop/src/app/session/hooks/use-message-stream/route-refused-completion.test.tsx
+index 761887cc39..8e141b618d 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/route-refused-completion.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/route-refused-completion.test.tsx
+@@ -65,16 +65,21 @@ describe('a pinned route refused before the turn (route_refused)', () => {
+   })
+ 
+   it('shows the same card when the agent build itself hit the wall (tui_gateway agent_init path)', async () => {
+-    // tui_gateway/methods_prompt.py `_agent_init_failure_surface`: no failure_reason, the turn text is
+-    // turn_error_text(), and the descriptor carries the held sentence as `message`.
++    // tui_gateway/methods_prompt.py `_agent_init_failure_surface`: no failure_reason, and the turn text and
++    // the descriptor's `message` are both the held sentence.
+     const bubble = await failTurn({
+       failure_reason: undefined,
+       error: HELD,
+       reset_at: 1794981540,
+-      text:
+-        "This chat's model is unavailable. Your message was not answered.\n" +
+-        `Details: ${HELD}\nUse /model to switch, or resend after the reset.`,
+-      error_surface: { layer: 'gateway', code: 'route_refused', retryable: false, message: HELD }
++      text: HELD,
++      error_surface: {
++        layer: 'gateway',
++        code: 'route_refused',
++        retryable: false,
++        provider: 'openai-codex',
++        model: 'gpt-6-astra',
++        message: HELD
++      }
+     })
+ 
+     const card = errorCardText(thread, bubble?.errorSurface)
+diff --git a/tests/tui_gateway/test_agent_init_quota_wall_card.py b/tests/tui_gateway/test_agent_init_quota_wall_card.py
+index 2f0d7671cb..30c9bb05cf 100644
+--- a/tests/tui_gateway/test_agent_init_quota_wall_card.py
++++ b/tests/tui_gateway/test_agent_init_quota_wall_card.py
+@@ -43,11 +43,27 @@ def test_walled_build_message_names_the_reset_in_pt_and_model_not_an_epoch_or_se
+     assert "1795216785" not in message and "hermes setup" not in message
+ 
+ 
+-def test_walled_build_behind_a_fallback_chain_names_the_terminal_route():
++@pytest.mark.parametrize("primary", [
++    RuntimeError("No LLM provider configured"),  # mixed chain: the real cause is not a quota
++    SubscriptionQuotaUnavailable("anthropic", "claude-fable-5-2", RESET),  # every route walled
++], ids=["mixed", "all-walled"])
++def test_a_fallback_chain_is_not_named_as_one_walled_pin(primary):
++    """Real chains list the pin first, then configured fallbacks: no one route and reset describes them."""
+     from hermes_cli.fallback_errors import ProviderFallbackError
+     from tui_gateway.user_messages import agent_init_failed_message
+-    chain = ProviderFallbackError([("anthropic", "claude-fable-5-2", _wall())])
+-    assert agent_init_failed_message(chain) == HELD
++    chain = ProviderFallbackError([("anthropic", "claude-fable-5-2", primary),
++                                   ("openai-codex", "gpt-6", SubscriptionQuotaUnavailable("openai-codex", "gpt-6", RESET + 86400))])
++    message = agent_init_failed_message(chain)
++    assert message.startswith("Hermes could not start the assistant for this session. Details: ")
++    assert "pinned to it" not in message
++
++
++def test_turn_text_for_an_own_sentence_code_is_that_sentence():
++    from tui_gateway.user_messages import turn_error_text
++    surface = {"layer": "gateway", "code": "route_refused", "retryable": False, "message": HELD}
++    assert turn_error_text("raw detail", surface) == HELD
++    # Without the sentence it keeps the title/detail/hint shape, with route_refused's own title.
++    assert turn_error_text("raw detail", {**surface, "message": ""}).startswith("This chat's model is unavailable.")
+ 
+ 
+ @pytest.mark.parametrize("exc", [
+@@ -80,6 +96,20 @@ def test_walled_build_records_its_route_and_never_sends_it(tmp_path, monkeypatch
+     assert "failure_route" not in data and "failure_resets_at" not in data
+ 
+ 
++def test_a_new_build_clears_an_earlier_builds_route(tmp_path, monkeypatch):
++    """A route recorded by an earlier failed build never labels a later build's failure (here: abandoned)."""
++    from tests.tui_gateway.test_provider_not_configured_code import _fail_build, _run_build
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    session = _fail_build(monkeypatch, RuntimeError("unused"))
++    monkeypatch.setattr(server, "_await_resume_history", lambda *a, **kw: False)
++    monkeypatch.setattr(server, "write_json", lambda frame: True)
++    session["agent_failure"] = {"failure_resets_at": RESET,
++                                "failure_route": {"provider": "anthropic", "model": "claude-fable-5-2", "resets_at": RESET}}
++    _run_build(session)
++    assert session["agent_error"] == server.AGENT_BUILD_ABANDONED
++    assert "failure_route" not in session["agent_failure"]
++
++
+ def test_unrelated_build_failure_records_no_route(tmp_path, monkeypatch):
+     from tests.tui_gateway.test_credential_failure import _strict_build
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+@@ -128,13 +158,14 @@ def test_walled_build_turn_closes_with_the_route_refused_card_and_no_send_it_aga
+     failure = {"failure_resets_at": RESET,
+                "failure_route": {"provider": "anthropic", "model": "claude-fable-5-2", "resets_at": RESET}}
+     complete, rows = _turn_on_failed_build(monkeypatch, tmp_path, failure, str(_wall()))
+-    expected = {"layer": "gateway", "code": "route_refused", "retryable": False, "message": HELD}
++    expected = {"layer": "gateway", "code": "route_refused", "retryable": False, "message": HELD,
++                "provider": "anthropic", "model": "claude-fable-5-2"}
+ 
+     (payload,) = complete
+     assert payload["status"] == "error"
+-    assert payload["error_surface"] == expected
++    assert expected.items() <= payload["error_surface"].items()
+     assert payload["error"] == HELD
+-    assert "1795216785" not in payload["text"] and "/model" in payload["text"]
++    assert payload["text"] == HELD
+     assert "failure_route" not in payload and "failure_resets_at" not in payload
+     assert payload["reset_at"] == RESET
+ 
+@@ -142,7 +173,14 @@ def test_walled_build_turn_closes_with_the_route_refused_card_and_no_send_it_aga
+     boundary = rows[-1]
+     assert boundary["display_kind"] == FAILED_TURN_DISPLAY_KIND
+     assert "Send it again" not in boundary["content"]
+-    assert _metadata(boundary)["error_surface"] == expected
++    assert _metadata(boundary)["error_surface"] == payload["error_surface"]
++
++
++def test_malformed_route_record_keeps_the_generic_card(monkeypatch, tmp_path):
++    complete, _rows = _turn_on_failed_build(
++        monkeypatch, tmp_path, {"failure_route": {"provider": "anthropic"}}, str(_wall()))
++    (payload,) = complete
++    assert payload["error_surface"] == {"layer": "runtime", "code": "agent_init_failed", "retryable": True}
+ 
+ 
+ def test_control_other_build_failure_keeps_agent_init_failed(monkeypatch, tmp_path):
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index 8a1823baff..0e37854025 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -682,14 +682,15 @@ def _agent_init_failure_surface(session: dict, message: str) -> tuple[str, dict,
+     route = failure.get("failure_route") if isinstance(failure, dict) else None
+     if isinstance(route, dict):
+         try:
++            from agent.error_surface import _surface
+             from agent.model_routing_walls import walled_pin_reply
+             reply = walled_pin_reply(route["provider"], route["model"], route["resets_at"])
++            surface = _surface("gateway", "route_refused", False, route["provider"], route["model"])
+         except Exception:  # health: allow BLE001 -- a malformed record keeps the generic card
+             logger.warning("prompt.submit: unusable failure_route %r", route, exc_info=True)
+         else:
+             from agent.turn_failure_copy import ROUTE_REFUSED_TURN_NOTICE
+-            return reply, {"layer": "gateway", "code": "route_refused", "retryable": False,
+-                           "message": reply}, ROUTE_REFUSED_TURN_NOTICE
++            return reply, {**surface, "message": reply}, ROUTE_REFUSED_TURN_NOTICE
+     return message, {"layer": "runtime", "code": "agent_init_failed", "retryable": True}, None
+ 
+ 
+@@ -716,7 +717,8 @@ def _close_agent_init_failed_turn(
+             if db is None or db.latest_conversation_role(sid) not in OPEN_TURN_TAIL_ROLES:
+                 return
+             error = redact_sensitive_text(str(message or "").strip()[:2000], force=True)
+-            row = {"role": "assistant", "content": notice or FAILED_TURN_NOTICE, "display_kind": FAILED_TURN_DISPLAY_KIND,
++            row = {"role": "assistant", "content": notice or FAILED_TURN_NOTICE,
++                   "display_kind": FAILED_TURN_DISPLAY_KIND,
+                    "display_metadata": {k: v for k, v in (("error", error), ("error_surface", error_surface)) if v}}
+             try:
+                 db.append_message(sid, **row)
+diff --git a/tui_gateway/session_registry.py b/tui_gateway/session_registry.py
+index 552e0ff9da..91671437cd 100644
+--- a/tui_gateway/session_registry.py
++++ b/tui_gateway/session_registry.py
+@@ -229,6 +229,21 @@ def _finish_agent_build(sid: str, key: str, current: dict, *, notify_registered:
+             session_db.close()
+ 
+ 
++def _record_failure_route(failure: dict, error: BaseException) -> None:
++    """[daveey] The pinned route whose own quota wall refused the build, with that wall's reset: the turn waiting
++    on it closes as a route refusal (``methods_prompt._agent_init_failure_surface``). Server-side only, like
++    ``failure_resets_at`` (``credential_failure.client_failure_fields`` drops it); cleared when a build starts."""
++    try:
++        from agent.model_routing_unavailable import quota_refusal_wall
++        wall = quota_refusal_wall(error)
++    except Exception:  # health: allow BLE001 -- the generic init-failure card still goes out
++        logger.warning("agent build: could not read the quota wall of %r", error, exc_info=True)
++        return
++    if wall is not None:
++        provider, model, resets_at = wall
++        failure["failure_route"] = {"provider": provider, "model": model, "resets_at": resets_at}
++
++
+ def _start_agent_build(sid: str, session: dict) -> None:
+     """Start building the real AIAgent for a TUI session, once. Deferred until the first prompt (or any
+     command needing the agent) so the composer isn't blocked on tool discovery / model metadata;
+@@ -246,6 +261,9 @@ def _start_agent_build(sid: str, session: dict) -> None:
+             return
+         session["agent_build_started"] = True
+         session.pop("lazy", None)  # now genuinely mid-construction: restore the "still starting" eviction exemption
++        # [daveey] A wall recorded by an earlier failed build says nothing about this one (``_record_failure_route``).
++        if isinstance(failure := session.get("agent_failure"), dict):
++            failure.pop("failure_route", None)
+     key = session["session_key"]
+ 
+     def _build() -> None:
+@@ -306,13 +324,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
+             if (isinstance(resets_at, (int, float)) and not isinstance(resets_at, bool)
+                     and "failure_resets_at" not in current["agent_failure"]):
+                 current["agent_failure"]["failure_resets_at"] = float(resets_at)
+-            # [daveey] The pinned route whose quota wall refused the build, with that wall's reset: the turn waiting
+-            # on it closes as a route refusal (``methods_prompt._run_after_agent_ready``). Server-side only, like
+-            # failure_resets_at (``credential_failure.client_failure_fields`` drops it).
+-            from agent.model_routing_unavailable import quota_refusal_wall
+-            if (wall := quota_refusal_wall(e)) is not None:
+-                current["agent_failure"]["failure_route"] = dict(zip(("provider", "model", "resets_at"), wall))
+             current["agent_error"] = str(e)
++            _record_failure_route(current["agent_failure"], e)
+             # Logged: a failed build otherwise leaves no trace, so a prompt waiting on it reads in agent.log as
+             # a message that "never ran" (the client only got an event, which a disconnect can lose). [daveey]
+             from tui_gateway.build_diagnostics import log_build_failure
+diff --git a/tui_gateway/user_messages.py b/tui_gateway/user_messages.py
+index cadcb5c6b3..2c4f6949f0 100644
+--- a/tui_gateway/user_messages.py
++++ b/tui_gateway/user_messages.py
+@@ -68,6 +68,10 @@ _TURN_ERROR_NO_RETRY_HINT: dict[str, str] = {
+                                   "Local models), or switch with /model."),
+ }
+ 
++# [daveey] Codes whose descriptor ``message`` is already the whole user-facing sentence (what happened, the reset,
++# /model): it is the turn text, as on the gateway path (``agent/error_surface.py`` ``_OWN_SENTENCE_REASONS``).
++_OWN_SENTENCE_CODES = {"route_refused"}
++
+ _TURN_ERROR_DEFAULT = ("The request failed", "Send /retry, or switch with /model.")
+ 
+ _DETAIL_LIMIT = 400
+@@ -98,7 +102,11 @@ def turn_error_hint(surface: dict | None, recoverable: bool = True) -> str:
+ 
+ def turn_error_text(error: Any, surface: dict | None = None, *, recoverable: bool = True) -> str:
+     """The assistant-slot text for a turn that produced no reply: title, what it means for the
+-    user, the raw provider detail on its own dimmed-able line, and the next step."""
++    user, the raw provider detail on its own dimmed-able line, and the next step. A code in
++    ``_OWN_SENTENCE_CODES`` whose descriptor carries ``message`` reads as that sentence alone."""
++    if isinstance(surface, dict) and surface.get("code") in _OWN_SENTENCE_CODES:
++        if isinstance(own := surface.get("message"), str) and own.strip():
++            return own.strip()
+     detail = " ".join(str(error or "").split())
+     if len(detail) > _DETAIL_LIMIT:
+         detail = detail[:_DETAIL_LIMIT - 1] + "…"
+-- 
+2.43.0
+

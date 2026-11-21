@@ -1,0 +1,779 @@
+From 3264b97a41927cf1d0f0e5d5182e08e069b572b8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 04:42:16 +0000
+Subject: [PATCH] feat(kanban): lanes flow JSON, split landing steps, daily
+ lane caps [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Why: the lanes factory board needs one JSON for every open card's
+step/reason/source and per-lane throughput, plus daily admission and
+spend caps that hold new cards at the gate instead of guessing.
+
+What:
+- `hermes kanban lanes flow --json [--window 1h|6h|24h|7d]`
+- steps intake/waiting/ready/running/review/ci/merge/deploy/test/done;
+  unplaceable landing → landing_unclassified
+- per-lane cards_per_day and usd_per_day (unset = unlimited), set via
+  `lanes set`, reset at local midnight, reasons limit:cards_per_day /
+  limit:usd_per_day
+
+Proof: tests/hermes_cli/test_kanban_lanes_flow.py 33 passed;
+test_kanban_lanes.py 41, test_kanban_lanes_plan.py 16,
+test_kanban_lanes_tool_create.py 3, test_kanban_lane_order.py 13,
+test_docs_drift.py 3; scripts/check --only health --base origin/main ok.
+Live fleet replica snapshot: 145 open cards, 5 lanes.
+---
+ hermes_cli/kanban_lanes.py                 |  72 +++++-
+ hermes_cli/kanban_lanes_cli.py             |  36 ++-
+ hermes_cli/kanban_lanes_flow.py            | 283 +++++++++++++++++++++
+ hermes_cli/kanban_parser.py                |   7 +-
+ tests/hermes_cli/test_kanban_lanes_flow.py | 166 ++++++++++++
+ website/docs/user-guide/configuration.md   |   2 +-
+ website/docs/user-guide/features/kanban.md |   4 +-
+ 7 files changed, 557 insertions(+), 13 deletions(-)
+ create mode 100644 hermes_cli/kanban_lanes_flow.py
+ create mode 100644 tests/hermes_cli/test_kanban_lanes_flow.py
+
+diff --git a/hermes_cli/kanban_lanes.py b/hermes_cli/kanban_lanes.py
+index 210f560c15..eca29428d7 100644
+--- a/hermes_cli/kanban_lanes.py
++++ b/hermes_cli/kanban_lanes.py
+@@ -13,6 +13,8 @@ A card's lane is ``tasks.tenant``. ``kanban.admission.lanes`` in the installatio
+             share: 20
+             gated: true              # cards filed by other cards or by detectors start held in triage
+             admit_per_day: 50
++            cards_per_day: 50        # optional; new cards wait at the gate once today's admissions hit it
++            usd_per_day: 40          # optional; new cards wait at the gate once today's run spend hits it
+             match: {creators: [self-heal], key_prefixes: ["ci-main-watch:"], repos: [hermes-agent], self_work: true}
+             gate_exempt: ['independent review']   # title regexes that skip the gate under an admitted creator
+             never_admit: ['lifecycle guard']      # title regexes the planner may never admit
+@@ -76,6 +78,8 @@ class Lane:
+     share: float = 0
+     gated: bool = False
+     admit_per_day: Optional[int] = None
++    cards_per_day: Optional[int] = None
++    usd_per_day: Optional[float] = None
+     paused: bool = False
+     describe: str = ""
+     creators: frozenset = frozenset()
+@@ -105,6 +109,7 @@ class Decision:
+     gated: bool = False
+     cap: Optional[int] = None
+     would_gate: bool = False
++    gate_reason: Optional[str] = None
+ 
+     def priority(self, value: int) -> int:
+         from hermes_cli.kanban_priority import bounded
+@@ -134,7 +139,8 @@ def _lane(name, raw) -> Lane:
+     raw = {} if raw is None else raw
+     if not isinstance(raw, dict):
+         raise ValueError(f"lane {name} must be a mapping")
+-    known = {"share", "gated", "admit_per_day", "paused", "describe", "match", "gate_exempt", "never_admit"}
++    known = {"share", "gated", "admit_per_day", "cards_per_day", "usd_per_day", "paused", "describe",
++             "match", "gate_exempt", "never_admit"}
+     if unknown := sorted(set(raw) - known):
+         raise ValueError(f"lane {name}: unknown key(s) {', '.join(map(str, unknown))}")
+     share = raw.get("share", 0)
+@@ -143,11 +149,20 @@ def _lane(name, raw) -> Lane:
+     per_day = raw.get("admit_per_day")
+     if per_day is not None and (type(per_day) is not int or per_day < 0):
+         raise ValueError(f"lane {name}: admit_per_day must be a nonnegative integer")
++    cards_per_day = raw.get("cards_per_day")
++    if cards_per_day is not None and (type(cards_per_day) is not int or cards_per_day < 0):
++        raise ValueError(f"lane {name}: cards_per_day must be a nonnegative integer")
++    usd_per_day = raw.get("usd_per_day")
++    if usd_per_day is not None and (type(usd_per_day) not in (int, float) or not math.isfinite(usd_per_day)
++                                    or usd_per_day < 0):
++        raise ValueError(f"lane {name}: usd_per_day must be a finite nonnegative number")
+     match = raw.get("match") or {}
+     if not isinstance(match, dict) or set(match) - {"creators", "key_prefixes", "repos", "self_work"}:
+         raise ValueError(f"lane {name}: match takes creators, key_prefixes, repos, self_work")
+     return Lane(
+         name=name, share=float(share), gated=raw.get("gated") is True, admit_per_day=per_day,
++        cards_per_day=cards_per_day,
++        usd_per_day=None if usd_per_day is None else float(usd_per_day),
+         paused=raw.get("paused") is True, describe=str(raw.get("describe") or ""),
+         creators=frozenset(_strings(match.get("creators"), "match.creators")),
+         key_prefixes=_strings(match.get("key_prefixes"), "match.key_prefixes"),
+@@ -391,11 +406,15 @@ def initial_state(conn, parents, initial_status, triage, tenant, opts) -> tuple[
+     if pol is None:
+         return status, inherited, Decision()
+     lane, source = _classify(conn, pol, tenant, inherited, opts)
+-    gated = status in ("ready", "todo") and _gated(conn, pol, lane, opts)
++    startable = status in ("ready", "todo")
++    gated = startable and _gated(conn, pol, lane, opts)
++    limit_reason = _daily_limit_reason(conn, pol, lane, opts) if startable and not pol.shadow else None
++    if limit_reason:
++        gated = True
+     if pol.shadow:
+         return status, lane, Decision(lane, source, would_gate=gated)
+     cap = None if _by_user(opts) else pol.priority_cap
+-    return ("triage" if gated else status), lane, Decision(lane, source, gated, cap, gated)
++    return ("triage" if gated else status), lane, Decision(lane, source, gated, cap, gated, limit_reason)
+ 
+ 
+ def record(conn, task_id: str, decision: Optional[Decision]) -> None:
+@@ -410,7 +429,10 @@ def record(conn, task_id: str, decision: Optional[Decision]) -> None:
+         _append_event(conn, task_id, UNCLASSIFIED, {"lane": decision.lane})
+     if decision.gated:
+         conn.execute("UPDATE tasks SET block_kind = ? WHERE id = ?", (GATE_KIND, task_id))
+-        _append_event(conn, task_id, GATED, {"lane": decision.lane})
++        payload = {"lane": decision.lane}
++        if decision.gate_reason:
++            payload["reason"] = decision.gate_reason
++        _append_event(conn, task_id, GATED, payload)
+ 
+ 
+ # ── moves after creation ────────────────────────────────────────────────────
+@@ -455,6 +477,48 @@ def admitted_today(conn, lane: str, *, now: Optional[float] = None) -> int:
+         (ADMITTED, day_start(now), lane)).fetchone()[0]
+ 
+ 
++def cards_today(conn, lane: str, *, now: Optional[float] = None) -> int:
++    """Distinct cards that passed the lane gate (or never waited) since local midnight, plus budgeted admits."""
++    start = day_start(now)
++    passed = conn.execute(
++        "SELECT COUNT(DISTINCT task_id) FROM task_events WHERE kind = ? AND created_at >= ? "
++        "AND json_extract(payload, '$.lane') = ? AND COALESCE(json_extract(payload, '$.would_gate'), 0) = 0",
++        (ASSIGNED, start, lane)).fetchone()[0]
++    return int(passed) + admitted_today(conn, lane, now=now)
++
++
++def spent_today(conn, pol: Policy, lane: str, *, now: Optional[float] = None) -> float:
++    """Run spend charged to ``lane`` since local midnight (same receipts ``usage`` uses)."""
++    start = day_start(now)
++    total = 0.0
++    for tenant, cost in conn.execute(
++            "SELECT tenant, SUM(cost) FROM ("
++            "SELECT t.tenant AS tenant, MAX(COALESCE(json_extract(e.payload, '$.usage.cost_usd'), 0)) AS cost "
++            "FROM task_events e JOIN tasks t ON t.id = e.task_id WHERE e.kind = 'worker_result' "
++            "AND e.created_at >= ? AND json_extract(e.payload, '$.usage') IS NOT NULL "
++            "GROUP BY e.task_id, e.run_id) GROUP BY tenant", (start,)):
++        if pol.lane_of(tenant) == lane:
++            total += float(cost or 0)
++    return round(total, 2)
++
++
++def _daily_limit_reason(conn, pol: Policy, lane_name: str, opts: dict) -> Optional[str]:
++    """``limit:usd_per_day`` / ``limit:cards_per_day`` when a new startable card must wait; else None."""
++    from hermes_cli.kanban_admission_score import _alarm_key
++
++    if opts.get("created_by") in RECOVERY_CREATORS or opts.get("admission_class") == "urgent":
++        return None
++    if _alarm_key(opts.get("idempotency_key")):
++        return None
++    lane = pol.lanes[pol.lane_of(lane_name)]
++    now = time.time()
++    if lane.usd_per_day is not None and spent_today(conn, pol, lane.name, now=now) >= lane.usd_per_day:
++        return "limit:usd_per_day"
++    if lane.cards_per_day is not None and cards_today(conn, lane.name, now=now) >= lane.cards_per_day:
++        return "limit:cards_per_day"
++    return None
++
++
+ def admit(conn, task_id: str, *, actor: str, reason: str, budget: bool = True) -> bool:
+     """Release a gate-held card to ``ready`` (``todo`` while a parent is open). False when it is not held."""
+     from hermes_cli import kanban_db as kb
+diff --git a/hermes_cli/kanban_lanes_cli.py b/hermes_cli/kanban_lanes_cli.py
+index 2d0c123b5f..af5532bf32 100644
+--- a/hermes_cli/kanban_lanes_cli.py
++++ b/hermes_cli/kanban_lanes_cli.py
+@@ -145,8 +145,9 @@ def _pin(args) -> int:
+     return 0
+ 
+ 
+-def set_lane(lane: str, *, share=None, admit_per_day=None, paused=None) -> None:
+-    """Change one lane's share, daily admit budget or pause state; raises ValueError.
++def set_lane(lane: str, *, share=None, admit_per_day=None, cards_per_day=None, usd_per_day=None,
++             paused=None) -> None:
++    """Change one lane's share, daily admit/cards/spend budget or pause state; raises ValueError.
+ 
+     Written to the installation-root ``config.yaml``, the file the policy is read from, whatever profile the
+     caller runs under: a profile's own config never holds lanes.
+@@ -167,12 +168,18 @@ def set_lane(lane: str, *, share=None, admit_per_day=None, paused=None) -> None:
+         raise ValueError("share must be a finite nonnegative number")
+     if admit_per_day is not None and (type(admit_per_day) is not int or admit_per_day < 0):
+         raise ValueError("admit_per_day must be a nonnegative integer")
++    if cards_per_day is not None and (type(cards_per_day) is not int or cards_per_day < 0):
++        raise ValueError("cards_per_day must be a nonnegative integer")
++    if usd_per_day is not None and (type(usd_per_day) not in (int, float) or not math.isfinite(usd_per_day)
++                                    or usd_per_day < 0):
++        raise ValueError("usd_per_day must be a finite nonnegative number")
+     if paused is not None and type(paused) is not bool:
+         raise ValueError("paused must be true or false")
+-    changes = {"share": share, "admit_per_day": admit_per_day, "paused": paused}
++    changes = {"share": share, "admit_per_day": admit_per_day, "cards_per_day": cards_per_day,
++               "usd_per_day": usd_per_day, "paused": paused}
+     changes = {key: value for key, value in changes.items() if value is not None}
+     if not changes:
+-        raise ValueError("nothing to set: give a share, a daily admit budget, pause or resume")
++        raise ValueError("nothing to set: give a share, a daily admit/cards/spend budget, pause or resume")
+     path = Path(get_default_hermes_root()) / "config.yaml"
+     doc = copy.deepcopy(read_config_doc_readonly(path))
+     spec = doc["kanban"]["admission"]["lanes"]
+@@ -185,10 +192,27 @@ def set_lane(lane: str, *, share=None, admit_per_day=None, paused=None) -> None:
+ 
+ def _set(args) -> int:
+     set_lane(args.lane, share=args.share, admit_per_day=args.admit_per_day,
++             cards_per_day=getattr(args, "cards_per_day", None),
++             usd_per_day=getattr(args, "usd_per_day", None),
+              paused=True if args.pause else False if args.resume else None)
+     return 0
+ 
+ 
++def _flow(args) -> int:
++    from hermes_cli import kanban_lanes_flow as flow
++
++    with kbc.connect_closing() as conn:
++        replica = _fleet(conn, local=False)
++        try:
++            data = flow.snapshot(replica or conn, window=args.window)
++        finally:
++            if replica is not None:
++                replica.close()
++    if not _json_out(args, data):
++        print(json.dumps(data, indent=2))
++    return 0
++
++
+ def _apply(args) -> int:
+     from hermes_cli import kanban_lanes_plan as plan
+ 
+@@ -232,8 +256,8 @@ def _explain(args) -> int:
+     return 0
+ 
+ 
+-_ACTIONS = {None: _show, "show": _show, "held": _held, "unclassified": _unclassified, "assign": _assign,
+-            "admit": _admit, "pin": _pin, "set": _set, "apply": _apply, "explain": _explain}
++_ACTIONS = {None: _show, "show": _show, "flow": _flow, "held": _held, "unclassified": _unclassified,
++            "assign": _assign, "admit": _admit, "pin": _pin, "set": _set, "apply": _apply, "explain": _explain}
+ 
+ 
+ def command(args: argparse.Namespace) -> int:
+diff --git a/hermes_cli/kanban_lanes_flow.py b/hermes_cli/kanban_lanes_flow.py
+new file mode 100644
+index 0000000000..ab3b3e5f5d
+--- /dev/null
++++ b/hermes_cli/kanban_lanes_flow.py
+@@ -0,0 +1,283 @@
++"""Open-card flow for ``hermes kanban lanes flow --json``. [daveey]
++
++Steps are derived from status, card events and an explicit PR snapshot. Missing evidence is
++``landing_unclassified``, never a guessed landing stage. Daily ``cards_per_day`` / ``usd_per_day``
++caps are enforced at creation in ``kanban_lanes``; this module only reports them.
++"""
++from __future__ import annotations
++
++import json
++import time
++from typing import Any, Optional
++
++from hermes_cli import kanban_lanes as lanes
++
++WINDOWS = {"1h": 3600, "6h": 6 * 3600, "24h": 86400, "7d": 7 * 86400}
++STEPS = ("intake", "waiting", "ready", "running", "review", "ci", "merge", "deploy", "test", "done")
++LANDING_UNCLASSIFIED = "landing_unclassified"
++LIMIT_CARDS = "limit:cards_per_day"
++LIMIT_USD = "limit:usd_per_day"
++_LANDING_STEPS = {"review", "ci", "merge", "deploy", "test"}
++_USER = lanes.USER_CREATORS
++_OPEN = ("triage", "todo", "scheduled", "ready", "running", "blocked", "review")
++
++
++def _payload(event: dict) -> dict:
++    raw = event.get("payload")
++    if isinstance(raw, str):
++        try:
++            raw = json.loads(raw)
++        except ValueError:
++            return {}
++    return raw if isinstance(raw, dict) else {}
++
++
++def _landing_evidence(card: dict) -> bool:
++    if card.get("status") == "review":
++        return True
++    if any(e.get("kind") == "review_requested" for e in card.get("events") or ()):
++        return True
++    pr = card.get("pr")
++    if isinstance(pr, dict) and pr:
++        return True
++    awaited = card.get("awaiting") or {}
++    return isinstance(awaited, dict) and awaited.get("kind") in ("ci", "deploy")
++
++
++def _landing_step(card: dict) -> str:
++    pr = card.get("pr") if isinstance(card.get("pr"), dict) else {}
++    pr = pr or {}
++    awaited = card.get("awaiting") if isinstance(card.get("awaiting"), dict) else {}
++    awaited = awaited or {}
++    review_event = card.get("status") == "review" or any(
++        e.get("kind") == "review_requested" for e in card.get("events") or ())
++    checks = pr.get("checks")
++    if checks is None and awaited.get("kind") == "ci":
++        checks = "pending"
++    merged = pr.get("merged")
++    deployed = pr.get("deployed")
++    if deployed is None and awaited.get("kind") == "deploy":
++        merged = True if merged is None else merged
++        deployed = False
++    verified = pr.get("verified")
++    approved = pr.get("approved")
++    if merged is True and deployed is True and verified is False:
++        return "test"
++    if merged is True and deployed is False:
++        return "deploy"
++    if approved is True and checks == "green" and merged is False:
++        return "merge"
++    if checks == "pending":
++        return "ci"
++    if review_event:
++        return "review"
++    return LANDING_UNCLASSIFIED
++
++
++def classify_step(card: dict) -> str:
++    status = card.get("status")
++    if status == "done":
++        return "done"
++    if status == "running":
++        return "running"
++    if _landing_evidence(card):
++        return _landing_step(card)
++    if status == "ready":
++        return "ready"
++    if status in ("blocked", "scheduled", "todo"):
++        return "waiting"
++    if status == "triage":
++        return "intake"
++    return LANDING_UNCLASSIFIED
++
++
++def _skip_reason(card: dict) -> Optional[str]:
++    for event in reversed(card.get("events") or ()):
++        if event.get("kind") != "dispatch_skipped":
++            continue
++        reason = _payload(event).get("reason") or event.get("reason")
++        detail = str(_payload(event).get("detail") or "")
++        if reason == "llm_paced" or "llm_paced" in detail:
++            return "quota"
++        if reason in ("waiting_for_worker_capacity", "skipped_ineligible") or "waiting_for_worker_capacity" in detail:
++            return "slot"
++        if reason == "llm_paced":
++            return "quota"
++    return None
++
++
++def classify_reason(card: dict, step: str) -> str:
++    if card.get("human_request") or card.get("block_kind") in ("needs_input", "capability"):
++        return "you"
++    gate_reason = card.get("gate_reason")
++    if gate_reason in (LIMIT_CARDS, LIMIT_USD):
++        return gate_reason
++    if card.get("held") or (card.get("status") == "triage" and card.get("block_kind") == lanes.GATE_KIND):
++        return "gate"
++    if card.get("parents_open"):
++        return "dep"
++    if card.get("status") == "scheduled" or step == "waiting" and not card.get("parents_open"):
++        if card.get("status") == "scheduled":
++            return "time"
++    skip = _skip_reason(card)
++    if skip:
++        return skip
++    if step in _LANDING_STEPS:
++        return "review"
++    if step == "running":
++        return "run"
++    if step == "ready":
++        return "slot"
++    if step == "waiting":
++        return "time" if card.get("status") == "scheduled" else "dep"
++    if step == "intake":
++        return "triage"
++    if step == "done":
++        return "run"
++    return "triage"
++
++
++def classify_source(card: dict) -> dict[str, Optional[str]]:
++    session_id = card.get("session_id") or None
++    created = card.get("created_by") or ""
++    project = card.get("project_id") or None
++    if session_id:
++        return {"kind": "session", "id": session_id, "project": project}
++    if created in _USER:
++        return {"kind": "user", "id": created, "project": project}
++    if created:
++        return {"kind": "automation", "id": created, "project": project}
++    return {"kind": "user", "id": "", "project": project}
++
++
++def _json_obj(value: Any) -> Any:
++    if isinstance(value, str):
++        try:
++            return json.loads(value)
++        except ValueError:
++            return None
++    return value
++
++
++def _pr_url(task, events) -> Optional[str]:
++    contract = task["completion_contract"] if "completion_contract" in task.keys() else None
++    if isinstance(contract, str) and "pull/" in contract:
++        return contract
++    for event in reversed(events):
++        payload = _json_obj(event["payload"] if not isinstance(event, dict) else event.get("payload"))
++        if not isinstance(payload, dict):
++            continue
++        meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else payload
++        for key in ("published_pr", "reviewed_pr", "pr"):
++            url = meta.get(key) if isinstance(meta, dict) else None
++            if isinstance(url, str) and url.startswith("http"):
++                return url
++    return None
++
++
++def _pr_snapshot(task, events, awaiting) -> Optional[dict]:
++    snap: dict[str, Any] = {}
++    if any((e["kind"] if not isinstance(e, dict) else e.get("kind")) == "review_requested" for e in events):
++        snap["review_requested"] = True
++    if isinstance(awaiting, dict) and awaiting.get("kind") == "ci":
++        snap["checks"] = "pending"
++    if isinstance(awaiting, dict) and awaiting.get("kind") == "deploy":
++        snap["merged"] = True
++        snap["deployed"] = False
++    url = _pr_url(task, events)
++    if url:
++        snap["url"] = url
++    return snap or None
++
++
++def _held(task) -> bool:
++    return task["status"] == "triage" and (task["block_kind"] or "") == lanes.GATE_KIND
++
++
++def _gate_reason(events) -> Optional[str]:
++    for event in reversed(events):
++        kind = event["kind"] if not isinstance(event, dict) else event.get("kind")
++        if kind != lanes.GATED:
++            continue
++        payload = _json_obj(event["payload"] if not isinstance(event, dict) else event.get("payload")) or {}
++        reason = payload.get("reason") if isinstance(payload, dict) else None
++        return reason if reason in (LIMIT_CARDS, LIMIT_USD) else None
++    return None
++
++
++def _events(conn, task_id: str) -> list:
++    return conn.execute(
++        "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id", (task_id,)).fetchall()
++
++
++def _parents_open(conn, task_id: str) -> bool:
++    from hermes_cli import kanban_db as kb
++
++    return bool(kb.unsatisfied_parents(conn, task_id))
++
++
++def _awaiting(task) -> Optional[dict]:
++    raw = None
++    try:
++        raw = task["awaiting"]
++    except (KeyError, IndexError):
++        raw = None
++    data = _json_obj(raw)
++    return data if isinstance(data, dict) else None
++
++
++def _card_from_row(conn, task, now: float) -> dict:
++    events = _events(conn, task["id"])
++    awaited = _awaiting(task)
++    human = _json_obj(task["human_request"] if "human_request" in task.keys() else None)
++    age = max(0.0, (now - float(task["created_at"] or now)) / 3600.0)
++    pr = _pr_snapshot(task, events, awaited)
++    event_dicts = [{"kind": e["kind"], "payload": e["payload"]} for e in events]
++    return {
++        "id": task["id"], "title": task["title"], "status": task["status"],
++        "block_kind": task["block_kind"], "human_request": human if human else None,
++        "parents_open": _parents_open(conn, task["id"]), "events": event_dicts,
++        "awaiting": awaited, "pr": pr, "created_by": task["created_by"],
++        "session_id": task["session_id"] if "session_id" in task.keys() else None,
++        "project_id": task["project_id"] if "project_id" in task.keys() else None,
++        "held": _held(task), "gate_reason": _gate_reason(events),
++        "age_h": round(age, 1), "tenant": task["tenant"],
++    }
++
++
++def snapshot(conn, *, window: str = "6h", now: Optional[float] = None, pol=None) -> dict:
++    """Cards still open, plus per-lane window throughput and today's cap usage."""
++    if window not in WINDOWS:
++        raise ValueError(f"window must be one of {', '.join(WINDOWS)}")
++    now = time.time() if now is None else now
++    pol = lanes.safe_policy() if pol is None else pol
++    if pol is None:
++        return {"window": window, "cards": [], "lanes": {}}
++    window_s = WINDOWS[window]
++    usage = lanes.usage(conn, pol, window_s=window_s, now=now)
++    rows = conn.execute(
++        f"SELECT * FROM tasks WHERE status IN {_OPEN} ORDER BY created_at, id").fetchall()
++    cards = []
++    for row in rows:
++        card = _card_from_row(conn, row, now)
++        step = classify_step(card)
++        reason = classify_reason(card, step)
++        source = classify_source(card)
++        pr = None
++        if isinstance(card.get("pr"), dict):
++            pr = card["pr"].get("url")
++        cards.append({"id": card["id"], "title": card["title"] or "",
++                      "lane": pol.lane_of(card["tenant"]), "step": step, "reason": reason,
++                      "source": source, "age_h": card["age_h"], "pr": pr})
++    out_lanes = {}
++    for name, spec in pol.lanes.items():
++        row = usage[name]
++        out_lanes[name] = {
++            "done": row["done"],
++            "run_hours": round(row["run_seconds"] / 3600, 1),
++            "cost_usd": row["cost_usd"],
++            "limits": {"cards_per_day": spec.cards_per_day, "usd_per_day": spec.usd_per_day},
++            "usage": {"cards_today": lanes.cards_today(conn, name, now=now),
++                      "usd_today": lanes.spent_today(conn, pol, name, now=now)},
++        }
++    return {"window": window, "cards": cards, "lanes": out_lanes}
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index c27e5e9bd6..e1b6796b73 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -687,6 +687,10 @@ _SPECS = [
+         _cmd("show", [_arg("--hours", type=float, default=6.0, help="Trailing window for actual share (default 6)"),
+                       _arg("--local", action="store_true", help="This board only, not the fleet replica"),
+                       _json_flag()], help="Target against actual share, and what is backed up, per lane"),
++        _cmd("flow", [_arg("--window", choices=("1h", "6h", "24h", "7d"), default="6h",
++                           help="Throughput window (default 6h)"),
++                      _json_flag()],
++             help="Open cards by step and reason, plus per-lane done/run-hours/cost and daily limits"),
+         _cmd("held", [_arg("--lane"), _arg("--limit", type=int, default=200), _json_flag()],
+              help="Cards waiting at a lane gate, oldest first"),
+         _cmd("unclassified", [_arg("--limit", type=int, default=200), _json_flag()],
+@@ -697,8 +701,9 @@ _SPECS = [
+         _cmd("pin", [_TASK_ID, _arg("--off", action="store_true", help="Remove the pin")],
+              help="Keep the planner from reprioritizing a card"),
+         _cmd("set", [_arg("lane"), _arg("--share", type=float), _arg("--admit-per-day", type=int),
++                     _arg("--cards-per-day", type=int), _arg("--usd-per-day", type=float),
+                      _arg("--pause", action="store_true"), _arg("--resume", action="store_true")],
+-             help="Change a lane's share, daily admit budget or pause state"),
++             help="Change a lane's share, daily admit/cards/spend limits or pause state"),
+         _cmd("apply", [_arg("file", help="JSON action list, or - for stdin"),
+                        _arg("--dry-run", action="store_true"), _json_flag()],
+              help="Validate and apply a planner's action list"),
+diff --git a/tests/hermes_cli/test_kanban_lanes_flow.py b/tests/hermes_cli/test_kanban_lanes_flow.py
+new file mode 100644
+index 0000000000..b9c8c29416
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_lanes_flow.py
+@@ -0,0 +1,166 @@
++"""Lanes flow JSON: step/reason classification, daily caps, snapshot shape. [daveey]"""
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_lanes as lanes
++from hermes_cli import kanban_lanes_flow as flow
++from tests.hermes_cli import test_kanban_lanes as base
++from tests.hermes_cli.test_kanban_lanes_plan import cli
++
++conn = base.conn
++configured = base.configured
++person = base.person
++
++
++def _card(**fields):
++    card = {"status": "ready", "block_kind": None, "human_request": None, "parents_open": False,
++            "events": [], "awaiting": None, "pr": None, "created_by": "user", "session_id": None,
++            "project_id": None, "gate_reason": None}
++    card.update(fields)
++    return card
++
++
++@pytest.mark.parametrize("status,extra,step", [
++    ("triage", {}, "intake"),
++    ("blocked", {}, "waiting"),
++    ("scheduled", {}, "waiting"),
++    ("todo", {"parents_open": True}, "waiting"),
++    ("ready", {}, "ready"),
++    ("running", {}, "running"),
++    ("review", {}, "review"),
++    ("done", {}, "done"),
++    ("ready", {"pr": {"checks": "pending"}}, "ci"),
++    ("todo", {"pr": {"approved": True, "checks": "green", "merged": False}}, "merge"),
++    ("todo", {"pr": {"merged": True, "deployed": False}}, "deploy"),
++    ("todo", {"pr": {"merged": True, "deployed": True, "verified": False}}, "test"),
++    ("todo", {"pr": {"url": "https://github.com/o/r/pull/1"}}, "landing_unclassified"),
++    ("mystery", {}, "landing_unclassified"),
++])
++def test_each_step_and_unclassified(status, extra, step):
++    assert flow.classify_step(_card(status=status, **extra)) == step
++
++
++def test_review_requested_event_is_review_without_guessing_ci():
++    assert flow.classify_step(_card(status="todo", events=[{"kind": "review_requested"}])) == "review"
++
++
++@pytest.mark.parametrize("fields,reason", [
++    ({"human_request": {"action": "pick"}, "status": "blocked", "block_kind": "needs_input"}, "you"),
++    ({"parents_open": True, "status": "todo"}, "dep"),
++    ({"status": "triage", "block_kind": lanes.GATE_KIND, "held": True}, "gate"),
++    ({"status": "triage", "block_kind": lanes.GATE_KIND, "held": True,
++      "gate_reason": "limit:cards_per_day"}, "limit:cards_per_day"),
++    ({"status": "triage", "block_kind": lanes.GATE_KIND, "held": True,
++      "gate_reason": "limit:usd_per_day"}, "limit:usd_per_day"),
++    ({"status": "scheduled"}, "time"),
++    ({"status": "ready", "events": [{"kind": "dispatch_skipped", "payload": {"reason": "llm_paced"}}]}, "quota"),
++    ({"status": "ready"}, "slot"),
++    ({"status": "triage"}, "triage"),
++    ({"status": "running"}, "run"),
++    ({"status": "review"}, "review"),
++])
++def test_each_reason(fields, reason):
++    assert flow.classify_reason(_card(**fields), flow.classify_step(_card(**fields))) == reason
++
++
++def test_source_kinds():
++    assert flow.classify_source(_card(created_by="user"))["kind"] == "user"
++    assert flow.classify_source(_card(created_by="self-heal"))["kind"] == "automation"
++    assert flow.classify_source(_card(created_by="self-heal"))["id"] == "self-heal"
++    assert flow.classify_source(_card(session_id="sess-1", created_by="user"))["kind"] == "session"
++    assert flow.classify_source(_card(session_id="sess-1"))["id"] == "sess-1"
++    assert flow.classify_source(_card(project_id="Example App"))["project"] == "Example App"
++
++
++def _myapp_limits(configured, **lane):
++    mapping = json.loads(json.dumps(base.LANES))
++    mapping["myapp"].update(lane)
++    configured(mapping)
++
++
++def test_cards_per_day_under_over_unset(conn, configured):
++    _myapp_limits(configured, cards_per_day=2)
++    a = base._ready_in(conn, "myapp", "a")
++    b = base._ready_in(conn, "myapp", "b")
++    c = base._ready_in(conn, "myapp", "c")
++    assert base._task(conn, a)["status"] == "ready"
++    assert base._task(conn, b)["status"] == "ready"
++    row = base._task(conn, c)
++    assert (row["status"], row["block_kind"]) == ("triage", lanes.GATE_KIND)
++    payload = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
++                           (c, lanes.GATED)).fetchone()[0]
++    assert json.loads(payload)["reason"] == "limit:cards_per_day"
++    configured(base.LANES)  # unset
++    d = base._ready_in(conn, "myapp", "d")
++    assert base._task(conn, d)["status"] == "ready"
++
++
++def test_usd_per_day_under_over_unset(conn, configured):
++    _myapp_limits(configured, usd_per_day=10)
++    cheap = base._ready_in(conn, "myapp", "cheap")
++    now = int(time.time())
++    conn.execute("INSERT INTO task_runs (task_id, status, started_at, ended_at) VALUES (?, 'done', ?, ?)",
++                 (cheap, now - 10, now - 1))
++    run_id = conn.execute("SELECT MAX(id) FROM task_runs").fetchone()[0]
++    conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
++                 (cheap, run_id, "worker_result", json.dumps({"usage": {"cost_usd": 10.0}}), now - 1))
++    conn.commit()
++    over = base._ready_in(conn, "myapp", "over")
++    row = base._task(conn, over)
++    assert (row["status"], row["block_kind"]) == ("triage", lanes.GATE_KIND)
++    payload = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?",
++                           (over, lanes.GATED)).fetchone()[0]
++    assert json.loads(payload)["reason"] == "limit:usd_per_day"
++    configured(base.LANES)
++    free = base._ready_in(conn, "myapp", "free")
++    assert base._task(conn, free)["status"] == "ready"
++
++
++def test_daily_limits_reset_at_local_midnight(conn, configured, monkeypatch):
++    start = lanes.day_start()
++    clock = [start + 22 * 3600]
++    monkeypatch.setattr(time, "time", lambda: clock[0])
++    _myapp_limits(configured, cards_per_day=1)
++    first = base._ready_in(conn, "myapp", "before-midnight")
++    blocked = base._ready_in(conn, "myapp", "still-today")
++    assert base._task(conn, first)["status"] == "ready"
++    assert base._task(conn, blocked)["status"] == "triage"
++    clock[0] = start + 24 * 3600 + 60
++    nxt = base._ready_in(conn, "myapp", "after-midnight")
++    assert base._task(conn, nxt)["status"] == "ready"
++
++
++def test_flow_json_shape_and_window(conn, configured, capsys):
++    configured()
++    tid = base._ready_in(conn, "myapp", "shape card")
++    assert cli("lanes", "flow", "--json", "--window", "6h") == 0
++    data = json.loads(capsys.readouterr().out)
++    assert data["window"] == "6h"
++    assert set(data) >= {"window", "cards", "lanes"}
++    card = next(c for c in data["cards"] if c["id"] == tid)
++    assert set(card) == {"id", "title", "lane", "step", "reason", "source", "age_h", "pr"}
++    assert card["lane"] == "myapp" and card["step"] == "ready" and card["reason"] == "slot"
++    assert card["pr"] is None and isinstance(card["age_h"], (int, float))
++    assert set(card["source"]) == {"kind", "id", "project"}
++    assert card["source"]["kind"] in ("session", "automation", "user")
++    lane = data["lanes"]["myapp"]
++    assert set(lane) >= {"done", "run_hours", "cost_usd", "limits", "usage"}
++    assert set(lane["limits"]) == {"cards_per_day", "usd_per_day"}
++    assert set(lane["usage"]) == {"cards_today", "usd_today"}
++    assert lane["limits"]["cards_per_day"] is None and lane["limits"]["usd_per_day"] is None
++
++
++def test_set_persists_daily_limits(conn, configured):
++    configured()
++    from hermes_cli import kanban_lanes_cli
++    kanban_lanes_cli.set_lane("myapp", cards_per_day=7, usd_per_day=12.5)
++    lane = lanes.policy().lanes["myapp"]
++    assert (lane.cards_per_day, lane.usd_per_day) == (7, 12.5)
++
++
++def test_unknown_window_is_rejected():
++    with pytest.raises(SystemExit):
++        cli("lanes", "flow", "--json", "--window", "2h")
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index c764bd373e..97be1ae692 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -3672,7 +3672,7 @@ kanban:
+     cpu_busy_below_pct: 50   # absent/null = gate off (default)
+ ```
+ 
+-`kanban.admission.lanes`, `kanban.admission.lane_default`, `kanban.admission.lane_shadow` and `kanban.admission.agent_priority_cap` (all default unset: off) configure project lanes; see [Project lanes](features/kanban.md#project-lanes).
++`kanban.admission.lanes`, `kanban.admission.lane_default`, `kanban.admission.lane_shadow` and `kanban.admission.agent_priority_cap` (all default unset: off) configure project lanes; optional per-lane `cards_per_day` and `usd_per_day` (unset = unlimited) hold new cards at the lane gate once today's admissions or run spend hit the cap (reset at local midnight). See [Project lanes](features/kanban.md#project-lanes).
+ 
+ `kanban.admission.cpu_busy_below_pct` (default unset: off) turns on the measured-CPU admission gate on a host that takes overflow work from the Board's worker-first placement. It is read only from the installation-root `config.yaml`, never from a profile override. When set:
+ 
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 6d3fcf2cd4..ad38a06d6d 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1620,6 +1620,8 @@ kanban:
+         share: 20
+         gated: true              # cards filed by other cards or by detectors start held in triage
+         admit_per_day: 50
++        cards_per_day: 50        # optional; new cards wait at the gate after this many admissions today
++        usd_per_day: 40          # optional; new cards wait at the gate after this much run spend today
+         match: {creators: [self-heal], key_prefixes: ["ci-main-watch:"], repos: [hermes-agent], self_work: true}
+         gate_exempt: ['independent review']
+         never_admit: ['lifecycle guard']
+@@ -1633,7 +1635,7 @@ kanban:
+ - **Priority cap.** `agent_priority_cap` bounds the stored priority of a card the user did not create, at creation. Later edits are not capped, and the planner may set 0 to 1000.
+ - **Limits.** Worker nodes order foreign pickup with their own board copy, so lane order is exact only on the board that holds the cards; `paused` applies where `lanes` is configured. A worker that parks on a held follow-up card waits until that card is admitted.
+ 
+-`hermes kanban lanes` (default `show`) prints target against actual share of run-hours over `--hours` (default 6), running, ready, held and open cards per lane; on a synced board it reads the fleet replica unless `--local`. `held` and `unclassified` list cards; `assign <id> <lane>`, `admit <id>`, `pin <id> [--off]` and `set <lane> [--share N] [--admit-per-day N] [--pause|--resume]` (always written to the installation-root config) are the controls; a person's `admit` does not spend the daily budget (an agent's does); `promote` and `unblock` also release a held card and are not budgeted; `explain <id>` says which lane a card is in and why it waits.
++`hermes kanban lanes` (default `show`) prints target against actual share of run-hours over `--hours` (default 6), running, ready, held and open cards per lane; on a synced board it reads the fleet replica unless `--local`. `lanes flow --json [--window 1h|6h|24h|7d]` lists every open card with step, reason and source plus per-lane done/run-hours/cost and today's cap usage. `held` and `unclassified` list cards; `assign <id> <lane>`, `admit <id>`, `pin <id> [--off]` and `set <lane> [--share N] [--admit-per-day N] [--cards-per-day N] [--usd-per-day N] [--pause|--resume]` (always written to the installation-root config) are the controls; a person's `admit` does not spend the daily budget (an agent's does); `promote` and `unblock` also release a held card and are not budgeted; `explain <id>` says which lane a card is in and why it waits. Unset `cards_per_day` / `usd_per_day` means unlimited. Over the cap, new cards wait at the gate with reason `limit:cards_per_day` or `limit:usd_per_day`; both reset at local midnight.
+ 
+ `hermes kanban lanes apply <file|->` applies a planner's JSON action list. Each action is validated on its own and refused with a reason when it breaks a limit: `admit` (at most `admit_per_day` per local day, never a `never_admit` title), `merge` (a held card into an open card of the same lane; it stays held), `reprioritize` (0 to 1000, never a pinned card), `relane` (only a card placed by inheritance or by default, never into or out of a gated lane) and `note`. Every action except `note` needs a one-line `reason`; one plan applies at most 50 actions.
+ 
+-- 
+2.43.0
+

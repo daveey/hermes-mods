@@ -1,0 +1,1736 @@
+From 09471c0bd202ef93aa8be0f94dd62fe8ee37bb01 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 19:12:24 +0000
+Subject: [PATCH] fix(kanban): quarantine only deterministic conflicts;
+ per-receipt holds; release = acceptance + certified catch-up [daveey]
+
+Review round 3 of #3796 (both 0e97d5a6fd reviews plus the second reviewer's findings).
+
+- Only a ContainmentConflict (identity_changed in remember, event_differs in certify_page) quarantines; any
+  other ContainmentRefused (non-live/unproven evidence, unavailable proof, invalid page) re-raises so #3759's
+  per-board backoff retries the page with the cursor unmoved. A transient evidence failure is never a hold.
+- Hold rows are keyed (task_id, receipt_uid, via): a task stays held while any unreleased receipt names it,
+  directly or as a dependency; a release removes only that receipt's rows.
+- Release (hermes kanban sync quarantine --release R --reason TEXT) fetches the Board's current evidence and
+  refuses unless it is live and certifies; appends a containment_sync_acceptances row (sha256 of the certified
+  identity, evidence, reason, operator, time) that remember() honours while the first receipt stays; replays the
+  receipt's canonical event and the withheld rows it frees through certify_page + apply_remote_changes, and
+  lifts the holds inside that apply transaction. CLI runs replica first, then live, under board_sync_lock.
+- One hub card per quarantined receipt via the hermes-hub courier (idempotency key
+  containment-quarantine:<board>:<receipt>), ERROR log only on the hub, 10 min courier backoff; held cards get a
+  sync_quarantine queue reason and a refusal naming the receipt and the release command.
+- A held task's own chat-link/attachment deletes wait (owner recorded by a host-local delete trigger);
+  adopt copies only new hold/acceptance rows and never the withheld ledger; CLI exit codes 0/1/2 tested.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_containment_connections.py  |   6 +-
+ hermes_cli/kanban_containment_lifecycle.py    |  12 +
+ hermes_cli/kanban_containment_replica.py      |  15 +-
+ hermes_cli/kanban_parser.py                   |   9 +-
+ hermes_cli/kanban_queue_position.py           |   5 +
+ hermes_cli/kanban_sync_cli.py                 |  32 +-
+ hermes_cli/kanban_sync_client.py              |   4 +-
+ hermes_cli/kanban_sync_quarantine.py          | 322 +++++++++++-------
+ hermes_cli/kanban_sync_quarantine_notice.py   | 142 ++++++++
+ hermes_cli/kanban_sync_quarantine_release.py  | 245 +++++++++++++
+ tests/hermes_cli/kanban_quarantine_support.py |  32 ++
+ .../test_kanban_receipt_quarantine_cli.py     |  97 ++++++
+ ...test_kanban_receipt_quarantine_conflict.py |  84 +++++
+ .../test_kanban_receipt_quarantine_holds.py   |  54 +++
+ .../test_kanban_receipt_quarantine_notice.py  |  84 +++++
+ .../test_kanban_receipt_quarantine_release.py | 184 +++++++---
+ .../test_kanban_receipt_quarantine_safety.py  |   2 +-
+ 17 files changed, 1127 insertions(+), 202 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_quarantine_notice.py
+ create mode 100644 hermes_cli/kanban_sync_quarantine_release.py
+ create mode 100644 tests/hermes_cli/kanban_quarantine_support.py
+ create mode 100644 tests/hermes_cli/test_kanban_receipt_quarantine_cli.py
+ create mode 100644 tests/hermes_cli/test_kanban_receipt_quarantine_conflict.py
+ create mode 100644 tests/hermes_cli/test_kanban_receipt_quarantine_holds.py
+ create mode 100644 tests/hermes_cli/test_kanban_receipt_quarantine_notice.py
+
+diff --git a/hermes_cli/kanban_containment_connections.py b/hermes_cli/kanban_containment_connections.py
+index 6d9b4f9fed..9102086eaa 100644
+--- a/hermes_cli/kanban_containment_connections.py
++++ b/hermes_cli/kanban_containment_connections.py
+@@ -49,9 +49,9 @@ def drop_held(conn: sqlite3.Connection, rows: list) -> list:
+ 
+ 
+ def refusal(conn: sqlite3.Connection, task_id: str) -> str | None:
+-    from hermes_cli.kanban_sync_quarantine import held as quarantined, refusal as quarantine_refusal
+-    if quarantined(conn, task_id):  # a host-local hold: resume-contained has no episode to release  [daveey]
+-        return quarantine_refusal(conn, task_id)
++    from hermes_cli.kanban_sync_quarantine import refusal as quarantine_refusal
++    if quarantined := quarantine_refusal(conn, task_id):  # host-local: resume-contained cannot release it [daveey]
++        return quarantined
+     return "containment_pending: scoped resume-contained required" if held(conn, task_id) else None
+ 
+ 
+diff --git a/hermes_cli/kanban_containment_lifecycle.py b/hermes_cli/kanban_containment_lifecycle.py
+index 753b979633..411fd6b8c4 100644
+--- a/hermes_cli/kanban_containment_lifecycle.py
++++ b/hermes_cli/kanban_containment_lifecycle.py
+@@ -21,6 +21,18 @@ class ContainmentRefused(ValueError):
+     code = "containment_refused"
+ 
+ 
++class ContainmentConflict(ContainmentRefused):
++    """A deterministic evidence conflict, never a transient one: the Board's authenticated evidence for a receipt
++    no longer equals this host's first certified observation (``identity_changed``), or a feed event differs from
++    its canonical receipt (``event_differs``). Only these quarantine one task (``kanban_sync_quarantine``); every
++    other refusal (unproven or non-live evidence, unavailable proof, an invalid page) refuses the whole page.
++    ``uid`` is the receipt whose evidence conflicted (a release's stop receipt can be the one). [daveey]"""
++
++    def __init__(self, message: str, *, kind: str, uid: str | None = None):
++        super().__init__(message)
++        self.kind, self.uid = kind, uid
++
++
+ def _local(conn: sqlite3.Connection) -> None:
+     exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_sync_state'").fetchone()
+     if exists and conn.execute("SELECT 1 FROM kanban_sync_state LIMIT 1").fetchone():
+diff --git a/hermes_cli/kanban_containment_replica.py b/hermes_cli/kanban_containment_replica.py
+index 42d39a34f1..fc1323315b 100644
+--- a/hermes_cli/kanban_containment_replica.py
++++ b/hermes_cli/kanban_containment_replica.py
+@@ -13,7 +13,7 @@ import sqlite3
+ from collections.abc import Iterator
+ 
+ from hermes_cli import kanban_containment_canonical as canonical
+-from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
++from hermes_cli.kanban_containment_lifecycle import ContainmentConflict, ContainmentRefused
+ from hermes_cli.kanban_containment_state import _payload
+ 
+ _CACHE = contextvars.ContextVar("containment_cache_write", default=None)
+@@ -62,9 +62,12 @@ def remember(conn: sqlite3.Connection, evidence: dict, *, board: str, task: str,
+         if prior is not None:
+             # Identity is the certified fields only; volatile transport keys of the
+             # evidence response (feed `head` etc.) are ignored. The first stored
+-            # evidence is kept: the cache is append-only.
++            # evidence is kept: the cache is append-only. An operator's recorded acceptance of exactly this
++            # evidence (``hermes kanban sync quarantine --release``) is the only other match.
+             if tuple(prior)[:6] != values[:6] or _certified(prior[6]) != _certified(raw):
+-                raise ContainmentRefused("canonical receipt identity changed")
++                from hermes_cli.kanban_sync_quarantine_release import accepted
++                if not accepted(conn, uid, raw):
++                    raise ContainmentConflict("canonical receipt identity changed", kind="identity_changed", uid=uid)
+             return
+         token = _CACHE.set(id(conn))
+         try:
+@@ -90,8 +93,12 @@ def _certified(raw: str) -> tuple:
+ 
+ 
+ def _cached(conn: sqlite3.Connection, uid: str) -> dict | None:
++    """The receipt's certified evidence: an operator-accepted newer Board copy, else the first observation."""
+     if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='containment_canonical_receipts'").fetchone():
+         return None
++    from hermes_cli.kanban_sync_quarantine_release import accepted_evidence
++    if (newer := accepted_evidence(conn, uid)) is not None:
++        return newer
+     row = conn.execute("SELECT evidence FROM containment_canonical_receipts WHERE uid=?", (uid,)).fetchone()
+     return json.loads(row[0]) if row else None
+ 
+@@ -141,7 +148,7 @@ def certify_page(conn: sqlite3.Connection, hub, board: str, changes) -> None:
+             stop = hub.row_evidence(board, "task_events", data.get("episode"))
+         remember(conn, proof, board=board, task=ch.fields.get("task_id"), uid=ch.uid, stop_evidence=stop)
+         if not _matches({**ch.fields, "uid": ch.uid}, proof) or ch.origin_gateway != proof["row"]["origin_gateway"]:
+-            raise ContainmentRefused("replica event differs from its canonical receipt")
++            raise ContainmentConflict("replica event differs from its canonical receipt", kind="event_differs", uid=ch.uid)
+ 
+ 
+ def adopt_receipts(conn: sqlite3.Connection, source: sqlite3.Connection, changes) -> None:
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 9addd0292d..a0c5ff33a6 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -817,10 +817,11 @@ _SPECS = [
+                                    _arg("--expect", metavar="TOKEN", default=None)],
+              help="Abandon containment-refused historical deletes in favor of the live canonical link (audited preview by default)"),
+         _cmd("quarantine", [_json_flag(), _arg("--release", metavar="RECEIPT", default=None,
+-                                               help="Release one receipt's host-local hold (needs --reason)"),
+-                            _arg("--reason", metavar="TEXT", default=None)],
+-             help="List receipts quarantined for a changed certified identity and the tasks they hold; "
+-                  "--release RECEIPT --reason TEXT lifts one after you have ruled on the Board's copy"),
++                                               help="Accept the Board's live evidence for RECEIPT and replay its "
++                                                    "withheld rows (needs --reason)"),
++                            _arg("--reason", metavar="TEXT", default=None, help="Recorded with the acceptance")],
++             help="List receipts quarantined for conflicting containment evidence and the tasks they hold; "
++                  "--release RECEIPT --reason TEXT releases one after you have ruled on the Board's copy"),
+         _cmd("reserved-key", [_json_flag(), _arg("task_id", metavar="TASK_ID"),
+                               _arg("--new-key", required=True, metavar="KEY",
+                                    help="Replacement idempotency key (non-empty, not pickup-stall:/worker-resources-unknown:)"),
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index c2eb251c06..cc39936acd 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -213,6 +213,9 @@ def _position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Op
+     lock = conn.execute("SELECT claim_lock, worker_pid FROM tasks WHERE id = ?", (task.id,)).fetchone()
+     if lock is not None and lock[0]:
+         return {"lane": "leftover_claim", "claim_lock": lock[0], "worker_pid": lock[1]}
++    from hermes_cli.kanban_sync_quarantine import refusal as quarantine_refusal
++    if held := quarantine_refusal(conn, task.id):  # the dispatcher drops it (drop_held): say why and how [daveey]
++        return {"lane": "sync_quarantine", "reason": held}
+     guard = recorded_guard(conn, task.id)
+     if guard:
+         return {"lane": "respawn_guard", "reason": guard}
+@@ -335,6 +338,8 @@ def _describe_lane(place: Optional[dict[str, Any]]) -> Optional[str]:
+     if not place:
+         return None
+     lane = place.get("lane")
++    if lane == "sync_quarantine":
++        return place.get("reason")
+     if lane == "respawn_guard":
+         return (f"last recorded dispatch hold: respawn guard ({place.get('reason')}). "
+                 "Check the current dispatcher verdict and resolve that guard; priority changes do not clear it")
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index 8bc2947c40..09e5aa5f36 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -50,7 +50,7 @@ def _status(args: argparse.Namespace) -> int:
+     from hermes_cli.kanban_sync_claims import describe
+     out["claims"] = describe(_path(slug), out.get("mode") or "off")  # the dispatcher's first-round gate
+     if out.get("quarantined"):
+-        out["quarantined"] = f"{out['quarantined']} receipt(s) held; run `hermes kanban sync quarantine`"
++        out["quarantined"] = f"{out['quarantined']} receipt(s) held; run `hermes kanban --board {slug} sync quarantine`"
+     shadow = ksc.shadow_path(slug)
+     if shadow.exists():
+         sconn = kbc.connect(shadow)
+@@ -263,32 +263,30 @@ def _reserved_key(args: argparse.Namespace) -> int:
+ 
+ 
+ def _quarantine(args: argparse.Namespace) -> int:
+-    """List (default) or release (``--release RECEIPT --reason TEXT``) host-local receipt quarantines."""
++    """List (default) or release (``--release RECEIPT --reason TEXT``) host-local receipt quarantines. A release
++    records the operator's acceptance of the Board's live evidence and replays the withheld rows through
++    certify+apply, replica first, under the board's sync lock (``kanban_sync_quarantine_release``). Exit 0 released,
++    1 no such receipt, 2 refused (no reason, evidence not live, catch-up failed, round busy): the hold stays."""
+     from hermes_cli import kanban_sync_quarantine as quarantine
+     slug = _board(args)
+     release = getattr(args, "release", None)
+-    if release and not (getattr(args, "reason", None) or "").strip():
+-        print("kanban sync: --reason TEXT is required to release a quarantine")
+-        return 2
+-    paths = [_path(slug)] + ([ksc.shadow_path(slug)] if ksc.shadow_path(slug).exists() else [])
+-    released = 0
++    if release is not None:
++        reason = (getattr(args, "reason", None) or "").strip()
++        if not reason:
++            print("kanban sync: --reason TEXT is required to release a quarantine (it is recorded with the acceptance)")
++            return 2
++        from hermes_cli.kanban_sync_quarantine_release import release_board
++        code, text = release_board(slug, _path(slug), release, reason)
++        print(text)
++        return code
+     listed: dict[str, dict] = {}
+-    for path in paths:
++    for path in [_path(slug)] + ([ksc.shadow_path(slug)] if ksc.shadow_path(slug).exists() else []):
+         conn = kbc.connect(path)
+         try:
+-            if release:
+-                released += quarantine.release(conn, release)
+             for entry in quarantine.entries(conn):
+                 listed.setdefault(entry["receipt"], entry)
+         finally:
+             conn.close()
+-    if release:
+-        if not released:
+-            print(f"kanban sync: no quarantined receipt {release} on board {slug}")
+-            return 1
+-        print(f"kanban sync: released {release} ({args.reason.strip()}); its refused rows are redelivered by a "
+-              "replica rebuild, and it quarantines again if the Board's receipt still conflicts")
+-        return 0
+     _print({"board": slug, "quarantined": list(listed.values())}, args.json)
+     return 0
+ 
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index a9d94ddf23..cfd8cc8ba3 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1047,8 +1047,8 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+         except (HubError, OSError) as exc:
+             _log.info("kanban sync: %s push before the pull failed (%s); pulling anyway", slug, exc)
+         with quarantine.mirroring(live), _pulled_replica(slug, hub, gateway) as (replica, pulled, rebuilt):
+-            from hermes_cli.kanban_sync_quarantine import adopt
+-            adopt(replica, live)
++            quarantine.adopt(replica, live)
++            quarantine.notify(live, slug)  # one hub card per new receipt (kanban_sync_quarantine_notice); never raises
+             result.pulled = pulled
+             result.behind = pulled.more
+             acw.expedite(live, pulled.status_changed)  # a park naming a card the pull moved re-probes now [daveey]
+diff --git a/hermes_cli/kanban_sync_quarantine.py b/hermes_cli/kanban_sync_quarantine.py
+index 6d7c7be42d..cff111fcc3 100644
+--- a/hermes_cli/kanban_sync_quarantine.py
++++ b/hermes_cli/kanban_sync_quarantine.py
+@@ -1,10 +1,21 @@
+-"""Host-local, append-only quarantine for refused containment receipts. [daveey]
+-
+-Certification remains strict. A refused receipt and every withheld wire row are
+-retained before advancing the feed cursor. Its task and dependency descendants
+-cannot dispatch, be imported, or push. Other tasks keep syncing. There is no
+-automatic release: corrected evidence must not erase an observed identity conflict.
+-This ledger is never synced authority and never fabricates a containment episode.
++"""Host-local quarantine for containment receipts whose evidence deterministically conflicts. [daveey]
++
++Certification stays strict. Only a ``ContainmentConflict`` quarantines: the Board's authenticated evidence for a
++receipt differs from this host's first certified observation (``identity_changed``), or a feed event differs from
++its canonical receipt (``event_differs``). Every other refusal (unproven or non-live evidence, unavailable proof,
++an invalid page) re-raises, so the per-board backoff (``kanban_sync_refusal``) retries the whole page with the
++cursor where it was: a transient evidence failure never becomes a permanent hold.
++
++A quarantined receipt is journaled, with its wire row, before the cursor can move. Every hold row names the receipt
++it derives from (``direct``, or ``dependency`` for descendants), so a task stays held while ANY unreleased receipt
++names it. A held task and its dependency descendants cannot dispatch, be picked up or push (their own chat-link and
++attachment deletes included); their later feed rows are withheld. Other tasks keep syncing.
++
++Nothing releases a hold automatically. ``hermes kanban sync quarantine --release`` (``kanban_sync_quarantine_release``)
++appends an operator acceptance of the Board's current live evidence, replays the withheld rows through certify and
++apply, and lifts only that receipt's holds inside that apply transaction. The first observed receipt is never
++rewritten and acceptances are append-only. One hub card per receipt tells the owner
++(``kanban_sync_quarantine_notice``). This ledger is never synced authority and never fabricates a containment episode.
+ """
+ from __future__ import annotations
+ 
+@@ -21,24 +32,39 @@ from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
+ 
+ log = logging.getLogger(__name__)
+ _SINK = contextvars.ContextVar("containment_quarantine_sink", default=None)
++# Released per receipt by ``lift`` (its triggers are dropped and restored inside that transaction).
+ _TABLES = {
+-    "containment_sync_quarantine": "uid TEXT PRIMARY KEY,task_id TEXT NOT NULL,board TEXT NOT NULL,reason TEXT NOT NULL,wire TEXT NOT NULL",
+-    "containment_sync_quarantine_tasks": "task_id TEXT PRIMARY KEY,receipt_uid TEXT NOT NULL",
++    "containment_sync_quarantine": "uid TEXT PRIMARY KEY,task_id TEXT NOT NULL,board TEXT NOT NULL,kind TEXT NOT NULL,"
++                                   "reason TEXT NOT NULL,wire TEXT NOT NULL",
++    "containment_sync_quarantine_tasks": "task_id TEXT NOT NULL,receipt_uid TEXT NOT NULL,via TEXT NOT NULL,"
++                                         "PRIMARY KEY(task_id,receipt_uid)",
+     "containment_sync_withheld": "wire TEXT PRIMARY KEY",
+ }
++# Append-only forever: the durable audit record of each operator release.
++_ACCEPTANCES = ("containment_sync_acceptances", "receipt_uid TEXT NOT NULL,sha256 TEXT NOT NULL,evidence TEXT NOT NULL,"
++                "reason TEXT NOT NULL,operator TEXT NOT NULL,accepted_at INTEGER NOT NULL,"
++                "PRIMARY KEY(receipt_uid,sha256,accepted_at)")
++# The owning task of a deleted chat link/attachment: its outbox delete carries no fields and its row is gone.
++_OWNER = "containment_sync_delete_owner"
++_OWNED = ("task_chat_links", "task_attachments")
++_ADOPTED = ("containment_sync_quarantine", "containment_sync_quarantine_tasks", _ACCEPTANCES[0])
++_CLOSURE = ("WITH RECURSIVE held(id) AS (SELECT task_id FROM containment_sync_quarantine_tasks{where} UNION "
++            "SELECT l.child_id FROM task_links l JOIN held h ON l.parent_id=h.id) SELECT id FROM held")
+ 
+ 
+-def _exists(conn) -> bool:
+-    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='containment_sync_quarantine'").fetchone() is not None
++def _exists(conn, table: str = "containment_sync_quarantine") -> bool:
++    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
+ 
+ 
+ def file_holds(path: Path) -> bool:
+-    """Cheap peek: does this database file hold any quarantine row? Opens no pooled shadow connection."""
++    """Cheap peek: does this database file hold any quarantine row? Opens no pooled shadow connection. Fails
++    closed: an unreadable file answers True, so the caller adopts through the real connection (or the round fails
++    before its first send)."""
+     try:
+         # Short-lived read-only peek, closed below; never a pooled handle.
+         peek = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)  # noqa: kanban-lockguard
+     except sqlite3.Error:
+-        return True  # cannot tell: fail closed so the caller adopts through the real connection
++        return True
+     try:
+         return _exists(peek) and peek.execute("SELECT 1 FROM containment_sync_quarantine LIMIT 1").fetchone() is not None
+     except sqlite3.Error:
+@@ -47,86 +73,98 @@ def file_holds(path: Path) -> bool:
+         peek.close()
+ 
+ 
++def _immutable(conn, table: str) -> None:
++    for op in ("UPDATE", "DELETE"):
++        conn.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_{op.lower()} BEFORE {op} ON {table} "
++                     "BEGIN SELECT RAISE(ABORT,'containment_quarantine_immutable'); END")
++
++
+ def install(conn) -> None:
+     from hermes_cli import kanban_containment_guard as guard
+     from hermes_cli.kanban_containment_connections import verifier
+     from hermes_cli import kanban_containment_replica as replica
+     guard.install(conn, verify_release=lambda r, s: verifier(conn, r, s))
+     replica.install(conn)
+-    for table, columns in _TABLES.items():
++    for table, columns in (*_TABLES.items(), _ACCEPTANCES):
+         conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({columns})")
+-        for op in ("UPDATE", "DELETE"):
+-            conn.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_{op.lower()} BEFORE {op} ON {table} "
+-                         "BEGIN SELECT RAISE(ABORT,'containment_quarantine_immutable'); END")
++        _immutable(conn, table)
++    conn.execute(f"CREATE TABLE IF NOT EXISTS {_OWNER} (table_name TEXT NOT NULL,row_uid TEXT NOT NULL,"
++                 "task_id TEXT NOT NULL,PRIMARY KEY(table_name,row_uid))")
++    for table in _OWNED:
++        if {"uid", "task_id"} <= {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
++            conn.execute(f"CREATE TRIGGER IF NOT EXISTS {_OWNER}_{table} AFTER DELETE ON {table} BEGIN "
++                         f"INSERT OR REPLACE INTO {_OWNER} VALUES ('{table}',OLD.uid,OLD.task_id); END")
+ 
+ 
+-def tasks(conn) -> set[str]:
++def receipts(conn) -> list[str]:
++    if not _exists(conn):
++        return []
++    return [r[0] for r in conn.execute("SELECT uid FROM containment_sync_quarantine ORDER BY rowid")]
++
++
++def tasks(conn, receipt: str | None = None, *, without: str | None = None) -> set[str]:
++    """Held tasks: every task a hold row names, and its dependency descendants. ``receipt``: only that receipt's;
++    ``without``: as if that receipt were released. UNION (not UNION ALL) also terminates for cyclic graphs."""
+     if not _exists(conn):
+         return set()
+-    # A dependent cannot inherit readiness from a stale terminal projection of a
+-    # quarantined parent. UNION (not UNION ALL) also terminates for cyclic graphs.
+-    return {r[0] for r in conn.execute(
+-        "WITH RECURSIVE held(id) AS (SELECT task_id FROM containment_sync_quarantine_tasks UNION "
+-        "SELECT l.child_id FROM task_links l JOIN held h ON l.parent_id=h.id) SELECT id FROM held")}
++    where, args = ("", ()) if receipt is None and without is None else (
++        (" WHERE receipt_uid=?", (receipt,)) if receipt is not None else (" WHERE receipt_uid<>?", (without,)))
++    return {r[0] for r in conn.execute(_CLOSURE.format(where=where), args)}
+ 
+ 
+ def held(conn, task: str) -> bool:
+     return task in tasks(conn)
+ 
+ 
++def holders(conn, task: str) -> list[str]:
++    """The quarantined receipts holding ``task``, directly or as a dependency descendant."""
++    return sorted(uid for uid in receipts(conn) if task in tasks(conn, uid))
++
++
+ def entries(conn) -> list[dict]:
+     """Owner-visible view: one dict per quarantined receipt, with every task it holds."""
+     if not _exists(conn):
+         return []
+-    out = []
+-    for uid, task, board, reason in conn.execute("SELECT uid,task_id,board,reason FROM containment_sync_quarantine ORDER BY rowid"):
+-        held_tasks = [r[0] for r in conn.execute(
+-            "SELECT task_id FROM containment_sync_quarantine_tasks WHERE receipt_uid=? ORDER BY task_id", (uid,))]
+-        out.append({"receipt": uid, "board": board, "task": task, "held_tasks": held_tasks, "reason": reason})
+-    return out
++    return [{"receipt": uid, "board": board, "task": task, "kind": kind, "reason": reason,
++             "held_tasks": sorted(tasks(conn, uid))}
++            for uid, task, board, kind, reason in conn.execute(
++                "SELECT uid,task_id,board,kind,reason FROM containment_sync_quarantine ORDER BY rowid")]
+ 
+ 
+-def refusal(conn, task: str) -> str | None:
+-    """Accurate text for a hold that ``resume-contained`` cannot release (it is host-local, not an episode)."""
+-    if not held(conn, task):
+-        return None
+-    mine = [e["receipt"] for e in entries(conn) if task in e["held_tasks"]]
+-    cause = f"receipt {mine[0]}" if mine else "a quarantined parent task"
+-    return (f"containment_quarantine: held by {cause}, whose identity changed after first certification. "
+-            "resume-contained cannot release it; list with `hermes kanban sync quarantine`, rule on the Board's "
+-            "receipt, then `hermes kanban sync quarantine --release <receipt> --reason <why>`")
++def release_command(board: str, receipt: str) -> str:
++    return f"hermes kanban --board {board} sync quarantine --release {receipt} --reason ..."
+ 
+ 
+-def release(conn, receipt: str) -> int:
+-    """Operator release of one receipt's host-local hold. The refused wire rows are NOT replayed: a replica
+-    rebuild or the next ordinary change redelivers them. A still-conflicting receipt quarantines again on its
+-    next delivery, so releasing without ruling on the Board's copy is self-correcting, never a bypass."""
+-    from hermes_cli import kanban_db as kb
+-    if not _exists(conn):
+-        return 0
+-    with kb.write_txn(conn, allow_nested=True):
+-        found = conn.execute("SELECT 1 FROM containment_sync_quarantine WHERE uid=?", (receipt,)).fetchone()
+-        if not found:
+-            return 0
+-        saved = {}
+-        for table in _TABLES:
+-            for op in ("update", "delete"):
+-                name = f"{table}_{op}"
+-                row = conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)).fetchone()
+-                saved[name] = row[0]
+-                conn.execute(f"DROP TRIGGER {name}")
+-        conn.execute("DELETE FROM containment_sync_quarantine_tasks WHERE receipt_uid=?", (receipt,))
+-        conn.execute("DELETE FROM containment_sync_quarantine WHERE uid=?", (receipt,))
+-        if conn.execute("SELECT 1 FROM containment_sync_quarantine LIMIT 1").fetchone() is None:
+-            # Only dependency marks can remain; with no receipt left they have no cause.
+-            conn.execute("DELETE FROM containment_sync_quarantine_tasks WHERE receipt_uid='dependency'")
+-        for sql in saved.values():
+-            conn.execute(sql)
+-    log.warning("kanban sync: released quarantine for receipt %s", receipt)
+-    return 1
+-
+-
+-def _subjects(conn, table: str, uid: str, fields: dict) -> set[str]:
++def refusal(conn, task: str) -> str | None:
++    """Why a held card waits and how it is released (``resume-contained`` cannot: this is not an episode)."""
++    mine = holders(conn, task)
++    if not mine:
++        return None
++    board = conn.execute("SELECT board FROM containment_sync_quarantine WHERE uid=?", (mine[0],)).fetchone()[0]
++    return (f"held by sync quarantine of receipt {', '.join(mine)}; release with "
++            f"`{release_command(board, mine[0])}` once you have ruled on the Board's copy")
++
++
++def lift(conn, receipt: str, replayed: list[str], deferred: list[str]) -> None:
++    """Inside the caller's write transaction: drop ``receipt``'s quarantine row and every hold row it derives, the
++    withheld wires just replayed, and keep ``deferred`` wires withheld for a later release."""
++    saved = {}
++    for table in _TABLES:
++        for op in ("update", "delete"):
++            name = f"{table}_{op}"
++            saved[name] = conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)).fetchone()[0]
++            conn.execute(f"DROP TRIGGER {name}")
++    conn.execute("DELETE FROM containment_sync_quarantine_tasks WHERE receipt_uid=?", (receipt,))
++    conn.execute("DELETE FROM containment_sync_quarantine WHERE uid=?", (receipt,))
++    conn.executemany("DELETE FROM containment_sync_withheld WHERE wire=?", [(w,) for w in replayed])
++    conn.executemany("INSERT OR IGNORE INTO containment_sync_withheld VALUES (?)", [(w,) for w in deferred])
++    if not receipts(conn):
++        conn.execute(f"DELETE FROM {_OWNER}")
++    for sql in saved.values():
++        conn.execute(sql)
++
++
++def subjects(conn, table: str, uid: str, fields: dict) -> set[str]:
+     if table == "tasks":
+         return {uid}
+     if table == "task_links":
+@@ -135,75 +173,90 @@ def _subjects(conn, table: str, uid: str, fields: dict) -> set[str]:
+     task = fields.get("task_id")
+     if task:
+         return {task}
+-    # Delete envelopes have no fields. Read the existing row, never infer a task
+-    # from an event uid. Unknown tables/subjects retain the board-level refusal.
+-    if table not in ("task_runs", "task_events", "task_comments", "task_attachments", "task_chat_links"):
++    # Delete envelopes have no fields. Read the existing row (or, for a chat link/attachment deleted here, the
++    # owner its delete recorded), never infer a task from an event uid. Unknown tables keep the board refusal.
++    if table not in ("task_runs", "task_events", "task_comments", *_OWNED):
+         raise ContainmentRefused(f"quarantine cannot identify {table}/{uid}")
+     row = conn.execute(f"SELECT task_id FROM {table} WHERE uid=?", (uid,)).fetchone()
++    if row is None and table in _OWNED and _exists(conn, _OWNER):
++        row = conn.execute(f"SELECT task_id FROM {_OWNER} WHERE table_name=? AND row_uid=?", (table, uid)).fetchone()
+     return {row[0]} if row else set()
+ 
+ 
+-def _wire(change) -> str:
++def wire(change) -> str:
+     return json.dumps(dataclasses.asdict(change), sort_keys=True, separators=(",", ":"), allow_nan=False)
+ 
+ 
++def protected(change) -> bool:
++    return change.table == "task_events" and change.fields.get("kind") in ("contained", "containment_released")
++
++
+ def certified_page(conn, hub, board: str, changes) -> list:
+     """Transport seam around (not weakening) certify_page; run before apply.
+ 
+-    Each refusal is durable before a cursor can move. If journaling fails, the
+-    exception aborts the round and no cursor advances. A later apply failure may
+-    conservatively retain a quarantine, never lose one.
++    Each conflict is durable before a cursor can move. If journaling fails, the exception aborts the round and no
++    cursor advances. A later apply failure may conservatively retain a quarantine, never lose one.
+     """
+     from hermes_cli import kanban_containment_replica as replica
+-    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_containment_lifecycle import ContainmentConflict
+     for change in changes:
+-        if change.table != "task_events" or change.fields.get("kind") not in ("contained", "containment_released"):
++        if not protected(change):
+             continue
+         try:
+             replica.certify_page(conn, hub, board, [change])
+-        except ContainmentRefused as exc:
+-            subjects = _subjects(conn, change.table, change.uid, change.fields)
+-            cached = replica._cached(conn, change.uid)
+-            if cached:
+-                subjects.add(cached["row"]["task_id"])
+-            if not subjects:
+-                raise  # no task identity: fail the board round rather than skip uncertain history
+-            with kb.write_txn(conn, allow_nested=True):
+-                install(conn)
+-                inserted = conn.execute("INSERT OR IGNORE INTO containment_sync_quarantine VALUES (?,?,?,?,?)",
+-                                        (change.uid, sorted(subjects)[0], board, str(exc), _wire(change))).rowcount
+-                conn.executemany("INSERT OR IGNORE INTO containment_sync_quarantine_tasks VALUES (?,?)",
+-                                 [(task, change.uid) for task in subjects])
+-            if inserted:
+-                log.error("kanban sync: quarantined receipt %s on %s tasks=%s: %s; unrelated rows keep syncing",
+-                          change.uid, board, sorted(subjects), exc)
+-            _mirror(conn)
+-    blocked = tasks(conn)
+-    if not blocked:
++        except ContainmentConflict as exc:
++            _quarantine(conn, board, change, exc)
++    return _withhold(conn, changes)
++
++
++def _quarantine(conn, board: str, change, exc) -> None:
++    from hermes_cli import kanban_containment_replica as replica
++    from hermes_cli import kanban_db as kb
++    held_tasks = subjects(conn, change.table, change.uid, change.fields)
++    cached = replica._cached(conn, change.uid)
++    if cached:
++        held_tasks.add(cached["row"]["task_id"])
++    if not held_tasks:
++        raise exc  # no task identity: fail the board round rather than skip uncertain history
++    reason = str(exc) if exc.uid in (None, change.uid) else f"{exc} (receipt {exc.uid})"
++    with kb.write_txn(conn, allow_nested=True):
++        install(conn)
++        inserted = conn.execute("INSERT OR IGNORE INTO containment_sync_quarantine VALUES (?,?,?,?,?,?)",
++                                (change.uid, sorted(held_tasks)[0], board, exc.kind, reason, wire(change))).rowcount
++        conn.executemany("INSERT OR IGNORE INTO containment_sync_quarantine_tasks VALUES (?,?,'direct')",
++                         [(task, change.uid) for task in held_tasks])
++    if inserted:
++        log.error("kanban sync: quarantined receipt %s on %s tasks=%s (%s: %s); unrelated rows keep syncing; "
++                  "release with `%s`", change.uid, board, sorted(held_tasks), exc.kind, reason,
++                  release_command(board, change.uid))
++    _mirror(conn)
++
++
++def _withhold(conn, changes) -> list:
++    from hermes_cli import kanban_db as kb
++    if not tasks(conn):
+         return changes
+     with kb.write_txn(conn, allow_nested=True):
+         install(conn)
+-        # New dependency edges can precede their tasks. Persist their downstream
+-        # holds even though withholding that edge means it is not in task_links.
+-        again = True
+-        while again:
+-            before = len(blocked)
+-            for ch in changes:
+-                if ch.table == "task_links":
+-                    parent, sep, child = ch.uid.partition(">")
+-                    if sep and parent in blocked:
+-                        blocked.add(child)
+-            again = len(blocked) != before
+-        for task in blocked:
+-            conn.execute("INSERT OR IGNORE INTO containment_sync_quarantine_tasks VALUES (?,?)", (task, "dependency"))
++        for receipt in receipts(conn):
++            # New dependency edges can precede their tasks. Persist their downstream holds, per receipt, even
++            # though withholding that edge means it is not in task_links.
++            mine = tasks(conn, receipt)
++            grown = True
++            while grown:
++                before = len(mine)
++                mine |= {ch.uid.partition(">")[2] for ch in changes
++                         if ch.table == "task_links" and ">" in ch.uid and ch.uid.partition(">")[0] in mine}
++                grown = len(mine) != before
++            conn.executemany("INSERT OR IGNORE INTO containment_sync_quarantine_tasks VALUES (?,?,'dependency')",
++                             [(task, receipt) for task in mine])
++        blocked = tasks(conn)
+         safe = []
+         for ch in changes:
+-            subjects = _subjects(conn, ch.table, ch.uid, ch.fields)
+-            if subjects & blocked:
+-                conn.execute("INSERT OR IGNORE INTO containment_sync_withheld VALUES (?)", (_wire(ch),))
+-            elif not subjects and ch.op != "upsert":
+-                # Could be an unknown deleted child of a held task. Keep it, too.
+-                conn.execute("INSERT OR IGNORE INTO containment_sync_withheld VALUES (?)", (_wire(ch),))
++            names = subjects(conn, ch.table, ch.uid, ch.fields)
++            # A delete with no known subject could be an unknown deleted child of a held task: withhold it too.
++            if names & blocked or (not names and ch.op != "upsert"):
++                conn.execute("INSERT OR IGNORE INTO containment_sync_withheld VALUES (?)", (wire(ch),))
+             else:
+                 safe.append(ch)
+     _mirror(conn)
+@@ -219,15 +272,14 @@ def sendable(conn, rows: list[dict], *, blocked: set[str] | None = None) -> list
+         fields = row["fields"]
+         fields = json.loads(fields) if isinstance(fields, str) else fields
+         try:
+-            subjects = _subjects(conn, row["table_name"], row["row_uid"], fields or {})
++            names = subjects(conn, row["table_name"], row["row_uid"], fields or {})
+         except ContainmentRefused:
+             continue  # unidentifiable: stays pending, never pushed
+-        if subjects and not subjects & blocked:
++        if names and not names & blocked:
+             safe.append(row)
+-        elif not subjects and row.get("op") == "delete":
+-            # A delete envelope of a chat link/attachment carries no fields and its local row is gone, so
+-            # the owning task is unknowable. Removing such a row cannot release a hold; do not let one
+-            # quarantined task pin every unrelated delete pending.
++        elif not names and row.get("op") == "delete":
++            # A chat link/attachment deleted before this file had a quarantine left no owner record; removing it
++            # cannot release a hold, so one quarantined task does not pin every unrelated delete pending.
+             safe.append(row)
+     return safe
+ 
+@@ -236,7 +288,7 @@ def snapshot(conn) -> dict:
+     """Carry local safety state across retention rebuilds; called before closing."""
+     if not _exists(conn):
+         return {}
+-    data = {table: [tuple(r) for r in conn.execute(f"SELECT * FROM {table}")] for table in _TABLES}
++    data = {table: [tuple(r) for r in conn.execute(f"SELECT * FROM {table}")] for table in (*_TABLES, _ACCEPTANCES[0])}
+     data["receipts"] = [r[0] for r in conn.execute("SELECT evidence FROM containment_canonical_receipts")]
+     return data
+ 
+@@ -257,8 +309,8 @@ def restore(conn, data: dict, checkpoint: Path | None = None) -> None:
+         replica.remember(conn, proof, board=proof["board"], task=proof["row"]["task_id"], uid=proof["uid"], stop_evidence=stop)
+     with kb.write_txn(conn, allow_nested=True):
+         install(conn)
+-        for table in _TABLES:
+-            for row in data[table]:
++        for table in (*_TABLES, _ACCEPTANCES[0]):
++            for row in data.get(table, ()):
+                 marks = ",".join("?" for _ in row)
+                 conn.execute(f"INSERT OR IGNORE INTO {table} VALUES ({marks})", row)
+     if checkpoint is not None:
+@@ -267,7 +319,9 @@ def restore(conn, data: dict, checkpoint: Path | None = None) -> None:
+ 
+ 
+ def adopt(source, dest) -> None:
+-    """Transfer host-local quarantine before live repair/pickup; no release authority."""
++    """Copy the replica's new hold and acceptance rows into the live file before repair/pickup; no release
++    authority. Only rows the destination lacks are written (no write transaction when there are none), and the
++    withheld ledger is never copied: each file replays only the rows its own pull withheld."""
+     if source is dest or not _exists(source):
+         return
+     from hermes_cli import kanban_containment_replica as replica
+@@ -276,12 +330,22 @@ def adopt(source, dest) -> None:
+         raise ContainmentRefused("quarantine belongs to a different board")
+     # Holds must not depend on replaying receipts: the destination can correctly
+     # retain a different first observation of that uid. Never replace its cache.
++    new = {}
++    for table in _ADOPTED:
++        have = {tuple(r) for r in dest.execute(f"SELECT * FROM {table}")} if _exists(dest, table) else set()
++        new[table] = [row for row in map(tuple, source.execute(f"SELECT * FROM {table}")) if row not in have]
++    if not any(new.values()):
++        return
+     with kb.write_txn(dest, allow_nested=True):
+         install(dest)
+-        for table in _TABLES:
+-            for row in source.execute(f"SELECT * FROM {table}"):
+-                marks = ",".join("?" for _ in row)
+-                dest.execute(f"INSERT OR IGNORE INTO {table} VALUES ({marks})", tuple(row))
++        for table, rows in new.items():
++            for row in rows:
++                dest.execute(f"INSERT OR IGNORE INTO {table} VALUES ({','.join('?' for _ in row)})", row)
++
++
++def notify(live, board: str) -> list[str]:
++    from hermes_cli.kanban_sync_quarantine_notice import notify as file_cards
++    return file_cards(live, board)
+ 
+ 
+ @contextlib.contextmanager
+diff --git a/hermes_cli/kanban_sync_quarantine_notice.py b/hermes_cli/kanban_sync_quarantine_notice.py
+new file mode 100644
+index 0000000000..bbd8620504
+--- /dev/null
++++ b/hermes_cli/kanban_sync_quarantine_notice.py
+@@ -0,0 +1,142 @@
++"""One hub card per quarantined containment receipt, so its owner hears of the hold. [daveey]
++
++A quarantine (``kanban_sync_quarantine``) holds a card and its dependency descendants until an operator rules on
++the Board's evidence; before this module its only signals were one log line and a count in ``sync status``.
++:func:`notify` runs in each board's sync round, after the replica's holds are copied into the live file. Each
++receipt not yet filed opens ONE hub card through the ``hermes-hub`` courier (the dead-watcher alert's route,
++``kanban_sync_watcher_alert``), idempotency key ``containment-quarantine:<board>:<receipt>``, naming the board,
++the held tasks, the receipt, the refusal kind and the exact release command. The hub gateway never files through
++the courier (its card would wait on its own sync-gated board): it logs one ERROR per receipt and records it. A
++failed courier call backs off :data:`RETRY_S`; state persists in ``kanban/.sync-quarantine-alert.json``. Never
++raises.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import time
++from pathlib import Path
++from typing import Callable, Optional
++
++log = logging.getLogger(__name__)
++
++HUB = "hub"
++KEY_PREFIX = "containment-quarantine"
++RETRY_S = 600.0
++_FILE = ".sync-quarantine-alert.json"
++
++
++def key(board: str, receipt: str) -> str:
++    return f"{KEY_PREFIX}:{board}:{receipt}"
++
++
++def _state_path() -> Path:
++    from hermes_cli import kanban_db as kb
++    return kb.kanban_home() / "kanban" / _FILE
++
++
++def _read_state() -> dict:
++    try:
++        data = json.loads(_state_path().read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return {}
++    return data if isinstance(data, dict) else {}
++
++
++def _write_state(state: dict) -> None:
++    target = _state_path()
++    try:
++        target.parent.mkdir(parents=True, exist_ok=True)
++        tmp = target.with_name(f"{_FILE}.tmp")
++        tmp.write_text(json.dumps(state), encoding="utf-8")
++        tmp.replace(target)
++    except OSError:
++        log.warning("kanban sync: cannot record the quarantine notice state at %s", target, exc_info=True)
++
++
++def _body(entry: dict) -> str:
++    from hermes_cli.kanban_sync_quarantine import release_command
++    board, receipt = entry["board"], entry["receipt"]
++    return "\n".join([
++        f"Board **{board}**: this host quarantined containment receipt `{receipt}` because its evidence conflicts "
++        f"({entry['kind']}: {entry['reason']}). The cards below are held here (no dispatch, pickup or push) until "
++        "an operator rules on the Board's copy; every other card keeps syncing.",
++        "",
++        f"- Receipt: `{receipt}` (task `{entry['task']}`)",
++        f"- Held tasks: {', '.join(f'`{t}`' for t in entry['held_tasks']) or '-'}",
++        f"- Refusal kind: `{entry['kind']}`",
++        "",
++        "Do: 1) compare the Board's evidence for the receipt with this host's first observation "
++        f"(`hermes kanban --board {board} sync quarantine --json`); 2) if the Board's copy is the legitimate one, "
++        f"release it on that host: `{release_command(board, receipt)}` (records your acceptance and replays the "
++        "withheld rows); 3) done when `hermes kanban sync status` shows no quarantined receipt.",
++    ])
++
++
++def notify(conn, board: str, *, runner: Optional[Callable[[list[str]], tuple[int, str, str]]] = None,
++           hub_cli: Optional[str] = None, host: Optional[str] = None, now: Optional[float] = None) -> list[str]:
++    """File one hub card per new quarantined receipt of ``board`` in ``conn``; the request ids filed. Never raises."""
++    try:
++        return _notify(conn, board, runner, hub_cli, host, time.time() if now is None else now)
++    except Exception as exc:  # health: allow BLE001 -- a notice must never fail the sync round
++        log.warning("kanban sync: quarantine notice for %s failed: %s", board, exc, exc_info=True)
++        _write_state({**_read_state(), "last_attempt": time.time() if now is None else now,
++                      "last_error": str(exc)[:500]})
++        return []
++
++
++def _notify(conn, board, runner, hub_cli, host, now) -> list[str]:
++    from hermes_cli import kanban_sync_quarantine as quarantine
++    entries = quarantine.entries(conn)
++    state = _read_state()
++    filed = dict(state.get("filed") or {})
++    current = {key(board, e["receipt"]) for e in entries}
++    stale = [k for k in filed if k.startswith(f"{KEY_PREFIX}:{board}:") and k not in current]
++    todo = [e for e in entries if key(board, e["receipt"]) not in filed]
++    if stale and not todo:  # released receipts: forget them so a re-quarantine files again
++        _write_state({**state, "filed": {k: v for k, v in filed.items() if k not in stale}})
++    if not todo:
++        return []
++    if state.get("last_error") and now - float(state.get("last_attempt") or 0) < RETRY_S:
++        return []
++    for k in stale:
++        filed.pop(k, None)
++    if host is None:
++        from hermes_cli.kanban_sync_watcher_alert import _gateway
++        host = _gateway()
++    if host == HUB:
++        for entry in todo:
++            log.error("kanban sync: hub quarantined containment receipt %s on %s (tasks %s, %s); no hub card filed "
++                      "(it would wait on this board's own sync); release with `%s`", entry["receipt"], board,
++                      entry["held_tasks"], entry["kind"], quarantine.release_command(board, entry["receipt"]))
++            filed[key(board, entry["receipt"])] = {"hub": True, "seen_at": now}
++        _write_state({**state, "filed": filed})
++        return []
++    from hermes_cli import kanban_capability_registry as reg
++    from hermes_cli import kanban_placement as kp
++    runner = runner or kp.hub_runner
++    if runner is kp._default_runner:
++        from hermes_state_guard import _in_test_context
++        if _in_test_context():
++            log.warning("kanban sync: quarantine hub card not filed from a test process")
++            return []
++    hub_cli = hub_cli or reg.hub_cli_path(kp.config().get("hub_cli"))
++    out: list[str] = []
++    for entry in todo:
++        rid = key(board, entry["receipt"])
++        title = f"Containment receipt quarantined on {host}/{board}: {entry['task']}"
++        argv = [hub_cli, "create-task", HUB, title, "--body", _body(entry), "--assignee", "default",
++                "--origin-session", "", "--id", rid, "--option", f"idempotency_key={json.dumps(rid)}",
++                "--option", "priority=900"]
++        rc, stdout, err = runner(argv)
++        if rc not in (0, 3):
++            error = f"create-task exit {rc}: {(err or stdout or '')[-300:]}"
++            _write_state({**state, "filed": filed, "last_attempt": now, "last_error": error})
++            log.warning("kanban sync: quarantine hub card for %s not filed (%s); retry in %ds", rid, error, RETRY_S)
++            return out
++        filed[rid] = {"request_id": rid, "filed_at": now, "host": host}
++        out.append(rid)
++        log.error("kanban sync: opened a hub card for quarantined receipt %s on %s (request %s)",
++                  entry["receipt"], board, rid)
++    _write_state({k: v for k, v in {**state, "filed": filed, "last_attempt": now}.items() if k != "last_error"})
++    return out
+diff --git a/hermes_cli/kanban_sync_quarantine_release.py b/hermes_cli/kanban_sync_quarantine_release.py
+new file mode 100644
+index 0000000000..d7554c37db
+--- /dev/null
++++ b/hermes_cli/kanban_sync_quarantine_release.py
+@@ -0,0 +1,245 @@
++"""Operator release of one quarantined receipt: acceptance plus certified catch-up, never a bare delete. [daveey]
++
++``hermes kanban sync quarantine --release RECEIPT --reason TEXT`` (``release_board``) runs under the board's sync
++lock, the replica (shadow) first and then the live file, so a sync round can neither copy the hold back nor run
++between the two. For each file, :func:`release`:
++
++a. fetches the Board's current evidence for the receipt (and, for a release receipt, its stop receipt) and refuses
++   unless it is live and certifies: a non-live or unavailable copy keeps the hold;
++b. appends a ``containment_sync_acceptances`` row (receipt, sha256 of the accepted certified identity, the evidence,
++   reason, operator, time): the durable audit record. ``remember`` then treats exactly that evidence as matching;
++   the first receipt row stays and nothing is erased;
++c. replays, in seq order, the receipt's canonical event (built from that evidence) and every withheld row the
++   release frees, through ``certify_page`` and ``apply_remote_changes`` (version/HLC fences, local pending edits
++   win). Protected events are replayed from the Board's current evidence, not the stale feed copy. The holds are
++   deleted inside that apply transaction, so a refused certify or a failed apply leaves every hold in place. A
++   freed event whose task another receipt still holds stays withheld for that receipt's release.
++
++The live file of a primary board replays its own partition; any other live file only lifts the holds (it holds
++no feed rows of its own and takes the replica's state through pickup, which certifies against the acceptance).
++"""
++from __future__ import annotations
++
++import getpass
++import hashlib
++import json
++import logging
++import time
++from pathlib import Path
++
++from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
++
++log = logging.getLogger(__name__)
++_TABLE = "containment_sync_acceptances"
++
++
++class ReleaseRefused(ContainmentRefused):
++    """The receipt stays quarantined: the Board's evidence is not live and certified, or the catch-up failed."""
++
++
++def digest(raw: str) -> str:
++    """sha256 of the certified identity of one evidence response (row bookkeeping and transport keys excluded)."""
++    from hermes_cli.kanban_containment_replica import _certified
++    return hashlib.sha256(json.dumps(_certified(raw)).encode()).hexdigest()
++
++
++def _has_table(conn) -> bool:
++    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (_TABLE,)).fetchone() is not None
++
++
++def accepted(conn, uid: str, raw: str) -> bool:
++    """An operator accepted exactly this evidence for ``uid``."""
++    return _has_table(conn) and conn.execute(f"SELECT 1 FROM {_TABLE} WHERE receipt_uid=? AND sha256=? LIMIT 1",
++                                             (uid, digest(raw))).fetchone() is not None
++
++
++def accepted_evidence(conn, uid: str) -> dict | None:
++    """The newest accepted evidence for ``uid``, or None."""
++    if not _has_table(conn):
++        return None
++    row = conn.execute(f"SELECT evidence FROM {_TABLE} WHERE receipt_uid=? ORDER BY accepted_at DESC, rowid DESC "
++                       "LIMIT 1", (uid,)).fetchone()
++    return json.loads(row[0]) if row else None
++
++
++def _raw(evidence: dict) -> str:
++    return json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False)
++
++
++def _fetch(hub, board: str, uid: str) -> dict:
++    try:
++        return hub.row_evidence(board, "task_events", uid)
++    except Exception as exc:  # health: allow BLE001 -- any fetch failure means "unavailable": the hold stays
++        raise ReleaseRefused(f"Board evidence for {uid} is unavailable ({type(exc).__name__}: {exc})") from exc
++
++
++def _live_chain(hub, board: str, change) -> list[tuple[str, dict]]:
++    """``[(uid, evidence)]`` for the receipt (its stop receipt first), each live and certified now."""
++    from hermes_cli import kanban_containment_canonical as canonical
++    from hermes_cli.kanban_containment_state import _payload
++    task = change.fields.get("task_id")
++    evidence = _fetch(hub, board, change.uid)
++    try:
++        if change.fields.get("kind") == "containment_released":
++            episode = str((_payload(change.fields) or {}).get("episode"))
++            stop = _fetch(hub, board, episode)
++            canonical.certified_release(stop, evidence, board=board, task=task, episode=episode, receipt=change.uid)
++            return [(episode, stop), (change.uid, evidence)]
++        canonical.certified_stop(evidence, board=board, task=task, uid=change.uid)
++    except ReleaseRefused:
++        raise
++    except ContainmentRefused as exc:
++        raise ReleaseRefused(f"Board evidence for {change.uid} is not live and certified: {exc}") from exc
++    return [(change.uid, evidence)]
++
++
++def _accept(conn, chain, receipt: str, reason: str, operator: str, now: float) -> None:
++    from hermes_cli import kanban_containment_replica as replica
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_sync_quarantine as quarantine
++    with kb.write_txn(conn):
++        quarantine.install(conn)
++        for uid, evidence in chain:
++            raw = _raw(evidence)
++            first = conn.execute("SELECT evidence FROM containment_canonical_receipts WHERE uid=?", (uid,)).fetchone()
++            if uid != receipt and (first is None or replica._certified(first[0]) == replica._certified(raw)):
++                continue  # the released receipt always; a stop receipt only when its identity changed too
++            conn.execute(f"INSERT OR IGNORE INTO {_TABLE} VALUES (?,?,?,?,?,?)",
++                         (uid, digest(raw), raw, reason, operator, int(now)))
++
++
++def _free(conn, change, blocked: set[str]) -> bool:
++    from hermes_cli import kanban_sync_quarantine as quarantine
++    try:
++        names = quarantine.subjects(conn, change.table, change.uid, change.fields)
++    except ContainmentRefused:
++        return False
++    return bool(names and not names & blocked) or (not names and not blocked)
++
++
++def _canonical(hub, board: str, chosen: list) -> list:
++    """Protected events from the Board's current evidence (one per uid), the rest as withheld; in seq order."""
++    from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli import kanban_sync_quarantine as quarantine
++    events, rows = {}, []
++    for ch in sorted(chosen, key=lambda c: c.seq):
++        if quarantine.protected(ch) and ch.op == "upsert":
++            events[ch.uid] = ksc._row_change("task_events", _fetch(hub, board, ch.uid)["row"], seq=ch.seq)
++        else:
++            rows.append(ch)
++    return sorted(rows + list(events.values()), key=lambda c: c.seq)
++
++
++def _apply(conn, hub, board: str, receipt: str, changes: list, replayed: list[str], deferred: list[str],
++           observers: bool) -> None:
++    from hermes_cli import kanban_containment_replica as replica
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_quarantine as quarantine
++    if changes:
++        if sync.board_mode(conn) == "off":
++            raise ReleaseRefused("kanban sync is not enabled on this file, so nothing can replay; the hold stays")
++        try:
++            replica.certify_page(conn, hub, board, changes)
++        except ContainmentRefused as exc:
++            raise ReleaseRefused(f"the catch-up did not certify ({exc}); the hold stays") from exc
++        lifted: list[bool] = []
++
++        def lift_first(c, _change) -> bool:  # runs inside the apply transaction, before the first row applies
++            if not lifted:
++                quarantine.lift(c, receipt, replayed, deferred)
++                lifted.append(True)
++            return True
++
++        cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
++        sync.apply_remote_changes(conn, changes, new_cursor=cursor, board=board, observers=observers,
++                                  local_pending_wins=True, keep=lift_first)
++        if lifted:
++            return
++    with kb.write_txn(conn):
++        quarantine.lift(conn, receipt, replayed, deferred)
++
++
++def release(conn, hub, board: str, receipt: str, *, reason: str, operator: str, partition: str | None = None,
++            replay: bool = True, observers: bool = False, now: float | None = None) -> dict | None:
++    """Release ``receipt`` in this file (module docstring). None when this file does not quarantine it; raises
++    :class:`ReleaseRefused` (every hold kept) when the Board's evidence is not live or the catch-up fails."""
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli import kanban_sync_quarantine as quarantine
++    if receipt not in quarantine.receipts(conn):
++        return None
++    raw = conn.execute("SELECT wire FROM containment_sync_quarantine WHERE uid=?", (receipt,)).fetchone()[0]
++    change = sync.RemoteChange(**json.loads(raw))
++    chain = _live_chain(hub, board, change)
++    _accept(conn, chain, receipt, reason, operator, time.time() if now is None else now)
++    own = ksc._row_change("task_events", chain[-1][1]["row"], seq=change.seq)
++    blocked = quarantine.tasks(conn, without=receipt)
++    replayed, chosen, deferred = [], [], []
++    if replay:
++        for (text,) in conn.execute("SELECT wire FROM containment_sync_withheld").fetchall():
++            ch = sync.RemoteChange(**json.loads(text))
++            if _free(conn, ch, blocked):
++                replayed.append(text)
++                chosen.append(ch)
++        if _free(conn, own, blocked):
++            chosen.append(own)
++        else:
++            deferred.append(quarantine.wire(own))
++    changes = _canonical(hub, board, chosen)
++    if partition is not None:
++        changes = ksc.own_partition(conn, changes, partition)
++    _apply(conn, hub, board, receipt, changes, replayed, deferred, observers)
++    log.warning("kanban sync: released quarantine receipt %s on %s by %s (%s): %d row(s) replayed, %d deferred",
++                receipt, board, operator, reason, len(changes), len(deferred))
++    return {"receipt": receipt, "released": True, "replayed": len(changes), "deferred": len(deferred),
++            "still_held": sorted(quarantine.tasks(conn))}
++
++
++def _operator(gateway: str) -> str:
++    try:
++        user = getpass.getuser()
++    except (KeyError, OSError):
++        user = "unknown"
++    return f"{user}@{gateway}"
++
++
++def release_board(slug: str, live_path: Path, receipt: str, reason: str) -> tuple[int, str]:
++    """The CLI's release: (exit code, message). 0 released, 1 no such receipt here, 2 refused or busy."""
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli import kanban_sync_guard as guard
++    ident = ksc.load_identity()
++    hub, operator = ksc.Hub(ident), _operator(ident.gateway)
++    done: list[tuple[str, dict]] = []
++    try:
++        with guard.board_sync_lock(live_path):
++            shadow = ksc.shadow_path(slug)
++            if shadow.exists():
++                conn = ksc.open_shadow(slug, ident.gateway)
++                try:
++                    if result := release(conn, hub, slug, receipt, reason=reason, operator=operator):
++                        done.append(("replica", result))
++                finally:
++                    conn.close()
++            conn = kbc.connect(live_path)
++            try:
++                primary = sync.board_mode(conn) == "primary"
++                if result := release(conn, hub, slug, receipt, reason=reason, operator=operator,
++                                     partition=ident.gateway if primary else None, replay=primary, observers=primary):
++                    done.append(("live", result))
++            finally:
++                conn.close()
++    except guard.SyncRoundBusy as exc:
++        return 2, f"kanban sync: {receipt} not released: a sync round holds board {slug} ({exc}); retry shortly"
++    except ReleaseRefused as exc:
++        partial = f" (already released in: {', '.join(name for name, _ in done)}; rerun to finish)" if done else ""
++        return 2, f"kanban sync: {receipt} not released: {exc}{partial}"
++    if not done:
++        return 1, f"kanban sync: no quarantined receipt {receipt} on board {slug}"
++    replayed = sum(r["replayed"] for _, r in done)
++    still = sorted({t for _, r in done for t in r["still_held"]})
++    return 0, (f"kanban sync: released {receipt} ({reason}) in {', '.join(name for name, _ in done)}: accepted the "
++               f"Board's live evidence (recorded in {_TABLE}) and applied {replayed} withheld row(s) through "
++               "certify+apply" + (f"; still held by other receipts: {', '.join(still)}" if still else ""))
+diff --git a/tests/hermes_cli/kanban_quarantine_support.py b/tests/hermes_cli/kanban_quarantine_support.py
+new file mode 100644
+index 0000000000..8d5957b208
+--- /dev/null
++++ b/tests/hermes_cli/kanban_quarantine_support.py
+@@ -0,0 +1,32 @@
++"""Shared fixtures for the receipt-quarantine tests (fixture Board doubles only, never a live store)."""
++from __future__ import annotations
++
++import copy
++from types import SimpleNamespace
++
++from hermes_cli import kanban_containment_replica as replica
++from hermes_cli import kanban_sync_quarantine as quarantine
++from tests.hermes_cli import test_kanban_containment_replica as fixtures
++
++
++def conflict(conn, *, both: bool = False) -> SimpleNamespace:
++    """Quarantine the stop receipt the way a Board re-stamp does (its certified ``created_at`` changes after this
++    host remembered it). ``both`` also delivers the release event, whose certification re-checks that stop receipt,
++    so a second receipt names the same task."""
++    target, child, stop, release, hub = fixtures.scenario(conn)
++    uid = stop["event_uid"]
++    replica.remember(conn, hub.events[uid], board="fixture", task=target, uid=uid)
++    original = copy.deepcopy(hub.events[uid])
++    hub.events[uid]["row"]["created_at"] += 1
++    page = [fixtures.event(stop, hub, 1)]
++    if both:
++        page.append(fixtures.event(release, hub, 2))
++    assert quarantine.certified_page(conn, hub, "fixture", page) == []
++    return SimpleNamespace(target=target, child=child, stop=stop, release=release, hub=hub, original=original,
++                           uid=uid, release_uid=release["event_uid"])
++
++
++def count(conn, table: str) -> int:
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
++        return 0
++    return conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+diff --git a/tests/hermes_cli/test_kanban_receipt_quarantine_cli.py b/tests/hermes_cli/test_kanban_receipt_quarantine_cli.py
+new file mode 100644
+index 0000000000..589b8b6414
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_receipt_quarantine_cli.py
+@@ -0,0 +1,97 @@
++"""``hermes kanban sync quarantine`` and the ``sync status`` line, through ``cmd_sync`` (review r3, item 5)."""
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_cli as cli
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_quarantine as quarantine
++from tests.hermes_cli import kanban_quarantine_support as support
++from tests.hermes_cli import test_kanban_containment_replica as fixtures
++
++kanban_home = fixtures.kanban_home
++synced_conn = fixtures.synced_conn
++
++
++@pytest.fixture
++def board(synced_conn, kanban_home, monkeypatch):
++    """The fixture-board file plays the replica (shadow); a second synced file plays this gateway's live board."""
++    case = support.conflict(synced_conn)
++    shadow = Path(synced_conn.execute("PRAGMA database_list").fetchone()[2])
++    live = kanban_home / "live.db"
++    with kbc.connect_closing(db_path=live) as conn:
++        sync.set_identity(conn, "fixture", "worker")
++    monkeypatch.setattr(cli, "_path", lambda slug: live)
++    monkeypatch.setattr(ksc, "shadow_path", lambda slug: shadow)
++    monkeypatch.setattr(ksc, "load_identity", lambda: SimpleNamespace(gateway="worker", url="https://board.test"))
++    monkeypatch.setattr(ksc, "Hub", lambda ident: case.hub)
++    return SimpleNamespace(case=case, shadow=synced_conn, live=live)
++
++
++def _run(**kw) -> int:
++    args = argparse.Namespace(sync_action="quarantine", board="fixture", json=kw.pop("json", False),
++                              release=kw.pop("release", None), reason=kw.pop("reason", None))
++    return cli.cmd_sync(args)
++
++
++def test_listing_names_each_receipt_and_the_tasks_it_holds(board, capsys):
++    assert _run(json=True) == 0
++    out = json.loads(capsys.readouterr().out)
++    [entry] = out["quarantined"]
++    assert entry["receipt"] == board.case.uid and entry["kind"] == "identity_changed"
++    assert board.case.target in entry["held_tasks"] and board.case.child in entry["held_tasks"]
++
++
++def test_release_requires_a_reason(board, capsys):
++    assert _run(release=board.case.uid) == 2
++    assert "--reason" in capsys.readouterr().out
++    assert _run(release=board.case.uid, reason="   ") == 2
++    assert quarantine.held(board.shadow, board.case.target)
++
++
++def test_release_of_an_unknown_receipt_exits_1(board, capsys):
++    assert _run(release="no-such-receipt", reason="typo") == 1
++    assert "no quarantined receipt no-such-receipt" in capsys.readouterr().out
++
++
++def test_release_refused_while_board_evidence_is_not_live_exits_2(board, capsys):
++    board.case.hub.events[board.case.uid]["state"] = "deleted"
++    assert _run(release=board.case.uid, reason="ruled benign") == 2
++    assert "not released" in capsys.readouterr().out
++    assert quarantine.held(board.shadow, board.case.target)
++
++
++def test_release_accepts_replays_and_lifts_the_hold(board, capsys):
++    assert _run(release=board.case.uid, reason="ruled benign") == 0
++    out = capsys.readouterr().out
++    assert f"released {board.case.uid}" in out and "accepted" in out
++    assert not quarantine.held(board.shadow, board.case.target)
++    assert support.count(board.shadow, "containment_sync_acceptances") == 1
++    assert board.shadow.execute("SELECT 1 FROM task_events WHERE uid=?", (board.case.uid,)).fetchone()
++
++
++def test_release_while_a_round_holds_the_board_exits_2(board, capsys, monkeypatch):
++    from hermes_cli import kanban_sync_guard as guard
++
++    def busy(path):
++        raise guard.SyncRoundBusy("board sync round is busy")
++    monkeypatch.setattr(guard, "board_sync_lock", busy)
++    assert _run(release=board.case.uid, reason="ruled benign") == 2
++    assert "busy" in capsys.readouterr().out
++    assert quarantine.held(board.shadow, board.case.target)
++
++
++def test_status_line_points_at_the_quarantine_command(board, capsys, monkeypatch):
++    monkeypatch.setattr(cli, "_path", lambda slug: Path(board.shadow.execute("PRAGMA database_list").fetchone()[2]))
++    monkeypatch.setattr(ksc, "shadow_path", lambda slug: Path("/nonexistent/shadow.db"))
++    args = argparse.Namespace(sync_action="status", board="fixture", json=True)
++    assert cli.cmd_sync(args) == 0
++    out = json.loads(capsys.readouterr().out)
++    assert out["quarantined"] == "1 receipt(s) held; run `hermes kanban --board fixture sync quarantine`"
+diff --git a/tests/hermes_cli/test_kanban_receipt_quarantine_conflict.py b/tests/hermes_cli/test_kanban_receipt_quarantine_conflict.py
+new file mode 100644
+index 0000000000..98c5f4122f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_receipt_quarantine_conflict.py
+@@ -0,0 +1,84 @@
++"""Only a deterministic evidence conflict quarantines; every other refusal refuses the page (review r3, item 1)."""
++from __future__ import annotations
++
++import copy
++
++import pytest
++
++from hermes_cli import kanban_containment_connections as connections
++from hermes_cli import kanban_containment_replica as replica
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_quarantine as quarantine
++from hermes_cli.kanban_containment_lifecycle import ContainmentConflict, ContainmentRefused
++from tests.hermes_cli import kanban_quarantine_support as support
++from tests.hermes_cli import test_kanban_containment_replica as fixtures
++
++kanban_home = fixtures.kanban_home
++synced_conn = fixtures.synced_conn
++
++
++def _feed(monkeypatch, changes):
++    page = {"changes": changes, "next": changes[-1].seq, "more": False}
++    monkeypatch.setattr(ksc.acw, "changes_page", lambda *args: page)
++    monkeypatch.setattr(ksc, "adapt", lambda change: change)
++
++
++@pytest.mark.parametrize("state", ["deleted", "unavailable"])
++def test_non_live_evidence_refuses_the_page_without_quarantine_then_applies(synced_conn, monkeypatch, state):
++    conn = synced_conn
++    target, _, stop, _, hub = fixtures.scenario(conn)
++    uid = stop["event_uid"]
++    marker = sync.RemoteChange(1, "tasks", target, "upsert", {"status": "triage", "containment_episode": uid},
++                               100, "", "home")
++    _feed(monkeypatch, [marker, fixtures.event(stop, hub, 2)])
++    before = sync.sync_state(conn)["cursor"]
++    hub.events[uid]["state"] = state
++    with pytest.raises(ContainmentRefused) as caught:
++        ksc.pull(conn, hub, "fixture", observers=False)
++    assert not isinstance(caught.value, ContainmentConflict)
++    assert sync.sync_state(conn)["cursor"] == before
++    assert support.count(conn, "containment_sync_quarantine") == 0
++    assert not quarantine.tasks(conn)
++    hub.events[uid]["state"] = "live"  # the transient cause is gone: the same page applies whole
++    ksc.pull(conn, hub, "fixture", observers=False)
++    assert sync.sync_state(conn)["cursor"] == 2
++    assert conn.execute("SELECT 1 FROM task_events WHERE uid=?", (uid,)).fetchone() is not None
++    assert kb.get_task(conn, target).containment_episode == uid
++    assert connections.held(conn, target)
++    assert kb.claim_task(conn, target) is None
++
++
++def test_conflicts_are_typed_at_exactly_the_two_deterministic_sites(synced_conn):
++    conn = synced_conn
++    target, _, stop, _, hub = fixtures.scenario(conn)
++    uid = stop["event_uid"]
++    replica.remember(conn, hub.events[uid], board="fixture", task=target, uid=uid)
++    changed = copy.deepcopy(hub.events[uid])
++    changed["row"]["created_at"] += 1
++    with pytest.raises(ContainmentConflict) as identity:
++        replica.remember(conn, changed, board="fixture", task=target, uid=uid)
++    assert (identity.value.kind, identity.value.uid) == ("identity_changed", uid)
++    origin = fixtures.event(stop, hub, 1)
++    origin = sync.RemoteChange(1, origin.table, origin.uid, origin.op, origin.fields, 1, "", "server")
++    with pytest.raises(ContainmentConflict) as differs:
++        replica.certify_page(conn, hub, "fixture", [origin])
++    assert differs.value.kind == "event_differs"
++    hub.events[uid]["state"] = "deleted"
++    with pytest.raises(ContainmentRefused) as unproven:
++        replica.certify_page(conn, hub, "fixture", [fixtures.event(stop, hub, 1)])
++    assert not isinstance(unproven.value, ContainmentConflict)
++
++
++def test_event_differs_quarantines_only_that_task(synced_conn):
++    conn = synced_conn
++    target, child, stop, _, hub = fixtures.scenario(conn)
++    other = kb.create_task(conn, title="Unrelated", assignee="default")
++    event = fixtures.event(stop, hub, 1)
++    rehomed = sync.RemoteChange(1, event.table, event.uid, event.op, event.fields, 1, "", "server")
++    healthy = sync.RemoteChange(2, "tasks", other, "upsert", {"title": "Unrelated synced"}, 200, "", "worker")
++    assert quarantine.certified_page(conn, hub, "fixture", [rehomed, healthy]) == [healthy]
++    [entry] = quarantine.entries(conn)
++    assert entry["receipt"] == stop["event_uid"] and entry["kind"] == "event_differs"
++    assert quarantine.held(conn, target) and quarantine.held(conn, child) and not quarantine.held(conn, other)
+diff --git a/tests/hermes_cli/test_kanban_receipt_quarantine_holds.py b/tests/hermes_cli/test_kanban_receipt_quarantine_holds.py
+new file mode 100644
+index 0000000000..2723a4b9e7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_receipt_quarantine_holds.py
+@@ -0,0 +1,54 @@
++"""Holds are keyed per receipt: a task stays held while ANY unreleased receipt names it (review r3, item 2)."""
++from __future__ import annotations
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_quarantine as quarantine
++from hermes_cli import kanban_sync_quarantine_release as qr
++from tests.hermes_cli import kanban_quarantine_support as support
++from tests.hermes_cli import test_kanban_containment_replica as fixtures
++
++kanban_home = fixtures.kanban_home
++synced_conn = fixtures.synced_conn
++
++
++def _release(conn, case, uid):
++    return qr.release(conn, case.hub, "fixture", uid, reason="Board re-stamp ruled benign", operator="test")
++
++
++def test_two_receipts_on_one_task_hold_it_until_both_are_released(synced_conn):
++    conn = synced_conn
++    case = support.conflict(conn, both=True)
++    listed = {e["receipt"]: e["held_tasks"] for e in quarantine.entries(conn)}
++    assert set(listed) == {case.uid, case.release_uid}
++    assert all(case.target in held and case.child in held for held in listed.values())
++    assert quarantine.holders(conn, case.target) == sorted([case.uid, case.release_uid])
++    assert _release(conn, case, case.uid)["released"]
++    assert quarantine.held(conn, case.target) and quarantine.held(conn, case.child)
++    assert [e["receipt"] for e in quarantine.entries(conn)] == [case.release_uid]
++    assert _release(conn, case, case.release_uid)["released"]
++    assert not quarantine.held(conn, case.target) and not quarantine.held(conn, case.child)
++    assert quarantine.entries(conn) == []
++
++
++def test_release_drops_only_that_receipts_dependency_marks(synced_conn):
++    conn = synced_conn
++    a = support.conflict(conn)
++    b = support.conflict(conn)
++    dependent = kb.create_task(conn, title="Dependent of A via a withheld edge", assignee="default")
++    edge = sync.RemoteChange(5, "task_links", f"{a.target}>{dependent}", "upsert",
++                             {"parent_id": a.target, "child_id": dependent}, 5, "", "worker")
++    assert quarantine.certified_page(conn, a.hub, "fixture", [edge]) == []
++    marks = {tuple(r) for r in conn.execute("SELECT task_id,receipt_uid,via FROM containment_sync_quarantine_tasks")}
++    assert (dependent, a.uid, "dependency") in marks and (a.child, a.uid, "dependency") in marks
++    assert (b.child, b.uid, "dependency") in marks and (b.child, a.uid, "dependency") not in marks
++    assert quarantine.held(conn, dependent)
++    assert _release(conn, a, a.uid)["released"]
++    remaining = {tuple(r) for r in conn.execute("SELECT task_id,receipt_uid FROM containment_sync_quarantine_tasks")}
++    assert all(receipt == b.uid for _task, receipt in remaining)
++    for task in (a.target, a.child, dependent):
++        assert not quarantine.held(conn, task)
++    for task in (b.target, b.child):
++        assert quarantine.held(conn, task)
++    # the withheld edge was replayed with the release, so the dependency is real again, now unheld
++    assert conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?", (a.target, dependent)).fetchone()
+diff --git a/tests/hermes_cli/test_kanban_receipt_quarantine_notice.py b/tests/hermes_cli/test_kanban_receipt_quarantine_notice.py
+new file mode 100644
+index 0000000000..4c92ead79e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_receipt_quarantine_notice.py
+@@ -0,0 +1,84 @@
++"""The owner hears of a quarantine: one hub card per receipt and a queue reason on the held card (review r3, item 4)."""
++from __future__ import annotations
++
++import logging
++
++from hermes_cli import kanban_containment_connections as connections
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_queue_position as kqp
++from hermes_cli import kanban_sync_quarantine_notice as notice
++from tests.hermes_cli import kanban_quarantine_support as support
++from tests.hermes_cli import test_kanban_containment_replica as fixtures
++
++kanban_home = fixtures.kanban_home
++synced_conn = fixtures.synced_conn
++
++
++class Courier:
++    def __init__(self, rc=0):
++        self.calls, self.rc = [], rc
++
++    def __call__(self, argv):
++        self.calls.append(argv)
++        return self.rc, "", "courier down" if self.rc else ""
++
++
++def _arg(argv, flag):
++    return argv[argv.index(flag) + 1]
++
++
++def test_one_hub_card_per_receipt_naming_board_tasks_kind_and_release_command(synced_conn):
++    conn = synced_conn
++    case = support.conflict(conn, both=True)
++    courier = Courier()
++    filed = notice.notify(conn, "fixture", runner=courier, hub_cli="hermes-hub", host="worker-1", now=1000.0)
++    keys = {f"containment-quarantine:fixture:{case.uid}", f"containment-quarantine:fixture:{case.release_uid}"}
++    assert set(filed) == keys and len(courier.calls) == 2
++    for argv in courier.calls:
++        assert argv[:3] == ["hermes-hub", "create-task", "hub"]
++        assert _arg(argv, "--id") in keys and f"idempotency_key=\"{_arg(argv, '--id')}\"" in argv
++        body = _arg(argv, "--body")
++        receipt = _arg(argv, "--id").rsplit(":", 1)[1]
++        assert "fixture" in body and case.target in body and "identity_changed" in body
++        assert f"hermes kanban --board fixture sync quarantine --release {receipt} --reason" in body
++    assert notice.notify(conn, "fixture", runner=courier, hub_cli="hermes-hub", host="worker-1", now=1001.0) == []
++    assert len(courier.calls) == 2  # once per receipt
++
++
++def test_hub_host_logs_once_and_files_no_card(synced_conn, caplog):
++    conn = synced_conn
++    case = support.conflict(conn)
++    courier = Courier()
++    caplog.clear()  # the quarantine's own log line is not the notice
++    with caplog.at_level(logging.ERROR, logger=notice.log.name):
++        notice.notify(conn, "fixture", runner=courier, hub_cli="hermes-hub", host="hub", now=1000.0)
++        notice.notify(conn, "fixture", runner=courier, hub_cli="hermes-hub", host="hub", now=1001.0)
++    assert courier.calls == []
++    assert sum(case.uid in r.getMessage() for r in caplog.records) == 1
++    assert notice._read_state()["filed"][f"containment-quarantine:fixture:{case.uid}"]["hub"] is True
++
++
++def test_courier_failure_backs_off_ten_minutes(synced_conn):
++    conn = synced_conn
++    support.conflict(conn)
++    down = Courier(rc=1)
++    assert notice.notify(conn, "fixture", runner=down, hub_cli="hermes-hub", host="worker-1", now=1000.0) == []
++    assert len(down.calls) == 1 and "courier down" in notice._read_state()["last_error"]
++    up = Courier()
++    assert notice.notify(conn, "fixture", runner=up, hub_cli="hermes-hub", host="worker-1", now=1000.0 + 599) == []
++    assert up.calls == []
++    assert len(notice.notify(conn, "fixture", runner=up, hub_cli="hermes-hub", host="worker-1", now=1000.0 + 601)) == 1
++    assert "last_error" not in notice._read_state()
++
++
++def test_held_card_queue_reason_and_refusal_name_the_receipt_and_its_release(synced_conn):
++    conn = synced_conn
++    case = support.conflict(conn)
++    command = f"hermes kanban --board fixture sync quarantine --release {case.uid} --reason"
++    place = kqp.position(conn, kb.get_task(conn, case.target))
++    assert place["lane"] == "sync_quarantine"
++    note = kqp.describe(place)
++    assert f"held by sync quarantine of receipt {case.uid}" in note and command in note
++    for task in (case.target, case.child):
++        text = connections.refusal(conn, task)
++        assert "resume-contained required" not in text and case.uid in text and command in text
+diff --git a/tests/hermes_cli/test_kanban_receipt_quarantine_release.py b/tests/hermes_cli/test_kanban_receipt_quarantine_release.py
+index ea94bca841..69a2a6cc35 100644
+--- a/tests/hermes_cli/test_kanban_receipt_quarantine_release.py
++++ b/tests/hermes_cli/test_kanban_receipt_quarantine_release.py
+@@ -1,15 +1,23 @@
+-"""Review round 2: unrelated deletes keep flowing, the hold is owner-visible and has a real release path."""
++"""Release = operator acceptance + certified catch-up, never a bare delete (review r3, items 3 and 5)."""
+ from __future__ import annotations
+ 
++import hashlib
+ import json
++import sqlite3
+ import time
+ 
++import pytest
++
+ from hermes_cli import kanban_containment_connections as connections
++from hermes_cli import kanban_containment_replica as replica
+ from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_sync_client as ksc
+ from hermes_cli import kanban_sync_quarantine as quarantine
++from hermes_cli import kanban_sync_quarantine_release as qr
++from tests.hermes_cli import kanban_quarantine_support as support
+ from tests.hermes_cli import test_kanban_containment_replica as fixtures
+-from tests.hermes_cli import test_kanban_receipt_quarantine_safety as safety
+ 
+ kanban_home = fixtures.kanban_home
+ synced_conn = fixtures.synced_conn
+@@ -24,67 +32,159 @@ class Hub:
+         return {"results": []}
+ 
+ 
+-def _link(conn, task):
++def _release(conn, case, uid=None):
++    return qr.release(conn, case.hub, "fixture", uid or case.uid, reason="Board re-stamp ruled benign",
++                      operator="test")
++
++
++def _event(conn, uid):
++    return conn.execute("SELECT kind FROM task_events WHERE uid=?", (uid,)).fetchone()
++
++
++def test_release_applies_the_board_changes_withheld_during_the_hold(synced_conn):
++    conn = synced_conn
++    case = support.conflict(conn)
++    released = fixtures.event(case.release, case.hub, 2)
++    done = sync.RemoteChange(3, "tasks", case.target, "upsert", {"status": "done", "containment_episode": None},
++                             3, "", "worker")
++    # The release event re-checks the re-stamped stop receipt, so it is a second refused receipt on the task.
++    assert quarantine.certified_page(conn, case.hub, "fixture", [released, done]) == []
++    assert kb.get_task(conn, case.target).status == "ready"
++    _release(conn, case)
++    assert quarantine.held(conn, case.target)  # the release receipt still names it
++    _release(conn, case, case.release_uid)
++    assert kb.get_task(conn, case.target).status == "done"
++    assert kb.claim_task(conn, case.target) is None
++    assert _event(conn, case.uid)[0] == "contained" and _event(conn, case.release_uid)[0] == "containment_released"
++    assert not connections.held(conn, case.target)
++    assert support.count(conn, "containment_sync_withheld") == 0
++
++
++def test_transient_then_identity_never_yields_a_claimable_contained_task(synced_conn, monkeypatch):
++    conn = synced_conn
++    target, _, stop, _, hub = fixtures.scenario(conn)
++    uid = stop["event_uid"]
++    replica.remember(conn, hub.events[uid], board="fixture", task=target, uid=uid)
++    marker = sync.RemoteChange(1, "tasks", target, "upsert", {"status": "triage", "containment_episode": uid},
++                               100, "", "home")
++    page = {"changes": [marker, fixtures.event(stop, hub, 2)], "next": 2, "more": False}
++    monkeypatch.setattr(ksc.acw, "changes_page", lambda *args: page)
++    monkeypatch.setattr(ksc, "adapt", lambda change: change)
++    hub.events[uid]["state"] = "unavailable"
++    with pytest.raises(qr.ContainmentRefused):
++        ksc.pull(conn, hub, "fixture", observers=False)
++    assert quarantine.entries(conn) == []  # a transient refusal is never a quarantine
++    hub.events[uid]["state"] = "live"
++    hub.events[uid]["row"]["created_at"] += 1  # ...then the Board re-stamps the receipt
++    ksc.pull(conn, hub, "fixture", observers=False)
++    assert [e["receipt"] for e in quarantine.entries(conn)] == [uid]
++    assert kb.claim_task(conn, target) is None
++    qr.release(conn, hub, "fixture", uid, reason="re-stamp", operator="test")
++    assert _event(conn, uid)[0] == "contained"
++    assert kb.get_task(conn, target).containment_episode == uid
++    assert connections.held(conn, target)  # by its certified contained event now, not by the quarantine
++    assert not quarantine.held(conn, target)
++    assert kb.claim_task(conn, target) is None
++
++
++@pytest.mark.parametrize("fault", ["state", "unavailable"])
++def test_release_refuses_unless_the_board_evidence_is_live(synced_conn, fault, monkeypatch):
++    conn = synced_conn
++    case = support.conflict(conn)
++    if fault == "state":
++        case.hub.events[case.uid]["state"] = "deleted"
++    else:
++        monkeypatch.setattr(case.hub, "row_evidence", lambda *a: (_ for _ in ()).throw(OSError("Board down")))
++    with pytest.raises(qr.ReleaseRefused):
++        _release(conn, case)
++    assert quarantine.held(conn, case.target) and quarantine.held(conn, case.child)
++    assert [e["receipt"] for e in quarantine.entries(conn)] == [case.uid]
++    assert support.count(conn, "containment_sync_acceptances") == 0
++
++
++def test_acceptance_is_durable_and_a_redelivery_of_that_evidence_certifies(synced_conn):
++    conn = synced_conn
++    case = support.conflict(conn)
++    accepted = case.hub.events[case.uid]
++    result = _release(conn, case)
++    assert result["released"] and result["receipt"] == case.uid
++    [row] = conn.execute("SELECT receipt_uid,sha256,reason,operator,accepted_at FROM containment_sync_acceptances")
++    raw = json.dumps(accepted, sort_keys=True, separators=(",", ":"))
++    assert row[0] == case.uid and row[1] == qr.digest(raw) and row[1] == hashlib.sha256(
++        json.dumps(replica._certified(raw)).encode()).hexdigest()
++    assert row[2] == "Board re-stamp ruled benign" and row[3] == "test" and abs(row[4] - time.time()) < 60
++    assert replica._cached(conn, case.uid) == accepted
++    first = conn.execute("SELECT evidence FROM containment_canonical_receipts WHERE uid=?", (case.uid,)).fetchone()[0]
++    assert json.loads(first) == case.original  # the first observation is never rewritten
++    again = fixtures.event(case.stop, case.hub, 9)
++    assert quarantine.certified_page(conn, case.hub, "fixture", [again]) == [again]
++    assert quarantine.entries(conn) == []
++    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
++        conn.execute("DELETE FROM containment_sync_acceptances")
++
++
++def test_release_of_an_unknown_receipt_changes_nothing(synced_conn):
++    conn = synced_conn
++    case = support.conflict(conn)
++    assert qr.release(conn, case.hub, "fixture", "no-such-receipt", reason="x", operator="t") is None
++    assert quarantine.held(conn, case.target)
++    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'containment_sync_%'")}
++    _release(conn, case)
++    after = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'containment_sync_%'")}
++    assert names <= after  # immutability triggers are back after a release
++
++
++def _link(conn, task, uid):
+     conn.execute("INSERT INTO task_chat_links (uid,task_id,chat_gateway,chat_session,kind,created_at) "
+-                 "VALUES (?,?,?,?,?,?)", (f"link-{task}", task, "gw", "sess", "owner", int(time.time())))
+-    conn.execute("DELETE FROM kanban_sync_outbox")
+-    conn.execute("DELETE FROM task_chat_links WHERE task_id=?", (task,))
++                 "VALUES (?,?,?,?,?,?)", (uid, task, "gw", "sess", "owner", int(time.time())))
++    conn.execute("DELETE FROM kanban_sync_outbox WHERE NOT (table_name='task_chat_links' AND op='delete')")
++    conn.execute("DELETE FROM task_chat_links WHERE uid=?", (uid,))
+ 
+ 
+-def test_unrelated_delete_of_chat_link_is_pushed_while_a_quarantine_exists(synced_conn):
++def test_held_tasks_own_chat_link_delete_waits_and_an_unrelated_one_is_sent(synced_conn):
+     conn = synced_conn
+-    safety.conflict(conn)
++    case = support.conflict(conn)
+     other = kb.create_task(conn, title="Unrelated", assignee="default")
+-    _link(conn, other)
+-    assert conn.execute("SELECT op FROM kanban_sync_outbox").fetchall()[0][0] == "delete"
++    _link(conn, case.target, "link-held")
+     hub = Hub()
+-    result = ksc.push(conn, hub, "fixture", "worker", primary=False, max_batches=1)
+-    assert result.sent == 1
+-    assert len(hub.wires) == 1 and "delete" in json.dumps(hub.wires[0])
++    assert ksc.push(conn, hub, "fixture", "worker", primary=False, max_batches=1).sent == 0
++    assert [tuple(r) for r in conn.execute("SELECT row_uid,state FROM kanban_sync_outbox")] == [("link-held", "pending")]
++    _link(conn, other, "link-free")
++    assert ksc.push(conn, hub, "fixture", "worker", primary=False, max_batches=1).sent == 1
++    assert [w["uid"] for w in hub.wires] == ["link-free"]
++    assert ksc.push(conn, hub, "fixture", "worker", primary=False, max_batches=1) is not None
++    assert "link-held" not in [w["uid"] for w in hub.wires]  # never sent while its task is held
++    assert conn.execute("SELECT state FROM kanban_sync_outbox WHERE row_uid='link-held'").fetchone()[0] == "pending"
+ 
+ 
+ def test_unidentifiable_table_stays_pending_instead_of_killing_push(synced_conn):
+     conn = synced_conn
+-    safety.conflict(conn)
++    support.conflict(conn)
+     row = {"table_name": "mystery", "row_uid": "x", "op": "upsert", "fields": "{}"}
+     assert quarantine.sendable(conn, [row]) == []
+ 
+ 
+-def test_hold_refusal_names_receipt_and_a_release_path_not_resume_contained(synced_conn):
+-    conn = synced_conn
+-    target, child, change, _hub, _ = safety.conflict(conn)
+-    for task in (target, child):
+-        text = connections.refusal(conn, task)
+-        assert "resume-contained required" not in text
+-        assert "quarantine --release" in text
+-    assert change.uid in connections.refusal(conn, target)
+-    listed = quarantine.entries(conn)
+-    assert [e["receipt"] for e in listed] == [change.uid]
+-    assert target in listed[0]["held_tasks"]
+-    assert ksc.status(conn)["quarantined"] == 1
+-
+-
+-def test_release_lifts_only_that_receipt_and_keeps_the_append_only_cache(synced_conn):
+-    conn = synced_conn
+-    target, child, change, _hub, original = safety.conflict(conn)
+-    from hermes_cli import kanban_containment_replica as replica
+-    assert quarantine.release(conn, "no-such-receipt") == 0
+-    assert quarantine.release(conn, change.uid) == 1
+-    assert not quarantine.held(conn, target) and not quarantine.held(conn, child)
+-    assert quarantine.entries(conn) == []
+-    assert replica._cached(conn, change.uid) == original  # the first observation is never rewritten
+-    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'containment_sync_%'")}
+-    assert len(names) == 6  # immutability triggers are back after a release
++def test_adopt_copies_only_new_hold_rows_and_never_the_withheld_ledger(synced_conn, tmp_path):
++    source = synced_conn
++    case = support.conflict(source)
++    assert support.count(source, "containment_sync_withheld") >= 1
++    with kbc.connect_closing(db_path=tmp_path / "live.db") as live:
++        sync.set_identity(live, "fixture", "worker")
++        quarantine.adopt(source, live)
++        assert quarantine.held(live, case.target)
++        assert support.count(live, "containment_sync_withheld") == 0
++        before = live.total_changes
++        quarantine.adopt(source, live)
++        assert live.total_changes == before  # nothing new: no write transaction on the live writer
+ 
+ 
+ def test_restore_consumes_checkpoint_file(synced_conn, tmp_path):
+     conn = synced_conn
+-    safety.conflict(conn)
++    support.conflict(conn)
+     path = tmp_path / "replica.db"
+     quarantine.save_rebuild(conn, path)
+     assert path.with_suffix(".quarantine.json").exists()
+-    data = quarantine.load_rebuild(path)
+-    quarantine.restore(conn, data, path)
++    quarantine.restore(conn, quarantine.load_rebuild(path), path)
+     assert not path.with_suffix(".quarantine.json").exists()
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_receipt_quarantine_safety.py b/tests/hermes_cli/test_kanban_receipt_quarantine_safety.py
+index 64d00c5a6e..8dccb047aa 100644
+--- a/tests/hermes_cli/test_kanban_receipt_quarantine_safety.py
++++ b/tests/hermes_cli/test_kanban_receipt_quarantine_safety.py
+@@ -77,7 +77,7 @@ def test_journal_failure_does_not_advance_cursor(synced_conn, monkeypatch):
+     conn = synced_conn
+     target, _, change, hub, _original = conflict(conn)
+     old = sync.sync_state(conn)["cursor"]
+-    monkeypatch.setattr(quarantine, "_wire", lambda ch: (_ for _ in ()).throw(OSError("disk unavailable")))
++    monkeypatch.setattr(quarantine, "wire", lambda ch: (_ for _ in ()).throw(OSError("disk unavailable")))
+     with pytest.raises(OSError, match="disk unavailable"):
+         quarantine.certified_page(conn, hub, "fixture", [change])
+     assert sync.sync_state(conn)["cursor"] == old
+-- 
+2.43.0
+

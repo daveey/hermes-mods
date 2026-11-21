@@ -1,0 +1,133 @@
+From 18d7e721d82cc5198fd993184a85736961b9f6a8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:36:17 +0000
+Subject: [PATCH] fix(tui_gateway): #3840 review r3: concluding stamp only when
+ the retire runs [daveey]
+
+- _retire_turn_marker takes concluding_key and stamps _turn_concluding_marker_key
+  only past its early returns (held refused turn, exit keep, update pause,
+  carried pause), right before the delete. A kept marker a sibling deletes
+  during post-turn work still raises the lost-marker WARNING.
+- Test: turn A concludes, turn B starts on the same session (its marker clears
+  A's stamp), a sibling deletes B's marker, and the WARNING fires.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../tui_gateway/test_turn_marker_ownership.py | 47 +++++++++++++++++++
+ tui_gateway/prompt_turn.py                    |  9 ++--
+ tui_gateway/session_auto_continue.py          |  9 +++-
+ 3 files changed, 58 insertions(+), 7 deletions(-)
+
+diff --git a/tests/tui_gateway/test_turn_marker_ownership.py b/tests/tui_gateway/test_turn_marker_ownership.py
+index 0202802e17..5f43a21e0d 100644
+--- a/tests/tui_gateway/test_turn_marker_ownership.py
++++ b/tests/tui_gateway/test_turn_marker_ownership.py
+@@ -446,3 +446,50 @@ def test_a_pause_poll_during_post_turn_work_does_not_warn(env, monkeypatch, capl
+     _finish(live, agent)
+     assert polled == [(True, "no turn marker")], polled
+     assert not [r for r in caplog.records if "live turn lost its marker" in r.getMessage()]
++
++
++def _lost_marker_warnings(caplog):
++    return [r for r in caplog.records if "live turn lost its marker" in r.getMessage()]
++
++
++def test_the_next_turn_warns_when_a_sibling_deletes_its_marker(env, monkeypatch, caplog):
++    from tui_gateway.turn_marker import clear_turn_marker
++    live, agent = _start_live_turn(env, monkeypatch)  # turn A
++    _finish(live, agent)  # A concluded: it retired its own marker (the concluding stamp)
++    caplog.set_level(logging.INFO)
++    agent_b = LiveAgent()
++    live["agent"] = agent_b
++    with live["history_lock"]:
++        live["running"] = True
++    assert server._run_prompt_submit("rid-b", "ui-live", live, "turn B") is True
++    assert agent_b.entered.wait(WAIT_S)
++    try:
++        assert read_turn_marker(env.home, KEY)["prompt"] == "turn B"
++        clear_turn_marker(env.home, KEY)  # a sibling deletes turn B's live marker
++        assert up.not_resumable_reason(live, KEY) == "no turn marker"
++        assert _lost_marker_warnings(caplog), "turn A's concluding stamp hid turn B's lost marker"
++    finally:
++        _finish(live, agent_b)
++
++
++def test_a_kept_marker_deleted_during_post_turn_work_still_warns(env, monkeypatch, caplog):
++    from tui_gateway.turn_marker import clear_turn_marker
++    polled: list = []
++
++    def after_complete(sid, session, st, raw):  # the turn kept its marker (no retire ran); a sibling deletes it
++        clear_turn_marker(env.home, KEY)
++        polled.append(up.not_resumable_reason(session, KEY))
++
++    def body(agent):
++        agent.release.wait(WAIT_S)
++        # A held refused turn's marker: _retire_turn_marker returns early and keeps it.
++        server._sessions["ui-live"]["_refused_turn_marker_key"] = KEY
++        return {"final_response": "done", "messages": []}
++
++    monkeypatch.setattr(server, "_after_complete_turn", after_complete)
++    monkeypatch.setattr(server, "_schedule_refused_turn_retry", lambda *a, **k: None)
++    caplog.set_level(logging.INFO)
++    live, agent = _start_live_turn(env, monkeypatch, body)
++    _finish(live, agent)
++    assert polled == ["no turn marker"], polled
++    assert _lost_marker_warnings(caplog), "a kept marker deleted by a sibling did not warn"
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 5ef97a25c0..56d5d6471c 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1263,9 +1263,8 @@ def _complete_turn_payload(session: dict, st: _TurnRun, status_note: str | None,
+         st.receipt_committed = True
+     if st.receipt_committed:
+         _hold_refused_turn(session, st.marker_key, getattr(st, "display_kind", None), _error_surface)
+-        # [daveey] Read by update_pause's lost-marker WARNING: from here the turn retires its own marker.
+-        session["_turn_concluding_marker_key"] = st.marker_key
+-        _retire_turn_marker(session, st.marker_key)
++        # [daveey] concluding_key: update_pause's lost-marker WARNING skips a marker this turn really retires.
++        _retire_turn_marker(session, st.marker_key, concluding_key=st.marker_key)
+     return payload, raw, status
+ 
+ 
+@@ -1554,8 +1553,8 @@ def _run_admitted_prompt(
+                     st.error_detail)
+                 # Backstop for turns that never reached a terminal frame.
+                 if st.receipt_committed:
+-                    session["_turn_concluding_marker_key"] = st.marker_key
+-                    _retire_turn_marker(session, st.marker_key, concluding_turn=concluding)
++                    _retire_turn_marker(session, st.marker_key, concluding_turn=concluding,
++                                        concluding_key=st.marker_key)
+                     with session["history_lock"]:
+                         if session.get("_active_turn_marker_key") == st.marker_key:
+                             session.pop("_active_turn_marker_key", None)
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 1413de4bf4..8fc6fd816b 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -67,16 +67,21 @@ def _session_home(session: dict) -> Path:
+     return Path(session.get("profile_home") or _hermes_home)
+ 
+ 
+-def _retire_turn_marker(session: dict, *keys: str, concluding_turn: frozenset | None = None) -> None:
++def _retire_turn_marker(session: dict, *keys: str, concluding_turn: frozenset | None = None,
++                        concluding_key: str = "") -> None:
+     """Drop the crash marker right before the terminal frame (not at turn-thread end: post-turn work outlives the
+     client's answer, and quitting in that window would leave a marker that re-runs a finished turn). Extra ``keys``
+     cover a session_key that compression rotated mid-turn. A turn stopped by backend shutdown keeps its marker
+-    (``_stop_turns_before_exit`` flags it) so the next boot auto-continues it like a crash."""
++    (``_stop_turns_before_exit`` flags it) so the next boot auto-continues it like a crash.
++    [daveey] ``concluding_key``: the turn's own marker key, stamped (``_turn_concluding_marker_key``, read by
++    update_pause's lost-marker WARNING) only when the retire really runs, never when a kept marker returns early."""
+     if session.get("_exit_keeps_turn_marker") or session.get("_refused_turn_marker_key"):
+         return
+     # [daveey] A core-update pause keeps its marker: the next backend (or the in-place watcher) continues it.
+     if session.get("_update_pause_marker_key") or session.get("_paused_marker_carried"):
+         return
++    if concluding_key:  # set before the delete: a pause poll in between must not read a lost marker
++        session["_turn_concluding_marker_key"] = concluding_key
+     home = _session_home(session)
+     for key in dict.fromkeys((*keys, str(session.get("session_key") or ""))):
+         if key:
+-- 
+2.43.0
+

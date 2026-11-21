@@ -1,0 +1,136 @@
+From b21c470c94bfefbccbb32ac4ce1edb4801a53d3a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:39:04 +0000
+Subject: [PATCH] fix(auth): scope pool deletion fence to the write target's
+ own rows
+
+---
+ agent/credential_pool.py                      |  8 ++--
+ hermes_cli/auth.py                            |  3 +-
+ hermes_cli/auth_pool_read_scope.py            | 18 +++++++++
+ .../test_credential_pool_deleted_rows.py      | 37 +++++++++++++++++++
+ 4 files changed, 61 insertions(+), 5 deletions(-)
+
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index f4f91b844f..90b8a8528a 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -27,6 +27,7 @@ from agent.credential_pool_plugin import apply_plugin_refresh_result, plugin_row
+ from agent.credential_persistence import (
+     fingerprint_secret_value, is_borrowed_credential_source, sanitize_borrowed_credential_payload)
+ import hermes_cli.auth as auth_mod
++from hermes_cli.auth_pool_read_scope import known_pool_pairs
+ from hermes_cli.auth_oauth_grants import owned_profile_reads_root_state
+ from hermes_cli.auth import (
+     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+@@ -3013,9 +3014,8 @@ def load_pool(provider: str, *, allowed_auth_types=None) -> CredentialPool:
+         for payload in raw_entries
+     )
+     if raw_needs_auth_normalization:
+-        # A profile may be reading this provider from the global-root fallback.
+-        # Keep that fallback read-only: only the owning store may rewrite these
+-        # rows; loading the default/root profile heals global rows.
++        # A profile may read this provider through the global-root fallback; keep that
++        # read-only: only the owning store may rewrite these rows (the root's load heals them).
+         active_pool = _load_auth_store().get("credential_pool")
+         active_entries = active_pool.get(provider) if isinstance(active_pool, dict) else None
+         changed |= bool(active_entries)
+@@ -3050,7 +3050,7 @@ def load_pool(provider: str, *, allowed_auth_types=None) -> CredentialPool:
+         changed |= _normalize_pool_priorities(provider, entries)
+ 
+     pool = CredentialPool(provider, entries, allowed_auth_types=allowed_auth_types)
+-    pool._persisted_token_pairs = auth_mod._token_pairs_by_id(raw_entries)
++    pool._persisted_token_pairs = known_pool_pairs(provider, raw_entries)
+     if changed:
+         pool._persist(removed_ids=sorted(disk_ids - {entry.id for entry in entries}))
+     # Remember the root's borrowed rows so a later ``add_entry`` in this
+diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
+index 3afdce4554..8cd5271147 100644
+--- a/hermes_cli/auth.py
++++ b/hermes_cli/auth.py
+@@ -1022,9 +1022,10 @@ def write_credential_pool(
+     IDs without a base are new additions. Concurrent disk additions are retained unless
+     in *removed_ids*. *status_cleared_ids* skips the status-recency merge for explicit resets."""
+     removed = {rid for rid in (removed_ids or ()) if rid}
+-    bases = token_bases or {}
+     with _auth_store_lock():
+         auth_store = _load_auth_store()
++        # A store without a pool section (missing/corrupt, loads empty) is no evidence of peer deletions.
++        bases = (token_bases or {}) if isinstance(auth_store.get("credential_pool"), dict) else {}
+         pool = _store_section(auth_store, "credential_pool")
+         sanitized = [
+             sanitize_borrowed_credential_payload(e, provider_id) if isinstance(e, dict) else e
+diff --git a/hermes_cli/auth_pool_read_scope.py b/hermes_cli/auth_pool_read_scope.py
+index 9b0c73c011..b19f163c85 100644
+--- a/hermes_cli/auth_pool_read_scope.py
++++ b/hermes_cli/auth_pool_read_scope.py
+@@ -88,3 +88,21 @@ def read_credential_pool(provider_id=None):
+     if not (isinstance(rows, list) and rows):
+         rows = global_pool.get(provider_id)
+     return deepcopy(rows) if isinstance(rows, list) else []
++
++
++def known_pool_pairs(provider_id, rows):
++    """Token-generation bases for the deletion fence, limited to rows of the store written.
++
++    Rows read through the global-root fallback were never in the active store, so a missing
++    one there is an addition, not a peer deletion. Single-use providers write back to the
++    root, so their root-read rows stay known."""
++    from agent.credential_pool import SINGLE_USE_REFRESH_POOL_PROVIDERS, _profile_owns_pool_provider
++    from hermes_cli import auth
++
++    pairs = auth._token_pairs_by_id(rows)
++    if provider_id in SINGLE_USE_REFRESH_POOL_PROVIDERS and not _profile_owns_pool_provider(provider_id):
++        return pairs
++    own = auth._load_auth_store().get("credential_pool")
++    own_rows = own.get(provider_id) if isinstance(own, dict) else None
++    own_ids = set(auth._entry_ids(own_rows)) if isinstance(own_rows, list) else set()
++    return {rid: pair for rid, pair in pairs.items() if rid in own_ids}
+diff --git a/tests/agent/test_credential_pool_deleted_rows.py b/tests/agent/test_credential_pool_deleted_rows.py
+index 035f7e1acd..ca6c7c19cf 100644
+--- a/tests/agent/test_credential_pool_deleted_rows.py
++++ b/tests/agent/test_credential_pool_deleted_rows.py
+@@ -61,3 +61,40 @@ def test_tokenless_known_row_cannot_be_reinserted():
+     bases = auth._token_pairs_by_id([row])
+     auth.write_credential_pool("openrouter", [], removed_ids=["blank"])
+     assert auth.write_credential_pool("openrouter", [row], token_bases=bases) == []
++
++
++def test_profile_fallback_flush_keeps_borrowed_rows(tmp_path, monkeypatch):
++    import json
++    from pathlib import Path
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    root = tmp_path / ".hermes"
++    root.mkdir()
++    prof = root / "profiles" / "coder"
++    prof.mkdir(parents=True)
++    monkeypatch.setenv("HERMES_HOME", str(prof))
++    monkeypatch.setattr(pools, "_seed_from_singletons", lambda *a: (False, set()))
++    monkeypatch.setattr(pools, "_seed_from_env", lambda *a: (False, set()))
++    (root / "auth.json").write_text(json.dumps({"version": 1, "credential_pool": {"openrouter": [
++        {"id": "g1", "label": "g", "auth_type": "api_key", "priority": 0, "source": "manual",
++         "access_token": "fixture-global"}]}}))
++    pool = pools.load_pool("openrouter")
++    assert [e.id for e in pool.entries()] == ["g1"]
++    pool._entries = [replace(e, last_status="exhausted", last_status_at=100, last_error_code=429)
++                     for e in pool.entries()]
++    pool._current_id = "g1"
++    pool._persist()
++    assert [e.id for e in pool.entries()] == ["g1"]
++    assert [r["id"] for r in auth.read_credential_pool("openrouter")] == ["g1"]
++
++
++def test_corrupt_store_flush_self_heals_from_memory(monkeypatch):
++    monkeypatch.setattr(pools, "_seed_from_singletons", lambda *a: (False, set()))
++    monkeypatch.setattr(pools, "_seed_from_env", lambda *a: (False, set()))
++    row = pools.PooledCredential(provider="openrouter", id="row0", label="f", source="manual",
++                                 auth_type="api_key", priority=0, access_token="fixture-0")
++    auth.write_credential_pool("openrouter", [row.to_dict()])
++    pool = pools.load_pool("openrouter")
++    auth._auth_file_path().write_text("{not json")
++    pool._persist()
++    assert [e.id for e in pool.entries()] == ["row0"]
++    assert [r["id"] for r in auth.read_credential_pool("openrouter")] == ["row0"]
+-- 
+2.43.0
+

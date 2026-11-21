@@ -1,0 +1,119 @@
+From a620b15c5bc3545b7574cde705be94a1ed879f4a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 04:09:32 +0000
+Subject: [PATCH] fix(kanban): named wait-comment producers are not creator
+ asks [daveey]
+
+Problem: required CI on PR #3730 at 637362dd failed
+tests/hermes_cli/test_kanban_comment_origin.py::test_wait_comment_probe_parks
+with no_chat_subscriber. That park waits on
+`wait-comment <own> --from-gateway macbook` (external macbook reply).
+
+Why 1: own_comment_wait matched any wait-comment on the own task id.
+Why 2: kanban_awaiting then reclassified declared external waits as chat waits.
+Why 3: chat waits require a subscriber; --from-gateway/--from-card already
+name a producer other than the creator chat.
+Root (happened): creator-ask classification ignored named comment producers.
+Root (not caught): origin-decision tests used --skip-system only; the
+existing from-gateway park test ran only in affected CI shard 5/12.
+Recurrence: first time on this topic; same class as over-broad chat
+reclassification.
+
+Countermeasures:
+- own_comment_wait is true only for own-card wait-comment without
+  --from-gateway/--from-card (incident --skip-system still a creator ask).
+- Killing tests: from-gateway/from-card stay False; skip-system stays True;
+  from-gateway still parks; skip-system without a subscriber still refuses.
+---
+ hermes_cli/kanban_remote_ask.py               | 21 +++++++++++++++++--
+ .../hermes_cli/test_kanban_comment_origin.py  | 11 ++++++++++
+ .../test_kanban_origin_decision_wake.py       | 15 +++++++++++++
+ 3 files changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_remote_ask.py b/hermes_cli/kanban_remote_ask.py
+index d519d36b9f..faf8a61550 100644
+--- a/hermes_cli/kanban_remote_ask.py
++++ b/hermes_cli/kanban_remote_ask.py
+@@ -31,6 +31,20 @@ def envelope(task: dict) -> dict | None:
+     return notice
+ 
+ 
++def _named_comment_producer(args: list[str]) -> bool:
++    """``--from-gateway`` / ``--from-card`` already names a producer other than the creator chat."""
++    i = 0
++    while i < len(args):
++        word = args[i]
++        for flag in ('--from-gateway', '--from-card'):
++            if word == flag:
++                return bool(i + 1 < len(args) and not str(args[i + 1]).startswith('-') and str(args[i + 1]).strip())
++            if word.startswith(flag + '='):
++                return bool(word.split('=', 1)[1].strip())
++        i += 1
++    return False
++
++
+ def own_comment_wait(cmd: str | None, task_id: str) -> bool:
+     """A wait on replies to this card is a chat ask, not an external producer."""
+     import os
+@@ -39,8 +53,11 @@ def own_comment_wait(cmd: str | None, task_id: str) -> bool:
+         words = shlex.split(cmd or '')
+     except ValueError:
+         return False
+-    return any(os.path.basename(words[i]) == 'hermes' and words[i + 1:i + 4] == ['kanban', 'wait-comment', task_id]
+-               for i in range(len(words) - 3))
++    for i in range(len(words) - 3):
++        if os.path.basename(words[i]) == 'hermes' and words[i + 1:i + 4] == ['kanban', 'wait-comment', task_id]:
++            if not _named_comment_producer(words[i + 4:]):
++                return True
++    return False
+ 
+ 
+ def notifiable(task: dict) -> bool:
+diff --git a/tests/hermes_cli/test_kanban_comment_origin.py b/tests/hermes_cli/test_kanban_comment_origin.py
+index d2d8bf2fd9..286fc1f451 100644
+--- a/tests/hermes_cli/test_kanban_comment_origin.py
++++ b/tests/hermes_cli/test_kanban_comment_origin.py
+@@ -128,6 +128,17 @@ def test_wait_comment_probe_parks(kanban_home, monkeypatch) -> None:
+         assert out.get("status") == "scheduled", out
+ 
+ 
++def test_own_skip_system_wait_comment_without_subscriber_is_refused(kanban_home, monkeypatch) -> None:
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        _as_worker(monkeypatch, conn, tid)
++        out = _tool("schedule", {"reason": "Decide premise A/B/C; waiting on the next reply.",
++                                 "awaiting": {"kind": "external", "ref": "origin session", "why": "Decide premise A/B/C."},
++                                 "wake_check": f"hermes kanban wait-comment {tid} --after-id 0 --skip-system"})
++        assert out.get("code") == "no_chat_subscriber", out
++        assert kb.get_task(conn, tid).status == "running"
++
++
+ def test_guard_can_be_switched_off(kanban_home, monkeypatch) -> None:
+     # The documented undo: ``kanban.author_probe_guard: false`` in config.yaml.
+     (kanban_home / "config.yaml").write_text("kanban:\n  author_probe_guard: false\n")
+diff --git a/tests/hermes_cli/test_kanban_origin_decision_wake.py b/tests/hermes_cli/test_kanban_origin_decision_wake.py
+index 8c31ab5f37..cdd231709d 100644
+--- a/tests/hermes_cli/test_kanban_origin_decision_wake.py
++++ b/tests/hermes_cli/test_kanban_origin_decision_wake.py
+@@ -135,3 +135,18 @@ def test_malformed_decision_envelope_is_not_notifiable(change):
+     assert not notifiable({'status': 'scheduled', 'ask_notice': {**ask, **change}})
+     assert not notifiable({'status': 'running', 'ask_notice': ask})
+ 
++
++@pytest.mark.parametrize('cmd,want', [
++    ('hermes kanban wait-comment t_x --after-id 0 --skip-system', True),
++    ('hermes kanban wait-comment t_x --after-id 0 --contains APPROVED', True),
++    ('nice hermes kanban wait-comment t_x --after-id 0', True),
++    ('hermes kanban wait-comment t_x --after-id 0 --from-gateway macbook', False),
++    ('hermes kanban wait-comment t_x --after-id 0 --from-gateway=macbook', False),
++    ('hermes kanban wait-comment t_x --after-id 0 --from-card t_other', False),
++    ('hermes kanban wait-comment t_other --after-id 0 --skip-system', False),
++    ('gh run view 1 --json status', False),
++])
++def test_own_comment_wait_excludes_named_producers(cmd, want):
++    from hermes_cli.kanban_remote_ask import own_comment_wait
++    assert own_comment_wait(cmd, 't_x') is want
++
+-- 
+2.43.0
+

@@ -1,0 +1,338 @@
+From 69e2705472fe3cbca58f9ced4e58e8162a759892 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 08:53:46 +0000
+Subject: [PATCH] [daveey] lanes flow: fit PR observer to gh latency, real
+ approval source, reopen + planner-exemption fixes
+
+Review of PR #3742 @f8971d1278 found three behaviour defects:
+1. Reader: 5 s budget vs three 3-4.5 s brokered gh calls per PR returned {} for every PR, and
+   approved read reviewDecision (empty on this repo) so merge was unreachable. Now: 30 s
+   wall budget, PRs read concurrently (prefetch), view+checks in parallel, approval from a
+   non-author human's latest APPROVED review on the current head with no CHANGES_REQUESTED.
+2. _review_active ignored review_reopened/reopened: a reopened card still read review.
+3. Planner admission dropped the gate_exempt cap exemption (row lacked creator fields);
+   row_opts() now feeds reason() in planner, release_due and flow.
+
+Proof: RED 8 failed (new tests) on old code; GREEN 8 consumer files 159 passed, scripts/check 21 ok.
+---
+ hermes_cli/kanban_lane_daily_limits.py        | 16 ++++--
+ hermes_cli/kanban_lanes_flow.py               | 16 +++++-
+ hermes_cli/kanban_lanes_flow_pr.py            | 57 ++++++++++++++++---
+ hermes_cli/kanban_lanes_plan.py               |  4 +-
+ .../test_kanban_lane_daily_limits.py          | 16 ++++++
+ .../test_kanban_lanes_flow_evidence.py        | 19 +++++++
+ tests/hermes_cli/test_kanban_lanes_flow_pr.py | 46 ++++++++++++++-
+ 7 files changed, 155 insertions(+), 19 deletions(-)
+
+diff --git a/hermes_cli/kanban_lane_daily_limits.py b/hermes_cli/kanban_lane_daily_limits.py
+index 95d715e643..8d790de83c 100644
+--- a/hermes_cli/kanban_lane_daily_limits.py
++++ b/hermes_cli/kanban_lane_daily_limits.py
+@@ -43,6 +43,16 @@ def reason(conn, pol, lane_name, opts, *, now=None):
+     return None
+ 
+ 
++def row_opts(conn, row):
++    """A stored card as creation options, including the creator fields the exemptions read."""
++    opts = dict(row)
++    created = conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='created' ORDER BY id LIMIT 1", (row["id"],)).fetchone()
++    if created:
++        opts["creator_task_id"] = json.loads(created[0] or "{}").get("creator_task_id")
++    return opts
++
++
+ def release_due(conn, *, foreign=()):
+     """Inside readiness's write txn: release only daily-limit parks, oldest first.
+ 
+@@ -66,11 +76,7 @@ def release_due(conn, *, foreign=()):
+         if event is None or json.loads(event[0] or "{}").get("reason") not in (
+                 "limit:cards_per_day", "limit:usd_per_day"):
+             continue
+-        opts = dict(row)
+-        created = conn.execute(
+-            "SELECT payload FROM task_events WHERE task_id=? AND kind='created' ORDER BY id LIMIT 1", (tid,)).fetchone()
+-        if created:
+-            opts["creator_task_id"] = json.loads(created[0] or "{}").get("creator_task_id")
++        opts = row_opts(conn, row)
+         if lanes._gated(conn, pol, row["tenant"], opts) or reason(conn, pol, row["tenant"], opts):
+             continue
+         count += lanes.admit(conn, tid, actor="lane-limit-reset", reason="daily lane capacity available")
+diff --git a/hermes_cli/kanban_lanes_flow.py b/hermes_cli/kanban_lanes_flow.py
+index d2be24e896..10f540e15a 100644
+--- a/hermes_cli/kanban_lanes_flow.py
++++ b/hermes_cli/kanban_lanes_flow.py
+@@ -18,6 +18,7 @@ LANDING_UNCLASSIFIED = "landing_unclassified"
+ LIMIT_CARDS = "limit:cards_per_day"
+ LIMIT_USD = "limit:usd_per_day"
+ _LANDING_STEPS = {"review", "ci", "merge", "deploy", "test"}
++_REVIEW_ENDED = ("changes_requested", "review_reopened", "reopened")
+ _USER = lanes.USER_CREATORS
+ _OPEN = ("triage", "todo", "scheduled", "ready", "running", "blocked", "review")
+ 
+@@ -34,7 +35,7 @@ def _payload(event: dict) -> dict:
+ 
+ def _review_active(events) -> bool:
+     for event in reversed(events or ()):
+-        if event.get("kind") in ("review_requested", "changes_requested", "review_changes_requested"):
++        if event.get("kind") in _REVIEW_ENDED + ("review_requested",):
+             return event.get("kind") == "review_requested"
+     return False
+ 
+@@ -246,8 +247,8 @@ def _card_from_row(conn, task, now: float, reader=None, pol=None) -> dict:
+     held = conn.execute(f"SELECT 1 FROM tasks WHERE id=? AND {lanes.HELD}", (task["id"],)).fetchone() is not None
+     gate_reason = _gate_reason(events) if held else None
+     if gate_reason and pol is not None:
+-        from hermes_cli.kanban_lane_daily_limits import reason
+-        gate_reason = reason(conn, pol, task["tenant"], dict(task), now=now)
++        from hermes_cli.kanban_lane_daily_limits import reason, row_opts
++        gate_reason = reason(conn, pol, task["tenant"], row_opts(conn, task), now=now)
+     creator = next((_payload(dict(e)).get("creator_task_id") for e in events if e["kind"] == "created"), None)
+     human = _json_obj(task["human_request"] if "human_request" in task.keys() else None)
+     age = max(0.0, (now - float(task["created_at"] or now)) / 3600.0)
+@@ -266,6 +267,14 @@ def _card_from_row(conn, task, now: float, reader=None, pol=None) -> dict:
+     }
+ 
+ 
++def _pr_urls(conn, rows) -> list:
++    out = []
++    for task in rows:
++        events = _events(conn, task["id"])
++        out.append((_pr_snapshot(task, events, _awaiting(task, events)) or {}).get("url"))
++    return out
++
++
+ def snapshot(conn, *, window: str = "6h", now: Optional[float] = None, pol=None) -> dict:
+     """Cards still open, plus per-lane window throughput and today's cap usage."""
+     if window not in WINDOWS:
+@@ -280,6 +289,7 @@ def snapshot(conn, *, window: str = "6h", now: Optional[float] = None, pol=None)
+         f"SELECT * FROM tasks WHERE status IN {_OPEN} ORDER BY created_at, id").fetchall()
+     from hermes_cli.kanban_lanes_flow_pr import Reader
+     reader = Reader()
++    reader.prefetch(_pr_urls(conn, rows))
+     cards = []
+     for row in rows:
+         card = _card_from_row(conn, row, now, reader, pol)
+diff --git a/hermes_cli/kanban_lanes_flow_pr.py b/hermes_cli/kanban_lanes_flow_pr.py
+index bc20b1c11c..6e9a8ecafe 100644
+--- a/hermes_cli/kanban_lanes_flow_pr.py
++++ b/hermes_cli/kanban_lanes_flow_pr.py
+@@ -2,15 +2,50 @@
+ import json
+ import subprocess
+ import time
++from concurrent.futures import ThreadPoolExecutor
+ 
+ from tools.environments.local import build_subprocess_env
+ 
++# Brokered gh calls measure 3-4.5 s each on the fleet, so the budget is wall-clock for the whole
++# report and PRs are read concurrently (``prefetch``), not as one call chain after another.
++BUDGET_S = 30
++_VIEW = "state,headRefOid,reviewDecision,author,reviews"
++
++
++def _login(person):
++    return str(person.get("login") or "").lower() if isinstance(person, dict) else ""
++
++
++def _bot(person):
++    return isinstance(person, dict) and bool(person.get("is_bot") or _login(person).endswith("[bot]"))
++
++
++def independent_approval(data):
++    """True when each non-author human's latest verdict is clean and one approves the current head.
++
++    ``reviewDecision`` is empty on repositories that require no PR reviews, so it alone never shows approval.
++    """
++    head = data.get("headRefOid")
++    latest = {}
++    for review in data.get("reviews") or ():
++        if not isinstance(review, dict):
++            continue
++        who = _login(review.get("author"))
++        if not who or _bot(review.get("author")) or who == _login(data.get("author")):
++            continue
++        if review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
++            latest[who] = review
++    if not latest or any(r.get("state") == "CHANGES_REQUESTED" for r in latest.values()):
++        return False
++    return any(r.get("state") == "APPROVED" and (r.get("commit") or {}).get("oid") == head
++               for r in latest.values())
++
+ 
+ class Reader:
+-    """One report has a five-second network budget; unknown evidence stays unclassified."""
++    """One report has a bounded network budget; unknown evidence stays unclassified."""
+ 
+-    def __init__(self):
+-        self.deadline = time.monotonic() + 5
++    def __init__(self, budget=BUDGET_S):
++        self.deadline = time.monotonic() + budget
+         self.cache = {}
+ 
+     def _read(self, argv):
+@@ -31,22 +66,30 @@ class Reader:
+         except (OSError, subprocess.SubprocessError, ValueError):
+             return None
+ 
++    def prefetch(self, urls):
++        """Warm the cache for every URL concurrently; ``get`` then answers from memory."""
++        todo = sorted({u for u in urls if u and u not in self.cache})
++        if len(todo) > 1:
++            with ThreadPoolExecutor(max_workers=min(8, len(todo))) as pool:
++                list(pool.map(self.get, todo))
++
+     def get(self, url):
+         if url in self.cache:
+             return self.cache[url]
+         self.cache[url] = {}
+-        data = self._read(["pr", "view", url, "--json", "state,headRefOid,reviewDecision"])
++        with ThreadPoolExecutor(max_workers=2) as pool:
++            view = pool.submit(self._read, ["pr", "view", url, "--json", _VIEW])
++            checks = pool.submit(self._read, ["pr", "checks", url, "--required", "--json", "bucket"])
++            data, checks = view.result(), checks.result()
+         if not isinstance(data, dict):
+             return {}
+         state = data.get("state")
+         out = {"merged": state == "MERGED"} if state in ("OPEN", "MERGED") else {}
+         if state == "OPEN":
+-            out["approved"] = data.get("reviewDecision") == "APPROVED"
+-            checks = self._read(["pr", "checks", url, "--required", "--json", "bucket"])
++            out["approved"] = data.get("reviewDecision") == "APPROVED" or independent_approval(data)
+             confirm = self._read(["pr", "view", url, "--json", "state,headRefOid,reviewDecision"])
+             if (not isinstance(confirm, dict) or not data.get("headRefOid")
+                     or any(confirm.get(k) != data.get(k) for k in ("state", "headRefOid", "reviewDecision"))):
+-                self.cache[url] = {}
+                 return {}
+             # Empty/missing required checks never establish green.
+             if isinstance(checks, list) and checks:
+diff --git a/hermes_cli/kanban_lanes_plan.py b/hermes_cli/kanban_lanes_plan.py
+index dfdba1662e..73eabf4f3e 100644
+--- a/hermes_cli/kanban_lanes_plan.py
++++ b/hermes_cli/kanban_lanes_plan.py
+@@ -85,8 +85,8 @@ def _admit_locked(conn, pol, action, row, state) -> Optional[str]:
+     used = state["used"].setdefault(lane.name, lanes.admitted_today(conn, lane.name, now=state["now"]))
+     if lane.admit_per_day is not None and used >= lane.admit_per_day:
+         return f"lane {lane.name} admit budget spent ({used}/{lane.admit_per_day} today)"
+-    from hermes_cli.kanban_lane_daily_limits import reason
+-    why = reason(conn, pol, lane.name, dict(row), now=state["now"])
++    from hermes_cli.kanban_lane_daily_limits import reason, row_opts
++    why = reason(conn, pol, lane.name, row_opts(conn, row), now=state["now"])
+     if why:
+         return why
+     lanes.admit(conn, row["id"], actor=state["actor"], reason=action["reason"])
+diff --git a/tests/hermes_cli/test_kanban_lane_daily_limits.py b/tests/hermes_cli/test_kanban_lane_daily_limits.py
+index d1d26a93a0..e8ca10b553 100644
+--- a/tests/hermes_cli/test_kanban_lane_daily_limits.py
++++ b/tests/hermes_cli/test_kanban_lane_daily_limits.py
+@@ -123,3 +123,19 @@ def test_legacy_admission_event_counted_without_inventing_relanes(conn, configur
+     assert lanes.cards_today(conn, "myapp") == 1
+     lanes.assign(conn, tid, "other", source="user", reason="move")
+     assert lanes.cards_today(conn, "other") == 0
++
++
++@pytest.mark.parametrize("cap", ["cards_per_day", "usd_per_day"])
++def test_planner_admission_honours_gate_exempt_creator(conn, configured, cap):
++    parent = base._hermes_parent(conn)
++    limits(configured, "hermes", **{cap: 0})
++    conn.execute("UPDATE tasks SET status='triage', block_kind=? WHERE id=?", (lanes.GATE_KIND, parent))
++    conn.commit()
++    review = kb.create_task(conn, title="Independent review", assignee="default", creator_task_id=parent,
++                            created_by="self-heal")
++    assert base._task(conn, review)["status"] == "triage"
++    conn.execute("UPDATE tasks SET status='ready', block_kind=NULL WHERE id=?", (parent,))
++    conn.commit()
++    result = plan.apply(conn, [{"action": "admit", "card": review, "reason": "finish admitted work"}])
++    assert result["applied"], result
++    assert base._task(conn, review)["status"] == "ready"
+diff --git a/tests/hermes_cli/test_kanban_lanes_flow_evidence.py b/tests/hermes_cli/test_kanban_lanes_flow_evidence.py
+index 7d2863d0aa..db5b1b2b2b 100644
+--- a/tests/hermes_cli/test_kanban_lanes_flow_evidence.py
++++ b/tests/hermes_cli/test_kanban_lanes_flow_evidence.py
+@@ -94,3 +94,22 @@ def test_expired_limit_on_ordinary_gated_lane_reports_gate(conn, configured):
+     assert card(conn, tid)["reason"] == "limit:cards_per_day"
+     configured()
+     assert card(conn, tid)["reason"] == "gate"
++
++
++@pytest.mark.parametrize("kind", ["review_reopened", "reopened"])
++def test_reopened_card_is_not_still_in_review(conn, configured, kind):
++    tid = base._ready_in(conn, "myapp", "rework")
++    kb._append_event(conn, tid, "review_requested", {})
++    kb._append_event(conn, tid, kind, {})
++    conn.commit()
++    assert card(conn, tid)["step"] == "ready"
++
++
++def test_real_reopen_review_task_leaves_review(conn, configured):
++    tid = base._ready_in(conn, "myapp", "real reopen")
++    conn.execute("UPDATE tasks SET status='review' WHERE id=?", (tid,))
++    kb._append_event(conn, tid, "review_requested", {})
++    conn.commit()
++    assert card(conn, tid)["step"] == "review"
++    assert kb.reopen_review_task(conn, tid)
++    assert card(conn, tid)["step"] == "ready"
+diff --git a/tests/hermes_cli/test_kanban_lanes_flow_pr.py b/tests/hermes_cli/test_kanban_lanes_flow_pr.py
+index c011619723..af5a462dac 100644
+--- a/tests/hermes_cli/test_kanban_lanes_flow_pr.py
++++ b/tests/hermes_cli/test_kanban_lanes_flow_pr.py
+@@ -1,5 +1,6 @@
+ """Exercise the actual read-only gh subprocess boundary without network."""
+ import sys
++import time
+ 
+ import pytest
+ 
+@@ -60,6 +61,47 @@ def test_changed_head_or_review_during_checks_is_unknown(monkeypatch, change):
+         last.pop("headRefOid")
+     else:
+         last[change] = "different"
+-    answers = iter([first, [{"bucket": "pass"}], last])
+-    monkeypatch.setattr(Reader, "_read", lambda self, argv: next(answers))
++    views = iter([first, last])
++
++    def read(self, argv):
++        return [{"bucket": "pass"}] if "checks" in argv else next(views)
++    monkeypatch.setattr(Reader, "_read", read)
+     assert Reader().get("https://github.com/example/repo/pull/1") == {}
++
++
++def _review(login, state, oid, bot=False):
++    return {"author": {"login": login, "is_bot": bot}, "state": state, "commit": {"oid": oid}}
++
++
++@pytest.mark.parametrize("reviews,approved", [
++    ([_review("rev", "APPROVED", "a" * 40)], True),
++    ([_review("rev", "APPROVED", "b" * 40)], False),                          # older head
++    ([_review("rev", "APPROVED", "a" * 40), _review("rev", "CHANGES_REQUESTED", "a" * 40)], False),
++    ([_review("rev", "CHANGES_REQUESTED", "a" * 40), _review("rev", "APPROVED", "a" * 40)], True),
++    ([_review("rev", "APPROVED", "a" * 40), _review("other", "CHANGES_REQUESTED", "a" * 40)], False),
++    ([_review("author", "APPROVED", "a" * 40)], False),                       # self-approval
++    ([_review("ci[bot]", "APPROVED", "a" * 40, bot=True)], False),
++    ([], False),
++])
++def test_empty_review_decision_still_reaches_merge_via_independent_approval(monkeypatch, reviews, approved):
++    view = {"state": "OPEN", "headRefOid": "a" * 40, "reviewDecision": "", "author": {"login": "author"},
++            "reviews": reviews}
++    monkeypatch.setattr(Reader, "_read", lambda self, argv: [{"bucket": "pass"}] if "checks" in argv else view)
++    assert Reader().get("https://github.com/example/repo/pull/1")["approved"] is approved
++
++
++def test_slow_brokered_gh_fits_budget_across_many_prs(tmp_path, monkeypatch):
++    """Every gh call takes ~1.2 s (fleet: 3-4.5 s); six PRs read serially would need ~21 s."""
++    script = tmp_path / "slow_gh.py"
++    view = {"state": "OPEN", "reviewDecision": "", "headRefOid": "a" * 40, "author": {"login": "x"},
++            "reviews": [_review("rev", "APPROVED", "a" * 40)]}
++    script.write_text("import json,sys,time\ntime.sleep(1.2)\n"
++                      f"print(json.dumps({view!r} if 'view' in sys.argv else [{{'bucket': 'pass'}}]))\n")
++    monkeypatch.setattr(shared, "_gh_argv", lambda: [sys.executable, str(script)])
++    urls = [f"https://github.com/example/repo/pull/{n}" for n in range(6)]
++    reader = Reader(budget=10)
++    start = time.monotonic()
++    reader.prefetch(urls)
++    assert time.monotonic() - start < 9
++    for url in urls:
++        assert reader.get(url) == {"merged": False, "approved": True, "checks": "green"}
+-- 
+2.43.0
+

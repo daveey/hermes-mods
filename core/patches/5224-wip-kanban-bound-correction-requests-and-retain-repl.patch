@@ -1,0 +1,177 @@
+From c411f27e02f49cd21af7d024f2d2e7624b41a0c0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:25:36 +0000
+Subject: [PATCH] wip(kanban): bound correction requests and retain replay
+ audit [daveey]
+
+---
+ hermes_cli/kanban_diagnostic_correction.py    | 36 ++++++--
+ .../test_kanban_diagnostic_correction.py      | 86 +++++++++++++++++++
+ 2 files changed, 117 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_diagnostic_correction.py b/hermes_cli/kanban_diagnostic_correction.py
+index fae1d8d6ac..165ccc5193 100644
+--- a/hermes_cli/kanban_diagnostic_correction.py
++++ b/hermes_cli/kanban_diagnostic_correction.py
+@@ -16,7 +16,11 @@ def correct_diagnostics(
+     """Operator-only local CAS; sync convergence must be verified separately.
+ 
+     Caller-provided prose is an audit reason, never an authorization grant.
+-    The existing process/DB fence remains the mutation authority boundary.
++    This uses the existing trusted-operator model: absence of worker markers
++    does not authenticate a human or author chat. The actual authorized operator
++    must initiate the call; process_context is observation, not identity proof.
++    Retain the existing process/DB fences and verify invocation custody outside
++    this function before claiming independent-author delivery.
+     """
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_db_sync as sync
+@@ -24,8 +28,15 @@ def correct_diagnostics(
+ 
+     if worker_identity():
+         raise PermissionError("diagnostic correction requires an independent non-worker operator")
+-    if not reason.strip() or not request_id.strip():
+-        raise ValueError("reason and request_id must be nonempty")
++    fields = {
++        "task_id": (task_id, 64), "comment_uid": (comment_uid, 201),
++        "expected_body": (expected_body, 100000), "expected_comment": (expected_comment, 50000),
++        "body_diagnostic": (body_diagnostic, 2000), "comment_diagnostic": (comment_diagnostic, 2000),
++        "reason": (reason, 2000), "request_id": (request_id, 128),
++    }
++    for name, (value, limit) in fields.items():
++        if not isinstance(value, str) or not value.strip() or len(value.encode("utf-8")) > limit:
++            raise ValueError(f"invalid correction field: {name}")
+     after = {
+         "body": quote_diagnostic(expected_body, body_diagnostic),
+         "comment": quote_diagnostic(expected_comment, comment_diagnostic),
+@@ -41,13 +52,28 @@ def correct_diagnostics(
+             raise PermissionError("diagnostic correction requires the owning primary gateway")
+         if task["status"] not in ("todo", "ready", "blocked", "scheduled", "triage") or task["current_run_id"]:
+             raise ValueError("diagnostic correction requires an inactive open task")
++        request = {
++            "request_id": request_id, "comment_uid": comment_uid, "reason": reason,
++            "before": {"body": expected_body, "comment": expected_comment}, "after": after,
++        }
++        for event in kb.list_events(conn, task_id):
++            if event.kind != "diagnostic_corrected" or event.payload.get("request_id") != request_id:
++                continue
++            if any(event.payload.get(key) != value for key, value in request.items()):
++                raise ValueError("request_id conflict; no correction applied")
++            if task["body"] != after["body"] or comment["body"] != after["comment"]:
++                raise ValueError("correction state drifted; no replay applied")
++            return event.payload
+         if task["body"] != expected_body or comment["body"] != expected_comment:
+             raise ValueError("stale body or comment; no correction applied")
+         payload = {
+             "request_id": request_id, "comment_uid": comment_uid, "reason": reason,
+             "before": {"body": expected_body, "comment": expected_comment}, "after": after,
+-            "operator": {"kind": "non-worker", "session": os.environ.get("HERMES_SESSION_ID"),
+-                         "gateway": state["gateway_id"] if state else None},
++            "process_context": {
++                "authority_model": "trusted-operator", "worker_markers_present": False,
++                "session_hint": os.environ.get("HERMES_SESSION_ID"),
++                "gateway": state["gateway_id"] if state else None,
++            },
+         }
+         conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (after["body"], task_id))
+         conn.execute("UPDATE task_comments SET body = ? WHERE uid = ?", (after["comment"], comment_uid))
+diff --git a/tests/hermes_cli/test_kanban_diagnostic_correction.py b/tests/hermes_cli/test_kanban_diagnostic_correction.py
+index 6646bf2fe5..1eaa07fbde 100644
+--- a/tests/hermes_cli/test_kanban_diagnostic_correction.py
++++ b/tests/hermes_cli/test_kanban_diagnostic_correction.py
+@@ -43,6 +43,92 @@ def test_atomic_correction_keeps_original_comment_identity_and_audit(kanban_home
+         assert events[0].payload["before"] == {"body": body, "comment": comment}
+         assert events[0].payload["comment_uid"] == before["uid"]
+         assert result["request_id"] == "fixture-correction-1"
++        assert "operator" not in result
++        assert result["process_context"]["authority_model"] == "trusted-operator"
++        assert result["process_context"]["worker_markers_present"] is False
++        changes = conn.total_changes
++        replay = apply(
++            conn, task_id, comment_uid=before["uid"], expected_body=body, expected_comment=comment,
++            body_diagnostic="origin chat @session:example", comment_diagnostic="origin chat @session:example",
++            reason="The two occurrences reproduce an error; neither is a delivery destination.",
++            request_id="fixture-correction-1",
++        )
++        assert replay == result
++        assert conn.total_changes == changes
++        # Unrelated history must not evict the durable replay identity.
++        for _ in range(110):
++            kb.add_comment(conn, task_id, "fixture-author", "Unrelated history")
++        changes = conn.total_changes
++        assert apply(
++            conn, task_id, comment_uid=before["uid"], expected_body=body, expected_comment=comment,
++            body_diagnostic="origin chat @session:example", comment_diagnostic="origin chat @session:example",
++            reason="The two occurrences reproduce an error; neither is a delivery destination.",
++            request_id="fixture-correction-1",
++        ) == result
++        assert conn.total_changes == changes
++        with pytest.raises(ValueError, match="request_id conflict"):
++            apply(
++                conn, task_id, comment_uid=before["uid"], expected_body=body, expected_comment=comment,
++                body_diagnostic="origin chat @session:example", comment_diagnostic="origin chat @session:example",
++                reason="Different authority explanation must not reuse the key.",
++                request_id="fixture-correction-1",
++            )
++        assert conn.total_changes == changes
++
++
++@pytest.mark.parametrize("worker_key", ["HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK"])
++def test_worker_refused_before_reading_board(kanban_home, monkeypatch, worker_key):
++    from hermes_cli.kanban_diagnostic_correction import correct_diagnostics
++
++    monkeypatch.setenv(worker_key, "fixture-worker")
++    with pytest.raises(PermissionError, match="independent non-worker operator"):
++        correct_diagnostics(
++            None, "fixture-card", comment_uid="fixture-comment", expected_body="error",
++            expected_comment="error", body_diagnostic="error", comment_diagnostic="error",
++            reason="test worker exclusion", request_id="fixture-worker-exclusion",
++        )
++
++
++@pytest.mark.parametrize(("field", "value"), [
++    ("reason", "x" * 2001), ("request_id", "x" * 129),
++    ("reason", None), ("request_id", []), ("expected_body", "x" * 100001),
++    ("expected_comment", "x" * 50001), ("comment_uid", "x" * 202),
++])
++def test_invalid_request_refused_before_board_access(kanban_home, field, value):
++    from hermes_cli.kanban_diagnostic_correction import correct_diagnostics
++
++    request = dict(comment_uid="fixture-comment", expected_body="error", expected_comment="error",
++                   body_diagnostic="error", comment_diagnostic="error", reason="fixture correction",
++                   request_id="fixture-limits")
++    request[field] = value
++    with pytest.raises(ValueError, match="invalid correction field"):
++        correct_diagnostics(None, "fixture-card", **request)
++
++
++@pytest.mark.parametrize("stale", ["body", "comment"])
++def test_stale_compare_preserves_both_fields_and_history(kanban_home, stale):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_diagnostic_correction import correct_diagnostics
++
++    with kbc.connect_closing() as conn:
++        sync.apply_sync_schema_steps(conn)
++        conn.commit()
++        tid = kb.create_task(conn, title="CAS fixture", body="Diagnostic error")
++        kb.add_comment(conn, tid, "author", "Diagnostic error")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_comments SET uid = ? WHERE task_id = ?", ("fixture-cas", tid))
++        before = list(conn.iterdump())
++        with pytest.raises(ValueError, match="stale body or comment"):
++            correct_diagnostics(
++                conn, tid, comment_uid="fixture-cas",
++                expected_body="Diagnostic error" + (" stale" if stale == "body" else ""),
++                expected_comment="Diagnostic error" + (" stale" if stale == "comment" else ""),
++                body_diagnostic="error", comment_diagnostic="error",
++                reason="test CAS exclusion", request_id="fixture-cas",
++            )
++        assert list(conn.iterdump()) == before
+ 
+ 
+ @pytest.mark.parametrize(("original", "diagnostic", "reason"), [
+-- 
+2.43.0
+

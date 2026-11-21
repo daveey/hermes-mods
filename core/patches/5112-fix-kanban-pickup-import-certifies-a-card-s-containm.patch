@@ -1,0 +1,274 @@
+From b5f677205bc711316cbbc98d7906e5b8328f072c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 09:31:14 +0000
+Subject: [PATCH] fix(kanban): pickup import certifies a card's containment
+ receipts from the replica; one refused card no longer aborts the batch
+ [daveey]
+
+Problem: 06:28Z-08:35Z Nov 20 every worker-1 pickup failed (~every 17 s) with
+sqlite3.IntegrityError: containment_pending at import_cards -> apply_remote_changes
+-> _apply_one -> _upsert_row (INSERT), so no pool card was imported while ~67 waited.
+
+Why 1: the INSERT of a released card's `contained`/`containment_released` task_events
+row hits trigger containment_event_insert, which allows it only when
+kanban_containment_sync_event -> replica.event_permit finds a matching receipt in the
+live file's containment_canonical_receipts cache.
+Why 2: that cache is filled only by certify_page (sync loop, Hub evidence). Pickup
+copies replica -> live without the Hub and never called it, so the live cache had no
+receipt for the copied card's events (the replica file does: its own pull certified them).
+Why 3: import_cards applied every picked card in ONE apply_remote_changes transaction,
+so the single refused row rolled back all cards, and pickup retried the same batch each tick.
+Root (happened): the pickup copy path was added before containment receipts existed and
+nothing made it follow the same certification rule as the feed path.
+Root (not caught): no test ran pickup with the real containment triggers and a released card.
+Recurrence: PR #3753 (receipt cache ignores re-stamp bookkeeping) fixed a different refusal
+(canonical receipt identity changed) on the sync path; this path was untouched.
+
+Fix: replica.adopt_receipts re-certifies each protected event's receipt (stored in the
+replica's cache) into the live cache with remember() (signature, board, origin, stop/release
+pair) and checks the event equals it, offline. import_cards does this per card; a card that
+cannot be certified is left out (never by disabling a trigger), logged with its id and table
+(task_events), and recorded as a kanban_pickup_skips row (reason other); the rest import.
+Guard triggers are unchanged.
+
+Proof: tests/hermes_cli/test_kanban_pickup_containment_import.py (real triggers): RED on
+base (IntegrityError containment_pending), GREEN with fix; 66 related test files pass.
+---
+ hermes_cli/kanban_containment_replica.py      |  31 +++++
+ hermes_cli/kanban_worker_node.py              |  30 ++++-
+ .../test_kanban_pickup_containment_import.py  | 122 ++++++++++++++++++
+ 3 files changed, 181 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_containment_import.py
+
+diff --git a/hermes_cli/kanban_containment_replica.py b/hermes_cli/kanban_containment_replica.py
+index 0756671096..127481d989 100644
+--- a/hermes_cli/kanban_containment_replica.py
++++ b/hermes_cli/kanban_containment_replica.py
+@@ -144,6 +144,37 @@ def certify_page(conn: sqlite3.Connection, hub, board: str, changes) -> None:
+             raise ContainmentRefused("replica event differs from its canonical receipt")
+ 
+ 
++def adopt_receipts(conn: sqlite3.Connection, source: sqlite3.Connection, changes) -> None:
++    """Certify a pickup copy's protected events from the host's own pulled replica, offline.
++
++    The Board feed fills ``source`` (the replica file) only through :func:`certify_page`, so its receipt cache
++    holds the authenticated evidence for every protected event it applied. A pickup copy goes replica -> live
++    file without the Hub, so :func:`event_permit` finds no receipt in the live cache unless we carry it over.
++    Each carried receipt is certified again by :func:`remember` (signature, board, origin, stop/release pair),
++    never trusted for sitting in the replica, and the event must still equal its receipt. A missing or invalid
++    receipt raises ``ContainmentRefused``: nothing is permitted for that event.
++    """
++    for ch in changes:
++        if ch.table != "task_events" or ch.fields.get("kind") not in ("contained", "containment_released"):
++            continue
++        if ch.op != "upsert":
++            raise ContainmentRefused("protected containment history cannot be deleted")
++        proof = _cached(source, ch.uid)
++        if proof is None:
++            raise ContainmentRefused(f"no certified receipt for {ch.fields['kind']} event {ch.uid} in the replica")
++        stop = None
++        if ch.fields["kind"] == "containment_released":
++            data = _payload(ch.fields)
++            if data is None:
++                raise ContainmentRefused("invalid canonical release event")
++            stop = _cached(source, str(data.get("episode")))
++            if stop is None:
++                raise ContainmentRefused(f"no certified stop receipt for release event {ch.uid} in the replica")
++        remember(conn, proof, board=proof["board"], task=ch.fields.get("task_id"), uid=ch.uid, stop_evidence=stop)
++        if not _matches({**ch.fields, "uid": ch.uid}, proof) or ch.origin_gateway != proof["row"]["origin_gateway"]:
++            raise ContainmentRefused("replica event differs from its canonical receipt")
++
++
+ @contextlib.contextmanager
+ def projection(conn: sqlite3.Connection, change) -> Iterator[None]:
+     """Internal apply scope: one connection, transaction and exact wire row only."""
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index e18cd542e1..00a7813c9f 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -514,15 +514,39 @@ def _changes_for(replica: sqlite3.Connection, tid: str, card: sqlite3.Row) -> li
+     return out
+ 
+ 
++_IMPORT_REFUSALS: dict[str, str] = {}
++
++
++def import_refusals() -> dict[str, str]:
++    """Cards the latest :func:`import_cards` call left out (id -> why). The call keeps its list-of-ids contract
++    (wrappers and other callers rely on it); the pickup tick reads the reasons here for its skip evidence."""
++    return dict(_IMPORT_REFUSALS)
++
++
+ def import_cards(conn: sqlite3.Connection, replica: sqlite3.Connection, ids: Iterable[str]) -> list[str]:
+-    """Copy cards (and their history) from the replica into the live file, without capture and without hooks."""
++    """Copy cards (and their history) from the replica into the live file, without capture and without hooks.
++
++    A card whose protected containment events cannot be certified from the replica's receipts is left out and
++    named in :func:`import_refusals`: one refused row aborts the whole apply transaction, so it must never reach
++    it. The containment guard itself is untouched."""
++    from hermes_cli import kanban_containment_replica as containment
++    from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
++    _IMPORT_REFUSALS.clear()
+     changes: list[sync.RemoteChange] = []
+     done: list[str] = []
+     for tid in ids:
+         card = replica.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
+         if card is None:
+             continue
+-        changes.extend(_changes_for(replica, tid, card))
++        card_changes = _changes_for(replica, tid, card)
++        try:
++            containment.adopt_receipts(conn, replica, card_changes)
++        except (ContainmentRefused, KeyError, ValueError, TypeError) as exc:  # malformed evidence refuses too
++            why = f"containment receipts not certified for task_events: {exc}"
++            _log.warning("kanban worker node: not importing %s (table task_events): %s", tid, why)
++            _IMPORT_REFUSALS[tid] = why
++            continue
++        changes.extend(card_changes)
+         done.append(tid)
+     if changes:
+         cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
+@@ -736,10 +760,12 @@ def pickup(conn: sqlite3.Connection, *, budget: Any,
+         picked, plans, judged = admission.screen(conn, replica, own, [tid for tid in picked if tid not in behind])
+         skips.update(judged)
+         imported = import_cards(conn, replica, picked)
++        refused = import_refusals()
+     finally:
+         replica.close()
+     denied = admission.apply(conn, own, plans, imported)
+     skips.update({tid: ("other", "import failed") for tid in picked if tid not in imported})
++    skips.update({tid: ("other", why) for tid, why in refused.items()})
+     skips.update(denied)
+     imported = [tid for tid in imported if tid not in denied]
+     kph.remember({tid: sig for tid, sig in held.items() if tid in imported})
+diff --git a/tests/hermes_cli/test_kanban_pickup_containment_import.py b/tests/hermes_cli/test_kanban_pickup_containment_import.py
+new file mode 100644
+index 0000000000..0486e8a664
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_containment_import.py
+@@ -0,0 +1,122 @@
++"""Pickup copies a released card's containment history from the replica with the real containment triggers.
++
++The replica file is filled through ``certify_page`` (it holds the authenticated receipts); the live file gets the
++copy through ``worker_pickup`` -> ``import_cards`` -> ``apply_remote_changes`` with no Hub. One card whose
++receipts are missing must not abort the import of the others, and the guard itself stays closed.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_containment_connections as connections
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_containment_replica as base
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli import test_kanban_sync_capture as capture
++
++kanban_home = capture.kanban_home
++
++
++@pytest.fixture
++def pair(kanban_home, tmp_path):
++    support.write_sync_config(kanban_home, True)
++    with kbc.connect(tmp_path / "replica.db") as replica, kbc.connect(kanban_home / "kanban.db") as live:
++        client.ensure_identity(live, "fixture", "worker")
++        sync.set_mode(live, "primary")
++        previous = sync.set_lease_client(support.FakeLeaseClient())
++        try:
++            yield replica, live
++        finally:
++            sync.set_lease_client(previous)
++
++
++def released_card(replica):
++    """A card the replica holds as released (stop + release receipts cached), plus its Hub double."""
++    target, _child, stop, release, hub = base.scenario(replica)
++    marker = sync.RemoteChange(1, "tasks", target, "upsert",
++                               {"status": "triage", "containment_episode": stop["event_uid"]}, 100, "", "home")
++    base.apply(replica, hub, [marker])
++    base.apply(replica, hub, [base.event(stop, hub, 2)])
++    cleared = sync.RemoteChange(3, "tasks", target, "upsert", {"status": "ready", "containment_episode": None},
++                                101, "", "home")
++    base.apply(replica, hub, [cleared])
++    base.apply(replica, hub, [base.event(release, hub, 4)])
++    assert kb.get_task(replica, target).status == "ready"
++    return target, stop, release
++
++
++def plain_card(replica, title):
++    return kb.create_task(replica, title=title, assignee="default")
++
++
++def test_released_card_imports_and_can_be_claimed(pair):
++    replica, live = pair
++    target, _stop, _release = released_card(replica)
++    other = plain_card(replica, "Plain ready card")
++    assert sorted(wn.import_cards(live, replica, [target, other])) == sorted([target, other])
++    kinds = {r[0] for r in live.execute("SELECT kind FROM task_events WHERE task_id=?", (target,))}
++    assert {"contained", "containment_released"} <= kinds
++    assert not connections.held(live, target)
++    assert kb.claim_task(live, target) is not None
++
++
++def test_uncertifiable_card_is_skipped_visibly_and_others_import(pair, caplog, monkeypatch):
++    """Through ``worker_pickup``: the refused card is recorded and logged; every other card is imported."""
++    replica, live = pair
++    bad, _stop, release = released_card(replica)
++    good, _s, _r = released_card(replica)
++    other = plain_card(replica, "Plain ready card")
++    # The replica lost the release receipt of `bad` (and nothing else).
++    replica.execute("DROP TRIGGER containment_cache_delete")
++    replica.execute("DELETE FROM containment_canonical_receipts WHERE uid=?", (release["event_uid"],))
++    picked = [bad, good, other]
++    monkeypatch.setattr(wn, "pickup_mode", lambda: "all")
++    monkeypatch.setattr(wn, "open_replica", lambda conn: _Keep(replica))
++    monkeypatch.setattr(wn, "_evaluate", lambda *a, **k: (list(picked), {}))
++    from hermes_cli import kanban_hub_admission_pickup as admission
++    monkeypatch.setattr(admission, "screen", lambda conn, rep, own, ids: (list(ids), {}, {}))
++    with caplog.at_level(logging.WARNING):
++        sync.worker_pickup(live, 10, False, lambda: None)
++    assert not [r for r in caplog.records if "pickup failed" in r.getMessage()]
++    assert {r[0] for r in live.execute("SELECT id FROM tasks")} >= {good, other}
++    assert live.execute("SELECT 1 FROM tasks WHERE id=?", (bad,)).fetchone() is None
++    assert live.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind LIKE 'contain%'",
++                        (bad,)).fetchone()[0] == 0
++    assert any(bad in r.getMessage() and "task_events" in r.getMessage() for r in caplog.records)
++    skip = live.execute("SELECT reason, detail FROM kanban_pickup_skips WHERE task_id=?", (bad,)).fetchone()
++    assert skip[0] == "other" and "containment receipts not certified" in skip[1]
++    assert kb.claim_task(live, good) is not None
++
++
++class _Keep:
++    """The replica handle pickup closes when done: keep the fixture's connection open."""
++
++    def __init__(self, conn):
++        self._conn = conn
++
++    def close(self):
++        pass
++
++    def __getattr__(self, name):
++        return getattr(self._conn, name)
++
++
++def test_guard_still_refuses_uncertified_history_and_edges(pair):
++    replica, live = pair
++    target, _stop, _release = released_card(replica)
++    wn.import_cards(live, replica, [target])
++    fresh = sync.uuid7()
++    live.execute("UPDATE kanban_sync_state SET applying=1")
++    with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++        live.execute("INSERT INTO task_events(uid,task_id,kind,payload,created_at) VALUES (?,?,?,?,1)",
++                     (fresh, target, "contained", "{}"))
++    with pytest.raises(sqlite3.IntegrityError, match="containment_pending"):
++        live.execute("INSERT INTO task_events(uid,task_id,kind,payload,created_at) VALUES (?,?,?,?,1)",
++                     (fresh, target, "containment_released", "{}"))
+-- 
+2.43.0
+

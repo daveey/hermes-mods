@@ -1,0 +1,711 @@
+From 490e2b4a01f4b2d3edc9e075943d59cfd3b848b2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 20:48:47 -0800
+Subject: [PATCH] fix(doctor): fourth review round - values that are argv,
+ switches, quoting, speed
+
+Leaks closed:
+- a spaced env value (JAVA_TOOL_OPTIONS='-Xmx1g -Dapi.token=x',
+  GIT_SSH_COMMAND='sshpass -p x ssh', CURL_ARGS='-u a:b') is judged as its
+  own argv; shell text whose program word is a flag is passed as flags
+- a flag inside a value (--jvm-arg=-Dpassword=x, JAVA_OPTS=-Dtoken=x)
+- lists are split before a value is taken for a path
+- URL queries are judged pair by pair (an e-mail stays one value), and a
+  fragment after a masked path piece is masked as its tail
+- mixed-case dotted key groups; -u/--user user:pass for any program
+  (a bare user or a numeric uid:gid stays)
+
+Over-masks fixed: secret-named switches no longer eat the next argument
+(stdin suffix; ask/prompt/keep prefixes; main's kebab-case --flag rule and
+its test restored); openssl -key/-keyout/-kdf (attached matching only for
+flags listed as attached), -newkey/-keyform, key and cert file names after
+a secret flag; digest-pinned images keep their name; model names via a
+small model vocabulary; Go pseudo-versions; -Xlog:gc*, %r@%h:%p, globs.
+
+Shell text is shown as written (quotes kept) unless masking changed a
+word. The base64-neighbour pass is linear (25k pieces: 0.3 s, was minutes).
+Dead branches removed (-D special case, path symbol rule); path/URL
+handling split into named helpers.
+
+Tests: positions for spaced env values, flag values and lists, a
+mixed-case dotted key shape; ceilings and docstring state the same bounds
+(10/5/3/2% tested, ~8/3/2/1% measured worst); the doctor test no longer
+depends on the runner's random temp dir name.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_state_argv_secrets.py                  | 288 ++++++++++++------
+ .../test_doctor_fts_deferral_holders.py       |   2 +-
+ tests/hermes_state/test_argv_secrets.py       | 129 +++++++-
+ 3 files changed, 316 insertions(+), 103 deletions(-)
+
+diff --git a/hermes_state_argv_secrets.py b/hermes_state_argv_secrets.py
+index 14b59bae8c..b1a8c2d476 100644
+--- a/hermes_state_argv_secrets.py
++++ b/hermes_state_argv_secrets.py
+@@ -9,15 +9,18 @@ a secret-named flag (``--webhook-secret``, ``--api-key-value``, ``-Dapi.key=``,
+ env prefixes in shell strings. ``agent.redact`` still runs afterwards for known secret formats and URL credentials.
+ 
+ Limits, measured on generated secrets of every common shape (letters and digits, base32/64, urlsafe, hex, symbol
+-passwords, single-case letters, grouped keys) as a bare argument, in an absolute or relative path, in a URL and as a
+-``NAME=`` value -- counting a shown tail of 8+ characters as a leak: at most about 7% of 16-character secrets are shown,
+-2.5% of 24-character, 1.5% of 32-character and 1% of 40-character ones (the worst shapes are random mixed- or
+-single-case letters, which can read like words); about 0.15% of this repo's identifiers and 0.1% of its env names
+-are masked. This is a rate, not a guarantee, and some secrets look exactly like identifiers and are shown:
+-pronounceable passwords (``correcthorse``), all-digit values, UUIDs and strings under 12 characters, unless a name
+-marks them secret. Short hex (up to 12 characters) is shown on purpose: it is how commits are abbreviated; longer hex
+-(full commits, digests, container ids) is masked with the keys it looks like. ``--pin`` and ``--private`` are not
+-secret names on purpose: in Hermes and common tools they are switches or provider slugs.
++passwords, single- and mixed-case letters, grouped keys) as a bare argument, in an absolute or relative path, in a
++URL, in a list, inside a spaced env value or a flag value and as a ``NAME=`` value -- a shown tail of 8+ characters
++counts as a leak: the worst shape and position shows about 8% of 16-character secrets, 3% of 24-character, 2% of
++32-character and 1% of 40-character ones (random letters can read like words); the tests hold these under 10%, 5%,
++3% and 2%. About 0.15% of this repo's identifiers and 0.1% of its env names are masked. This is a rate, not a
++guarantee, and some secrets look exactly like identifiers and are shown: pronounceable passwords (``correcthorse``),
++all-digit values, UUIDs, strings under 12 characters and a secret shaped like a kebab-case ``--flag`` right after a
++secret-named flag (read as the next flag, as switches need), unless a name marks them secret. Short hex (up to 12
++characters) is shown on purpose: it is how commits are abbreviated; longer hex (full commits, digests, container ids)
++is masked with the keys it looks like. ``--pin`` and ``--private`` are not secret names on purpose (switches or
++provider slugs in Hermes and common tools); the query names ``code``, ``session`` and ``hash`` are, so harmless values
++there are masked too.
+ """
+ 
+ from __future__ import annotations
+@@ -45,18 +48,22 @@ _SETTING_SUFFIXES = frozenset({
+     "endpoint", "host", "port", "count", "limit", "size", "length", "len", "mode", "type", "kind", "format", "store",
+     "backend", "provider", "browser", "enabled", "required", "only", "whitelist", "allowlist", "denylist",
+     "blacklist", "server", "servers", "scheme", "schemes", "delegate", "signingkey", "version", "versions",
+-    "arn", "fd",
++    "arn", "fd", "stdin",
+ })
+ # Parts that make a plural secret name a count (--max-tokens 4096, --tokens-per-delta 512), not a list of secrets.
++# Model families and formats: short words in model names that the letter statistics cannot vouch for.
++_MODEL_WORDS = frozenset({"qwen", "llama", "mistral", "mixtral", "gemma", "phi", "deepseek", "gpt", "claude", "grok",
++                          "kimi", "glm", "falcon", "olmo", "nemotron", "granite", "gemini", "codestral", "devstral",
++                          "smollm", "dwq", "gguf", "awq", "gptq", "mlx", "bnb", "fp", "bf", "int", "bit", "instruct"})
+ _COUNT_PARTS = frozenset({"max", "min", "cap", "per", "limit", "num", "count", "total", "budget"})
+ # Query parameters that carry a credential although their name has no secret word.
+ _QUERY_SECRETS = frozenset({"sid", "sig", "signature", "code", "session", "hash", "pass", "pwd", "otp"})
+ _COMMAND_SUFFIXES = frozenset({"cmd", "command", "helper"})
+ # A first part that makes a flag a switch: it takes no value, so the next argument is not its secret.
+ _BOOLEAN_PREFIXES = frozenset({"no", "show", "rotate", "migrate", "with", "list", "print", "clear", "reset", "skip",
+-                               "allow", "require", "enable", "disable", "isolated"})
++                               "allow", "require", "enable", "disable", "isolated", "ask", "prompt", "keep"})
+ _PUBLIC_FLAGS = frozenset({"--ssh-session-token-file", "--keychain", "--monkey", "--keyboard", "--author",
+-                           "--max-tokens", "--min-tokens", "--cache-read-tokens",
++                           "--max-tokens", "--min-tokens", "--cache-read-tokens", "--newkey", "--keyform",
+                            "--authority", "--idempotency-key", "--step-key", "--passkey-browser", "--session-key",
+                            "--no-credentials", "--use-partner-key-as-auth", "--keywords"})
+ # Values that select an auth mechanism (mcp add --auth oauth): kept after a flag whose only secret word is "auth".
+@@ -76,10 +83,11 @@ _PROGRAM_SECRET_FLAGS = {
+     "keytool": (("-storepass", "-keypass", "-srcstorepass", "-deststorepass", "-srckeypass", "-destkeypass"), (), ()),
+     "7z": ((), ("-p",), ()), "7za": ((), ("-p",), ()), "zip": (("-P",), (), ()), "unzip": (("-P",), (), ()),
+     "ssh-keygen": (("-N", "-P"), (), ()),
+-    "curl": (("-b",), (), ("-u", "--user", "-U", "--proxy-user")), "smbclient": ((), (), ("-U", "--user")),
++    "curl": (("-b",), ("-b",), ("-u", "--user", "-U", "--proxy-user")), "smbclient": ((), (), ("-U", "--user")),
+     "lftp": ((), (), ("-u", "--user")),
+ }
+-_NO_FLAGS = ((), (), ())
++# Any program: -u/--user user:pass (curl-style); a bare user or a numeric uid:gid (docker -u 1000:1000) stays.
++_NO_FLAGS = ((), (), ("-u", "--user"))
+ _COOKIE_FLAGS = frozenset({"-b", "--cookie", "cookie"})
+ # Programs that run a command given as their first positional argument: that program's own flags apply after it.
+ _COMMAND_WRAPPERS = frozenset({"sshpass", "sudo", "doas", "env", "nice", "nohup", "timeout", "xargs", "exec", "time",
+@@ -106,6 +114,7 @@ _COMMON_MIN, _VOWEL_MIN, _RARE_MAX, _CLUSTER_MIN = 0.55, 0.1, 0.25, 7
+ # a long all-caps word with a 5-consonant cluster is random unless its letter pairs read strongly (PASSPHRASE)
+ _CLUSTER_MIN_UPPER, _UPPER_LEN, _UPPER_CLUSTER_COMMON = 5, 8, 0.75
+ _ALPHA_FREE = 6  # letter runs this short carry too little to be a secret on their own (iOS, gRPC)
++_ALPHA_FREE_LOWER = 7  # one letter longer when all lowercase (execvpe, openxml): random runs are mostly mixed case
+ _SHORT_WORD, _MAX_SHORT_WORDS, _MIN_AVG_WORD = 2, 3, 2.5  # camelCase word-shape limits
+ # key groups: equal-length chunks, 3+ of 5-8 characters or 4+ of 3-4, mostly not words (OKWV-IDIA-T5UR-…)
+ _KEY_GROUP_LEN, _KEY_GROUPS_LONG, _KEY_GROUPS_SHORT = (3, 8), 3, 4
+@@ -124,7 +133,7 @@ _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4
+ # Ids with a known prefix: Hermes cards/processes/sessions, cloud resources.
+ _KNOWN_ID_BODY = (r"(?:t_[0-9a-f]+|proc_[0-9a-f]+|\d{8}_\d{6}_[0-9a-z]+|tail[0-9a-f]{4,10}|"
+                   r"(?:i|mi|vol|snap|sg|subnet|vpc|ami|eni|igw|rtb|nat|acl|lt)-[0-9a-f]{8,17})")
+-_KNOWN_ID = re.compile(rf"^{_KNOWN_ID_BODY}$")
++_KNOWN_ID = re.compile(rf"^(?:{_KNOWN_ID_BODY}|v\d+\.\d+\.\d+-(?:0\.)?\d{{14}}-[0-9a-f]{{12}})$")  # + Go pseudo-versions
+ _KNOWN_ID_INSIDE = re.compile(rf"(?<![0-9A-Za-z]){_KNOWN_ID_BODY}(?![0-9A-Za-z])")
+ _PATH_START = re.compile(r"^(?:/|~|\.{1,2}/|\\|[A-Za-z]:[\\/])")
+ _URL = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+@@ -137,6 +146,9 @@ _USERINFO = re.compile(r"^([^:@/\s]+):([^:@/\s]+)@([A-Za-z][A-Za-z0-9-]*(?:\.[A-
+ _NOT_USERINFO = frozenset({"mailto", "npm", "github", "gitlab", "bitbucket", "pkg", "jsr", "docker", "oci", "git"})
+ _STRUCTURE = re.compile(r"[/?&#=;@]")  # between the components of a path or URL
+ _NAME_COLON = re.compile(r"^([A-Za-z_][\w.-]*):(\S+)$")  # name:value, judged by the name
++_IMAGE_DIGEST = re.compile(r"^[\w.-]+@sha\d+:[0-9a-fA-F]+$")  # image@sha256:… (the long hex is still masked)
++# A file that holds a key or credential, named after a secret flag (openssl -key server.key).
++_SECRET_FILE = re.compile(r"^[\w.-]+\.(?:key|pem|crt|cer|der|p12|pfx|jks|keystore|pub|asc|gpg|txt|json|ya?ml|env)$")
+ _NPM_SPEC = re.compile(r"^@[\w.-]+/[\w.-]+(?:@[\w.^~<>=-]+)?$")  # @playwright/mcp@latest
+ 
+ 
+@@ -181,7 +193,8 @@ def _letters_look_random(letters: str) -> bool:
+ def _alpha_ok(run: str) -> bool:
+     """A letter run that is a word, an acronym or camelCase words. Runs of up to 6 letters carry too little to be a
+     secret on their own (iOS, gRPC, eBPF); longer runs are judged."""
+-    return len(run) <= _ALPHA_FREE or not _letters_look_random(run)
++    free = _ALPHA_FREE_LOWER if run.islower() else _ALPHA_FREE
++    return len(run) <= free or not _letters_look_random(run)
+ 
+ 
+ def _segment_ok(segment: str) -> bool:
+@@ -217,7 +230,8 @@ def _is_word_group(group: str) -> bool:
+     """A chunk that reads as a word or number (hermes, pytest, 2507), not a generated group (T5UR, OKWV)."""
+     if group.isdigit() or _short_hex(group) and not re.search(r"\d", group):
+         return True
+-    return group.isalpha() and (len(group) <= 2 or not _letters_random(group))
++    consistent = group.islower() or group.isupper() or group.istitle()  # ETMRrk, KvJecc: random case
++    return group.isalpha() and consistent and (len(group) <= 2 or not _letters_random(group))
+ 
+ 
+ def _key_groups(groups: list[str]) -> bool:
+@@ -257,8 +271,10 @@ def _random_chunk(alnum: str) -> bool:
+ def _words_with_short_ids(token: str) -> bool:
+     """A name of real words with short id or version parts (hermes-gateway-7d9f8c6b5-x2k4p, v1.2.3-rc4+build5):
+     its letter/digit changes come from the short parts, not from one generated string."""
+-    chunks = [c for c in re.split(r"[-_.+]", token) if c]
+-    words = [c for c in chunks if (m := re.fullmatch(r"([a-z]{5,})\d*", c)) and not _letters_random(m.group(1))]
++    chunks = [c for c in re.split(r"[-_.+/]", token) if c]
++    words = [c for c in chunks
++             if ((m := re.fullmatch(r"([a-z]{5,})\d*", c)) and not _letters_random(m.group(1)))
++             or re.sub(r"\d+", "", c).lower() in _MODEL_WORDS]
+     return bool(words) and all(len(c) <= 10 for c in chunks if c not in words)
+ 
+ 
+@@ -285,7 +301,8 @@ def is_identifier(token: str) -> bool:
+         return True
+     token = _KNOWN_ID_INSIDE.sub("id", token)  # followup:t_eeeeee0000000015:notify, hermes-kanban-t_…
+     if not _NPM_SPEC.match(token):
+-        unglobbed = re.sub(r"(?<![A-Za-z0-9])\*(?![A-Za-z0-9])", "", token)  # *.example.com, dir/*: globs
++        # globs (*.example.com, dir/*, gc*) and printf tokens (%r@%h:%p) are not password symbols
++        unglobbed = re.sub(r"(?<![A-Za-z0-9])\*|\*(?![A-Za-z0-9])|%[A-Za-z]", "", token)
+         if re.search(r"[A-Za-z0-9]", unglobbed) and (
+                 re.search(r"[!^$*]", unglobbed) or len(re.findall(r"[&#%@]", unglobbed)) >= 2):
+             return False  # shell-unsafe symbols, or several of &#%@, in a name: a password, not an identifier
+@@ -358,72 +375,107 @@ def _base64_piece(part: str) -> bool:
+         re.search(r"\d", part) or (re.search(r"[a-z]", part) and re.search(r"[A-Z]", part)))
+ 
+ 
+-def _mask_components(value: str) -> str:
+-    """A path, URL path or query keeps its structure; each component that is not an identifier is masked. Adjacent
+-    components are also judged together, since base64 secrets carry "/" (``i0/WDpxZVIeYA8N/gAbxXu8i``)."""
+-    parts = _STRUCTURE.split(value)
+-    seps = _STRUCTURE.findall(value)
+-    bad = [not is_identifier(part) for part in parts]
+-    content_bad = list(bad)  # bad by what it looks like, before any name or neighbour rule
+-    for index in range(len(parts) - 1):
++def _spread_to_base64_neighbours(parts: list[str], seps: list[str], bad: list[bool]) -> None:
++    """A base64 secret cut at "/" or "#": two pieces that pass alone but not together are masked, and so are the
++    pieces next to a masked piece. One pass over pairs, then a forward and a backward sweep: linear."""
++    joinable = [sep in "/#" for sep in seps]
++    for index in range(len(parts) - 1):  # two pieces that pass alone but not together (UKSjptB/XAwzL4sS)
+         left, right = parts[index], parts[index + 1]
+-        if (seps[index] in "/#" and not bad[index] and not bad[index + 1] and _base64_piece(left)
++        if (joinable[index] and not bad[index] and not bad[index + 1] and _base64_piece(left)
+                 and _base64_piece(right) and not is_identifier(left + right)):
+             bad[index] = bad[index + 1] = True
+-    for index, part in enumerate(parts):
+-        if re.search(r"[!^$*]", part) and re.search(r"[A-Za-z0-9]", part):
+-            bad[index] = True  # shell-unsafe symbols do not occur in path or URL names; they do in passwords
+-        if index and seps[index - 1] == "=" and (
+-                _is_secret_name(parts[index - 1]) or parts[index - 1].lower() in _QUERY_SECRETS):
+-            bad[index] = True  # ?token=…, ?pass=…, ?sid=…: the value is a credential
+-    changed = True
+-    while changed:  # a base64 secret cut at "/" or "#": the pieces next to a masked piece are part of it
+-        changed = False
+-        for index in range(len(parts) - 1):
+-            if seps[index] not in "/#":
+-                continue
+-            for a, b in ((index, index + 1), (index + 1, index)):
+-                if bad[a] and not bad[b] and len(parts[b]) >= 4 and _base64_piece(parts[b]):
+-                    bad[b] = changed = True
+-    # the path part of a "/" segment (before any "?") with password symbols is one secret cut at # & @ %: when the
+-    # part as a whole is not a name, mask all of its pieces (the query after it is judged piece by piece)
+-    segment_start = 0
+-    for index in range(len(parts) + 1):
+-        if index == len(parts) or (index and seps[index - 1] == "/"):
+-            path_pieces = []
+-            for i in range(segment_start, index):
+-                path_pieces.append(i)
+-                if i < len(seps) and seps[i] == "?":
+-                    break
+-            text = "".join(parts[i] + (seps[i] if i != path_pieces[-1] else "") for i in path_pieces)
+-            if re.search(r"[!^$*&#%@]", text) and re.search(r"[A-Za-z0-9]", text) and (
+-                    any(content_bad[i] for i in path_pieces) or not is_identifier(text)):
+-                for i in path_pieces:
+-                    bad[i] = True
+-            segment_start = index
++    for index in range(1, len(parts)):
++        if joinable[index - 1] and bad[index - 1] and len(parts[index]) >= 4 and _base64_piece(parts[index]):
++            bad[index] = True
++    for index in range(len(parts) - 2, -1, -1):
++        if joinable[index] and bad[index + 1] and len(parts[index]) >= 4 and _base64_piece(parts[index]):
++            bad[index] = True
++
++
++def _segments(seps: list[str], count: int) -> list[range]:
++    """Index ranges of the pieces in each "/" segment."""
++    ranges, first = [], 0
++    for index, sep in enumerate(seps):
++        if sep == "/":
++            ranges.append(range(first, index + 1))
++            first = index + 1
++    ranges.append(range(first, count))
++    return ranges
++
++
++def _mask_password_segments(parts: list[str], seps: list[str], bad: list[bool], content_bad: list[bool]) -> None:
++    """The path part of a "/" segment (before any "?") with password symbols is one secret cut at # & @ %: when that
++    part as a whole is not a name, mask all of its pieces. An image digest (name@sha256:…) is not one."""
++    for segment in _segments(seps, len(parts)):
++        pieces = []
++        for index in segment:
++            pieces.append(index)
++            if index < len(seps) and seps[index] == "?":
++                break
++        text = "".join(parts[i] + (seps[i] if i != pieces[-1] else "") for i in pieces)
++        if (re.search(r"[&#%@]", text) and re.search(r"[A-Za-z0-9]", text) and not _IMAGE_DIGEST.match(text)
++                and (any(content_bad[i] for i in pieces) or not is_identifier(text))):
++            for index in pieces:
++                bad[index] = True
++
++
++def _mask_components(value: str) -> str:
++    """A path or URL path keeps its structure; each component that is not an identifier is masked, base64 pieces next
++    to a masked piece too, and a segment that is a symbol password cut into pieces as a whole."""
++    parts = _STRUCTURE.split(value)
++    seps = _STRUCTURE.findall(value)
++    content_bad = [not is_identifier(part) for part in parts]
++    bad = list(content_bad)
++    _spread_to_base64_neighbours(parts, seps, bad)
++    _mask_password_segments(parts, seps, bad, content_bad)
+     out = [MASK if bad[0] else parts[0]]
+     for sep, part, masked in zip(seps, parts[1:], bad[1:]):
+         out += [sep, MASK if masked else part]
+     return "".join(out)
+ 
+ 
+-def _mask_url(value: str) -> str:
++def _mask_query(query: str, *, depth: int) -> str:
++    """``a=1&token=x``: each value judged whole under its name (an e-mail with "@" stays one value)."""
++    out = []
++    for pair in query.split("&"):
++        name, eq, value = pair.partition("=")
++        if not eq:
++            out.append(pair if is_identifier(pair) else MASK)
++        elif _is_secret_name(name) or name.lower() in _QUERY_SECRETS:
++            out.append(f"{name}={MASK if value else value}")
++        else:
++            out.append(f"{name}={_judge(value, secret=False, depth=depth + 1)}")
++    return "&".join(out)
++
++
++def _mask_url(value: str, *, depth: int = 0) -> str:
+     scheme, rest = value.split("://", 1)
++    rest, hash_sign, fragment = rest.partition("#")
++    rest, question, query = rest.partition("?")
+     authority, slash, path = rest.partition("/")
+     if "@" in authority:
+         authority = f"{MASK}@{authority.rsplit('@', 1)[1]}"  # userinfo is a credential either way
+     host = authority.rsplit("@", 1)[-1]
+     if not is_identifier(host.split(":")[0]):
+         authority = authority[: len(authority) - len(host)] + MASK
+-    return f"{scheme}://{authority}{slash}{_mask_components(path)}" if slash else f"{scheme}://{authority}"
++    shown = f"{scheme}://{authority}{slash}{_mask_components(path) if slash else ''}"
++    if question:
++        shown += "?" + _mask_query(query, depth=depth)
++    if hash_sign:
++        # after a masked piece, a "#" is most likely inside the same secret: the fragment is its tail
++        shown += "#" + (MASK if MASK in shown or not is_identifier(fragment) else fragment)
++    return shown
+ 
+ 
+ def _mask_userpass(value: str) -> str:
+-    """``user:pass`` / ``user%pass`` / ``user,pass`` -> the user (if it reads as one) and ``***``."""
++    """``user:pass`` / ``user%pass`` / ``user,pass`` -> the user (if it reads as one) and ``***``; a bare key used as
++    the user (``-u KEY:``) is masked too."""
+     split = re.match(r"^([^:%,]*)([:%,])(.*)$", value, re.DOTALL)
+     if split is None:
+         return value if is_identifier(value) else MASK
+-    user, sep, _secret = split.groups()
++    user, sep, secret = split.groups()
++    if user.isdigit() and secret.isdigit():
++        return value  # uid:gid
+     return f"{user if user and is_identifier(user) else MASK}{sep}{MASK}"
+ 
+ 
+@@ -434,11 +486,13 @@ def _mask_command(value: str, *, depth: int = 0) -> str:
+ 
+ def _judge_secret(value: str, *, name: str) -> str:
+     """The value of a secret-named flag or name: masked, except an auth mechanism word, a count, or a file that
+-    holds the secret (an absolute path of 2+ directories made of names)."""
++    holds the secret (an absolute path of 2+ directories made of names, or a key/cert file name)."""
+     if _auth_only(name) and value.lower() in _AUTH_MODES:
+         return value
+     if _counts_secrets(name) and value.isdigit():
+         return value
++    if _SECRET_FILE.match(value) and is_identifier(value):
++        return value  # openssl -key server.key, --cert-key tls.pem
+     if (_PATH_START.match(value) and re.fullmatch(r"[\w./\\:~-]+", value) and value.count("/") >= 2
+             and _mask_components(value) == value):
+         return value
+@@ -455,30 +509,65 @@ def _judge_assignment(name: str, inner: str, *, depth: int) -> str:
+     return f"{name}={_judge(inner, secret=False, depth=depth + 1)}"
+ 
+ 
+-def _shell_words(text: str) -> list[str] | None:
+-    """Shell text split as the shell would (quotes kept together), or None when its quoting does not parse."""
+-    try:
+-        return shlex.split(text, posix=True)
+-    except ValueError:
++def _shell_words(text: str) -> list[tuple[str, str]] | None:
++    """Shell text as ``(raw, value)`` words: *raw* as written (quotes kept, for showing), *value* as the shell would
++    pass it. None when its quoting does not parse."""
++    raws: list[str] = []
++    current, quote, escaped = [], "", False
++    for char in text:
++        if escaped:
++            current.append(char)
++            escaped = False
++        elif char == "\\" and quote != "'":
++            current.append(char)
++            escaped = True
++        elif quote:
++            current.append(char)
++            if char == quote:
++                quote = ""
++        elif char in "'\"":
++            current.append(char)
++            quote = char
++        elif char.isspace():
++            if current:
++                raws.append("".join(current))
++                current = []
++        else:
++            current.append(char)
++    if quote or escaped:
+         return None
++    if current:
++        raws.append("".join(current))
++    words = []
++    for raw in raws:
++        try:
++            values = shlex.split(raw, posix=True)
++        except ValueError:
++            return None
++        words.append((raw, values[0] if values else ""))
++    return words
+ 
+ 
+ def _mask_shell(text: str, *, depth: int) -> str:
+-    """Shell text: leading ``NAME=value`` env words, then a program and its arguments. Text whose quoting does not
+-    parse is masked whole: a quoted secret could span any number of words."""
++    """Shell text: leading ``NAME=value`` env words, then a program and its arguments; a word is shown as written
++    unless masking changed it. Text whose quoting does not parse is masked whole: a quoted secret could span any
++    number of words."""
+     words = _shell_words(text)
+     if words is None:
+         return MASK
+-    out: list[str] = []
++    raws, values = [raw for raw, _ in words], [value for _, value in words]
++    shown: list[str] = []
+     index = 0
+-    while index + 1 < len(words) and (assignment := _ASSIGNMENT.match(words[index])):
+-        out.append(_judge_assignment(assignment.group(1), words[index][assignment.end():], depth=depth))
++    while index + 1 < len(values) and (assignment := _ASSIGNMENT.match(values[index])):
++        shown.append(_judge_assignment(assignment.group(1), values[index][assignment.end():], depth=depth))
+         index += 1
+-    if index < len(words):
+-        program = words[index]
+-        out.append(_judge(program, secret=False, depth=depth + 1))
+-        out.extend(mask_argv_secrets(words[index + 1:], program=program, _depth=depth + 1))
+-    return " ".join(out)
++    if index < len(values):
++        if values[index].startswith("-"):
++            shown.extend(mask_argv_secrets(values[index:], _depth=depth + 1))  # flags, not a program (OPTS=…)
++        else:
++            shown.append(_judge(values[index], secret=False, depth=depth + 1))
++            shown.extend(mask_argv_secrets(values[index + 1:], program=values[index], _depth=depth + 1))
++    return " ".join(raw if out == value else out for raw, value, out in zip(raws, values, shown))
+ 
+ 
+ def _judge(value: str, *, secret: bool, depth: int, name: str = "") -> str:
+@@ -494,11 +583,9 @@ def _judge(value: str, *, secret: bool, depth: int, name: str = "") -> str:
+         name = assignment.group(1)
+         if _is_secret_name(name):
+             return f"{name}={_judge_secret(value[assignment.end():], name=name)}"  # all of it, spaces included
+-        if any(c.isspace() for c in value) and _ENV_NAME.match(name):
+-            return _mask_shell(value, depth=depth)  # HERMES_X=1 hermes update: env prefix, then a command
+         if not is_identifier(name):
+             return MASK  # AB12_CD34_EF56_GH78=…: random segments, not a name
+-        return _judge_assignment(name, value[assignment.end():], depth=depth)
++        return _judge_assignment(name, value[assignment.end():], depth=depth)  # OPTS='-Xmx1g -Dapi.token=…' too
+     if (named := _NAME_COLON.match(value)) and _is_secret_name(named.group(1)):
+         return f"{named.group(1)}:{MASK}"  # api_key:sunshine
+     if header := _HEADER.match(value):
+@@ -507,16 +594,18 @@ def _judge(value: str, *, secret: bool, depth: int, name: str = "") -> str:
+         return f"{name}: {MASK if secret_header else _judge(rest, secret=False, depth=depth + 1)}"
+     if any(c.isspace() for c in value):
+         return _mask_shell(value, depth=depth)
++    if value.startswith("-") and (flag_name := _long_flag(value)):
++        return _flag(value, flag_name, depth + 1)  # --jvm-arg=-Dpassword=…, JAVA_OPTS=-Dtoken=…
+     if _URL.match(value):
+-        return _mask_url(value)
++        return _mask_url(value, depth=depth)
+     if (userinfo := _USERINFO.match(value)) and userinfo.group(1).lower() not in _NOT_USERINFO and not re.match(
+             r"sha\d+$", userinfo.group(3)):
+         return f"{userinfo.group(1)}:{MASK}@{value[userinfo.end(2) + 1:]}"
+-    if _PATH_START.match(value) or "/" in value:
+-        return _mask_components(value)  # absolute or relative (data/x.json, anthropic/claude-opus-4.7)
+     if sep := next((c for c in ",|" if c in value), None):
+         # a list (--enable-features=A,B,C, A|B): each item on its own, so one odd item does not hide the rest
+         return sep.join(_judge(item, secret=False, depth=depth + 1) for item in value.split(sep))
++    if _PATH_START.match(value) or "/" in value:
++        return _mask_components(value)  # absolute or relative (data/x.json, anthropic/claude-opus-4.7)
+     return value if is_identifier(value) else MASK
+ 
+ 
+@@ -540,9 +629,7 @@ def _long_flag(token: str) -> str | None:
+     if token.startswith("--"):
+         name = head[2:]
+         shaped = bool(re.fullmatch(r"[A-Za-z][\w.-]*", name))
+-    elif re.fullmatch(r"-D[A-Za-z_][\w.-]*=.*", token, re.DOTALL):
+-        name, shaped = token[2:].partition("=")[0], True
+-    else:
++    else:  # Go-style -name; -Dname=value (Java properties) is one of these, named "Dname"
+         name = head[1:]
+         shaped = bool(re.fullmatch(r"[A-Za-z][\w.-]{2,}", name)) and (bool(sep) or len(name) > 4)
+     return name if shaped and is_identifier(name) else None
+@@ -558,9 +645,10 @@ def _program_flag(token: str, flags):
+         return token, "userpass"
+     if eq and flag in userpass:
+         return f"{flag}={_mask_userpass(value)}", None
+-    for short in (*attached, *separate, *userpass):
++    for short in (*attached, *userpass):
+         if len(short) == 2 and token.startswith(short) and len(token) > 2 and not token.startswith("--"):
+-            # attached value: mysql -pPASS, curl -bsession=x, curl -ualice:pw
++            # attached value (only for flags listed as attached: openssl -key is a flag, not -k with "ey"):
++            # mysql -pPASS, curl -bsession=x, curl -ualice:pw
+             return f"{short}{_mask_userpass(token[2:]) if short in userpass else MASK}", None
+     # combined short switches ending in a flag that takes a value: curl -su alice:pw, curl -sb session=x
+     if re.fullmatch(r"-[A-Za-z]{2,}", token):
+@@ -573,10 +661,7 @@ def _program_flag(token: str, flags):
+ 
+ def _flag(token: str, name: str, depth: int) -> str:
+     """A long flag as shown: its name, and its ``=value`` (or ``:value``) judged under that name."""
+-    if token.startswith("-D") and not token.startswith("--"):
+-        head, sep, value = token.partition("=")
+-    else:
+-        head, sep, value = _split_flag(token)
++    head, sep, value = _split_flag(token)
+     if not sep:
+         return token
+     if _is_command_name(name):
+@@ -586,9 +671,11 @@ def _flag(token: str, name: str, depth: int) -> str:
+     return f"{head}{sep}{_judge(value, secret=False, depth=depth)}"
+ 
+ 
+-def _pending_value(token: str, kind: str, name: str, *, depth: int) -> str:
+-    """The argument after a flag that takes a secret: always its value (fail closed -- a secret may start with
+-    ``-`` or ``--``; a secret-named switch is listed as public or as a switch prefix instead)."""
++def _pending_value(token: str, kind: str, name: str, *, depth: int) -> str | None:
++    """The argument after a flag that takes a secret, or None when it is the next flag instead: a kebab-case
++    ``--flag`` (the secret-named flag was a switch). Anything else is its value, also when it starts with ``-``."""
++    if re.fullmatch(r"--[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:=.*)?", token, re.DOTALL):
++        return None
+     if kind == "userpass":
+         return _mask_userpass(token)
+     if kind == "command":
+@@ -611,8 +698,9 @@ def mask_argv_secrets(argv: list[str], *, program: str = "", _depth: int = 0) ->
+             continue
+         if pending is not None:
+             (kind, name), pending = pending, None
+-            out.append(_pending_value(token, kind, name, depth=_depth))
+-            continue
++            if (shown := _pending_value(token, kind, name, depth=_depth)) is not None:
++                out.append(shown)
++                continue
+         if (handled := _program_flag(token, flags)) is not None:
+             shown, kind = handled
+             out.append(shown)
+diff --git a/tests/hermes_cli/test_doctor_fts_deferral_holders.py b/tests/hermes_cli/test_doctor_fts_deferral_holders.py
+index bebf77731e..8d6be58eea 100644
+--- a/tests/hermes_cli/test_doctor_fts_deferral_holders.py
++++ b/tests/hermes_cli/test_doctor_fts_deferral_holders.py
+@@ -161,7 +161,7 @@ def test_doctor_lists_holders_with_their_whole_command_line(tmp_path):
+     try:
+         assert holder.stdout.readline().strip() == "ready"
+         ((pid, desc, _is_gateway),) = _live_state_db_holders(db_path)
+-        assert pid == holder.pid and desc.endswith(f"{db_path} {tail})"), desc
++        assert pid == holder.pid and desc.endswith(f"state.db {tail})"), desc
+         short = describe_holder_pid(holder.pid)
+         assert len(short) < len(desc) and "--the-end" not in short
+     finally:
+diff --git a/tests/hermes_state/test_argv_secrets.py b/tests/hermes_state/test_argv_secrets.py
+index 0298782ac5..1ce2756683 100644
+--- a/tests/hermes_state/test_argv_secrets.py
++++ b/tests/hermes_state/test_argv_secrets.py
+@@ -603,8 +603,9 @@ def test_deep_nesting_is_masked_not_a_crash():
+ 
+ # Leak rate allowed per secret length (a random string sometimes reads as a name; the shorter, the likelier): the
+ # worst shape and position measured over several seeds, plus about two standard deviations at 400 samples.
+-_LEAK_CEILING = {16: 0.10, 24: 0.05, 32: 0.03, 40: 0.025}
++_LEAK_CEILING = {16: 0.10, 24: 0.05, 32: 0.03, 40: 0.02}
+ _SHAPES = [
++    "grouped_dot_mixed",
+     "alnum",
+     "lower_digits",
+     "upper_digits",
+@@ -623,6 +624,9 @@ _SHAPES = [
+ ]
+ _POSITIONS = {
+     "bare": lambda s: ["worker.py", s],
++    "spaced_env": lambda s: [f"OPTS=--verbose {s} --x"],
++    "flag_value": lambda s: [f"--jvm-arg=-Dregion={s}"],
++    "list": lambda s: [f"--ids=alpha,{s},beta"],
+     "relative_path": lambda s: [f"data/{s}.json"],
+     "path": lambda s: [f"/srv/data/{s}/file.json"],
+     "url": lambda s: [f"https://api.example.com/v1/{s}?page=2"],
+@@ -659,6 +663,10 @@ def _shape(rng: random.Random, kind: str, length: int) -> str:
+         "grouped_dash": lambda: grouped("-", 4),
+         "grouped_underscore": lambda: grouped("_", 4),
+         "grouped_dot": lambda: grouped(".", 6),
++        "grouped_dot_mixed": lambda: ".".join(
++            pick(string.ascii_letters + string.digits, 6)
++            for _ in range(max(3, length // 6))
++        ),
+     }[kind]()
+ 
+ 
+@@ -758,7 +766,6 @@ def test_relative_paths_with_grouped_keys_are_masked():
+             [f"--password:{MASK}", f"api_key:{MASK}"],
+         ),
+         (["-pass", "sunshine", "-pw", "sunshine"], ["-pass", MASK, "-pw", MASK]),
+-        (["--token", "--correct-horse"], ["--token", MASK]),
+     ],
+ )
+ def test_more_name_shapes_mask_their_values(argv, expected):
+@@ -840,3 +847,121 @@ def test_image_digests_are_not_user_and_password():
+     assert shown(["python:3.12-slim@sha256:0362a20c0e39"]) == [
+         "python:3.12-slim@sha256:0362a20c0e39"
+     ]
++
++
++# ---- the fourth review: values that are argv, switches, openssl, digests, quoting, speed -----------------------------
++
++
++@pytest.mark.parametrize(
++    "argv, program, secret",
++    [
++        (["JAVA_TOOL_OPTIONS=-Xmx1g -Dapi.token=sunshine"], "env", "sunshine"),
++        (["-e", "JAVA_TOOL_OPTIONS=-Xmx1g -Dapi.token=sunshine"], "docker", "sunshine"),
++        (["OPTS=--verbose --token sunshine", "run"], "env", "sunshine"),
++        (
++            ["GIT_SSH_COMMAND=sshpass -p sunshine ssh", "git", "fetch"],
++            "env",
++            "sunshine",
++        ),
++        (["CURL_ARGS=-u admin:sunshine", "./x"], "env", "sunshine"),
++        (
++            ["JAVA_OPTS=-Dpassword=hunter2", "--jvm-arg=-Dpassword=hunter2"],
++            "x",
++            "hunter2",
++        ),
++        (["--args", "--token sunshine"], "x", "sunshine"),
++        (["--ids=a,3kjw7/gd4EQ6tyKW"], "x", "gd4EQ6tyKW"),
++        (["https://h/x?q=7%0Nv5^zU^aX2ZRi@FLc0tYI"], "x", "FLc0tYI"),
++    ],
++)
++def test_values_that_are_argv_are_judged_as_argv(argv, program, secret):
++    assert secret not in " ".join(shown(argv, program))
++
++
++def test_a_flag_value_that_is_itself_a_flag_is_not_swallowed():
++    """main's rule, kept: a kebab-case --flag after a secret-named flag is the next flag (that flag was a switch)."""
++    assert shown(["--token", "--verbose", "x"]) == ["--token", "--verbose", "x"]
++
++
++@pytest.mark.parametrize(
++    "argv, program",
++    [
++        (["--ask-become-pass", "-i", "inv", "site.yml"], "ansible-playbook"),
++        (["--ask-vault-pass", "site.yml"], "ansible-playbook"),
++        (["login", "--password-stdin", "-u", "me", "ghcr.io"], "docker"),
++        (
++            [
++                "--token-stdin",
++                "-v",
++                "--keep-secrets",
++                "build",
++                "--ask-password",
++                "--host",
++                "db",
++            ],
++            "x",
++        ),
++        (
++            [
++                "req",
++                "-key",
++                "server.key",
++                "-keyout",
++                "k.pem",
++                "-kdf",
++                "x",
++                "-keyform",
++                "PEM",
++                "-newkey",
++                "rsa:2048",
++            ],
++            "openssl",
++        ),
++        (
++            [
++                "mlx-community/Qwen3-30B-A3B-4bit-DWQ",
++                "v0.0.0-20241119163442-8f3a2c1d9e0b",
++            ],
++            "x",
++        ),
++        (["-Xlog:gc*:file=gc.log"], "java"),
++        (["-o", "ControlPath=/tmp/cm-%r@%h:%p"], "ssh"),
++        (
++            [
++                "Edit(//**/ccd-*h.501)",
++                "openxml",
++                "execvpe",
++                "https://h/x?email=a@b.com",
++            ],
++            "x",
++        ),
++    ],
++)
++def test_switches_and_tool_arguments_the_fourth_review_found_are_kept(argv, program):
++    assert shown(argv, program) == argv
++
++
++def test_a_digest_pinned_image_keeps_its_name():
++    assert shown(["ghcr.io/org/image@sha256:" + "9f2b8c1e" * 8], "docker") == [
++        f"ghcr.io/org/image@{MASK}"
++    ]
++
++
++def test_shell_text_is_shown_as_written():
++    assert shown(["-c", "require('node:http').createServer()"], "node") == [
++        "-c",
++        "require('node:http').createServer()",
++    ]
++    assert shown(["-c", "./run --name 'two words' && echo ok"], "bash") == [
++        "-c",
++        "./run --name 'two words' && echo ok",
++    ]
++
++
++def test_long_paths_are_judged_in_linear_time():
++    import time
++
++    value = "/".join(["Ab1x"] * 25000) + "/" + KEY
++    start = time.monotonic()
++    shown([value])
++    assert time.monotonic() - start < 5
+-- 
+2.43.0
+

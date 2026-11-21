@@ -1,0 +1,348 @@
+From 64fe14dd79640f7328cc4a3ae24cb02c656afa54 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 03:49:34 +0000
+Subject: [PATCH] [daveey] kanban: a comment on a card wakes its wait-comment
+ park now, not at the next 15-minute probe
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Incident (t_eeeeee000000001b, example incident): a pool worker asked its orchestrator chat a design question and
+parked on `hermes kanban wait-comment <card> --after-id <its question> --skip-system` (check_every 900). The
+chat answered 6 s (example time A) and 2.5 min (example time B) after the two parks. Each probe still slept to its next slot
+(example probe time A, example probe time B). Meanwhile the session showed the card "Waiting · on schedule", owner-wake reported it
+"waiting on chat with no named producer", and the chat unblocked it by hand both times.
+
+Five whys:
+1. Why did the session show a waiting card after the answer? The card stayed `scheduled` until its probe ran.
+   Evidence: example-worker events wake_episode_started example park time -> commented <comment-id> at example time B -> no condition_met;
+   the probe row's next_at was park + 900.
+2. Why didn't the probe run when the answer arrived? Probes are polled on check_every only. A comment insert,
+   local or synced in, never touched task_wake_checks.next_at.
+3. Why do status changes wake parks but comments don't? kanban_local_status_wake and kanban_awaited_card_wake
+   expedite only on `tasks.status` updates. The chat-wait park (kanban_decision_ask) added the wait-comment probe
+   later, without a matching trigger.
+4. Why wasn't it caught? No test drives a comment into a wait-comment park and asserts wake latency. The
+   status-wake suite covers only wait-check/awaiting-card parks.
+5. Root (design gap): wake triggers were added per probe kind, and the comment-answer kind had none.
+
+Fix: write_txn's recorder also records comment inserts (TEMP trigger on task_comments, same commit and rollback
+semantics as the status recorder). After COMMIT, a scheduled park whose probe is `wait-comment <that card>` gets
+next_at = now and the dispatcher is woken. The probe stays the judge, so a comment it rejects (a system author,
+--from-card mismatch) costs one probe, then the park returns to its cadence. A comment on a card with no such
+park costs one indexed read and no write. Both recorders are read before any expedite write, because the
+expedite's own write_txn re-arms (clears) them.
+
+Tests (tests/hermes_cli/test_kanban_comment_wake.py; RED 4/6 on main, GREEN 6/6):
+- the answer wakes the park within a minute, and condition_met carries the comment;
+- a rejected comment adds exactly one probe, then the cadence resumes;
+- comments on other cards, or on a non-comment park, move nothing;
+- a rolled-back comment moves nothing;
+- one commit with a comment and a status change expedites both;
+- a failing expedite never fails the comment write.
+Neighbouring suites: 7 files, 189 passed. Every test file that writes comments: 73 files, 1994 passed.
+scripts/check --base origin/main: ok.
+---
+ hermes_cli/kanban_local_status_wake.py       |  71 +++++++-
+ tests/hermes_cli/test_kanban_comment_wake.py | 181 +++++++++++++++++++
+ 2 files changed, 245 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_comment_wake.py
+
+diff --git a/hermes_cli/kanban_local_status_wake.py b/hermes_cli/kanban_local_status_wake.py
+index ce275126dc..ae6d033771 100644
+--- a/hermes_cli/kanban_local_status_wake.py
++++ b/hermes_cli/kanban_local_status_wake.py
+@@ -30,6 +30,13 @@ logger = logging.getLogger(__name__)
+ _TABLE = "kanban_local_status_changed"
+ _TRIGGER = "kanban_local_status_changed_trg"
+ _PREFILTER_MAX = 32  # more changed cards than this in one commit (a sweep): let expedite read the parks once
++# [daveey] Comments too (t_eeeeee000000001b, example incident): a worker parked on ``hermes kanban wait-comment <card>``
++# for its orchestrator's answer (check_every 900). The answer was synced in 6 s and 2.5 min after each park, yet
++# the probe slept to its next 15-minute slot; the owner-wake sweep reported the card "waiting on chat" meanwhile and
++# the chat released it by hand twice. Each comment insert is recorded the same way and makes due now the
++# wait-comment probe of a scheduled park on that card; the probe stays the judge.
++_COMMENT_TABLE = "kanban_local_comment_added"
++_COMMENT_TRIGGER = "kanban_local_comment_added_trg"
+ _active = threading.local()
+ 
+ _MENTIONS = (
+@@ -49,25 +56,39 @@ def arm(conn: sqlite3.Connection) -> None:
+         conn.execute(f"DELETE FROM temp.{_TABLE}")
+     except sqlite3.Error:  # a board without ``tasks`` yet: nothing to record
+         pass
++    try:
++        conn.execute(f"CREATE TEMP TABLE IF NOT EXISTS {_COMMENT_TABLE} (task_id TEXT PRIMARY KEY)")
++        conn.execute(f"CREATE TEMP TRIGGER IF NOT EXISTS {_COMMENT_TRIGGER} AFTER INSERT ON main.task_comments "
++                     f"BEGIN INSERT OR IGNORE INTO {_COMMENT_TABLE} (task_id) VALUES (NEW.task_id); END")
++        conn.execute(f"DELETE FROM temp.{_COMMENT_TABLE}")
++    except sqlite3.Error:  # a board without ``task_comments`` yet
++        pass
+ 
+ 
+ def flush(conn: sqlite3.Connection) -> list[str]:
+-    """``write_txn`` after COMMIT: expedite the parks naming a card whose status this commit changed.
+-    Returns the waiting cards whose probe moved earlier. Never raises."""
++    """``write_txn`` after COMMIT: expedite the parks naming a card whose status this commit changed, and the
++    wait-comment park of a card this commit commented on. Returns the waiting cards whose probe moved earlier.
++    Never raises."""
+     if getattr(_active, "busy", False):  # expedite's own write txn commits here too
+         return []
++    # Read both recorders before any write: an expedite's own write_txn re-arms (clears) them.
+     try:
+         changed = dict(conn.execute(f"SELECT task_id, status FROM temp.{_TABLE}").fetchall())
+     except Exception:  # health: allow BLE001 -- no recorder here, or a non-sqlite stand-in: never raise into the commit
+-        return []
+-    if not changed:
++        changed = {}
++    try:
++        commented = [r[0] for r in conn.execute(f"SELECT task_id FROM temp.{_COMMENT_TABLE}").fetchall()]
++    except Exception:  # health: allow BLE001 -- no recorder here: never raise into the commit
++        commented = []
++    if not changed and not commented:
+         return []
+     _active.busy = True
+     try:
+-        if not _mentioned(conn, changed):
+-            return []
++        moved = _flush_comments(conn, commented) if commented else []
++        if not changed or not _mentioned(conn, changed):
++            return moved
+         from hermes_cli.kanban_awaited_card_wake import expedite
+-        return expedite(conn, changed)
++        return moved + expedite(conn, changed)
+     except Exception:  # health: allow BLE001 -- best-effort: the park keeps its check_every cadence
+         logger.warning("kanban local status wake: could not expedite parks for %d changed card(s)", len(changed),
+                        exc_info=True)
+@@ -76,6 +97,42 @@ def flush(conn: sqlite3.Connection) -> list[str]:
+         _active.busy = False
+ 
+ 
++_COMMENT_WHERE = ("task_id = ?2 AND next_at > ?1 AND purpose IS NOT 'ask_resolved' "
++                  "AND instr(cmd, 'wait-comment ' || ?2) > 0 "
++                  "AND EXISTS (SELECT 1 FROM tasks WHERE id = ?2 AND status = 'scheduled')")
++_COMMENT_PARK = "SELECT 1 FROM task_wake_checks WHERE " + _COMMENT_WHERE
++_COMMENT_DUE = "UPDATE task_wake_checks SET next_at = ?1 WHERE " + _COMMENT_WHERE
++
++
++def _flush_comments(conn: sqlite3.Connection, commented: list[str]) -> list[str]:
++    """A comment this commit added on a card parked on ``wait-comment <that card>``: its probe is due now."""
++    import time
++
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_db_connect import write_txn
++
++    due = int(time.time())
++    try:
++        hits = [t for t in commented if conn.execute(_COMMENT_PARK, (due, t)).fetchone()]
++    except sqlite3.OperationalError:  # a board without the probe table: nothing parks on probes
++        return []
++    if not hits:  # the common comment: one indexed read, no write
++        return []
++    moved: list[str] = []
++    try:
++        with write_txn(conn):
++            for task_id in hits:
++                if conn.execute(_COMMENT_DUE, (due, task_id)).rowcount:
++                    moved.append(task_id)
++                    logger.info("kanban comment wake: %s re-probes now: a comment arrived on its wait-comment park",
++                                task_id)
++        if moved:
++            sync.wake_dispatcher()
++    except Exception:  # health: allow BLE001 -- best-effort: the park keeps its check_every cadence
++        logger.warning("kanban comment wake: could not expedite %d commented card(s)", len(hits), exc_info=True)
++    return moved
++
++
+ def _mentioned(conn: sqlite3.Connection, changed: dict) -> bool:
+     if len(changed) > _PREFILTER_MAX:
+         return True
+diff --git a/tests/hermes_cli/test_kanban_comment_wake.py b/tests/hermes_cli/test_kanban_comment_wake.py
+new file mode 100644
+index 0000000000..2cd305c854
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_comment_wake.py
+@@ -0,0 +1,181 @@
++"""A park on ``hermes kanban wait-comment <card>`` re-probes when a comment lands on that card, not up to
++``check_every`` later (t_eeeeee000000001b, example incident). [daveey]
++
++A worker asked its orchestrator chat a design question and parked on ``wait-comment --after-id <its last comment>
++--skip-system`` (check_every 900). The chat's answer arrived 6 s (example time A) and 2.5 min (example time B) after the two
++parks, yet each probe slept to its next 15-minute slot; owner-wake meanwhile reported the card "waiting on chat"
++and the chat unblocked it by hand both times.
++"""
++from __future__ import annotations
++
++import argparse
++import contextlib
++import io
++import os
++import shlex
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_awaited_card_wake as acw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_local_status_wake as lsw
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli import kanban_sync_support as support
++
++EVERY = 900
++
++
++@pytest.fixture
++def live(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    acw._reset_for_tests()
++    conn = kbc.connect(home / "kanban.db")
++    try:
++        yield conn
++    finally:
++        conn.close()
++        kwc._shutdown_for_tests()
++        acw._reset_for_tests()
++
++
++@pytest.fixture
++def probes(monkeypatch):
++    """Run each ``hermes kanban wait-comment`` probe in-process with the real ``run_wait_comment``."""
++    from hermes_cli import kanban_comment_origin as kco
++
++    runs: dict[str, int] = {}
++    lock = threading.Lock()
++    parser = argparse.ArgumentParser()
++    parser.add_argument("task_id")
++    parser.add_argument("--after-id", dest="after_id", type=int, default=0)
++    for flag in ("--from-gateway", "--contains", "--from-card"):
++        parser.add_argument(flag, default=None)
++    parser.add_argument("--skip-system", dest="skip_system", action="store_true")
++
++    def run_probe(key, cmd, cwd, env):
++        argv = shlex.split(cmd)
++        assert argv[:3] == ["hermes", "kanban", "wait-comment"], cmd
++        with lock:
++            runs[env["HERMES_KANBAN_TASK"]] = runs.get(env["HERMES_KANBAN_TASK"], 0) + 1
++            saved = {k: os.environ.get(k) for k in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_DB",
++                                                    "HERMES_KANBAN_WAKE_PROBE")}
++            os.environ.update({k: env[k] for k in saved})
++            out = io.StringIO()
++            try:
++                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
++                    rc = kco.run_wait_comment(parser.parse_args(argv[3:]))
++            finally:
++                for k, v in saved.items():
++                    if v is None:
++                        os.environ.pop(k, None)
++                    else:
++                        os.environ[k] = v
++        return rc, out.getvalue()
++
++    monkeypatch.setattr(kwc, "_run_probe", run_probe)
++    return runs
++
++
++def _status(live, tid):
++    task = kb.get_task(live, tid)
++    assert task is not None
++    return task.status
++
++
++def _next_at(live, tid):
++    state = kwc.get_state(live, tid)
++    assert state is not None
++    return state["next_at"]
++
++
++def _park(live, probes, *, wake_check=None):
++    """The worker comments its question, then parks on a comment after it, and runs its first probe."""
++    tid = kb.create_task(live, title="coach self-heal backlog", assignee="worker")
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++    assert kb.claim_task(live, tid, claimer="worker") is not None
++    asked = kb.add_comment(live, tid, "default", "Question for the orchestrator: triage or clock?")
++    cmd = wake_check or f"hermes kanban wait-comment {tid} --after-id {asked} --skip-system"
++    assert kb.schedule_task(live, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting on the chat's answer",
++                            wake_check=cmd, check_every=EVERY)
++    t0 = int(time.time())
++    kwc.run_due_wake_checks(live, now=t0, wait=True)
++    assert _status(live, tid) == "scheduled"
++    assert _next_at(live, tid) == t0 + EVERY
++    sync.consume_dispatcher_wake()
++    return tid, t0
++
++
++def test_the_answer_comment_wakes_the_park_within_a_minute(live, probes):
++    tid, t0 = _park(live, probes)
++    kb.add_comment(live, tid, "default", "Decision: rotate daily; proceed.")  # example time B, the chat's answer
++    assert sync.consume_dispatcher_wake()  # an in-process dispatcher ticks now
++    assert _next_at(live, tid) <= t0 + 60  # before the fix: t0 + 900
++    kwc.run_due_wake_checks(live, now=t0 + 60, wait=True)
++    assert _status(live, tid) == "ready"
++    met = [e for e in kb.list_events(live, tid) if e.kind == "condition_met"]
++    assert met and "Decision: rotate daily" in (met[-1].payload or {})["output"]
++
++
++def test_a_comment_the_probe_rejects_costs_one_probe_then_the_cadence(live, probes):
++    tid, t0 = _park(live, probes)
++    kb.add_comment(live, tid, "kanban-dispatcher", "system note", system=True)  # --skip-system: not an answer
++    assert _next_at(live, tid) <= t0 + 60
++    kwc.run_due_wake_checks(live, now=t0 + 30, wait=True)
++    assert _status(live, tid) == "scheduled" and probes[tid] == 2
++    assert _next_at(live, tid) == t0 + 30 + EVERY
++
++
++def test_a_comment_on_another_card_or_a_non_comment_park_moves_nothing(live, probes):
++    flag = os.path.join(os.path.dirname(str(kbc._main_db_file(live))), "never-written")
++    other_park, t0 = _park(live, probes, wake_check=f"test -f {flag}")
++    tid, t1 = _park(live, probes)
++    unrelated = kb.create_task(live, title="unrelated", assignee="worker")
++    kb.add_comment(live, unrelated, "default", "noise")
++    kb.add_comment(live, other_park, "default", "a comment on a card whose park is not a comment wait")
++    assert _next_at(live, tid) == t1 + EVERY and _next_at(live, other_park) == t0 + EVERY
++    assert not sync.consume_dispatcher_wake()
++
++
++def test_a_rolled_back_comment_expedites_nothing(live, probes):
++    tid, t0 = _park(live, probes)
++    with pytest.raises(RuntimeError), kb.write_txn(live):
++        live.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, 'x', 'y', 0)", (tid,))
++        raise RuntimeError("boom")
++    assert _next_at(live, tid) == t0 + EVERY
++    assert not sync.consume_dispatcher_wake()
++
++
++def test_one_commit_with_a_comment_and_a_status_change_expedites_both(live, probes):
++    """The comment expedite's own write txn re-arms the recorders: the status changes are read first."""
++    tid, _t0 = _park(live, probes)
++    review = kb.create_task(live, title="review", assignee="worker")
++    owner = kb.create_task(live, title="owner", assignee="worker")
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'running' WHERE id IN (?, ?)", (review, owner))
++    flag = os.path.join(os.path.dirname(str(kbc._main_db_file(live))), "never-written")
++    assert kb.schedule_task(live, owner, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting",
++                            wake_check=f"test -f {flag}", check_every=EVERY,
++                            awaiting={"kind": "card", "ref": review, "why": "review"})
++    later = int(time.time()) + EVERY
++    with kb.write_txn(live):
++        live.execute("UPDATE task_wake_checks SET next_at = ? WHERE task_id IN (?, ?)", (later, tid, owner))
++    with kb.write_txn(live):
++        live.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, 'default', 'go', ?)",
++                     (tid, int(time.time())))
++        live.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (review,))
++    now = int(time.time())
++    assert _next_at(live, tid) <= now and _next_at(live, owner) <= now
++
++
++def test_a_failing_comment_expedite_never_fails_the_comment(live, probes, monkeypatch, caplog):
++    tid, t0 = _park(live, probes)
++    monkeypatch.setattr(lsw, "_COMMENT_DUE", "UPDATE no_such_table SET x = 1")
++    cid = kb.add_comment(live, tid, "default", "answer")
++    assert cid and _next_at(live, tid) == t0 + EVERY
++    assert "could not expedite" in caplog.text
+-- 
+2.43.0
+

@@ -1,0 +1,443 @@
+From dc829f289b5ff9bfd2072c3c28ef3e32cb13ba3a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:02:06 +0000
+Subject: [PATCH] fix(tui_gateway): transfer rewall custody and compact
+ terminal replay payload [daveey]
+
+---
+ .../test_automation_replay_custody_edges.py   |  36 ++++++
+ .../test_automation_replay_dispatch.py        | 108 ++++++++++++++++-
+ .../test_automation_replay_retention.py       | 114 ++++++++++++++++++
+ tui_gateway/automation_replay.py              |   5 +
+ tui_gateway/automation_replay_handoff.py      |  48 ++++++++
+ 5 files changed, 306 insertions(+), 5 deletions(-)
+ create mode 100644 tests/tui_gateway/test_automation_replay_retention.py
+
+diff --git a/tests/tui_gateway/test_automation_replay_custody_edges.py b/tests/tui_gateway/test_automation_replay_custody_edges.py
+index 397bce8329..e5cdd15764 100644
+--- a/tests/tui_gateway/test_automation_replay_custody_edges.py
++++ b/tests/tui_gateway/test_automation_replay_custody_edges.py
+@@ -43,6 +43,42 @@ def test_second_retirement_preserves_rewall_batch_provenance(wired, monkeypatch)
+     assert recovered.attempt == 1 and recovered.failed_at == 10 and recovered.persisted
+ 
+ 
++def test_retiring_build_failure_transfers_parent_to_durable_rewall_once(wired, monkeypatch):
++    import json
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: None)
++    monkeypatch.setattr(ar.time, "time", lambda: 1000)
++    wired.publish(KEY, [helpers.item(due=0)])
++    parents = []
++
++    def wake(owner, text, **kw):
++        parents.append(kw["display_metadata"][ar.REPLAY_METADATA_KEY]["batch_id"])
++        # Retirement occurs during builder failure, so schedule immediately hands
++        # the rewall to the journal rather than leaving any local evidence.
++        original = ar.rewall_due
++        def retire_after_plan(*args):
++            due = original(*args)
++            monkeypatch.setattr(ar, "stale_code_reason", lambda: "retired during build")
++            return due
++        monkeypatch.setattr(ar, "rewall_due", retire_after_plan)
++        ar.replay_failed_wake(owner, text, {
++            "profile_home": wired.path.parent,
++            "agent_failure": {"failure_resets_at": 9000},
++        }, kw["display_kind"], kw["display_metadata"], "build")
++        assert not ar.pending(KEY)
++        return "error"
++
++    assert ar.consume_handoffs([wired.path.parent], wake=wake, now=5000) == 1
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: None)
++    calls = []
++    assert ar.consume_handoffs([wired.path.parent], wake=lambda *a, **kw: calls.append(1) or "error",
++                               now=5000) == 0
++    assert calls == []
++    child = wired.claim(KEY, 10000, "successor", lambda _: False)
++    assert child["id"] != parents[0]
++    assert json.loads(child["payload"])[0]["source_batch"] == parents[0]
++    assert not wired.release({"id": parents[0], "token": "old"})
++
++
+ def test_error_budget_is_not_reset_by_consumer_process_replacement(wired, monkeypatch):
+     monkeypatch.setattr(ar, "stale_code_reason", lambda: None)
+     wired.publish(KEY, [helpers.item(due=0)])
+diff --git a/tests/tui_gateway/test_automation_replay_dispatch.py b/tests/tui_gateway/test_automation_replay_dispatch.py
+index f0c241ba91..7a9ecc3526 100644
+--- a/tests/tui_gateway/test_automation_replay_dispatch.py
++++ b/tests/tui_gateway/test_automation_replay_dispatch.py
+@@ -65,6 +65,22 @@ def test_admitted_receipt_recovers_without_assistant_or_second_dispatch(store):
+     assert journal.owners() == []
+ 
+ 
++def test_admitted_quota_rewall_can_transfer_to_new_attempt(store):
++    db, journal, batch = store
++    pending, _ = stage(db, journal, batch)
++    assert pending.admit()
++    child = {**item("rewall", due=9000), "source_batch": batch["id"], "attempt": 2}
++    journal.publish("chat", [child])
++    assert journal.commit_message(batch, lambda *a: pytest.fail("retired parent wrote again")) is None
++    assert not journal.settle(batch)
++    assert journal.claim("chat", 100, "successor", lambda _: False) is None
++    successor = journal.claim("chat", 9000, "successor", lambda _: False)
++    assert successor["id"] != batch["id"]
++    assert journal.discard(successor)
++    assert journal.owners() == []
++    assert len(db.get_messages("chat")) == 1
++
++
+ def test_stop_between_row_commit_and_worker_entry_refuses_dispatch(store):
+     db, journal, batch = store
+     pending, _ = stage(db, journal, batch)
+@@ -120,7 +136,57 @@ def test_real_dispatch_storage_refusal_releases_claim_without_failure_charge(sto
+     assert recovered is not None and recovered["failures"] == 0
+ 
+ 
+-@pytest.mark.parametrize("stop", [False, True, "retire"])
++@pytest.mark.parametrize("failure", ["locked", "missing_store"])
++def test_submit_storage_refusal_returns_false_and_releases_claim(store, monkeypatch, failure):
++    from tui_gateway import server
++    db, journal, batch = store
++    session = {"session_key": "chat", "agent": SimpleNamespace(session_id="chat"),
++               "history_lock": threading.RLock(), "_notif_turn_claim": object()}
++    released = []
++    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _: failure != "missing_store")
++    monkeypatch.setattr(server, "_session_db", lambda _: nullcontext(db))
++    monkeypatch.setattr(server, "_notif_release_claim", lambda *args: released.append(args))
++    def locked(*args, **kw):
++        raise sqlite3.OperationalError("storage refused")
++    monkeypatch.setattr(journal, "commit_message", locked)
++    assert delivery(journal, batch).submit("rid", "sid", session, "report", "process_complete", {}, "test") is False
++    assert released == [(session, session["_notif_turn_claim"])]
++    assert db.get_messages("chat") == []
++
++
++def test_cleanup_preserves_newer_staged_row_and_marker(store):
++    db, journal, batch = store
++    pending, session = stage(db, journal, batch)
++    session["history_lock"] = threading.RLock()
++    newer = {"role": "user", "content": "newer turn"}
++    session["_submit_user_row"] = newer
++    pending.cleanup()
++    assert session["_submit_user_row"] is newer
++    assert session["_marker_until_tool"] is True
++    session["_submit_user_row"] = pending.staged
++    pending.cleanup()
++    assert "_submit_user_row" not in session and "_marker_until_tool" not in session
++
++
++def test_submit_refusal_cleans_exact_row_and_releases_original_claim(store, monkeypatch):
++    from tui_gateway import server
++    db, journal, batch = store
++    session = {"session_key": "chat", "agent": SimpleNamespace(session_id="chat"),
++               "history_lock": threading.RLock(), "_notif_turn_claim": object()}
++    claim = session["_notif_turn_claim"]
++    released = []
++    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _: True)
++    monkeypatch.setattr(server, "_session_db", lambda _: nullcontext(db))
++    monkeypatch.setattr(server, "_notif_submit", lambda *a, **kw: False)
++    monkeypatch.setattr(server, "_notif_release_claim", lambda s, c: released.append((s, c)))
++    pending = delivery(journal, batch)
++    assert not pending.submit("rid", "sid", session, "report", "process_complete", {}, "test")
++    assert released == [(session, claim)]
++    assert "_submit_user_row" not in session and "_marker_until_tool" not in session
++    assert len(db.get_messages("chat")) == 1
++
++
++@pytest.mark.parametrize("stop", [False, True, "retire", "gate_error", "gate_refused"])
+ @pytest.mark.parametrize("local", [False, True])
+ def test_real_wake_worker_entry_and_live_pending_claim(store, turn_env, monkeypatch, stop, local):
+     from tui_gateway import server, automation_replay as ar
+@@ -133,6 +199,21 @@ def test_real_wake_worker_entry_and_live_pending_claim(store, turn_env, monkeypa
+     session.update(profile_home=str(journal.path.parent), session_key="chat", running=False)
+     session["agent"].session_id = "chat"
+     session["agent"]._session_db = db
++    from agent.session_persistence import SessionPersistenceMixin
++    from agent.turn_context import _stage_turn_user_message
++    class FlushingAgent(SessionPersistenceMixin, SimpleNamespace):
++        def run_conversation(self, text, *, persist_user_message=None, persist_user_display_kind=None,
++                             persist_user_display_metadata=None, **kwargs):
++            row, _ = _stage_turn_user_message(self, text, persist_user_message, None, None,
++                                              persist_user_display_kind, persist_user_display_metadata)
++            messages = [row, {"role": "assistant", "content": "ok"}]
++            assert self._flush_messages_to_session_db(messages)
++            assert self._flush_messages_to_session_db(messages)
++            completed.set()
++            return {"final_response": "ok", "messages": messages, "interrupted": False, "completed": True}
++    attrs = vars(session["agent"]).copy()
++    attrs.pop("run_conversation")
++    session["agent"] = FlushingAgent(**attrs, _session_db_created=True)
+     monkeypatch.setattr(server, "_session_db", lambda _: nullcontext(db))
+     monkeypatch.setattr(server, "_ensure_session_db_row", lambda _: True)
+     monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a: None)
+@@ -167,11 +248,21 @@ def test_real_wake_worker_entry_and_live_pending_claim(store, turn_env, monkeypa
+         else:
+             assert ar.consume_handoffs([journal.path.parent], now=100) == 1
+         assert entered.wait(10)
++        staged_identity = None if local else (session["_submit_user_row"]["_row_id"],
++                                               session["_submit_user_row"]["message_uid"])
+         if local:
+             assert ar.pending("chat", profile_home=journal.path.parent)
+         # Wake returned, but the actual PreparedWork has not entered its body.
+         assert ar.consume_handoffs([journal.path.parent], now=100) == 0
+-        if stop == "retire":
++        if stop in ("gate_error", "gate_refused"):
++            from tui_gateway.automation_replay_dispatch import Delivery
++            from tui_gateway.automation_replay_local import LocalPermit
++            def refuse(_):
++                if stop == "gate_error":
++                    raise sqlite3.OperationalError("admission unavailable")
++                return False
++            monkeypatch.setattr(LocalPermit if local else Delivery, "admit", refuse)
++        elif stop == "retire":
+             monkeypatch.setattr(ar, "stale_code_reason", lambda: "superseded")
+             ar.handoff_all()
+         elif stop:
+@@ -180,13 +271,20 @@ def test_real_wake_worker_entry_and_live_pending_claim(store, turn_env, monkeypa
+         session["_run_thread"].join(10)
+         assert not session["_run_thread"].is_alive()
+         assert completed.is_set() is (not stop)
+-        # The fake agent does not flush ordinary local messages. Durable staging is real.
+-        assert len(db.get_messages("chat")) == (0 if local else 1)
++        rows = db.get_messages("chat")
++        assert len(rows) == ((0 if local else 1) if stop else 2)
++        assert sum(row["role"] == "user" for row in rows) == (0 if local and stop else 1)
++        if not local:
++            assert (rows[0]["id"], rows[0]["message_uid"]) == staged_identity
++            assert rows[0]["message_uid"] == "automation-replay-" + batch["id"]
++        if not stop:
++            assert rows[0]["display_kind"] in ("process_complete", "kanban_notice")
+         assert not session["running"]
+         if not stop:
+             # Worker admission is permanent even without relying on its assistant rows.
+             ar.consume_handoffs([journal.path.parent], now=100)
+-        assert journal.owners() == (["chat"] if stop == "retire" else [])
++        retained = stop == "retire" or (not local and stop in ("gate_error", "gate_refused"))
++        assert journal.owners() == (["chat"] if retained else [])
+         if stop == "retire":
+             # The predecessor is still alive; refusing its worker must release custody now.
+             assert journal.claim("chat", 1e20, "successor", lambda _: True) is not None
+diff --git a/tests/tui_gateway/test_automation_replay_retention.py b/tests/tui_gateway/test_automation_replay_retention.py
+new file mode 100644
+index 0000000000..86b4864278
+--- /dev/null
++++ b/tests/tui_gateway/test_automation_replay_retention.py
+@@ -0,0 +1,114 @@
++"""Terminal payload compaction preserves exact dedupe and pending custody."""
++import sqlite3
++
++import pytest
++
++from tests.tui_gateway import test_automation_replay_handoff as helpers
++
++journal = helpers.journal
++wired = helpers.wired
++
++
++def test_compaction_dedupes_arbitrarily_late_publication_but_accepts_old_first_publish(journal):
++    original = helpers.item("old", due=0, created=1)
++    journal.publish("chat", [original])
++    batch = helpers.take(journal)
++    journal.commit_message(batch, helpers.writer)
++    assert journal.settle(batch)
++    journal.compact()
++    with sqlite3.connect(journal.path) as conn:
++        assert conn.execute("SELECT count(*) FROM automation_replay_items").fetchone()[0] == 0
++        assert conn.execute("SELECT count(*) FROM automation_replay_batches").fetchone()[0] == 0
++        assert conn.execute("SELECT count(*) FROM automation_replay_tombstones").fetchone()[0] == 1
++    journal.publish("chat", [original])
++    assert helpers.take(journal, now=1e30) is None
++    with pytest.raises(ValueError, match="identity"):
++        journal.publish("chat", [{**original, "text": "conflict"}])
++    with pytest.raises(ValueError, match="identity"):
++        journal.publish("foreign", [original])
++    journal.publish("chat", [helpers.item("never-published", due=0, created=1)])
++    assert helpers.take(journal, now=1e30) is not None
++
++
++def test_compaction_never_prunes_pending_future_or_committed_work(journal):
++    journal.publish("future", [helpers.item("future", due=1e30, created=1)])
++    journal.publish("chat", [helpers.item("committed", due=0, created=1)])
++    pending = helpers.take(journal)
++    receipt = journal.commit_message(pending, helpers.writer)
++    for _ in range(3):
++        journal.compact(limit=1)
++    recovered = helpers.take(journal, now=1e20)
++    assert recovered["message_row_id"] == receipt["message_row_id"]
++    assert journal.claim("future", 1e20, "successor", lambda _: False) is None
++    assert journal.claim("future", 1e30, "successor", lambda _: False) is not None
++
++
++def test_partial_stop_compaction_preserves_survivor_and_fences_old_claim(journal):
++    covered = helpers.item("covered", due=0, created=10)
++    survivor = helpers.item("survivor", due=0, created=30, persisted=False)
++    journal.publish("chat", [covered, survivor])
++    old = helpers.take(journal)
++    journal.cancel("chat", 20, stop=True)
++    journal.compact()
++    journal.publish("chat", [covered, survivor])
++    assert journal.commit_message(old, helpers.writer) is None
++    batch = helpers.take(journal)
++    import json
++    assert [i["id"] for i in json.loads(batch["payload"])] == ["survivor"]
++
++
++def test_compaction_bounds_rows_and_rollback_keeps_payload_and_identity(journal):
++    for name in ("one", "two", "three"):
++        journal.publish(name, [helpers.item(name, due=0)])
++        batch = journal.claim(name, 100, "dead", lambda _: False)
++        assert journal.discard(batch)
++    with sqlite3.connect(journal.path) as conn:
++        conn.execute("CREATE TRIGGER fail_compaction BEFORE DELETE ON automation_replay_items "
++                     "BEGIN SELECT RAISE(ABORT,'compaction interrupted'); END")
++    with pytest.raises(sqlite3.IntegrityError, match="interrupted"):
++        journal.compact(limit=1)
++    with sqlite3.connect(journal.path) as conn:
++        assert conn.execute("SELECT count(*) FROM automation_replay_items").fetchone()[0] == 3
++        assert conn.execute("SELECT count(*) FROM automation_replay_tombstones").fetchone()[0] == 0
++        conn.execute("DROP TRIGGER fail_compaction")
++    journal.compact(limit=1)
++    with sqlite3.connect(journal.path) as conn:
++        assert conn.execute("SELECT count(*) FROM automation_replay_items").fetchone()[0] == 2
++        assert conn.execute("SELECT count(*) FROM automation_replay_batches").fetchone()[0] == 2
++        assert conn.execute("SELECT count(*) FROM automation_replay_tombstones").fetchone()[0] == 1
++
++
++def test_idle_compaction_does_not_take_write_transaction(journal, monkeypatch):
++    journal.publish("chat", [helpers.item("pending", due=1e30)])
++    def unexpected():
++        pytest.fail("idle compaction must not acquire the writer")
++    monkeypatch.setattr(journal, "transaction", unexpected)
++    journal.compact()
++
++
++def test_consumer_compaction_failure_does_not_block_dispatch(wired, monkeypatch):
++    from tui_gateway import automation_replay as ar
++    from tui_gateway.automation_replay_handoff import Journal
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: None)
++    wired.publish(helpers.KEY, [helpers.item(due=0)])
++    def fail(*a):
++        raise sqlite3.OperationalError("compaction unavailable")
++    monkeypatch.setattr(Journal, "compact", fail)
++    calls = []
++    assert ar.consume_handoffs([wired.path.parent], now=100,
++                               wake=lambda *a, **kw: calls.append(1) or "missing") == 1
++    assert calls == [1] and wired.owners() == []
++
++
++def test_child_publication_cannot_cancel_foreign_parent_and_rolls_back_on_conflict(journal):
++    journal.publish("foreign", [helpers.item("foreign", due=0)])
++    parent = journal.claim("foreign", 100, "owner", lambda _: False)
++    child = {**helpers.item("child", due=0), "source_batch": parent["id"]}
++    journal.publish("chat", [child])
++    assert journal.release(parent)
++    journal.publish("chat", [helpers.item("conflict", due=0)])
++    same = helpers.take(journal)
++    with pytest.raises(ValueError, match="identity"):
++        journal.publish("chat", [{**helpers.item("new", due=0), "source_batch": same["id"]},
++                                 {**helpers.item("conflict", due=0), "text": "different"}])
++    assert journal.release(same)
+diff --git a/tui_gateway/automation_replay.py b/tui_gateway/automation_replay.py
+index f3f66658fd..5c66320162 100644
+--- a/tui_gateway/automation_replay.py
++++ b/tui_gateway/automation_replay.py
+@@ -762,6 +762,11 @@ def _consume(homes: list, wake: Callable[..., str] | None, now: float | None) ->
+             continue
+         try:
+             journal = Journal(home)
++            try:
++                journal.compact()
++            except sqlite3.Error:
++                logger.warning("automation-replay: compaction of %s refused; delivery still proceeds", home,
++                               exc_info=True)
+             owners = journal.owners()
+         except Exception:  # health: allow BLE001 -- one unreadable store must not stop the others
+             logger.warning("automation-replay: journal of %s unreadable", home, exc_info=True)
+diff --git a/tui_gateway/automation_replay_handoff.py b/tui_gateway/automation_replay_handoff.py
+index 00c920f607..84b10b114e 100644
+--- a/tui_gateway/automation_replay_handoff.py
++++ b/tui_gateway/automation_replay_handoff.py
+@@ -7,6 +7,7 @@ Explicit Stop and successful-context watermarks survive backend replacement.
+ """
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ import sqlite3
+ import time
+@@ -22,6 +23,11 @@ _SCHEMA = (
+     "CREATE TABLE IF NOT EXISTS automation_replay_batches ("
+     "id TEXT PRIMARY KEY, owner TEXT NOT NULL, token TEXT, holder TEXT, payload TEXT NOT NULL, "
+     "status TEXT NOT NULL, message_row_id INTEGER, message_uid TEXT, target TEXT, committed_at REAL)",
++    "CREATE INDEX IF NOT EXISTS automation_replay_terminal_items ON automation_replay_items(status)",
++    "CREATE INDEX IF NOT EXISTS automation_replay_batch_items ON automation_replay_items(batch)",
++    "CREATE INDEX IF NOT EXISTS automation_replay_terminal_batches ON automation_replay_batches(status)",
++    "CREATE TABLE IF NOT EXISTS automation_replay_tombstones ("
++    "id TEXT PRIMARY KEY, owner TEXT NOT NULL, payload_sha256 BLOB NOT NULL)",
+     "CREATE TABLE IF NOT EXISTS automation_replay_fences ("
+     "owner TEXT PRIMARY KEY, stopped_at REAL NOT NULL DEFAULT 0, carried_through REAL NOT NULL DEFAULT 0)",
+ )
+@@ -60,6 +66,12 @@ class Journal:
+                 covered = fence and (created <= fence["stopped_at"] or
+                                      (item["persisted"] and created <= fence["carried_through"]))
+                 payload = json.dumps(item, separators=(",", ":"))
++                terminal = conn.execute("SELECT owner,payload_sha256 FROM automation_replay_tombstones WHERE id=?",
++                                        (item["id"],)).fetchone()
++                if terminal:
++                    if terminal["owner"] != owner or terminal["payload_sha256"] != hashlib.sha256(payload.encode()).digest():
++                        raise ValueError("delivery identity already published with different owner or payload")
++                    continue
+                 prior = conn.execute("SELECT owner,payload FROM automation_replay_items WHERE id=?",
+                                      (item["id"],)).fetchone()
+                 if prior and (prior["owner"] != owner or prior["payload"] != payload):
+@@ -69,6 +81,17 @@ class Journal:
+                     "(id,owner,payload,due,created_at,persisted,status) VALUES(?,?,?,?,?,?,?)",
+                     (item["id"], owner, payload, item["due"], created,
+                      bool(item["persisted"]), "cancelled" if covered else "queued"))
++                # A build can rewall and retire before _run_batch inspects local
++                # entries. Transfer custody atomically with child publication: the
++                # predecessor token must not remain dispatchable beside its child.
++                parent = item.get("source_batch")
++                if parent:
++                    changed = conn.execute(
++                        "UPDATE automation_replay_batches SET status='cancelled',token=NULL,holder=NULL "
++                        "WHERE id=? AND owner=? AND status='pending'", (parent, owner)).rowcount
++                    if changed:
++                        conn.execute("UPDATE automation_replay_items SET status='cancelled' WHERE batch=?",
++                                     (parent,))
+ 
+     def claim(self, owner: str, now: float, holder: str, holder_alive) -> dict | None:
+         """Freeze one coalesced due batch, or recover the exact batch of a dead custodian.
+@@ -218,6 +241,31 @@ class Journal:
+                 conn.execute("UPDATE automation_replay_items SET batch=NULL,status='queued' "
+                              "WHERE batch=? AND status='batched'", (row["batch"],))
+ 
++    def compact(self, limit: int = 256) -> None:
++        """Remove terminal payload in bounded transactions, never pending custody.
++
++        Exact UUID tombstones cannot expire: a live predecessor may publish an
++        arbitrarily old item. They retain only owner and digest, not delivery text.
++        This bounds each maintenance pass, not total outstanding/dedupe metadata.
++        """
++        with closing(sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=5.0)) as probe:
++            terminal = probe.execute(
++                "SELECT 1 FROM automation_replay_items WHERE status IN ('cancelled','dispatched') "
++                "UNION ALL SELECT 1 FROM automation_replay_batches WHERE status IN ('cancelled','dispatched') LIMIT 1"
++            ).fetchone()
++        if terminal is None:
++            return
++        with self.transaction() as conn:
++            rows = conn.execute("SELECT id,owner,payload FROM automation_replay_items "
++                                "WHERE status IN ('cancelled','dispatched') LIMIT ?", (limit,)).fetchall()
++            conn.executemany("INSERT OR IGNORE INTO automation_replay_tombstones VALUES(?,?,?)",
++                             [(r["id"], r["owner"], hashlib.sha256(r["payload"].encode()).digest()) for r in rows])
++            conn.executemany("DELETE FROM automation_replay_items WHERE id=?", [(r["id"],) for r in rows])
++            conn.execute("DELETE FROM automation_replay_batches WHERE id IN ("
++                         "SELECT id FROM automation_replay_batches WHERE status IN ('cancelled','dispatched') "
++                         "AND NOT EXISTS (SELECT 1 FROM automation_replay_items WHERE batch=automation_replay_batches.id) "
++                         "LIMIT ?)", (limit,))
++
+     def owners(self) -> list[str]:
+         """Read-only (no write lock, no DDL): owners with undelivered custody."""
+         try:
+-- 
+2.43.0
+

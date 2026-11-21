@@ -1,0 +1,242 @@
+From 82b11299c51f0a88a4a32e92972f8b40420b2fd1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 03:17:50 +0000
+Subject: [PATCH] fix(kanban): carry blocked-upstream evidence across remote
+ card transports [daveey]
+
+Owner inventory observation now stamps nearest blocked/triage ancestry before
+hashing its payload. Preserve the optional stamp through hub and origin-ledger
+projections. Board replicas derive the same presentation from their synced
+links, and tolerate both an optional stamp column and older graphless schemas.
+No lifecycle schema or renderer rebuild is required.
+
+Proof: focused tests initially 42 passed. Source-only revert produced 6
+regression failures and 2 passing compatibility controls. Full scripts/check
+passed all 21 checks; health has zero blocking/advisory findings. Existing
+remote hubLinkChips mapping was executed in Node and preserves blockedUpstream.
+Further consumer tests recorded on the implementation card. No live render
+has been observed.
+---
+ hermes_cli/kanban_chat_links.py               |  8 +-
+ hermes_cli/kanban_origin_ledger.py            |  4 +-
+ hermes_cli/kanban_replica_projection.py       |  1 +
+ hermes_cli/kanban_replica_upstream.py         | 31 ++++++
+ .../test_kanban_blocked_upstream_remote.py    | 95 +++++++++++++++++++
+ 5 files changed, 136 insertions(+), 3 deletions(-)
+ create mode 100644 hermes_cli/kanban_replica_upstream.py
+ create mode 100644 tests/hermes_cli/test_kanban_blocked_upstream_remote.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 8d20c15abf..be42d3d438 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -31,6 +31,7 @@ from typing import Any, Iterable, Optional
+ 
+ from hermes_cli import kanban_chat_links_released as _released
+ from hermes_cli.kanban_replica_execution import read_runs, run_evidence
++from hermes_cli.kanban_replica_upstream import fields as upstream_fields
+ from hermes_cli.kanban_run_machine import placement_select, run_machine
+ from hermes_cli.kanban_session_activity_release import (DONE_PENDING_RELEASE, TERMINAL_STATUSES, UNKNOWN,
+                                                        unreleased_obligation)
+@@ -569,14 +570,16 @@ def replica_link_rows(conn: sqlite3.Connection, path: Path, gateway: str, profil
+ 
+ 
+ def _read_replica_links(conn: sqlite3.Connection, gateway: str, profile: str) -> list[dict[str, Any]]:
+-    return [dict(r) for r in conn.execute(
++    from hermes_cli.kanban_replica_upstream import enrich, optional_select
++    rows = [dict(r) for r in conn.execute(
+         "SELECT l.task_id AS id, t.id AS task_row, t.title, t.status, t.assignee, t.created_at, t.started_at, "
+         f"t.priority, t.block_kind, t.human_request, t.created_on, {placement_select(conn, 't')}, "
+-        "l.chat_session, l.chat_profile, l.kind "
++        f"l.chat_session, l.chat_profile, l.kind {optional_select(conn)} "
+         "FROM task_chat_links l LEFT JOIN tasks t ON t.id = l.task_id "
+         "WHERE l.chat_gateway = ? AND l.chat_profile = ? AND l.released = 0 "
+         "AND (t.id IS NULL OR (t.created_on IS NOT NULL AND t.created_on != ?))",
+         (gateway, profile, gateway)).fetchall()]
++    return enrich(conn, rows)
+ 
+ 
+ def _ledger_owners(stale_ok: bool = False) -> dict[tuple[str, str], list[tuple[str, str, str, bool]]]:
+@@ -833,6 +836,7 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+                 "released": False, "reported_status": status, "synced_at": pulled, "stale": stale,
+                 "source": "replica",
+             }
++            out[pair].update(upstream_fields(r))
+             if machine := run_machine(r):
+                 out[pair]["run_machine"] = machine
+             # Executor-stamped liveness of the current run (kanban_replica_execution), never the pull clock.
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 46ee7c2312..5d4830406a 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -246,6 +246,8 @@ def observe_owner_task(conn: sqlite3.Connection, task: dict, *, now: float) -> d
+         receipt_epoch=lambda: _receipt_epoch(conn))
+     payload = {k: v for k, v in task.items()
+                if k not in ('origin_observation', 'withdrawal_notice', 'withdrawal_recipients')}
++    from hermes_cli.kanban_session_activity_card_details import _add_blocked_upstream
++    _add_blocked_upstream(conn, {task['id']: payload})
+     from hermes_cli.kanban_withdrawal_notice import publish
+     withdrawal = publish(conn, task)
+     if withdrawal is not None:
+@@ -656,7 +658,7 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                     'legacy_aliases': aliases_for_projection(alias_receipts.get(structure.digest(raw, binding), []), binding),
+                     # [daveey] Bounded run fields for what the card waits on (kanban_wait_info, display only).
+                     'park': _park_of(task),
+-                    **{k: task[k] for k in ('awaiting', 'wake_check', 'human_request') if task.get(k)},
++                    **{k: task[k] for k in ('awaiting', 'wake_check', 'human_request', 'blocked_upstream') if task.get(k)},
+                 })
+         return result
+     finally:
+diff --git a/hermes_cli/kanban_replica_projection.py b/hermes_cli/kanban_replica_projection.py
+index 58b78de9de..29e2e215cd 100644
+--- a/hermes_cli/kanban_replica_projection.py
++++ b/hermes_cli/kanban_replica_projection.py
+@@ -70,6 +70,7 @@ def card_rows(tkey: tuple, t: dict[str, Any], *, sids, closed: bool, synced, sta
+     for sid in sids:
+         out.append(((sid, ref), {
+             **historical,
++            **({"blocked_upstream": t["blocked_upstream"]} if t.get("blocked_upstream") else {}),
+             **{f: t.get(f) for f in _REMOTE_FIELDS},
+             "id": tid, "board": board, "gateway": gw, "key": ref, "session": sid,
+             "via": "shepherd", "root": ref, "remote": True,
+diff --git a/hermes_cli/kanban_replica_upstream.py b/hermes_cli/kanban_replica_upstream.py
+new file mode 100644
+index 0000000000..9d5247bbf5
+--- /dev/null
++++ b/hermes_cli/kanban_replica_upstream.py
+@@ -0,0 +1,31 @@
++"""Optional upstream presentation for Board replicas, without a derived synced column. [daveey]"""
++from __future__ import annotations
++
++import sqlite3
++
++from hermes_cli.kanban_session_activity_card_details import _add_blocked_upstream
++
++
++def optional_select(conn: sqlite3.Connection) -> str:
++    """Some inventory schemas carry a stamp; older ones have only the synced graph."""
++    columns = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    return ", t.blocked_upstream" if "blocked_upstream" in columns else ""
++
++
++def enrich(conn: sqlite3.Connection, rows: list[dict]) -> list[dict]:
++    from hermes_cli.kanban_chat_links import _decoded_request
++
++    # Card ids can occur once per linked chat. Compute once, then fan out to all links.
++    cards = {r["id"]: {"status": r["status"]} for r in rows}
++    _add_blocked_upstream(conn, cards)
++    for row in rows:
++        stamp = _decoded_request(row.get("blocked_upstream"))
++        row.pop("blocked_upstream", None)
++        ancestor = stamp or cards[row["id"]].get("blocked_upstream")
++        if ancestor:
++            row["blocked_upstream"] = ancestor
++    return rows
++
++
++def fields(row: dict) -> dict:
++    return {"blocked_upstream": row["blocked_upstream"]} if row.get("blocked_upstream") else {}
+diff --git a/tests/hermes_cli/test_kanban_blocked_upstream_remote.py b/tests/hermes_cli/test_kanban_blocked_upstream_remote.py
+new file mode 100644
+index 0000000000..1c06ef4890
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_blocked_upstream_remote.py
+@@ -0,0 +1,95 @@
++"""Blocked-upstream presentation survives both remote card transports."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_origin_ledger as ledger
++from hermes_cli import kanban_replica_projection as projection
++from hermes_cli import kanban_session_activity as activity
++from tests.hermes_cli import test_kanban_chat_links as fixtures
++from tests.hermes_cli import test_kanban_origin_ledger as origin_fixtures
++from tests.hermes_cli import kanban_sync_support as support
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++
++world = origin_fixtures.world
++
++
++@pytest.mark.parametrize("present", [True, False])
++def test_origin_ledger_projection_keeps_optional_ancestor(world, present):
++    path, replica, binding = world
++    expected = {"id": "parent", "status": "blocked"}
++    origin_fixtures.publish(replica, binding, **({"blocked_upstream": expected} if present else {}))
++    origin_fixtures.accept(world)
++    row = ledger.project(path, replica=replica, gateway="origin", profile="default")[0]
++    if present:
++        assert row["blocked_upstream"] == expected
++    else:
++        assert "blocked_upstream" not in row
++
++
++@pytest.mark.parametrize("status", ["blocked", "triage", "running"])
++def test_owner_publication_stamps_current_ancestor(tmp_path, monkeypatch, status):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    conn = kbc.connect(home / "kanban.db")
++    try:
++        parent = kb.create_task(conn, title="parent", assignee="worker")
++        child = kb.create_task(conn, title="child", assignee="worker")
++        with kbc.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (child,))
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, parent))
++            conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (parent, child))
++            task = ledger.observe_owner_task(conn, {"id": child, "status": "todo",
++                                                   "blocked_upstream": {"id": "obsolete", "status": "blocked"}}, now=1000)
++        if status == "running":
++            assert "blocked_upstream" not in task
++        else:
++            assert task["blocked_upstream"] == {"id": parent, "status": status}
++        assert ledger._owner_evidence(task)["task_hash"] == task["origin_observation"]["task_hash"]
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize("transport", ["stamped", "graph", "old"])
++def test_replica_session_tasks_preserves_optional_ancestor(tmp_path, monkeypatch, transport):
++    path = tmp_path / "replica.db"
++    fixtures._replica(path, [("child", "child", "todo", fixtures.OTHER)],
++                      [("child", fixtures.ME, "s1", "created", 0)])
++    expected = {"id": "parent", "status": "blocked"}
++    with sqlite3.connect(path) as conn:
++        if transport == "stamped":
++            conn.execute("ALTER TABLE tasks ADD COLUMN blocked_upstream TEXT")
++            conn.execute("UPDATE tasks SET blocked_upstream=?", (json.dumps(expected),))
++        elif transport == "graph":
++            conn.execute("CREATE TABLE task_links(parent_id TEXT, child_id TEXT)")
++            conn.execute("INSERT INTO tasks(id, status) VALUES ('parent', 'blocked')")
++            conn.execute("INSERT INTO task_links VALUES ('parent', 'child')")
++    monkeypatch.setattr(activity, "_remote_links", lambda **kw: [])
++    monkeypatch.setattr(activity, "_board_db_paths", list)
++    monkeypatch.setattr(activity, "_remote_cards", lambda ids, statuses, stale_ok: links.replica_cards(
++        ids, fixtures.ME, statuses, replicas=[("default", path)]))
++    links._reset_for_tests()
++    rows = activity.session_tasks(["s1"])
++    assert len(rows) == 1 and rows[0]["source"] == "replica"
++    if transport == "old":
++        assert "blocked_upstream" not in rows[0]
++    else:
++        assert rows[0]["blocked_upstream"] == expected
++
++
++@pytest.mark.parametrize("present", [True, False])
++def test_hub_inventory_projection_carries_optional_field(present):
++    task = {"id": "child", "status": "todo"}
++    expected = {"id": "parent", "status": "blocked"}
++    if present:
++        task["blocked_upstream"] = expected
++    rows = projection.card_rows(("remote", "default", "default", "child"), task,
++                               sids=["s1"], closed=False, synced=1, stale=False, me="local",
++                               origin_profile="default", legacy_record=None, historical={})
++    row = rows[0][1]
++    if present:
++        assert row["blocked_upstream"] == expected
++    else:
++        assert "blocked_upstream" not in row
+-- 
+2.43.0
+

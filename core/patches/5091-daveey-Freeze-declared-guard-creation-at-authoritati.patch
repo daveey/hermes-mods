@@ -1,0 +1,339 @@
+From 2e2a4209b8874e2ac67ef1b2829dffd286265807 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 03:05:15 +0000
+Subject: [PATCH] [daveey] Freeze declared guard creation at authoritative
+ intake
+
+Default kanban.self_work.freeze_guards on. Append only to open guard owners in the same repository/area/tenant across days, otherwise return a definitive pre-write refusal. Preserve immutable receipt replay and existing execution. Sender declarations cannot override authority configuration.
+
+Proof: corrected baseline fails guard tests; all 422 focused selfwork/docs tests pass. Ten policy mutants killed (default/off/kind/owner-kind/closed/area/repository/tenant/type/log). Read-only census of hub boards and shadows found ten declaration rows including replicas, zero guard declarations: zero historical classification changes. Undeclared legacy guards remain outside the explicit contract; no title heuristics. Reversal: set freeze_guards false at intake authority.
+---
+ hermes_cli/config_defaults.py                 |   2 +-
+ hermes_cli/kanban_selfwork_guards.py          |  52 +++++++++
+ hermes_cli/kanban_selfwork_intake.py          |   5 +-
+ hermes_cli/kanban_selfwork_owner.py           |  20 +++-
+ .../test_kanban_selfwork_guard_entry.py       |  40 +++++++
+ .../hermes_cli/test_kanban_selfwork_guards.py | 105 ++++++++++++++++++
+ website/docs/user-guide/configuration.md      |   9 ++
+ 7 files changed, 224 insertions(+), 9 deletions(-)
+ create mode 100644 hermes_cli/kanban_selfwork_guards.py
+ create mode 100644 tests/hermes_cli/test_kanban_selfwork_guard_entry.py
+ create mode 100644 tests/hermes_cli/test_kanban_selfwork_guards.py
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 0f9fe7ade5..6a06725784 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1883,7 +1883,7 @@ DEFAULT_CONFIG = {
+     "kanban": {
+         # Evidence only; never changes urgency or starts capture without explicit activation.
+         "fairness_capture": {"enabled": False, "capture_id": None, "directory": None, "max_bytes": 536870912},
+-        "self_work": {"sample_rate": 0.2},  # Reversible spot checks; risky/unknown diffs always selected. [daveey]
++        "self_work": {"sample_rate": 0.2, "freeze_guards": True},  # Reversible self-work policies. [daveey]
+         "wake_check_stale_hours": 48,  # Reconsider a never-passing probe; same-probe re-parks retain age.
+         "passive_intake": {},  # Exact task ID -> exact wake_check for standing external listeners.
+         "sync": {"enabled": False},  # New boards get sync tables + outbox triggers when enabled. [daveey]
+diff --git a/hermes_cli/kanban_selfwork_guards.py b/hermes_cli/kanban_selfwork_guards.py
+new file mode 100644
+index 0000000000..01018e85e2
+--- /dev/null
++++ b/hermes_cli/kanban_selfwork_guards.py
+@@ -0,0 +1,52 @@
++"""Default-on creation freeze for explicitly declared guard maintenance."""
++import logging
++
++from hermes_cli import kanban_selfwork as policy
++from hermes_cli import kanban_selfwork_batch as batch
++
++log = logging.getLogger(__name__)
++
++
++class GuardFrozen(policy.SelfWorkError):
++    """Definitive pre-write refusal, safe for courier acknowledgement."""
++
++
++def refusal(exc):
++    import json
++    return json.dumps({'ok': False, 'status': 'rejected', 'code': 'self_work_guard_frozen',
++                       'handoff_complete': False, 'created': False, 'error': str(exc)})
++
++
++def frozen():
++    from hermes_cli.config import load_config
++    section = load_config()
++    for key in ('kanban', 'self_work'):
++        if not isinstance(section, dict):
++            raise policy.SelfWorkError('kanban.self_work.freeze_guards requires object configuration')
++        section = section.get(key, {})
++    if not isinstance(section, dict):
++        raise policy.SelfWorkError('kanban.self_work.freeze_guards requires object configuration')
++    value = section.get('freeze_guards', True)
++    if type(value) is not bool:
++        raise policy.SelfWorkError('kanban.self_work.freeze_guards must be boolean')
++    return value
++
++
++def choose(conn, value, *, now, tenant=None, report=True):
++    """Share selection between preflight and admission; caller holds write lock."""
++    if value['kind'] != 'guard' or not frozen():
++        return batch.choose(conn, value, now=now, tenant=tenant)
++    row = conn.execute(
++        "SELECT t.id FROM tasks t JOIN task_events e ON e.task_id=t.id "
++        "WHERE t.tenant IS ? AND t.status NOT IN ('done','archived') AND e.kind=? "
++        "AND json_extract(e.payload,'$.repository')=? AND json_extract(e.payload,'$.area')=? "
++        "AND json_extract(e.payload,'$.kind')='guard' ORDER BY t.created_at,t.id LIMIT 1",
++        (tenant, policy.EVENT, value['repository'], value['area']),
++    ).fetchone()
++    if report or row is None:
++        log.info('guard creation frozen: repository=%s area=%s owner=%s',
++                 value['repository'], value['area'], row['id'] if row else 'none')
++    if row is None:
++        raise GuardFrozen('kanban.self_work.freeze_guards is on: no open guard owner in this area; '
++                                   'add evidence to existing work instead of creating a guard')
++    return batch.Decision('append', row['id'])
+diff --git a/hermes_cli/kanban_selfwork_intake.py b/hermes_cli/kanban_selfwork_intake.py
+index b7558850ce..f401ff0e05 100644
+--- a/hermes_cli/kanban_selfwork_intake.py
++++ b/hermes_cli/kanban_selfwork_intake.py
+@@ -14,6 +14,7 @@ from contextvars import ContextVar
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_selfwork as policy
+ from hermes_cli import kanban_selfwork_batch as batch
++from hermes_cli import kanban_selfwork_guards as guards
+ 
+ _CREATION = ContextVar('self_work_intake_creation', default=None)
+ 
+@@ -93,7 +94,7 @@ def admit(conn, *, request_id, authority, local_gateway, options, now, create_gu
+         from hermes_cli.kanban_lanes import lane_tenant
+         tenant = lane_tenant(conn, tuple(options.get('parents', ())), options.get('initial_status', 'running'),
+                              options.get('triage', False), options.get('tenant'), options)
+-        decision = batch.choose(conn, value, now=now, tenant=tenant)
++        decision = guards.choose(conn, value, now=now, tenant=tenant)
+         if decision.disposition == 'append':
+             receipt = batch.append(conn, decision, value, request_id=request_id,
+                                    title=options['title'], body=options.get('body'),
+@@ -147,7 +148,7 @@ def append_existing(conn, *, request_id, authority, options, request, now):
+         from hermes_cli.kanban_lanes import lane_tenant
+         tenant = lane_tenant(conn, tuple(options.get('parents', ())), options.get('initial_status', 'running'),
+                              options.get('triage', False), options.get('tenant'), options)
+-        if batch.choose(conn, value, now=now, tenant=tenant).disposition != 'append':
++        if guards.choose(conn, value, now=now, tenant=tenant, report=False).disposition != 'append':
+             return None
+         return admit(conn, request_id=request_id, authority=authority, local_gateway=authority,
+                      options=options, request=request, now=now)
+diff --git a/hermes_cli/kanban_selfwork_owner.py b/hermes_cli/kanban_selfwork_owner.py
+index 5253877cf1..eb0e2ac8b0 100644
+--- a/hermes_cli/kanban_selfwork_owner.py
++++ b/hermes_cli/kanban_selfwork_owner.py
+@@ -98,8 +98,12 @@ def replay(conn, args, intent, *, origin_intent=None):
+                        creator_task_id=creator_task(conn, intent),
+                        created_by=intent.get('sender') or _persisted_identity(),
+                        parents=_coerce_str_list(args.get('parents') or [], 'parents', 'task ids'))
+-        receipt = intake.append_existing(conn, request_id=intent['request_id'], authority=authority,
+-                                         options=options, request=request, now=int(time.time()))
++        from hermes_cli import kanban_selfwork_guards as guards
++        try:
++            receipt = intake.append_existing(conn, request_id=intent['request_id'], authority=authority,
++                                             options=options, request=request, now=int(time.time()))
++        except guards.GuardFrozen as exc:
++            return guards.refusal(exc)
+     return _render(conn, receipt, intent) if receipt is not None else None
+ 
+ 
+@@ -137,8 +141,12 @@ def create(conn, options, *, after_create, marker_placement, place_origin, reque
+     # execution labels remain valid, but legacy deferred forwarding cannot.
+     if marker_placement and marker_placement.get('defer'):
+         raise policy.SelfWorkError('self-work admission stays at home; use Board execution labels, not gateway forwarding')
+-    receipt = intake.admit(conn, request_id=intent['request_id'], authority=authority,
+-                           local_gateway=authority, options=options, now=int(time.time()),
+-                           create_guard=guard, on_created=after_create,
+-                           request={'args': request, 'intent': intent})
++    from hermes_cli import kanban_selfwork_guards as guards
++    try:
++        receipt = intake.admit(conn, request_id=intent['request_id'], authority=authority,
++                               local_gateway=authority, options=options, now=int(time.time()),
++                               create_guard=guard, on_created=after_create,
++                               request={'args': request, 'intent': intent})
++    except guards.GuardFrozen as exc:
++        return guards.refusal(exc)
+     return _render(conn, receipt, intent, marker_placement, place_origin)
+diff --git a/tests/hermes_cli/test_kanban_selfwork_guard_entry.py b/tests/hermes_cli/test_kanban_selfwork_guard_entry.py
+new file mode 100644
+index 0000000000..1f120de115
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_selfwork_guard_entry.py
+@@ -0,0 +1,40 @@
++"""Authenticated CLI and tool intake both enforce the authority's freeze."""
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from hermes_cli import config
++from hermes_cli.kanban_selfwork_receiver import receive
++from tests.hermes_cli import test_kanban_selfwork_nochat as support
++from tests.hermes_cli import test_kanban_selfwork_guards as guards
++
++world = support.world
++request_envelope = support.request_envelope
++
++
++@pytest.mark.parametrize('surface', ['cli', 'tool'])
++@pytest.mark.parametrize('mode', ['refuse', 'append', 'off', 'non-guard'])
++def test_guard_policy_at_entry(request_envelope, monkeypatch, capsys, surface, mode, caplog):
++    original = config.load_config
++    def configured(*args, **kwargs):
++        value = original(*args, **kwargs)
++        value['kanban']['self_work']['freeze_guards'] = mode != 'off'
++        return value
++    monkeypatch.setattr(config, 'load_config', configured)
++    request_envelope['args']['create']['self_work']['kind'] = 'sweep' if mode == 'non-guard' else 'guard'
++    with kbc.connect_closing() as conn:
++        tid = guards.seed(conn) if mode == 'append' else None
++    with caplog.at_level('INFO'):
++        result = (support.invoke(request_envelope, monkeypatch, capsys) if surface == 'cli'
++                  else receive(request_envelope))
++    with kbc.connect_closing() as conn:
++        if mode == 'refuse':
++            assert result['status'] == 'rejected', result
++            assert not kb.list_tasks(conn)
++        elif mode == 'append':
++            assert result['disposition'] == 'append', result
++            assert result['task_id'] == tid
++            assert len(kb.list_comments(conn, tid)) == 1
++            assert len(kb.list_tasks(conn)) == 1
++        else:
++            assert result.get('created') is True, result
++    assert len([r for r in caplog.records if 'guard creation frozen' in r.message]) == (mode in {'refuse', 'append'})
+diff --git a/tests/hermes_cli/test_kanban_selfwork_guards.py b/tests/hermes_cli/test_kanban_selfwork_guards.py
+new file mode 100644
+index 0000000000..bd7fc23ebb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_selfwork_guards.py
+@@ -0,0 +1,105 @@
++"""Guard freezing acts only at intake, before generic area batching."""
++import logging
++
++import pytest
++
++from hermes_cli import config, kanban_db as kb, kanban_selfwork as policy
++from hermes_cli import kanban_selfwork_intake as intake
++from tests.hermes_cli import test_kanban_selfwork as support
++
++board = support.board
++
++
++@pytest.fixture
++def settings(monkeypatch):
++    value = {'kanban': {'self_work': {}}}
++    monkeypatch.setattr(config, 'load_config', lambda: value)
++    return value['kanban']['self_work']
++
++
++def admit(conn, request='guard-request-001', **options):
++    return intake.admit(conn, request_id=request, authority='home', local_gateway='home', now=1794690000,
++                        options={'title': 'Guard finding', 'self_work': support.declaration('guard'), **options})
++
++
++def seed(conn, **changes):
++    tid = kb.create_task(conn, title='Existing owner', tenant=changes.pop('tenant', None))
++    policy.record(conn, tid, support.declaration(changes.pop('kind', 'guard'), **changes), day='2020-01-01')
++    return tid
++
++
++def test_default_freeze_refuses_without_owner(board, settings, caplog):
++    with caplog.at_level(logging.INFO), pytest.raises(policy.SelfWorkError, match='freeze_guards'):
++        admit(board)
++    assert not kb.list_tasks(board)
++    assert len([r for r in caplog.records if 'guard creation frozen' in r.message]) == 1
++
++
++def test_append_old_guard_and_replay_once(board, settings, caplog):
++    tid = seed(board)
++    before = kb.get_task(board, tid)
++    with caplog.at_level(logging.INFO):
++        result = admit(board)
++        replay = admit(board)
++    assert result['disposition'] == 'append' and result['task_id'] == tid
++    assert replay['replayed'] is True
++    assert len(kb.list_comments(board, tid)) == 1
++    assert kb.get_task(board, tid).status == before.status
++    assert len([r for r in caplog.records if 'guard creation frozen' in r.message]) == 1
++
++
++@pytest.mark.parametrize('change', [{'kind': 'sweep'}, {'area': 'other'}, {'repository': 'hermes-state'},
++                                     {'tenant': 'other'}])
++def test_wrong_owner_cannot_receive_guard(board, settings, change):
++    seed(board, **change)
++    with pytest.raises(policy.SelfWorkError, match='freeze_guards'):
++        admit(board)
++    assert len(kb.list_tasks(board)) == 1
++
++
++@pytest.mark.parametrize('status', ['done', 'archived'])
++def test_closed_guards_not_reused(board, settings, status):
++    tid = seed(board)
++    board.execute('UPDATE tasks SET status=? WHERE id=?', (status, tid))
++    board.commit()
++    with pytest.raises(policy.SelfWorkError, match='freeze_guards'):
++        admit(board)
++
++
++def test_off_allows_create_and_existing_replay_after_freeze(board, settings):
++    settings['freeze_guards'] = False
++    first = admit(board)
++    assert first['created'] is True
++    settings['freeze_guards'] = True
++    assert admit(board)['replayed'] is True
++
++
++@pytest.mark.parametrize('kind', sorted(policy.KINDS - {'guard'}))
++def test_other_kinds_unchanged(board, settings, kind):
++    assert admit(board, self_work=support.declaration(kind))['created'] is True
++
++
++def test_product_unchanged(board, settings):
++    tid = kb.create_task(board, title='Product lifecycle guard')
++    assert policy.declared(board, tid) is None
++
++
++@pytest.mark.parametrize('owner', [False, True])
++def test_append_probe_agrees(board, settings, owner):
++    tid = seed(board) if owner else None
++    options = {'title': 'Guard finding', 'self_work': support.declaration('guard')}
++    def call():
++        return intake.append_existing(board, request_id='guard-probe-001', authority='home',
++                                      options=options, request=options, now=1794690000)
++    if owner:
++        assert call()['task_id'] == tid
++    else:
++        with pytest.raises(policy.SelfWorkError, match='freeze_guards'):
++            call()
++
++
++@pytest.mark.parametrize('bad', [None, 0, 'false', [], {}])
++def test_malformed_switch_does_not_unfreeze(board, settings, bad):
++    settings['freeze_guards'] = bad
++    with pytest.raises(policy.SelfWorkError, match='freeze_guards'):
++        admit(board)
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 9b883c84a3..c764bd373e 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -3601,6 +3601,15 @@ dashboard:
+ 
+ ## Hermes self-work spot checks
+ 
++`kanban.self_work.freeze_guards` defaults to `true`. At authoritative intake,
++explicit `self_work.kind: guard` requests append evidence to the oldest open guard
++owner in the same repository, area and tenant, even across UTC days. If none exists,
++creation is refused. Each new attempt logs one line; replayed receipts do not append
++again. Existing guards keep running. Set the key to `false` to restore ordinary
++area/day batching and creation. This switch does not infer guard work from titles:
++undeclared cards and other maintenance kinds are unaffected. Configure it at the
++intake authority; a sender cannot override it in a creation request.
++
+ `kanban.self_work.sample_rate` sets the fraction of ordinary merged Hermes fixes
+ selected for post-merge verification (default `0.2`). Set it to `1.0` to restore
+ 100% selection, or `0.0` to select only mandatory checks. Values must be finite
+-- 
+2.43.0
+

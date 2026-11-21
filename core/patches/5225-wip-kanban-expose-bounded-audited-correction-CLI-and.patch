@@ -1,0 +1,444 @@
+From f68c8cf3728d26f568bb8e86466a14657fdcff48 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:39:31 +0000
+Subject: [PATCH] wip(kanban): expose bounded audited correction CLI and
+ refusal controls [daveey]
+
+---
+ hermes_cli/kanban.py                          |  17 ++-
+ hermes_cli/kanban_diagnostic_correction.py    |  40 ++++++-
+ hermes_cli/kanban_parser.py                   |   5 +
+ .../test_kanban_diagnostic_correction.py      |   7 +-
+ .../test_kanban_diagnostic_correction_cli.py  |  69 ++++++++++++
+ ...t_kanban_diagnostic_correction_controls.py | 101 ++++++++++++++++++
+ .../diagnostic-prose-correction.md            |  74 +++++++++++++
+ 7 files changed, 299 insertions(+), 14 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_diagnostic_correction_cli.py
+ create mode 100644 tests/hermes_cli/test_kanban_diagnostic_correction_controls.py
+ create mode 100644 website/docs/developer-guide/diagnostic-prose-correction.md
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index bd67b33519..6a4229f18f 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -56,7 +56,7 @@ from hermes_cli.kanban_cli_park import (
+ from hermes_cli.kanban_ops import (
+     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_recover, _cmd_repair, _cmd_tail, _cmd_watch,
+ )
+-from hermes_cli.kanban_parser import build_parser, cmd_resume as _cmd_resume, cmd_quota_release as _cmd_quota_release
++from hermes_cli.kanban_parser import build_parser, cmd_resume as _cmd_resume, cmd_quota_release as _cmd_quota_release, cmd_correct_diagnostics as _cmd_correct_diagnostics
+ from hermes_cli.kanban_claim_cli import cmd_claim as _cmd_claim  # moved; re-exported for callers
+ from hermes_cli.kanban_source_cli import cmd_source_release as _cmd_source_release
+ from hermes_cli.kanban_run_models_cli import command as _cmd_attest_run_models
+@@ -211,15 +211,10 @@ def kanban_command(args: argparse.Namespace) -> int:
+         board_scope = kb.scoped_current_board(normed)
+ 
+     with board_scope:
+-        # `repair` dispatches BEFORE auto-init: on a corrupt DB init_db() itself raises
+-        # KanbanDbCorruptError, which would turn every repair into "could not initialize database".
+-        if action == "repair":
+-            return _cmd_repair(args)
+-        # `recover` too: it exists for boards init refuses.
+-        if action == "recover":
+-            return _cmd_recover(args)
+-        # init_db is idempotent (one sqlite_master SELECT when tables exist) and prevents
+-        # "no such table: tasks" on first use from a fresh HERMES_HOME.
++        # Maintenance commands must not auto-initialize/migrate before validation.
++        if handler := {"repair": _cmd_repair, "recover": _cmd_recover,
++                       "correct-diagnostics": _cmd_correct_diagnostics}.get(action):
++            return handler(args)
+         try:
+             kb.init_db()
+         except BoardSchemaNotOwned as exc:  # one line, its own "kanban:" prefix
+@@ -271,7 +266,7 @@ def _profile_author() -> str:
+ 
+ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+     "init", "attest-run-models", "create", "swarm", "assign", "reclaim", "move", "reassign", "link", "unlink",
+-    "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
++    "claim", "comment", "attach", "attach-rm", "complete", "edit", "block", "correct-diagnostics",
+     "schedule", "unblock", "contain", "resume-contained", "promote", "archive", "dispatch", "daemon", "repair", "recover",
+     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+     "request-review", "request-changes", "reopen-review", "reopen", "resume", "quota-release", "source-release",
+diff --git a/hermes_cli/kanban_diagnostic_correction.py b/hermes_cli/kanban_diagnostic_correction.py
+index 165ccc5193..5a96cdf428 100644
+--- a/hermes_cli/kanban_diagnostic_correction.py
++++ b/hermes_cli/kanban_diagnostic_correction.py
+@@ -8,6 +8,40 @@ import os
+ import sqlite3
+ 
+ 
++def command(args) -> int:
++    """Read a bounded exact request; no actor/force/authority flags exist."""
++    import json
++    import sys
++
++    from hermes_cli.kanban_db_connect import connect_closing
++    from hermes_cli.kanban_review_required import worker_identity
++
++    if worker_identity():
++        print("kanban: diagnostic correction requires an independent non-worker operator", file=sys.stderr)
++        return 2
++    keys = {"comment_uid", "expected_body", "expected_comment", "body_diagnostic",
++            "comment_diagnostic", "reason", "request_id"}
++    try:
++        with open(args.request_file, "rb") as source:
++            raw = source.read(200001)
++        if len(raw) > 200000:
++            raise ValueError("file exceeds 200000 bytes")
++        request = json.loads(raw.decode("utf-8"))
++        if not isinstance(request, dict) or set(request) != keys:
++            raise ValueError("expected exactly: " + ", ".join(sorted(keys)))
++    except (OSError, ValueError) as exc:
++        print(f"kanban: invalid correction request: {exc}", file=sys.stderr)
++        return 2
++    try:
++        with connect_closing() as conn:
++            result = correct_diagnostics(conn, args.task_id, **request)
++    except (ValueError, RuntimeError, PermissionError, sqlite3.Error) as exc:
++        print(f"kanban: correction refused: {exc}", file=sys.stderr)
++        return 1
++    print(json.dumps(result, ensure_ascii=False))
++    return 0
++
++
+ def correct_diagnostics(
+     conn: sqlite3.Connection, task_id: str, *, comment_uid: str,
+     expected_body: str, expected_comment: str, body_diagnostic: str,
+@@ -57,7 +91,11 @@ def correct_diagnostics(
+             "before": {"body": expected_body, "comment": expected_comment}, "after": after,
+         }
+         for event in kb.list_events(conn, task_id):
+-            if event.kind != "diagnostic_corrected" or event.payload.get("request_id") != request_id:
++            if event.kind != "diagnostic_corrected":
++                continue
++            if not isinstance(event.payload, dict):
++                raise ValueError("malformed correction audit; no correction applied")
++            if event.payload.get("request_id") != request_id:
+                 continue
+             if any(event.payload.get(key) != value for key, value in request.items()):
+                 raise ValueError("request_id conflict; no correction applied")
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 5493cdc45a..7b19a3f0f5 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -18,6 +18,7 @@ from hermes_cli.kanban_chat_links_settle import DEFAULT_SETTLE_S
+ # The `resume` handler rides kanban.py's existing kanban_parser import, so kanban.py (at its
+ # FILE_LINES cap) gains no line for it. [daveey]
+ from hermes_cli.kanban_operator_resume import cmd as cmd_resume
++from hermes_cli.kanban_diagnostic_correction import command as cmd_correct_diagnostics
+ from hermes_cli.kanban_quota_episode_release import cmd as cmd_quota_release  # same ride as cmd_resume
+ 
+ 
+@@ -530,6 +531,10 @@ _SPECS = [
+              help="Override the live-claim guard: complete a running, claimed task "
+                   "even without owning its run (closes the worker's run)."),
+     ], help="Mark one or more tasks done"),
++    _cmd("correct-diagnostics", [
++        _TASK_ID,
++        _arg("--request-file", required=True, help="UTF-8 JSON exact-content quotation request (operator only)"),
++    ], help="Audited quotation of diagnostic body/comment prose; preserves lifecycle and delivery requirements"),
+     _cmd("edit", [
+         _TASK_ID,
+         _arg("--requires", metavar="CAPABILITIES",
+diff --git a/tests/hermes_cli/test_kanban_diagnostic_correction.py b/tests/hermes_cli/test_kanban_diagnostic_correction.py
+index 1eaa07fbde..77d7f6756d 100644
+--- a/tests/hermes_cli/test_kanban_diagnostic_correction.py
++++ b/tests/hermes_cli/test_kanban_diagnostic_correction.py
+@@ -3,11 +3,14 @@ from __future__ import annotations
+ 
+ import importlib
+ import importlib.util
++import sqlite3
++from typing import cast
+ 
+ import pytest
+ 
+ from tests.hermes_cli import test_kanban_edit_operator_fields as fixtures
+ 
++NO_BOARD = cast(sqlite3.Connection, None)
+ kanban_home = fixtures.kanban_home
+ 
+ 
+@@ -83,7 +86,7 @@ def test_worker_refused_before_reading_board(kanban_home, monkeypatch, worker_ke
+     monkeypatch.setenv(worker_key, "fixture-worker")
+     with pytest.raises(PermissionError, match="independent non-worker operator"):
+         correct_diagnostics(
+-            None, "fixture-card", comment_uid="fixture-comment", expected_body="error",
++            NO_BOARD, "fixture-card", comment_uid="fixture-comment", expected_body="error",
+             expected_comment="error", body_diagnostic="error", comment_diagnostic="error",
+             reason="test worker exclusion", request_id="fixture-worker-exclusion",
+         )
+@@ -102,7 +105,7 @@ def test_invalid_request_refused_before_board_access(kanban_home, field, value):
+                    request_id="fixture-limits")
+     request[field] = value
+     with pytest.raises(ValueError, match="invalid correction field"):
+-        correct_diagnostics(None, "fixture-card", **request)
++        correct_diagnostics(NO_BOARD, "fixture-card", **request)
+ 
+ 
+ @pytest.mark.parametrize("stale", ["body", "comment"])
+diff --git a/tests/hermes_cli/test_kanban_diagnostic_correction_cli.py b/tests/hermes_cli/test_kanban_diagnostic_correction_cli.py
+new file mode 100644
+index 0000000000..40bdff5182
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_diagnostic_correction_cli.py
+@@ -0,0 +1,69 @@
++"""Exercise actual argparse/dispatch for the narrow operator surface."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from tests.hermes_cli import test_kanban_diagnostic_correction_controls as controls
++from tests.hermes_cli import test_kanban_edit_operator_fields as fixtures
++
++kanban_home = fixtures.kanban_home
++correction_case = controls.correction_case
++
++
++def test_cli_applies_exact_request_file(correction_case, tmp_path, capsys):
++    conn, tid, request = correction_case
++    path = tmp_path / "request.json"
++    path.write_text(json.dumps(request), encoding="utf-8")
++    assert fixtures._main(["correct-diagnostics", tid, "--request-file", str(path)]) == 0
++    result = json.loads(capsys.readouterr().out)
++    assert result["request_id"] == request["request_id"]
++    task = kb.get_task(conn, tid)
++    assert task is not None and task.body == 'Diagnostic "error"'
++
++
++@pytest.mark.parametrize("payload", [[], {"force": True}, {"reason": "only"}])
++def test_cli_invalid_request_has_no_mutations(correction_case, tmp_path, capsys, payload):
++    conn, tid, _ = correction_case
++    path = tmp_path / "invalid.json"
++    path.write_text(json.dumps(payload), encoding="utf-8")
++    before = list(conn.iterdump())
++    assert fixtures._main(["correct-diagnostics", tid, "--request-file", str(path)]) != 0
++    assert "correction request" in capsys.readouterr().err
++    assert list(conn.iterdump()) == before
++
++
++def test_cli_worker_cannot_open_request(correction_case, monkeypatch, capsys):
++    conn, tid, _ = correction_case
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "fixture-worker")
++    before = list(conn.iterdump())
++    assert fixtures._main(["correct-diagnostics", tid, "--request-file", "/nonexistent"]) != 0
++    assert "non-worker operator" in capsys.readouterr().err
++    assert list(conn.iterdump()) == before
++
++
++@pytest.mark.parametrize("raw", [b"not json", b"\xff", b"x" * 200001], ids=["json", "utf8", "size"])
++def test_cli_bad_file_bytes(correction_case, tmp_path, capsys, raw):
++    conn, tid, _ = correction_case
++    path = tmp_path / "bad-bytes.json"
++    path.write_bytes(raw)
++    before = list(conn.iterdump())
++    assert fixtures._main(["correct-diagnostics", tid, "--request-file", str(path)]) == 2
++    assert "invalid correction request" in capsys.readouterr().err
++    assert list(conn.iterdump()) == before
++
++
++def test_cli_and_db_delegation_fences(correction_case, kanban_home, monkeypatch, capsys):
++    from hermes_cli.kanban_diagnostic_correction import correct_diagnostics
++
++    conn, tid, request = correction_case
++    before = list(conn.iterdump())
++    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(kanban_home))
++    assert fixtures._main(["correct-diagnostics", tid, "--request-file", "/nonexistent"]) != 0
++    assert "cannot mutate" in capsys.readouterr().err
++    with pytest.raises(PermissionError, match="(?i)delegat|fenc"):
++        correct_diagnostics(conn, tid, **request)
++    assert list(conn.iterdump()) == before
++
+diff --git a/tests/hermes_cli/test_kanban_diagnostic_correction_controls.py b/tests/hermes_cli/test_kanban_diagnostic_correction_controls.py
+new file mode 100644
+index 0000000000..078aa2bf01
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_diagnostic_correction_controls.py
+@@ -0,0 +1,101 @@
++"""Negative controls for trusted-operator diagnostic correction."""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli.kanban_diagnostic_correction import correct_diagnostics
++from tests.hermes_cli import test_kanban_edit_operator_fields as fixtures
++
++kanban_home = fixtures.kanban_home
++
++
++@pytest.fixture
++def correction_case(kanban_home):
++    with kbc.connect_closing() as conn:
++        sync.apply_sync_schema_steps(conn)
++        conn.commit()
++        tid = kb.create_task(conn, title="Correction control", body="Diagnostic error")
++        kb.add_comment(conn, tid, "original-author", "Diagnostic error")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_comments SET uid = ? WHERE task_id = ?", ("control-comment", tid))
++        request = dict(comment_uid="control-comment", expected_body="Diagnostic error",
++                       expected_comment="Diagnostic error", body_diagnostic="error",
++                       comment_diagnostic="error", reason="Diagnostic only", request_id="control-request")
++        yield conn, tid, request
++
++
++@pytest.mark.parametrize("payload", [None, [], "malformed", 42])
++def test_malformed_audit_fails_closed(correction_case, payload):
++    conn, tid, request = correction_case
++    with kb.write_txn(conn):
++        # Corrupt imported audit fixture; ordinary append only emits objects.
++        conn.execute(
++            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
++            (tid, "diagnostic_corrected", json.dumps(payload), 1),
++        )
++    before = list(conn.iterdump())
++    with pytest.raises(ValueError, match="malformed correction audit"):
++        correct_diagnostics(conn, tid, **request)
++    assert list(conn.iterdump()) == before
++
++
++@pytest.mark.parametrize("field", ["body", "comment"])
++def test_retry_refuses_drift(correction_case, field):
++    conn, tid, request = correction_case
++    correct_diagnostics(conn, tid, **request)
++    with kb.write_txn(conn):
++        if field == "body":
++            conn.execute("UPDATE tasks SET body = ? WHERE id = ?", ("Drift", tid))
++        else:
++            conn.execute("UPDATE task_comments SET body = ? WHERE uid = ?", ("Drift", request["comment_uid"]))
++    before = list(conn.iterdump())
++    with pytest.raises(ValueError, match="state drifted"):
++        correct_diagnostics(conn, tid, **request)
++    assert list(conn.iterdump()) == before
++
++
++@pytest.mark.parametrize("identity", ["task", "comment", "membership"])
++def test_wrong_identity_preserves_every_row(correction_case, identity):
++    conn, tid, request = correction_case
++    if identity == "task":
++        tid = "missing-task"
++    elif identity == "comment":
++        request["comment_uid"] = "missing-comment"
++    else:
++        tid = kb.create_task(conn, title="Different task", body=request["expected_body"])
++    before = list(conn.iterdump())
++    with pytest.raises(ValueError, match="identity mismatch"):
++        correct_diagnostics(conn, tid, **request)
++    assert list(conn.iterdump()) == before
++
++
++@pytest.mark.parametrize("status", ["running", "review", "done", "archived"])
++def test_active_or_closed_task_refused(correction_case, status):
++    conn, tid, request = correction_case
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
++    before = list(conn.iterdump())
++    with pytest.raises(ValueError, match="inactive open task"):
++        correct_diagnostics(conn, tid, **request)
++    assert list(conn.iterdump()) == before
++
++
++@pytest.mark.parametrize("state", [
++    {"mode": "shadow", "gateway_id": "owner"},
++    {"mode": "primary", "gateway_id": ""},
++    {"mode": "primary", "gateway_id": "foreign"},
++])
++def test_primary_owner_required(correction_case, monkeypatch, state):
++    conn, tid, request = correction_case
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET created_on = ? WHERE id = ?", ("owner", tid))
++    monkeypatch.setattr(sync, "sync_state", lambda _conn: state)
++    before = list(conn.iterdump())
++    with pytest.raises(PermissionError, match="owning primary gateway"):
++        correct_diagnostics(conn, tid, **request)
++    assert list(conn.iterdump()) == before
+diff --git a/website/docs/developer-guide/diagnostic-prose-correction.md b/website/docs/developer-guide/diagnostic-prose-correction.md
+new file mode 100644
+index 0000000000..df913e8ca7
+--- /dev/null
++++ b/website/docs/developer-guide/diagnostic-prose-correction.md
+@@ -0,0 +1,74 @@
++# Audited diagnostic prose correction
++
++`hermes kanban --board <board> correct-diagnostics <task-id> --request-file <path>`
++quotes one exact diagnostic span in a task body and one comment. This is a narrow
++trusted-operator maintenance command, not a delivery receipt or origin waiver.
++It does not change origin detection, acceptance criteria, task status, dependencies,
++comment identity, comment author, timestamps, or notification bookkeeping.
++
++## Authority and limits
++
++Only the actual independently authorized operator may initiate this command.
++Worker-marked calls and delegated-child mutations are refused. Absence of worker
++markers is **not authentication**: the recorded `process_context` describes the
++process, not certified human or author identity. Keep genuine operator invocation
++evidence separately. A worker must not launch a clean remote shell to impersonate
++the operator. A relayed permission or supplied reason does not confer machine authority.
++
++Before applying, independently establish that both selected spans reproduce a
++diagnostic and do not specify genuine delivery destinations. Quotation is not
++semantic proof. Preserve all genuine origin obligations. This command must never
++be used to hide an unmet obligation. The planner inserts only double quotes and
++rejects ambiguous/missing spans, embedded double quotes, multiline spans, and
++spans reaching into an `Acceptance:` suffix. Other acceptance formats still need
++operator review; no text heuristic can establish their meaning.
++
++The task must be inactive and open. A synced board must be primary on the card's
++owning gateway. The comment must have an existing portable UID and belong to that
++exact task. Run on an existing initialized board; this command does not initialize
++or migrate one. There is no force or caller-supplied authority flag.
++
++## Request
++
++Supply a UTF-8 JSON object with exactly these seven fields:
++
++```json
++{
++  "comment_uid": "existing-comment-uid",
++  "expected_body": "Diagnostic error\nAcceptance: unchanged.",
++  "expected_comment": "Diagnostic error",
++  "body_diagnostic": "error",
++  "comment_diagnostic": "error",
++  "reason": "Explain the independently verified diagnostic provenance.",
++  "request_id": "unique-correction-id"
++}
++```
++
++Expected strings must match current content byte-for-byte. Field limits in UTF-8
++bytes are: body 100000, comment 50000, each diagnostic 2000, reason 2000, request ID
++128, comment UID 201; the request file is at most 200000 bytes. Inputs must be
++nonempty strings. The task ID is limited to 64 bytes.
++
++The local transaction compares both originals before updating either. It appends
++a `diagnostic_corrected` event preserving before/after content, reason, request ID,
++comment UID, and observed process context. Existing historical events are retained.
++An exact retry returns that audit without writing again; changed request content
++or drift since application is refused. A malformed correction audit fails closed.
++The result on stdout is the audit JSON, **not** proof of canonical convergence or
++genuine operator identity.
++
++## Required verification
++
++Local transaction atomicity is not distributed atomicity. Normal row replication
++carries the body, same-UID comment, and audit independently. Read back the exact
++body, comment UID/content, and audit on the owner, canonical Board, and relevant
++replica after synchronization. Investigate partial acceptance or concurrent edits;
++do not manufacture a receipt or report success from local return alone.
++
++Compare the entire original acceptance and every genuine destination. Then run the
++installed read-only origin checker freshly, and retain its result alongside the
++genuine operator invocation evidence. No proof rerun, lifecycle transition, send,
++adoption, or gate exemption is implied by applying this correction.
++
++There is no destructive audit rollback. Any further correction needs a separately
++reviewed supported edit retaining the existing audit history.
+-- 
+2.43.0
+

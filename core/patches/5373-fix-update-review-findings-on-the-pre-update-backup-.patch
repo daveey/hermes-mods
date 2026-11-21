@@ -1,0 +1,795 @@
+From 95dfd4d3c0b85ffd4328799baf8cb7cdff7bae17 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 19:10:12 -0800
+Subject: [PATCH] fix(update): review findings on the pre-update backup
+ progress [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Snapshot (hermes_cli/backup_sqlite.py):
+- The clone path is decided before any lock: skipped (with the reason logged
+  and in clone_error) on Python < 3.12, where the lock connection's close could
+  checkpoint the WAL into state.db on the main thread, and on a filesystem
+  where a throwaway probe file cannot be cloned (ext4, NTFS), so those never
+  take state.db's write lock just to fail.
+- The lock is tried without waiting first; when another writer holds it the
+  script says so ({"event":"backup_lock_wait"}) and waits up to 2 s. The result
+  carries lock_wait_ms next to lock_ms.
+- The Linux clone source descriptor closes in its own finally.
+- The light clone check (header, open, schema_version, WAL fold) says plainly
+  that a corrupt state.db is backed up as it is on that path, not cancelled.
+
+Desktop:
+- The backup stage shows at once (indeterminate "start"), so an older snapshot
+  script with no progress lines still shows "Backing up before updating…", and
+  the start is always logged.
+- The POSIX hand-off leaves "Checking the backup…" for "Backup done. Starting
+  the updater…" as soon as the snapshot returns.
+- A snapshot that ignores SIGTERM past its deadline is SIGKILLed after 10 s.
+
+Tests: Python < 3.12 path, the probe keeping the lock untaken, a passive
+checkpoint between the db and WAL clones, SIGTERM during the clone verify, the
+lock-wait test now waits for the child's own lock_wait line instead of a sleep;
+SIGKILL escalation, the start stage with a silent script, and restart strictly
+after the backup in the hand-off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../updater/checkout-backup-progress.test.ts  |   8 ++
+ .../electron/updater/checkout-handoff.test.ts |  63 +++++++--
+ apps/desktop/electron/updater/checkout.ts     |  24 +++-
+ .../updater/state-db-preflight.test.ts        |  50 ++++++-
+ .../electron/updater/state-db-preflight.ts    |  37 ++++-
+ .../src/app/updates-overlay.backup.test.tsx   |   8 ++
+ apps/desktop/src/app/updates-overlay.tsx      |   6 +-
+ apps/desktop/src/global.d.ts                  |   3 +-
+ hermes_cli/backup_sqlite.py                   |  99 ++++++++++----
+ .../test_backup_preflight_progress.py         | 129 +++++++++++++++++-
+ 10 files changed, 376 insertions(+), 51 deletions(-)
+
+diff --git a/apps/desktop/electron/updater/checkout-backup-progress.test.ts b/apps/desktop/electron/updater/checkout-backup-progress.test.ts
+index c096b4f4b3..d33fc1c3c0 100644
+--- a/apps/desktop/electron/updater/checkout-backup-progress.test.ts
++++ b/apps/desktop/electron/updater/checkout-backup-progress.test.ts
+@@ -17,6 +17,14 @@ it('logs a backup’s start, end and check but not its twice-a-second ticks', ()
+     backup: { phase: 'copy' as const, doneBytes, totalBytes: 4 * GIB, method: 'copy' as const }
+   })
+ 
++  expect(
++    updateProgressLogLine({
++      stage: 'backup',
++      message: 'Backing up state.db…',
++      percent: null,
++      backup: { phase: 'start', doneBytes: 0, totalBytes: 0, method: null }
++    })
++  ).toBe('[updates] backup: Backing up state.db…')
+   expect(updateProgressLogLine(copy(0, 0))).toBe('[updates] backup: Backing up state.db (copy): 0 of 4 GB')
+   expect(updateProgressLogLine(copy(GIB, 25))).toBe('')
+   expect(updateProgressLogLine(copy(4 * GIB, 100))).toBe('[updates] backup: Backing up state.db (copy): 4 of 4 GB')
+diff --git a/apps/desktop/electron/updater/checkout-handoff.test.ts b/apps/desktop/electron/updater/checkout-handoff.test.ts
+index d08d10fbca..75c49fd8be 100644
+--- a/apps/desktop/electron/updater/checkout-handoff.test.ts
++++ b/apps/desktop/electron/updater/checkout-handoff.test.ts
+@@ -584,15 +584,7 @@ it('the Windows protocol-2 hand-off passes -HandoffRun with the bridged run id',
+ 
+ // The emergency state.db backup can take minutes on a large database: its
+ // progress reaches the overlay as stage `backup`, before "this window will close".
+-it('forwards the pre-flight backup progress to the overlay before the hand-off', async (): Promise<void> => {
+-  const { root, deps } = handoffFixture(false)
+-
+-  deps.preflightStateDb = (_home, _log, onProgress): void => {
+-    onProgress?.({ kind: 'progress', doneBytes: 0, totalBytes: 4 * 1024 ** 3, method: 'copy' })
+-    onProgress?.({ kind: 'progress', doneBytes: 1024 ** 3, totalBytes: 4 * 1024 ** 3, method: 'copy' })
+-    onProgress?.({ kind: 'check' })
+-  }
+-
++function failingSpawn(): void {
+   vi.spyOn(updaterProcess, 'spawnUpdaterProcess').mockImplementation((): updaterProcess.UpdaterChild => {
+     const child: EventEmitter & updaterProcess.UpdaterChild = Object.assign(new EventEmitter(), {
+       unref: (): void => {}
+@@ -604,13 +596,35 @@ it('forwards the pre-flight backup progress to the overlay before the hand-off',
+ 
+     return child
+   })
++}
++
++const START = { phase: 'start', doneBytes: 0, totalBytes: 0, method: null }
++
++it('forwards the pre-flight backup progress to the overlay before the hand-off', async (): Promise<void> => {
++  const { root, deps } = handoffFixture(false)
++
++  const emitted = (): Parameters<CheckoutStrategyDeps['emitUpdateProgress']>[0][] =>
++    vi.mocked(deps.emitUpdateProgress).mock.calls.map(([payload]) => payload)
++
++  deps.preflightStateDb = (_home, _log, onProgress): void => {
++    // The indeterminate start is already on screen when the snapshot begins.
++    expect(emitted().at(-1)).toEqual(
++      expect.objectContaining({ stage: 'backup', percent: null, message: 'Backing up state.db…', backup: START })
++    )
++    onProgress?.({ kind: 'progress', doneBytes: 0, totalBytes: 4 * 1024 ** 3, method: 'copy' })
++    onProgress?.({ kind: 'progress', doneBytes: 1024 ** 3, totalBytes: 4 * 1024 ** 3, method: 'copy' })
++    onProgress?.({ kind: 'check' })
++  }
++
++  failingSpawn()
+ 
+   try {
+     await createCheckoutStrategy(deps).apply()
+-    const calls = vi.mocked(deps.emitUpdateProgress).mock.calls.map(([payload]) => payload)
++    const calls = emitted()
+     const backups = calls.filter(payload => payload.stage === 'backup')
+ 
+     expect(backups).toEqual([
++      expect.objectContaining({ percent: null, backup: START }),
+       expect.objectContaining({
+         percent: 0,
+         backup: { phase: 'copy', doneBytes: 0, totalBytes: 4 * 1024 ** 3, method: 'copy' }
+@@ -625,9 +639,36 @@ it('forwards the pre-flight backup progress to the overlay before the hand-off',
+         backup: { phase: 'check', doneBytes: 4 * 1024 ** 3, totalBytes: 4 * 1024 ** 3, method: 'copy' }
+       })
+     ])
++    const firstBackup = calls.indexOf(backups[0]!)
+     const lastBackup = calls.lastIndexOf(backups.at(-1)!)
+     const restart = calls.findIndex(payload => payload.stage === 'restart')
+-    expect(restart === -1 || restart > lastBackup).toBe(true)
++
++    // "This window will close" comes only after the backup, never before or during it.
++    expect(restart).toBeGreaterThan(lastBackup)
++    expect(calls.slice(0, firstBackup).some(payload => payload.stage === 'restart')).toBe(false)
++    // The backup's last view is left as soon as the snapshot returns.
++    expect(calls[lastBackup + 1]).toEqual(
++      IS_WINDOWS
++        ? expect.objectContaining({ stage: 'restart' })
++        : expect.objectContaining({ stage: 'prepare', message: 'Backup done. Starting the updater…' })
++    )
++  } finally {
++    fs.rmSync(root, { recursive: true, force: true })
++  }
++})
++
++it('shows the backup stage even when the snapshot script reports no progress', async (): Promise<void> => {
++  const { root, deps } = handoffFixture(false)
++
++  failingSpawn()
++
++  try {
++    await createCheckoutStrategy(deps).apply()
++    const calls = vi.mocked(deps.emitUpdateProgress).mock.calls.map(([payload]) => payload)
++
++    expect(calls.filter(payload => payload.stage === 'backup')).toEqual([
++      expect.objectContaining({ percent: null, backup: START })
++    ])
+   } finally {
+     fs.rmSync(root, { recursive: true, force: true })
+   }
+diff --git a/apps/desktop/electron/updater/checkout.ts b/apps/desktop/electron/updater/checkout.ts
+index ecd22c4a97..0cd70813ca 100644
+--- a/apps/desktop/electron/updater/checkout.ts
++++ b/apps/desktop/electron/updater/checkout.ts
+@@ -40,7 +40,7 @@ import type { UpdaterApplyResultWire, UpdaterMechanism, UpdaterStatusWire, Updat
+  */
+ /** The emergency state.db backup's progress, as the overlay draws it (stage `backup`). */
+ export interface UpdateBackupProgress {
+-  phase: 'copy' | 'check'
++  phase: 'start' | 'copy' | 'check'
+   doneBytes: number
+   totalBytes: number
+   method: 'clone' | 'copy' | null
+@@ -57,6 +57,10 @@ const GIB = 1024 ** 3
+ 
+ /** English log text for one backup report; the renderer localizes from `backup`. */
+ function backupLogMessage(backup: UpdateBackupProgress): string {
++  if (backup.phase === 'start') {
++    return 'Backing up state.db…'
++  }
++
+   if (backup.phase === 'check') {
+     return 'Checking the state.db backup…'
+   }
+@@ -85,6 +89,18 @@ export function updateProgressLogLine(merged: {
+   return `[updates] ${merged.stage}: ${merged.message || merged.error || ''}`
+ }
+ 
++/**
++ * Run the pre-flight snapshot with its progress on the overlay (stage
++ * `backup`): an indeterminate start at once, so even a snapshot script that
++ * reports nothing (an older checkout) shows the backup, then its reports.
++ */
++export async function runStateDbPreflight(deps: CheckoutStrategyDeps): Promise<void> {
++  const start: UpdateBackupProgress = { phase: 'start', doneBytes: 0, totalBytes: 0, method: null }
++
++  deps.emitUpdateProgress({ stage: 'backup', message: backupLogMessage(start), percent: null, backup: start })
++  await deps.preflightStateDb(deps.hermesHome, deps.rememberLog, backupProgressEmitter(deps))
++}
++
+ /** Forward the pre-flight snapshot's reports to the update overlay as stage `backup`. */
+ export function backupProgressEmitter(
+   deps: Pick<CheckoutStrategyDeps, 'emitUpdateProgress'>
+@@ -617,7 +633,7 @@ export function createCheckoutStrategy(deps: CheckoutStrategyDeps): CheckoutStra
+     // anything.  Runs while the backend is still alive. Its progress shows in
+     // the overlay, so "this window will close" follows it rather than sitting
+     // over a backup that can take minutes.
+-    await deps.preflightStateDb(deps.hermesHome, deps.rememberLog, backupProgressEmitter(deps))
++    await runStateDbPreflight(deps)
+     deps.emitUpdateProgress({
+       stage: 'restart',
+       message:
+@@ -774,7 +790,9 @@ export function createCheckoutStrategy(deps: CheckoutStrategyDeps): CheckoutStra
+     }
+ 
+     // ── Pre-flight state.db integrity guard (#68474) ──
+-    await deps.preflightStateDb(deps.hermesHome, deps.rememberLog, backupProgressEmitter(deps))
++    await runStateDbPreflight(deps)
++    // Leave "Checking the backup…" now: the hand-off planning below takes a moment.
++    deps.emitUpdateProgress({ stage: 'prepare', message: 'Backup done. Starting the updater…', percent: null })
+ 
+     const args: string[] = [
+       ...handoff.args,
+diff --git a/apps/desktop/electron/updater/state-db-preflight.test.ts b/apps/desktop/electron/updater/state-db-preflight.test.ts
+index e0ae908db9..0494b4de5e 100644
+--- a/apps/desktop/electron/updater/state-db-preflight.test.ts
++++ b/apps/desktop/electron/updater/state-db-preflight.test.ts
+@@ -233,6 +233,7 @@ test('the progress parser joins lines split across chunks and ignores garbage',
+   parser.push('al_bytes": 100, "method": "copy"}\nWARNING: clone unavailable\r\n{not json}\n')
+   parser.push('{"event": "something_else"}\n{"event": "backup_progress", "done_bytes": "x", "total_bytes": 1}\n')
+   parser.push('{"event": "backup_progress", "done_bytes": 150, "total_bytes": 100, "method": "clone"}\n[1, 2]\n\n')
++  parser.push('{"event": "backup_lock_wait"}\n')
+   parser.push('{"event": "backup_check"}')
+   // The unterminated last line waits for its newline (or the end of the stream).
+   assert.equal(events.length, 2)
+@@ -248,7 +249,8 @@ test('the progress parser joins lines split across chunks and ignores garbage',
+     '{not json}',
+     '{"event": "something_else"}',
+     '{"event": "backup_progress", "done_bytes": "x", "total_bytes": 1}',
+-    '[1, 2]'
++    '[1, 2]',
++    'waiting (up to 2 s) for the state.db write lock another writer holds'
+   ])
+ })
+ 
+@@ -367,3 +369,49 @@ sys.exit(1)
+     fs.rmSync(home, { recursive: true, force: true })
+   }
+ })
++
++test.skipIf(process.platform === 'win32')(
++  'a snapshot that ignores SIGTERM past its deadline is killed',
++  async (): Promise<void> => {
++    const home: string = fs.mkdtempSync(path.join(os.tmpdir(), 'preflight-kill-'))
++    const script = path.join(home, 'snapshot.py')
++    const pidFile = path.join(home, 'pid')
++    fs.writeFileSync(
++      script,
++      `import os, signal, sys, time
++signal.signal(signal.SIGTERM, signal.SIG_IGN)
++open(${JSON.stringify(pidFile)}, 'w').write(str(os.getpid()))
++time.sleep(120)
++`
++    )
++    const logs: string[] = []
++    const started = Date.now()
++
++    try {
++      await assert.rejects(
++        preflightStateDb({
++          python: process.env.HERMES_PYTHON || 'python3',
++          script,
++          home,
++          log: (message: string): void => {
++            logs.push(message)
++          },
++          timeoutMs: 500,
++          killGraceMs: 300
++        }),
++        /timed out after 500 ms/
++      )
++      assert.ok(Date.now() - started < 30_000)
++      assert.ok(
++        logs.some((line: string): boolean => /ignored SIGTERM for 300 ms; killing it/.test(line)),
++        logs.join('\n')
++      )
++      const pid = Number(fs.readFileSync(pidFile, 'utf8'))
++      assert.throws((): void => {
++        process.kill(pid, 0)
++      })
++    } finally {
++      fs.rmSync(home, { recursive: true, force: true })
++    }
++  }
++)
+diff --git a/apps/desktop/electron/updater/state-db-preflight.ts b/apps/desktop/electron/updater/state-db-preflight.ts
+index db5b49187c..7fbeffa665 100644
+--- a/apps/desktop/electron/updater/state-db-preflight.ts
++++ b/apps/desktop/electron/updater/state-db-preflight.ts
+@@ -95,7 +95,9 @@ export function createBackupProgressParser(
+   const route = (line: string): void => {
+     const event = readProgressEvent(line)
+ 
+-    if (event) {
++    if (!event && /^\s*\{\s*"event"\s*:\s*"backup_lock_wait"\s*\}\s*$/.test(line)) {
++      onLine('waiting (up to 2 s) for the state.db write lock another writer holds')
++    } else if (event) {
+       onProgress(event)
+     } else if (line.trim()) {
+       onLine(line.replace(/\r$/, ''))
+@@ -134,8 +136,14 @@ interface StateDbPreflight {
+   launcher?: string | null
+   /** Snapshot progress as it arrives (stderr JSON lines); other stderr lines go to `log`. */
+   onProgress?: (progress: StateDbBackupProgress) => void
++  /** Deadline before SIGTERM; default from the database size (stateDbPreflightTimeoutMs). */
++  timeoutMs?: number
++  /** How long a SIGTERM'd snapshot gets to exit before SIGKILL. */
++  killGraceMs?: number
+ }
+ 
++const KILL_GRACE_MS = 10_000
++
+ interface SnapshotRun {
+   stdout: string
+   /** Non-progress stderr lines, for the failure message. */
+@@ -147,6 +155,7 @@ function runSnapshot(
+   args: string[],
+   options: SpawnOptions,
+   timeoutMs: number,
++  killGraceMs: number,
+   onProgress: (progress: StateDbBackupProgress) => void,
+   log: (message: string) => void
+ ): Promise<SnapshotRun> {
+@@ -170,12 +179,27 @@ function runSnapshot(
+       }
+     )
+ 
++    let killTimer: ReturnType<typeof setTimeout> | null = null
++
+     // Same stop as execFile's timeout: SIGTERM, which the snapshot turns into its staging cleanup.
++    // A snapshot that does not exit within the grace (stuck in one long C call) gets SIGKILL.
+     const timer = setTimeout((): void => {
+       timedOut = true
+       child.kill('SIGTERM')
++      killTimer = setTimeout((): void => {
++        log(`[updates] state.db pre-flight ignored SIGTERM for ${killGraceMs} ms; killing it`)
++        child.kill('SIGKILL')
++      }, killGraceMs)
+     }, timeoutMs)
+ 
++    const clearTimers = (): void => {
++      clearTimeout(timer)
++
++      if (killTimer) {
++        clearTimeout(killTimer)
++      }
++    }
++
+     child.stdout!.setEncoding('utf8')
+     child.stderr!.setEncoding('utf8')
+     child.stdout!.on('data', (chunk: string): void => {
+@@ -183,11 +207,11 @@ function runSnapshot(
+     })
+     child.stderr!.on('data', parser.push)
+     child.on('error', (error: Error): void => {
+-      clearTimeout(timer)
++      clearTimers()
+       reject(error)
+     })
+     child.on('close', (code: number | null, signal: NodeJS.Signals | null): void => {
+-      clearTimeout(timer)
++      clearTimers()
+       parser.flush()
+       const stderr = stderrLines.join('\n')
+ 
+@@ -215,7 +239,9 @@ export async function preflightStateDb({
+   home,
+   log,
+   launcher = null,
+-  onProgress = (): void => {}
++  onProgress = (): void => {},
++  timeoutMs,
++  killGraceMs = KILL_GRACE_MS
+ }: StateDbPreflight): Promise<void> {
+   try {
+     const command: string | null = launcher ?? python
+@@ -242,7 +268,8 @@ export async function preflightStateDb({
+         ? ['/d', '/v:off', '/s', '/c', `""${command}" ${args.map((arg: string): string => `"${arg}"`).join(' ')}"`]
+         : args,
+       hiddenWindowsChildOptions({ windowsVerbatimArguments: viaCmd }),
+-      stateDbPreflightTimeoutMs(home),
++      timeoutMs ?? stateDbPreflightTimeoutMs(home),
++      killGraceMs,
+       onProgress,
+       log
+     )
+diff --git a/apps/desktop/src/app/updates-overlay.backup.test.tsx b/apps/desktop/src/app/updates-overlay.backup.test.tsx
+index 05bfb51d73..58c18ba9d1 100644
+--- a/apps/desktop/src/app/updates-overlay.backup.test.tsx
++++ b/apps/desktop/src/app/updates-overlay.backup.test.tsx
+@@ -60,6 +60,14 @@ it('shows the backup size and a determinate bar while the pre-update backup runs
+     )
+   })
+ 
++  // The start: title and an indeterminate bar before any size is known.
++  await act(async (): Promise<void> => {
++    emit(backupEvent({ phase: 'start', doneBytes: 0, totalBytes: 0, method: null }, null))
++  })
++
++  expect(screen.getAllByText(en.updates.stages.backup!).length).toBeGreaterThan(0)
++  expect(screen.getByRole('progressbar').getAttribute('aria-valuenow')).toBeNull()
++
+   const total = 21.7 * GIB
+   const done = 12.3 * GIB
+ 
+diff --git a/apps/desktop/src/app/updates-overlay.tsx b/apps/desktop/src/app/updates-overlay.tsx
+index f7e6677db7..f7f49ab697 100644
+--- a/apps/desktop/src/app/updates-overlay.tsx
++++ b/apps/desktop/src/app/updates-overlay.tsx
+@@ -619,6 +619,10 @@ function backupMessage(backup: DesktopUpdateBackupProgress, u: ReturnType<typeof
+     return u.backupChecking
+   }
+ 
++  if (backup.phase === 'start') {
++    return ''
++  }
++
+   const { done, total } = backupSizes(backup.doneBytes, backup.totalBytes)
+ 
+   return u.backupProgress(done, total)
+@@ -645,7 +649,7 @@ function ApplyingView({
+   const recentLog = apply.log.slice(-4)
+ 
+   const percent =
+-    backup?.phase === 'check'
++    backup && backup.phase !== 'copy'
+       ? null
+       : typeof apply.percent === 'number' && Number.isFinite(apply.percent)
+         ? Math.max(2, Math.min(100, Math.round(apply.percent)))
+diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
+index 77b2aecb39..cc677ab2d4 100644
+--- a/apps/desktop/src/global.d.ts
++++ b/apps/desktop/src/global.d.ts
+@@ -1180,7 +1180,8 @@ export type DesktopUpdateStage =
+ 
+ /** The emergency state.db backup's progress: bytes copied (or cloned), then the backup check. */
+ export interface DesktopUpdateBackupProgress {
+-  phase: 'copy' | 'check'
++  /** 'start': under way, no size yet (indeterminate); 'copy': bytes so far; 'check': verifying. */
++  phase: 'start' | 'copy' | 'check'
+   doneBytes: number
+   totalBytes: number
+   method: 'clone' | 'copy' | null
+diff --git a/hermes_cli/backup_sqlite.py b/hermes_cli/backup_sqlite.py
+index 6d556d75a1..20c14fd686 100644
+--- a/hermes_cli/backup_sqlite.py
++++ b/hermes_cli/backup_sqlite.py
+@@ -72,6 +72,9 @@ class _ProgressReporter:
+     def check(self) -> None:
+         self._write({"event": "backup_check"})
+ 
++    def lock_wait(self) -> None:
++        self._write({"event": "backup_lock_wait"})
++
+ 
+ class _SQLiteBackupTimeout(RuntimeError):
+     """Raised when a SQLite snapshot remains busy past its deadline."""
+@@ -368,7 +371,34 @@ def _clone_file(src: Path, dst: Path, src_fd: Optional[int] = None) -> None:
+     raise OSError(errno.ENOTSUP, "no copy-on-write clone on this platform", str(src))
+ 
+ 
+-def _clone_snapshot(source: Path, staged: Path) -> dict:
++def _clone_unavailable(home: Path, probe: Path) -> Optional[str]:
++    """Why the clone path cannot run here (None when it can), decided before any lock is taken.
++
++    Python < 3.12 cannot stop the lock connection's close from checkpointing the whole WAL into
++    state.db (on the main thread, where SIGTERM cannot interrupt it). A filesystem without
++    copy-on-write clones (ext4, NTFS, a cross-device home) answers a throwaway probe file, so it
++    never takes state.db's write lock just to fail."""
++    if os.environ.get(_CLONE_ENV, "1") == "0":
++        return f"turned off by {_CLONE_ENV}=0"
++    if not hasattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE") or not hasattr(sqlite3.Connection, "setconfig"):
++        return "needs Python 3.12+ (SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE) so closing the lock never writes state.db"
++    clone = Path(f"{probe}-clone")
++    try:
++        fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
++        try:
++            os.write(fd, b"\0" * 4096)
++        finally:
++            os.close(fd)
++        _clone_file(probe, clone)
++    except OSError as exc:
++        return f"no copy-on-write clone in {home}: {exc}"
++    finally:
++        probe.unlink(missing_ok=True)
++        clone.unlink(missing_ok=True)
++    return None
++
++
++def _clone_snapshot(source: Path, staged: Path, reporter: Optional[_ProgressReporter] = None) -> dict:
+     """Clone state.db (and its WAL) while holding SQLite's write lock, then release it.
+ 
+     Under BEGIN IMMEDIATE no other connection can commit, restart or truncate the WAL, or delete it
+@@ -384,31 +414,42 @@ def _clone_snapshot(source: Path, staged: Path) -> dict:
+             # POSIX locks die with ANY close() of the file in this process, so the database's clone
+             # source is opened before the lock connection and closed only after it is gone.
+             source_fd = os.open(source, os.O_RDONLY)  # sqlite-sidecar-open: ok — opened before and closed after the lock connection
+-        lock = sqlite3.connect(str(source), timeout=_CLONE_LOCK_WAIT_SECONDS, isolation_level=None,
+-                               check_same_thread=False)
+-        # As the last connection to close, SQLite would checkpoint the whole WAL into state.db: a
+-        # write the snapshot has no business making (Python 3.12+ can turn it off).
+-        if hasattr(lock, "setconfig") and hasattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE"):
++        try:
++            lock = sqlite3.connect(str(source), timeout=0, isolation_level=None, check_same_thread=False)
++            # As the last connection to close, SQLite would checkpoint the whole WAL into state.db:
++            # a write the snapshot must not make (_clone_unavailable requires Python 3.12+ for this).
+             lock.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+-        lock.execute("BEGIN IMMEDIATE")
+-        locked_at = time.monotonic()
+-        _clone_file(source, staged, source_fd)
+-        if wal_mode and Path(f"{source}-wal").exists():
+-            # sqlite-sidecar-open: ok — SQLite never locks the -wal itself (WAL locks live in -shm and state.db)
+-            _clone_file(Path(f"{source}-wal"), Path(f"{staged}-wal"))
+-        lock_ms = (time.monotonic() - locked_at) * 1000
++            waited_at = time.monotonic()
++            try:
++                lock.execute("BEGIN IMMEDIATE")
++            except sqlite3.OperationalError:
++                # Another writer holds it: say so, then wait a bounded while (a longer holder sends
++                # the snapshot to the page copy, which needs no write lock on a WAL database).
++                if reporter is not None:
++                    reporter.lock_wait()
++                lock.execute(f"PRAGMA busy_timeout = {int(_CLONE_LOCK_WAIT_SECONDS * 1000)}")
++                lock.execute("BEGIN IMMEDIATE")
++            locked_at = time.monotonic()
++            _clone_file(source, staged, source_fd)
++            if wal_mode and Path(f"{source}-wal").exists():
++                # sqlite-sidecar-open: ok — SQLite never locks the -wal itself (WAL locks live in -shm and state.db)
++                _clone_file(Path(f"{source}-wal"), Path(f"{staged}-wal"))
++            lock_ms = (time.monotonic() - locked_at) * 1000
++            lock_wait_ms = (locked_at - waited_at) * 1000
++        finally:
++            if lock is not None:
++                with suppress(sqlite3.Error):
++                    lock.execute("ROLLBACK")
++                lock.close()
+     finally:
+-        if lock is not None:
+-            with suppress(sqlite3.Error):
+-                lock.execute("ROLLBACK")
+-            lock.close()
++        # Its own finally: it must close even when closing the lock connection raised.
+         if source_fd is not None:
+             os.close(source_fd)
+     # A clone keeps the source's mode (never wider than state.db itself); snapshots are owner-only.
+     for clone in (staged, Path(f"{staged}-wal")):
+         if clone.exists():
+             os.chmod(clone, 0o600)
+-    return {"lock_ms": round(lock_ms, 1)}
++    return {"lock_ms": round(lock_ms, 1), "lock_wait_ms": round(lock_wait_ms, 1)}
+ 
+ 
+ @contextmanager
+@@ -426,8 +467,13 @@ def _closing_unless_terminated(connection: sqlite3.Connection):
+ 
+ 
+ def _verify_clone(staged: Path) -> None:
+-    """A clone is the source's committed bytes, so no full check: the header is SQLite's, it opens,
+-    the schema reads, and its WAL folds back into the one file a snapshot is."""
++    """Light check of a clone: the header is SQLite's, it opens, the schema reads, and its WAL folds
++    back into the one file a snapshot is.
++
++    Deliberately no PRAGMA quick_check (on 21.7 GB it ran 5+ minutes): the clone is the source's
++    committed bytes taken under the write lock, so the check would only re-check state.db itself.
++    The trade-off: on this path a state.db that is already corrupt is backed up as it is instead of
++    cancelling the update, as the page copy's quick_check would."""
+     with open(staged, "rb") as handle:  # sqlite-sidecar-open: ok — our own clone, before any connection to it
+         if handle.read(len(_SQLITE_MAGIC)) != _SQLITE_MAGIC:
+             raise RuntimeError("cloned snapshot has no SQLite header")
+@@ -445,7 +491,7 @@ def _verify_clone(staged: Path) -> None:
+     _discard_sidecars(staged, ("-wal", "-shm"))
+ 
+ 
+-def _discard_sidecars(staged: Path, suffixes=("-wal", "-shm", "-journal")) -> None:
++def _discard_sidecars(staged: Path, suffixes=("-wal", "-shm", "-journal", "-probe", "-probe-clone")) -> None:
+     for suffix in suffixes:
+         Path(f"{staged}{suffix}").unlink(missing_ok=True)
+ 
+@@ -481,13 +527,18 @@ def preflight_state_db(home: Path, *, busy_timeout_seconds: float = 10.0, clone:
+     result: dict = {}
+     try:
+         cloned = False
+-        if clone and os.environ.get(_CLONE_ENV, "1") != "0":
++        unavailable = _clone_unavailable(home, Path(f"{staged}-probe")) if clone else None
++        if unavailable:
++            logger.warning("Copy-on-write snapshot skipped, copying instead: %s", unavailable)
++            result = {"clone_error": unavailable}
++        elif clone:
+             try:
+-                result.update(_clone_snapshot(source, staged))
++                result.update(_clone_snapshot(source, staged, reporter))
++                # Light check only (header, open, schema_version, WAL fold): see _verify_clone.
+                 _verify_clone(staged)
+                 cloned = True
+             except Exception as exc:
+-                # EXDEV/ENOTSUP/EOPNOTSUPP (no reflink here), a held write lock, a bad clone: copy instead.
++                # A held write lock, a failed or bad clone: copy instead.
+                 logger.warning("Copy-on-write snapshot unavailable, copying instead: %s", exc, exc_info=True)
+                 result = {"clone_error": str(exc)}
+                 staged.unlink(missing_ok=True)
+diff --git a/tests/hermes_cli/test_backup_preflight_progress.py b/tests/hermes_cli/test_backup_preflight_progress.py
+index fef5daa514..4fc29e8e75 100644
+--- a/tests/hermes_cli/test_backup_preflight_progress.py
++++ b/tests/hermes_cli/test_backup_preflight_progress.py
+@@ -211,9 +211,12 @@ def test_clone_captures_wal_commits_made_while_it_waited_for_the_lock(clone_base
+         writer.execute("INSERT INTO messages VALUES ('committed while the clone waited')")
+         proc = subprocess.Popen([sys.executable, "-I", "-S", str(SCRIPT), str(home)],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+-        time.sleep(0.3)  # health: allow HX013 -- the lock holder must still be holding when the child asks
++        # The child says when it found the lock held and started waiting; only then commit.
++        first = proc.stderr.readline()
++        assert json.loads(first) == {"event": "backup_lock_wait"}, first
+         writer.execute("COMMIT")
+-        stdout, stderr = proc.communicate(timeout=60)
++        stdout, rest = proc.communicate(timeout=60)
++        stderr = first + rest
+         assert proc.returncode == 0, stderr
+         result = json.loads(stdout)
+         # Written after the clone: must not be in the snapshot.
+@@ -222,7 +225,7 @@ def test_clone_captures_wal_commits_made_while_it_waited_for_the_lock(clone_base
+         writer.close()
+ 
+     assert result["method"] == "clone", stderr
+-    assert result["lock_ms"] < 2000
++    assert 0 < result["lock_wait_ms"] < 2000 and result["lock_ms"] < 2000
+     snapshot = Path(result["path"])
+     # One self-contained file: the clone's WAL was folded in (opening the snapshot below recreates one).
+     assert not Path(f"{snapshot}-wal").exists() and not list(home.glob("*.partial*"))
+@@ -231,7 +234,8 @@ def test_clone_captures_wal_commits_made_while_it_waited_for_the_lock(clone_base
+     assert len(rows) == 202
+     events = _events(stderr)
+     # One instant 100% line, and no whole-database check on a byte-identical clone.
+-    assert events == [{"event": "backup_progress", "done_bytes": result["bytes"],
++    assert events == [{"event": "backup_lock_wait"},
++                      {"event": "backup_progress", "done_bytes": result["bytes"],
+                        "total_bytes": result["bytes"], "method": "clone"}]
+     assert oct(snapshot.stat().st_mode & 0o777) == "0o600"
+     assert _lock_is_free(db)
+@@ -268,7 +272,8 @@ def test_clone_holds_the_write_lock_only_while_cloning(tmp_path, monkeypatch):
+     seen: dict = {}
+ 
+     def cp_clone(src, dst, _fd=None):
+-        seen.setdefault("held_during_clone", not _lock_is_free(db))
++        if Path(src) == db:  # not the support probe, which runs before the lock
++            seen.setdefault("held_during_clone", not _lock_is_free(db))
+         subprocess.run(["cp", str(src), str(dst)], check=True)
+ 
+     real_copy = backup_sqlite._safe_copy_db
+@@ -287,10 +292,16 @@ def test_clone_holds_the_write_lock_only_while_cloning(tmp_path, monkeypatch):
+     def unsupported(src, dst, _fd=None):
+         raise OSError(errno.EXDEV, "cross-device", str(src))
+ 
++    def must_not_lock(*_args):
++        raise AssertionError("took the write lock on a filesystem that cannot clone")
++
+     monkeypatch.setattr(backup_sqlite, "_clone_file", unsupported)
++    monkeypatch.setattr(backup_sqlite, "_clone_snapshot", must_not_lock)
+     out = io.StringIO()
+     result = backup_sqlite.preflight_state_db(home, clone=True, reporter=backup_sqlite._ProgressReporter(out))
+     assert result["method"] == "copy" and "cross-device" in result["clone_error"]
++    monkeypatch.undo()
++    monkeypatch.setattr(backup_sqlite, "_safe_copy_db", watching_copy)
+     assert seen["free_during_copy"] is True and _lock_is_free(db)
+     assert len(_snapshot_rows(result["path"])) == 50
+     assert _events(out.getvalue())[-1] == {"event": "backup_check"}
+@@ -336,3 +347,111 @@ def test_the_clone_never_writes_the_source_database(clone_base):
+     assert result["method"] == "clone"
+     assert db.read_bytes() == before
+     assert _snapshot_rows(result["path"])[-1] == ("only in the WAL",)
++
++
++def test_without_python_3_12_the_clone_is_skipped_for_the_copy(tmp_path, monkeypatch):
++    """Without SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE the lock connection's close could checkpoint the WAL
++    into state.db on the main thread, where SIGTERM cannot stop it: copy instead, and say why."""
++    from hermes_cli import backup_sqlite
++
++    def must_not_clone(*_args):
++        raise AssertionError("clone attempted")
++
++    home = _home(tmp_path, 5)
++    monkeypatch.delattr(backup_sqlite.sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE", raising=False)
++    monkeypatch.setattr(backup_sqlite, "_clone_file", must_not_clone)
++    result = backup_sqlite.preflight_state_db(home, clone=True)
++    assert result["method"] == "copy"
++    assert "Python 3.12" in result["clone_error"]
++
++
++def _cp_clone(src, dst, _fd=None):
++    """A stand-in clone (another process's byte copy) so the lock-window tests run on any filesystem."""
++    subprocess.run(["cp", str(src), str(dst)], check=True)
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.skipif(not hasattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE"), reason="needs Python 3.12+")
++def test_a_checkpoint_between_the_db_and_wal_clones_loses_no_committed_row(tmp_path, monkeypatch):
++    """Under the snapshot's write lock no one can commit, but a passive checkpoint may still move WAL
++    frames into state.db between the two clones. The WAL clone keeps those frames, so the snapshot
++    still holds every committed row."""
++    from hermes_cli import backup_sqlite
++
++    home = _home(tmp_path, 10)
++    db = home / "state.db"
++    writer = _wal_writer(db)
++    writer.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
++    for n in range(50):
++        writer.execute("INSERT INTO messages VALUES (?)", (f"row {n}",))
++    writer.close()
++    with sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True) as reader:
++        committed = reader.execute("SELECT body FROM messages ORDER BY rowid").fetchall()
++    assert len(committed) == 60
++    seen: dict = {}
++
++    def checkpoint_between(src, dst, fd=None):
++        _cp_clone(src, dst, fd)
++        if Path(src) != db:
++            return
++        other = sqlite3.connect(db, timeout=0, isolation_level=None)
++        other.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
++        try:
++            with pytest.raises(sqlite3.OperationalError, match="locked"):
++                other.execute("INSERT INTO messages VALUES ('during the clone')")
++            seen["checkpoint"] = other.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
++        finally:
++            other.close()
++
++    monkeypatch.setattr(backup_sqlite, "_clone_file", checkpoint_between)
++    result = backup_sqlite.preflight_state_db(home, clone=True)
++
++    busy, frames, moved = seen["checkpoint"]
++    assert busy == 0 and frames > 0 and moved == frames, seen
++    assert result["method"] == "clone", result
++    assert _snapshot_rows(result["path"]) == committed
++    with sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True) as reader:
++        assert reader.execute("SELECT body FROM messages ORDER BY rowid").fetchall() == committed
++    assert _lock_is_free(db)
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.skipif(not hasattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE"), reason="needs Python 3.12+")
++def test_sigterm_during_the_clone_verify_exits_cleanly(tmp_path):
++    home = _home(tmp_path, 10)
++    db = home / "state.db"
++    writer = _wal_writer(db)
++    writer.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
++    writer.execute("INSERT INTO messages VALUES ('in the WAL')")
++    writer.close()
++    driver = (
++        "import runpy, signal, subprocess, sys\n"
++        "ns = runpy.run_path(sys.argv[1], run_name='not_main')\n"
++        "signal.signal(signal.SIGTERM, ns['_on_sigterm'])\n"
++        "live = ns['_verify_clone'].__globals__  # run_path returns a copy; patch the module's own globals\n"
++        "live['_clone_file'] = lambda src, dst, fd=None: subprocess.run(['cp', str(src), str(dst)], check=True)\n"
++        "real = live['_run_interruptibly']\n"
++        "def slow(conn, work):\n"
++        "    sys.stderr.write('verifying\\n'); sys.stderr.flush()\n"
++        "    slow_sql = 'WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n) SELECT count(*) FROM n'\n"
++        "    return real(conn, lambda: (conn.execute(slow_sql).fetchall(), work())[1])\n"
++        "live['_run_interruptibly'] = slow\n"
++        "ns['preflight_state_db'](__import__('pathlib').Path(sys.argv[2]), clone=True,\n"
++        "                         reporter=ns['_ProgressReporter']())\n")
++    proc = subprocess.Popen([sys.executable, "-I", "-S", "-u", "-c", driver, str(SCRIPT), str(home)],
++                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    try:
++        seen = []
++        wait_until(lambda: seen.append(proc.stderr.readline()) or seen[-1] == "verifying\n" or
++                   proc.poll() is not None, timeout=60, what="the clone verify")
++        assert proc.poll() is None, "".join(seen)
++        assert _lock_is_free(db), "the write lock must be released before the verify"
++        proc.send_signal(signal.SIGTERM)
++        proc.wait(timeout=30)
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++            proc.wait()
++    assert proc.returncode == 128 + signal.SIGTERM
++    assert sorted(p.name for p in home.glob("state.db.pre-update-emergency-*")) == []
++    assert _lock_is_free(db)
+-- 
+2.43.0
+

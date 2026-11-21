@@ -1,0 +1,127 @@
+From 75efd99ddbcce068f0ff48d2c92b02e44dce55c5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 05:35:17 +0000
+Subject: [PATCH] [daveey] Allow recorded spend release from scheduled cards
+
+A spend hold can outlive a run that parked scheduled. Permit promotion only for scheduled cards with a pending durable spend decision; recheck under the writer lock and compare the exact observed status. Retain promoted_manual as the only release receipt.
+
+Proof: RED scheduled-held promotion fails on main; GREEN spend suites and promotion consumers, including dry run, ordinary scheduled refusal, decision/status races and a real spend triage injected during claim acquisition. Current claim_check already refuses both before lease and under the claim writer; the interleaving creates no run and leaves triage. scripts/check: all 21 checks pass.
+---
+ hermes_cli/kanban_db_promote.py               | 10 ++-
+ .../test_kanban_spend_budget_hold.py          | 63 +++++++++++++++++++
+ 2 files changed, 70 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_db_promote.py b/hermes_cli/kanban_db_promote.py
+index 679e203e05..e6ce5c15b8 100644
+--- a/hermes_cli/kanban_db_promote.py
++++ b/hermes_cli/kanban_db_promote.py
+@@ -10,7 +10,7 @@ def promote_task(
+     dry_run: bool = False,
+     precondition: Optional[Callable[[sqlite3.Connection], Optional[str]]] = None,
+ ) -> tuple[bool, Optional[str]]:
+-    """Promote todo/blocked/triage to ready after parent and caller preconditions.
++    """Promote todo/blocked/triage, or a scheduled spend stop, after caller and parent checks.
+ 
+     System callers omit the precondition. Manual boundaries check unread comments
+     under the write lock; dry runs validate without writing anything.
+@@ -18,7 +18,8 @@ def promote_task(
+     cur_status = _kb._task_status(conn, task_id)
+     if cur_status is None:
+         return False, f"task {task_id} not found"
+-    if cur_status not in _kb._PROMOTABLE_STATUSES:
++    from hermes_cli.kanban_spend_decision import pending
++    if cur_status not in _kb._PROMOTABLE_STATUSES and not (cur_status == "scheduled" and pending(conn, task_id)):
+         return False, (
+             f"task {task_id} is {cur_status!r}; promote only applies to "
+             f"'todo', 'blocked' or 'triage'"
+@@ -39,9 +40,12 @@ def promote_task(
+     with _kb.write_txn(conn):
+         if precondition and (refusal := precondition(conn)):
+             return False, refusal
++        # A scheduled exception authorizes only an unresolved spend decision, rechecked under the writer lock.
++        if cur_status == "scheduled" and not pending(conn, task_id):
++            return False, f"task {task_id} spend decision changed during promotion"
+         upd = conn.execute(
+             "UPDATE tasks SET status = 'ready' "
+-            "WHERE id = ? AND status IN ('todo', 'blocked', 'triage')", (task_id,),
++            "WHERE id = ? AND status = ?", (task_id, cur_status),
+         )
+         if upd.rowcount != 1:
+             return False, f"task {task_id} status changed during promotion"
+diff --git a/tests/hermes_cli/test_kanban_spend_budget_hold.py b/tests/hermes_cli/test_kanban_spend_budget_hold.py
+index 04f5afe660..6a8c1655cc 100644
+--- a/tests/hermes_cli/test_kanban_spend_budget_hold.py
++++ b/tests/hermes_cli/test_kanban_spend_budget_hold.py
+@@ -166,6 +166,69 @@ def test_manual_decision_clears_hold_and_later_triage_can_sweep(kanban_home):
+         assert tid in sweep.sweep_stale_triage(conn, now=int(time.time()) + 7200)
+ 
+ 
++@pytest.mark.parametrize("held", [False, True])
++def test_scheduled_spend_decision_can_be_promoted(kanban_home, held):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Scheduled decision", assignee="default")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++            if held:
++                kb._append_event(conn, tid, budget.EVENT, {"reason": "spent"})
++        before = len(helpers._events(conn, tid, "promoted_manual"))
++        assert kb.promote_task(conn, tid, actor="operator", reason="bounded rescope", dry_run=True)[0] == held
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert len(helpers._events(conn, tid, "promoted_manual")) == before
++        ok, _ = kb.promote_task(conn, tid, actor="operator", reason="bounded rescope")
++        assert ok == held
++        if not held:
++            assert kb.get_task(conn, tid).status == "scheduled"
++            return
++        assert kb.get_task(conn, tid).status == "ready"
++        assert not decision.pending(conn, tid)
++        assert helpers._events(conn, tid, "promoted_manual")[-1].payload["from_status"] == "scheduled"
++        # The ordinary scheduled-unblock path is usable again after the recorded decision.
++        assert kb.schedule_task(conn, tid, reason="short cooldown", clock_only=True,
++                                awaiting={"kind": "clock", "why": "cooldown"})
++        assert kb.unblock_task(conn, tid)
++        assert kb.get_task(conn, tid).status == "ready"
++
++
++@pytest.mark.parametrize("changed", ["decision", "status"])
++def test_scheduled_promotion_rechecks_under_writer(kanban_home, changed):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Promotion race", assignee="default")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++            kb._append_event(conn, tid, budget.EVENT, {})
++        def racing(c):
++            if changed == "decision":
++                kb._append_event(c, tid, "promoted_manual", {"actor": "other"})
++            else:
++                c.execute("UPDATE tasks SET status='running' WHERE id=?", (tid,))
++        ok, why = kb.promote_task(conn, tid, actor="operator", precondition=racing)
++        assert not ok and why and "changed during promotion" in why
++        assert kb.get_task(conn, tid).status == ("scheduled" if changed == "decision" else "running")
++        assert len(helpers._events(conn, tid, "promoted_manual")) == int(changed == "decision")
++
++
++def test_spend_triage_wins_during_claim_admission(kanban_home, monkeypatch):
++    from hermes_cli import kanban_db_sync as sync
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Concurrent spending stop", assignee="default")
++        real = sync.claim_gate
++        def arriving(c, task_id, expires, **kw):
++            gate = real(c, task_id, expires, **kw)
++            helpers._runs(c, task_id, budget.DEFAULT_RUNS)
++            assert budget.hold(c, task_id) == "triage"
++            return gate
++        monkeypatch.setattr(sync, "claim_gate", arriving)
++        assert kb.claim_task(conn, tid) is None
++        assert kb.get_task(conn, tid).status == "triage"
++        assert decision.pending(conn, tid)
++        assert not helpers._events(conn, tid, "claimed")
++        assert conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (tid,)).fetchone()[0] is None
++
++
+ def test_gateway_notice_contains_spend_and_decision(kanban_home):
+     from types import SimpleNamespace
+     from gateway.kanban_watchers_notifier import _EVENT_FORMATTERS
+-- 
+2.43.0
+

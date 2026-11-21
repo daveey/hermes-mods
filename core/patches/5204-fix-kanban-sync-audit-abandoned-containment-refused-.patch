@@ -1,0 +1,806 @@
+From ef11513e0d1183a529e82c6321a7533c87e28af4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:02:10 +0000
+Subject: [PATCH] fix(kanban-sync): audit abandoned containment-refused
+ dependency deletes [daveey]
+
+A refused historical unlink left the canonical link live but local deletion
+intent and its tombstone unresolved. The generic resolver correctly refused
+that tombstone; retrying after containment release would perform unintended
+new lifecycle work. No explicit audit-preserving abandonment API existed.
+
+Add per-link token-bound preview/apply with completed diagnostic refresh,
+authenticated empty-head cuts, endpoint/containment identity proof and local
+transactional compare-and-set. Apply retains original operation/event bytes in
+an immutable hashed receipt and clears only the covered stale tombstone.
+Normal sync retires only exact receipt-covered operations while retaining the
+canonical dependency and all history. No task, link or lease writes are made.
+
+Proof so far: canonical three-delete RED (missing API), GREEN; sync-under-lock
+RED (busy refresh), GREEN; audit identity/clock RED, GREEN; CLI/parser RED,
+GREEN. Current focused suite passes. Broader regressions, per-guard mutation
+proof, final full check, independent exact-head review and CI still required
+before landing. No live repair performed; operational owner retains live proof.
+
+Co-Authored-By: GPT 6.1 Sol <noreply@openai.com>
+---
+ hermes_cli/kanban_parser.py                   |   5 +
+ hermes_cli/kanban_sync_cli.py                 |  19 +-
+ hermes_cli/kanban_sync_dependency_delete.py   | 229 +++++++++++
+ hermes_cli/kanban_sync_rejections.py          |   5 +
+ .../test_kanban_sync_dependency_delete.py     | 389 ++++++++++++++++++
+ .../kanban-dependency-delete-recovery.md      |  64 +++
+ 6 files changed, 710 insertions(+), 1 deletion(-)
+ create mode 100644 hermes_cli/kanban_sync_dependency_delete.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_dependency_delete.py
+ create mode 100644 website/docs/user-guide/features/kanban-dependency-delete-recovery.md
+
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 44d45ded4d..5493cdc45a 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -806,6 +806,11 @@ _SPECS = [
+                                                    help="Cards to refill (default: every open copied card)")],
+              help="Refill events an older pickup cut off local copies of other gateways' cards, from the replica "
+                   "(by uid; never invents rows; safe on running cards)"),
++        _cmd("dependency-delete", [_json_flag(), _arg("row_uid", metavar="PARENT>CHILD"),
++                                   _arg("--reason", required=True, metavar="TEXT"),
++                                   _arg("--apply", action="store_true"),
++                                   _arg("--expect", metavar="TOKEN", default=None)],
++             help="Abandon containment-refused historical deletes in favor of the live canonical link (audited preview by default)"),
+         _cmd("reserved-key", [_json_flag(), _arg("task_id", metavar="TASK_ID"),
+                               _arg("--new-key", required=True, metavar="KEY",
+                                    help="Replacement idempotency key (non-empty, not pickup-stall:/worker-resources-unknown:)"),
+diff --git a/hermes_cli/kanban_sync_cli.py b/hermes_cli/kanban_sync_cli.py
+index a486119981..da66499605 100644
+--- a/hermes_cli/kanban_sync_cli.py
++++ b/hermes_cli/kanban_sync_cli.py
+@@ -260,9 +260,26 @@ def _reserved_key(args: argparse.Namespace) -> int:
+         report.get("action") == "preview" and report.get("eligible")) else 1
+ 
+ 
++def _dependency_delete(args: argparse.Namespace) -> int:
++    """Preview/apply audited abandonment of one refused historical link delete."""
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    slug = _board(args)
++    hub = ksc.Hub(ksc.load_identity())
++    conn = kbc.connect(_path(slug))
++    try:
++        if args.apply:
++            report = recovery.apply(conn, hub, slug, args.row_uid, args.expect, args.reason)
++        else:
++            report = recovery.plan(conn, hub, slug, args.row_uid, args.reason)
++    finally:
++        conn.close()
++    _print(report, args.json)
++    return 0 if report.get("eligible") or report.get("action") == "applied" else 1
++
++
+ _ACTIONS = {"status": _status, "attach": _attach, "import": _import, "diff": _diff, "run": _run,
+             "links": _links, "links-diff": _links_diff, "reconcile": _reconcile, "machine-links": _machine_links,
+-            "refill-history": _refill_history, "reserved-key": _reserved_key}
++            "refill-history": _refill_history, "reserved-key": _reserved_key, "dependency-delete": _dependency_delete}
+ 
+ 
+ def cmd_sync(args: argparse.Namespace) -> int:
+diff --git a/hermes_cli/kanban_sync_dependency_delete.py b/hermes_cli/kanban_sync_dependency_delete.py
+new file mode 100644
+index 0000000000..58fa743c3e
+--- /dev/null
++++ b/hermes_cli/kanban_sync_dependency_delete.py
+@@ -0,0 +1,229 @@
++"""Audited abandonment of refused dependency DELETEs, never replay or lifecycle recovery.
++
++Preview/apply touch only an immutable host-local receipt and the exact stale link
++ tombstone. Tasks, leases, links and history are never written. Board reads are
++bounded evidence, not a distributed lock: a changed feed during proof refuses.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++from pathlib import Path
++
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_reserved_key as keys
++from hermes_cli.kanban_db_connect import write_txn
++
++ERROR = "containment_hold: use scoped resume-contained; generic writes cannot satisfy containment"
++TABLE = "kanban_sync_dependency_recoveries"
++MAX_ROWS = 10000
++
++
++class Refused(ValueError):
++    """No mutation is authorized by this proof."""
++
++
++def _require(ok, reason):
++    if not ok:
++        raise Refused(reason)
++
++
++def _schema(conn):
++    conn.execute(f"CREATE TABLE IF NOT EXISTS {TABLE} (receipt_id TEXT PRIMARY KEY, board TEXT NOT NULL, "
++                 "row_uid TEXT NOT NULL UNIQUE, endpoint TEXT NOT NULL, reason TEXT NOT NULL, snapshot_json TEXT NOT NULL, "
++                 "snapshot_sha256 TEXT NOT NULL, evidence_json TEXT NOT NULL)")
++    for op in ("UPDATE", "DELETE"):
++        conn.execute(f"CREATE TRIGGER IF NOT EXISTS dependency_recovery_{op.lower()} BEFORE {op} ON {TABLE} "
++                     "BEGIN SELECT RAISE(ABORT,'immutable dependency recovery receipt'); END")
++
++
++def _rows(conn, sql, args=()):
++    result = [dict(r) for r in conn.execute(sql, args).fetchmany(MAX_ROWS + 1)]
++    _require(len(result) <= MAX_ROWS, "local_snapshot_too_large")
++    return result
++
++
++def _ids(uid):
++    pieces = uid.split(">") if isinstance(uid, str) else []
++    _require(len(pieces) == 2 and all(pieces) and pieces[0] != pieces[1], "bad_link_uid")
++    return tuple(pieces)
++
++
++def _snapshot(conn, uid):
++    from hermes_cli.kanban_containment_connections import held
++    parent, child = _ids(uid)
++    return {
++        "link": _rows(conn, "SELECT * FROM task_links WHERE parent_id=? AND child_id=?", (parent, child)),
++        "tasks": _rows(conn, "SELECT * FROM tasks WHERE id IN (?,?) ORDER BY id", (parent, child)),
++        "ops": _rows(conn, "SELECT * FROM kanban_sync_outbox WHERE table_name='task_links' AND row_uid=? ORDER BY op_id", (uid,)),
++        "endpoint_ops": _rows(conn, "SELECT * FROM kanban_sync_outbox WHERE table_name='tasks' AND row_uid IN (?,?) "
++                              "ORDER BY op_id", (parent, child)),
++        "tombstones": _rows(conn, "SELECT * FROM kanban_sync_tombstones WHERE "
++                            "(table_name='task_links' AND row_uid=?) OR (table_name='tasks' AND row_uid IN (?,?)) "
++                            "ORDER BY table_name,row_uid", (uid, parent, child)),
++        "events": [r for r in _rows(conn, "SELECT * FROM task_events WHERE task_id=? AND kind='unlinked' ORDER BY id", (child,))
++                   if json.loads(r["payload"] or "null") == {"parent": parent, "child": child}],
++        "held": [held(conn, parent), held(conn, child)],
++    }
++
++
++def _local(snap, uid, *, settlement=False):
++    parent, child = _ids(uid)
++    _require(snap["link"] == [{"parent_id": parent, "child_id": child}], "local_link_changed")
++    _require(len(snap["tasks"]) == 2, "missing_endpoint")
++    _require(not any(snap["held"]), "local_containment_hold")
++    _require(not snap["endpoint_ops"], "endpoint_local_work")
++    _require(bool(snap["ops"]), "no_rejected_deletes")
++    for op in snap["ops"]:
++        _require(op["state"] == "rejected" and op["op"] == "delete" and op["last_error"] == ERROR
++                 and json.loads(op["fields"]) == {}, "unsupported_link_work")
++    _require(len(snap["events"]) >= len(snap["ops"])
++             and all(e.get("uid") for e in snap["events"])
++             and all(any(e["created_at"] == o["created_at"] // 1000 for e in snap["events"]) for o in snap["ops"]),
++             "missing_unlink_audit")
++    if settlement:
++        _require(not snap["tombstones"], "new_local_tombstone")
++    else:
++        _require(snap["tombstones"] == [{"table_name": "task_links", "row_uid": uid,
++                                        "deleted_at": max(op["created_at"] for op in snap["ops"])}],
++                 "uncovered_tombstone")
++
++
++def _empty(hub, board, cursor):
++    data = hub.changes(board, cursor)
++    _require(isinstance(data, dict) and data.get("changes") == [] and data.get("more") is False
++             and type(data.get("head")) is int and data["head"] == cursor and data.get("next") == cursor,
++             "authoritative_feed_changed")
++    return data
++
++
++def _evidence(hub, board, table, uid, head):
++    e = hub.row_evidence(board, table, uid)
++    _require(isinstance(e, dict) and (e.get("board"), e.get("table"), e.get("uid")) == (board, table, uid)
++             and e.get("head") == head and e.get("state") == "live" and e.get("tombstone") is None
++             and isinstance(e.get("row"), dict), "authoritative_identity_changed")
++    r = e["row"]
++    _require(r.get("uid") == uid and r.get("deleted_at") is None
++             and type(r.get("version")) is int and r["version"] > 0, "authoritative_version_changed")
++    return e
++
++
++def _proof(conn, hub, board, uid, snap, *, refresh=True):
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli.kanban_containment_remote import context
++    _require(not conn.in_transaction, "network_inside_transaction")
++    _require(keys._identity_refusal(conn, hub, board) is None, "sync_identity_changed")
++    if refresh:
++        path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
++        pulled = client._pull_replica(board, hub, hub.ident.gateway, path, diagnostic=True)
++        _require(not pulled.busy and not pulled.more, "diagnostic_refresh_incomplete")
++    shadow = client.open_shadow(board, hub.ident.gateway)
++    try:
++        state = sync.sync_state(shadow)
++        head = state["cursor"]
++        _require(_rows(shadow, "SELECT * FROM task_links WHERE parent_id=? AND child_id=?", _ids(uid)) == snap["link"],
++                 "shadow_link_changed")
++    finally:
++        shadow.close()
++    empty = _empty(hub, board, head)
++    link = _evidence(hub, board, "task_links", uid, head)
++    parent, child = _ids(uid)
++    _require((link["row"].get("parent_id"), link["row"].get("child_id")) == (parent, child), "canonical_link_changed")
++    endpoints = []
++    for task in sorted((parent, child)):
++        e = _evidence(hub, board, "tasks", task, head)
++        local = next(t for t in snap["tasks"] if t["id"] == task)
++        _require(e["row"].get("id") == task and e["row"].get("created_on") == local["created_on"]
++                 and local["sync_version"] == e["row"]["version"], "endpoint_identity_changed")
++        c = context(hub, board, task)
++        _require(c["held"] is False and e["row"].get("containment_episode") is None, "canonical_containment_hold")
++        endpoints.append(e["row"])
++    _empty(hub, board, head)
++    return {"link": link["row"], "endpoints": endpoints, "cut": empty}
++
++
++def _token(hub, board, uid, reason, snap, proof):
++    return keys._sha({"v": 1, "board": board, "uid": uid, "endpoint": keys._endpoint(hub), "reason": reason,
++                      "snapshot": snap, "link": proof["link"], "endpoints": proof["endpoints"]})
++
++
++def _prepare(conn, hub, board, uid, reason):
++    _require(isinstance(reason, str) and bool(reason.strip()), "reason_required")
++    started = keys._mono()
++    snap = _snapshot(conn, uid)
++    _local(snap, uid)
++    proof = _proof(conn, hub, board, uid, snap)
++    _require(keys._fresh(started), "evidence_expired")
++    _require(_snapshot(conn, uid) == snap, "local_inputs_changed")
++    return snap, proof, started, _token(hub, board, uid, reason, snap, proof)
++
++
++def plan(conn, hub, board, uid, reason):
++    """Read-only default; no receipt/schema or canonical writes."""
++    from hermes_cli.kanban_sync_client import HubError, Resync, SyncUnavailable
++    from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
++    try:
++        snap, proof, _, token = _prepare(conn, hub, board, uid, reason)
++        return {"action": "preview", "eligible": True, "token": token,
++                "op_ids": [o["op_id"] for o in snap["ops"]], "evidence": proof}
++    except (Refused, HubError, Resync, SyncUnavailable, ContainmentRefused, OSError, ValueError) as exc:
++        return {"action": "refused", "eligible": False, "reason": str(exc)}
++
++
++def apply(conn, hub, board, uid, expect, reason):
++    """Insert immutable custody and clear only the covered stale tombstone, atomically."""
++    from hermes_cli.kanban_sync_client import HubError, Resync, SyncUnavailable
++    from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
++    try:
++        snap, proof, started, token = _prepare(conn, hub, board, uid, reason)
++        _require(isinstance(expect, str) and expect == token, "preview_token_changed")
++        with write_txn(conn):
++            _require(keys._fresh(started), "evidence_expired")
++            _require(keys._identity_refusal(conn, hub, board) is None, "sync_identity_changed")
++            _require(_snapshot(conn, uid) == snap, "local_inputs_changed")
++            _schema(conn)
++            raw = keys._canon(snap)
++            conn.execute(f"INSERT INTO {TABLE} VALUES (?,?,?,?,?,?,?,?)",
++                         (token, board, uid, keys._endpoint(hub), reason, raw, keys._sha(snap), keys._canon(proof)))
++            conn.execute("DELETE FROM kanban_sync_tombstones WHERE table_name='task_links' AND row_uid=? AND deleted_at=?",
++                         (uid, snap["tombstones"][0]["deleted_at"]))
++        return {"action": "applied", "receipt_id": token, "op_ids": [o["op_id"] for o in snap["ops"]]}
++    except (Refused, HubError, Resync, SyncUnavailable, ContainmentRefused, OSError, ValueError) as exc:
++        return {"action": "refused", "reason": str(exc)}
++
++
++def receipt_for_op(conn, op):
++    if op["table_name"] != "task_links" or op["op"] != "delete":
++        return None
++    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name=? AND type='table'", (TABLE,)).fetchone():
++        return None
++    matches = _rows(conn, f"SELECT * FROM {TABLE} WHERE row_uid=? ORDER BY receipt_id", (op["row_uid"],))
++    return (matches[0] if len(matches) == 1 else {"invalid": "ambiguous dependency receipts"}) if matches else None
++
++
++def settle(conn, hub, board, op, receipt):
++    """Normal sync retires just this byte-identical op; immutable receipt/history stay."""
++    from hermes_cli.kanban_sync_client import HubError, Resync, SyncUnavailable
++    from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
++    report = {"op_id": op["op_id"], "table": op["table_name"], "row_uid": op["row_uid"],
++              "classification": "unresolved", "action": "retained"}
++    try:
++        saved = json.loads(receipt["snapshot_json"])
++        _require(keys._sha(saved) == receipt["snapshot_sha256"] and op in saved["ops"], "receipt_bytes_changed")
++        _require(receipt["board"] == board and receipt["endpoint"] == keys._endpoint(hub), "receipt_identity_changed")
++        started = keys._mono()
++        snap = _snapshot(conn, op["row_uid"])
++        _local(snap, op["row_uid"], settlement=True)
++        _require(all(o in saved["ops"] for o in snap["ops"]), "new_link_work")
++        _require(snap["events"] == saved["events"], "history_changed")
++        proof = _proof(conn, hub, board, op["row_uid"], snap, refresh=False)
++        _require(proof["link"] == json.loads(receipt["evidence_json"])["link"], "receipt_link_changed")
++        with write_txn(conn):
++            _require(keys._fresh(started), "evidence_expired")
++            _require(_snapshot(conn, op["row_uid"]) == snap, "local_inputs_changed")
++            _require(receipt_for_op(conn, op) == receipt, "receipt_changed")
++            conn.execute("DELETE FROM kanban_sync_outbox WHERE op_id=? AND state='rejected'", (op["op_id"],))
++        report.update(classification="superseded", action="retired", proof="immutable dependency recovery receipt")
++    except (Refused, HubError, Resync, SyncUnavailable, ContainmentRefused, OSError, ValueError, KeyError, TypeError) as exc:
++        report["proof"] = str(exc)
++    return report
+diff --git a/hermes_cli/kanban_sync_rejections.py b/hermes_cli/kanban_sync_rejections.py
+index 58b49e3521..8cc97c2acb 100644
+--- a/hermes_cli/kanban_sync_rejections.py
++++ b/hermes_cli/kanban_sync_rejections.py
+@@ -142,8 +142,13 @@ def resolve_rejections(conn: sqlite3.Connection, hub, board: str) -> list[dict]:
+     """
+     from hermes_cli.kanban_sync_client import HubError, SyncUnavailable
+     ops = [dict(r) for r in conn.execute("SELECT * FROM kanban_sync_outbox WHERE state='rejected' ORDER BY op_id")]
++    from hermes_cli import kanban_sync_dependency_delete as dependency_delete
+     reports = []
+     for op in ops:
++        receipt = dependency_delete.receipt_for_op(conn, op)
++        if receipt is not None:
++            reports.append(dependency_delete.settle(conn, hub, board, op, receipt))
++            continue
+         report = {"op_id": op["op_id"], "table": op["table_name"], "row_uid": op["row_uid"],
+                   "fields": sorted(json.loads(op["fields"])), "classification": "unresolved", "action": "retained"}
+         reports.append(report)
+diff --git a/tests/hermes_cli/test_kanban_sync_dependency_delete.py b/tests/hermes_cli/test_kanban_sync_dependency_delete.py
+new file mode 100644
+index 0000000000..2465fa20ab
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_dependency_delete.py
+@@ -0,0 +1,389 @@
++"""Explicit abandonment of containment-refused deletes retains canonical dependencies."""
++import copy
++import json
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++
++BOARD, ME = "default", "macbook"
++ERROR = "containment_hold: use scoped resume-contained; generic writes cannot satisfy containment"
++OP_IDS = ("01a1f721-13c4-713c-ad27-0db16bc7e944", "01a1f724-8fe9-73b5-9782-adec705a8120",
++          "01a1f741-6dcf-7c33-9b92-d6fce5f88ca6")
++
++
++@pytest.fixture
++def case(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, True)
++    live = kbc.connect(home / "kanban.db")
++    client.ensure_identity(live, BOARD, ME)
++    sync.set_mode(live, "primary")
++    svc = FakeService()
++    hub = svc.hub(ME)
++    parent = kb.create_task(live, title="released parent", assignee="worker")
++    child = kb.create_task(live, title="leased child", assignee="worker")
++    kb.link_tasks(live, parent, child)
++    client.sync_board(BOARD, home / "kanban.db", hub, ME)
++    uid = parent + ">" + child
++    canonical_child = svc._put(svc.board(BOARD), "tasks", child,
++                               {"status": "running", "lease_holder": "worker-1", "lease_expires": 9999999999999},
++                               "worker-1", None, "9999999999998-0000-worker-1")
++    svc.board(BOARD)["leases"][child] = {"task_id": child, "holder": "worker-1", "run_uid": "active-worker", "expires": 9999999999999}
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying=1")
++        live.execute("UPDATE tasks SET status='running',lease_holder='worker-1',lease_expires=9999999999999,sync_version=? WHERE id=?",
++                     (canonical_child["version"], child))
++        live.execute("UPDATE kanban_sync_state SET applying=0")
++        for i, op in enumerate(OP_IDS):
++            live.execute("INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,op,fields,hlc,created_at,state,"
++                         "last_error,attempts) VALUES (?,'task_links',?,'delete',?,'',?,'rejected',?,1)",
++                         (op, uid, '{ }' if i == 0 else '{}', 1000 + i * 1000, ERROR))
++            live.execute("INSERT INTO task_events(uid,task_id,kind,payload,created_at) VALUES (?,?,'unlinked',?,?)",
++                         (f"historical-{i}", child, json.dumps({"parent": parent, "child": child}), i + 1))
++        live.execute("INSERT INTO kanban_sync_tombstones VALUES ('task_links',?,3000)", (uid,))
++        # Historical events already synced; their original payloads are retained.
++        live.execute("DELETE FROM kanban_sync_outbox WHERE table_name='task_events'")
++    original_evidence = hub.row_evidence
++    monkeypatch.setattr(hub, "row_evidence", lambda b, t, u: {"board": b, **original_evidence(b, t, u)})
++    def context(board, task, producer=None):
++        return {"version": 1, "board": board, "target": {"board": board, "gateway": ME, "task_id": task}, "held": False}
++    monkeypatch.setattr(hub, "containment_context", context, raising=False)
++    yield live, hub, svc, uid, parent, child
++    live.close()
++
++
++def rows(conn, table):
++    return [dict(r) for r in conn.execute(f"SELECT * FROM {table} ORDER BY 1")]
++
++
++def test_three_deletes_preview_apply_and_normal_resolver_preserve_bytes(case):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    live, hub, _svc, uid, _parent, _child = case
++    before = {t: rows(live, t) for t in ("tasks", "task_links", "task_events", "kanban_sync_outbox")}
++    preview = recovery.plan(live, hub, BOARD, uid, "abandon refused historical unlink")
++    assert preview["eligible"], preview
++    assert preview["action"] == "preview"
++    assert rows(live, "kanban_sync_outbox") == before["kanban_sync_outbox"]
++    assert not live.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_sync_dependency_recoveries'").fetchone()
++    applied = recovery.apply(live, hub, BOARD, uid, preview["token"], "abandon refused historical unlink")
++    assert applied["action"] == "applied", applied
++    for table, original_rows in before.items():
++        assert rows(live, table) == original_rows
++    assert not rows(live, "kanban_sync_tombstones")
++    receipt = rows(live, "kanban_sync_dependency_recoveries")[0]
++    snapshot = json.loads(receipt["snapshot_json"])
++    assert snapshot["ops"] == before["kanban_sync_outbox"]
++    assert snapshot["events"] == [e for e in before["task_events"] if e["kind"] == "unlinked"]
++    reports = resolve_rejections(live, hub, BOARD)
++    assert len(reports) == 3
++    assert all(r["action"] == "retired" for r in reports), reports
++    assert not rows(live, "kanban_sync_outbox")
++    assert rows(live, "task_links") == before["task_links"]
++    assert rows(live, "tasks") == before["tasks"]
++    assert rows(live, "task_events") == before["task_events"]
++    assert rows(live, "kanban_sync_dependency_recoveries") == [receipt]
++    assert resolve_rejections(live, hub, BOARD) == []
++    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
++        live.execute("UPDATE kanban_sync_dependency_recoveries SET reason='changed'")
++
++
++def test_normal_round_settles_receipt_while_holding_sync_lock(case, monkeypatch):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _svc, uid, parent, child = case
++    preview = recovery.plan(live, hub, BOARD, uid, "retain canonical link")
++    assert preview["eligible"], preview
++    assert recovery.apply(live, hub, BOARD, uid, preview["token"], "retain canonical link")["action"] == "applied"
++    path = live.execute("PRAGMA database_list").fetchone()[2]
++    result = client.sync_board(BOARD, Path(path), hub, ME)
++    assert not rows(live, "kanban_sync_outbox"), result.rejection_resolutions
++    assert len(rows(live, "kanban_sync_dependency_recoveries")) == 1
++    assert rows(live, "task_links") == [{"parent_id": parent, "child_id": child}]
++
++
++def test_new_progress_event_does_not_strand_receipted_deletes(case):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    live, hub, _, uid, _, child = case
++    p = recovery.plan(live, hub, BOARD, uid, "retain link")
++    assert recovery.apply(live, hub, BOARD, uid, p["token"], "retain link")["action"] == "applied"
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying=1")
++        live.execute("INSERT INTO task_events(uid,task_id,kind,payload,created_at) VALUES ('later',?,'progress','{}',99)", (child,))
++        live.execute("UPDATE kanban_sync_state SET applying=0")
++    assert all(r["action"] == "retired" for r in resolve_rejections(live, hub, BOARD))
++    assert live.execute("SELECT 1 FROM task_events WHERE uid='later'").fetchone()
++
++
++def test_missing_unlink_audit_refuses_receipt(case):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _, uid, _, _ = case
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying=1")
++        live.execute("DELETE FROM task_events WHERE kind='unlinked'")
++        live.execute("UPDATE kanban_sync_state SET applying=0")
++    p = recovery.plan(live, hub, BOARD, uid, "retain link")
++    assert p.get("reason") == "missing_unlink_audit", p
++
++
++def test_corrupt_receipt_retains_ops_instead_of_crashing_sync(case):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    live, hub, _, uid, _, _ = case
++    with kbc.write_txn(live):
++        recovery._schema(live)
++        live.execute("INSERT INTO kanban_sync_dependency_recoveries VALUES ('broken',?,?,?,'reason','{','bad','{}')",
++                     (BOARD, uid, recovery.keys._endpoint(hub)))
++    reports = resolve_rejections(live, hub, BOARD)
++    assert len(reports) == 3
++    assert all(r["action"] == "retained" for r in reports)
++
++
++@pytest.mark.parametrize("column,value", [("last_error", "containment_hold: different reason"),
++    ("state", "pending"), ("op", "upsert"), ("fields", '{"parent_id":"wrong"}')])
++def test_only_exact_refused_empty_deletes_eligible(case, column, value):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _, uid, _, _ = case
++    with kbc.write_txn(live):
++        live.execute(f"UPDATE kanban_sync_outbox SET {column}=? WHERE op_id=?", (value, OP_IDS[0]))
++    p = recovery.plan(live, hub, BOARD, uid, "retain link")
++    assert p.get("reason") == "unsupported_link_work", p
++    assert len(rows(live, "kanban_sync_outbox")) == 3
++
++
++@pytest.mark.parametrize("defect,reason", [("pending_endpoint", "endpoint_local_work"),
++    ("tombstone", "uncovered_tombstone"), ("missing_audit", "missing_unlink_audit"),
++    ("wrong_audit", "missing_unlink_audit"), ("audit_clock", "missing_unlink_audit"),
++    ("audit_uid", "missing_unlink_audit"), ("local_hold", "local_containment_hold")])
++def test_local_vetoes_preserve_every_input(case, defect, reason):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _, uid, parent, _child = case
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying=1")
++        statements = {
++            "pending_endpoint": ("INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,op,fields,hlc,created_at) "
++                                 "VALUES ('newer','tasks',?,'upsert','{}','',9999)", (parent,)),
++            "tombstone": ("UPDATE kanban_sync_tombstones SET deleted_at=9999", ()),
++            "missing_audit": ("DELETE FROM task_events WHERE uid='historical-1'", ()),
++            "wrong_audit": ("UPDATE task_events SET payload='{}' WHERE uid='historical-1'", ()),
++            "audit_clock": ("UPDATE task_events SET created_at=99 WHERE uid='historical-1'", ()),
++            "audit_uid": ("UPDATE task_events SET uid=NULL WHERE uid='historical-1'", ()),
++            "local_hold": ("UPDATE tasks SET containment_episode='current-episode' WHERE id=?", (parent,)),
++        }
++        sql, params = statements[defect]
++        live.execute(sql, params)
++        live.execute("UPDATE kanban_sync_state SET applying=0")
++    before = {t: rows(live, t) for t in ("tasks", "task_events", "task_links", "kanban_sync_outbox", "kanban_sync_tombstones")}
++    p = recovery.plan(live, hub, BOARD, uid, "retain link")
++    assert p.get("reason") == reason, p
++    assert all(rows(live, t) == v for t, v in before.items())
++
++
++@pytest.mark.parametrize("defect,reason", [("uid", "authoritative_identity_changed"),
++    ("row_uid", "authoritative_version_changed"), ("version", "authoritative_version_changed"),
++    ("parent", "canonical_link_changed"), ("deleted", "authoritative_version_changed"),
++    ("endpoint_version", "endpoint_identity_changed"), ("endpoint_origin", "endpoint_identity_changed"),
++    ("canonical_hold", "canonical_containment_hold"), ("feed", "authoritative_feed_changed"),
++    ("busy", "diagnostic_refresh_incomplete"), ("behind", "diagnostic_refresh_incomplete")])
++def test_authoritative_vetoes(case, monkeypatch, defect, reason):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _svc, uid, parent, child = case
++    read = hub.row_evidence
++    def evidence(board, table, key):
++        e = read(board, table, key)
++        if table == "task_links":
++            if defect == "uid": e["uid"] = "wrong"
++            if defect == "row_uid": e["row"]["uid"] = "wrong"
++            if defect == "version": e["row"]["version"] = True
++            if defect == "parent": e["row"]["parent_id"] = child
++            if defect == "deleted": e["row"]["deleted_at"] = 99
++        elif key == parent:
++            if defect == "endpoint_version": e["row"]["version"] += 1
++            if defect == "endpoint_origin": e["row"]["created_on"] = "other-gateway"
++        return e
++    monkeypatch.setattr(hub, "row_evidence", evidence)
++    if defect == "canonical_hold":
++        old = hub.containment_context
++        monkeypatch.setattr(hub, "containment_context", lambda *a: {**old(*a), "held": True})
++    elif defect == "feed":
++        old = hub.changes
++        def changed(board, cursor, limit=500):
++            result = old(board, cursor, limit)
++            if result["changes"] == []:
++                result["head"] += 1
++            return result
++        monkeypatch.setattr(hub, "changes", changed)
++    elif defect in ("busy", "behind"):
++        monkeypatch.setattr(client, "_pull_replica", lambda *a, **kw: client.Pulled(busy=defect == "busy", more=defect == "behind"))
++    p = recovery.plan(live, hub, BOARD, uid, "retain link")
++    assert p.get("reason") == reason, p
++    assert len(rows(live, "kanban_sync_outbox")) == 3
++
++
++@pytest.mark.parametrize("change", ["reason", "token", "version", "local", "during_read"])
++def test_apply_revalidates_preview_and_evidence(case, monkeypatch, change):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, svc, uid, _parent, _child = case
++    p = recovery.plan(live, hub, BOARD, uid, "retain link")
++    assert p["eligible"], p
++    reason = "new reason" if change == "reason" else "retain link"
++    token = "not-the-preview" if change == "token" else p["token"]
++    if change == "version":
++        svc.board(BOARD)["rows"]["task_links"][uid]["version"] += 1
++    if change == "local":
++        with kbc.write_txn(live):
++            live.execute("UPDATE kanban_sync_outbox SET attempts=2 WHERE op_id=?", (OP_IDS[0],))
++    if change == "during_read":
++        original = hub.row_evidence
++        def read(*args):
++            e = original(*args)
++            with kbc.write_txn(live):
++                live.execute("UPDATE kanban_sync_outbox SET attempts=attempts+1 WHERE op_id=?", (OP_IDS[0],))
++            return e
++        monkeypatch.setattr(hub, "row_evidence", read)
++    r = recovery.apply(live, hub, BOARD, uid, token, reason)
++    assert r["action"] == "refused", r
++    assert r["reason"] == ("local_inputs_changed" if change == "during_read" else "preview_token_changed")
++    assert len(rows(live, "kanban_sync_outbox")) == 3
++    assert rows(live, "kanban_sync_tombstones")
++
++
++def test_link_version_change_after_apply_prevents_retirement(case):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    live, hub, svc, uid, _, _ = case
++    p = recovery.plan(live, hub, BOARD, uid, "retain link")
++    assert recovery.apply(live, hub, BOARD, uid, p["token"], "retain link")["action"] == "applied"
++    svc.board(BOARD)["rows"]["task_links"][uid]["version"] += 1
++    reports = resolve_rejections(live, hub, BOARD)
++    assert all(r["action"] == "retained" and r["proof"] == "receipt_link_changed" for r in reports)
++
++
++def test_cli_preview_apply(case, monkeypatch, capsys):
++    from argparse import Namespace
++    from hermes_cli import kanban_sync_cli as cli
++    live, hub, _, uid, parent, child = case
++    path = Path(live.execute("PRAGMA database_list").fetchone()[2])
++    monkeypatch.setattr(cli, "_board", lambda _: BOARD)
++    monkeypatch.setattr(cli, "_path", lambda _: path)
++    monkeypatch.setattr(client, "load_identity", lambda: hub.ident)
++    monkeypatch.setattr(client, "Hub", lambda _: hub)
++    args = Namespace(sync_action="dependency-delete", row_uid=uid, reason="keep link", apply=False, expect=None, json=True)
++    assert cli.cmd_sync(args) == 0
++    preview = json.loads(capsys.readouterr().out)
++    assert preview["eligible"]
++    args.apply = True
++    args.expect = preview["token"]
++    assert cli.cmd_sync(args) == 0
++    applied = json.loads(capsys.readouterr().out)
++    assert applied["action"] == "applied"
++    assert rows(live, "task_links") == [{"parent_id": parent, "child_id": child}]
++
++
++def test_parser_exposes_explicit_per_link_preview():
++    import argparse
++    from hermes_cli.kanban_parser import build_parser
++    root = argparse.ArgumentParser()
++    build_parser(root.add_subparsers())
++    args = root.parse_args(["kanban", "sync", "dependency-delete", "t_parent>t_child", "--reason", "retain link", "--json"])
++    assert args.sync_action == "dependency-delete"
++    assert args.row_uid == "t_parent>t_child"
++    assert not args.apply and args.expect is None
++
++
++@pytest.mark.parametrize("at_commit", [False, True])
++def test_evidence_age_includes_writer_lock_wait(case, monkeypatch, at_commit):
++    import contextlib
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _, uid, _, _ = case
++    clock = [0.0]
++    monkeypatch.setattr(recovery.keys, "_mono", lambda: clock[0])
++    p = recovery.plan(live, hub, BOARD, uid, "retain link")
++    if at_commit:
++        transaction = recovery.write_txn
++        @contextlib.contextmanager
++        def delayed(conn):
++            with transaction(conn):
++                clock[0] += 31
++                yield
++        monkeypatch.setattr(recovery, "write_txn", delayed)
++    else:
++        read = hub.row_evidence
++        def slow(*args):
++            e = read(*args)
++            clock[0] += 11
++            return e
++        monkeypatch.setattr(hub, "row_evidence", slow)
++    r = recovery.apply(live, hub, BOARD, uid, p["token"], "retain link")
++    assert r.get("reason") == "evidence_expired", r
++    assert len(rows(live, "kanban_sync_outbox")) == 3
++    assert rows(live, "kanban_sync_tombstones")
++    assert not live.execute("SELECT 1 FROM sqlite_master WHERE name='kanban_sync_dependency_recoveries'").fetchone()
++
++
++def test_local_cas_after_transaction_entry(case, monkeypatch):
++    import contextlib
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, _, uid, _parent, _ = case
++    p = recovery.plan(live, hub, BOARD, uid, "retain link")
++    transaction = recovery.write_txn
++    @contextlib.contextmanager
++    def interleaved(conn):
++        with transaction(conn):
++            conn.execute("UPDATE kanban_sync_outbox SET attempts=2 WHERE op_id=?", (OP_IDS[0],))
++        with transaction(conn):
++            yield
++    monkeypatch.setattr(recovery, "write_txn", interleaved)
++    r = recovery.apply(live, hub, BOARD, uid, p["token"], "retain link")
++    assert r.get("reason") == "local_inputs_changed", r
++    assert rows(live, "kanban_sync_tombstones")
++
++
++@pytest.mark.parametrize("defect", ["new_delete", "changed_bytes", "changed_audit", "held", "new_tombstone"])
++def test_settlement_does_not_hide_new_work(case, defect):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    from hermes_cli.kanban_sync_rejections import resolve_rejections
++    live, hub, _, uid, parent, _child = case
++    p = recovery.plan(live, hub, BOARD, uid, "retain link")
++    assert recovery.apply(live, hub, BOARD, uid, p["token"], "retain link")["action"] == "applied"
++    statements = {
++        "new_delete": ("INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,op,fields,hlc,created_at,state,last_error) "
++                       "VALUES ('new','task_links',?,'delete','{}','',9999,'rejected',?)", (uid, ERROR)),
++        "changed_bytes": ("UPDATE kanban_sync_outbox SET attempts=999 WHERE op_id=?", (OP_IDS[0],)),
++        "changed_audit": ("UPDATE task_events SET created_at=99 WHERE uid='historical-1'", ()),
++        "held": ("UPDATE tasks SET containment_episode='unreleased' WHERE id=?", (parent,)),
++        "new_tombstone": ("INSERT INTO kanban_sync_tombstones VALUES ('task_links',?,9999)", (uid,)),
++    }
++    with kbc.write_txn(live):
++        live.execute("UPDATE kanban_sync_state SET applying=1")
++        live.execute(*statements[defect])
++        live.execute("UPDATE kanban_sync_state SET applying=0")
++    before = rows(live, "kanban_sync_outbox")
++    reports = resolve_rejections(live, hub, BOARD)
++    assert all(r["action"] == "retained" for r in reports), reports
++    assert rows(live, "kanban_sync_outbox") == before
++
++
++def test_canonical_change_during_evidence_reads_vetoes_apply(case, monkeypatch):
++    from hermes_cli import kanban_sync_dependency_delete as recovery
++    live, hub, svc, uid, parent, child = case
++    p = recovery.plan(live, hub, BOARD, uid, "retain link")
++    read = hub.row_evidence
++    def racing(*args):
++        e = read(*args)
++        if args[1] == "tasks" and args[2] == child:
++            svc._put(svc.board(BOARD), "task_links", uid, {"parent_id": parent, "child_id": child}, ME, None,
++                     "9999999999998-0000-macbook")
++        return e
++    monkeypatch.setattr(hub, "row_evidence", racing)
++    r = recovery.apply(live, hub, BOARD, uid, p["token"], "retain link")
++    assert r.get("reason") == "authoritative_feed_changed", r
++    assert rows(live, "kanban_sync_tombstones")
+diff --git a/website/docs/user-guide/features/kanban-dependency-delete-recovery.md b/website/docs/user-guide/features/kanban-dependency-delete-recovery.md
+new file mode 100644
+index 0000000000..9835494b5f
+--- /dev/null
++++ b/website/docs/user-guide/features/kanban-dependency-delete-recovery.md
+@@ -0,0 +1,64 @@
++---
++title: "Kanban: abandoning containment-refused dependency deletes"
++description: "Audited per-link recovery preserves the live authoritative dependency and the original refused operations."
++---
++
++# Abandoning a refused dependency delete
++
++A refused `task_links` DELETE can leave a live canonical dependency, a restored local link,
++a stale local deletion tombstone, and one or more rejected outbox operations. A later containment
++release is **not** permission to retry that historical DELETE. This recovery abandons it instead.
++
++```bash
++hermes kanban sync dependency-delete 'PARENT_ID>CHILD_ID' --reason 'retain the authoritative dependency' --json
++# Inspect the preview and preserve its token. Then use the identical reason:
++hermes kanban sync dependency-delete 'PARENT_ID>CHILD_ID' --reason 'retain the authoritative dependency' \
++  --apply --expect TOKEN --json
++```
++
++The `>` must be quoted to avoid shell redirection. `--reason` is required and nonblank.
++Preview performs a diagnostic replica refresh but does not write the live board or create receipt tables.
++A busy/incomplete refresh is a refusal, not a successful preflight. The command requires an enrolled
++sync identity matching the local board/gateway and binds its nonsecret endpoint fingerprint into the token.
++
++## Eligibility and evidence
++
++- The local and refreshed replica link must already exist with exactly the requested parent and child.
++- Every operation for that link must be a rejected empty-fields DELETE with the exact Board refusal
++  `containment_hold: use scoped resume-contained; generic writes cannot satisfy containment`.
++  Both endpoint task rows must exist, with no endpoint task outbox work.
++- The only eligible tombstone is this link's, with its deletion clock equal to the latest covered DELETE.
++  Matching `unlinked` history must remain available and is copied into the receipt without rewriting its payload.
++- Both canonical endpoint rows and the link must be live, with valid versions/identities. Endpoint origin and
++  settled local version must match the Board. Local containment checks must pass, including certified-release
++  verification; fresh authenticated Board containment contexts must say neither endpoint is held.
++- An active worker lease is preserved. This command never changes lifecycle state, runs, claims or lease ownership.
++- The replica cursor must match authenticated empty feed evidence (`head = next = cursor`, `more=false`).
++  All authoritative row reads and the concluding empty-feed check must cover that same cut; a moving feed refuses.
++  The entire evidence interval, including SQLite writer-lock wait, is limited to 30 monotonic seconds.
++- Apply re-fetches evidence, compares the preview token, then compares exact local inputs again in its transaction.
++  Changed operations, history, task rows, identities, reason or link versions require a fresh preview.
++
++This is a bounded observation, not an atomic reservation or a distributed Board lock.
++No server mutation is sent. Operators must recheck authoritative state after recovery.
++
++## Writes and audit custody
++
++Apply atomically inserts one host-local `kanban_sync_dependency_recoveries` receipt and clears only the exact
++covered stale link tombstone. The receipt contains original outbox rows (including original `fields` strings),
++matching historical events, a SHA-256 of the canonical snapshot, the reason, endpoint fingerprint and canonical
++proof. SQL triggers prohibit receipt UPDATE and DELETE. The original rejections remain unchanged at apply.
++No dependency, task or historical event is inserted, updated or deleted; no replacement DELETE is queued.
++
++Normal sync subsequently retires only byte-identical receipt-covered rejected operations after fresh canonical
++link/endpoint/containment checks. A changed link, pending/newer work, changed audit or damaged receipt retains
++rejections. Unrelated later progress events do not invalidate the historical audit. Retiring an outbox operation
++does not remove its immutable receipt or its existing `unlinked` / rejection events.
++
++A repeated apply after the tombstone has been cleared refuses rather than creating a second receipt.
++Run normal sync to settle the existing receipt. If evidence or newer work prevents settlement, investigate it;
++do not clear the outbox, edit the receipt, remove the dependency or replay the old DELETE manually.
++
++The operational owner remains responsible for repeated completed diagnostic refreshes, authenticated empty-head
++verification and confirming that no unrelated drift remains. An implementation test or successful apply alone
++is not a claim that a live board has converged.
+-- 
+2.43.0
+

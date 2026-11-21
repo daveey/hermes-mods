@@ -1,0 +1,1257 @@
+From 0b1fda72f5e69856b45cce3463f46a5aa0c5b1e0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 20:52:58 +0000
+Subject: [PATCH] [daveey] perf(kanban-sync): key a links pass's state.db reads
+ by value instead of re-reconciling every 300 s
+
+An unchanged board was reconciled again every LINKS_MAX_AGE_S only to re-read
+session sources, compression lineage and profile homes from state.db. A pass now
+records the answers each board's reconcile used and the next pass replays those
+reads; the board is reconciled again only when an answer changed. Inside a pass
+the 300 s source cache is bypassed, so a recorded answer is never older than its
+pass. A pass that swallowed a failed read records no key and keeps the max-age
+retry.
+
+Also counts links_refresh background checks by decision (cold/skip/age/inputs)
+and accounts the rebuild separately: the existing links_refresh scope counts
+checks, cache hits included.
+
+Task: t_eeeeee0000000018
+---
+ hermes_cli/kanban_chat_links.py               |  24 +-
+ hermes_cli/kanban_creator_chats.py            |   5 +
+ hermes_cli/kanban_links_chat_key.py           | 164 +++++++
+ hermes_cli/kanban_links_refresh.py            |  46 +-
+ hermes_cli/kanban_session_activity.py         |   6 +-
+ hermes_cli/kanban_session_provenance.py       |  68 ++-
+ hermes_cli/kanban_sync_client.py              |  44 +-
+ .../test_kanban_links_refresh_accounting.py   | 126 ++++++
+ .../test_kanban_sync_links_chat_key.py        | 400 ++++++++++++++++++
+ .../test_kanban_sync_local_integration.py     |  34 +-
+ .../test_kanban_sync_steady_links.py          |   8 +-
+ 11 files changed, 864 insertions(+), 61 deletions(-)
+ create mode 100644 hermes_cli/kanban_links_chat_key.py
+ create mode 100644 tests/hermes_cli/test_kanban_links_refresh_accounting.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_links_chat_key.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index be42d3d438..d618ad550e 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -98,6 +98,8 @@ def _local_links(conn: sqlite3.Connection, gateway: str) -> dict[str, dict[str,
+             f"SELECT s.task_id, s.chat_id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
+             f"WHERE s.platform = 'tui' AND s.chat_id != '' AND {_counted_sub_clause(conn)}")]
+     except sqlite3.Error:  # board predates notify subscriptions
++        from hermes_cli.kanban_links_chat_key import degrade_unless_absent
++        degrade_unless_absent(conn, "kanban_notify_subs")
+         shepherds = []
+     candidates = [r[1] for r in sessions] + [r[1] for r in shepherds]
+     # [daveey] Each verdict below is classified in one batch, not per row: a per-row lookup reopened every home's
+@@ -188,7 +190,7 @@ def _owner_written_releases(board: str, gateway: str, want: dict[str, dict[str,
+     A link to a machine session of this gateway (``is_machine_session``) is released whatever the card's status:
+     no human reads that session, so it owns nothing even on an open card (hub t_01a19864fc42f5b2 was owned by
+     MacBook worker transcript 20261029_180356_84db5f, 2026-11-01)."""
+-    from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli import kanban_links_chat_key as chat_key, kanban_sync_client as ksc
+     from hermes_cli.kanban_lockguard import connect
+     from hermes_cli.kanban_placement import is_placeholder_session
+     path = ksc.shadow_path(board)
+@@ -208,6 +210,7 @@ def _owner_written_releases(board: str, gateway: str, want: dict[str, dict[str,
+             conn.close()
+     except sqlite3.Error as exc:  # an unreadable replica releases nothing this round; the next one retries
+         _log.info("kanban chat links: replica %s unreadable for owner-link releases (%s)", path, exc)
++        chat_key.degrade()
+         return {}
+     out: dict[str, dict[str, Any]] = {}
+     rows = [r for r in rows if r["uid"] not in want and not is_placeholder_session(r["chat_session"])]
+@@ -240,7 +243,9 @@ def _compressed_away(rows: list[dict[str, Any]], want: dict[str, dict[str, Any]]
+     the lineage; an unreadable one releases nothing this pass."""
+     from hermes_cli.kanban_origin import _ro
+     from hermes_cli.kanban_session_provenance import _local_homes
+-    from hermes_state_compression import _CHAIN_CAP, _CHAIN_STEP_SQL
++    from hermes_cli import kanban_links_chat_key as chat_key
++    from hermes_state_compression import _CHAIN_CAP
++    reads = chat_key.active()
+     linked: dict[tuple[str, Any], set[str]] = {}
+     for link in want.values():
+         if link.get("task_id") and not link.get("released") and link.get("chat_gateway") == gateway:
+@@ -254,27 +259,29 @@ def _compressed_away(rows: list[dict[str, Any]], want: dict[str, dict[str, Any]]
+     for profile, group in candidates.items():
+         for home in _local_homes(profile):
+             path = home / "state.db"
+-            if not path.exists():
++            if not (path.exists() if reads is None else reads.answer(("exists", str(path)), path.exists)):
+                 continue
+             try:
+                 db = _ro(path)
+             except sqlite3.Error as exc:
+                 _log.info("kanban chat links: %s unreadable for compression lineage (%s)", path, exc)
++                chat_key.degrade()
+                 continue
+             try:
+                 for r in group:
+                     sid, seen = str(r["chat_session"]), {str(r["chat_session"])}
+                     for _ in range(_CHAIN_CAP):
+-                        step = db.execute(_CHAIN_STEP_SQL, (sid,)).fetchone()
+-                        if step is None or step[0] in seen:
++                        step = chat_key.chain_step(db, path, sid)
++                        if step is None or step in seen:
+                             break
+-                        sid = str(step[0])
++                        sid = step
+                         seen.add(sid)
+                         if sid in linked[(r["task_id"], r["chat_profile"])]:
+                             out.add(r["uid"])
+                             break
+             except sqlite3.Error as exc:
+                 _log.info("kanban chat links: compression lineage unreadable in %s (%s)", path, exc)
++                chat_key.degrade()
+             finally:
+                 db.close()
+     return out
+@@ -295,7 +302,7 @@ def _owner_hub_links(conn: sqlite3.Connection, board: str, gateway: str) -> list
+     its release (its ledger, ``_owner_written_releases``). Nothing is written while any row for that card and chat
+     exists in this file or the replica, released included, so a release the chat's gateway already made is never
+     reopened; an unreadable replica writes nothing this pass."""
+-    from hermes_cli import kanban_sync_client as ksc
++    from hermes_cli import kanban_links_chat_key as chat_key, kanban_sync_client as ksc
+     from hermes_cli.kanban_db_notify import machine_sessions
+     from hermes_cli.kanban_lockguard import connect
+     from hermes_cli.kanban_origin import OriginError, parse_origin
+@@ -311,6 +318,7 @@ def _owner_hub_links(conn: sqlite3.Connection, board: str, gateway: str) -> list
+             f"AND {_counted_sub_clause(conn)} {mine} ORDER BY s.task_id, s.chat_id",
+             (*TERMINAL_STATUSES, *((gateway,) if mine else ()))).fetchall()
+     except sqlite3.Error:  # board predates notify subscriptions
++        chat_key.degrade_unless_absent(conn, "kanban_notify_subs")
+         return []
+     wanted: dict[tuple, dict[str, Any]] = {}
+     for task_id, chat_id, created_at in subs:
+@@ -341,6 +349,7 @@ def _owner_hub_links(conn: sqlite3.Connection, board: str, gateway: str) -> list
+         replica = connect(f"file:{path}?mode=ro", uri=True, timeout=5) if path.exists() else None
+     except sqlite3.Error as exc:
+         _log.info("kanban chat links: replica %s unreadable for owner hub links (%s)", path, exc)
++        chat_key.degrade()
+         return []
+     try:
+         for db in (conn, replica):
+@@ -363,6 +372,7 @@ def _owner_hub_links(conn: sqlite3.Connection, board: str, gateway: str) -> list
+                     continue
+     except sqlite3.Error as exc:  # nothing is written from a partial read; the next pass retries
+         _log.info("kanban chat links: owner hub links unreadable for %s (%s)", board, exc)
++        chat_key.degrade()
+         return []
+     finally:
+         if replica is not None:
+diff --git a/hermes_cli/kanban_creator_chats.py b/hermes_cli/kanban_creator_chats.py
+index 0c790f4558..5b8287ff62 100644
+--- a/hermes_cli/kanban_creator_chats.py
++++ b/hermes_cli/kanban_creator_chats.py
+@@ -4,6 +4,8 @@ from __future__ import annotations
+ import json
+ import sqlite3
+ 
++from hermes_cli.kanban_links_chat_key import degrade as _degrade  # swallowed read errors leave no links key
++
+ MAX_DEPTH = 16
+ 
+ 
+@@ -221,6 +223,7 @@ class _ReplicaReader:
+                 self.attempted = True
+                 self._open()
+         except (OSError, sqlite3.Error):
++            _degrade()
+             return None
+         return self.replica
+ 
+@@ -229,6 +232,7 @@ class _ReplicaReader:
+             replica = self.open()
+             return resolve_chats(replica, creator_task_id, verdicts=verdicts) if replica is not None else []
+         except (OSError, sqlite3.Error):
++            _degrade()
+             return []
+ 
+ 
+@@ -330,6 +334,7 @@ class LinkVerdicts:
+                         continue
+                     keys[(origin.gateway, origin.profile, str(origin.session or ""))] = None
+             except sqlite3.Error:  # a missing verdict fails closed or needs no read, never a read under the lock
++                _degrade()
+                 continue
+         return cls(machine_verdicts([k for k in keys if not is_placeholder_session(k[2])], local_gateway=me), me)
+ 
+diff --git a/hermes_cli/kanban_links_chat_key.py b/hermes_cli/kanban_links_chat_key.py
+new file mode 100644
+index 0000000000..83d1908c67
+--- /dev/null
++++ b/hermes_cli/kanban_links_chat_key.py
+@@ -0,0 +1,164 @@
++"""Change key for the state.db answers one board's chat-links pass used (``kanban_sync_client.reconcile_links``).
++
++A links pass reads three things from this host's state.db files that no board, replica or ledger revision covers:
++session creation sources (``kanban_session_provenance._local_session_sources``), compression lineage steps
++(``kanban_chat_links._compressed_away``, with whether each store exists) and which homes exist (``_local_homes``).
++Until now an unchanged board was reconciled again every ``LINKS_MAX_AGE_S`` only to re-read them. state.db's
++``PRAGMA data_version`` is no key for this: every chat turn on the host commits there, so it would re-arm every
++pass. The key is the answers themselves.
++
++While a pass is active (:func:`pass_reads`):
++
++* every such read goes to the database once per pass (``memo``), bypassing the 300 s source cache in both
++  directions (a positive and a missing answer alike), so a reconcile never certifies an answer older than its pass;
++* the reads one board's reconcile used are recorded (``used``), and the next pass replays exactly those reads
++  (:meth:`ChatReads.unchanged`) instead of reconciling when they answer the same;
++* a required read whose error the pass swallows (:func:`degrade`) leaves the board without a recorded key, so it
++  keeps the previous max-age retry instead of being skipped for good.
++
++Nothing here is shared between passes or threads: the process-wide source cache keeps serving every other reader,
++including this thread outside a board's reconcile or replay, and a thread that copied this context (the links
++refresher) never sees the pass. [daveey]
++"""
++from __future__ import annotations
++
++import sqlite3
++import threading
++from contextlib import contextmanager
++from contextvars import ContextVar
++from pathlib import Path
++from typing import Any, Callable, Iterator, Optional
++
++_MISSING = object()
++
++
++class ChatReads:
++    """One links pass: ``memo`` answers each state.db read once; ``used`` is the current board's record of them."""
++
++    def __init__(self) -> None:
++        self.memo: dict[tuple, Any] = {}
++        self.used: Optional[dict[tuple, Any]] = None
++        self.last: Optional[dict[tuple, Any]] = None
++        self.degraded = False
++        self.owner = threading.get_ident()
++
++    def recall(self, key: tuple) -> Any:
++        """This pass's answer for ``key`` (recorded as used), or ``_MISSING`` when it has not been read yet."""
++        value = self.memo.get(key, _MISSING)
++        if value is not _MISSING:
++            self.used[key] = value
++        return value
++
++    def record(self, key: tuple, value: Any) -> Any:
++        self.memo[key] = self.used[key] = value
++        return value
++
++    def answer(self, key: tuple, read: Callable[[], Any]) -> Any:
++        value = self.recall(key)
++        return self.record(key, read()) if value is _MISSING else value
++
++    @contextmanager
++    def board(self) -> Iterator[None]:
++        """Record one board's reads; :meth:`key` afterwards is what the next pass replays."""
++        self.used, self.degraded, self.last = {}, False, None
++        try:
++            yield
++            self.last = None if self.degraded else self.used
++        finally:
++            self.used = None
++
++    def key(self) -> Optional[dict[tuple, Any]]:
++        """The reads the board just reconciled with, or None when one of them failed (retry by age instead)."""
++        return self.last
++
++    def unchanged(self, recorded: dict[tuple, Any]) -> bool:
++        """Whether every recorded read answers the same now. Reads go through this pass's memo, so boards sharing a
++        session share the read, and a board that reconciles after a False answer uses these same fresh answers."""
++        from hermes_cli import loop_accounting as la
++        self.used, self.degraded = {}, False
++        try:
++            with la.pass_("sync.links.chat_key"):
++                _replay(self, recorded)
++            return not self.degraded and self.used == recorded
++        except (OSError, sqlite3.Error, KeyError):  # KeyError: a read kind this code cannot replay
++            return False
++        finally:
++            self.used = None
++
++
++_PASS: ContextVar[Optional[ChatReads]] = ContextVar("kanban_links_chat_reads", default=None)
++
++
++def active() -> Optional[ChatReads]:
++    """The pass recording reads on this thread right now (inside a board's reconcile or replay), else None."""
++    reads = _PASS.get()
++    return reads if reads is not None and reads.used is not None and reads.owner == threading.get_ident() else None
++
++
++def degrade() -> None:
++    """A required read failed and its error is being swallowed: this board's pass must not be recorded as a key."""
++    reads = active()
++    if reads is not None:
++        reads.degraded = True
++
++
++def degrade_unless_absent(conn: sqlite3.Connection, table: str) -> None:
++    """A board read failed and is answered empty: fine for a board that predates ``table``, a failed read otherwise."""
++    if active() is None:
++        return
++    try:
++        if conn.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (table,)).fetchone() is None:
++            return
++    except sqlite3.Error:
++        pass
++    degrade()
++
++
++@contextmanager
++def pass_reads() -> Iterator[ChatReads]:
++    reads = ChatReads()
++    token = _PASS.set(reads)
++    try:
++        yield reads
++    finally:
++        _PASS.reset(token)
++
++
++def chain_step(db: sqlite3.Connection, path: Path, sid: str) -> Optional[str]:
++    """The compression continuation of ``sid`` in ``db`` (``hermes_state_compression._CHAIN_STEP_SQL``)."""
++    from hermes_state_compression import _CHAIN_STEP_SQL
++
++    def read() -> Optional[str]:
++        step = db.execute(_CHAIN_STEP_SQL, (sid,)).fetchone()
++        return None if step is None else str(step[0])
++
++    reads = active()
++    return read() if reads is None else reads.answer(("step", str(path), sid), read)
++
++
++def _replay(reads: ChatReads, recorded: dict[tuple, Any]) -> None:
++    from hermes_cli.kanban_origin import _ro
++    from hermes_cli.kanban_session_provenance import _local_homes, _local_session_sources
++    kinds: dict[str, list[tuple]] = {"homes": [], "exists": [], "source": [], "step": []}
++    for key in recorded:
++        kinds[key[0]].append(key)
++    for key in kinds["homes"]:
++        _local_homes(key[1])
++    for key in kinds["exists"]:
++        reads.answer(key, Path(key[1]).exists)
++    by_path: dict[tuple[str, str], list[str]] = {}
++    for key in (*kinds["source"], *kinds["step"]):
++        by_path.setdefault((key[0], key[1]), []).append(key[2])
++    for (kind, path), sids in by_path.items():
++        if kind == "source":
++            _local_session_sources(sids, home=Path(path).parent)
++            continue
++        todo = [sid for sid in sids if reads.recall(("step", path, sid)) is _MISSING]
++        if not todo:
++            continue
++        db = _ro(Path(path))
++        try:
++            for sid in todo:
++                chain_step(db, Path(path), sid)
++        finally:
++            db.close()
+diff --git a/hermes_cli/kanban_links_refresh.py b/hermes_cli/kanban_links_refresh.py
+index 1ca66711f5..42bf421d2a 100644
+--- a/hermes_cli/kanban_links_refresh.py
++++ b/hermes_cli/kanban_links_refresh.py
+@@ -7,6 +7,50 @@ from collections.abc import Callable
+ _log = logging.getLogger(__name__)
+ 
+ 
++def record_decision(hit: tuple | None, fingerprint: tuple, *, fresh: bool, now: float) -> None:
++    """Bounded counters for background checks; raw store changes may overlap expiry.
++
++    No IO or input probing here. Store categories describe changed fingerprint
++    entries, not necessarily semantically relevant changes (narrowing can ignore
++    an unread board). Only non-fresh decisions report changed-store counters.
++    """
++    from hermes_cli import loop_accounting as la
++    if fresh:
++        reason = "skip"
++    elif hit is None:
++        reason = "cold"
++    else:
++        age, changed = now >= hit[0], hit[2] != fingerprint
++        reason = "age_inputs" if age and changed else "age" if age else "inputs"
++        if changed:
++            kinds = set()
++            for entry in (*hit[2], *fingerprint):
++                if entry in hit[2] and entry in fingerprint:
++                    continue
++                if isinstance(entry, tuple) and entry and isinstance(entry[0], str):
++                    name = entry[0].rsplit("/", 1)[-1]
++                    kind = "ledger" if name in ("origin-ledger.db", "origin-ledger.db-wal") else (
++                        "board" if len(entry) == 2 else "hub")
++                else:
++                    kind = "unknown"
++                kinds.add(kind)
++            for kind in kinds:
++                with la.pass_("links_refresh.changed." + kind):
++                    pass
++    with la.pass_("links_refresh." + reason) as accounting:
++        if fresh:
++            accounting.skip()
++
++
++def refresh_decided(hit: tuple | None, fingerprint: tuple, fresh: bool, now: float, build: Callable[[], object]) -> None:
++    """Count one background check's decision, and run ``build`` (accounted as a build) unless it is fresh."""
++    from hermes_cli import loop_accounting as la
++    record_decision(hit, fingerprint, fresh=fresh, now=now)
++    if not fresh:
++        with la.pass_("links_refresh.build"):
++            build()
++
++
+ class ScopeRefresher:
+     """One lazy process-lifetime daemon; pending and active scopes share one bound.
+ 
+@@ -54,7 +98,7 @@ class ScopeRefresher:
+                 scope = next(iter(self._pending))
+                 context = self._pending[scope]
+             try:
+-                from hermes_cli import loop_accounting  # one ``links_refresh`` pass per rebuild
++                from hermes_cli import loop_accounting  # one check; nested .build counts actual rebuilds
+                 context.run(loop_accounting.timed, "links_refresh", self._refresh, scope)
+             except Exception:  # health: allow BLE001 -- refresh failure retains last-good data; later polls retry
+                 _log.warning('kanban remote links: background rebuild failed; serving the previous projection',
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 80a89ccd04..ec690a05cc 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -44,7 +44,7 @@ from hermes_cli.kanban_session_activity_attention import AttentionCache as _Atte
+ from hermes_cli.kanban_session_activity_attention import run_checks as _run_done_checks
+ from hermes_cli.kanban_session_activity_card_details import _add_card_details
+ from hermes_cli.kanban_watch import not_watch_sql as _not_watch
+-from hermes_cli.kanban_links_refresh import ScopeRefresher
++from hermes_cli.kanban_links_refresh import ScopeRefresher, refresh_decided
+ from hermes_cli import kanban_links_narrow as _links_narrow, kanban_external_activity as _external_activity
+ from hermes_cli.kanban_session_wait_rows import _describe_waits, _local_wait_info, _local_wait_rows
+ from hermes_cli.kanban_open_asks import card_is_open_human_ask, stamp_needs_you
+@@ -997,8 +997,8 @@ def _refresh_links_scope(scope: tuple) -> None:
+             return
+         fingerprint = _links_fingerprint()
+         hit = _links_cache.get(scope)
+-        if hit is None or not _links_fresh(hit, fingerprint):
+-            _publish_links(scope, fingerprint)
++        fresh = hit is not None and _links_fresh(hit, fingerprint)
++        refresh_decided(hit, fingerprint, fresh, time.monotonic(), lambda: _publish_links(scope, fingerprint))
+ 
+ 
+ _links_refresher = ScopeRefresher(lambda scope: _refresh_links_scope(scope), _LINKS_SCOPE_CAP)
+diff --git a/hermes_cli/kanban_session_provenance.py b/hermes_cli/kanban_session_provenance.py
+index 19dff12643..a7489127ac 100644
+--- a/hermes_cli/kanban_session_provenance.py
++++ b/hermes_cli/kanban_session_provenance.py
+@@ -28,42 +28,59 @@ def session_creation_source(row) -> Optional[str]:
+     return created if source == "local" else source
+ 
+ 
++def _read_sources(path: str, todo: list[str]) -> tuple[dict[str, Optional[str]], Optional[bool]]:
++    """``(found, readable)`` from one state.db; ``readable`` is None when the file does not exist."""
++    found: dict[str, Optional[str]] = {}
++    if not Path(path).exists():
++        return found, None
++    try:
++        uri = Path(path).as_uri() + "?mode=ro"
++        with closing(sqlite3.connect(uri, uri=True, timeout=5)) as db:  # noqa: kanban-lockguard (state.db)
++            columns = {r[1] for r in db.execute("PRAGMA table_info(sessions)")}
++            created = "created_source" if "created_source" in columns else "NULL"
++            for i in range(0, len(todo), 500):
++                chunk = todo[i:i + 500]
++                for sid, source, provenance in db.execute(
++                        f"SELECT id, source, {created} FROM sessions WHERE id IN ({','.join('?' * len(chunk))})", chunk):
++                    found[sid] = session_creation_source({"source": source, "created_source": provenance})
++    except sqlite3.Error:
++        return {}, False
++    return found, True
++
++
+ def _local_session_sources(sessions: Iterable[str], *, home: Optional[Path] = None) -> dict[str, Optional[str]]:
+-    """Read effective creation sources, without creating a store or migrating it."""
++    """Read effective creation sources, without creating a store or migrating it.
++
++    Inside a links pass (``kanban_links_chat_key``) the 300 s cache is not consulted: each id is read once per pass
++    and recorded as that board's key; an unreadable store marks the pass degraded (no key). [daveey]"""
+     from hermes_constants import get_hermes_home
++    from hermes_cli import kanban_links_chat_key as chat_key
+     path = str((home if home is not None else get_hermes_home()) / "state.db")
+     now = time.monotonic()
++    reads = chat_key.active()
+     out: dict[str, Optional[str]] = {}
+     todo = []
+     for sid in dict.fromkeys(sessions):
+-        hit = _source_cache.get((path, sid))
+-        if hit is not None and now - hit[1] < _MISSING_TTL_S:
++        if reads is not None:
++            if (value := reads.recall(("source", path, sid))) is not chat_key._MISSING:
++                out[sid] = value
++                continue
++        elif (hit := _source_cache.get((path, sid))) is not None and now - hit[1] < _MISSING_TTL_S:
+             out[sid] = hit[0]
+-        else:
+-            todo.append(sid)
++            continue
++        todo.append(sid)
+     if not todo:
+         return out
+-    found: dict[str, Optional[str]] = {}
+-    readable = False
+-    if Path(path).exists():
+-        try:
+-            uri = Path(path).as_uri() + "?mode=ro"
+-            with closing(sqlite3.connect(uri, uri=True, timeout=5)) as db:  # noqa: kanban-lockguard (state.db)
+-                columns = {r[1] for r in db.execute("PRAGMA table_info(sessions)")}
+-                created = "created_source" if "created_source" in columns else "NULL"
+-                for i in range(0, len(todo), 500):
+-                    chunk = todo[i:i + 500]
+-                    for sid, source, provenance in db.execute(
+-                            f"SELECT id, source, {created} FROM sessions WHERE id IN ({','.join('?' * len(chunk))})", chunk):
+-                        found[sid] = session_creation_source({"source": source, "created_source": provenance})
+-            readable = True
+-        except sqlite3.Error:
+-            pass
++    found, readable = _read_sources(path, todo)
+     for sid in todo:
+         source = found.get(sid)
+         out[sid] = str(source) if source is not None else None
+         if readable:
+             _source_cache[(path, sid)] = (out[sid], now)
++        if reads is not None and readable is not False:
++            reads.record(("source", path, sid), out[sid])
++    if readable is False:
++        chat_key.degrade()
+     return out
+ 
+ 
+@@ -72,7 +89,16 @@ def _local_homes(profile: Optional[str]) -> list[Path]:
+ 
+     Boards and legacy tui subscriptions are host-wide and often omit a profile.
+     Do not bind those rows to whichever profile happens to run reconciliation.
++    Inside a links pass the answer is part of the board's key (``kanban_links_chat_key``).
+     """
++    from hermes_cli import kanban_links_chat_key as chat_key
++    reads = chat_key.active()
++    if reads is None:
++        return _discover_homes(profile)
++    return [Path(h) for h in reads.answer(("homes", profile), lambda: tuple(str(h) for h in _discover_homes(profile)))]
++
++
++def _discover_homes(profile: Optional[str]) -> list[Path]:
+     from hermes_constants import get_hermes_home
+     from hermes_cli.profiles import get_active_profile_name, get_profile_dir, list_profile_names
+     active = get_active_profile_name()
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index ad5251a672..a70e3fdbf4 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1241,13 +1241,12 @@ class FeedWatcher:
+ 
+ 
+ LINKS_EVERY_S = 60.0
+-# Machine-session sources come from state.db (``kanban_db_notify._local_session_sources``), which is not in a links
+-# pass's key: a missing session is re-read after its 300 s TTL. An unchanged board is still reconciled this long after
+-# its last pass. A shared-cache refresh can add this interval after the missing-source TTL; content changes
+-# still reconcile immediately on the next links pass, and notification delivery checks sources independently. [daveey]
++# state.db answers (session sources, compression lineage, homes) are keyed by value: a pass records the reads it used
++# and the next one replays them (``kanban_links_chat_key``). Only a pass that swallowed a failed read has no such key;
++# its unchanged board is still reconciled this long after that pass, as every board was before. [daveey]
+ LINKS_MAX_AGE_S = 300.0
+-# Per board file: (inputs, started at) of the last completed links pass (see ``_links_inputs``).
+-_LINKS_DONE: dict[str, tuple[tuple, float]] = {}
++# Per board file: (inputs, started at, state.db reads or None) of the last completed links pass (``_links_inputs``).
++_LINKS_DONE: dict[str, tuple[tuple, float, Optional[dict]]] = {}
+ 
+ 
+ def _links_clock() -> float:
+@@ -1273,16 +1272,18 @@ def _links_pass_clock() -> float:
+ _LINKS_RUNNER: Any = None  # a kanban_sync_links_pass.LinksPass while the loop runs
+ 
+ 
+-def _links_unchanged(key: str, inputs: Optional[tuple], slug: str, began: float) -> tuple[bool, float]:
+-    """(whether a board's links-pass inputs equal its last completed pass's, under ``LINKS_MAX_AGE_S`` ago, so the
+-    pass is skipped; the pass start to record). Not a pure predicate: it pops ``_LINKS_DONE[key]`` and puts it back
+-    only on a skip, so a non-skip drops the stale entry and the caller re-records it when inputs were readable and
++def _links_unchanged(key: str, inputs: Optional[tuple], slug: str, began: float, reads: Any) -> tuple[bool, float]:
++    """(whether a board's links-pass inputs equal its last completed pass's and its state.db reads answer the same
++    (no recorded reads: under ``LINKS_MAX_AGE_S`` ago), so the pass is skipped; the pass start to record). Not a
++    pure predicate: it pops ``_LINKS_DONE[key]`` and puts it back only on a skip, so a non-skip drops the stale entry
++    and the caller re-records it when inputs were readable and
+     reconcile succeeded (unreadable inputs or a raising reconcile leave it dropped). A skip ``LINKS_SLOW_LOG_S`` or
+     more after ``began`` names its board; ``began`` is taken before the board's connection is
+     borrowed, so that time counts the connect (a lock wait included), ``board_mode`` and the inputs read."""
+     done = _LINKS_DONE.pop(key, None)
+     started = _links_clock()
+-    if inputs is None or done is None or done[0] != inputs or started - done[1] >= LINKS_MAX_AGE_S:
++    if inputs is None or done is None or done[0] != inputs or (
++            started - done[1] >= LINKS_MAX_AGE_S if done[2] is None else not reads.unchanged(done[2])):
+         return False, started
+     _LINKS_DONE[key] = done
+     took = _links_pass_clock() - began
+@@ -1295,7 +1296,7 @@ def _links_unchanged(key: str, inputs: Optional[tuple], slug: str, began: float)
+ def _links_inputs(conn: sqlite3.Connection, path: Path, slug: str, gateway: str, mode: str,
+                   ledger: Optional[dict[str, frozenset]], signature: Optional[tuple]) -> Optional[tuple]:
+     """Everything one board's links pass (``kanban_chat_links.reconcile`` with its creator-chats backfill) reads,
+-    besides state.db (``LINKS_MAX_AGE_S``): the live file's identity and transactional activity revision (tasks,
++    besides state.db (``kanban_links_chat_key``): the live file's identity and transactional activity revision (tasks,
+     events, subscriptions, links; trigger-backed, so dispatcher clocks and sync stamps do not move it), the replica's
+     main-file identity/stat and covered activity revision (not transport cursor or heartbeat progress), this gateway's
+     ledger rows for the board, the mode and the configuration. Legacy nonempty replica subscriptions are not covered
+@@ -1334,14 +1335,14 @@ def reconcile_links(boards: list[tuple[str, Path]], gateway: str, *, skip_unchan
+     """Bring this gateway's chat links up to date in every synced board (kanban_chat_links.reconcile), creating a
+     link-only board for each board this gateway's chats have cards on but this host does not have.
+ 
+-    ``skip_unchanged`` (the sync loop): a board whose links-pass inputs (``_links_inputs``) equal those of its last
+-    completed pass, less than ``LINKS_MAX_AGE_S`` ago, is not reconciled again. A failed pass records nothing, so the
+-    next one retries. Explicit callers (``hermes kanban sync links``) always reconcile. Boards are borrowed through
+-    the loop's connection scope (``kanban_sync_connections``). [daveey]"""
+-    from hermes_cli import kanban_chat_links
++    ``skip_unchanged`` (the sync loop): a board whose links-pass inputs (``_links_inputs``) and state.db reads
++    (``kanban_links_chat_key``) equal those of its last completed pass is not reconciled again. A failed pass records
++    nothing, so the next one retries. Explicit callers (``hermes kanban sync links``) always reconcile. Boards are
++    borrowed through the loop's connection scope (``kanban_sync_connections``). [daveey]"""
++    from hermes_cli import kanban_chat_links, kanban_links_chat_key as chat_key
+     from hermes_cli.kanban_placement import config_snapshot
+     pass_began = _links_pass_clock()
+-    with config_snapshot() as placement:
++    with config_snapshot() as placement, chat_key.pass_reads() as reads:
+         ledger: Optional[dict[str, frozenset]] = None
+         try:
+             from hermes_cli.kanban_session_activity import _remote_links
+@@ -1368,13 +1369,14 @@ def reconcile_links(boards: list[tuple[str, Path]], gateway: str, *, skip_unchan
+                     inputs, started = None, 0.0
+                     if skip_unchanged:
+                         inputs = _links_inputs(conn, path, slug, gateway, mode, ledger, signature)
+-                        skip, started = _links_unchanged(key, inputs, slug, began)
++                        skip, started = _links_unchanged(key, inputs, slug, began, reads)
+                         if skip:
+                             accounting.skip()
+                             continue
+-                    counts = kanban_chat_links.reconcile(conn, slug, gateway)
++                    with reads.board():
++                        counts = kanban_chat_links.reconcile(conn, slug, gateway)
+                     if inputs is not None:
+-                        _LINKS_DONE[key] = (inputs, started)
++                        _LINKS_DONE[key] = (inputs, started, reads.key())
+                 took = _links_pass_clock() - began
+                 if any(counts.values()) or took >= LINKS_SLOW_LOG_S:
+                     _log.info("kanban sync: %s chat links %s in %.1fs", slug, counts, took)
+diff --git a/tests/hermes_cli/test_kanban_links_refresh_accounting.py b/tests/hermes_cli/test_kanban_links_refresh_accounting.py
+new file mode 100644
+index 0000000000..e7a74af133
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_links_refresh_accounting.py
+@@ -0,0 +1,126 @@
++"""Refresh checks are not rebuilds; attribute actual decisions without extra IO."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import loop_accounting as la
++
++
++@pytest.fixture
++def harness(monkeypatch):
++    scope = ("accounting-scope",)
++    state = {"now": 10.0, "fingerprint": (("/board.db", (1,)),), "builds": 0}
++    monkeypatch.setattr(activity, "time", SimpleNamespace(monotonic=lambda: state["now"]))
++    monkeypatch.setattr(activity, "_origin_scope", lambda: scope)
++    monkeypatch.setattr(activity, "_links_cache", {})
++    monkeypatch.setattr(activity, "_links_fingerprint", lambda: state["fingerprint"])
++    monkeypatch.setattr(activity, "_board_db_paths", list)
++
++    def project():
++        state["builds"] += 1
++        if state.get("fail"):
++            raise ValueError("projection failed")
++        return [{"id": "one"}]
++
++    monkeypatch.setattr(activity, "_project_remote_links", project)
++    activity._links_narrow.reset()
++    yield state, scope
++    activity._links_narrow.reset()
++
++
++def runs():
++    return {k: v["runs"] for k, v in la.snapshot()["loops"].items()}
++
++
++def delta(before, name):
++    return runs().get(name, 0) - before.get(name, 0)
++
++
++def test_background_checks_distinguish_cold_skip_and_age(harness):
++    state, scope = harness
++    before = runs()
++    activity._refresh_links_scope(scope)
++    activity._refresh_links_scope(scope)
++    state["now"] += activity._LINKS_MAX_AGE_S
++    activity._refresh_links_scope(scope)
++    assert state["builds"] == 2
++    for name in ("cold", "skip", "age"):
++        assert delta(before, "links_refresh." + name) == 1, name
++    assert delta(before, "links_refresh.build") == 2
++
++
++@pytest.mark.parametrize("entry,kind", [
++    (("/board.db", (2,)), "board"),
++    (("/hub.db", None, (("tasks", 1, 2, 2),), "gateway"), "hub"),
++    (("/kanban/origin-ledger.db-wal", 1, 2, 3), "ledger"),
++])
++def test_changed_store_is_counted_at_real_rebuild(harness, entry, kind):
++    state, scope = harness
++    state["fingerprint"] = (entry,)
++    activity._refresh_links_scope(scope)
++    before = runs()
++    state["fingerprint"] = ()  # deletion also has to name the old store
++    activity._refresh_links_scope(scope)
++    assert state["builds"] == 2
++    assert delta(before, "links_refresh.inputs") == 1
++    assert delta(before, "links_refresh.changed." + kind) == 1
++    assert delta(before, "links_refresh.age") == 0
++
++
++def test_expiry_and_changed_inputs_are_both_reported(harness):
++    state, scope = harness
++    activity._refresh_links_scope(scope)
++    before = runs()
++    state["now"] += activity._LINKS_MAX_AGE_S
++    state["fingerprint"] = (("/board.db", (2,)),)
++    activity._refresh_links_scope(scope)
++    assert delta(before, "links_refresh.age_inputs") == 1
++    assert delta(before, "links_refresh.changed.board") == 1
++    assert delta(before, "links_refresh.build") == 1
++
++
++def test_narrowed_cache_hit_is_not_a_rebuild(harness, monkeypatch):
++    state, scope = harness
++    activity._refresh_links_scope(scope)
++    before = runs()
++    state["fingerprint"] = (("/unread.db", (2,)),)
++    monkeypatch.setattr(activity._links_narrow, "matches", lambda hit, fingerprint: True)
++    activity._refresh_links_scope(scope)
++    assert state["builds"] == 1
++    assert delta(before, "links_refresh.skip") == 1
++    assert delta(before, "links_refresh.build") == 0
++
++
++def test_projection_error_is_counted_and_not_published(harness):
++    state, scope = harness
++    state["fail"] = True
++    before = runs()
++    with pytest.raises(ValueError, match="projection failed"):
++        activity._refresh_links_scope(scope)
++    assert scope not in activity._links_cache
++    assert delta(before, "links_refresh.build") == 1
++    state["fail"] = False
++    activity._refresh_links_scope(scope)
++    assert state["builds"] == 2
++
++
++def test_multiple_raw_store_changes_count_each_category_once(harness):
++    state, scope = harness
++    state["fingerprint"] = (("/a.db", (1,)), ("/b.db", (1,)), ("/stable.db", (1,)))
++    activity._refresh_links_scope(scope)
++    before = runs()
++    state["fingerprint"] = (("/a.db", (2,)), ("/b.db", (2,)), ("/stable.db", (1,)),
++                            ("/kanban/origin-ledger.db", None), ("/hub.db", None, (), "gw"), "opaque")
++    activity._refresh_links_scope(scope)
++    for kind in ("board", "ledger", "hub", "unknown"):
++        assert delta(before, "links_refresh.changed." + kind) == 1
++    assert delta(before, "links_refresh.build") == 1
++
++
++def test_changed_scope_neither_builds_nor_reports_a_cache_decision(harness):
++    state, _scope = harness
++    before = runs()
++    activity._refresh_links_scope(("different",))
++    assert state["builds"] == 0
++    assert runs() == before
+diff --git a/tests/hermes_cli/test_kanban_sync_links_chat_key.py b/tests/hermes_cli/test_kanban_sync_links_chat_key.py
+new file mode 100644
+index 0000000000..a1f2490680
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_links_chat_key.py
+@@ -0,0 +1,400 @@
++"""A links pass keys its state.db reads by value: an unchanged board is reconciled again only when one of the
++answers it used changed, not every ``LINKS_MAX_AGE_S``. [daveey]
++
++Example incident (task t_eeeeee0000000018): repeated board reconciles were the 5-minute
++max-age re-run of boards whose inputs had not changed, only to re-read session sources that had not changed either.
++"""
++import contextvars
++import sqlite3
++import threading
++
++import pytest
++
++from hermes_cli import kanban_chat_links as links
++from hermes_cli import kanban_creator_chats as creator_chats
++from hermes_cli import kanban_links_chat_key as chat_key
++from hermes_cli import kanban_lockguard
++from hermes_cli import kanban_session_provenance as provenance
++from tests.hermes_cli import test_kanban_sync_steady_links as helpers
++
++kanban_home = helpers.kanban_home
++ledger = helpers.ledger
++live = helpers.live
++scope = helpers.scope
++spies = helpers.spies
++ksc = helpers.ksc
++ME, OTHER, BOARD = helpers.ME, helpers.OTHER, helpers.BOARD
++
++
++@pytest.fixture(autouse=True)
++def cold_source_cache():
++    provenance._source_cache.clear()
++    yield
++    provenance._source_cache.clear()
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    now = [1000.0]
++    monkeypatch.setattr(ksc, "_links_clock", lambda: now[0])
++    return now
++
++
++def _state(home, rows=(), *, table=True):
++    with sqlite3.connect(home / "state.db") as state:
++        if table:
++            state.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, source TEXT, created_source TEXT)")
++        else:
++            state.execute("CREATE TABLE IF NOT EXISTS other (id TEXT)")
++        for sid, source in rows:
++            state.execute("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?)", (sid, source, source))
++    state.close()
++    return True
++
++
++def _creator(live):
++    return live.execute("SELECT id FROM tasks WHERE title='creator'").fetchone()[0]
++
++
++def test_unchanged_chat_sources_skip_beyond_old_max_age(live, ledger, kanban_home, spies, scope, clock):
++    _state(kanban_home, [("s_creator", "desktop")])
++    settled = helpers._settled(live, ledger, kanban_home, spies)
++    for _ in range(3):
++        clock[0] += 601.0
++        helpers._pass(kanban_home)
++    assert spies == {"reconcile": 0, "backfill": 0}
++    assert helpers._links(live) == settled
++
++
++def test_a_board_without_any_state_db_skips_beyond_old_max_age(live, ledger, kanban_home, spies, scope, clock):
++    assert not (kanban_home / "state.db").exists()
++    settled = helpers._settled(live, ledger, kanban_home, spies)
++    clock[0] += 601.0
++    helpers._pass(kanban_home)
++    assert spies == {"reconcile": 0, "backfill": 0}
++    assert helpers._links(live) == settled
++
++
++def test_changed_chat_source_ignores_warm_provenance_ttl(live, ledger, kanban_home, spies, scope):
++    _state(kanban_home, [("s_creator", "desktop")])
++    helpers._settled(live, ledger, kanban_home, spies)
++    tid = _creator(live)
++    assert (tid, "s_creator", "created", 0) in helpers._links(live)
++    _state(kanban_home, [("s_creator", "kanban")])
++    helpers._pass(kanban_home)
++    assert spies["reconcile"] == 1
++    assert (tid, "s_creator", "created", 1) in helpers._links(live)
++
++
++def test_a_session_that_appears_ignores_the_missing_source_ttl(live, ledger, kanban_home, spies, scope):
++    """The negative answer is keyed too: a session row written after the pass re-arms the next one."""
++    _state(kanban_home)
++    helpers._settled(live, ledger, kanban_home, spies)
++    tid = _creator(live)
++    assert (tid, "s_creator", "created", 0) in helpers._links(live)
++    _state(kanban_home, [("s_creator", "cron")])
++    helpers._pass(kanban_home)
++    assert spies["reconcile"] == 1
++    assert (tid, "s_creator", "created", 1) in helpers._links(live)
++
++
++def test_a_state_db_that_appears_reconciles_on_the_next_pass(live, ledger, kanban_home, spies, scope):
++    helpers._settled(live, ledger, kanban_home, spies)
++    tid = _creator(live)
++    _state(kanban_home, [("s_creator", "kanban")])
++    helpers._pass(kanban_home)
++    assert spies["reconcile"] == 1
++    assert (tid, "s_creator", "created", 1) in helpers._links(live)
++
++
++def test_an_unrelated_state_db_commit_does_not_reconcile(live, ledger, kanban_home, spies, scope):
++    """state.db commits on every chat turn; only an answer the pass used is its key."""
++    _state(kanban_home, [("s_creator", "desktop")])
++    helpers._settled(live, ledger, kanban_home, spies)
++    _state(kanban_home, [("s_unrelated", "kanban")])
++    helpers._pass(kanban_home)
++    assert spies == {"reconcile": 0, "backfill": 0}
++
++
++def test_a_source_committed_during_the_pass_rearms_the_next_one(live, ledger, kanban_home, spies, scope, monkeypatch):
++    """The key is what the reconcile read, not a read made after it."""
++    _state(kanban_home, [("s_creator", "desktop")])
++    helpers._settled(live, ledger, kanban_home, spies)
++    tid, spied, wrote = _creator(live), links.reconcile, []
++
++    def concurrent(conn, *a, **k):
++        out = spied(conn, *a, **k)
++        if not wrote:
++            wrote.append(_state(kanban_home, [("s_creator", "kanban")]))
++        return out
++
++    monkeypatch.setattr(links, "reconcile", concurrent)
++    ledger.append(helpers._ledger_row("t_more", "s_chat"))  # arm one pass
++    helpers._pass(kanban_home)
++    assert wrote and (tid, "s_creator", "created", 0) in helpers._links(live)
++    helpers._pass(kanban_home)
++    assert (tid, "s_creator", "created", 1) in helpers._links(live)
++
++
++def test_an_unreadable_state_db_keeps_the_max_age_retry(live, ledger, kanban_home, spies, scope, clock):
++    """A swallowed read error records no key: the board is retried by age, and keyed once the store reads."""
++    _state(kanban_home, table=False)  # a store without a sessions table: every source read fails
++    helpers._settled(live, ledger, kanban_home, spies)
++    tid = _creator(live)
++    assert ksc._LINKS_DONE[str(kanban_home / "kanban.db")][2] is None
++    _state(kanban_home, [("s_creator", "kanban")])
++    clock[0] += ksc.LINKS_MAX_AGE_S - 1
++    helpers._pass(kanban_home)
++    assert spies["reconcile"] == 0
++    clock[0] += 2
++    helpers._pass(kanban_home)
++    assert spies["reconcile"] == 1
++    assert (tid, "s_creator", "created", 1) in helpers._links(live)
++    for _ in range(3):  # settle the release, then the board is keyed and no age applies
++        helpers._pass(kanban_home)
++    spies["reconcile"] = 0
++    clock[0] += 601.0
++    helpers._pass(kanban_home)
++    assert spies["reconcile"] == 0
++
++
++def test_a_new_profile_home_reconciles_on_the_next_pass(live, ledger, kanban_home, spies, scope, tmp_path, monkeypatch):
++    homes = [kanban_home]
++    monkeypatch.setattr(provenance, "_discover_homes", lambda profile: list(homes))
++    helpers._settled(live, ledger, kanban_home, spies)
++    helpers._pass(kanban_home)
++    assert spies["reconcile"] == 0
++    other = tmp_path / "other-profile"
++    other.mkdir()
++    _state(other, [("s_creator", "kanban")])
++    homes.append(other)
++    helpers._pass(kanban_home)
++    assert spies["reconcile"] == 1
++    assert (_creator(live), "s_creator", "created", 1) in helpers._links(live)
++
++
++def test_each_session_is_read_once_per_pass_and_the_cache_serves_everyone_else(kanban_home, monkeypatch):
++    _state(kanban_home, [("sid", "desktop")])
++    reads = []
++    real = provenance._read_sources
++    monkeypatch.setattr(provenance, "_read_sources", lambda path, todo: reads.append(list(todo)) or real(path, todo))
++    assert provenance._local_session_sources(["sid"], home=kanban_home) == {"sid": "desktop"}
++    with chat_key.pass_reads() as pass_:
++        assert provenance._local_session_sources(["sid"], home=kanban_home) == {"sid": "desktop"}
++        assert reads == [["sid"]], "outside a board's reconcile the shared cache answers"
++        _state(kanban_home, [("sid", "kanban")])
++        with pass_.board():
++            assert provenance._local_session_sources(["sid", "gone"], home=kanban_home) == {"sid": "kanban", "gone": None}
++            assert provenance._local_session_sources(["gone", "sid"], home=kanban_home) == {"gone": None, "sid": "kanban"}
++        assert reads == [["sid"], ["sid", "gone"]]
++        key = str(kanban_home / "state.db")
++        assert pass_.key() == {("source", key, "sid"): "kanban", ("source", key, "gone"): None}
++    assert provenance._local_session_sources(["sid"], home=kanban_home) == {"sid": "kanban"}
++    assert len(reads) == 2, "the pass refreshed the shared cache"
++
++
++def test_a_failed_read_is_not_this_passes_answer_for_the_next_board(kanban_home):
++    """Two boards share a session: the second must not take the first one's failed read as a certified answer."""
++    _state(kanban_home, table=False)
++    with chat_key.pass_reads() as pass_:
++        for _ in range(2):
++            with pass_.board():
++                assert provenance._local_session_sources(["sid"], home=kanban_home) == {"sid": None}
++            assert pass_.key() is None
++        assert pass_.memo == {}
++
++
++def test_a_thread_that_copied_the_context_does_not_join_the_pass():
++    seen = []
++    with chat_key.pass_reads() as pass_, pass_.board():
++        assert chat_key.active() is pass_
++        thread = threading.Thread(target=contextvars.copy_context().run, args=(lambda: seen.append(chat_key.active()),))
++        thread.start()
++        thread.join()
++        chat_key.degrade()
++    assert seen == [None]
++    assert pass_.key() is None and chat_key.active() is None
++
++
++def test_a_reconcile_that_raises_leaves_no_key():
++    with chat_key.pass_reads() as pass_:
++        with pass_.board():
++            pass
++        assert pass_.key() == {}
++        with pytest.raises(RuntimeError), pass_.board():
++            raise RuntimeError("reconcile failed")
++        assert pass_.key() is None and chat_key.active() is None
++
++
++def _replays(recorded):
++    with chat_key.pass_reads() as pass_:
++        return pass_.unchanged(recorded)
++
++
++def _chain_db(path, rows):
++    """A real state.db: each ``(id, parent, end_reason)`` session, in order."""
++    from hermes_state import SessionDB
++    state = SessionDB(db_path=path)
++    try:
++        for sid, parent, end_reason in rows:
++            state.create_session(sid, "cli", **({"parent_session_id": parent} if parent else {}))
++            if end_reason:
++                state.end_session(sid, end_reason)
++    finally:
++        state.close()
++
++
++def _without_sessions(path):
++    for name in (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
++        name.unlink(missing_ok=True)
++    with sqlite3.connect(path) as db:
++        db.execute("CREATE TABLE other (id TEXT)")
++    db.close()
++
++
++def test_a_compression_step_is_keyed_by_its_answer(tmp_path):
++    path = tmp_path / "state.db"
++    _chain_db(path, [("root", None, "compression"), ("tip", "root", None)])
++    with chat_key.pass_reads() as pass_, pass_.board():
++        db = sqlite3.connect(path)
++        try:
++            assert chat_key.chain_step(db, path, "root") == "tip"
++            assert chat_key.chain_step(db, path, "tip") is None
++            _chain_db(path, [("later", "root", "compression")])
++            assert chat_key.chain_step(db, path, "root") == "tip", "one answer per pass"
++        finally:
++            db.close()
++    recorded = pass_.key()
++    assert recorded == {("step", str(path), "root"): "tip", ("step", str(path), "tip"): None}
++    assert not _replays(recorded)
++    assert _replays({**recorded, ("step", str(path), "root"): "later"})
++    _without_sessions(path)
++    assert not _replays(recorded), "an unreadable store is a changed answer"
++
++
++def test_store_existence_homes_and_unknown_reads_replay_by_value(tmp_path, monkeypatch):
++    path = tmp_path / "state.db"
++    assert _replays({("exists", str(path)): False}) and not _replays({("exists", str(path)): True})
++    path.write_bytes(b"")
++    assert _replays({("exists", str(path)): True}) and not _replays({("exists", str(path)): False})
++    monkeypatch.setattr(provenance, "_discover_homes", lambda profile: [tmp_path / str(profile)])
++    assert _replays({("homes", "p"): (str(tmp_path / "p"),)})
++    assert not _replays({("homes", "p"): (str(tmp_path / "q"),)})
++    assert not _replays({("future-kind", "x"): 1})
++    assert _replays({})
++
++
++def test_a_degraded_replay_is_a_changed_answer(kanban_home):
++    key = ("source", str(kanban_home / "state.db"), "sid")
++    assert _replays({key: None})
++    _state(kanban_home, table=False)
++    assert not _replays({key: None})
++
++
++def _garbage(path):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_bytes(b"not a sqlite database" * 64)
++    return path
++
++
++def _degraded(call):
++    with chat_key.pass_reads() as pass_:
++        with pass_.board():
++            call()
++        return pass_.key() is None
++
++
++class _Broken:
++    def execute(self, *a, **k):
++        raise sqlite3.OperationalError("disk I/O error")
++
++
++def test_owner_release_and_replica_reader_errors_leave_no_key(live, ledger, kanban_home, scope):
++    assert not _degraded(lambda: links._owner_written_releases(BOARD, ME, {}))
++    assert not _degraded(lambda: creator_chats._ReplicaReader(live).open())
++    _garbage(ksc.shadow_path(BOARD))
++    assert _degraded(lambda: links._owner_written_releases(BOARD, ME, {}))
++    assert _degraded(lambda: creator_chats._ReplicaReader(live).open())
++
++
++def test_replica_resolve_and_verdict_read_errors_leave_no_key(live, ledger, kanban_home, scope):
++    reader = creator_chats._ReplicaReader(live)
++    assert not _degraded(lambda: reader.resolve("t_missing"))
++    assert not _degraded(lambda: creator_chats.LinkVerdicts.read(live, reader))
++    broken = creator_chats._ReplicaReader(live)
++    broken.attempted, broken.replica = True, _Broken()
++    assert _degraded(lambda: broken.resolve("t_missing"))
++    broken.replica = None
++    assert _degraded(lambda: creator_chats.LinkVerdicts.read(_Broken(), broken))
++
++
++def test_owner_hub_link_errors_leave_no_key(live, ledger, kanban_home, scope, monkeypatch):
++    tid = helpers.kb.create_task(live, title="owned", assignee="worker")
++    with helpers.kbc.write_txn(live):
++        live.execute("INSERT INTO kanban_notify_subs (task_id, platform, chat_id, created_at) VALUES (?, 'hub', ?, 1)",
++                     (tid, f"{OTHER}/default/s_remote"))
++    assert not _degraded(lambda: links._owner_hub_links(live, BOARD, ME))
++    assert [link["chat_session"] for link in links._owner_hub_links(live, BOARD, ME)] == ["s_remote"]
++    shadow = ksc.shadow_path(BOARD)
++    shadow.parent.mkdir(parents=True, exist_ok=True)
++    with sqlite3.connect(shadow) as replica:  # a replica without the links table
++        replica.execute("CREATE TABLE other (id TEXT)")
++    replica.close()
++    assert _degraded(lambda: links._owner_hub_links(live, BOARD, ME)), "a replica that opens but does not read"
++    real = kanban_lockguard.connect
++
++    def refuse(target, *a, **k):
++        if "mode=ro" in str(target):
++            raise sqlite3.OperationalError("unable to open database file")
++        return real(target, *a, **k)
++
++    monkeypatch.setattr(kanban_lockguard, "connect", refuse)
++    assert _degraded(lambda: links._owner_hub_links(live, BOARD, ME)), "a replica that does not open"
++
++
++class _FailingSubs:
++    """A board connection whose subscription reads fail (a lock, a damaged page), everything else intact."""
++
++    def __init__(self, conn):
++        self.conn = conn
++
++    def execute(self, sql, *a):
++        if "FROM kanban_notify_subs" in sql:
++            raise sqlite3.OperationalError("database is locked")
++        return self.conn.execute(sql, *a)
++
++
++def test_a_failed_subscription_read_leaves_no_key_but_a_board_without_the_table_does(live, ledger, kanban_home, scope):
++    helpers._seed(live, ledger)
++    assert not _degraded(lambda: links._local_links(live, ME))
++    assert not _degraded(lambda: links._owner_hub_links(live, BOARD, ME))
++    assert _degraded(lambda: links._local_links(_FailingSubs(live), ME))
++    assert _degraded(lambda: links._owner_hub_links(_FailingSubs(live), BOARD, ME))
++    links._local_links(_FailingSubs(live), ME)  # outside a pass: answered as before, no extra read
++    with helpers.kbc.write_txn(live):
++        live.execute("ALTER TABLE kanban_notify_subs RENAME TO subs_gone")
++    assert not _degraded(lambda: links._local_links(live, ME))
++    assert not _degraded(lambda: links._owner_hub_links(live, BOARD, ME))
++
++
++def test_compression_lineage_errors_leave_no_key(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setattr(provenance, "_discover_homes", lambda profile: [home])
++    rows = [{"uid": "u_old", "task_id": "t1", "chat_profile": "default", "chat_session": "root", "status": "running"}]
++    want = {"u_new": {"task_id": "t1", "chat_profile": "default", "chat_session": "tip", "chat_gateway": ME,
++                      "released": 0}}
++    with chat_key.pass_reads() as pass_:
++        with pass_.board():
++            assert links._compressed_away(rows, want, ME) == set()
++        assert pass_.key() == {("homes", "default"): (str(home),), ("exists", str(home / "state.db")): False}
++    _chain_db(home / "state.db", [("root", None, "compression"), ("tip", "root", None)])
++    with chat_key.pass_reads() as pass_:
++        with pass_.board():
++            assert links._compressed_away(rows, want, ME) == {"u_old"}
++        assert pass_.key()[("step", str(home / "state.db"), "root")] == "tip"
++    assert links._compressed_away(rows, want, ME) == {"u_old"}, "outside a pass the lineage reads as before"
++    _without_sessions(home / "state.db")
++    assert _degraded(lambda: links._compressed_away(rows, want, ME)), "a store whose lineage query fails"
++    _garbage(home / "state.db")
++    assert _degraded(lambda: links._compressed_away(rows, want, ME)), "a store that does not open"
+diff --git a/tests/hermes_cli/test_kanban_sync_local_integration.py b/tests/hermes_cli/test_kanban_sync_local_integration.py
+index 00bdf862be..284bc73499 100644
+--- a/tests/hermes_cli/test_kanban_sync_local_integration.py
++++ b/tests/hermes_cli/test_kanban_sync_local_integration.py
+@@ -213,27 +213,49 @@ def test_pulled_parent_rows_refresh_only_changed_parent(mirrored, monkeypatch, t
+     assert row_calls == [] and full_calls == [], "settled follow-up must skip both mirror paths"
+ 
+ 
+-def test_links_pass_keeps_its_300s_floor(live, kanban_home, monkeypatch):
++def test_links_pass_keeps_its_300s_floor_only_without_a_state_db_key(live, kanban_home, monkeypatch):
++    """The floor bounds a board whose state.db reads failed; a board that read them is keyed by the answers
++    (``kanban_links_chat_key``) and is not reconciled again by age."""
++    import sqlite3
++
+     from hermes_cli import kanban_chat_links
+     from hermes_cli import kanban_session_activity as ksa
++    from hermes_cli import kanban_session_provenance as provenance
+     from hermes_cli.kanban_creator_empty import ensure
+     sync.set_mode(live, "primary")
++    kb.create_task(live, title="from a chat", assignee="worker", session_id="s_chat")
+     # Test the settled deadline, not the initial backfill schema invalidation.
+     assert ensure(live)
+     monkeypatch.setattr(ksa, "_remote_links", lambda stale_ok=False: [])
+     ksc._LINKS_DONE.clear()
++    provenance._source_cache.clear()
+     now = [5000.0]
+     monkeypatch.setattr(ksc, "_links_clock", lambda: now[0])
+     calls = []
+     real = kanban_chat_links.reconcile
+     monkeypatch.setattr(kanban_chat_links, "reconcile", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+     boards = [(BOARD, kanban_home / "kanban.db")]
+-    for _ in range(3):
+-        ksc.reconcile_links(boards, ME, skip_unchanged=True)
+-    assert len(calls) == 1
++
++    def settle():
++        for _ in range(4):
++            ksc.reconcile_links(boards, ME, skip_unchanged=True)
++        calls.clear()
++
++    with sqlite3.connect(kanban_home / "state.db") as state:  # no sessions table: the source read fails
++        state.execute("CREATE TABLE other (id TEXT)")
++    state.close()
++    settle()
+     now[0] += 299.0  # literal: the stated floor, not the constant under test
+     ksc.reconcile_links(boards, ME, skip_unchanged=True)
+-    assert len(calls) == 1
++    assert len(calls) == 0
+     now[0] += 1
+     ksc.reconcile_links(boards, ME, skip_unchanged=True)
+-    assert len(calls) == 2
++    assert len(calls) == 1
++    with sqlite3.connect(kanban_home / "state.db") as state:
++        state.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, created_source TEXT)")
++    state.close()
++    now[0] += 300.0
++    settle()
++    now[0] += 3000.0
++    ksc.reconcile_links(boards, ME, skip_unchanged=True)
++    assert len(calls) == 0
+diff --git a/tests/hermes_cli/test_kanban_sync_steady_links.py b/tests/hermes_cli/test_kanban_sync_steady_links.py
+index c5b6129b1b..cc7181623e 100644
+--- a/tests/hermes_cli/test_kanban_sync_steady_links.py
++++ b/tests/hermes_cli/test_kanban_sync_steady_links.py
+@@ -286,9 +286,13 @@ def test_a_replaced_board_file_reconciles_on_the_next_pass(live, ledger, kanban_
+     assert spies["reconcile"] == 1
+ 
+ 
+-def test_the_maximum_age_reconciles_an_unchanged_board(live, ledger, kanban_home, spies, scope, monkeypatch):
+-    """State.db machine-session sources are not keyed (a missing session is re-read after its TTL); the pass is
++def test_the_maximum_age_reconciles_an_unchanged_board_whose_state_db_reads_failed(live, ledger, kanban_home, spies,
++                                                                                   scope, monkeypatch):
++    """State.db answers are keyed by value (``kanban_links_chat_key``); only a pass that could not read them is
+     bounded by ``LINKS_MAX_AGE_S`` instead."""
++    with sqlite3.connect(kanban_home / "state.db") as state:  # no sessions table: every source read fails
++        state.execute("CREATE TABLE other (id TEXT)")
++    state.close()
+     _settled(live, ledger, kanban_home, spies)
+     later = time.monotonic() + ksc.LINKS_MAX_AGE_S + 1
+     monkeypatch.setattr(ksc, "_links_clock", lambda: later)
+-- 
+2.43.0
+

@@ -1,0 +1,163 @@
+From 7aee5e56fa4e5eea2e050d8ea37c8de26701c4c7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 16:30:11 -0800
+Subject: [PATCH] fix(update): `hermes update --force` stops supervised
+ gateways through the waiting stops [daveey]
+
+force_stop's supervisor thread called _stop_at_once(entry), but _stop_at_once became the queued
+(entry, deadline, procs) form, so every `hermes update --force` over a launchd or systemd gateway
+deferred with "_stop_at_once() missing 2 required positional arguments" and never applied. The thread
+now calls the waiting stops _disarm already uses: _stop_unit for systemd, _stop_job for launchd. It
+stays alive until the supervisor's stop is done, which is what the kill / settle / StopUnsettled
+checks read; a failed bootout with a respawned gateway raises PauseRefused as the old stop did.
+
+The tests stubbed _stop_at_once with a one-argument lambda, which hid the mismatch. They now stub
+_stop_unit, and new tests run the real _stop_job (launchctl stood in: success, failed bootout with a
+respawn) and the real _stop_unit (systemd job runner stood in: job still running -> StopUnsettled).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/update_cmd_force_stop.py        | 10 ++-
+ tests/hermes_cli/test_update_force_stop.py | 87 +++++++++++++++++++++-
+ 2 files changed, 93 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/update_cmd_force_stop.py b/hermes_cli/update_cmd_force_stop.py
+index 608a784884..1bb439e715 100644
+--- a/hermes_cli/update_cmd_force_stop.py
++++ b/hermes_cli/update_cmd_force_stop.py
+@@ -173,7 +173,7 @@ def _stop_one(token: dict, entry: dict, lock: threading.Lock) -> tuple[bool, str
+     """Stop *entry* within its own deadline. ``None`` when it is gone (and, if supervised, its
+     supervisor is stopped), else ``(unsettled, why)``: *unsettled* when its stop is still running."""
+     from hermes_cli import update_pause_record as pause_record
+-    from hermes_cli.update_cmd_posix_pause import _names, _stop_at_once, _wait_gone
++    from hermes_cli.update_cmd_posix_pause import _names, _stop_job, _stop_unit, _wait_gone
+     work = _live_work(entry)
+     homes = _checkpoint_homes(entry)
+     with lock:  # the pause record is one file shared by every entry
+@@ -182,7 +182,13 @@ def _stop_one(token: dict, entry: dict, lock: threading.Lock) -> tuple[bool, str
+     if entry.get("kind"):
+         def _supervisor_stop() -> None:
+             try:
+-                _stop_at_once(entry)
++                # The waiting stops (as _disarm uses): this thread stays alive until the supervisor's stop is
++                # done, which is what the kill and StopUnsettled checks below read. A failed launchd bootout
++                # that left a respawned gateway raises PauseRefused, reported as this entry's refusal.
++                if entry.get("kind") == "systemd":
++                    _stop_unit(entry)
++                else:
++                    _stop_job(entry)
+             except Exception as exc:  # health: allow BLE001 -- reported as this entry's refusal below
+                 failed.append(str(exc))
+         supervisor = threading.Thread(target=_supervisor_stop, name=f"force-stop-{entry['pid']}", daemon=True)
+diff --git a/tests/hermes_cli/test_update_force_stop.py b/tests/hermes_cli/test_update_force_stop.py
+index a7e394bccb..fe946aca33 100644
+--- a/tests/hermes_cli/test_update_force_stop.py
++++ b/tests/hermes_cli/test_update_force_stop.py
+@@ -72,7 +72,7 @@ def test_force_kills_the_unit_when_its_stop_job_outlives_the_gateway(monkeypatch
+     released, kills = threading.Event(), []
+     monkeypatch.setattr(force_stop, "FORCE_KILL_AFTER_S", 0.5)
+     monkeypatch.setattr(force_stop, "_live_work", lambda entry: [])
+-    monkeypatch.setattr(posix_pause, "_stop_at_once", lambda entry: released.wait(10))
++    monkeypatch.setattr(posix_pause, "_stop_unit", lambda entry: released.wait(10))
+     monkeypatch.setattr(force_stop, "_kill", lambda entry: (kills.append(entry["unit"]), released.set()))
+     gone = {"pid": 2 ** 22 + 7, "home": str(tmp_path), "ct": None, "kind": "systemd", "scope": "user",
+             "unit": "hermes-gateway.service"}
+@@ -131,7 +131,7 @@ def test_an_unsettled_force_stop_aborts_before_the_checkout_moves(monkeypatch, t
+     monkeypatch.setattr(posix_pause, "_discover_launchd", list)
+     monkeypatch.setattr(posix_pause, "_left_running", lambda units, jobs: (units, jobs, []))
+     monkeypatch.setattr(posix_pause, "_discover_bare", lambda service_pids: ([], []))
+-    monkeypatch.setattr(posix_pause, "_stop_at_once", lambda entry: released.wait(30))
++    monkeypatch.setattr(posix_pause, "_stop_unit", lambda entry: released.wait(30))
+     monkeypatch.setattr(posix_pause, "resume_paused_set",
+                         lambda token: pytest.fail("a start was queued behind a stop still running"))
+     monkeypatch.setattr(force_stop, "_kill", lambda entry: None)
+@@ -218,3 +218,86 @@ def test_recovery_never_starts_a_unit_whose_force_stop_is_still_running(monkeypa
+     [claim] = pause_record._claims(pause_record.record_path())
+     owed = pause_record.read(claim)["token"]
+     assert [u["unit"] for u in owed["posix_units"]] == ["hermes-gateway.service"], "the unit's restart was dropped"
++
++
++
++def _launchd_entry(proc, tmp_path) -> dict:
++    return {"pid": proc.pid, "home": str(tmp_path), "ct": None, "kind": "launchd", "label": "ai.hermes.gateway",
++            "domain": "gui/501"}
++
++
++def test_force_stops_a_launchd_gateway_through_the_real_stop_job(monkeypatch, tmp_path, no_record):
++    """[daveey] Regression: `hermes update --force` crashed on every supervised gateway ("_stop_at_once()
++    missing 2 required positional arguments") because the stubs took only ``entry``. This runs the real
++    waiting ``_stop_job``; only ``launchctl`` itself is stood in (its bootout stops the gateway)."""
++    proc = _child(ignore_term=False)
++    calls = []
++
++    def run(cmd, **kw):
++        calls.append(cmd)
++        assert cmd[:2] == ["launchctl", "bootout"], cmd
++        proc.terminate()
++        return subprocess.CompletedProcess(cmd, 0, "", "")
++
++    try:
++        monkeypatch.setattr(force_stop, "FORCE_KILL_AFTER_S", 5.0)
++        monkeypatch.setattr(force_stop, "_live_work", lambda entry: [])
++        monkeypatch.setattr(posix_pause.subprocess, "run", run)
++        monkeypatch.setattr(force_stop, "_kill", lambda entry: pytest.fail("a gateway the bootout stopped is never killed"))
++        force_stop.force_stop_gateways({}, [_launchd_entry(proc, tmp_path)])
++        assert calls == [["launchctl", "bootout", "gui/501/ai.hermes.gateway"]]
++        assert proc.wait(timeout=5) is not None
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++
++
++def test_a_failed_launchd_bootout_with_a_respawned_gateway_is_refused(monkeypatch, tmp_path, no_record):
++    """The bootout failed and launchd still runs a gateway (KeepAlive respawned it on the old tree):
++    the force stop must refuse rather than report the stop done."""
++    from hermes_cli import gateway as gateway_mod
++    proc = _child(ignore_term=False)
++
++    def run(cmd, **kw):
++        proc.terminate()  # the old PID goes away...
++        return subprocess.CompletedProcess(cmd, 5, "", "Boot-out failed: 5: Input/output error")
++
++    try:
++        monkeypatch.setattr(force_stop, "FORCE_KILL_AFTER_S", 5.0)
++        monkeypatch.setattr(force_stop, "_live_work", lambda entry: [])
++        monkeypatch.setattr(posix_pause.subprocess, "run", run)
++        # ...but launchd reports a live job PID: a respawn on the old tree.
++        monkeypatch.setattr(gateway_mod, "_locate_launchd_gateway_service", lambda label: (label, 4242))
++        monkeypatch.setattr(force_stop, "_kill", lambda entry: None)
++        with pytest.raises(posix_pause.PauseRefused, match="launchctl bootout ai.hermes.gateway failed"):
++            force_stop.force_stop_gateways({}, [_launchd_entry(proc, tmp_path)])
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++
++
++def test_a_systemd_stop_job_still_running_is_unsettled_through_the_real_stop_unit(monkeypatch, tmp_path, no_record):
++    """The real ``_stop_unit`` waits on systemd's stop job. With the gateway already gone but the job
++    still running past the force deadline and its kill, the force stop raises StopUnsettled instead
++    of reporting the unit stopped (the queued ``stop --no-block`` returned at once and hid this)."""
++    import threading
++    from hermes_cli import update_cmd_fleet_unit_budget as unit_budget
++    released = threading.Event()
++
++    def run_unit_job(cmd, scope_cmd, verb, unit, timeout):
++        released.wait(10)  # the stop job outlives the deadline
++        return subprocess.CompletedProcess(cmd, 0, "", "")
++
++    monkeypatch.setattr(unit_budget, "run_unit_job", run_unit_job)
++    monkeypatch.setattr(posix_pause, "_manage_cmd", lambda scope: ["systemctl", "--user"])
++    monkeypatch.setattr(force_stop, "_live_work", lambda entry: [])
++    monkeypatch.setattr(force_stop, "_kill", lambda entry: None)
++    monkeypatch.setattr(force_stop, "FORCE_KILL_AFTER_S", 0.2)
++    monkeypatch.setattr(force_stop, "_STOP_JOB_SETTLE_S", 0.2)
++    unit = {"kind": "systemd", "scope": "user", "unit": "hermes-gateway.service", "pid": 2 ** 22 + 11,
++            "home": str(tmp_path), "ct": None}
++    try:
++        with pytest.raises(posix_pause.StopUnsettled, match="hermes-gateway.service|still stopping"):
++            force_stop.force_stop_gateways({}, [unit])
++    finally:
++        released.set()
+-- 
+2.43.0
+

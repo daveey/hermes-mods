@@ -1,0 +1,254 @@
+From 55510c261e6b8f0b53d7d679c9934e52129ec900 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 21:55:00 +0000
+Subject: [PATCH] fix(kanban): register containment SQL functions once per
+ connection [daveey]
+
+SQLite refuses replacement of a user function while any statement is active. Keep a connection-owned callable and refresh its Python callback, preserving verifier and snapshot behavior without replacing the SQL registration. Weak-value bookkeeping is released on connection close; plain SQLite connections need no weakref support. Quarantine modules have no create_function sites.
+
+Proof: active-cursor RED 6 failed/1 passed; GREEN 9 passed including stop+release certify_page and close cleanup. scripts/check --base origin/main passed.
+---
+ hermes_cli/kanban_containment_functions.py    |  37 ++++++
+ hermes_cli/kanban_containment_guard.py        |  15 +--
+ hermes_cli/kanban_containment_replica.py      |   3 +-
+ ...est_kanban_containment_udf_registration.py | 118 ++++++++++++++++++
+ 4 files changed, 165 insertions(+), 8 deletions(-)
+ create mode 100644 hermes_cli/kanban_containment_functions.py
+ create mode 100644 tests/hermes_cli/test_kanban_containment_udf_registration.py
+
+diff --git a/hermes_cli/kanban_containment_functions.py b/hermes_cli/kanban_containment_functions.py
+new file mode 100644
+index 0000000000..358e22d59a
+--- /dev/null
++++ b/hermes_cli/kanban_containment_functions.py
+@@ -0,0 +1,37 @@
++"""Connection-owned SQLite callbacks that can be refreshed with active cursors."""
++from __future__ import annotations
++
++import sqlite3
++import weakref
++from collections.abc import Callable
++
++
++class _Function:
++    def __init__(self, conn: sqlite3.Connection, callback: Callable) -> None:
++        self.conn = conn
++        self.callback = callback
++
++    def __call__(self, *args):
++        return self.callback(*args)
++
++
++# sqlite3.Connection itself is not weak-referenceable. SQLite owns the callable
++# until close (or collection); weak values avoid retaining connections globally
++# and prevent a recycled connection id from inheriting another connection's UDF.
++_FUNCTIONS: weakref.WeakValueDictionary[tuple[int, str, int], _Function] = weakref.WeakValueDictionary()
++
++
++def register(conn: sqlite3.Connection, name: str, arity: int, callback: Callable) -> None:
++    """Replace Python callback semantics, never re-register an existing SQL UDF.
++
++    SQLite rejects create_function replacement while ANY statement is active.
++    Refreshing the callable also preserves guard verifier/snapshot transitions.
++    """
++    key = (id(conn), name, arity)
++    function = _FUNCTIONS.get(key)
++    if function is not None:
++        function.callback = callback
++        return
++    function = _Function(conn, callback)
++    conn.create_function(name, arity, function)
++    _FUNCTIONS[key] = function
+diff --git a/hermes_cli/kanban_containment_guard.py b/hermes_cli/kanban_containment_guard.py
+index e1d6dd4a72..56f95c46a3 100644
+--- a/hermes_cli/kanban_containment_guard.py
++++ b/hermes_cli/kanban_containment_guard.py
+@@ -12,6 +12,7 @@ import sqlite3
+ from collections.abc import Callable, Iterator, Mapping
+ from typing import Any
+ 
++from hermes_cli.kanban_containment_functions import register as register_function
+ from hermes_cli.kanban_containment_state import reduce_events
+ 
+ _WRITE: contextvars.ContextVar[tuple[int, str] | None] = contextvars.ContextVar("containment_write", default=None)
+@@ -67,7 +68,7 @@ def inert_snapshot(conn: sqlite3.Connection) -> None:
+     for name, arity in (("kanban_containment_held", 1), ("kanban_containment_write", 1), ("kanban_containment_delete", 1),
+                         ("kanban_containment_sync_task", 1), ("kanban_containment_sync_event", 4),
+                         ("kanban_containment_sync_edge", 2), ("kanban_containment_cache_write", 0)):
+-        conn.create_function(name, arity, lambda *a: 0)
++        register_function(conn, name, arity, lambda *a: 0)
+ 
+ 
+ def pending(conn: sqlite3.Connection, task_id: str, *, verify_release: Callable | None = None) -> bool:
+@@ -101,17 +102,17 @@ def pending(conn: sqlite3.Connection, task_id: str, *, verify_release: Callable
+ 
+ def register(conn: sqlite3.Connection, *, verify_release: Callable | None = None) -> None:
+     """Register per-connection functions without schema writes or network I/O."""
+-    conn.create_function("kanban_containment_held", 1,
++    register_function(conn, "kanban_containment_held", 1,
+                          lambda task: int(pending(conn, task, verify_release=verify_release)))
+-    conn.create_function("kanban_containment_delete", 1,
++    register_function(conn, "kanban_containment_delete", 1,
+                          lambda task: int(conn.in_transaction and _DELETE.get() == (id(conn), task)))
+-    conn.create_function("kanban_containment_write", 1,
++    register_function(conn, "kanban_containment_write", 1,
+                          lambda task: int(conn.in_transaction and _WRITE.get() == (id(conn), task)))
+     from hermes_cli import kanban_containment_replica as replica
+-    conn.create_function("kanban_containment_sync_task", 1, lambda task: replica.task_permit(conn, task))
+-    conn.create_function("kanban_containment_sync_event", 4,
++    register_function(conn, "kanban_containment_sync_task", 1, lambda task: replica.task_permit(conn, task))
++    register_function(conn, "kanban_containment_sync_event", 4,
+                          lambda uid, task, kind, payload: replica.event_permit(conn, uid, task, kind, payload))
+-    conn.create_function("kanban_containment_sync_edge", 2, lambda parent, child: replica.edge_permit(conn, parent, child))
++    register_function(conn, "kanban_containment_sync_edge", 2, lambda parent, child: replica.edge_permit(conn, parent, child))
+     replica.register(conn)
+ 
+ 
+diff --git a/hermes_cli/kanban_containment_replica.py b/hermes_cli/kanban_containment_replica.py
+index fc1323315b..57d8ebad0f 100644
+--- a/hermes_cli/kanban_containment_replica.py
++++ b/hermes_cli/kanban_containment_replica.py
+@@ -13,6 +13,7 @@ import sqlite3
+ from collections.abc import Iterator
+ 
+ from hermes_cli import kanban_containment_canonical as canonical
++from hermes_cli.kanban_containment_functions import register as register_function
+ from hermes_cli.kanban_containment_lifecycle import ContainmentConflict, ContainmentRefused
+ from hermes_cli.kanban_containment_state import _payload
+ 
+@@ -21,7 +22,7 @@ _SCOPE = contextvars.ContextVar("containment_replica_projection", default=None)
+ 
+ 
+ def register(conn: sqlite3.Connection) -> None:
+-    conn.create_function("kanban_containment_cache_write", 0, lambda: int(_CACHE.get() == id(conn) and conn.in_transaction))
++    register_function(conn, "kanban_containment_cache_write", 0, lambda: int(_CACHE.get() == id(conn) and conn.in_transaction))
+ 
+ 
+ def install(conn: sqlite3.Connection) -> None:
+diff --git a/tests/hermes_cli/test_kanban_containment_udf_registration.py b/tests/hermes_cli/test_kanban_containment_udf_registration.py
+new file mode 100644
+index 0000000000..e410ae32d4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_containment_udf_registration.py
+@@ -0,0 +1,118 @@
++"""Containment UDF registration must not reset active SQLite statements."""
++import gc
++import sqlite3
++import weakref
++
++import pytest
++
++from hermes_cli import kanban_containment_guard as guard
++from hermes_cli import kanban_containment_replica as replica
++from tests.hermes_cli import test_kanban_containment_replica as fixtures
++
++kanban_home = fixtures.kanban_home
++synced_conn = fixtures.synced_conn
++
++
++@pytest.mark.parametrize("operation", ["install", "remember", "guard", "snapshot"])
++def test_registration_preserves_active_cursor(synced_conn, operation):
++    conn = synced_conn
++    target, _, stop, _, hub = fixtures.scenario(conn)
++    replica.install(conn)
++    cursor = conn.execute("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
++    assert cursor.fetchone()[0] == 1
++    try:
++        if operation == "install":
++            replica.install(conn)
++        elif operation == "remember":
++            replica.remember(conn, hub.events[stop["event_uid"]], board="fixture", task=target, uid=stop["event_uid"])
++        elif operation == "guard":
++            guard.register(conn)
++        else:
++            # Snapshot registration is an intentional replacement, but must not
++            # replace SQLite's callable while the connection has active work.
++            guard.inert_snapshot(conn)
++            guard.inert_snapshot(conn)
++        assert [row[0] for row in cursor] == [2, 3]
++    finally:
++        cursor.close()
++
++
++def test_certify_page_with_stop_and_release_preserves_active_cursor(synced_conn):
++    conn = synced_conn
++    target, child, stop, release, hub = fixtures.scenario(conn)
++    changes = [fixtures.event(stop, hub, 1), fixtures.event(release, hub, 2)]
++    cursor = conn.execute("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
++    assert cursor.fetchone()[0] == 1
++    try:
++        replica.certify_page(conn, hub, "fixture", changes)
++        assert [row[0] for row in cursor] == [2, 3]
++    finally:
++        cursor.close()
++    assert {row[0] for row in conn.execute("SELECT uid FROM containment_canonical_receipts")} == {
++        stop["event_uid"], release["event_uid"]}
++    fixtures.apply(conn, hub, changes)
++    assert not fixtures.connections.held(conn, target)
++    assert fixtures.kb.get_task(conn, child).status == "todo"
++
++
++def test_guard_re_registration_updates_verifier(synced_conn, monkeypatch):
++    conn = synced_conn
++    monkeypatch.setattr(guard, "pending", lambda conn, task, verify_release: verify_release({}, {}))
++    guard.register(conn, verify_release=lambda r, s: False)
++    assert conn.execute("SELECT kanban_containment_held('fixture')").fetchone()[0] == 0
++    cursor = conn.execute("SELECT 1 UNION ALL SELECT 2")
++    try:
++        guard.register(conn, verify_release=lambda r, s: True)
++        assert conn.execute("SELECT kanban_containment_held('fixture')").fetchone()[0] == 1
++        assert len(cursor.fetchall()) == 2
++    finally:
++        cursor.close()
++
++
++def test_plain_connections_register_independently():
++    with sqlite3.connect(":memory:") as first, sqlite3.connect(":memory:") as second:
++        replica.register(first)
++        replica.register(second)
++        first.execute("BEGIN")
++        token = replica._CACHE.set(id(first))
++        try:
++            assert first.execute("SELECT kanban_containment_cache_write()").fetchone()[0] == 1
++            assert second.execute("SELECT kanban_containment_cache_write()").fetchone()[0] == 0
++        finally:
++            replica._CACHE.reset(token)
++    first.close()
++    second.close()
++
++
++def test_close_releases_registration_bookkeeping():
++    from hermes_cli import kanban_containment_functions as functions
++    conn = sqlite3.connect(":memory:")
++    replica.register(conn)
++    key = (id(conn), "kanban_containment_cache_write", 0)
++    callback = weakref.ref(functions._FUNCTIONS[key])
++    conn.close()
++    del conn
++    gc.collect()
++    assert callback() is None
++    assert key not in functions._FUNCTIONS
++
++
++def test_snapshot_callback_can_be_restored_without_sql_replacement():
++    conn = sqlite3.connect(":memory:")
++    try:
++        replica.register(conn)
++        conn.execute("BEGIN")
++        token = replica._CACHE.set(id(conn))
++        cursor = conn.execute("SELECT 1 UNION ALL SELECT 2")
++        try:
++            assert conn.execute("SELECT kanban_containment_cache_write()").fetchone()[0] == 1
++            guard.inert_snapshot(conn)
++            assert conn.execute("SELECT kanban_containment_cache_write()").fetchone()[0] == 0
++            replica.register(conn)
++            assert conn.execute("SELECT kanban_containment_cache_write()").fetchone()[0] == 1
++            assert len(cursor.fetchall()) == 2
++        finally:
++            cursor.close()
++            replica._CACHE.reset(token)
++    finally:
++        conn.close()
+-- 
+2.43.0
+

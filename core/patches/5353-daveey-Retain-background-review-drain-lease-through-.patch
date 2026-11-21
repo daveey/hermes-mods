@@ -1,0 +1,154 @@
+From 45ff6855b12b21d59e115e8627cb18e4a4f7df61 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 21:52:24 +0000
+Subject: [PATCH] [daveey] Retain background review drain lease through thread
+ cleanup
+
+---
+ run_agent.py                                  | 29 +++++++--
+ .../test_worker_drain_background_review.py    | 64 +++++++++++++++++++
+ 2 files changed, 86 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_worker_drain_background_review.py
+
+diff --git a/run_agent.py b/run_agent.py
+index 9264e8dfc8..e8c33ce5bb 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -807,20 +807,28 @@ class AIAgent(
+         requeue) releases, every earlier exit releases here. A requeue enqueues before the predecessor
+         releases, so a rescheduled review never shows a zero gap."""
+         from agent import local_work_agent
++        from hermes_cli.worker_drain_fence import admit, lease_scope
+ 
+-        custody = [local_work_agent.reserve("background_review", "run_agent._spawn_background_review_now")]
++        drain = [admit('background_review')]
++        custody = []
+         try:
+-            __class__._spawn_background_review_run(  # defining class: stand-in agents drive this method
+-                self, messages_snapshot, review_memory, review_skills, focus, task_cfg, _requeue_attempts, explicit,
+-                _work=custody)
++            custody.append(local_work_agent.reserve("background_review", "run_agent._spawn_background_review_now"))
++            with lease_scope(drain[0]):
++                __class__._spawn_background_review_run(  # defining class: stand-in agents drive this method
++                    self, messages_snapshot, review_memory, review_skills, focus, task_cfg, _requeue_attempts, explicit,
++                    _work=custody, _drain=drain)
+         finally:
+             for held in custody:  # the thread took custody (list cleared) or nothing started
+                 local_work_agent.release(held)
++            for lease in drain:
++                if lease is not None:
++                    lease.close()
+ 
+     def _spawn_background_review_run(self, messages_snapshot: list[dict], review_memory: bool = False,
+                                      review_skills: bool = False, focus: Optional[str] = None,
+                                      task_cfg: Optional[dict[str, Any]] = None, _requeue_attempts: int = 0,
+-                                     explicit: bool = False, _work: Optional[list] = None) -> None:
++                                     explicit: bool = False, _work: Optional[list] = None,
++                                     _drain: Optional[list] = None) -> None:
+         """Spawn the background memory/skill review thread.
+ 
+         ``threading.Thread`` is constructed here so tests patching ``run_agent.threading.Thread`` keep working.
+@@ -854,6 +862,7 @@ class AIAgent(
+             )
+ 
+             work_held = _work[0] if _work else None
++            drain_held = _drain[0] if _drain else None
+ 
+             def _target_with_requeue() -> None:
+                 try:
+@@ -872,14 +881,20 @@ class AIAgent(
+                         self._maybe_requeue_preempted_review(review_run, requeue)
+                 finally:
+                     # Outermost: only after the requeue (which holds its own continuation) is done.
+-                    if work_held is not None:
+-                        work_held.release()
++                    try:
++                        if work_held is not None:
++                            work_held.release()
++                    finally:
++                        if drain_held is not None:
++                            drain_held.close()
+ 
+             # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
+             # right profile.
+             threading.Thread(target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review").start()  # health: allow HX012 -- target already wrapped by propagate_context_to_thread
+             if _work:
+                 _work.clear()  # started: the thread's finally owns the token
++            if _drain:
++                _drain.clear()  # independent lease outlives the caller's turn lease
+         except Exception:
+             retirement.end_background_review(hold)
+             finish_background_review_run(self, review_run)
+diff --git a/tests/hermes_cli/test_worker_drain_background_review.py b/tests/hermes_cli/test_worker_drain_background_review.py
+new file mode 100644
+index 0000000000..0f3d449b72
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_background_review.py
+@@ -0,0 +1,64 @@
++"""Background review custody precedes spawn and outlives target plus requeue."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import worker_drain_fence as fence
++
++
++@pytest.mark.parametrize('start_fails', [False, True])
++def test_review_retains_independent_lease_through_outermost_cleanup(monkeypatch, start_fails):
++    from agent import background_review, local_work_agent, review_idle_queue
++    from hermes_cli.backend_retirement import retirement
++    import run_agent
++
++    events, targets = [], []
++    lease = SimpleNamespace(closed=False)
++
++    def close():
++        lease.closed = True
++        events.append('close')
++
++    lease.close = close
++    monkeypatch.setattr(fence, 'admit', lambda purpose: (events.append('admit') or lease))
++    monkeypatch.setattr(local_work_agent, 'reserve', lambda *a: None)
++    monkeypatch.setattr(background_review, 'prepare_background_review_run', lambda agent: SimpleNamespace())
++    monkeypatch.setattr(background_review, 'finish_background_review_run', lambda *a: None)
++    monkeypatch.setattr(retirement, 'begin_background_review', lambda *a: object())
++    monkeypatch.setattr(retirement, 'end_background_review', lambda *a: events.append('retirement-end'))
++
++    def target():
++        assert not lease.closed
++        assert fence._authority.get() is lease
++        events.append('target')
++
++    monkeypatch.setattr(background_review, 'spawn_background_review_thread', lambda *a, **k: (target, 'prompt'))
++
++    def requeue(*a):
++        assert not lease.closed
++        events.append('requeue')
++        return True
++
++    monkeypatch.setattr(review_idle_queue, 'requeue_update_paused_review', requeue)
++
++    class Thread:
++        def __init__(self, *, target, **kwargs):
++            targets.append(target)
++
++        def start(self):
++            assert events == ['admit']
++            if start_fails:
++                raise RuntimeError('spawn failed')
++
++    monkeypatch.setattr(run_agent.threading, 'Thread', Thread)
++    agent = SimpleNamespace(session_id='fixture', _REVIEW_REQUEUE_MAX_ATTEMPTS=3)
++    if start_fails:
++        with pytest.raises(RuntimeError, match='spawn failed'):
++            run_agent.AIAgent._spawn_background_review_now(agent, [])
++        assert lease.closed
++    else:
++        run_agent.AIAgent._spawn_background_review_now(agent, [])
++        assert events == ['admit'] and not lease.closed
++        targets[0]()
++        assert events == ['admit', 'target', 'retirement-end', 'requeue', 'close']
++        assert fence._authority.get() is None
+-- 
+2.43.0
+

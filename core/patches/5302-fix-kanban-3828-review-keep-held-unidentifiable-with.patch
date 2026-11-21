@@ -1,0 +1,138 @@
+From 5fcc21ce30778c643067925b4ee188e1e5947beb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 21:41:05 +0000
+Subject: [PATCH] fix(kanban): #3828 review: keep held/unidentifiable withheld
+ rows, refuse cleanly [daveey]
+
+- Test that the non-primary lift keeps withheld rows naming a task another
+  live receipt still holds (a task_links edge from the freed task) and rows
+  with no identifiable task, and drops only the freed task's own row.
+- release_board catches ContainmentRefused broadly (after ReleaseRefused):
+  a clear message, exit 1, every hold kept. Tested with the real
+  different-board adopt refusal raised while opening the replica.
+- Docstring: why dropping withheld rows of freed tasks absent from the live
+  file is safe (non-primary files never replay withheld rows; the replica's
+  certified rows are applied).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_sync_quarantine_release.py  | 14 ++---
+ .../kanban_sync_quarantine_release_live.py    |  5 +-
+ ...est_kanban_receipt_quarantine_followups.py | 54 +++++++++++++++++++
+ 3 files changed, 66 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_quarantine_release.py b/hermes_cli/kanban_sync_quarantine_release.py
+index 43bfd993f4..4457840613 100644
+--- a/hermes_cli/kanban_sync_quarantine_release.py
++++ b/hermes_cli/kanban_sync_quarantine_release.py
+@@ -311,11 +311,12 @@ def _release_files(slug, live_path, receipt, reason, ident, hub, done) -> None:
+ 
+ 
+ def release_board(slug: str, live_path: Path, receipt: str, reason: str) -> tuple[int, str]:
+-    """The CLI's release: (exit code, message). 0 released, 1 no such receipt, a refused quarantine table shape
+-    or an apply-time database/runtime error (holds kept), 2 refused or busy."""
++    """The CLI's release: (exit code, message). 0 released, 1 no such receipt, any other containment refusal
++    (e.g. a quarantine table shape, another board's file) or an apply-time database/runtime error (holds kept), 2 a
++    refused release (``ReleaseRefused``) or busy."""
+     from hermes_cli import kanban_sync_client as ksc
+     from hermes_cli import kanban_sync_guard as guard
+-    from hermes_cli.kanban_sync_quarantine import QuarantineSchemaRefused, release_command
++    from hermes_cli.kanban_sync_quarantine import release_command
+     from hermes_cli.kanban_sync_quarantine_release_live import refused_suffix
+     ident = ksc.load_identity()
+     hub = ksc.Hub(ident)
+@@ -327,9 +328,10 @@ def release_board(slug: str, live_path: Path, receipt: str, reason: str) -> tupl
+         return 2, f"kanban sync: {receipt} not released: a sync round holds board {slug} ({exc}); retry shortly"
+     except ReleaseRefused as exc:
+         return 2, f"kanban sync: {receipt} not released: {exc}{refused_suffix(slug, done)}"
+-    except QuarantineSchemaRefused as exc:  # e.g. while opening the replica: a clear error, never a traceback
+-        return 1, (f"kanban sync: {receipt} not released: a quarantine table has a shape this core does not "
+-                   f"know ({exc}){refused_suffix(slug, done)}")
++    except ContainmentRefused as exc:  # any other refusal (a quarantine table shape, another board's file, an
++        # adopt or certify step): a clear error, never a traceback; its transaction rolled back, so the holds stay
++        return 1, (f"kanban sync: {receipt} not released: {type(exc).__name__}: {exc}; every hold is kept"
++                   f"{refused_suffix(slug, done)}")
+     except (sqlite3.Error, RuntimeError) as exc:
+         return 1, (f"kanban sync: {receipt} not released: the catch-up failed to apply ({type(exc).__name__}: "
+                    f"{exc}); it was rolled back, every hold is kept{refused_suffix(slug, done)}")
+diff --git a/hermes_cli/kanban_sync_quarantine_release_live.py b/hermes_cli/kanban_sync_quarantine_release_live.py
+index 3eba4e7747..95408197b4 100644
+--- a/hermes_cli/kanban_sync_quarantine_release_live.py
++++ b/hermes_cli/kanban_sync_quarantine_release_live.py
+@@ -26,7 +26,10 @@ def first_seen(seen, uid: str) -> int | None:
+ 
+ 
+ def _dropped(conn, freed: set[str], blocked: set[str]) -> list[str]:
+-    """This file's withheld wires of the freed tasks (none still held by another receipt)."""
++    """This file's withheld wires of the freed tasks (none still held by another receipt). Dropping them is safe
++    even for a freed task absent from this file: a non-primary file never replays withheld rows (``replay=False``),
++    and the replica's certified rows of each freed task it holds are what the lift applies. A row naming a task
++    another receipt still holds, or naming no identifiable task, stays withheld."""
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_sync_quarantine as quarantine
+     if not freed or not quarantine._exists(conn, "containment_sync_withheld"):
+diff --git a/tests/hermes_cli/test_kanban_receipt_quarantine_followups.py b/tests/hermes_cli/test_kanban_receipt_quarantine_followups.py
+index 6028bc2ff2..9fec709fef 100644
+--- a/tests/hermes_cli/test_kanban_receipt_quarantine_followups.py
++++ b/tests/hermes_cli/test_kanban_receipt_quarantine_followups.py
+@@ -225,3 +225,57 @@ def test_refused_quarantine_shape_while_opening_the_replica_exits_1(synced_conn,
+     assert r4._run("receipt-x") == 1
+     out = capsys.readouterr().out
+     assert "receipt-x not released" in out and "earlier unreleased quarantine shape" in out
++
++
++# --- review of #3828: the item-6 deletion keeps rows another receipt holds and unidentifiable rows ------------
++
++def test_non_primary_lift_keeps_withheld_rows_of_another_receipt_and_unidentifiable_rows(synced_conn, kanban_home,
++                                                                                         monkeypatch, capsys):
++    shadow = synced_conn
++    case = _picked_up(shadow, kanban_home)
++    other = "t_held_by_receipt_r"
++    stale = sync.RemoteChange(4, "tasks", case.target, "upsert", {"title": "stale reconcile copy"}, 4, "", "worker")
++    edge = sync.RemoteChange(5, "task_links", f"{case.target}>{other}", "upsert",
++                             {"parent_id": case.target, "child_id": other}, 5, "", "worker")
++    orphan = sync.RemoteChange(6, "task_comments", "comment-gone", "delete", {}, 6, "", "worker")  # no known task
++    with kbc.connect_closing(db_path=case.live_path) as live:
++        r4._hold(live, other)  # a second live receipt holds the edge's other end
++        assert quarantine.withhold(live, [stale, edge, orphan]) == []
++        assert support.count(live, "containment_sync_withheld") == 3
++    r4._cli(monkeypatch, case.live_path, _path(shadow), case.hub)
++    assert r4._run(case.uid) == 0, capsys.readouterr().out
++    with kbc.connect_closing(db_path=case.live_path) as live:
++        assert not quarantine.held(live, case.target) and quarantine.held(live, other)
++        kept = {r[0] for r in live.execute("SELECT wire FROM containment_sync_withheld")}
++    assert kept == {quarantine.wire(edge), quarantine.wire(orphan)}  # only the freed task's own row is dropped
++
++
++def test_containment_refusal_in_release_board_exits_1_and_keeps_the_holds(synced_conn, kanban_home, monkeypatch,
++                                                                          capsys):
++    shadow = synced_conn
++    case = _picked_up(shadow, kanban_home)
++    other = kanban_home / "other-board.db"
++    with kbc.connect_closing(db_path=other) as conn:
++        sync.set_identity(conn, "other-board", "worker")
++    real_open = ksc.open_shadow
++
++    def open_and_adopt(slug, gateway):  # opening the replica copies its holds into a file of another board
++        conn = real_open(slug, gateway)
++        with kbc.connect_closing(db_path=other) as dest:
++            try:
++                quarantine.adopt(conn, dest)  # the real board check raises ContainmentRefused
++            except Exception:
++                conn.close()
++                raise
++        return conn
++
++    monkeypatch.setattr(ksc, "open_shadow", open_and_adopt)
++    r4._cli(monkeypatch, case.live_path, _path(shadow), case.hub)
++    assert r4._run(case.uid) == 1
++    out = capsys.readouterr().out
++    assert f"{case.uid} not released: ContainmentRefused: quarantine belongs to a different board" in out
++    assert "every hold is kept" in out
++    with kbc.connect_closing(db_path=case.live_path) as live:
++        assert quarantine.held(live, case.target) and quarantine.receipts(live) == [case.uid]
++        assert support.count(live, "containment_sync_acceptances") == 0
++    assert quarantine.receipts(shadow) == [case.uid] and support.count(shadow, "containment_sync_acceptances") == 0
+-- 
+2.43.0
+

@@ -1,0 +1,113 @@
+From 3fa27756fde68d884acf401db681547fdc0dc99d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 03:56:40 +0000
+Subject: [PATCH] [daveey] fix(kanban): preflight drops access needs already
+ carried by a runs_on label
+
+preflight dropped ACCESS_LABELS needs (hub:read, hub:write, ssh:mini, ssh:mbp) only under
+placement_policy worker-first-v1. A card whose runs_on already carries the mapped Board label
+(capability:hub-read etc.) was still checked against the gateway capability registry, where these
+needs are never advertised, so kanban_create returned a false capability_placement
+no_capability_holder even though a pool worker claimed and ran the card.
+
+Drop each ACCESS_LABELS need whose mapped label is in the card's runs_on (the Board enforces it at
+claim time). Needs without a carrying label (hub-pinned cards, aws:/github:) keep registry routing;
+worker-first-v1 is unchanged.
+
+Five whys: false warning <- registry never lists Board-attested needs <- preflight only exempted
+worker-first-v1 cards <- exemption keyed on policy, not on the label that actually attests access.
+
+Proof: new test_preflight_drops_access_needs_the_runs_on_label_carries: 3 of 6 cases red on main,
+all green after; test_kanban_declared_access, _capability_routing, _capability_relay and
+_placement suites: 328 passed.
+---
+ hermes_cli/kanban_capability_routing.py       | 27 +++++++++++++++++++
+ .../hermes_cli/test_kanban_declared_access.py | 27 +++++++++++++++++++
+ 2 files changed, 54 insertions(+)
+
+diff --git a/hermes_cli/kanban_capability_routing.py b/hermes_cli/kanban_capability_routing.py
+index 931fcc8bc3..a83e5d1458 100644
+--- a/hermes_cli/kanban_capability_routing.py
++++ b/hermes_cli/kanban_capability_routing.py
+@@ -635,6 +635,28 @@ def route(conn, task_id: str, needs, *, reason: str, expected_run_id: Optional[i
+     return {"status": "scheduled", "routes": routes, "wake_check": wake_check, "local": decided["local"]}
+ 
+ 
++def _access_labels() -> dict:
++    from hermes_cli.kanban_placement_coordination import ACCESS_LABELS
++    return ACCESS_LABELS
++
++
++def _task_runs_on(conn, task) -> set:
++    """The card's ``runs_on`` labels (empty when unreadable or the board has no such column)."""
++    value = getattr(task, "runs_on", None)
++    if value is None and conn is not None:
++        try:
++            row = conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (task.id,)).fetchone()
++            value = row[0] if row else None
++        except Exception:  # health: allow BLE001 -- no column / unreadable: no labels, registry check stays
++            value = None
++    if isinstance(value, str):
++        try:
++            value = json.loads(value)
++        except ValueError:
++            value = None
++    return {str(v) for v in value} if isinstance(value, (list, tuple)) else set()
++
++
+ def preflight(conn, task_id: str, *, board: Optional[str] = None, **lookup) -> Optional[dict]:
+     """Placement preflight for a just-created card whose ``requires`` declare gateway needs.
+ 
+@@ -653,6 +675,11 @@ def preflight(conn, task_id: str, *, board: Optional[str] = None, **lookup) -> O
+             # worker. Do not create an origin-side owner for its remote access.
+             from hermes_cli.kanban_placement_coordination import ACCESS_LABELS
+             needs = [need for need in needs if need not in ACCESS_LABELS]
++        elif any(need in _access_labels() for need in needs):
++            # The Board enforces a carried access label at claim time and no gateway advertises these
++            # needs in the registry, so a registry check would warn no_capability_holder falsely.
++            carried = _task_runs_on(conn, task)
++            needs = [need for need in needs if _access_labels().get(need) not in carried]
+         if not needs:
+             return None
+         if task.status != "ready":
+diff --git a/tests/hermes_cli/test_kanban_declared_access.py b/tests/hermes_cli/test_kanban_declared_access.py
+index de75e0fc2d..d8a8e8ae1e 100644
+--- a/tests/hermes_cli/test_kanban_declared_access.py
++++ b/tests/hermes_cli/test_kanban_declared_access.py
+@@ -110,6 +110,33 @@ def test_preflight_keeps_enrolled_access_with_worker(monkeypatch, policy, expect
+     assert observed == expected
+ 
+ 
++@pytest.mark.parametrize("runs_on,requires,expected", [
++    (["pool:worker", "capability:hub-read"], ["terminal", "hub:read"], []),
++    ('["pool:worker", "capability:hub-write"]', ["terminal", "hub:write"], []),
++    (["capability:ssh-mini"], ["ssh:mini", "aws:example:read"], ["aws:example:read"]),
++    (["pool:worker"], ["terminal", "hub:read"], ["hub:read"]),
++    (["capability:hub-read"], ["hub:write"], ["hub:write"]),
++    (None, ["hub:read"], ["hub:read"]),
++])
++def test_preflight_drops_access_needs_the_runs_on_label_carries(monkeypatch, runs_on, requires, expected):
++    from types import SimpleNamespace
++    from hermes_cli import kanban_capability_routing as routing
++    from hermes_cli import kanban_db as kb
++    task = SimpleNamespace(id="t_x", requires=requires, runs_on=runs_on, placement_policy=None,
++                           status="ready", body="read", title="read")
++    monkeypatch.setattr(kb, "get_task", lambda *_: task)
++    monkeypatch.setattr(routing, "_previous_routes", lambda *_: False)
++    observed = []
++
++    def route(conn, task_id, needs, **kwargs):
++        observed.extend(needs)
++        return {"warning": "no holder", "code": "no_capability_holder"}
++    monkeypatch.setattr(routing, "route", route)
++    placed = routing.preflight(None, "t_x")
++    assert [n for n in observed if n != "terminal"] == expected
++    assert (placed is None) == (not expected)
++
++
+ @pytest.mark.parametrize("requirement,label,body", [
+     ("hub:read", "capability:hub-read", "read the log on the hub"),
+     ("ssh:mbp", "capability:ssh-mbp", "ssh to the MacBook for a read"),
+-- 
+2.43.0
+

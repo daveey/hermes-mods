@@ -1,0 +1,418 @@
+From 1e5f9f7513f8ccf25ca71b841c9cbc353e47852c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 04:23:43 +0000
+Subject: [PATCH] fix(sessions): preserve human GUI visibility across local
+ routing [daveey]
+
+Canonical session.create(gui) freezes GUI policy and persists desktop creation
+provenance. Peer refresh changes routing source to local without changing that
+provenance. The human-only Desktop project/list classifier recognized neither
+gui nor the mixed local routing class, so real interactive chats disappeared
+outside the pinned section.
+
+Treat gui as the desktop surface and consult recognized creation provenance
+only for local routing. Explicit automated deny and wildcard rules retain
+precedence; local bot/eval/oneshot/unknown remain automated. Apply the same
+source/provenance exclusions in SQL before list pagination and total counts,
+including pinned backfill, instead of excluding the entire local routing class.
+No source relabeling, backfill, live session mutation or renderer change.
+
+Regression proof covers authenticated canonical GUI create, durable provenance,
+real peer refresh, resume, compression publication, project projection and both
+paged REST list routes. Main fails these regressions; patched suites pass:
+60 focused tests and 250 imported-module consumers. Full scripts/check passes
+21 checks. Independent review and required exact-head CI remain landing gates.
+
+Five whys: normal project rows missing because automated filter hid them;
+classifier used mutable routing source instead of creation surface; canonical
+gui alias/local refresh were absent from the human allowlist; source-only SQL
+also discarded mixed routing classes before pagination; initial admission proof
+did not inspect actual renderer grouping. Temporary pins are containment only.
+---
+ hermes_cli/session_listing.py                 | 50 +++++++++++-----
+ hermes_cli/web_routers/profiles.py            |  4 +-
+ hermes_cli/web_routers/sessions.py            |  5 +-
+ hermes_state_sessions.py                      | 10 ++++
+ tests/gateway/test_gui_sidebar_provenance.py  | 59 +++++++++++++++++++
+ .../hermes_cli/test_session_surface_lists.py  | 58 ++++++++++++++++++
+ .../test_session_surface_visibility.py        | 30 ++++++++++
+ tui_gateway/methods_projects.py               |  2 +-
+ 8 files changed, 199 insertions(+), 19 deletions(-)
+ create mode 100644 tests/gateway/test_gui_sidebar_provenance.py
+ create mode 100644 tests/hermes_cli/test_session_surface_lists.py
+ create mode 100644 tests/hermes_cli/test_session_surface_visibility.py
+
+diff --git a/hermes_cli/session_listing.py b/hermes_cli/session_listing.py
+index a925957f8a..7b5427e8f2 100644
+--- a/hermes_cli/session_listing.py
++++ b/hermes_cli/session_listing.py
+@@ -180,7 +180,7 @@ def automated_session_sources(hermes_home: str | Path) -> AutomatedSourcePolicy:
+     return policy
+ 
+ 
+-def is_automated_source(source: Any, automated_sources: list[str] | None) -> bool:
++def is_automated_source(source: Any, automated_sources: list[str] | None, *, created_source: Any = None) -> bool:
+     """Whether a row with *source* is automated under *automated_sources* (``"*"`` = all). When it
+     is an :class:`AutomatedSourcePolicy` with ``interactive`` sources, a non-empty source outside
+     that allowlist is automated too. A row with no source at all (legacy) is never flagged by the
+@@ -190,8 +190,18 @@ def is_automated_source(source: Any, automated_sources: list[str] | None) -> boo
+     src = str(source or "").strip().lower()
+     if AUTOMATED_ALL_SOURCES in automated_sources or (src and src in automated_sources):
+         return True
++    # Routing source is not creation provenance. Only the canonical local human surfaces
++    # may stand in for local; never let a bot/eval label borrow an unrelated creator.
++    if src == "gui":
++        src = "desktop"
++    elif src == "local" and created_source in {"desktop", "cli", "tui", "acp"}:
++        src = created_source
++    automated = {"desktop" if value == "gui" else value for value in automated_sources}
++    if src in automated:
++        return True
+     interactive = getattr(automated_sources, "interactive", None)
+-    return bool(interactive) and bool(src) and src not in interactive
++    allowed = {"desktop" if value == "gui" else value for value in (interactive or ())}
++    return bool(allowed) and bool(src) and src not in allowed
+ 
+ 
+ def stamp_automated(
+@@ -204,7 +214,7 @@ def stamp_automated(
+     if automated_sources is None:
+         automated_sources = automated_session_sources(hermes_home) if hermes_home is not None else []
+     for row in rows:
+-        row["automated"] = is_automated_source(row.get("source"), automated_sources)
++        row["automated"] = is_automated_source(row.get("source"), automated_sources, created_source=row.get("created_source"))
+     return rows
+ 
+ 
+@@ -216,23 +226,31 @@ def automated_policy_key(policy: AutomatedSourcePolicy) -> tuple[tuple[str, ...]
+ 
+ def automated_listing_exclusion(
+     hermes_home: str | Path, db: Any, policy: AutomatedSourcePolicy | None = None,
+-) -> tuple[bool, list[str]]:
+-    """``(skip_store, exclude_sources)`` for a list that leaves automated rows out in SQL, so they
+-    neither fill its pages nor count in its total [daveey]. ``skip_store``: the policy marks every
+-    session automated (``"*"``), the store contributes nothing. Otherwise every source spelling the
+-    store holds that :func:`is_automated_source` flags, so the SQL filter and the ``automated``
+-    stamp agree row for row (the stamp folds case, ``NOT IN`` does not). A row with no source is
+-    kept, as the stamp keeps it. Pinned rows are not exempt: the pin back-fill obeys the filter.
+-    Why: 2026-11-17, 15,432 auto-archived bot rows in two profiles sat between a user's own
+-    archived chats, 34 pages deep."""
++) -> tuple[bool, list[str], list[tuple[str, str]]]:
++    """``(skip_store, exclude_sources, exclude_source_pairs)`` for SQL list/count filtering.
++    Whole-source exclusions handle ordinary producer labels; mixed local routing rows use
++    exact (source, created_source) pairs so human surfaces do not admit bot/eval traffic.
++    Both filters apply before LIMIT/OFFSET and to pinned backfill. The classifier keeps
++    legacy rows with no source, and explicit ``*`` excludes the entire store.
++    """
+     if policy is None:
+         policy = automated_session_sources(hermes_home)
+     if not policy:
+-        return False, []
++        return False, [], []
+     if AUTOMATED_ALL_SOURCES in policy:
+-        return True, []
+-    held = db.session_count_by_source(include_archived=True)
+-    return False, sorted(src for src in held if is_automated_source(src, policy))
++        return True, [], []
++    # A routing class can hold both human and machine sessions. Exclude its individual
++    # provenance classes in SQL, before paging/counting; never exclude all local rows.
++    with db._read_ctx() as conn:
++        held = conn.execute("SELECT DISTINCT source, COALESCE(created_source, '') FROM sessions").fetchall()
++    sources, pairs = set(), []
++    for source, created in held:
++        if is_automated_source(source, policy, created_source=created):
++            if str(source or "").strip().lower() == "local":
++                pairs.append((source, created))
++            else:
++                sources.add(source)
++    return False, sorted(sources), pairs
+ 
+ 
+ def subagent_listing_scope(
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index 17f30e8ef9..e2015ba688 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -486,11 +486,13 @@ def get_profiles_sessions(
+ 
+         def _read(db, scoped=scoped, home=home, policy=policy):
+             if policy is not None:
+-                skip, automated_sources = automated_listing_exclusion(home, db, policy)
++                skip, automated_sources, excluded_pairs = automated_listing_exclusion(home, db, policy)
+                 if skip:
+                     return [], 0
+                 scoped = {**scoped, "exclude_sources": sorted(
+                     {*(scoped["exclude_sources"] or []), *automated_sources}) or None}
++                if excluded_pairs:
++                    scoped["exclude_source_pairs"] = excluded_pairs
+             rows = db.list_sessions_rich(
+                 limit=per_profile, offset=0, order_by_last_active=order == "recent",
+                 # Same SQL-level blob skip as /api/sessions.
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index f278faa032..c68b331591 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -293,8 +293,9 @@ def _list_sessions_payload(
+             include_subagents, exclude_list = subagent_listing_scope(
+                 Path(db.db_path).parent, source=source or None, sources=source_list or None,
+                 exclude_sources=_csv(exclude_sources) or None)
++            excluded_pairs = None
+             if automated == "exclude":
+-                skip, automated_sources = automated_listing_exclusion(Path(db.db_path).parent, db)
++                skip, automated_sources, excluded_pairs = automated_listing_exclusion(Path(db.db_path).parent, db)
+                 if skip:
+                     skipped = profile_name or _cron_default_profile()
+                     return {"sessions": [], "total": 0, "limit": limit, "offset": offset, "storage": (
+@@ -305,6 +306,8 @@ def _list_sessions_payload(
+                 exclude_sources=exclude_list or None, cwd_prefix=(cwd_prefix or None),
+                 min_message_count=min_message_count, include_archived=include_archived,
+                 archived_only=archived_only, include_subagents=include_subagents)
++            if excluded_pairs:
++                scope["exclude_source_pairs"] = excluded_pairs
+             sessions = db.list_sessions_rich(
+                 limit=limit,
+                 offset=offset,
+diff --git a/hermes_state_sessions.py b/hermes_state_sessions.py
+index ebe5372da6..46fb3ca62c 100644
+--- a/hermes_state_sessions.py
++++ b/hermes_state_sessions.py
+@@ -102,6 +102,7 @@ def _session_filter_where(
+     min_message_count: int = 0, archived_only: bool = False, include_archived: bool = False,
+     include_subagents: bool = False, local_created_sources: Sequence[str] | None = None,
+     workspace_key: str | None = None,
++    exclude_source_pairs: list[tuple[str, str]] | None = None,
+ ) -> tuple[list[str], list[Any]]:
+     """Shared ``sessions s`` WHERE builder so counts line up with listed rows. ``exclude_children``
+     hides sub-agent runs and compression continuations but keeps branch/reset children
+@@ -126,6 +127,10 @@ def _session_filter_where(
+         if values:
+             where.append(clause)
+             params.extend(values)
++    if exclude_source_pairs:
++        where.append("(COALESCE(s.source, ''), COALESCE(s.created_source, '')) NOT IN (" +
++                     ",".join("(?,?)" for _ in exclude_source_pairs) + ")")
++        params.extend(value for pair in exclude_source_pairs for value in pair)
+     if archived_only:
+         where.append("s.archived = 1")
+     elif not include_archived:
+@@ -1325,6 +1330,7 @@ class SessionSessionsMixin:
+         include_pinned: bool = False, session_key: str | None = None, include_hidden: bool = False,
+         include_subagents: bool = False, local_created_sources: Sequence[str] | None = None,
+         workspace_key: str | None = None,
++        exclude_source_pairs: list[tuple[str, str]] | None = None,
+     ) -> list[dict[str, Any]]:
+         """List sessions with preview and ``last_active`` in one query. ``order_by_last_active`` sorts
+         by the chain TIP via a recursive CTE (the only path honouring ``id_query`` / ``search_query``);
+@@ -1341,6 +1347,7 @@ class SessionSessionsMixin:
+             exclude_sources=exclude_sources, cwd_prefix=cwd_prefix, min_message_count=min_message_count,
+             archived_only=archived_only, include_archived=include_archived, include_subagents=include_subagents,
+             local_created_sources=local_created_sources, workspace_key=workspace_key,
++            exclude_source_pairs=exclude_source_pairs,
+         )
+         # The archived-only view is the recovery surface for rows that dropped out of every
+         # default list: a session that is archived AND hidden (Bot Mode marks its sessions
+@@ -1394,6 +1401,7 @@ class SessionSessionsMixin:
+                 min_message_count=min_message_count, archived_only=False, include_archived=True,
+                 include_subagents=include_subagents, local_created_sources=local_created_sources,
+                 workspace_key=workspace_key,
++                exclude_source_pairs=exclude_source_pairs,
+             )
+             if not include_hidden and not archived_only:
+                 pinned_clauses.append("s.hidden = 0")
+@@ -1543,6 +1551,7 @@ class SessionSessionsMixin:
+         min_message_count: int = 0, include_archived: bool = False, archived_only: bool = False,
+         exclude_children: bool = False, exclude_sources: list[str] | None = None, include_subagents: bool = False,
+         local_created_sources: Sequence[str] | None = None,
++        exclude_source_pairs: list[tuple[str, str]] | None = None,
+     ) -> int:
+         """Count sessions with list_sessions_rich's filters so a paired "load more" total matches."""
+         where_clauses, params = _session_filter_where(
+@@ -1550,6 +1559,7 @@ class SessionSessionsMixin:
+             exclude_sources=exclude_sources, cwd_prefix=cwd_prefix, min_message_count=min_message_count,
+             archived_only=archived_only, include_archived=include_archived, include_subagents=include_subagents,
+             local_created_sources=local_created_sources,
++            exclude_source_pairs=exclude_source_pairs,
+         )
+         if exclude_children:
+             from hermes_state_local import exclude_superseded_segments
+diff --git a/tests/gateway/test_gui_sidebar_provenance.py b/tests/gateway/test_gui_sidebar_provenance.py
+new file mode 100644
+index 0000000000..d94f2950dc
+--- /dev/null
++++ b/tests/gateway/test_gui_sidebar_provenance.py
+@@ -0,0 +1,59 @@
++"""Exercise authenticated canonical session.create, resume and real compression publication."""
++import pytest
++
++
++@pytest.mark.asyncio
++async def test_gui_creation_resume_and_compression_remain_interactive(tmp_path, monkeypatch):
++    from gateway import session_policy
++    from gateway.session_policy import restore_policy
++    from hermes_state_local import local_receipt
++    from hermes_cli.session_listing import automated_session_sources, stamp_automated
++    from tests.gateway.test_local_create_env_refs import _owner
++    from tui_gateway.methods_projects import _project_tree_row
++
++    home = tmp_path / "home"
++    home.mkdir()
++    (home / "config.yaml").write_text(
++        "model: {provider: custom, default: m, base_url: 'http://example.invalid/v1'}\n"
++        "platform_toolsets: {desktop: []}\n"
++        "sessions: {interactive_sources: [desktop]}\n")
++    owner, connection = await _owner(home, monkeypatch)
++    monkeypatch.setattr(session_policy, "policy_for_source", lambda runner, source: restore_policy(
++        local_receipt(owner.db, source.chat_id)["policy"]))
++    try:
++        snapshot = await connection.create(None, {
++            "request_id": "human-gui", "source": "gui", "cwd": str(home), "toolsets": []})
++        sid = snapshot["session_id"]
++        assert local_receipt(owner.db, sid)["policy"]["source"] == "gui"
++        assert owner.db.get_session(sid)["created_source"] == "desktop"
++        policy = automated_session_sources(home)
++
++        def visible(session_id):
++            row = owner.db.get_session(session_id)
++            assert row["created_source"] == "desktop"
++            assert not stamp_automated([row], automated_sources=policy)[0]["automated"]
++            assert not _project_tree_row(row, policy)["automated"]
++
++        visible(sid)
++        from gateway.session_a2a import storage_source
++        refreshed = storage_source(owner.db, owner.sessions[sid].source, sid, "local")
++        assert refreshed == "local"
++        peer = owner.db.get_session(sid)
++        owner.db.record_gateway_session_peer(sid, source=refreshed, **{
++            key: peer.get(key) for key in ("session_key", "user_id", "chat_id", "chat_type", "thread_id")})
++        assert owner.db.get_session(sid)["source"] == "local"
++        visible(sid)
++        from gateway.session_local_recovery import restore_local_session
++        await connection.resume(restore_local_session(owner, sid), {})
++        visible(sid)
++        owner.db.append_message(sid, "user", "hello")
++        owner.db.publish_compression_child(
++            parent_session_id=sid, child_session_id="continuation", source="local",
++            messages=[{"role": "user", "content": "summary"}], require_compression_lease=False)
++        visible("continuation")
++        rows = owner.db.list_sessions_rich(include_archived=True)
++        assert any(row.get("_lineage_root_id", row["id"]) == sid or row["id"] == sid for row in rows)
++        assert all(not row["automated"] for row in stamp_automated(rows, automated_sources=policy))
++    finally:
++        await connection.close()
++        owner.db.close()
+diff --git a/tests/hermes_cli/test_session_surface_lists.py b/tests/hermes_cli/test_session_surface_lists.py
+new file mode 100644
+index 0000000000..6105d4919d
+--- /dev/null
++++ b/tests/hermes_cli/test_session_surface_lists.py
+@@ -0,0 +1,58 @@
++"""Row-aware automation filtering agrees between project rows and paged REST lists."""
++import pytest
++
++from tests.hermes_cli import test_sessions_automated_exclude as helpers
++
++homes = helpers.homes
++client = helpers.client
++
++
++@pytest.mark.parametrize("route", ["/api/sessions", "/api/profiles/sessions?profile=default"])
++def test_local_provenance_filters_before_paging_and_count(client, homes, route):
++    from hermes_state import SessionDB
++
++    home = homes["default"]
++    (home / "config.yaml").write_text("sessions:\n  interactive_sources: [desktop]\n")
++    for sid, source, created in [("gui", "gui", "desktop"), ("human", "local", "desktop"),
++                                  ("bot", "local", "bot_room"), ("eval", "local", "eval"),
++                                  ("finite", "oneshot", "oneshot"), ("unset", "local", None)]:
++        helpers._seed(home, sid, source)
++        db = SessionDB(db_path=home / "state.db")
++        try:
++            db._execute_write(lambda conn: conn.execute(
++                "UPDATE sessions SET created_source=? WHERE id=?", (created, sid)))
++        finally:
++            db.close()
++    sep = "&" if "?" in route else "?"
++    base = route + sep + "archived=only&order=recent"
++    plain = client.get(base + "&limit=50").json()["sessions"]
++    assert {r["id"] for r in plain if not r["automated"]} == {"gui", "human"}
++    assert helpers._listed(client.get(base + "&automated=exclude&limit=2")) == (["gui", "human"], 2)
++    assert helpers._listed(client.get(base + "&automated=exclude&limit=2&offset=2")) == ([], 2)
++    assert helpers._listed(client.get(base + "&automated=exclude&limit=2&exclude_sources=local")) == (["gui"], 1)
++
++
++@pytest.mark.parametrize("source,created", [("gui", "desktop"), ("local", "desktop")])
++def test_project_projection_uses_creation_provenance(source, created):
++    from hermes_cli.session_listing import AutomatedSourcePolicy
++    from tui_gateway.methods_projects import _project_tree_row
++
++    row = _project_tree_row({"source": source, "created_source": created}, AutomatedSourcePolicy([], ["desktop"]))
++    assert row["automated"] is False
++    assert row["source"] == source  # routing is not rewritten
++
++
++@pytest.mark.parametrize("source", [""])
++def test_pair_filter_preserves_legacy_source(tmp_path, source):
++    from hermes_state import SessionDB
++
++    db = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        db.create_session("legacy", source="cli")
++        db._execute_write(lambda conn: conn.execute(
++            "UPDATE sessions SET source=? WHERE id='legacy'", (source,)))
++        scope = {"exclude_source_pairs": [("local", "bot_room")]}
++        assert [row["id"] for row in db.list_sessions_rich(**scope)] == ["legacy"]
++        assert db.session_count(**scope) == 1
++    finally:
++        db.close()
+diff --git a/tests/hermes_cli/test_session_surface_visibility.py b/tests/hermes_cli/test_session_surface_visibility.py
+new file mode 100644
+index 0000000000..5eb92d7eb8
+--- /dev/null
++++ b/tests/hermes_cli/test_session_surface_visibility.py
+@@ -0,0 +1,30 @@
++"""Canonical GUI provenance must survive local routing without admitting local automation."""
++import pytest
++
++from hermes_cli.session_listing import AutomatedSourcePolicy, stamp_automated
++
++
++@pytest.mark.parametrize("source,created,automated", [
++    ("gui", "desktop", False), ("local", "desktop", False),
++    ("local", "cli", False), ("local", "tui", False),
++    ("local", "oneshot", True), ("local", "bot_room", True),
++    ("local", "eval", True), ("local", "unknown", True),
++    ("local", None, True), ("oneshot", "desktop", True),
++    ("kanban", "desktop", True), ("eval", "desktop", True),
++])
++def test_surface_classification(source, created, automated):
++    policy = AutomatedSourcePolicy(["kanban", "oneshot"], ["desktop", "cli", "tui"])
++    row = {"source": source, "created_source": created}
++    assert stamp_automated([row], automated_sources=policy)[0]["automated"] is automated
++
++
++@pytest.mark.parametrize("deny", [["*"], ["local"], ["desktop"], ["gui"]])
++def test_explicit_deny_keeps_precedence(deny):
++    row = {"source": "local", "created_source": "desktop"}
++    assert stamp_automated([row], automated_sources=AutomatedSourcePolicy(deny, ["desktop"]))[0]["automated"]
++
++
++@pytest.mark.parametrize("source", ["gui", "desktop", "local"])
++def test_gui_policy_spelling_is_the_same_surface(source):
++    row = {"source": source, "created_source": "desktop"}
++    assert not stamp_automated([row], automated_sources=AutomatedSourcePolicy([], ["gui"]))[0]["automated"]
+diff --git a/tui_gateway/methods_projects.py b/tui_gateway/methods_projects.py
+index efbd896c44..a35dba4c4c 100644
+--- a/tui_gateway/methods_projects.py
++++ b/tui_gateway/methods_projects.py
+@@ -354,7 +354,7 @@ def _project_tree_row(r: dict, automated_sources: list[str] | None = None) -> di
+             "message_count", "tool_call_count", "input_tokens", "output_tokens")},
+         **{k: r.get(k) for k in ("actual_cost_usd", "estimated_cost_usd", "model")},
+         is_active=False, **{k: r.get(k) for k in ("cwd", "git_branch", "git_repo_root")},
+-        automated=is_automated_source(r.get("source"), automated_sources or []),
++        automated=is_automated_source(r.get("source"), automated_sources or [], created_source=r.get("created_source")),
+         # [daveey] The stored outcome + mute, as list_sessions_rich stamped them on the list rows. Without them a
+         # tree row painted green from idleness while the list row painted amber (`unresolved`), and the sidebar
+         # stripe flapped done<->attention on every refresh depending on which source wrote last.
+-- 
+2.43.0
+

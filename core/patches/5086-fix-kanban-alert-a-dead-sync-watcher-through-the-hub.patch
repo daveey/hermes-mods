@@ -1,0 +1,407 @@
+From 4ff5108763c8dcda6809bfabed18af9417ec7274 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 06:38:57 +0000
+Subject: [PATCH] fix(kanban): alert a dead sync watcher through the hub
+ courier [daveey]
+
+Example incident: ContainmentRefused repeatedly killed kanban_sync_watcher across gateways
+during repeated failures. Supervisor gave up restarts; dispatch stayed on
+claim_deferred(sync_first_round). replica-stale logged at 20 min through the local outbox,
+which could not push because sync was the thing that died.
+
+The receipt identity fix (_certified ignores Board row seq/version/updated_at/hlc) landed
+separately in #3753 (4124f7c4ae). This change is the detector only.
+
+Why not caught: replica-stale files through the dead outbox; SchemaAhead already uses the
+hermes-hub courier, a watcher crash did not.
+
+Fix: on each dispatcher tick, a `.sync-state.json` crash record older than 5 min opens one
+hub card via the courier (comment while open). Graceful STOPPED and SchemaAhead are other
+alarms. The 60 s outbox throttle does not skip this check.
+
+Proof: test_kanban_sync_watcher_alert: crash <5 min silent; at 5 min hub create-task; same
+incident no duplicate; new incident comments; STOPPED/SchemaAhead skip; dispatcher tick
+still calls it when the outbox throttle would skip.
+
+Card: t_eeeeee000000001f
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_sync_outbox_age.py          |  20 +-
+ hermes_cli/kanban_sync_watcher_alert.py       | 195 ++++++++++++++++++
+ .../test_kanban_sync_watcher_alert.py         | 112 ++++++++++
+ 3 files changed, 323 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_watcher_alert.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_watcher_alert.py
+
+diff --git a/hermes_cli/kanban_sync_outbox_age.py b/hermes_cli/kanban_sync_outbox_age.py
+index 12bcebefad..1caad1bc0b 100644
+--- a/hermes_cli/kanban_sync_outbox_age.py
++++ b/hermes_cli/kanban_sync_outbox_age.py
+@@ -180,28 +180,40 @@ def _loop_healthy(slug: str, now: float) -> bool:
+         return _LAST_OK.get(slug) is True or (started is not None and now - started >= STALE_S)
+ 
+ 
++def _dead_watcher() -> list[str]:
++    """A crashed sync loop files through the hub courier; the 60 s outbox throttle must not delay it."""
++    try:
++        from hermes_cli import kanban_sync_watcher_alert as watcher_alert
++        tid = watcher_alert.check()
++        return [tid] if tid else []
++    except Exception:  # health: allow BLE001 -- an alert must never break the dispatcher tick
++        log.warning("kanban: sync watcher death check failed", exc_info=True)
++        return []
++
++
+ def check(*, mono: Callable[[], float] = time.monotonic, file_fn: Optional[Callable[[str, str], Optional[str]]] = None,
+           boards: Optional[list[tuple[str, Path]]] = None,
+           age: Callable[[Path], Optional[float]] = _age,
+           awake_fn: Optional[Callable[[], bool]] = None) -> list[str]:
+     """One dispatcher-tick observation (at most every :data:`CHECK_EVERY_S`): the outbox, then each replica's
+     freshness (``kanban_sync_replica_age.check``). Returns the card ids filed or commented. Never raises."""
++    filed = _dead_watcher()
+     try:
+         now = mono()
+         if now < _NEXT_CHECK[0]:
+-            return []
++            return filed
+         _NEXT_CHECK[0] = now + CHECK_EVERY_S
+         if boards is None:
+             from hermes_cli import kanban_db_sync as sync
+             if not sync.sync_enabled():
+-                return []
++                return filed
+             from hermes_cli import kanban_sync_client as ksc
+             boards = ksc.board_paths()
+     except Exception:  # health: allow BLE001 -- an alert must never break the dispatcher tick
+         log.warning("kanban: sync outbox age check failed", exc_info=True)
+-        return []
++        return filed
+     awake = replica_age.fully_awake(awake_fn)
+-    return _check_outbox(boards, mono, file_fn, age, awake) + replica_age.check(
++    return filed + _check_outbox(boards, mono, file_fn, age, awake) + replica_age.check(
+         boards, now=now, awake_fn=lambda: awake)
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_watcher_alert.py b/hermes_cli/kanban_sync_watcher_alert.py
+new file mode 100644
+index 0000000000..9b5688ea17
+--- /dev/null
++++ b/hermes_cli/kanban_sync_watcher_alert.py
+@@ -0,0 +1,195 @@
++"""One hub card when this host's kanban sync watcher has been crashed for 5 min. [daveey]
++
++Example incident: ContainmentRefused killed ``kanban_sync_watcher``; the supervisor
++gave up after its restart budget. The replica-stale alarm logged later via the local outbox, which could not push
++because sync was the thing that died. SchemaAhead already files through the ``hermes-hub`` courier;
++watcher crash did not.
++
++:func:`check` runs on the dispatcher tick (outside the dead loop). A ``.sync-state.json`` crash record
++(``kanban sync loop crashed:``) older than :data:`DOWN_S` opens one hub card; while that card is open a
++later crash comments. Graceful ``STOPPED`` and SchemaAhead give-ups are other alarms. Never raises.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import socket
++import time
++from pathlib import Path
++from typing import Any, Callable, Optional
++
++log = logging.getLogger(__name__)
++
++HUB = "hub"
++KEY_PREFIX = "kanban-sync-watcher-dead"
++DOWN_S = 300.0
++CRASH_PREFIX = "kanban sync loop crashed:"
++_FILE = ".sync-watcher-alert.json"
++_CLOSED = ("done", "archived", "failed", "cancelled")
++_FRESH_S = 6 * 3600
++
++
++def _state_path() -> Path:
++    from hermes_cli import kanban_db as kb
++    return kb.kanban_home() / "kanban" / _FILE
++
++
++def _read_state() -> dict:
++    try:
++        data = json.loads(_state_path().read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return {}
++    return data if isinstance(data, dict) else {}
++
++
++def _write_state(state: dict) -> None:
++    target = _state_path()
++    try:
++        target.parent.mkdir(parents=True, exist_ok=True)
++        tmp = target.with_name(f"{_FILE}.tmp")
++        tmp.write_text(json.dumps(state), encoding="utf-8")
++        tmp.replace(target)
++    except OSError:
++        log.warning("kanban sync: cannot record the dead-watcher alert state at %s", target, exc_info=True)
++
++
++def incident_key(host: str, since: float) -> str:
++    return f"{KEY_PREFIX}:{host}:{int(since)}"
++
++
++def _body(host: str, why: str, since: float, info: dict) -> str:
++    when = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(since))
++    return "\n".join([
++        f"The Kanban sync watcher on **{host}** has been down since {when} ({why}). The gateway supervisor "
++        "stopped restarting it, so this host neither pushes nor pulls; dispatch stays on "
++        "`claim_deferred(sync_first_round)`. The replica-stale alarm files through the local outbox, which "
++        "cannot reach the Board while sync is dead — this card is the courier path that still can.",
++        "",
++        f"- Crash: {why}",
++        f"- Installed core: `{info.get('installed') or 'unknown'}` at `{info.get('installed_sha') or 'unknown'}`",
++        f"- origin/main: `{info.get('origin_main_sha') or 'unknown'}`",
++        "",
++        "Do: 1) `hermes kanban sync status` on that host; 2) recover with a core that includes the crash fix "
++        "(or restart the gateway once the cause is gone); 3) done when status shows `running: yes` and the "
++        "dispatcher has spawned a card. Precedent: t_eeeeee000000001f.",
++    ])
++
++
++def _replica_rows(hub_cli: str, runner) -> list[dict]:
++    rc, out, _err = runner([hub_cli, "tasks", "--gw", HUB, "--json", "--all"])
++    if rc != 0:
++        return []
++    try:
++        rows = json.loads(out or "[]")
++    except ValueError:
++        return []
++    return [r for r in rows if isinstance(r, dict)]
++
++
++def _open_card(host: str, state: dict, hub_cli: str, runner, now: float) -> Optional[str]:
++    prefix = f"{KEY_PREFIX}:{host}:"
++    rows = _replica_rows(hub_cli, runner)
++    for row in rows:
++        if (str(row.get("idempotency_key") or "").startswith(prefix)
++                and str(row.get("status") or "") not in _CLOSED):
++            return str(row.get("id"))
++    tid = state.get("task_id")
++    if not tid and state.get("request_id"):
++        try:
++            from hermes_cli import kanban_placement as kp
++            tid = kp.remote_task_id(state["request_id"])
++        except Exception:  # health: allow BLE001 -- a stale courier db only means "not known yet"
++            tid = None
++    if tid:
++        seen = next((r for r in rows if r.get("id") == tid), None)
++        if seen is not None:
++            return str(tid) if str(seen.get("status") or "") not in _CLOSED else None
++        if now - float(state.get("filed_at") or 0) < _FRESH_S:
++            return str(tid)
++    return None
++
++
++def report(host: str, why: str, since: float, *, runner: Optional[Callable[[list[str]], tuple[int, str, str]]] = None,
++           hub_cli: Optional[str] = None, info: Optional[dict] = None, now: Optional[float] = None) -> Optional[str]:
++    """Open (or comment) this host's dead-watcher card on the hub. Never raises."""
++    try:
++        return _report(host, why, since, runner, hub_cli, info, time.time() if now is None else now)
++    except Exception:  # health: allow BLE001 -- an alert must never break the dispatcher tick
++        log.warning("kanban sync: could not open the dead-watcher card on the hub", exc_info=True)
++        return None
++
++
++def _report(host, why, since, runner, hub_cli, info, now) -> Optional[str]:
++    from hermes_cli import kanban_capability_registry as reg
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli.kanban_sync_schema_alert import cores
++    runner = runner or kp.hub_runner
++    if runner is kp._default_runner:
++        from hermes_state_guard import _in_test_context
++        if _in_test_context():
++            log.warning("kanban sync: dead-watcher hub card not filed from a test process")
++            return None
++    hub_cli = hub_cli or reg.hub_cli_path(kp.config().get("hub_cli"))
++    key = incident_key(host, since)
++    state = _read_state()
++    if state.get("key") == key:
++        return None
++    info = info if info is not None else cores()
++    open_tid = _open_card(host, state, hub_cli, runner, now)
++    if open_tid:
++        rid = f"{key}:comment"
++        text = (f"Again on {host} at {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(since))}: {why} "
++                f"(installed core {info.get('installed_sha') or 'unknown'})")
++        argv = [hub_cli, "request", HUB, "tasks", f"default/default/{open_tid}", "comment", "--arg",
++                f"text={text[:7900]}", "--id", rid]
++        rc, out, err = runner(argv)
++        if rc not in (0, 3):
++            log.warning("kanban sync: could not comment the dead-watcher card %s on the hub (exit %s): %s",
++                        open_tid, rc, (err or out)[-300:])
++            return None
++        _write_state({**state, "key": key, "task_id": open_tid, "commented_at": now})
++        log.error("kanban sync: watcher still down; commented hub card %s (%s)", open_tid, rid)
++        return rid
++    rid = key
++    title = f"Kanban sync watcher dead on {host} for 5+ min"
++    argv = [hub_cli, "create-task", HUB, title, "--body", _body(host, why, since, info), "--assignee", "default",
++            "--origin-session", "", "--id", rid, "--option", f"idempotency_key={json.dumps(key)}",
++            "--option", "priority=900"]
++    rc, out, err = runner(argv)
++    if rc not in (0, 3):
++        log.warning("kanban sync: could not open the dead-watcher card on the hub (exit %s): %s",
++                    rc, (err or out)[-300:])
++        return None
++    _write_state({"key": key, "request_id": rid, "task_id": None, "filed_at": now})
++    log.error("kanban sync: opened a hub card for a dead sync watcher (request %s)", rid)
++    return rid
++
++
++def check(*, now: Optional[float] = None, runner: Optional[Callable[[list[str]], tuple[int, str, str]]] = None,
++          hub_cli: Optional[str] = None, host: Optional[str] = None, info: Optional[dict[str, Any]] = None
++          ) -> Optional[str]:
++    """File if this host's sync loop has been crashed for :data:`DOWN_S`. Never raises."""
++    try:
++        return _check(now, runner, hub_cli, host, info)
++    except Exception:  # health: allow BLE001 -- an alert must never break the dispatcher tick
++        log.warning("kanban sync: dead-watcher check failed", exc_info=True)
++        return None
++
++
++def _check(now, runner, hub_cli, host, info) -> Optional[str]:
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_runstate as runstate
++    from hermes_cli.kanban_sync_schema_alert import _updating
++    if not sync.sync_enabled() or _updating():
++        return None
++    record = runstate._read(runstate.path()) or {}
++    if record.get("running") is not False:
++        return None
++    why = str(record.get("reason") or "")
++    if not why.startswith(CRASH_PREFIX):
++        return None
++    since = float(record.get("since") or 0)
++    wall = time.time() if now is None else now
++    if since <= 0 or wall - since < DOWN_S:
++        return None
++    return report(host or socket.gethostname(), why, since, runner=runner, hub_cli=hub_cli, info=info, now=wall)
+diff --git a/tests/hermes_cli/test_kanban_sync_watcher_alert.py b/tests/hermes_cli/test_kanban_sync_watcher_alert.py
+new file mode 100644
+index 0000000000..d520649386
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_watcher_alert.py
+@@ -0,0 +1,112 @@
++"""A dead kanban sync watcher opens one hub card after 5 min (not through the local outbox). [daveey]
++
++Example incident: ContainmentRefused killed kanban_sync_watcher; the supervisor
++gave up after its restart budget. replica-stale filed later via the outbox, which could not push.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from hermes_cli import kanban_sync_runstate as runstate
++from hermes_cli import kanban_sync_watcher_alert as alert
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.test_kanban_schema_owner import FakeHubCli
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_SESSION_ID", "HERMES_KANBAN_TASK"):
++        monkeypatch.delenv(var, raising=False)
++    h = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(h, True)
++    yield h
++
++
++CRASH = "kanban sync loop crashed: ContainmentRefused: canonical receipt identity changed"
++SINCE = 1_000.0
++INFO = {"installed": "/opt/hermes", "installed_sha": "0362a20c0e", "newest_sha": None, "origin_main_sha": "a99783a19e"}
++
++
++def _crash(*, since=SINCE):
++    runstate.path().parent.mkdir(parents=True, exist_ok=True)
++    runstate.path().write_text(json.dumps({"running": False, "since": since, "reason": CRASH, "pid": 1}))
++
++
++def test_crash_under_five_minutes_does_not_file(home):
++    _crash()
++    hub = FakeHubCli()
++    assert alert.check(now=SINCE + 299, runner=hub, hub_cli="hermes-hub", host="worker-1", info=INFO) is None
++    assert hub.sent("create-task") == []
++
++
++def test_crash_at_five_minutes_opens_one_hub_card(home):
++    _crash()
++    hub = FakeHubCli()
++    rid = alert.check(now=SINCE + 300, runner=hub, hub_cli="hermes-hub", host="worker-1", info=INFO)
++    creates = hub.sent("create-task")
++    assert rid == "kanban-sync-watcher-dead:worker-1:1000" and len(creates) == 1
++    argv = creates[0]
++    assert argv[2] == "hub" and "worker-1" in argv[3]
++    body = argv[argv.index("--body") + 1]
++    assert "ContainmentRefused" in body and "0362a20c0e" in body
++    assert "hermes-hub" in argv[0] or argv[0] == "hermes-hub"
++    assert 'idempotency_key="kanban-sync-watcher-dead:worker-1:1000"' in argv
++    # Does not use the local default-board outbox path.
++    assert "create-task" in argv[1]
++
++
++def test_same_crash_incident_does_not_file_again(home):
++    _crash()
++    hub = FakeHubCli()
++    alert.check(now=SINCE + 300, runner=hub, hub_cli="hermes-hub", host="worker-1", info=INFO)
++    assert alert.check(now=SINCE + 400, runner=hub, hub_cli="hermes-hub", host="worker-1", info=INFO) is None
++    assert len(hub.sent("create-task")) == 1 and not hub.sent("request")
++
++
++def test_new_crash_while_open_comments_instead_of_a_second_card(home):
++    _crash()
++    hub = FakeHubCli()
++    alert.check(now=SINCE + 300, runner=hub, hub_cli="hermes-hub", host="worker-1", info=INFO)
++    hub.open = [{"id": "t_open", "status": "ready",
++                 "idempotency_key": "kanban-sync-watcher-dead:worker-1:1000"}]
++    runstate.path().write_text(json.dumps(
++        {"running": False, "since": 2_000.0, "reason": CRASH, "pid": 2}))
++    rid = alert.check(now=2_000.0 + 300, runner=hub, hub_cli="hermes-hub", host="worker-1", info=INFO)
++    assert rid == "kanban-sync-watcher-dead:worker-1:2000:comment"
++    assert len(hub.sent("create-task")) == 1
++    (comment,) = hub.sent("request")
++    assert comment[2:6] == ["hub", "tasks", "default/default/t_open", "comment"]
++    assert "ContainmentRefused" in comment[comment.index("--arg") + 1]
++
++
++def test_graceful_stop_and_schema_ahead_are_not_this_alarm(home):
++    hub = FakeHubCli()
++    runstate.path().parent.mkdir(parents=True, exist_ok=True)
++    runstate.path().write_text(json.dumps(
++        {"running": False, "since": SINCE, "reason": runstate.STOPPED, "pid": 1}))
++    assert alert.check(now=SINCE + 900, runner=hub, hub_cli="hermes-hub", host="worker-1", info=INFO) is None
++    runstate.path().write_text(json.dumps(
++        {"running": False, "since": SINCE,
++         "reason": "gave up the sync role: board default: SchemaAhead: x", "pid": 1}))
++    assert alert.check(now=SINCE + 900, runner=hub, hub_cli="hermes-hub", host="worker-1", info=INFO) is None
++    assert hub.sent("create-task") == []
++
++
++def test_dispatcher_tick_runs_the_dead_watcher_check(home, monkeypatch):
++    from hermes_cli import kanban_sync_outbox_age as outbox_age
++    seen = []
++
++    def fake_check(**_kwargs):
++        seen.append(True)
++        return "t_dead"
++
++    monkeypatch.setattr(alert, "check", fake_check)
++    outbox_age.reset()
++    assert "t_dead" in outbox_age.check(mono=lambda: 1e6, boards=[], age=lambda _p: None)
++    assert seen
++    seen.clear()
++    # The 60 s outbox throttle must not skip the dead-watcher courier (incident: 20 min local-only cards).
++    ids = outbox_age.check(mono=lambda: 1e6 + 10, boards=[], age=lambda _p: None)
++    assert seen and "t_dead" in ids
+-- 
+2.43.0
+

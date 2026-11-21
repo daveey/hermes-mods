@@ -1,0 +1,162 @@
+From 2a0a7dbf7c9371223b69c74a26e9d2bb52166cf5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 19:36:51 +0000
+Subject: [PATCH] [daveey] Route browser, router, compute host and direct TUI
+ exec through drain leases
+
+---
+ hermes_cli/local_runtime/processes.py         |  3 +-
+ .../test_worker_drain_launch_lifetime.py      | 53 ++++++++++---------
+ tools/browser_launcher.py                     |  3 +-
+ tui_gateway/host_supervisor.py                |  3 +-
+ tui_gateway/methods_tools.py                  |  6 ++-
+ 5 files changed, 38 insertions(+), 30 deletions(-)
+
+diff --git a/hermes_cli/local_runtime/processes.py b/hermes_cli/local_runtime/processes.py
+index f54cfff53f..7ad1267158 100644
+--- a/hermes_cli/local_runtime/processes.py
++++ b/hermes_cli/local_runtime/processes.py
+@@ -121,7 +121,8 @@ def spawn_server(cmd, *, owned: bool = False, **kwargs) -> tuple[subprocess.Pope
+     """
+     if sys.platform != "win32":
+         if not owned:
+-            return subprocess.Popen(cmd, **kwargs), None
++            from hermes_cli.worker_drain_fence import popen_worker
++            return popen_worker(subprocess.Popen, cmd, **kwargs), None
+         from hermes_cli.process_identity import spawn_owned
+ 
+         return spawn_owned(cmd, purpose="llama-server", **kwargs), None
+diff --git a/tests/tools/test_worker_drain_launch_lifetime.py b/tests/tools/test_worker_drain_launch_lifetime.py
+index 07b2c20e69..bbeb15ea20 100644
+--- a/tests/tools/test_worker_drain_launch_lifetime.py
++++ b/tests/tools/test_worker_drain_launch_lifetime.py
+@@ -12,18 +12,34 @@ node = fixtures.node
+ latch = fixtures.latch
+ 
+ 
+-@pytest.mark.parametrize('seam', ['generic', 'owned', 'bash'])
+-def test_child_holds_lease_after_spawn_returns(node, seam):
++def _launch(seam, argv, tmp_path):
++    import shlex
++    from hermes_cli.process_identity import spawn_owned
++    from hermes_cli.local_runtime.processes import spawn_server
++    from tools.environments.base_output import _popen_bash
++    from tools.environments.local import LocalEnvironment
++    from tools.browser_launcher import _spawn
++
++    def local():
++        env = LocalEnvironment.__new__(LocalEnvironment)
++        env.env, env.cwd = {}, str(tmp_path)
++        return env._run_bash(shlex.join(argv))
++
++    return {
++        'generic': lambda: f.popen_worker(subprocess.Popen, argv, env=None),
++        'owned': lambda: spawn_owned(argv, purpose='drain-lifetime-fixture'),
++        'bash': lambda: _popen_bash(argv),
++        'browser': lambda: _spawn(argv, {}, str(tmp_path)),
++        'router': lambda: spawn_server(argv)[0],
++        'local': local,
++    }[seam]()
++
++
++@pytest.mark.parametrize('seam', ['generic', 'owned', 'bash', 'browser', 'router'])
++def test_child_holds_lease_after_spawn_returns(node, tmp_path, seam):
+     root, ident = node
+     argv = [sys.executable, '-c', 'import time; time.sleep(30)']
+-    if seam == 'generic':
+-        proc = f.popen_worker(subprocess.Popen, argv, env=None)
+-    elif seam == 'owned':
+-        from hermes_cli.process_identity import spawn_owned
+-        proc = spawn_owned(argv, purpose='drain-lifetime-fixture')
+-    else:
+-        from tools.environments.base_output import _popen_bash
+-        proc = _popen_bash(argv)
++    proc = _launch(seam, argv, tmp_path)
+     try:
+         assert f.busy_leases(root) == 1
+         latch(root, ident)
+@@ -113,25 +129,12 @@ def test_seal_mutation_itself_checks_live_leases(node):
+     assert latch(root, ident, op='seal')['phase'] == 'sealed'
+ 
+ 
+-@pytest.mark.parametrize('seam', ['generic', 'owned', 'bash', 'local'])
++@pytest.mark.parametrize('seam', ['generic', 'owned', 'bash', 'local', 'browser', 'router'])
+ def test_late_terminal_seams_cannot_execute(node, tmp_path, seam):
+     root, ident = node
+     latch(root, ident)
+     output = tmp_path / 'should-not-exist'
+     argv = [sys.executable, '-c', f'open({str(output)!r}, "w").write("lost")']
+     with pytest.raises(f.DrainRefused):
+-        if seam == 'generic':
+-            f.popen_worker(subprocess.Popen, argv, env=None)
+-        elif seam == 'owned':
+-            from hermes_cli.process_identity import spawn_owned
+-            spawn_owned(argv, purpose='drain-late-fixture')
+-        elif seam == 'bash':
+-            from tools.environments.base_output import _popen_bash
+-            _popen_bash(argv)
+-        else:
+-            from tools.environments.local import LocalEnvironment
+-            # Bypass unrelated startup shells; exercise the real local spawn boundary.
+-            local = LocalEnvironment.__new__(LocalEnvironment)
+-            local.env, local.cwd = {}, str(tmp_path)
+-            local._run_bash('touch ' + str(output))
++        _launch(seam, argv, tmp_path)
+     assert not output.exists()
+diff --git a/tools/browser_launcher.py b/tools/browser_launcher.py
+index 9262d0ae94..58d3a1683c 100644
+--- a/tools/browser_launcher.py
++++ b/tools/browser_launcher.py
+@@ -428,9 +428,10 @@ def _prepare_dir(user_data_dir: str, ephemeral: bool) -> None:
+ 
+ 
+ def _spawn(argv: list[str], env: dict, user_data_dir: str) -> subprocess.Popen:
++    from hermes_cli.worker_drain_fence import popen_worker
+     log_path = os.path.join(user_data_dir, _LAUNCH_LOG)
+     with open(log_path, "wb") as log:
+-        return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env,
++        return popen_worker(subprocess.Popen, argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env,
+                                 **_spawn_kwargs())
+ 
+ 
+diff --git a/tui_gateway/host_supervisor.py b/tui_gateway/host_supervisor.py
+index 16e5b9b177..05450e5a9d 100644
+--- a/tui_gateway/host_supervisor.py
++++ b/tui_gateway/host_supervisor.py
+@@ -377,7 +377,8 @@ class HostSupervisor:
+         if root not in env["PYTHONPATH"].split(os.pathsep):
+             env["PYTHONPATH"] = root + os.pathsep + env["PYTHONPATH"]
+         # Lossy UTF-8 decode: a locale-mismatched byte must not raise inside the drain threads.
+-        proc = subprocess.Popen(
++        from hermes_cli.worker_drain_fence import popen_worker
++        proc = popen_worker(subprocess.Popen,
+             self.argv, cwd=str(self.cwd), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1,
+             # detached-spawn: ok — compute host exits on its own parent-guard (compute_host._parent_guard_loop) and flushes sessions; a supervisor KILL could cut that flush short
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 5d1a704799..5fb9149821 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -205,7 +205,8 @@ def _captured_exec(rid, cmd, timeout: int, *, on_result, timeout_err: tuple, fai
+     """Run ``cmd`` captured (see ``_capture_run_kwargs``) and hand the CompletedProcess to
+     ``on_result``; TimeoutExpired → ``timeout_err`` (code, message), other errors → ``fail_code``."""
+     try:
+-        return on_result(subprocess.run(cmd, cwd=os.getcwd(), shell=shell, env=env, **_capture_run_kwargs(timeout)))
++        from hermes_cli.worker_drain_fence import popen_worker
++        return on_result(popen_worker(subprocess.run, cmd, cwd=os.getcwd(), shell=shell, env=env, **_capture_run_kwargs(timeout)))
+     except subprocess.TimeoutExpired:
+         return _err(rid, *timeout_err)
+     except Exception as e:
+@@ -483,7 +484,8 @@ def _dispatch_quick(rid, params, session, name, arg):
+     if qc.get("type") == "exec":
+         # Sanitized env: the TUI server process holds every API key in os.environ.
+         env = _tools_mod("tools.environments.local").build_subprocess_env()
+-        r = subprocess.run(qc.get("command", ""), shell=True, env=env, **_capture_run_kwargs(30))
++        from hermes_cli.worker_drain_fence import popen_worker
++        r = popen_worker(subprocess.run, qc.get("command", ""), shell=True, env=env, **_capture_run_kwargs(30))
+         output = _joined_output(r)[:4000]
+         output = _tools_mod("agent.redact").redact_sensitive_text(output) if output else output
+         if r.returncode != 0:
+-- 
+2.43.0
+

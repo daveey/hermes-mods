@@ -1,0 +1,278 @@
+From 8fb1e1d5d5a7ff97558b24f60dff8214ff683e5b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 17:00:03 -0800
+Subject: [PATCH] fix(tui): review follow-ups for the all-walled chain card
+ [daveey]
+
+Independent review of #3855 at 06661a7 (APPROVE, non-blocking findings), all addressed:
+- A chain is recorded as one (walls, failure_resets_at) by what quota_refusal_walls read (more than one
+  route, or a rate-limited pin), not by the raw error's type, so a wrapped chain cannot split card and toast.
+- A fallback that repeats the pin with an earlier reset relabels it as that quota wall, not "rate-limited".
+- A chain sets the client's reset_at to its earliest reset when the pin's pool named a later one.
+- A chain nested in a chain is rejected explicitly (a ProviderFallbackError is an AuthError and could pass
+  as a rate-limited pin); a fallback whose reset has already passed disqualifies the chain.
+- _requested_model reads resume_runtime_overrides.model_override (it has no `model` key).
+- One clock for the recorded route and the toast; a chain entry named "auto" (agent_init) takes the
+  refusal's own provider; repeated routes compare providers case-insensitively.
+
+Tests, RED on 06661a7's source and GREEN after: typed-quota pin chain wording, a repeated pin relabelled,
+past-reset and nested rate-limited chains stay generic, the chain's reset as client reset_at and the replay
+clock (trusted_resets_at). Also added: a wait given only as "retry after Ns" text, a malformed walls record.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/model_routing_unavailable.py            | 30 ++++++---
+ .../test_agent_init_quota_wall_card.py        | 66 ++++++++++++++++++-
+ tui_gateway/session_registry.py               | 25 ++++---
+ tui_gateway/user_messages.py                  |  4 +-
+ 4 files changed, 100 insertions(+), 25 deletions(-)
+
+diff --git a/agent/model_routing_unavailable.py b/agent/model_routing_unavailable.py
+index 86d5bba853..66d8704c06 100644
+--- a/agent/model_routing_unavailable.py
++++ b/agent/model_routing_unavailable.py
+@@ -271,19 +271,25 @@ def _chain_pin(entry, pin_model, now):
+     """``(provider, model, resets_at, kind)`` for a fallback chain's first entry, else None."""
+     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+ 
++    from hermes_cli.fallback_errors import ProviderFallbackError
++
+     provider, model, failure = entry
++    error = _terminal_refusal(failure)
++    if isinstance(error, ProviderFallbackError):
++        return None  # a chain nested in a chain: no raiser builds one, and its "pin" is not one route
+     if (wall := quota_refusal_wall(failure)) is not None:
+         reset, kind = wall[2], WALL_QUOTA
+     else:
+-        error = _terminal_refusal(failure)
+         if not (isinstance(error, AuthError) and is_rate_limited_auth_error(error)):
+             return None
+         wait = _own_wait(error, now)
+         if wait is None:
+             return None
+         reset, kind = now + wait, WALL_RATE_LIMIT
+-    # The chain entry names the route that was tried; the requested model fills a model-less AuthError entry.
+-    provider = (provider if isinstance(provider, str) and provider.strip() else getattr(failure, "provider", "")) or ""
++    # The chain entry names the route that was tried (``agent_init`` writes "auto" when it had none: the refusal's
++    # own provider then); the requested model fills a model-less AuthError entry.
++    if not isinstance(provider, str) or provider.strip().lower() in ("", "auto"):
++        provider = getattr(error, "provider", None) or ""
+     model = model if isinstance(model, str) and model.strip() else (wall[1] if wall else pin_model) or ""
+     if not (isinstance(provider, str) and provider.strip()):
+         return None
+@@ -301,9 +307,10 @@ def quota_refusal_walls(exc, pin_model=None, now=None):
+     refusal with a finite reset (``quota_refusal_wall``). The pin is named as its chain entry gives it, with
+     *pin_model* (the session's requested model) when the entry has none; with no model at all it is named by
+     provider alone (model ""). Fallbacks are named as their refusal gives them; a repeat of the pin or of an
+-    earlier fallback is folded into the first, keeping the earlier reset. A mixed or no-wait chain gives None
+-    and keeps its own error, and so does a chain nested in a chain (unlike ``is_quota_failure``, which looks
+-    inside one: no raiser nests them)."""
++    earlier fallback (provider compared case-insensitively) is folded into the first, keeping the earlier reset
++    and that reset's kind. A mixed or no-wait chain gives None and keeps its own error, and so does one whose
++    fallback reset has already passed, or a chain nested in a chain (unlike ``is_quota_failure``, which looks
++    inside one: no raiser nests them). *now* is the clock a rate-limit wait is added to (default: now)."""
+     import time
+ 
+     from hermes_cli.fallback_errors import ProviderFallbackError
+@@ -314,17 +321,20 @@ def quota_refusal_walls(exc, pin_model=None, now=None):
+         return None if wall is None else [(*wall, WALL_QUOTA)]
+     if not error.failures:
+         return None
+-    pin = _chain_pin(error.failures[0], pin_model, time.time() if now is None else now)
++    now = time.time() if now is None else now
++    pin = _chain_pin(error.failures[0], pin_model, now)
+     fallbacks = [quota_refusal_wall(failure) for _, _, failure in error.failures[1:]]
+-    if pin is None or not fallbacks or any(w is None for w in fallbacks):
++    # A fallback whose reset has passed is not walled now: the chain did not fail on a wall alone.
++    if pin is None or not fallbacks or any(w is None or w[2] <= now for w in fallbacks):
+         return None
+     walls = [pin]
+     for provider, model, reset in fallbacks:
+-        same = next((i for i, w in enumerate(walls) if (w[0], w[1]) == (provider, model)), None)
++        same = next((i for i, w in enumerate(walls) if (w[0].lower(), w[1]) == (provider.lower(), model)), None)
+         if same is None:
+             walls.append((provider, model, reset, WALL_QUOTA))
+         elif reset < walls[same][2]:
+-            walls[same] = (*walls[same][:2], reset, walls[same][3])
++            # The route's own quota refusal opens first: it is that wall the sentence names, not a rate limit.
++            walls[same] = (*walls[same][:2], reset, WALL_QUOTA)
+     return walls
+ 
+ 
+diff --git a/tests/tui_gateway/test_agent_init_quota_wall_card.py b/tests/tui_gateway/test_agent_init_quota_wall_card.py
+index 4a5ef6dc31..a9a6890c82 100644
+--- a/tests/tui_gateway/test_agent_init_quota_wall_card.py
++++ b/tests/tui_gateway/test_agent_init_quota_wall_card.py
+@@ -208,11 +208,9 @@ def _fable(reset=LUNA):
+ def _real_chain(monkeypatch, pin_error, *fallbacks, target_model="gpt-6-luna"):
+     """The ProviderFallbackError the TUI build's own walker raises for this pin failure and these fallbacks."""
+     from hermes_cli.fallback_errors import ProviderFallbackError
+-    pending = iter(error for _, _, error in fallbacks)
++    pending = iter([pin_error, *(error for _, _, error in fallbacks)])  # the walker resolves the pin first
+ 
+     def resolve(**kwargs):
+-        if kwargs.get("requested") == "openai-codex":
+-            raise pin_error
+         raise next(pending)
+ 
+     monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
+@@ -349,3 +347,65 @@ def test_a_model_less_chain_pin_is_named_from_the_sessions_requested_model(tmp_p
+     assert session["agent_failure"]["failure_route"]["model"] == "gpt-6-luna"
+     (error,) = [f["params"]["payload"] for f in frames if f["params"]["type"] == "error"]
+     assert error["message"] == CHAIN
++
++
++# --- review follow-ups: wording, parsing, folding, clocks and records ---------------------------------------------
++
++def test_a_typed_quota_pin_reads_quota_out_in_the_chain_sentence(monkeypatch, frozen_now):
++    """``agent/agent_init.py`` names its chain pin ``agent.provider or "auto"``: a typed wall there reads as quota."""
++    from hermes_cli.fallback_errors import ProviderFallbackError
++    from tui_gateway.user_messages import agent_init_failed_message
++    chain = ProviderFallbackError([("auto", "", _wall()), ("openai-codex", "gpt-6-luna", SubscriptionQuotaUnavailable(
++        "openai-codex", "gpt-6-luna", LUNA))])
++    assert agent_init_failed_message(chain) == (
++        "⚠️ anthropic/claude-fable-5-2 subscription quota is out until Fri 11-20 15:19 PT, and its fallbacks are out "
++        "too (openai-codex/gpt-6-luna until Fri 11-20 16:00 PT). This chat is pinned to it; use /model to switch, "
++        "or resend after Fri 11-20 15:19 PT.")
++
++
++def test_a_pin_wait_given_only_in_its_text_is_read(monkeypatch, frozen_now):
++    from hermes_cli.auth import AuthError
++    from hermes_cli.auth_constants import CODEX_RATE_LIMITED_CODE
++    from tui_gateway.user_messages import agent_init_failed_message
++    pin = AuthError("Codex usage limit reached; retry after 3600s", provider="openai-codex",
++                    code=CODEX_RATE_LIMITED_CODE, relogin_required=False)
++    assert agent_init_failed_message(_real_chain(monkeypatch, pin, _fable())) == CHAIN
++
++
++def test_a_fallback_repeating_the_pin_with_an_earlier_reset_names_that_quota_wall(monkeypatch, frozen_now):
++    from tui_gateway.user_messages import agent_init_failed_message
++    repeat = ("openai-codex", "gpt-6-luna", SubscriptionQuotaUnavailable("openai-codex", "gpt-6-luna", RESET - 1800))
++    message = agent_init_failed_message(_real_chain(monkeypatch, _codex_429(), _fable(), repeat))
++    assert message.startswith("⚠️ openai-codex/gpt-6-luna subscription quota is out until Fri 11-20 14:49 PT,")
++    assert message.count("gpt-6-luna") == 1
++
++
++@pytest.mark.parametrize("case", ["past-fallback-reset", "nested-rate-limited-chain"])
++def test_more_chains_that_keep_the_generic_message(monkeypatch, frozen_now, case):
++    from hermes_cli.fallback_errors import ProviderFallbackError
++    from tui_gateway.user_messages import agent_init_failed_message
++    if case == "past-fallback-reset":
++        chain = _real_chain(monkeypatch, _codex_429(), _fable(NOW - 60))
++    else:
++        inner = ProviderFallbackError([("openai-codex", "gpt-6-luna", _codex_429()),
++                                       ("openai-codex", "gpt-6", _codex_429())])
++        chain = ProviderFallbackError([("openai-codex", "gpt-6-luna", inner), _fable()])
++    assert agent_init_failed_message(chain).startswith("Hermes could not start the assistant")
++
++
++def test_the_chain_reset_is_the_clients_reset_at_and_the_replay_clock(monkeypatch, frozen_now):
++    """A pin pool's later ``reset_at`` gives way to the chain's earliest; the automation replay reads it too."""
++    from tui_gateway.automation_replay import trusted_resets_at
++    monkeypatch.setattr("tui_gateway.automation_replay.stale_code_reason", lambda: "")
++    failure = {"failure_kind": "exhausted", "reset_at": LUNA + 3600}
++    server._record_failure_route(failure, _real_chain(monkeypatch, _codex_429(), _fable(RESET - 1800)), "", NOW)
++    assert failure["reset_at"] == failure["failure_resets_at"] == RESET - 1800
++    assert trusted_resets_at(failure) == RESET - 1800
++
++
++def test_a_malformed_walls_record_keeps_the_generic_card(monkeypatch, tmp_path):
++    failure = {"failure_route": {"provider": "openai-codex", "model": "gpt-6-luna", "resets_at": RESET,
++                                 "walls": [{"provider": "openai-codex"}]}}
++    complete, _rows = _turn_on_failed_build(monkeypatch, tmp_path, failure, "chain refused")
++    (payload,) = complete
++    assert payload["error_surface"] == {"layer": "runtime", "code": "agent_init_failed", "retryable": True}
+diff --git a/tui_gateway/session_registry.py b/tui_gateway/session_registry.py
+index 61297f74e2..04d5cc450b 100644
+--- a/tui_gateway/session_registry.py
++++ b/tui_gateway/session_registry.py
+@@ -233,8 +233,10 @@ def _requested_model(session: dict) -> str:
+     """[daveey] The model this session asked for (its override, else the config default): names a fallback chain's
+     pin when the pin's ``AuthError`` entry carries no model. "" when none is known; never invented."""
+     try:
+-        for overrides in (session.get("model_override"), session.get("resume_runtime_overrides")):
+-            model = overrides.get("model") if isinstance(overrides, dict) else overrides
++        resume = session.get("resume_runtime_overrides")
++        resumed = resume.get("model_override") if isinstance(resume, dict) else None
++        for override in (session.get("model_override"), resumed):
++            model = override.get("model") if isinstance(override, dict) else override
+             if isinstance(model, str) and model.strip():
+                 return model.strip()
+         cfg_model = _load_cfg().get("model")
+@@ -245,7 +247,7 @@ def _requested_model(session: dict) -> str:
+         return ""
+ 
+ 
+-def _record_failure_route(failure: dict, error: BaseException, pin_model: str = "") -> None:
++def _record_failure_route(failure: dict, error: BaseException, pin_model: str = "", now: float | None = None) -> None:
+     """[daveey] The pinned route whose quota wall refused the build and the earliest reset across the chain (for
+     an all-walled fallback chain, every route, pin first, in ``walls``): the turn waiting on it closes as a route
+     refusal (``methods_prompt._agent_init_failure_surface``). Server-side only, like ``failure_resets_at``
+@@ -253,19 +255,22 @@ def _record_failure_route(failure: dict, error: BaseException, pin_model: str =
+     reset also fills ``failure_resets_at`` (the replay clock and the client's ``reset_at``)."""
+     try:
+         from agent.model_routing_unavailable import quota_refusal_walls
+-        walls = quota_refusal_walls(error, pin_model)
++        walls = quota_refusal_walls(error, pin_model, now)
+     except Exception:  # health: allow BLE001 -- the generic init-failure card still goes out
+         logger.warning("agent build: could not read the quota wall of %r", error, exc_info=True)
+         return
+     if walls is None:
+         return
+-    (provider, model, _, _), earliest = walls[0], min(w[2] for w in walls)
++    from agent.model_routing_unavailable import WALL_QUOTA
++    (provider, model, _, kind), earliest = walls[0], min(w[2] for w in walls)
+     failure["failure_route"] = {"provider": provider, "model": model, "resets_at": earliest}
+-    from hermes_cli.fallback_errors import ProviderFallbackError
+-    if isinstance(error, ProviderFallbackError):
++    if len(walls) > 1 or kind != WALL_QUOTA:  # a fallback chain (``quota_refusal_walls`` reads only chains so)
+         failure["failure_route"]["walls"] = [
+             {"provider": p, "model": m, "resets_at": r, "kind": k} for p, m, r, k in walls]
+         failure.setdefault("failure_resets_at", earliest)
++        # The pin's pool may have named its own (later) reset; the client's clock is when a route serves again.
++        if not isinstance(reset := failure.get("reset_at"), (int, float)) or earliest < reset:
++            failure["reset_at"] = earliest
+ 
+ 
+ def _start_agent_build(sid: str, session: dict) -> None:
+@@ -349,8 +354,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
+                     and "failure_resets_at" not in current["agent_failure"]):
+                 current["agent_failure"]["failure_resets_at"] = float(resets_at)
+             current["agent_error"] = str(e)
+-            pin_model = _requested_model(current)
+-            _record_failure_route(current["agent_failure"], e, pin_model)
++            pin_model, failed_at = _requested_model(current), time.time()  # one clock for the record and the toast
++            _record_failure_route(current["agent_failure"], e, pin_model, failed_at)
+             # Logged: a failed build otherwise leaves no trace, so a prompt waiting on it reads in agent.log as
+             # a message that "never ran" (the client only got an event, which a disconnect can lose). [daveey]
+             from tui_gateway.build_diagnostics import log_build_failure
+@@ -359,7 +364,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
+             # error toast — but only if it can tell. The sentence is for the reader, the code is
+             # for the client; older clients keep matching the text.
+             _emit("error", sid, {
+-                "message": agent_init_failed_message(e, pin_model), **client_failure_fields(current["agent_failure"]),
++                "message": agent_init_failed_message(e, pin_model, failed_at), **client_failure_fields(current["agent_failure"]),
+                 **({"code": "provider_not_configured"} if provider_not_configured(e)
+                    and current["agent_failure"].get("failure_kind") != "exhausted" else {})})
+         finally:
+diff --git a/tui_gateway/user_messages.py b/tui_gateway/user_messages.py
+index 1e0f84ddd8..b738249e12 100644
+--- a/tui_gateway/user_messages.py
++++ b/tui_gateway/user_messages.py
+@@ -143,11 +143,11 @@ _AUTH_LOCK_TIMEOUT_PREFIXES = (
+ )
+ 
+ 
+-def agent_init_failed_message(exc: Any, pin_model: str | None = None) -> str:
++def agent_init_failed_message(exc: Any, pin_model: str | None = None, now: float | None = None) -> str:
+     # [daveey] A build refused by the pinned route's subscription quota wall: the reset in PT and /model, the
+     # same sentence as the pre-build refusal (``held_reply``), not a raw epoch and `hermes setup` advice.
+     from agent.model_routing_unavailable import quota_refusal_walls
+-    if (walls := quota_refusal_walls(exc, pin_model)) is not None:
++    if (walls := quota_refusal_walls(exc, pin_model, now)) is not None:
+         from agent.model_routing_walls import walled_reply
+         return walled_reply(walls)
+     detail = str(exc).rstrip(". ")  # resolver messages end in a sentence; no ".." before the hint
+-- 
+2.43.0
+

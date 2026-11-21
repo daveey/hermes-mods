@@ -1,0 +1,629 @@
+From dc95c947f25fffdc5a50e9b489d830cc7dcf665e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 04:00:22 +0000
+Subject: [PATCH] fix(kanban): track kept observers across offline restore
+ publication [daveey]
+
+Problem: source-backup failure let unlink+move replace a board beneath a
+real in-process cached_ro reader. Foreign scans skip self and the reader
+joined only the generation WeakSet, not the offline holder registry.
+
+Use the writer's lifecycle/guard/tracking factory order with nonblocking
+registry admission, retaining the existing retry budget outside the board
+lock. Preserve bytes paths and legacy positional sqlite options. Keep all
+reader custody until real close/GC; never evict a borrower to permit a swap.
+
+Also reserve missing-target import against kept deleted-inode readers.
+Clear stale sidecars only after holder refusal/reservation, so a nonempty
+old WAL cannot replay over the imported snapshot.
+
+Detection: existing tracked-state/corrupt-header and foreign-process
+fixtures did not cover real cached_ro with source-backup-only failure.
+Add real public-wrapper refusal, retained observer and fd proof, missing
+publication/stale WAL, lifetime/GC/close and deterministic race tests.
+
+Proof: real idle cached_ro RED returns True with deleted target fd before
+tracking. New missing-target RED publishes under kept observer and retains
+stale WAL. Focused GREEN: 5 files, 30 tests. All fallback bytes and identities
+unchanged from injected source backup failure; the prior live-safe TRUNCATE
+checkpoint may refresh SHM salts/readmarks only within first 136 bytes.
+Independent Opus design+addendum reviewed before each production change.
+Correctness only: no G26 revival or performance acceptance.
+---
+ hermes_cli/backup_restore.py                  |  12 +-
+ hermes_cli/kanban_lockguard.py                |  19 +-
+ .../test_cached_ro_restore_safety.py          | 217 ++++++++++++++++++
+ .../test_kanban_observer_tracking.py          | 165 +++++++++++++
+ .../test_kanban_restore_concurrency.py        | 127 ++++++++++
+ 5 files changed, 536 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_cached_ro_restore_safety.py
+ create mode 100644 tests/hermes_cli/test_kanban_observer_tracking.py
+ create mode 100644 tests/hermes_cli/test_kanban_restore_concurrency.py
+
+diff --git a/hermes_cli/backup_restore.py b/hermes_cli/backup_restore.py
+index 5b98a3f6d5..ccd46b2230 100644
+--- a/hermes_cli/backup_restore.py
++++ b/hermes_cli/backup_restore.py
+@@ -656,7 +656,17 @@ def _import_db_member_exclusive(
+                 f"{', '.join(str(pid) for pid in sorted(holders))}; publishing a new file would "
+                 "leave them writing an invisible database. Stop those processes and re-run the import."
+             )
+-        _extract_member_atomically(zf, member, target, new_file_mode)
++        from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
++
++        try:
++            with offline_file_access(target, what="publish imported database at"):
++                # A missing main file can still have an old WAL/journal. Never
++                # replay that deleted generation over the imported snapshot.
++                for suffix in ("-wal", "-shm", "-journal"):
++                    target.with_name(target.name + suffix).unlink(missing_ok=True)
++                _extract_member_atomically(zf, member, target, new_file_mode)
++        except LiveConnectionError as exc:
++            raise OSError(str(exc)) from exc
+         return
+ 
+     # The database keeps its own mode/ownership: the bytes come from the
+diff --git a/hermes_cli/kanban_lockguard.py b/hermes_cli/kanban_lockguard.py
+index c9c3447345..ce1e155825 100644
+--- a/hermes_cli/kanban_lockguard.py
++++ b/hermes_cli/kanban_lockguard.py
+@@ -188,13 +188,26 @@ def guard(conn: sqlite3.Connection, *, strict=False) -> bool:
+ def connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+     """Drop-in ``sqlite3.connect`` for Kanban board files: same arguments, guarded result."""
+     from hermes_cli.kanban_generation import lifecycle_access, prepare_connection, recover, retry_open
+-    timeout = args[0] if args else kwargs.get("timeout", 5.0)
+-    kwargs["factory"] = lifecycle_factory(guarded_factory(kwargs.get("factory", sqlite3.Connection)))
++    from hermes_cli.sqlite_safe_read import _tracking_factory, connect_tracked
++
++    # Preserve sqlite3's legacy positional arguments before composing factories.
++    names = ("timeout", "detect_types", "isolation_level", "check_same_thread", "factory", "cached_statements", "uri")
++    if len(args) > len(names):
++        raise TypeError("connect() takes at most 8 positional arguments")
++    for name, value in zip(names, args):
++        if name in kwargs:
++            raise TypeError(f"connect() got multiple values for argument '{name}'")
++        kwargs[name] = value
++    database = os.fsdecode(os.fspath(database))
++    timeout = kwargs.get("timeout", 5.0)
++    kwargs["factory"] = lifecycle_factory(guarded_factory(_tracking_factory(kwargs.get("factory", sqlite3.Connection))))
+ 
+     def open_once(remaining):
+         with lifecycle_access(database, remaining) as lock:
+             recover(database)
+-            conn = sqlite3.connect(database, *args, **kwargs)
++            # Readers must join the same lifetime/reservation authority as writers.
++            # Never wait for that registry while holding the board lifecycle lock.
++            conn = connect_tracked(database, wait_for_tracking=False, **kwargs)
+             conn._hermes_lifecycle_lock = lock
+             try:
+                 prepare_connection(conn, timeout)
+diff --git a/tests/hermes_cli/test_cached_ro_restore_safety.py b/tests/hermes_cli/test_cached_ro_restore_safety.py
+new file mode 100644
+index 0000000000..f6322495f5
+--- /dev/null
++++ b/tests/hermes_cli/test_cached_ro_restore_safety.py
+@@ -0,0 +1,217 @@
++"""Real cached-reader custody at the public restore fallback boundary."""
++import contextlib
++import os
++import shutil
++import sqlite3
++import zipfile
++
++import pytest
++
++from hermes_cli import backup_restore as restore
++from hermes_cli.kanban_session_activity import cached_ro, evict_readers
++from hermes_cli.sqlite_safe_read import pread_lock_safe, release_unlinked_fds
++
++
++def make_db(path, marker):
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        conn.execute('PRAGMA journal_mode=WAL')
++        conn.execute('CREATE TABLE t(v TEXT)')
++        conn.execute('INSERT INTO t VALUES (?)', (marker,))
++        conn.commit()
++
++
++def file_state(path):
++    result = {}
++    for suffix in ('', '-wal', '-shm', '-journal'):
++        file = path.with_name(path.name + suffix)
++        if file.exists():
++            st = file.stat()
++            result[suffix] = (st.st_dev, st.st_ino, st.st_size,
++                              pread_lock_safe(file, 0, st.st_size))
++    return result
++
++
++def deleted_fds(path):
++    # Drop ONLY the measurement's own unlinked lock-safe pread descriptors.
++    # This never closes any SQLite connection; real stranded readers remain visible.
++    release_unlinked_fds()
++    if not os.path.isdir('/proc/self/fd'):
++        return []
++    found = []
++    for name in os.listdir('/proc/self/fd'):
++        try:
++            target = os.readlink('/proc/self/fd/' + name)
++        except OSError:
++            continue
++        if target.startswith(str(path)) and target.endswith(' (deleted)'):
++            found.append(target)
++    return found
++
++
++def fail_source_backup(monkeypatch, source, at_fault=None):
++    real_connect = sqlite3.connect
++    calls = []
++
++    class FailedSource(sqlite3.Connection):
++        def backup(self, *args, **kwargs):
++            calls.append('source backup')
++            if at_fault is not None:
++                at_fault()
++            raise sqlite3.OperationalError('fixture: source backup only')
++
++    def connect(database, *args, **kwargs):
++        if str(database) == restore.read_only_db_uri(source):
++            kwargs['factory'] = FailedSource
++        return real_connect(database, *args, **kwargs)
++
++    monkeypatch.setattr(restore.sqlite3, 'connect', connect)
++    return calls
++
++
++def test_fallback_refuses_real_idle_cached_ro(monkeypatch, tmp_path):
++    source, target = tmp_path / 'snapshot.db', tmp_path / 'kanban.db'
++    make_db(source, 'snapshot')
++    make_db(target, 'current')
++    at_fault = []
++    calls = fail_source_backup(monkeypatch, source, lambda: at_fault.append(file_state(target)))
++    try:
++        with cached_ro(target) as held:
++            assert held.execute('SELECT v FROM t').fetchone() == ('current',)
++        # Leaving cached_ro returns the borrower, NOT the connection custody.
++        before = file_state(target)
++        ok = restore._safe_restore_db(source, target)
++        after = file_state(target)
++        assert calls == ['source backup']
++        assert ok is False, (before, after, deleted_fds(target))
++        # The pre-backup live-safe TRUNCATE checkpoint refreshes SHM salts.
++        # The failing backup/fallback must leave EVERY byte/identity unchanged.
++        assert after == at_fault[0]
++        assert after[''] == before['']
++        assert after['-wal'] == before['-wal']
++        assert after['-shm'][:3] == before['-shm'][:3]
++        assert all(i < 136 for i, (a, b) in enumerate(zip(before['-shm'][3], after['-shm'][3])) if a != b)
++        assert deleted_fds(target) == []
++        assert held.execute('SELECT v FROM t').fetchone() == ('current',)
++        with cached_ro(target) as again:
++            assert again is held
++    finally:
++        evict_readers(str(target.resolve()))
++
++
++@pytest.mark.parametrize('custody', ['borrowed', 'transaction', 'cache-lock', 'writer'])
++def test_fallback_preserves_active_holders(monkeypatch, tmp_path, custody):
++    from hermes_cli import kanban_session_activity as activity
++    from hermes_cli.kanban_dispatch_owner import connect_with_identity
++    from hermes_cli.sqlite_safe_read import has_live_connection
++
++    source, target = tmp_path / 'snapshot.db', tmp_path / 'kanban.db'
++    make_db(source, 'snapshot')
++    make_db(target, 'current')
++    at_fault = []
++    calls = fail_source_backup(monkeypatch, source, lambda: at_fault.append(file_state(target)))
++    try:
++        with contextlib.ExitStack() as stack:
++            if custody == 'writer':
++                held = stack.enter_context(contextlib.closing(connect_with_identity(target, timeout=0)))
++            else:
++                held = stack.enter_context(cached_ro(target))
++            assert held.execute('SELECT v FROM t').fetchone() == ('current',)
++            if custody == 'transaction':
++                held.execute('BEGIN')
++                held.execute('SELECT v FROM t').fetchall()
++                stack.callback(held.rollback)
++            if custody == 'cache-lock':
++                stack.enter_context(activity._RO_CACHE_LOCK)
++            assert has_live_connection(target)
++            assert restore._safe_restore_db(source, target) is False
++            assert calls == ['source backup']
++            assert file_state(target) == at_fault[0]
++            assert deleted_fds(target) == []
++            assert held.execute('SELECT v FROM t').fetchone() == ('current',)
++    finally:
++        evict_readers(str(target.resolve()))
++    assert not has_live_connection(target)
++    # No custody remains: fallback is still available, not permanently poisoned.
++    assert restore._safe_restore_db(source, target) is True
++    with contextlib.closing(sqlite3.connect(target)) as new:
++        assert new.execute('SELECT v FROM t').fetchone() == ('snapshot',)
++
++
++def test_normal_live_backup_converges_same_cached_reader(tmp_path):
++    source, target = tmp_path / 'snapshot.db', tmp_path / 'kanban.db'
++    make_db(source, 'snapshot')
++    make_db(target, 'current')
++    try:
++        with cached_ro(target) as held:
++            assert held.execute('SELECT v FROM t').fetchone() == ('current',)
++        inode = target.stat().st_ino
++        assert restore._safe_restore_db(source, target) is True
++        assert target.stat().st_ino == inode
++        assert held.execute('SELECT v FROM t').fetchone() == ('snapshot',)
++        with cached_ro(target) as again:
++            assert again is held
++        assert deleted_fds(target) == []
++    finally:
++        evict_readers(str(target.resolve()))
++
++
++def test_missing_import_refuses_kept_deleted_reader_then_succeeds(tmp_path):
++    source, target = tmp_path / 'snapshot.db', tmp_path / 'kanban.db'
++    make_db(source, 'snapshot')
++    make_db(target, 'current')
++    archive = tmp_path / 'snapshot.zip'
++    with zipfile.ZipFile(archive, 'w') as zf:
++        zf.write(source, 'kanban.db')
++    try:
++        with cached_ro(target) as held:
++            assert held.execute('SELECT v FROM t').fetchone() == ('current',)
++        target.unlink()  # Exact missing-target window; only fixture-owned board.
++        before = file_state(target)
++        with zipfile.ZipFile(archive) as zf:
++            with pytest.raises(OSError, match='connection.*still open'):
++                restore._import_db_member(zf, 'kanban.db', target)
++        assert not target.exists()
++        assert file_state(target) == before
++        assert held.execute('SELECT v FROM t').fetchone() == ('current',)
++    finally:
++        evict_readers(str(target.resolve()))
++    with zipfile.ZipFile(archive) as zf:
++        restore._import_db_member(zf, 'kanban.db', target)
++    assert not target.with_name(target.name + '-wal').exists()
++    assert not target.with_name(target.name + '-shm').exists()
++    try:
++        with cached_ro(target) as new:
++            assert new is not held
++            assert new.execute('SELECT v FROM t').fetchone() == ('snapshot',)
++            assert deleted_fds(target) == []
++    finally:
++        evict_readers(str(target.resolve()))
++
++
++def test_missing_import_discards_nonempty_stale_wal(tmp_path):
++    source, target = tmp_path / 'snapshot.db', tmp_path / 'kanban.db'
++    make_db(source, 'snapshot')
++    make_db(target, 'current')
++    archive = tmp_path / 'snapshot.zip'
++    with zipfile.ZipFile(archive, 'w') as zf:
++        zf.write(source, 'kanban.db')
++    wal = target.with_name(target.name + '-wal')
++    saved = tmp_path / 'saved-wal'
++    with contextlib.closing(sqlite3.connect(target)) as writer:
++        writer.execute('PRAGMA wal_autocheckpoint=0')
++        writer.execute("INSERT INTO t VALUES ('stale-wal-row')")
++        writer.commit()
++        # Preserve a real committed WAL only in this disposable fixture.
++        shutil.copy2(wal, saved)
++    assert saved.stat().st_size > 32
++    target.unlink()
++    shutil.copy2(saved, wal)
++    target.with_name(target.name + '-journal').write_bytes(b'stale journal')
++    with zipfile.ZipFile(archive) as zf:
++        restore._import_db_member(zf, 'kanban.db', target)
++    assert not wal.exists()
++    assert not target.with_name(target.name + '-journal').exists()
++    with contextlib.closing(sqlite3.connect(target)) as reader:
++        assert reader.execute('SELECT v FROM t').fetchall() == [('snapshot',)]
++        assert reader.execute('PRAGMA integrity_check').fetchone() == ('ok',)
++
+diff --git a/tests/hermes_cli/test_kanban_observer_tracking.py b/tests/hermes_cli/test_kanban_observer_tracking.py
+new file mode 100644
+index 0000000000..4a59fff3a0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_observer_tracking.py
+@@ -0,0 +1,165 @@
++"""Open/close compatibility and reservation order for tracked board observers."""
++import contextlib
++import gc
++import os
++import sqlite3
++import threading
++import weakref
++
++import pytest
++
++from hermes_cli import kanban_generation as generation
++from hermes_cli import kanban_lockguard as guard
++from hermes_cli import sqlite_safe_read as tracking
++from hermes_cli.sqlite_safe_read import LiveConnectionError, has_live_connection, offline_file_access
++
++
++@pytest.mark.parametrize('spelling', ['bytes', 'relative', 'uri', 'path'])
++def test_filesystem_spelling_is_tracked(tmp_path, monkeypatch, spelling):
++    target = tmp_path / 'board with space.db'
++    with contextlib.closing(sqlite3.connect(target)) as conn:
++        conn.execute('CREATE TABLE t(v)')
++    monkeypatch.chdir(tmp_path)
++    database, options = {
++        'bytes': (os.fsencode(target), {}),
++        'relative': (target.name, {}),
++        'uri': (target.as_uri() + '?mode=ro', {'uri': True}),
++        'path': (target, {}),
++    }[spelling]
++    with contextlib.closing(guard.connect(database, **options)) as conn:
++        assert conn.execute('SELECT count(*) FROM t').fetchone() == (0,)
++        assert has_live_connection(target)
++        with pytest.raises(LiveConnectionError):
++            with offline_file_access(target):
++                pytest.fail('live reader admitted')
++    assert not has_live_connection(target)
++
++
++def test_legacy_positional_factory_and_duplicate_arguments(tmp_path):
++    class Custom(sqlite3.Connection):
++        pass
++
++    target = tmp_path / 'board.db'
++    with contextlib.closing(guard.connect(target, 0.0, 0, None, True, Custom)) as conn:
++        assert isinstance(conn, Custom)
++        assert conn.isolation_level is None
++        assert has_live_connection(target)
++    assert not has_live_connection(target)
++    with pytest.raises(TypeError):
++        guard.connect(target, 0.0, timeout=0.0)
++    with pytest.raises(TypeError):
++        guard.connect(target, *range(8))
++
++
++@pytest.mark.parametrize('database,options', [
++    (':memory:', {}), ('file::memory:', {'uri': True}),
++    ('file:observer-memory?mode=memory&cache=shared', {'uri': True}),
++])
++def test_memory_connections_remain_usable(database, options):
++    with contextlib.closing(guard.connect(database, **options)) as conn:
++        assert conn.execute('SELECT 1').fetchone() == (1,)
++
++
++def test_gc_releases_tracked_reader(tmp_path):
++    target = tmp_path / 'board.db'
++    conn = guard.connect(target)
++    ref = weakref.ref(conn)
++    assert has_live_connection(target)
++    del conn
++    gc.collect()
++    assert ref() is None
++    assert not has_live_connection(target)
++
++
++def test_cross_thread_close_failure_retains_tracking(tmp_path):
++    target = tmp_path / 'board.db'
++    conn = guard.connect(target)
++    errors = []
++
++    def close():
++        try:
++            conn.close()
++        except sqlite3.ProgrammingError as exc:
++            errors.append(exc)
++
++    thread = threading.Thread(target=close)
++    thread.start()
++    thread.join(3)
++    assert not thread.is_alive()
++    try:
++        assert len(errors) == 1
++        assert has_live_connection(target)
++        assert conn.execute('SELECT 1').fetchone() == (1,)
++    finally:
++        conn.close()
++    assert not has_live_connection(target)
++
++
++def test_cross_thread_close_success_releases_tracking(tmp_path):
++    target = tmp_path / 'board.db'
++    conn = guard.connect(target, check_same_thread=False)
++    thread = threading.Thread(target=conn.close)
++    thread.start()
++    thread.join(3)
++    assert not thread.is_alive()
++    assert not has_live_connection(target)
++
++
++def test_reserved_open_is_busy_without_holding_board_over_retry(tmp_path, monkeypatch):
++    target = tmp_path / 'board.db'
++    with contextlib.closing(guard.connect(target)):
++        pass
++    observed = []
++    original_retry = generation.retry_open
++
++    def single_attempt(open_once, timeout):
++        try:
++            return open_once(0)
++        finally:
++            lock = generation.lifecycle_lock(target)
++            acquired = []
++            def probe():
++                ok = lock.acquire(timeout=0)
++                acquired.append(ok)
++                if ok:
++                    lock.release()
++            thread = threading.Thread(target=probe)
++            thread.start()
++            thread.join(3)
++            assert not thread.is_alive()
++            assert acquired == [True]
++            observed.append(True)
++
++    monkeypatch.setattr(generation, 'retry_open', single_attempt)
++    with offline_file_access(target, what='test reservation'):
++        with pytest.raises(sqlite3.OperationalError) as error:
++            guard.connect(target, timeout=0)
++        assert error.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
++        assert not has_live_connection(target)
++    assert observed == [True]
++    monkeypatch.setattr(generation, 'retry_open', original_retry)
++    with contextlib.closing(guard.connect(target, timeout=0)):
++        assert has_live_connection(target)
++
++
++def test_zero_budget_registry_contention_fails_closed(tmp_path):
++    target = tmp_path / 'board.db'
++    held, release = threading.Event(), threading.Event()
++
++    def holder():
++        with tracking._live_lock:
++            held.set()
++            assert release.wait(5)
++
++    thread = threading.Thread(target=holder)
++    thread.start()
++    try:
++        assert held.wait(3)
++        with pytest.raises(sqlite3.OperationalError) as error:
++            guard.connect(target, timeout=0)
++        assert error.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
++        assert not target.exists()
++    finally:
++        release.set()
++        thread.join(3)
++    assert not thread.is_alive()
+diff --git a/tests/hermes_cli/test_kanban_restore_concurrency.py b/tests/hermes_cli/test_kanban_restore_concurrency.py
+new file mode 100644
+index 0000000000..8e3b77a7d1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_restore_concurrency.py
+@@ -0,0 +1,127 @@
++"""Deterministic real opener/publication order, no sleeps or global process signals."""
++import contextlib
++import sqlite3
++import threading
++import zipfile
++
++import pytest
++
++from hermes_cli import backup_restore as restore
++from hermes_cli import kanban_lockguard as guard
++from hermes_cli import sqlite_safe_read as tracking
++
++
++def test_missing_import_reservation_excludes_open_until_publication(tmp_path, monkeypatch):
++    target, source = tmp_path / 'kanban.db', tmp_path / 'snapshot.db'
++    with contextlib.closing(sqlite3.connect(source)) as conn:
++        conn.execute('CREATE TABLE t(v)')
++        conn.execute("INSERT INTO t VALUES ('snapshot')")
++        conn.commit()
++    archive = tmp_path / 'snapshot.zip'
++    with zipfile.ZipFile(archive, 'w') as zf:
++        zf.write(source, 'kanban.db')
++    real_extract = restore._extract_member_atomically
++    observed = []
++
++    def during_publication(*args, **kwargs):
++        # Run a separate thread: same-thread reservations deliberately refuse too.
++        def contender():
++            try:
++                with pytest.raises(sqlite3.OperationalError) as exc:
++                    guard.connect(target, timeout=0)
++                assert exc.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
++                assert not target.exists()
++                # A reservation of A must not pin B or the whole tracking registry.
++                with contextlib.closing(guard.connect(tmp_path / 'unrelated.db', timeout=0)):
++                    pass
++                observed.append('excluded')
++            except BaseException as exc:
++                observed.append(exc)
++        thread = threading.Thread(target=contender)
++        thread.start()
++        thread.join(5)
++        assert not thread.is_alive()
++        assert observed == ['excluded']
++        return real_extract(*args, **kwargs)
++
++    monkeypatch.setattr(restore, '_extract_member_atomically', during_publication)
++    with zipfile.ZipFile(archive) as zf:
++        restore._import_db_member(zf, 'kanban.db', target)
++    with contextlib.closing(guard.connect(target, timeout=0)) as conn:
++        assert conn.execute('SELECT v FROM t').fetchone() == ('snapshot',)
++
++
++def test_open_registration_precedes_offline_refusal(tmp_path, monkeypatch):
++    target = tmp_path / 'kanban.db'
++    opened, finish, attempting, done = (threading.Event() for _ in range(4))
++    real_connect = sqlite3.connect
++    handles, results = [], []
++
++    def paused_connect(database, **kwargs):
++        conn = real_connect(database, **kwargs)
++        opened.set()
++        assert finish.wait(5)
++        return conn
++
++    monkeypatch.setattr(tracking.sqlite3, 'connect', paused_connect)
++
++    def opener():
++        try:
++            handles.append(guard.connect(target, timeout=0, check_same_thread=False))
++        except BaseException as exc:
++            results.append(exc)
++
++    def offline():
++        attempting.set()
++        try:
++            with tracking.offline_file_access(target):
++                results.append('unsafe publication')
++        except tracking.LiveConnectionError:
++            results.append('refused')
++        finally:
++            done.set()
++
++    first = threading.Thread(target=opener)
++    second = threading.Thread(target=offline)
++    try:
++        first.start()
++        assert opened.wait(3)
++        second.start()
++        assert attempting.wait(3)
++        assert not done.is_set()
++    finally:
++        finish.set()
++        first.join(5)
++        if second.ident is not None:
++            second.join(5)
++        for conn in handles:
++            conn.close()
++    assert not first.is_alive() and not second.is_alive()
++    assert len(handles) == 1
++    assert results == ['refused']
++    assert not tracking.has_live_connection(target)
++
++
++def test_guard_release_is_outside_global_tracking_mutex(tmp_path, monkeypatch):
++    target = tmp_path / 'kanban.db'
++    conn = guard.connect(target)
++    original = guard._release
++    observed = []
++
++    def release(handle):
++        # Cross-thread nonblocking probe is independent of private RLock ownership APIs.
++        def probe():
++            ok = tracking._live_lock.acquire(blocking=False)
++            observed.append(ok)
++            if ok:
++                tracking._live_lock.release()
++        thread = threading.Thread(target=probe)
++        thread.start()
++        thread.join(3)
++        assert not thread.is_alive()
++        original(handle)
++
++    monkeypatch.setattr(guard, '_release', release)
++    conn.close()
++    assert observed == [True]
++    assert not tracking.has_live_connection(target)
+-- 
+2.43.0
+

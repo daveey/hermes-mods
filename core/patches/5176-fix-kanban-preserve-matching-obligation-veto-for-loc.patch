@@ -1,0 +1,138 @@
+From 674da90f8197b03d2c29b3cb2fbebe10e2ec9ee7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:10:20 +0000
+Subject: [PATCH] fix(kanban): preserve matching obligation veto for local
+ selfwork [daveey]
+
+A matching released, corrupt, or unacknowledged obligation is invalid authority,
+not absence. Allow local proof only for genuine absence and recheck that absence
+inside admission for both live and historical same-request recovery.
+
+Review: addresses PR #3743 review 5990644587.
+Proof: canonical forward suite RED 60 passed/8 failed (all DID NOT RAISE),
+GREEN all 16 selfwork suites 414 passed including 10 new veto/race cases.
+Invalid matching authority blocks before lease and cannot insert admission.
+New accepted authority appearing between proofs also refuses rather than mixing
+local and obligation evidence. Remote obligation and immutable replay unchanged.
+---
+ hermes_cli/kanban_selfwork_forward.py         | 15 +++--
+ .../test_kanban_selfwork_forward.py           | 56 +++++++++++++++++++
+ 2 files changed, 65 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_selfwork_forward.py b/hermes_cli/kanban_selfwork_forward.py
+index 6d91dd33f6..dee840e120 100644
+--- a/hermes_cli/kanban_selfwork_forward.py
++++ b/hermes_cli/kanban_selfwork_forward.py
+@@ -69,7 +69,7 @@ def _validate(request, config, gateway, profile):
+     return home
+ 
+ 
+-def _obligation(conn, origin, creator):
++def _obligation(conn, origin, creator, *, allow_missing=False):
+     expected = {k: creator[k] for k in ('gateway', 'profile', 'board', 'task_id')}
+     for key, digest, raw, released in conn.execute(
+             'SELECT binding_id,binding_hash,binding_json,released FROM origin_obligations'):
+@@ -87,6 +87,9 @@ def _obligation(conn, origin, creator):
+                     and ack.get('binding_id') == binding['binding_id']
+                     and ack.get('owner') == expected and ack.get('origin') == origin):
+                 return {'binding': binding, 'binding_hash': digest}
++        raise ValueError('self_work_creator_unauthorized')
++    if allow_missing:
++        return None
+     raise ValueError('self_work_creator_unauthorized')
+ 
+ 
+@@ -296,11 +299,9 @@ def receive(request: dict) -> dict:
+         body = request['args']
+         origin, creator = body['origin'], body['creator']
+         historical = False
+-        try:
+-            binding = _obligation(conn, origin, creator)
+-        except ValueError as exc:
+-            if str(exc) != 'self_work_creator_unauthorized' or not _local_origin(origin, creator, gateway, profile):
+-                raise
++        binding = _obligation(conn, origin, creator,
++                              allow_missing=_local_origin(origin, creator, gateway, profile))
++        if binding is None:
+             try:
+                 binding = _local_proof(origin, creator, gateway, require_current=True)
+             except ValueError:
+@@ -323,6 +324,8 @@ def receive(request: dict) -> dict:
+         prior = _replay(conn, request, home)
+         if prior is not None:
+             return prior
++        if 'binding' not in binding and _obligation(conn, origin, creator, allow_missing=True) is not None:
++            raise ValueError('self_work_creator_unauthorized')
+         if historical:
+             if _historical_proof(origin, creator, gateway, request) != binding:
+                 raise ValueError('self_work_creator_unauthorized')
+diff --git a/tests/hermes_cli/test_kanban_selfwork_forward.py b/tests/hermes_cli/test_kanban_selfwork_forward.py
+index c9a923ce86..590dfdf0ac 100644
+--- a/tests/hermes_cli/test_kanban_selfwork_forward.py
++++ b/tests/hermes_cli/test_kanban_selfwork_forward.py
+@@ -394,6 +394,62 @@ def test_same_gateway_accepted_obligation_still_authorizes(case, tmp_path):
+     assert evidence['lease'] == case.lease
+ 
+ 
++def _matching_local_obligation(case, request, damage):
++    binding = copy.deepcopy(case.binding)
++    binding['owner'] = {k: v for k, v in request['args']['creator'].items() if k != 'run_uid'}
++    binding['task_record_key'] = 'default/default/' + binding['owner']['task_id']
++    digest = ledger.binding_hash(binding)
++    with sqlite3.connect(case.path) as conn:
++        conn.execute('UPDATE origin_obligations SET binding_id=?,binding_hash=?,binding_json=?,released=?',
++                     (ledger._binding_key(binding), 'forged' if damage == 'hash' else digest,
++                      ledger._json(binding), int(damage == 'released')))
++        conn.execute('DELETE FROM origin_receipts')
++        if damage == 'accepted':
++            ack = {'status': 'accepted', 'binding_hash': digest, 'binding_id': binding['binding_id'],
++                   'owner': binding['owner'], 'origin': binding['origin']}
++            conn.execute('INSERT INTO origin_receipts VALUES (?,?,?)', ('local-ack', digest, ledger._json(ack)))
++
++
++@pytest.mark.parametrize('historical', [False, True])
++@pytest.mark.parametrize('damage', ['released', 'hash', 'receipt'])
++def test_invalid_matching_obligation_vetoes_local_fallback(case, tmp_path, monkeypatch, historical, damage):
++    tid = _seed_local_creator(tmp_path, monkeypatch, current=not historical, holder='worker-gw')
++    request = _local_request(case, tid)
++    if historical:
++        _journal_rejected(tmp_path, monkeypatch, request)
++    _matching_local_obligation(case, request, damage)
++    with pytest.raises(ValueError, match='self_work_creator_unauthorized'):
++        forward.receive(request)
++    assert not case.calls
++    with sqlite3.connect(case.path) as conn:
++        assert conn.execute('SELECT count(*) FROM selfwork_forward_admissions').fetchone()[0] == 0
++
++
++@pytest.mark.parametrize('historical', [False, True])
++@pytest.mark.parametrize('damage', ['released', 'accepted'])
++def test_local_fallback_rechecks_obligation_veto(case, tmp_path, monkeypatch, historical, damage):
++    tid = _seed_local_creator(tmp_path, monkeypatch, current=not historical, holder='worker-gw')
++    request = _local_request(case, tid)
++    if historical:
++        _journal_rejected(tmp_path, monkeypatch, request)
++    real = forward._historical_proof if historical else forward._lease
++
++    injected = []
++
++    def add_veto(*args, **kwargs):
++        proof = real(*args, **kwargs)
++        if not injected:
++            _matching_local_obligation(case, request, damage)
++            injected.append(True)
++        return proof
++
++    monkeypatch.setattr(forward, '_historical_proof' if historical else '_lease', add_veto)
++    with pytest.raises(ValueError, match='self_work_creator_unauthorized'):
++        forward.receive(request)
++    with sqlite3.connect(case.path) as conn:
++        assert conn.execute('SELECT count(*) FROM selfwork_forward_admissions').fetchone()[0] == 0
++
++
+ def test_historical_repair_rejects_never_holder_sender(case, tmp_path, monkeypatch):
+     tid = _seed_local_creator(tmp_path, monkeypatch, current=False, holder='worker-gw')
+     request = _local_request(case, tid)
+-- 
+2.43.0
+

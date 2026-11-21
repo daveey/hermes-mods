@@ -1,0 +1,158 @@
+From 931b1fdac662d8241d853d501b107aa98470cd3a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 09:09:17 +0000
+Subject: [PATCH] [daveey] Preserve Stop and alias custody during held-queue
+ recovery
+
+Address independent review of PR #3723: retire the queued marker in unreachable compute-host cancellation, match both marker and canonical agent keys, and retain cancelled live-runtime custody until teardown can hand it off. Do not reset cancellation to force a replay.
+
+Proof: six assertions fail on reviewed 6ad6c365; both focused suites pass 103 tests. Seven targeted mutations killed by failing assertions, including both alias directions and closing/finalized handoff. All 21 scripts/check guards pass. Full direct-consumer run is in progress; exact-head CI and fresh independent review remain required.
+---
+ .../test_update_hold_submit_queue.py          | 10 ++++-
+ .../tui_gateway/test_update_queue_recovery.py | 45 ++++++++++++++-----
+ tui_gateway/admission_retry.py                |  7 ++-
+ tui_gateway/methods_session_interrupt.py      |  2 +
+ 4 files changed, 50 insertions(+), 14 deletions(-)
+
+diff --git a/tests/tui_gateway/test_update_hold_submit_queue.py b/tests/tui_gateway/test_update_hold_submit_queue.py
+index 9a6d3d50c4..2a84436166 100644
+--- a/tests/tui_gateway/test_update_hold_submit_queue.py
++++ b/tests/tui_gateway/test_update_hold_submit_queue.py
+@@ -518,12 +518,20 @@ def test_idle_stop_keeps_it_for_the_next_backend_after_an_update_restart(stoppab
+ 
+ 
+ @pytest.mark.parametrize("origin", ["delete", "rewind", "send_now", "plugin:hermes-bots"])
+-@pytest.mark.parametrize("compute_host", [False, True])
++@pytest.mark.parametrize("compute_host", [False, True, "unreachable"])
+ def test_non_stop_gestures_clear_the_held_queue_as_before(stoppable, origin, compute_host, monkeypatch):
+     from tui_gateway.turn_marker import read_turn_marker
+     held = stoppable
+     _submit()
+     monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: compute_host)
++    if compute_host == "unreachable":
++        class Supervisor:
++            def interrupt(self, *a, **k):
++                raise BrokenPipeError("host gone")
++            def has_pending_turn(self, sid):
++                return False
++        held.session["_compute_host_active"] = True
++        monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: Supervisor())
+     _interrupt(origin=origin)
+     assert not held.session.get("queued_prompt")
+     assert read_turn_marker(held.home, "session-key") is None
+diff --git a/tests/tui_gateway/test_update_queue_recovery.py b/tests/tui_gateway/test_update_queue_recovery.py
+index 5c4c924ac7..319f860db3 100644
+--- a/tests/tui_gateway/test_update_queue_recovery.py
++++ b/tests/tui_gateway/test_update_queue_recovery.py
+@@ -151,7 +151,8 @@ def test_sweep_releases_unusable_owned_queue(tmp_path, monkeypatch, state):
+     monkeypatch.setattr(server, "_sessions", {"s": session})
+     monkeypatch.setattr(admission_retry, "retry_queued_prompt", lambda *a: pytest.fail("unusable queue rearmed"))
+     admission_retry.redrive_update_queues(tmp_path)
+-    assert turn_marker.read_turn_marker(tmp_path, "chat")["queue_released"] is True
++    marker = turn_marker.read_turn_marker(tmp_path, "chat")
++    assert marker is not None and marker.get("queue_released") is True
+ 
+ 
+ @pytest.mark.parametrize("change", [{"reason": "core_update_pause"}, {"writer_pid": -1}, {"queue_released": True}])
+@@ -246,29 +247,49 @@ def test_sweep_inventory_includes_session_created_during_marker_read(tmp_path, m
+     assert not turn_marker.read_turn_marker(tmp_path, "chat").get("queue_released")
+ 
+ 
+-@pytest.mark.parametrize("owner_kind", ["queue", "running", "compute", "agent_key"])
++@pytest.mark.parametrize("owner_kind", ["queue", "running", "compute", "agent_key", "marker_key"])
+ def test_stale_alias_cannot_release_live_custody(tmp_path, monkeypatch, owner_kind):
+     assert turn_marker.record_turn_start(tmp_path, "chat", "pending", reason="update_hold_queue")
+     idle = _owned_queue(tmp_path)
+     idle.pop("queued_prompt")
+     active = _owned_queue(tmp_path)
+-    if owner_kind == "running":
+-        active["running"] = True
+-        active.pop("queued_prompt")
+-    elif owner_kind == "compute":
+-        active["_compute_host_turn_id"] = "turn"
+-        active.pop("queued_prompt")
+-    elif owner_kind == "agent_key":
+-        active["session_key"] = "previous"
+-        active["agent"] = SimpleNamespace(session_id="chat")
++    active.update({
++        "queue": {},
++        "running": {"running": True, "queued_prompt": None},
++        "compute": {"_compute_host_turn_id": "turn", "queued_prompt": None},
++        "agent_key": {"session_key": "previous", "agent": SimpleNamespace(session_id="chat")},
++        "marker_key": {"agent": SimpleNamespace(session_id="new-key")},
++    }[owner_kind])
+     monkeypatch.setattr(server, "_sessions", {"idle": idle, "active": active})
+     called = []
+     monkeypatch.setattr(admission_retry, "retry_queued_prompt", lambda *a: called.append(a))
+     admission_retry.redrive_update_queues(tmp_path)
+-    assert len(called) == (1 if owner_kind in {"queue", "agent_key"} else 0)
++    assert len(called) == (1 if owner_kind in {"queue", "agent_key", "marker_key"} else 0)
+     assert not turn_marker.read_turn_marker(tmp_path, "chat").get("queue_released")
+ 
+ 
++@pytest.mark.parametrize("closing", [None, "_closing", "_finalized"])
++def test_cancelled_live_session_retains_custody_until_teardown(tmp_path, monkeypatch, closing):
++    assert turn_marker.record_turn_start(tmp_path, "chat", "pending", reason="update_hold_queue")
++    session = _owned_queue(tmp_path)
++    session.pop("queued_prompt")
++    session["_turn_cancel_requested"] = True
++    if closing:
++        session[closing] = True
++    monkeypatch.setattr(server, "_sessions", {"s": session})
++    monkeypatch.setattr(admission_retry, "retry_queued_prompt", lambda *a: pytest.fail("cancelled queue rearmed"))
++    for _ in range(3):
++        admission_retry.redrive_update_queues(tmp_path)
++        marker = turn_marker.read_turn_marker(tmp_path, "chat")
++        assert bool(marker.get("queue_released")) == bool(closing)
++        pending = startup_resume.pending_resumes(tmp_path, {}, log_skips=False)
++        assert bool(pending) == bool(closing), "a cancelled live runtime cannot execute startup replay"
++    # Once the cancelled runtime is gone, the successor may recover teardown custody.
++    monkeypatch.setattr(server, "_sessions", {})
++    admission_retry.redrive_update_queues(tmp_path)
++    assert [r["session_key"] for r in startup_resume.pending_resumes(tmp_path, {}, log_skips=False)] == ["chat"]
++
++
+ @pytest.mark.parametrize("reason", ["update_hold_queue", "core_update_pause", None])
+ def test_discard_retires_only_queued_marker(tmp_path, reason):
+     assert turn_marker.record_turn_start(tmp_path, "chat", "pending", reason=reason)
+diff --git a/tui_gateway/admission_retry.py b/tui_gateway/admission_retry.py
+index 555bb43190..f22c397a99 100644
+--- a/tui_gateway/admission_retry.py
++++ b/tui_gateway/admission_retry.py
+@@ -101,7 +101,7 @@ def redrive_update_queues(home):
+                     or marker.get("writer_pid") != os.getpid() or marker.get("queue_released")):
+                 continue
+             owned = [(sid, session) for sid, session in sessions
+-                     if server._session_lookup_key(session, fallback=sid) == key
++                     if key in {session.get("session_key"), server._session_lookup_key(session, fallback=sid)}
+                      and Path(server._session_home(session)).resolve() == home.resolve()]
+             with ExitStack() as locks:
+                 for _, session in owned:
+@@ -114,6 +114,11 @@ def redrive_update_queues(home):
+                     elif session.get("queued_prompt") and not (session.get("_closing") or session.get("_finalized")):
+                         active = True
+                         retry_queued_prompt("__update_queue__", sid, session)
++                    elif session.get("_turn_cancel_requested") and not (session.get("_closing") or session.get("_finalized")):
++                        # This live runtime rejects auto-continue after interruption.
++                        # Keep custody until teardown removes it or makes it unusable;
++                        # otherwise every observer pass offers a replay it cannot run.
++                        active = True
+                 if not active:
+                     release_update_queue(home, key, marker)
+ 
+diff --git a/tui_gateway/methods_session_interrupt.py b/tui_gateway/methods_session_interrupt.py
+index 17f4355e60..418e291d5b 100644
+--- a/tui_gateway/methods_session_interrupt.py
++++ b/tui_gateway/methods_session_interrupt.py
+@@ -168,6 +168,8 @@ def _recover_unreachable_compute_host_turn(sid: str, session: dict, inflight_at_
+         # A Stop the helper already decided keeps the update-held queue (``outcome``; a kept Stop sends no
+         # interrupt frame, so only a later step can have raised) leaves it: there was no turn to recover.
+         if not kept_update_held_queue:
++            from tui_gateway.admission_retry import discard_update_queue_marker
++            discard_update_queue_marker(session)
+             session["_turn_cancel_requested"] = True
+             session["queued_prompt"] = None
+             session.pop("queued_prompts", None)
+-- 
+2.43.0
+

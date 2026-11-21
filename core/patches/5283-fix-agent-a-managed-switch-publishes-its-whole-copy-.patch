@@ -1,0 +1,129 @@
+From 3674f5e1466f35cd1679925228eef700917f7904 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 20:18:24 +0000
+Subject: [PATCH] fix(agent): a managed switch publishes its whole copy except
+ turn custody [daveey]
+
+The previous commit on this branch published only keys whose staged value
+differed from the switch's snapshot. Review of 06b9c93565 showed that this
+drops the switch's own resets: reset_route_verdicts, _finish_switch and the
+prompt-cache invalidation write defaults (False, 0, None) that usually equal
+the snapshot, so a value a concurrent turn set on the live agent during the
+switch survived onto the new route (old route verdicts, the fallback flag,
+the old model's cached system prompt). Base published those resets.
+
+Publish the whole staged copy again, as base did, and leave out only the
+three turn-custody attributes that turn admission and release own
+(_active_session_turn_lease_holder, _last_session_turn_lease_holder,
+_active_session_turn_lease_ttl_seconds). The switch never writes them, so the
+live agent keeps whatever its current turn holds. No lease row is inserted;
+released and superseded holders still refuse.
+
+Tests: tests/agent/test_managed_switch_turn_custody.py gains the reviewer's
+three probes as one parametrized test. With base agent_runtime_switch.py the
+3 custody tests fail and the 3 reset probes pass; at 06b9c93565 the reverse;
+here all 7 pass. 2437 pass across the 123 test files that reference
+switch_model, switch_runtime or _one_turn_runtime.
+
+Hermes-Card: t_eeeeee000000002b
+---
+ agent/agent_runtime_switch.py                 | 41 ++++++++-----------
+ .../agent/test_managed_switch_turn_custody.py | 15 +++++++
+ 2 files changed, 32 insertions(+), 24 deletions(-)
+
+diff --git a/agent/agent_runtime_switch.py b/agent/agent_runtime_switch.py
+index 1f5f913ccd..806e2131cd 100644
+--- a/agent/agent_runtime_switch.py
++++ b/agent/agent_runtime_switch.py
+@@ -39,26 +39,21 @@ def _stage_compressor(compressor):
+     return staged, writes
+ 
+ 
+-def _switch_changes(base, pristine, working, staged):
+-    """Only what the switch itself changed since its snapshot is published.
++# Turn custody is written only by turn admission and release (agent.turn_facade_lease), never by a switch.
++_TURN_CUSTODY_KEYS = frozenset({
++    '_active_session_turn_lease_holder', '_last_session_turn_lease_holder', '_active_session_turn_lease_ttl_seconds',
++})
++
++
++def _without_turn_custody(staged):
++    """The staged copy minus turn custody, which stays whatever the live agent holds now.
+ 
+     Resolution can take seconds and the callers' ``running`` check is unlocked, so a turn may be
+-    admitted on the live agent meanwhile. Publishing the whole stale copy reverted that turn's state:
+-    its lease holder went back to None (the flush then skipped the lease check) or to an earlier
+-    turn's released holder (the flush was refused as a lost lease)."""
+-    changes = {}
+-    for key, value in staged.items():
+-        if key in working and value is working[key]:
+-            try:
+-                unchanged = value == pristine[key]
+-            except (TypeError, ValueError, RecursionError):
+-                unchanged = False  # incomparable content: publish, as before
+-        else:
+-            unchanged = key in base and value is base[key]
+-        if unchanged:
+-            continue
+-        changes[key] = value
+-    return changes
++    admitted or released on the live agent meanwhile. Publishing the snapshot's custody reverted it:
++    the holder went back to None (the flush then skipped the lease check) or to an earlier turn's
++    released holder (the flush was refused as a lost lease). Everything else is still published
++    whole, so the switch's resets land even where they equal the snapshot."""
++    return {key: value for key, value in staged.items() if key not in _TURN_CUSTODY_KEYS}
+ 
+ 
+ def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabilities):
+@@ -76,13 +71,11 @@ def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabili
+     if config is None and not temporary:
+         return _switch_model_runtime(agent, model, provider, api_key, base_url, api_mode, capabilities)
+     staged = copy(agent)
+-    base = dict(vars(agent))
+     # Switch helpers mutate these containers in place. Never expose partial work
+     # or clear live provenance while constructing a replacement.
+-    pristine = {key: copy(value) for key, value in base.items() if isinstance(value, (dict, list, set))}
+-    for key, value in pristine.items():
+-        setattr(staged, key, copy(value))
+-    working = {key: vars(staged)[key] for key in pristine}
++    for key, value in vars(agent).items():
++        if isinstance(value, (dict, list, set)):
++            setattr(staged, key, copy(value))
+     staged.context_compressor, compressor_writes = _stage_compressor(getattr(agent, 'context_compressor', None))
+     staged._session_db = None
+ 
+@@ -105,7 +98,7 @@ def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabili
+     backend = getattr(staged.context_compressor, '_session_db', None)
+     if isinstance(backend, _DeferredSessionWrites):
+         staged.context_compressor._session_db = backend.backend
+-    vars(agent).update(_switch_changes(base, pristine, working, vars(staged)))
++    vars(agent).update(_without_turn_custody(vars(staged)))
+     persist_class_metadata(agent)
+     for method, args, kwargs in ([] if temporary else compressor_writes):
+         method(*args, **kwargs)
+diff --git a/tests/agent/test_managed_switch_turn_custody.py b/tests/agent/test_managed_switch_turn_custody.py
+index d66945cad3..99b5d66916 100644
+--- a/tests/agent/test_managed_switch_turn_custody.py
++++ b/tests/agent/test_managed_switch_turn_custody.py
+@@ -141,3 +141,18 @@ def test_quiet_switch_publishes_the_same_runtime(live):
+     agent.switch_model(TARGET, 'anthropic')
+     assert agent.model == TARGET and agent._session_db is db
+     assert getattr(agent, '_active_session_turn_lease_holder', None) is None
++
++
++@pytest.mark.parametrize('field, during, expected', [
++    ('_stream_options_unsupported', True, False),
++    ('_fallback_activated', True, False),
++    ('_cached_system_prompt', 'prompt built for the old model', None),
++])
++def test_switch_reset_lands_over_a_value_set_during_the_switch(live, field, during, expected):
++    """The reset equals the snapshot value, so a publish that diffs against the snapshot would drop it."""
++    agent, _db = live
++    setattr(agent, field, expected)
++    switch = PausedSwitch(agent)
++    setattr(agent, field, during)
++    switch.finish()
++    assert getattr(agent, field) == expected and agent.model == TARGET
+-- 
+2.43.0
+

@@ -1,0 +1,88 @@
+From 4124f7c4ae9c0b6d9b07fae9e8e4735c06da4e87 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 23:48:48 -0800
+Subject: [PATCH] fix(kanban): containment receipt cache ignores Board row
+ re-stamp bookkeeping (#3753)
+
+The Board rewrote an unchanged contained event row (version 1 -> 2, new
+seq/hlc/updated_at) during an example rewrite. remember() compared the whole
+evidence row, so every replica holding the first copy raised
+ContainmentRefused('canonical receipt identity changed') on re-fetch and
+its sync loop died on affected replicas. ff42d0a0a8 only dropped the
+top-level feed head.
+
+Identity now excludes the row's server bookkeeping (seq, hlc, updated_at,
+version); uid, kind, payload, origin, created_at, run_uid and the
+containment_v1 proof still refuse any change. Regression test uses the
+live values: red on main, green here.
+---
+ hermes_cli/kanban_containment_replica.py      | 13 ++++++++++++-
+ .../test_kanban_containment_replica.py        | 19 ++++++++++++++++++-
+ 2 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_containment_replica.py b/hermes_cli/kanban_containment_replica.py
+index 5d6ccb254e..0756671096 100644
+--- a/hermes_cli/kanban_containment_replica.py
++++ b/hermes_cli/kanban_containment_replica.py
+@@ -73,9 +73,20 @@ def remember(conn: sqlite3.Connection, evidence: dict, *, board: str, task: str,
+             _CACHE.reset(token)
+ 
+ 
++# Server bookkeeping the Board re-stamps when it rewrites an unchanged event row (version 1 -> 2 with
++# a new seq/hlc/updated_at; as in an example rewrite of a `contained` receipt). They place the row in
++# the feed; they are not part of what the containment proof certifies, so a re-fetch that differs
++# only there is the same receipt. Every other row field (uid, kind, payload, origin, created_at,
++# run_uid, deleted_at, ord, ...) stays identity.
++_ROW_BOOKKEEPING = frozenset({"seq", "hlc", "updated_at", "version"})
++
++
+ def _certified(raw: str) -> tuple:
+     data = json.loads(raw)
+-    return tuple(json.dumps(data.get(k), sort_keys=True) for k in ("row", "containment_v1"))
++    row = data.get("row")
++    if isinstance(row, dict):
++        row = {k: v for k, v in row.items() if k not in _ROW_BOOKKEEPING}
++    return (json.dumps(row, sort_keys=True), json.dumps(data.get("containment_v1"), sort_keys=True))
+ 
+ 
+ def _cached(conn: sqlite3.Connection, uid: str) -> dict | None:
+diff --git a/tests/hermes_cli/test_kanban_containment_replica.py b/tests/hermes_cli/test_kanban_containment_replica.py
+index 325537a3b7..529979ba4e 100644
+--- a/tests/hermes_cli/test_kanban_containment_replica.py
++++ b/tests/hermes_cli/test_kanban_containment_replica.py
+@@ -175,6 +175,22 @@ def test_receipt_cache_ignores_volatile_evidence_head(synced_conn):
+     assert len(stored) == 1 and json.loads(stored[0][0])["head"] == 100
+ 
+ 
++def test_receipt_cache_ignores_board_row_restamp(synced_conn):
++    # Example incident: the Board rewrote an unchanged `contained` row (version 1 -> 2, new
++    # seq/hlc/updated_at). Every replica holding the first copy crashed its sync loop on re-fetch.
++    conn = synced_conn
++    target, _, stop, _, hub = scenario(conn)
++    proof = hub.events[stop["event_uid"]]
++    proof["row"].update(seq=3668634, hlc="1795143677540-0000-server", updated_at=1795143677540, version=1)
++    replica.remember(conn, proof, board="fixture", task=target, uid=stop["event_uid"])
++    restamped = copy.deepcopy(proof)
++    restamped["head"] = 3699180
++    restamped["row"].update(seq=3695610, hlc="1795156252424-0000-server", updated_at=1795156252424, version=2)
++    replica.remember(conn, restamped, board="fixture", task=target, uid=stop["event_uid"])
++    stored = conn.execute("SELECT evidence FROM containment_canonical_receipts").fetchall()
++    assert len(stored) == 1 and json.loads(stored[0][0])["row"]["seq"] == 3668634  # first copy kept
++
++
+ def _foreign_origin(evidence):
+     # origin_gateway must stay aligned with containment_v1.gateway so certified_stop
+     # still passes; identity comparison is what must refuse.
+@@ -188,7 +204,8 @@ def _foreign_origin(evidence):
+     # request="changed" is refused by canonical_event (_uid) before identity compare.
+     lambda e: e["containment_v1"].update(request=sync.uuid7()),
+     lambda e: e["row"].update(created_at=12345),
+-], ids=["payload", "origin", "proof", "row"])
++    lambda e: e["row"].update(run_uid=sync.uuid7()),
++], ids=["payload", "origin", "proof", "row", "run_uid"])
+ def test_receipt_cache_still_refuses_certified_changes_with_head(synced_conn, mutate):
+     conn = synced_conn
+     target, _, stop, _, hub = scenario(conn)
+-- 
+2.43.0
+

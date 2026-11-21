@@ -1,0 +1,1822 @@
+From 141e8914262f7d51880937de4ddd7722e29ed5d5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 19:47:12 -0800
+Subject: [PATCH] fix(doctor): close the review's argv leaks and over-masks;
+ drop the filesystem check
+
+Adversarial review of the fail-closed mask found leaks by position and
+name, over-masking of real identifiers and a host-dependent path check.
+
+Leaks closed:
+- shell text: leading NAME=value env words and the first word are judged
+  by name; a NAME=command value (ssh -o ProxyCommand=sshpass -p ...) is
+  read as an assignment before it is split as a command
+- grouped keys (ABCD-EF12-..., ab12_cd34_..., three+ equal groups),
+  case/digit flip density, and long all-caps clusters judged as generated
+- paths and URLs judged component by component with the full identifier
+  rules (known ids inside, chunk checks), base64 pieces cut by "/" or "#"
+  judged together, shell-unsafe symbols in a component masked
+- symbol passwords: !^$* or several of &#%@ in a name (globs and npm
+  @scope/pkg@version exempt)
+- secret words passphrase/authorization/jwt/hmac and whole parts
+  pass/pw/otp/creds; Go-style -password and Java -Dapi.key= flags;
+  curl -b cookies; user:pass@host with an undotted host; the argument
+  after a secret flag is its value unless it is a kebab-case --flag;
+  mechanism words (oauth, header) only after auth-only flags; a path after
+  a secret flag only when it looks like a file of 2+ directories
+- long flags need a name that reads as one (urlsafe tokens start with -)
+
+Over-masks fixed: workflow, launchctl, example.com, amazonaws hosts,
+iOS/gRPC/eBPF, ExperimentalJSProfiler, Hermes ids inside paths, count flags
+(--cap-tokens, --tokens-per-delta), --token-endpoint, non-ASCII words.
+
+The "path exists here" shortcut is gone: it showed /tmp=SECRET and
+~/SECRET, made output differ by host and user, and could block on a stale
+mount. Letter-pair table rebuilt from the dictionary plus repo, process and
+host vocabulary. Docstring states the measured rates and limits.
+
+Tests: rewritten as one file with imports on top and a seeded RNG per test;
+fuzz over 15 shapes x 4 positions x 4 lengths with the measured ceilings;
+the two rows the previous commit edited are restored as explicit
+"masked by design" checks (full commits, digests, hex session folders);
+home-directory rows restored now that nothing touches the filesystem.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_state_argv_secrets.py            | 502 ++++++++------
+ hermes_state_holders.py                 |  13 +-
+ tests/hermes_state/test_argv_secrets.py | 878 ++++++++++++++----------
+ 3 files changed, 819 insertions(+), 574 deletions(-)
+
+diff --git a/hermes_state_argv_secrets.py b/hermes_state_argv_secrets.py
+index 0b122ffd8f..78664db8e1 100644
+--- a/hermes_state_argv_secrets.py
++++ b/hermes_state_argv_secrets.py
+@@ -1,22 +1,28 @@
+ """Mask secrets in a process's argv before it is shown to a person (``hermes doctor`` holder lists).
+ 
+-Fail closed: an argument is shown only when it parses as an identifier -- words, numbers, versions, paths, hosts,
+-model names, Hermes and cloud ids -- and is masked (``***``) otherwise, so a secret shape nobody listed is still
+-hidden. On top of that, values a name marks as secret are masked whatever they look like: after a secret-named flag
+-(``--webhook-secret``, ``--api-key-value``), in ``NAME=value`` and ``Header: value`` pairs, a program's own password
+-flags (``mysql -pPASS``, ``sshpass -p``, ``curl -u user:pass``, also behind ``sudo``/``docker exec``/``bash -c``) and
+-``user:pass@host``. ``agent.redact`` still runs afterwards for known secret formats and URL credentials.
+-
+-The limit: a short random string can read like a name. Measured on generated secrets of every common shape (letters
+-and digits, base32/64, urlsafe, hex, symbols, single-case letters), at most ~2% of 16-character ones and well under 1%
+-of 32-character ones are shown; under 0.5% of this repo's identifiers are masked. Short hex (up to 12 characters) is
+-shown on purpose: it is how commits and digests are abbreviated.
++Fail closed: an argument is shown only when it parses as an identifier -- words, numbers, versions, hosts, model
++names, Hermes and cloud ids, and paths and URLs whose parts are such names -- and masked (``***``) otherwise, so a
++secret shape nobody listed is still hidden. Values a name marks as secret are masked whatever they look like: after
++a secret-named flag (``--webhook-secret``, ``--api-key-value``, ``-Dapi.key=``, Go-style ``-password``), in
++``NAME=value`` and ``Header: value`` pairs, ``user:pass@host``, a program's own password flags (``mysql -pPASS``,
++``sshpass -p``, ``curl -u user:pass``, ``-b cookie``), also behind ``sudo``/``docker exec``/``env``/``bash -c`` and
++env prefixes in shell strings. ``agent.redact`` still runs afterwards for known secret formats and URL credentials.
++
++Limits, measured on generated secrets of every common shape (letters and digits, base32/64, urlsafe, hex, symbol
++passwords, single-case letters, grouped keys) as a bare argument, in a path, in a URL and as a ``NAME=`` value: at most
++about 6% of 16-character secrets are shown, 2.5% of 24-character, 1% of 32-character and 0.5% of 40-character ones
++(the worst shape is random single-case letters, which can read like words); about 0.25% of this repo's identifiers
++are masked. This is a rate, not a guarantee, and some secrets look exactly like identifiers and are shown:
++pronounceable passwords (``correcthorse``), all-digit values, UUIDs and strings under 12 characters, unless a name
++marks them secret. Short hex (up to 12 characters) is shown on purpose: it is how commits are abbreviated; longer hex
++(full commits, digests, container ids) is masked with the keys it looks like.
+ """
+ 
+ from __future__ import annotations
+ 
+ import os
+ import re
++from itertools import pairwise
+ 
+ MASK = "***"
+ INLINE_CODE = "<inline code>"  # describe_holder_pid's stand-in for an interpreter's -c source
+@@ -24,26 +30,29 @@ _MAX_DEPTH = 4
+ 
+ # ---- names that mark a value as secret ---------------------------------------------------------------------------
+ 
+-# A name is secret when one of its parts is, or ends with, a secret word (--api-key, --apikey, --client-secret-value,
+-# --token-b64) -- fail closed: a new suffix stays secret -- unless its LAST part names a setting about the secret.
+-_SECRET_WORD = re.compile(r"(?:key|token|secret|passw(?:or)?d|passwd|pwd|auth|credential|cookie|bearer)s?$",
+-                          re.IGNORECASE)
++# A name part that is, or ends with, a secret word (api-key, apikey, client-secret, passphrase); some words only as a
++# whole part, since they end other words (bypass, typewriter).
++_SECRET_WORD = re.compile(
++    r"(?:key|token|secret|passw(?:or)?d|passwd|passphrase|pwd|auth|authorization|credential|cookie|bearer|jwt|hmac)s?$",
++    re.IGNORECASE)
++_SECRET_PARTS = frozenset({"pass", "pw", "otp", "creds"})
++# A part after the secret word that names a setting about it, not the secret (--api-key-timeout, --key-file).
+ _SETTING_SUFFIXES = frozenset({
+     "file", "files", "env", "timeout", "ttl", "name", "names", "id", "ids", "path", "paths", "dir", "url", "uri",
+-    "host", "port", "count", "limit", "size", "length", "len", "mode", "type", "kind", "format", "store", "backend",
+-    "provider", "browser", "enabled", "required", "only", "whitelist", "allowlist", "denylist", "blacklist",
+-    "server", "servers", "scheme", "schemes", "delegate", "signingkey",
++    "endpoint", "host", "port", "count", "limit", "size", "length", "len", "mode", "type", "kind", "format", "store",
++    "backend", "provider", "browser", "enabled", "required", "only", "whitelist", "allowlist", "denylist",
++    "blacklist", "server", "servers", "scheme", "schemes", "delegate", "signingkey", "version", "versions",
+ })
+ _COMMAND_SUFFIXES = frozenset({"cmd", "command", "helper"})
+ # A first part that makes a flag a switch: it takes no value, so the next argument is not its secret.
+ _BOOLEAN_PREFIXES = frozenset({"no", "show", "rotate", "migrate", "with", "list", "print", "clear", "reset", "skip",
+                                "allow", "require", "enable", "disable", "isolated"})
+ _PUBLIC_FLAGS = frozenset({"--ssh-session-token-file", "--keychain", "--monkey", "--keyboard", "--author",
+-                           "--authority", "--max-tokens", "--min-tokens", "--cache-read-tokens", "--idempotency-key",
+-                           "--step-key", "--passkey-browser", "--session-key", "--no-credentials"})
+-# Values of a secret-named flag that select a mechanism rather than carry the secret (mcp add --auth oauth).
+-_MODE_WORDS = frozenset({"oauth", "oauth2", "header", "basic", "bearer", "none", "token", "api-key", "apikey", "env",
+-                         "file", "keychain", "prompt", "agent", "stdin", "auto", "true", "false", "on", "off"})
++                           "--authority", "--idempotency-key", "--step-key", "--passkey-browser", "--session-key",
++                           "--no-credentials", "--use-partner-key-as-auth", "--keywords"})
++# Values that select an auth mechanism (mcp add --auth oauth): kept after a flag whose only secret word is "auth".
++_AUTH_MODES = frozenset({"oauth", "oauth2", "header", "basic", "bearer", "none", "token", "api-key", "apikey", "env",
++                         "keychain", "agent", "sso", "iam", "anonymous", "password", "key"})
+ _SECRET_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie", "set-cookie"})
+ 
+ # Programs whose own short flags carry a password: separate-value flags, attached-only flags, user:pass flags.
+@@ -58,8 +67,8 @@ _PROGRAM_SECRET_FLAGS = {
+     "keytool": (("-storepass", "-keypass", "-srcstorepass", "-deststorepass", "-srckeypass", "-destkeypass"), (), ()),
+     "7z": ((), ("-p",), ()), "7za": ((), ("-p",), ()), "zip": (("-P",), (), ()), "unzip": (("-P",), (), ()),
+     "ssh-keygen": (("-N", "-P"), (), ()),
+-    "curl": ((), (), ("-u", "--user", "-U", "--proxy-user")), "smbclient": ((), (), ("-U", "--user")),
+-    "lftp": ((), (), ("-u", "--user")), "wget": ((), (), ()),
++    "curl": (("-b",), (), ("-u", "--user", "-U", "--proxy-user")), "smbclient": ((), (), ("-U", "--user")),
++    "lftp": ((), (), ("-u", "--user")),
+ }
+ _NO_FLAGS = ((), (), ())
+ # Programs that run a command given as their first positional argument: that program's own flags apply after it.
+@@ -70,27 +79,31 @@ _KEY_ID_NAMES = frozenset({"signingkey", "keyid", "key-id", "fingerprint", "kid"
+ 
+ # ---- identifier grammar --------------------------------------------------------------------------------------------
+ 
+-# Common letter pairs (95% of pairs in /usr/share/dict/words plus the identifiers of this repo and of live processes):
+-# identifiers are made of words, random letters are not.
++# Common letter pairs: 95% of pairs in /usr/share/dict/words plus the identifiers of this repo and of live processes.
+ _PAIRS = frozenset((
+-    "ab ac ad ae af ag ai ak al am an ap ar as at au av ay ba be bi bl bo br bu ca cc ce ch ci ck cl co cr ct cu cy "
+-    "da dd de di dl do dr ds du ea eb ec ed ee ef eg ei el em en eo ep er es et eu ev ew ex fa fe ff fi fl fo fr fu "
+-    "ga ge gh gi gl gn go gr gu gy ha he hi hl ho hr ht hu hy ia ib ic id ie if ig ik il im in io ip ir is it iu iv "
+-    "iz ka ke ki la ld le li ll lo ls lt lu ly ma mb me mi mm mo mp mu my na nc nd ne nf ng ni nk nl nn no np nr ns "
+-    "nt nu nv ny oa ob oc od oe of og oi ok ol om on oo op or os ot ou ov ow ox pa pe ph pi pl po pp pr ps pt pu py "
+-    "qu ra rb rc rd re rg rh ri rk rl rm rn ro rp rr rs rt ru rv ry sa sc se sh si sk sl sm sn so sp ss st su sy ta "
+-    "tc te th ti tl to tr ts tt tu ty ua ub uc ud ue ug ui ul um un up ur us ut va ve vi vo wa we wi wo xi ya yc yl "
+-    "ym yn yp yr ys yt za ze"
++    "aa ab ac ad ae af ag ah ai ak al am an ap ar as at au av aw ax ay az ba bb be bi bl bo br bs bu ca cc ce ch ci "
++    "ck cl co cr cs ct cu cy da dd de di dl dn do dr ds du dy ea eb ec ed ee ef eg eh ei ek el em en eo ep er es et "
++    "eu ev ew ex ey fa fe ff fi fl fo fr ft fu ga ge gg gh gi gl gn go gr gs gu gy ha he hi hl hn ho hr ht hu hy ia "
++    "ib ic id ie if ig ik il im in io ip ir is it iu iv iz ja je ju ka ke ki kl ko ks la lc ld le li ll lm lo lp ls "
++    "lt lu lv ly ma mb me mi mm mo mp mu my na nb nc nd ne nf ng nh ni nk nl nm nn no np nr ns nt nu nv ny oa ob oc "
++    "od oe of og oi ok ol om on oo op or os ot ou ov ow ox pa pe ph pi pl po pp pr ps pt pu py qu ra rb rc rd re rf "
++    "rg rh ri rk rl rm rn ro rp rr rs rt ru rv ry sa sc se sh si sk sl sm sn so sp sq ss st su sw sy ta tc te th ti "
++    "tl tm to tr ts tt tu tw ty ua ub uc ud ue ug ui ul um un up ur us ut va ve vi vo wa we wh wi wo xi xp xt ya yc "
++    "yd ye yl ym yn yo yp yr ys yt za ze zi zo"
+ ).split())
++# Thresholds measured on random strings vs the repo's identifiers, /usr/share/dict/words and live process arguments.
++_COMMON_MIN, _VOWEL_MIN, _RARE_MAX, _CLUSTER_MIN, _CLUSTER_MIN_UPPER = 0.55, 0.1, 0.2, 7, 5
++_COMMON_MIN_LONG, _LONG_WORD = 0.7, 14
+ _MIN_JOINED = 12
++_SHORT_HEX = 12  # an abbreviated commit; longer hex is masked with the keys it looks like
++_FLIP_DENSITY_MAX = 0.4
+ _VOWELS = frozenset("aeiouy")
+-# Thresholds measured on random strings vs the repo's identifiers and /usr/share/dict/words.
+-_COMMON_MIN, _VOWEL_MIN, _RARE_MAX, _CLUSTER_MIN = 0.55, 0.1, 0.25, 6
+-_COMMON_MIN_LONG, _LONG_WORD = 0.7, 14
+-_RARE = frozenset("jqxzkvw")
+-# Punctuation between the words of an identifier, list or shell text. A secret cut into short pieces by symbols is
+-# still caught: _joined_random judges each chunk with its symbols removed.
++_RARE = frozenset("jqxz")
++# Punctuation between the words of an identifier, list or shell text.
+ _SEPARATORS = re.compile(r"[-_.:/@=,+~%?&#*\\|;()\[\]{}<>\"'`$!^ ]")
++# Separators of words inside a name; the others (+ / = ~ % ? & # * ! $ ^) also cut secrets (base64, symbols) and are
++# removed, not split on, when a chunk is judged as a whole.
++_WORD_SEPARATORS = re.compile(r"[-_.:@,|;()\[\]{}<>\"'` ]")
+ _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+ # Ids with a known prefix: Hermes cards/processes/sessions, cloud resources.
+ _KNOWN_ID_BODY = (r"(?:t_[0-9a-f]+|proc_[0-9a-f]+|\d{8}_\d{6}_[0-9a-z]+|"
+@@ -100,164 +113,222 @@ _KNOWN_ID_INSIDE = re.compile(rf"(?<![0-9A-Za-z]){_KNOWN_ID_BODY}(?![0-9A-Za-z])
+ _PATH_START = re.compile(r"^(?:/|~|\.{1,2}/|\\|[A-Za-z]:[\\/])")
+ _URL = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+ _ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_.-]*)=")
++_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$")
+ _HEADER = re.compile(r"^([A-Za-z][A-Za-z0-9-]*):\s+(.*)$", re.DOTALL)
+ # user:pass@host without a scheme; not package or image specs (npm:react@18, python:3.12@sha256:…, mailto:a@b).
+-_USERINFO = re.compile(r"^([^:@/\s]+):([^:@/\s]+)@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|localhost|\d+(?:\.\d+){3})"
++_USERINFO = re.compile(r"^([^:@/\s]+):([^:@/\s]+)@([A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)*|\d+(?:\.\d+){3})"
+                        r"(?::\d+)?(?:[:/].*)?$")
+ _NOT_USERINFO = frozenset({"mailto", "npm", "github", "gitlab", "bitbucket", "pkg", "jsr", "docker", "oci", "git"})
++_STRUCTURE = re.compile(r"[/?&#=;@]")  # between the components of a path or URL
++_NPM_SPEC = re.compile(r"^@[\w.-]+/[\w.-]+(?:@[\w.^~<>=-]+)?$")  # @playwright/mcp@latest
+ 
+ 
+ def _letters_random(*words: str) -> bool:
+     """Letters that do not read as words: few common letter pairs, few vowels, many rare letters or a long consonant
+     cluster. Several *words* (camelCase parts) are judged together, with pairs taken inside each word only."""
+-    lowered = [w.lower() for w in words if w]
++    words = tuple(w for w in words if w)
++    lowered = [w.lower() for w in words]
+     pairs = [w[i:i + 2] for w in lowered for i in range(len(w) - 1)]
+     letters = "".join(lowered)
+-    if not pairs or not letters:
++    if not pairs:
+         return False
+     common = sum(pair in _PAIRS for pair in pairs) / len(pairs)
+     vowels = sum(c in _VOWELS for c in letters) / len(letters)
+     rare = sum(c in _RARE for c in letters) / len(letters)
+-    cluster = max((len(m) for w in lowered for m in re.findall(r"[^aeiouy]+", w)), default=0)
+-    longest = max(len(w) for w in lowered)
++    # compound words have long clusters (launchctl, fullscreen); a long all-caps word with one is random (GPOGJHRLO)
++    longest_cluster = max((len(m) for w in lowered for m in re.findall(r"[^aeiouy]+", w)), default=0)
++    upper_cluster = max((len(m) for w in words if w.isupper() and len(w) >= 8
++                         for m in re.findall(r"[^aeiouy]+", w.lower())), default=0)
++    clustered = longest_cluster >= _CLUSTER_MIN or (upper_cluster >= _CLUSTER_MIN_UPPER and common < 0.75)
+     # one unbroken word of 14+ letters is rare in identifiers and common in random strings: it must read strongly
+-    floor = _COMMON_MIN_LONG if longest >= _LONG_WORD and len(lowered) == 1 else _COMMON_MIN
+-    return common < floor or vowels < _VOWEL_MIN or rare > _RARE_MAX or cluster >= _CLUSTER_MIN
++    floor = _COMMON_MIN_LONG if len(lowered) == 1 and len(letters) >= _LONG_WORD else _COMMON_MIN
++    return common < floor or vowels < _VOWEL_MIN or rare > _RARE_MAX or clustered
+ 
+ 
+-def _alpha_ok(run: str) -> bool:
+-    """A letter run that is a word, an acronym or camelCase words."""
+-    if len(run) <= 3:
+-        return not re.search(r"[a-z][A-Z]", run)  # "mP", "qL": random case, not a word
+-    if len(set(run.lower())) == 1:
+-        return True  # a repeated letter (padding, placeholders) is no secret
+-    words = re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+", run)
+-    if "".join(words) != run:
+-        return False
++def _letters_look_random(letters: str) -> bool:
++    """Letters (possibly camelCase) that are not words: random case flips, or letters that do not read as words."""
++    if len(set(letters.lower())) <= 2:
++        return False  # a repeated letter (padding, placeholders) is no secret
++    words = re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+", letters)
+     if len(words) > 1 and sum(len(w) for w in words) / len(words) < 2.5:
+-        return False  # "XyQwErTy": a capital every other letter
+-    if len(run) >= 10 and sum(len(w) <= 2 for w in words) >= 3:
+-        return False  # names have at most a couple of short words (is, By, Id); random case has many (Ub…Lz…Jw)
+-    if len(words) > 1 and len(run) >= 8 and _letters_random(*words):
+-        return False  # camelCase whose parts do not read as words (RfilJpvPrieGXi…)
+-    for word in words:
+-        if word.isupper():
+-            if len(word) >= 8 and _letters_random(word):
+-                return False
+-            continue
+-        if len(word) >= 8 and _letters_random(word):
+-            return False
+-    return True
++        return True  # "XyQwErTy": a capital every other letter
++    if len(letters) >= 10 and sum(len(w) <= 2 for w in words) >= 3:
++        return True  # names have at most a couple of short words (is, By, Id); random case has many (Ub…Lz…Jw)
++    acronyms = [w for w in words if len(w) <= 2 and w.isupper()]
++    # one short acronym (JS, IO) carries no letter statistics; several are random case flips (…JPvGXi…)
++    judged = [w for w in words if len(w) >= 3] if len(acronyms) <= 1 else words
++    return _letters_random(*(judged if len(judged) > 1 else [letters]))
++
++
++def _alpha_ok(run: str) -> bool:
++    """A letter run that is a word, an acronym or camelCase words. Runs of up to 6 letters carry too little to be a
++    secret on their own (iOS, gRPC, eBPF); longer runs are judged."""
++    return len(run) <= 6 or not _letters_look_random(run)
+ 
+ 
+ def _segment_ok(segment: str) -> bool:
+     """One separator-free piece of an identifier."""
+     if not segment or segment.isdigit():
+         return True
+-    if not (segment.isascii() and segment.isalnum()):
++    if not segment.isascii():
++        return segment.isalnum()  # a word in another script (naïve, café, Cyrillic names)
++    if not segment.isalnum():
+         return False  # symbols: passwords, not identifiers
+-    has_letter, has_digit = re.search(r"[A-Za-z]", segment), re.search(r"\d", segment)
+-    if len(segment) >= 16 and has_letter and has_digit and re.fullmatch(r"[0-9a-fA-F]+", segment):
+-        return False  # long hex: a key, a token or a full digest
++    if re.fullmatch(r"[0-9a-fA-F]+", segment) and re.search(r"\d", segment) and re.search(r"[A-Fa-f]", segment):
++        return len(segment) <= _SHORT_HEX
+     runs = re.findall(r"[A-Za-z]+|\d+", segment)
+-    if len(segment) <= 12 and re.fullmatch(r"[0-9a-fA-F]+", segment):
+-        return True  # a short commit or digest prefix (0362a20c0e39); 16+ hex is masked above
+     if len(segment) >= 10 and len(runs) >= 6:
+         return False  # letters and digits alternating: generated, not named
+     return all(_alpha_ok(run) for run in runs if run.isalpha())
+ 
+ 
++def _flip_density(alnum: str) -> float:
++    """Changes between lowercase, uppercase and digits per character (a capital starting a word is not one):
++    camelCase and versions change rarely (Qwen3-Coder-480B ~0.24), generated tokens often (~0.6)."""
++    def kind(c: str) -> str:
++        return "d" if c.isdigit() else "u" if c.isupper() else "l"
++    flips = sum(1 for a, b in pairwise(alnum) if kind(a) != kind(b) and (kind(a), kind(b)) != ("u", "l"))
++    return flips / max(1, len(alnum) - 1)
++
++
+ def _joined_random(token: str) -> bool:
+-    """A chunk between word separators (``-``, ``_``, ``.``), its other symbols removed, is generated: many
+-    letter/digit alternations or letters that do not read as words. Symbols would otherwise cut a secret
+-    (``uAkqc7c#pilIq7s9``, ``+QBYaSITMRV…``) into short, innocent-looking pieces; word separators are left alone
+-    so snake_case and kebab-case names are judged word by word."""
+-    for chunk in re.split(r"[-_.]", token):
+-        joined = re.sub(r"[^A-Za-z0-9]", "", chunk)
+-        if len(joined) < _MIN_JOINED or (len(joined) <= 12 and re.fullmatch(r"[0-9a-fA-F]+", joined)):
+-            continue  # short, or a short commit/digest prefix
++    """The token is generated, judged with its symbols removed so that symbols cannot cut a secret into short,
++    innocent-looking pieces (``uAkqc7c#pilIq7s9``, ``+QBYaSITMRV…``, ``ab12_cd34_ef56_gh78``): many letter/digit
++    alternations across the whole token, or a word chunk whose letters do not read as words."""
++    whole = re.sub(r"[^A-Za-z0-9]", "", token)
++    short_hex = len(whole) <= _SHORT_HEX and re.fullmatch(r"[0-9a-fA-F]+", whole)
++    if len(whole) >= _MIN_JOINED and not short_hex and (
++            len(re.findall(r"[A-Za-z]+|\d+", whole)) >= 8 or _flip_density(whole) >= _FLIP_DENSITY_MAX):
++        return True
++    chunks = [re.sub(r"[^A-Za-z0-9]", "", chunk) for chunk in _WORD_SEPARATORS.split(token)]
++    groups = [chunk for chunk in chunks if chunk]
++    if (len({len(g) for g in groups}) == 1 and len(groups) >= (3 if len(groups[0]) >= 5 else 4)
++            and 3 <= len(groups[0]) <= 8
++            and not all(g.isdigit() for g in groups)
++            and (any(re.search(r"\d", g) and re.search(r"[A-Za-z]", g) for g in groups)
++                 or all(g.isupper() for g in groups))):
++        return True  # equal-length groups with digits or all caps: a license or recovery key (OKWV-IDIA-T5UR-…)
++    # short groups (N0BZ-AXT6-BODG-…, ZPTK29.PAJDOL.…): the letters of all chunks, pairs taken inside each chunk
++    group_letters = [re.sub(r"[^A-Za-z]", "", chunk) for chunk in chunks if chunk]
++    if len(group_letters) >= 3 and sum(map(len, group_letters)) >= _MIN_JOINED and not any(
++            len(g) >= 3 and g.islower() and not _letters_random(g) for g in group_letters if len(g) >= 5):
++        words = [g for g in group_letters if len(g) >= 2]
++        if len(words) >= 3 and all(w.isupper() or w.islower() for w in words) and _letters_random(*words):
++            return True
++    for joined in chunks:
++        if len(joined) < _MIN_JOINED or (len(joined) <= _SHORT_HEX and re.fullmatch(r"[0-9a-fA-F]+", joined)):
++            continue
+         if len(re.findall(r"[A-Za-z]+|\d+", joined)) >= 6:
+             return True
+         letters = re.sub(r"[^A-Za-z]", "", joined)
+-        if len(letters) >= 8 and len(set(letters.lower())) > 2 and _camel_random(letters):
++        if len(letters) >= 8 and _letters_look_random(letters):
+             return True
+     return False
+ 
+ 
+-def _camel_random(letters: str) -> bool:
+-    """Letters that do not read as words, judged per camelCase word when the casing is word-like."""
+-    words = re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+", letters)
+-    acronyms = [w for w in words if len(w) <= 2 and w.isupper()]
+-    # one short acronym (JS, IO, UI) carries no letter statistics; several are random case flips (…JPvGXi…)
+-    long_words = [w for w in words if len(w) >= 3] if len(acronyms) <= 1 else words
+-    if len(words) > 1 and len(long_words) > 1 and min(len(w) for w in long_words) >= 3:
+-        return _letters_random(*long_words)
+-    return _letters_random(letters)
+-
+-
+ def is_identifier(token: str) -> bool:
+-    """*token* reads as a name a person would recognise (words, numbers, versions, hosts, paths, ids)."""
+-    if _UUID.match(token) or _KNOWN_ID.match(token):
++    """*token* reads as a name a person would recognise (words, numbers, versions, hosts, ids)."""
++    if not token or _UUID.match(token) or _KNOWN_ID.match(token):
+         return True
+-    token = _KNOWN_ID_INSIDE.sub("id", token)  # followup:t_eeeeee0000000015:notify
++    token = _KNOWN_ID_INSIDE.sub("id", token)  # followup:t_eeeeee0000000015:notify, hermes-kanban-t_…
++    if not _NPM_SPEC.match(token):
++        unglobbed = re.sub(r"(?<![A-Za-z0-9])\*(?![A-Za-z0-9])", "", token)  # *.example.com, dir/*: globs
++        if re.search(r"[A-Za-z0-9]", unglobbed) and (
++                re.search(r"[!^$*]", unglobbed) or len(re.findall(r"[&#%@]", unglobbed)) >= 2):
++            return False  # shell-unsafe symbols, or several of &#%@, in a name: a password, not an identifier
+     if _joined_random(token):
+         return False
+     return all(_segment_ok(piece) for piece in _SEPARATORS.split(token))
+ 
+ 
+-# ---- values -------------------------------------------------------------------------------------------------------
++# ---- names ----------------------------------------------------------------------------------------------------------
++
++def _name_parts(name: str) -> list[str]:
++    return [part.lower() for part in re.split(r"[-_.]", name.lstrip("-")) if part]
++
++
++def _secret_index(parts: list[str]) -> int:
++    """Index of the last part that marks a secret, else -1."""
++    for index in range(len(parts) - 1, -1, -1):
++        if parts[index] in _SECRET_PARTS or _SECRET_WORD.search(parts[index]):
++            return index
++    return -1
++
+ 
+ def _is_secret_name(name: str) -> bool:
++    """A flag, env or option name whose value is a secret. Fail closed: a secret word followed by an unknown part is
++    still secret (--client-secret-value, --token-b64); only a setting part after it (or a switch prefix, or a public
++    flag) clears it."""
+     if "--" + name.lower().lstrip("-") in _PUBLIC_FLAGS:
+         return False
+-    parts = [part.lower() for part in re.split(r"[-_.]", name.lstrip("-")) if part]
++    parts = _name_parts(name)
+     if not parts:
+         return False
+     if "webhook" in parts or "webhooks" in parts:
+         return True  # a webhook URL is the secret itself
+-    if parts[0] in _BOOLEAN_PREFIXES or parts[-1] in _SETTING_SUFFIXES or parts[-1] in _COMMAND_SUFFIXES:
++    if parts[0] in _BOOLEAN_PREFIXES:
++        return False
++    index = _secret_index(parts)
++    if index < 0:
+         return False
+-    return any(_SECRET_WORD.search(part) for part in parts)
++    return not any(part in _SETTING_SUFFIXES or part in _COMMAND_SUFFIXES for part in parts[index + 1:])
+ 
+ 
+ def _is_command_name(name: str) -> bool:
+-    parts = [part.lower() for part in re.split(r"[-_.]", name.lstrip("-")) if part]
+-    return len(parts) > 1 and parts[-1] in _COMMAND_SUFFIXES and any(_SECRET_WORD.search(p) for p in parts[:-1])
+-
+-
+-def _mask_pieces(value: str) -> str:
+-    """A path or URL keeps its shape; each piece that is not an identifier is masked."""
+-    out, last = [], 0
+-    for match in _SEPARATORS.finditer(value):
+-        piece = value[last:match.start()]
+-        out.append(piece if _segment_ok(piece) or _UUID.match(piece) else MASK)
+-        out.append(match.group())
+-        last = match.end()
+-    tail = value[last:]
+-    out.append(tail if _segment_ok(tail) or _UUID.match(tail) else MASK)
+-    return "".join(out)
++    parts = _name_parts(name)
++    return len(parts) > 1 and parts[-1] in _COMMAND_SUFFIXES and _secret_index(parts[:-1]) >= 0
+ 
+ 
+-def _existing_path(value: str) -> bool:
+-    """A path that exists here (or whose directory does) names a file, not a secret: cache, container and mktemp
+-    names look random but are shown whole. A secret starting with "/" (base64) names nothing."""
+-    path = os.path.expanduser(value.split("=", 1)[0])
+-    try:
+-        parent = os.path.dirname(path.rstrip("/\\"))
+-        # an existing parent counts only two levels down: "/" or "~" exist for any secret that starts with "/"
+-        return os.path.lexists(path) or (parent.count(os.sep) >= 2 and os.path.isdir(parent))
+-    except (OSError, ValueError):
+-        return False
++def _counts_secrets(name: str) -> bool:
++    """--max-tokens, --cap-tokens: a plural secret word counts secrets; a number after it is a count."""
++    parts = _name_parts(name)
++    index = _secret_index(parts)
++    return index >= 0 and parts[index].endswith("s") and not parts[index].endswith("ss")
++
++
++def _auth_only(name: str) -> bool:
++    parts = _name_parts(name)
++    return any(p.endswith("auth") for p in parts) and not any(
++        p in _SECRET_PARTS or (_SECRET_WORD.search(p) and not p.endswith("auth")) for p in parts)
++
++
++# ---- values -------------------------------------------------------------------------------------------------------
++
++def _base64_piece(part: str) -> bool:
++    """A piece base64 could have cut at "/": its alphabet, with mixed case or digits (not a plain word)."""
++    return bool(re.fullmatch(r"[A-Za-z0-9+=]+", part)) and bool(
++        re.search(r"\d", part) or (re.search(r"[a-z]", part) and re.search(r"[A-Z]", part)))
++
++
++def _mask_components(value: str) -> str:
++    """A path, URL path or query keeps its structure; each component that is not an identifier is masked. Adjacent
++    components are also judged together, since base64 secrets carry "/" (``i0/WDpxZVIeYA8N/gAbxXu8i``)."""
++    parts = _STRUCTURE.split(value)
++    seps = _STRUCTURE.findall(value)
++    bad = [not is_identifier(part) for part in parts]
++    for index in range(len(parts) - 1):
++        left, right = parts[index], parts[index + 1]
++        if (seps[index] in "/#" and not bad[index] and not bad[index + 1] and _base64_piece(left)
++                and _base64_piece(right) and not is_identifier(left + right)):
++            bad[index] = bad[index + 1] = True
++    for index, part in enumerate(parts):
++        if re.search(r"[!^$*]", part) and re.search(r"[A-Za-z0-9]", part):
++            bad[index] = True  # shell-unsafe symbols do not occur in path or URL names; they do in passwords
++    out = [MASK if bad[0] else parts[0]]
++    for sep, part, masked in zip(seps, parts[1:], bad[1:]):
++        out += [sep, MASK if masked else part]
++    return "".join(out)
+ 
+ 
+ def _mask_url(value: str) -> str:
+     scheme, rest = value.split("://", 1)
+     authority, slash, path = rest.partition("/")
+     if "@" in authority:
+-        userinfo, host = authority.rsplit("@", 1)
+-        user = userinfo.split(":", 1)[0]
+-        authority = f"{user if is_identifier(user) else MASK}:{MASK}@{host}" if ":" in userinfo else f"{MASK}@{host}"
+-    return f"{scheme}://{authority}{slash}{_mask_pieces(path)}" if slash else f"{scheme}://{authority}"
++        authority = f"{MASK}@{authority.rsplit('@', 1)[1]}"  # userinfo is a credential either way
++    host = authority.rsplit("@", 1)[-1]
++    if not is_identifier(host.split(":")[0]):
++        authority = authority[: len(authority) - len(host)] + MASK
++    return f"{scheme}://{authority}{slash}{_mask_components(path)}" if slash else f"{scheme}://{authority}"
+ 
+ 
+ def _mask_userpass(value: str) -> str:
+@@ -271,67 +342,100 @@ def _mask_userpass(value: str) -> str:
+ 
+ def _mask_command(value: str) -> str:
+     program, _, rest = value.strip().partition(" ")
+-    return f"{program} {MASK}" if rest.strip() else value
++    return f"{_judge(program, secret=False, depth=1)} {MASK}" if rest.strip() else value
++
++
++def _judge_secret(value: str, *, name: str) -> str:
++    """The value of a secret-named flag or name: masked, except an auth mechanism word, a count, or a file that
++    holds the secret (an absolute path of 2+ directories made of names)."""
++    if _auth_only(name) and value.lower() in _AUTH_MODES:
++        return value
++    if _counts_secrets(name) and value.isdigit():
++        return value
++    if (_PATH_START.match(value) and re.fullmatch(r"[\w./\\:~-]+", value) and value.count("/") >= 2
++            and _mask_components(value) == value):
++        return value
++    return MASK
+ 
+ 
+-def _judge(value: str, *, secret: bool, depth: int) -> str:
++def _judge_assignment(name: str, inner: str, *, depth: int) -> str:
++    if _is_command_name(name):
++        return f"{name}={_mask_command(inner)}"
++    if name.lower().rsplit(".", 1)[-1] in _KEY_ID_NAMES and re.fullmatch(r"[0-9A-Fa-f]{8,40}", inner):
++        return f"{name}={inner}"
++    if _is_secret_name(name):
++        return f"{name}={_judge_secret(inner, name=name)}"
++    return f"{name}={_judge(inner, secret=False, depth=depth + 1)}"
++
++
++def _mask_shell(words: list[str], *, depth: int) -> str:
++    """Shell text: leading ``NAME=value`` env words, then a program and its arguments."""
++    out: list[str] = []
++    index = 0
++    while index + 1 < len(words) and (assignment := _ASSIGNMENT.match(words[index])):
++        out.append(_judge_assignment(assignment.group(1), words[index][assignment.end():], depth=depth))
++        index += 1
++    if index < len(words):
++        program = words[index]
++        out.append(_judge(program, secret=False, depth=depth + 1))
++        out.extend(mask_argv_secrets(words[index + 1:], program=program, _depth=depth + 1))
++    return " ".join(out)
++
++
++def _judge(value: str, *, secret: bool, depth: int, name: str = "") -> str:
+     """*value* as shown: kept when it reads as an identifier (and no name marked it secret), masked otherwise."""
+     if not value:
+         return value
+     if depth > _MAX_DEPTH:
+         return MASK
+     if secret:
+-        if value.lower() in _MODE_WORDS:
+-            return value
+-        if _PATH_START.match(value) and re.fullmatch(r"[\w./\\:~-]+", value) and _mask_pieces(value) == value:
+-            return value  # a file holding the secret (--auth ~/.hermes/egress.auth), not the secret
+-        return MASK
++        return _judge_secret(value, name=name)
++    assignment = _ASSIGNMENT.match(value)
++    if assignment and value[assignment.end():] and value[assignment.end()] != "=":
++        name = assignment.group(1)
++        if any(c.isspace() for c in value) and _ENV_NAME.match(name):
++            return _mask_shell(value.split(), depth=depth)  # SLACK_TOKEN=x ./run: env prefix, then a command
++        # the name must read as words even run together: AB12_CD34_EF56_GH78=… is random segments, not a name
++        if not (is_identifier(name) and _segment_ok(re.sub(r"[^A-Za-z0-9]", "", name))):
++            return MASK
++        return _judge_assignment(name, value[assignment.end():], depth=depth)
+     if header := _HEADER.match(value):
+         name, rest = header.groups()
+         secret_header = name.lower() in _SECRET_HEADERS or _is_secret_name(name)
+         return f"{name}: {MASK if secret_header else _judge(rest, secret=False, depth=depth + 1)}"
+     if any(c.isspace() for c in value):
+-        words = value.split()
+-        masked = mask_argv_secrets(words[1:], program=words[0], _depth=depth + 1)
+-        first = words[0] if is_identifier(words[0]) or _PATH_START.match(words[0]) else MASK
+-        return " ".join([first, *masked])
++        return _mask_shell(value.split(), depth=depth)
+     if _URL.match(value):
+         return _mask_url(value)
+-    if (userinfo := _USERINFO.match(value)) and userinfo.group(1).lower() not in _NOT_USERINFO:
++    if (userinfo := _USERINFO.match(value)) and userinfo.group(1).lower() not in _NOT_USERINFO and not re.match(
++            r"sha\d+$", userinfo.group(3)):
+         return f"{userinfo.group(1)}:{MASK}@{value[userinfo.end(2) + 1:]}"
+     if _PATH_START.match(value):
+-        return value if _existing_path(value) else _mask_pieces(value)
+-    if (sep := next((c for c in ",|" if c in value), None)) and not any(c.isspace() for c in value):
++        return _mask_components(value)
++    if sep := next((c for c in ",|" if c in value), None):
+         # a list (--enable-features=A,B,C, A|B): each item on its own, so one odd item does not hide the rest
+         return sep.join(_judge(item, secret=False, depth=depth + 1) for item in value.split(sep))
+-    if (assignment := _ASSIGNMENT.match(value)) and value[assignment.end():] and not value[assignment.end()] == "=":
+-        name = assignment.group(1)
+-        # the name must read as words even run together: AB12_CD34_EF56_GH78=… is random segments, not a name
+-        if not (is_identifier(name) and _segment_ok(_SEPARATORS.sub("", name))):
+-            return MASK
+-        inner = value[assignment.end():]
+-        if _is_command_name(name):
+-            return f"{name}={_mask_command(inner)}"
+-        if name.lower().rsplit(".", 1)[-1] in _KEY_ID_NAMES and re.fullmatch(r"[0-9A-Fa-f]{8,40}", inner):
+-            return value
+-        return f"{name}={_judge(inner, secret=_is_secret_name(name), depth=depth + 1)}"
+     return value if is_identifier(value) else MASK
+ 
+ 
+ # ---- argv -----------------------------------------------------------------------------------------------------------
+ 
+ def _program_flags(program: str):
+-    name = os.path.basename(program or "").lower().removesuffix(".exe")
+-    return _PROGRAM_SECRET_FLAGS.get(name)
++    return _PROGRAM_SECRET_FLAGS.get(os.path.basename(program or "").lower().removesuffix(".exe"))
+ 
+ 
+-def _flag_shaped(token: str, *, judged: bool = False) -> bool:
+-    """``--name`` or a short ``-x``/``-xyz`` cluster. *judged* (the argument after a secret-named flag): the name must
+-    also read as one, since a secret may start with ``-`` (``--password -Xy9kq2LmZ``)."""
+-    name = token.lstrip("-")
++def _long_flag(token: str) -> str | None:
++    """The name of a long flag: ``--name``, Go-style ``-name`` (5+ letters, or with ``=``) or a Java ``-Dname=…``."""
+     if token.startswith("--"):
+-        return bool(re.fullmatch(r"[A-Za-z][\w-]*", name)) and (not judged or is_identifier(name))
+-    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,3}", name))
++        name = token[2:].partition("=")[0]
++        shaped = bool(re.fullmatch(r"[A-Za-z][\w.-]*", name))
++    elif re.fullmatch(r"-D[A-Za-z_][\w.-]*=.*", token, re.DOTALL):
++        name, shaped = token[2:].partition("=")[0], True
++    else:
++        name = token[1:].partition("=")[0]
++        shaped = bool(re.fullmatch(r"[A-Za-z][\w.-]{2,}", name)) and ("=" in token or len(name) > 4)
++    # a name must read as one: a random token that starts with "-" (urlsafe base64) is a value, not a flag
++    return name if shaped and is_identifier(name) else None
+ 
+ 
+ def _program_flag(token: str, flags):
+@@ -346,8 +450,7 @@ def _program_flag(token: str, flags):
+         return f"{flag}={_mask_userpass(value)}", None
+     for short in (*attached, *userpass):
+         if len(short) == 2 and token.startswith(short) and len(token) > 2 and not token.startswith("--"):
+-            rest = token[2:]
+-            return f"{short}{MASK if short in attached else _mask_userpass(rest)}", None
++            return f"{short}{MASK if short in attached else _mask_userpass(token[2:])}", None
+     # combined short switches ending in a user flag: curl -su alice:pw, -fsSLu alice:pw
+     letters = {f[1] for f in userpass if len(f) == 2}
+     if re.fullmatch(r"-[A-Za-z]{2,}", token) and token[-1] in letters:
+@@ -355,42 +458,61 @@ def _program_flag(token: str, flags):
+     return None
+ 
+ 
++def _flag(token: str, name: str, depth: int) -> str:
++    """A long flag as shown: its name, and its ``=value`` judged under that name."""
++    head, eq, value = token.partition("=")
++    if not eq:
++        return token
++    if _is_command_name(name):
++        return f"{head}={_mask_command(value)}"
++    if _is_secret_name(name):
++        return f"{head}={_judge_secret(value, name=name)}"
++    return f"{head}={_judge(value, secret=False, depth=depth)}"
++
++
++def _pending_value(token: str, kind: str, name: str, *, depth: int) -> str | None:
++    """The argument after a flag that takes a secret, or None when it is the next flag instead (the secret flag was
++    a switch). Only a long ``--flag`` whose name reads as one counts as a flag: a secret may start with "-"."""
++    if re.fullmatch(r"--[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?:=.*)?", token, re.DOTALL):
++        return None  # a kebab-case --flag: the secret flag was a switch
++    if kind == "userpass":
++        return _mask_userpass(token)
++    if kind == "command":
++        return _mask_command(token)
++    return _judge_secret(token, name=name)
++
++
+ def mask_argv_secrets(argv: list[str], *, program: str = "", _depth: int = 0) -> list[str]:
+     """*argv* (without the program) as it may be shown; *program* (argv[0]) selects its own password flags."""
+     flags = _program_flags(program) or _NO_FLAGS
+     wrapper = os.path.basename(program or "").lower() in _COMMAND_WRAPPERS
+     out: list[str] = []
+-    pending = None  # what the next argument is: "secret", "command" or "userpass"
++    pending: tuple[str, str] | None = None  # (what the next argument is, the flag that asked for it)
+     for token in argv:
+         if token == INLINE_CODE:
+             out.append(token)
+             pending = None
+             continue
+         if pending is not None:
+-            kind, pending = pending, None
+-            if not token.startswith("-") or not _flag_shaped(token, judged=True):
+-                if kind == "userpass":
+-                    out.append(_mask_userpass(token))
+-                elif kind == "command":
+-                    out.append(_mask_command(token))
+-                else:
+-                    out.append(_judge(token, secret=True, depth=_depth))
++            (kind, name), pending = pending, None
++            shown = _pending_value(token, kind, name, depth=_depth)
++            if shown is not None:
++                out.append(shown)
+                 continue
+-        handled = _program_flag(token, flags)
+-        if handled is not None:
+-            shown, pending = handled
++        if (handled := _program_flag(token, flags)) is not None:
++            shown, kind = handled
+             out.append(shown)
++            pending = (kind, token) if kind else None
++            continue
++        if token.startswith("-") and (name := _long_flag(token)):
++            out.append(_flag(token, name, _depth))
++            if "=" not in token and _is_command_name(name):
++                pending = ("command", name)
++            elif "=" not in token and _is_secret_name(name):
++                pending = ("secret", name)
+             continue
+-        if token.startswith("-") and _flag_shaped(token.partition("=")[0]):
+-            flag, eq, value = token.partition("=")
+-            if _is_command_name(flag):
+-                out.append(f"{flag}={_mask_command(value)}" if eq else flag)
+-                pending = None if eq else "command"
+-            elif eq:
+-                out.append(f"{flag}={_judge(value, secret=_is_secret_name(flag), depth=_depth)}")
+-            else:
+-                out.append(token)
+-                pending = "secret" if _is_secret_name(flag) else None
++        if re.fullmatch(r"-[A-Za-z][A-Za-z0-9]{0,3}", token):
++            out.append(token)  # a short switch or cluster
+             continue
+         if (wrapped := _program_flags(token)) is not None:
+             flags, wrapper = wrapped, False  # sudo mysql …, docker exec db mysql …, env X=1 mysql …
+@@ -399,7 +521,5 @@ def mask_argv_secrets(argv: list[str], *, program: str = "", _depth: int = 0) ->
+         if wrapper and "=" not in token and not token.isdigit():
+             # sshpass -p x ssh -p 2222 …: from the wrapped program on, its own flags (here none) apply
+             flags, wrapper = _NO_FLAGS, os.path.basename(token).lower() in _COMMAND_WRAPPERS
+-            out.append(_judge(token, secret=False, depth=_depth))
+-            continue
+         out.append(_judge(token, secret=False, depth=_depth))
+     return out
+diff --git a/hermes_state_holders.py b/hermes_state_holders.py
+index 6ad75a0018..befece9ac0 100644
+--- a/hermes_state_holders.py
++++ b/hermes_state_holders.py
+@@ -60,9 +60,9 @@ def _read_proc_argv(pid: int) -> Optional[list[str]]:
+ def describe_holder_pid(pid: int, *, limit: Optional[int] = 80) -> str:
+     """``PID 123 (hermes gateway run)`` for operator-facing holder lists; /proc argv first, psutil elsewhere.
+     The command line is cut to *limit* characters for log and error lines; ``None`` keeps all of it
+-    (``hermes doctor``, whose holder lists are read by a person deciding what to stop). Secrets in the
+-    command line (secret-named flag values, bare random tokens, known key formats, URL credentials) are
+-    always redacted."""
++    (``hermes doctor``, whose holder lists are read by a person deciding what to stop). The arguments are
++    always masked first: only what reads as an identifier is shown (``hermes_state_argv_secrets``), then the
++    shared redactor masks known secret formats and URL credentials."""
+     argv = _read_proc_argv(pid)
+     if argv is None and psutil is not None:
+         try:
+@@ -78,10 +78,9 @@ def describe_holder_pid(pid: int, *, limit: Optional[int] = 80) -> str:
+             argv = [*argv[:at + 1], INLINE_CODE, *argv[at + 2:]]
+     if not argv:
+         return f"PID {pid} (command line unavailable)"
+-    # Redacted before the cut: holder lists are pasted into issues, and a process's argv can carry
+-    # `--api-key …` or credentials in a URL (an early secret used to leak its prefix through the cut too).
+-    # The argv-specific mask first (secret-named flags and bare random tokens it has no pattern for), then the
+-    # shared redactor (known secret formats).
++    # Masked before the cut: holder lists are pasted into issues, and a secret early in argv used to leak its
++    # prefix through the cut. The argv mask fails closed (identifiers shown, the rest masked, values of secret
++    # names always masked); the shared redactor then catches known secret formats and URL credentials.
+     from agent.redact import redact_sensitive_text
+     from hermes_state_argv_secrets import mask_argv_secrets
+     argv = [argv[0], *mask_argv_secrets(argv[1:], program=argv[0])]
+diff --git a/tests/hermes_state/test_argv_secrets.py b/tests/hermes_state/test_argv_secrets.py
+index 6b680e67aa..f8a60fef27 100644
+--- a/tests/hermes_state/test_argv_secrets.py
++++ b/tests/hermes_state/test_argv_secrets.py
+@@ -1,5 +1,14 @@
+-"""Secrets in a process's argv are masked before ``hermes doctor`` shows the process (holder lists are
+-pasted into issues); the identifiers a person needs to tell processes apart are kept."""
++"""Secrets in a process's argv are masked before ``hermes doctor`` shows the process (holder lists are pasted into
++issues); the identifiers a person needs to tell processes apart are kept.
++
++The mask fails closed: an argument is shown only when it reads as an identifier. Names (secret-named flags,
++``NAME=value``, headers, programs' own password flags) mask their values whatever they look like.
++"""
++
++import base64
++import random
++import secrets as _secrets
++import string
+ 
+ import pytest
+ 
+@@ -8,195 +17,183 @@ from hermes_state_argv_secrets import MASK, mask_argv_secrets
+ KEY = "q8ZpL2vXk9RtYwB4mN7cQ1sD5fH3jK6g"
+ 
+ 
++def shown(argv, program="tool"):
++    return mask_argv_secrets(argv, program=program)
++
++
++# ---- values a name marks as secret ---------------------------------------------------------------------------------
++
++
+ @pytest.mark.parametrize(
+     "argv, expected",
+     [
+-        # bare random tokens, any case
+-        (["worker.py", KEY], ["worker.py", MASK]),
+-        (["worker.py", "q8zpl2vxk9rtywb4mn7cq1sd5fh3jk6g"], ["worker.py", MASK]),
+-        # secret-named flags the shared redactor does not list, both spellings, short values too
+-        (
+-            ["tool.py", "--webhook-secret", "Zx9Lk2PqRt7V"],
+-            ["tool.py", "--webhook-secret", MASK],
+-        ),
+-        (["tool.py", "--signing-key=hunter2"], ["tool.py", f"--signing-key={MASK}"]),
+-        (["tool.py", "--auth", "abc"], ["tool.py", "--auth", MASK]),
+-        (["tool.py", "--DB-PASSWORD", "pw"], ["tool.py", "--DB-PASSWORD", MASK]),
+-        # base64 secrets contain "/": still masked after a secret-named flag (only a path's START keeps it)
++        # secret-named flags, both spellings; short, numeric, "/"-containing and hex values alike
++        (["--webhook-secret", "Zx9Lk2PqRt7V"], ["--webhook-secret", MASK]),
++        (["--signing-key=hunter2"], [f"--signing-key={MASK}"]),
++        (["--auth", "abc"], ["--auth", MASK]),
++        (["--DB-PASSWORD", "pw"], ["--DB-PASSWORD", MASK]),
+         (
+             ["--aws-secret-access-key", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"],
+             ["--aws-secret-access-key", MASK],
+         ),
+         (["--webhook-secret=Zm9vYmFyYmF6/cXV4cXV1eA=="], [f"--webhook-secret={MASK}"]),
+-        # a suffix after the secret word keeps the flag secret (fail closed); short, "/" and hex values too
+         (
++            ["--webhook-secret", "12345678901234567890", "--signing-key=4242424242"],
++            ["--webhook-secret", MASK, f"--signing-key={MASK}"],
++        ),
++        # fail closed: a part after the secret word keeps the flag secret unless it names a setting
++        (
++            [
++                "--client-secret-value",
++                "x/y",
++                "--token-b64",
++                "Zm9v",
++                "--api-key-value",
++                "hunter2",
++            ],
+             [
+                 "--client-secret-value",
+-                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
++                MASK,
+                 "--token-b64",
+-                "Zm9vYmFy/YmF6cXV4",
++                MASK,
++                "--api-key-value",
++                MASK,
+             ],
+-            ["--client-secret-value", MASK, "--token-b64", MASK],
+         ),
+         (
+             [
+-                "--api-key-value",
+-                "hunter2hunter2",
+                 "--secret-key-base",
+                 "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
++                "--auth-header",
++                "Bearer.x",
+             ],
+-            ["--api-key-value", MASK, "--secret-key-base", MASK],
++            ["--secret-key-base", MASK, "--auth-header", MASK],
+         ),
++        (
++            ["--private-key-pem=abc", "--apikey", "x", "--github-tokens", "Qx7L/w"],
++            [f"--private-key-pem={MASK}", "--apikey", MASK, "--github-tokens", MASK],
++        ),
++        # secret words the shared redactor does not list
+         (
+             [
+-                "--auth-header",
+-                "Bearer.Xy9kq2LmZp4Rt7",
+-                "--private-key-pem=abc",
+-                "--apikey",
++                "--passphrase",
++                "correct-horse",
++                "--pass",
+                 "x",
++                "--pw",
++                "x",
++                "--otp",
++                "123456",
++                "--jwt",
++                "a.b.c",
++            ],
++            [
++                "--passphrase",
++                MASK,
++                "--pass",
++                MASK,
++                "--pw",
++                MASK,
++                "--otp",
++                MASK,
++                "--jwt",
++                MASK,
+             ],
+-            ["--auth-header", MASK, f"--private-key-pem={MASK}", "--apikey", MASK],
+         ),
+-        # base64 padding is not an assignment: a padded random token is masked whole
+         (
+-            ["Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MA==", "Xy9kq2LmZp4Rt7Wb3NcQ8abc="],
+-            [MASK, MASK],
++            ["--authorization=Bearer abc.def.ghi", "--hmac", "x", "--sftp-pass", "x"],
++            [f"--authorization={MASK}", "--hmac", MASK, "--sftp-pass", MASK],
+         ),
+-        # NAME=value assignments: the value is judged under its name
++        # Go-style single-dash and Java -D property flags
++        (
++            [
++                "-password",
++                "sunshine",
++                "-Dpassword=sunshine",
++                "-Dapi.key=sunshine",
++                "-Dtoken=x",
++            ],
++            [
++                "-password",
++                MASK,
++                f"-Dpassword={MASK}",
++                f"-Dapi.key={MASK}",
++                f"-Dtoken={MASK}",
++            ],
++        ),
++        # the argument after a secret flag is its value even when it starts with "-"
++        (["--password", "-abcdefgh"], ["--password", MASK]),
++        (["--token", "-12345678"], ["--token", MASK]),
++        (["--password", "--Xy9kq2LmZ"], ["--password", MASK]),
++        (["--password", "-Xy9"], ["--password", MASK]),
++        # a mechanism word stays only after an auth-only flag; a path after a secret flag must look like a file
++        (
++            ["--password", "agent", "--token", "prompt"],
++            ["--password", MASK, "--token", MASK],
++        ),
++        (
++            ["--password", "~/hunter2", "--token", "./x"],
++            ["--password", MASK, "--token", MASK],
++        ),
++        (["--token=/K7MDENG+bPxRfiCYEXAMPLEKEY=="], [f"--token={MASK}"]),
++        # NAME=value, nested values, headers, webhooks
+         (
+             ["API_TOKEN=abc123", "Config=" + KEY],
+             [f"API_TOKEN={MASK}", f"Config={MASK}"],
+         ),
+-        # an UPPER_SNAKE env name stays readable; a secret-named one still hides its value
+         (
+-            ["HERMES_RELAY_ID_2024=abc", "OPENROUTER_API_KEY_2024=sk12"],
+-            ["HERMES_RELAY_ID_2024=abc", f"OPENROUTER_API_KEY_2024={MASK}"],
++            ["--env=API_TOKEN=abc", "--annotation=password=x"],
++            [f"--env=API_TOKEN={MASK}", f"--annotation=password={MASK}"],
+         ),
+-        # plural secret lists are secrets too
+         (
+-            ["--github-tokens", "Qx7Lm2Zp/w", "--bot-tokens=abc"],
+-            ["--github-tokens", MASK, f"--bot-tokens={MASK}"],
++            ["CREDS=x", "PASSPHRASE=x", "OPENROUTER_API_KEY_2024=sk12"],
++            [f"CREDS={MASK}", f"PASSPHRASE={MASK}", f"OPENROUTER_API_KEY_2024={MASK}"],
+         ),
+-        # a numeric value after a secret-named flag is the secret
+         (
+-            ["--webhook-secret", "12345678901234567890", "--signing-key=4242424242"],
+-            ["--webhook-secret", MASK, f"--signing-key={MASK}"],
++            ["-H", "X-Api-Key: hunter2", "-H", "Authorization: Bearer abc"],
++            ["-H", f"X-Api-Key: {MASK}", "-H", f"Authorization: {MASK}"],
+         ),
+-        # a lowercase prefixed random token is not a Hermes id
+-        (["abc-9f8e7d6c5b4a39281706f5e4z"], [MASK]),
+-        # a bare token as a --flag=value value
+-        (["tool.py", f"--config={KEY}"], ["tool.py", f"--config={MASK}"]),
+-    ],
+-)
+-def test_secrets_are_masked(argv, expected):
+-    assert mask_argv_secrets(argv) == expected
+-
+-
+-@pytest.mark.parametrize(
+-    "argv",
+-    [
+-        ["-m", "hermes_cli.main", "gateway", "run", "--external-supervisor"],
+-        [
+-            "serve",
+-            "--isolated",
+-            "--host",
+-            "127.0.0.1",
+-            "--port",
+-            "0",
+-            "--ssh-session-token-file",
+-            "/Users/x/.hermes/desktop-ssh/session-a/token",
+-        ],
+-        ["chat", "--resume", "20261119_163442_8f3a2c"],
+-        ["kanban", "run", "t_01a1ecf2c3d6367b"],
+-        [
+-            "checkout",
+-            "0362a20c0e39",
+-        ],  # a short commit; a full 40-hex digest is masked (hex keys look the same)
+-        ["--resume=8ec9ab93-b372-4c03-ac51-7abb31174eb9", "--model=claude-fable-5-2"],
+-        ["chat", "--model", "anthropic/claude-opus-4.7"],
+-        ["--password-file", "/opt/vnc/chrome-agent-vnc.pass"],
+-        ["--auth", "/opt/egress/egress-socks.auth"],
+-        [
+-            "--variations-seed-version=20261117-170111.083000-production",
+-            "--num-raster-threads=4",
+-            "--launch-time-ticks=1676849682180",
+-            "--trace-process-track-uuid=3190710511816001666",
+-        ],
+-        ["/home/ubuntu/.local/share/hermes-mail/hermes_hub.py", "_runtime-serve"],
+-        ["--author", "daveey", "--keyboard", "us"],
+-        [
+-            "--max-tokens",
+-            "4096",
+-            "--min-tokens=16",
+-            "--cache-read-tokens",
+-            "2048",
+-            "--token-env",
+-            "OPENAI_API_KEY",
+-        ],
+-        [
+-            "--idempotency-key",
+-            "followup:t_01a1ecf2c3d6367b:notify",
+-            "--step-key",
+-            "build",
+-            "--passkey-browser",
+-            "chrome",
+-        ],
+-        ["--model", "Qwen3-Coder-480B-A35B-Instruct"],
+-        ["--api-key-timeout", "30"],
+-        ["profile", "create", "--isolated-auth", "work", "--no-credentials", "scratch"],
+-        [
+-            "-o",
+-            "ServerAliveInterval=15",
+-            "-o",
+-            "NumberOfPasswordPrompts=0",
+-            "HERMES_PROFILE=coder",
+-        ],
+-        # settings about a secret, not the secret: deliberate (an id, a name, an env var, a store, a jar path)
+-        [
+-            "--access-key-id",
+-            "deploy-bot",
+-            "--secret-name",
+-            "prod/db",
+-            "--api-key-env",
+-            "OPENAI_API_KEY",
+-        ],
+-        [
+-            "--keyring-backend",
+-            "macos",
+-            "--auth-mode",
+-            "oauth",
+-            "--cookie-jar",
+-            "/opt/jar/cookies.txt",
+-        ],
+-        ["--key-file", "C:\\Users\\x\\key.pem"],
+-        ["--token-file", "./token.txt"],
++        (
++            ["--webhook-url", "https://hooks.slack.com/services/T0/B0/x"],
++            ["--webhook-url", MASK],
++        ),
++        # user:pass@host, with or without a dotted host
++        (
++            [
++                "alice:hunter2@git.example.com",
++                "admin:sunshine@db",
++                "admin:sunshine@db-primary:5432/app",
++            ],
++            [
++                f"alice:{MASK}@git.example.com",
++                f"admin:{MASK}@db",
++                f"admin:{MASK}@db-primary:5432/app",
++            ],
++        ),
++        # commands that print a secret show only their program
++        (
++            ["--password-cmd", "echo hunter2", "--api-key-helper=pass show openai"],
++            ["--password-cmd", f"echo {MASK}", f"--api-key-helper=pass {MASK}"],
++        ),
++        # random segments posing as a name
++        (["AB12_CD34_EF56_GH78_IJ90_KL12=x"], [MASK]),
++        # base64 padding is not an assignment
++        (
++            ["Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MA==", "Xy9kq2LmZp4Rt7Wb3NcQ8abc="],
++            [MASK, MASK],
++        ),
++        # symbol passwords
++        (["P@ssw0rd!2024xyz"], [MASK]),
+     ],
+ )
+-def test_identifiers_are_kept(argv):
+-    assert mask_argv_secrets(argv) == argv
+-
+-
+-def test_a_flag_value_that_is_itself_a_flag_is_not_swallowed():
+-    assert mask_argv_secrets(["--token", "--verbose", "x"]) == [
+-        "--token",
+-        "--verbose",
+-        "x",
+-    ]
+-
+-
+-# ---- the remaining shapes: short tokens, letter-only tokens, program short flags, userinfo, "-"-leading values,
+-# command-valued secret flags, UPPER_SNAKE look-alikes --------------------------------------------------------------
++def test_named_secrets_are_masked(argv, expected):
++    assert shown(argv) == expected
+ 
+ 
+ @pytest.mark.parametrize(
+     "argv, program, expected",
+     [
+-        # 16-19 character random tokens
+-        (["worker.py", "ab12cd34ef56gh78"], "python3", ["worker.py", MASK]),
+-        # letters-only random tokens: case flipping or vowel-poor
+-        (["worker.py", "XyQwErTyUiOpAsDfGhJk"], "python3", ["worker.py", MASK]),
+-        (["worker.py", "qzxkvbnmplkjhgfdrtwz"], "python3", ["worker.py", MASK]),
+-        # programs' own short password flags
++        # programs' own password flags
+         (
+             ["-u", "root", "-phunter2", "db"],
+             "/usr/bin/mysql",
+@@ -204,189 +201,82 @@ def test_a_flag_value_that_is_itself_a_flag_is_not_swallowed():
+         ),
+         (["-p", "hunter2", "ssh", "host"], "sshpass", ["-p", MASK, "ssh", "host"]),
+         (["-a", "hunter2", "ping"], "redis-cli", ["-a", MASK, "ping"]),
++        (["--pass", "hunter2"], "redis-cli", ["--pass", MASK]),
+         (
+             ["enc", "-k", "hunter2", "-pass", "pass:hunter2"],
+             "openssl",
+             ["enc", "-k", MASK, "-pass", MASK],
+         ),
++        (["-p", "hunter2"], "mongosh", ["-p", MASK]),
++        (["-w", "hunter2"], "ldapsearch", ["-w", MASK]),
++        (["-P", "hunter2"], "sqlcmd", ["-P", MASK]),
++        (["-storepass", "hunter2"], "keytool", ["-storepass", MASK]),
++        (["-phunter2", "x.7z"], "7z", [f"-p{MASK}", "x.7z"]),
++        (["-P", "hunter2"], "zip", ["-P", MASK]),
++        (["-N", "hunter2"], "ssh-keygen", ["-N", MASK]),
++        # curl/smbclient/lftp user:pass in every spelling, a key as the user, a random token as the user, cookies
+         (
+             ["-u", "alice:hunter2", "https://x"],
+             "curl",
+             ["-u", f"alice:{MASK}", "https://x"],
+         ),
+         (["-ualice:hunter2"], "curl", [f"-ualice:{MASK}"]),
+-        (["-U", "alice%hunter2"], "smbclient", ["-U", f"alice%{MASK}"]),
+-        # user:pass@host without a scheme
+         (
+-            ["push", "alice:hunter2@git.example.com"],
+-            "git",
+-            ["push", f"alice:{MASK}@git.example.com"],
+-        ),
+-        # a secret that starts with "-" after a secret-named flag
+-        (["--password", "-Xy9kq2LmZ"], "tool", ["--password", MASK]),
+-        # a command that prints the secret: only its program is shown
+-        (
+-            ["--password-cmd", "echo hunter2"],
+-            "tool",
+-            ["--password-cmd", f"echo {MASK}"],
+-        ),
+-        (
+-            ["--api-key-helper=pass show openai"],
+-            "tool",
+-            [f"--api-key-helper=pass {MASK}"],
++            ["--user=alice:hunter2", "--proxy-user=bob:pw123"],
++            "curl",
++            [f"--user=alice:{MASK}", f"--proxy-user=bob:{MASK}"],
+         ),
+-        # random segments posing as an UPPER_SNAKE name
+-        (["AB12_CD34_EF56_GH78_IJ90_KL12=x"], "env", [MASK]),
+-    ],
+-)
+-def test_remaining_secret_shapes_are_masked(argv, program, expected):
+-    assert mask_argv_secrets(argv, program=program) == expected
+-
+-
+-@pytest.mark.parametrize(
+-    "argv, program",
+-    [
++        (["-su", "alice:hunter2"], "curl", ["-su", f"alice:{MASK}"]),
++        (["-u", "sk9Lm2QxPz7Rt4Wb:"], "curl", ["-u", f"{MASK}:{MASK}"]),
++        (["-u", "Xk9mP2qL7vN4aB3cZ8wRtY5u"], "curl", ["-u", MASK]),
++        (["-b", "session=sunshine"], "curl", ["-b", MASK]),
++        (["-U", "alice%hunter2"], "smbclient", ["-U", f"alice%{MASK}"]),
++        (["--user=alice%hunter2"], "smbclient", [f"--user=alice%{MASK}"]),
+         (
+-            [
+-                "-o",
+-                "ServerAliveCountMax=3",
+-                "-o",
+-                "NumberOfPasswordPrompts=0",
+-                "-p",
+-                "2222",
+-                "host",
+-            ],
+-            "ssh",
++            ["-u", "alice,hunter2", "sftp://h"],
++            "lftp",
++            ["-u", f"alice,{MASK}", "sftp://h"],
+         ),
++        # behind wrappers and inside shell strings
++        (["mysql", "-uroot", "-phunter2"], "sudo", ["mysql", "-uroot", f"-p{MASK}"]),
+         (
+-            ["-p", "coder", "gateway", "run"],
+-            "hermes",
+-        ),  # -p is the profile for most programs: never masked
+-        (
+-            ["-u", "alice", "https://x"],
+-            "curl",
+-        ),  # a bare user: curl prompts for the password
+-        (
+-            [
+-                "run",
+-                "python:3.12-slim",
+-                "127.0.0.1:8000",
+-                "alice@example.com",
+-                "git@github.com:org/repo.git",
+-            ],
++            ["exec", "-it", "db", "mysql", "-phunter2"],
+             "docker",
++            ["exec", "-it", "db", "mysql", f"-p{MASK}"],
+         ),
++        (["X=1", "mysql", "-phunter2"], "env", ["X=1", "mysql", f"-p{MASK}"]),
++        (["-c", "mysql -phunter2 shop"], "bash", ["-c", f"mysql -p{MASK} shop"]),
+         (
+-            [
+-                "internationalization",
+-                "ServerAliveCountMax",
+-                "NumberOfPasswordPrompts",
+-                "followup:t_01a1:notify",
+-            ],
+-            "x",
++            ["-c", "SLACK_TOKEN=sunshine ./run"],
++            "sh",
++            ["-c", f"SLACK_TOKEN={MASK} ./run"],
+         ),
++        (["-c", "TOKEN=sunshine exec ./run"], "sh", ["-c", f"TOKEN={MASK} exec ./run"]),
+         (
+-            [
+-                "--annotation=platform=macosarm64",
+-                "--annotation=_version=5.11492.5",
+-                "--password-cmd",
+-                "pass",
+-            ],
+-            "x",
++            ["-o", "ProxyCommand=sshpass -p sunshine ssh h"],
++            "ssh",
++            ["-o", f"ProxyCommand=sshpass -p {MASK} ssh h"],
+         ),
++        # sshpass hides its own password, not the wrapped ssh's port
+         (
+-            [
+-                "HERMES_RELAY_ID_2024=abc",
+-                "OPENROUTER_BASE_URL=https://openrouter.ai/api/v1",
+-            ],
+-            "env",
++            ["-p", "hunter2", "ssh", "-p", "2222", "host"],
++            "sshpass",
++            ["-p", MASK, "ssh", "-p", "2222", "host"],
+         ),
+-        # repeated letters are padding or placeholders, not random secrets
+-        (["--profile", "p" * 120, "zzzzzzzzzzzzzzzzzzzzzzzz"], "x"),
+     ],
+ )
+-def test_identifiers_survive_the_stricter_rules(argv, program):
+-    assert mask_argv_secrets(argv, program=program) == argv
+-
+-
+-# ---- fail closed: generated secrets of every common shape are masked; identifiers people read are kept -----------
+-
+-import base64
+-import random
+-import secrets as _secrets
+-import string
+-
+-_RNG = random.Random(20261119)
++def test_program_secrets_are_masked(argv, program, expected):
++    assert shown(argv, program) == expected
+ 
+ 
+-def _shape(kind: str, length: int) -> str:
+-    pick = lambda alphabet: "".join(_RNG.choice(alphabet) for _ in range(length))
+-    return {
+-        "alnum": lambda: pick(string.ascii_letters + string.digits),
+-        "lower_digits": lambda: pick(string.ascii_lowercase + string.digits),
+-        "upper_digits": lambda: pick(string.ascii_uppercase + string.digits),
+-        "base32": lambda: pick(string.ascii_uppercase + "234567"),
+-        "hex": lambda: pick("0123456789abcdef"),
+-        "mixed_letters": lambda: pick(string.ascii_letters),
+-        "symbols": lambda: pick(string.ascii_letters + string.digits + "!@#$%^&*"),
+-        "base64": lambda: base64.b64encode(_RNG.randbytes(length)).decode()[
+-            : length + 4
+-        ],
+-        "urlsafe": lambda: (
+-            base64.urlsafe_b64encode(_RNG.randbytes(length)).decode().rstrip("=")
+-        ),
+-        "lower": lambda: pick(string.ascii_lowercase),
+-        "upper": lambda: pick(string.ascii_uppercase),
+-    }[kind]()
+-
+-
+-# Leak rate allowed per secret length (a random string sometimes reads as a name; the shorter, the likelier).
+-_LEAK_CEILING = {16: 0.05, 20: 0.03, 24: 0.02, 32: 0.006, 40: 0.006}
+-
+-
+-@pytest.mark.parametrize(
+-    "kind",
+-    [
+-        "alnum",
+-        "lower_digits",
+-        "upper_digits",
+-        "base32",
+-        "hex",
+-        "mixed_letters",
+-        "symbols",
+-        "base64",
+-        "urlsafe",
+-        "lower",
+-        "upper",
+-    ],
+-)
+-@pytest.mark.parametrize("length", sorted(_LEAK_CEILING))
+-def test_generated_secrets_are_masked_at_the_documented_rate(kind, length):
+-    leaked = 0
+-    for _ in range(1000):
+-        secret = _shape(kind, length)
+-        shown = " ".join(mask_argv_secrets(["worker.py", secret], program="python3"))
+-        leaked += secret in shown or secret[-8:] in shown
+-    assert leaked / 1000 <= _LEAK_CEILING[length], (
+-        f"{kind}/{length}: {leaked / 10:.1f}% shown"
++def test_a_secret_inside_a_credential_helper_command_is_masked():
++    out = " ".join(
++        shown(["-c", "credential.helper=!f() { echo password=hunter2; }; f"], "git")
+     )
++    assert "hunter2" not in out
+ 
+ 
+-@pytest.mark.parametrize(
+-    "make, ceiling",
+-    [
+-        (lambda: _secrets.token_urlsafe(16), _LEAK_CEILING[20]),  # 22 characters
+-        (lambda: _secrets.token_hex(16), 0.0),  # 32 hex: always masked
+-        (lambda: _secrets.token_urlsafe(32), _LEAK_CEILING[40]),  # 43 characters
+-    ],
+-)
+-def test_python_secrets_module_tokens_are_masked_at_the_documented_rate(make, ceiling):
+-    tokens = [make() for _ in range(1000)]
+-    leaked = sum(
+-        token in " ".join(mask_argv_secrets(["--opt", "x", token], program="tool"))
+-        for token in tokens
+-    )
+-    assert leaked / len(tokens) <= ceiling
++# ---- identifiers are kept ------------------------------------------------------------------------------------------
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -407,6 +297,7 @@ def test_python_secrets_module_tokens_are_masked_at_the_documented_rate(make, ce
+         "utf8",
+         "v1beta1",
+         "k8s",
++        "-XX:+UseG1GC",
+         # ids people match on
+         "proc_467899b1fa1b",
+         "i-0abc123def4567890",
+@@ -416,6 +307,7 @@ def test_python_secrets_module_tokens_are_masked_at_the_documented_rate(make, ce
+         "0362a20c0e39",
+         "GIT_CONFIG_KEY_17",
+         "HERMES_RELAY_ID_2024",
++        "followup:t_eeeeee0000000015:notify",
+         # files, programs, hosts, refs
+         "Wide310x150Logo.png",
+         "VCRUNTIME140.dll",
+@@ -433,102 +325,68 @@ def test_python_secrets_module_tokens_are_masked_at_the_documented_rate(make, ce
+         "github:org/repo@v1",
+         "https://github.com/org/repo@main",
+         "git+https://github.com/org/tool@v1.2.0",
+-        # words and camelCase
++        "s3.amazonaws.com",
++        "ec2-user@ec2-54-12-34-56.us-west-2.compute.amazonaws.com",
++        "@playwright/mcp@latest",
++        "/tmp/hermes-kanban-t_eeeeee0000000015",
++        "/x/workspaces/t_9c1f00ab2d3e4f51/out",
++        # words and camelCase, short mixed case, other scripts
+         "internationalization",
+         "isHermesHubPickerUrl",
+         "WebKitWebContentProcess",
+         "ServerAliveCountMax",
+         "testSessionOwnerByRuntimeId",
++        "FullscreenBubbleShowOrigin",
++        "ExperimentalJSProfiler",
++        "workflow",
++        "launchctl",
++        "mdworker",
++        "iOS",
++        "iPad",
++        "tvOS",
++        "eBPF",
++        "gRPC",
++        "DBus",
++        "getX",
++        "naïve-café",
++        "Привет",
+         "production",
+         "gateway",
+         "serve",
+         "dashboard",
+         "_runtime-serve",
++        "release-workflow.yml",
+     ],
+ )
+ def test_identifiers_people_read_are_kept(token):
+-    assert mask_argv_secrets([token], program="tool") == [token]
++    assert shown([token]) == [token]
+ 
+ 
+ @pytest.mark.parametrize(
+-    "argv, program, expected",
++    "argv, program",
+     [
+-        # wrappers keep the inner program's own password flags
+-        (["mysql", "-uroot", "-phunter2"], "sudo", ["mysql", "-uroot", f"-p{MASK}"]),
+-        (
+-            ["exec", "-it", "db", "mysql", "-phunter2"],
+-            "docker",
+-            ["exec", "-it", "db", "mysql", f"-p{MASK}"],
+-        ),
+-        (["-c", "mysql -phunter2 shop"], "bash", ["-c", f"mysql -p{MASK} shop"]),
+-        # sshpass hides its password, not the wrapped ssh's port
+         (
+-            ["-p", "hunter2", "ssh", "-p", "2222", "host"],
+-            "sshpass",
+-            ["-p", MASK, "ssh", "-p", "2222", "host"],
++            ["-m", "hermes_cli.main", "gateway", "run", "--external-supervisor"],
++            "python3",
+         ),
+-        # curl user:pass in every spelling, a key as the user, a random token as the user
+         (
+-            ["--user=alice:hunter2", "--proxy-user=bob:pw123"],
+-            "curl",
+-            [f"--user=alice:{MASK}", f"--proxy-user=bob:{MASK}"],
+-        ),
+-        (["-su", "alice:hunter2"], "curl", ["-su", f"alice:{MASK}"]),
+-        (["-u", "sk9Lm2QxPz7Rt4Wb:"], "curl", ["-u", f"{MASK}:{MASK}"]),
+-        (["-u", "Xk9mP2qL7vN4aB3cZ8wRtY5u"], "curl", ["-u", MASK]),
+-        (["--user=alice%hunter2"], "smbclient", [f"--user=alice%{MASK}"]),
+-        (
+-            ["-u", "alice,hunter2", "sftp://h"],
+-            "lftp",
+-            ["-u", f"alice,{MASK}", "sftp://h"],
+-        ),
+-        # more programs' password flags
+-        (["-p", "hunter2"], "mongosh", ["-p", MASK]),
+-        (["-w", "hunter2"], "ldapsearch", ["-w", MASK]),
+-        (["-P", "hunter2"], "sqlcmd", ["-P", MASK]),
+-        (["-storepass", "hunter2"], "keytool", ["-storepass", MASK]),
+-        (["-phunter2", "x.7z"], "7z", [f"-p{MASK}", "x.7z"]),
+-        (["-P", "hunter2"], "zip", ["-P", MASK]),
+-        (["-N", "hunter2"], "ssh-keygen", ["-N", MASK]),
+-        # secrets that start with "-" after a secret flag
+-        (["--password", "-abcdefgh"], "tool", ["--password", MASK]),
+-        (["--token", "-12345678"], "tool", ["--token", MASK]),
+-        (["--password", "--Xy9kq2LmZ"], "tool", ["--password", MASK]),
+-        # a secret header, a webhook URL, a secret inside a command
+-        (["-H", "X-Api-Key: hunter2"], "curl", ["-H", f"X-Api-Key: {MASK}"]),
+-        (["-H", "Authorization: Bearer abc"], "curl", ["-H", f"Authorization: {MASK}"]),
+-        (
+-            ["--webhook-url", "https://hooks.slack.com/services/T0/B0/x"],
+-            "tool",
+-            ["--webhook-url", MASK],
+-        ),
+-        (["-c", "credential.helper=!f() { echo password=hunter2; }; f"], "git", None),
+-        # symbol passwords and a path-shaped secret after a secret flag
+-        (["P@ssw0rd!2024xyz"], "tool", [MASK]),
+-        (["--token=/K7MDENG+bPxRfiCYEXAMPLEKEY=="], "tool", [f"--token={MASK}"]),
+-        # nested values are judged under their own names
+-        (
+-            ["--env=API_TOKEN=abc", "--annotation=password=x"],
+-            "tool",
+-            [f"--env=API_TOKEN={MASK}", f"--annotation=password={MASK}"],
++            [
++                "serve",
++                "--isolated",
++                "--host",
++                "127.0.0.1",
++                "--port",
++                "0",
++                "--ssh-session-token-file",
++                "/Users/x/.hermes/desktop-ssh/session-a/token",
++            ],
++            "hermes",
+         ),
+-    ],
+-)
+-def test_named_and_program_secrets_are_masked(argv, program, expected):
+-    shown = mask_argv_secrets(argv, program=program)
+-    if expected is None:
+-        assert "hunter2" not in " ".join(shown), shown
+-    else:
+-        assert shown == expected
+-
+-
+-@pytest.mark.parametrize(
+-    "argv, program",
+-    [
+-        (["-p", "coder", "gateway", "run"], "hermes"),
+         (
+             [
+                 "chat",
++                "--resume",
++                "20260109_000000_abc129",
+                 "--model",
+                 "gpt-5.6-sol-900k",
+                 "--session-key",
+@@ -536,6 +394,9 @@ def test_named_and_program_secrets_are_masked(argv, program, expected):
+             ],
+             "hermes",
+         ),
++        (["kanban", "run", "t_eeeeee0000000015"], "hermes"),
++        (["process", "kill", "proc_467899b1fa1b"], "hermes"),
++        (["-p", "coder", "gateway", "run"], "hermes"),
+         (
+             [
+                 "--show-tokens",
+@@ -548,20 +409,285 @@ def test_named_and_program_secrets_are_masked(argv, program, expected):
+             "hermes",
+         ),
+         (["mcp", "add", "--auth", "oauth", "srv"], "hermes"),
++        (
++            [
++                "--cap-tokens",
++                "4096",
++                "--tokens-per-delta",
++                "512",
++                "--turn1-max-tokens",
++                "800",
++            ],
++            "python3",
++        ),
++        (
++            [
++                "--token-endpoint",
++                "https://auth.example.com/token",
++                "--use-partner-key-as-auth",
++                "flux",
++            ],
++            "python3",
++        ),
++        (
++            [
++                "--max-tokens",
++                "4096",
++                "--min-tokens=16",
++                "--cache-read-tokens",
++                "2048",
++                "--token-env",
++                "OPENAI_API_KEY",
++            ],
++            "x",
++        ),
++        (
++            [
++                "--idempotency-key",
++                "followup:t_eeeeee0000000015:notify",
++                "--step-key",
++                "build",
++                "--passkey-browser",
++                "chrome",
++            ],
++            "x",
++        ),
++        (["--model", "Qwen3-Coder-480B-A35B-Instruct", "--api-key-timeout", "30"], "x"),
++        (
++            [
++                "--password-file",
++                "/home/ubuntu/.hermes/chrome-agent-vnc.pass",
++                "--auth",
++                "~/.hermes/egress-socks.auth",
++            ],
++            "x",
++        ),
++        (
++            [
++                "--key-file",
++                "C:\\Users\\x\\key.pem",
++                "--token-file",
++                "./token.txt",
++                "--cookie-jar",
++                "~/.hermes/c.txt",
++            ],
++            "x",
++        ),
++        (
++            [
++                "--access-key-id",
++                "deploy-bot",
++                "--secret-name",
++                "prod/db",
++                "--api-key-env",
++                "OPENAI_API_KEY",
++            ],
++            "x",
++        ),
++        (["--keyring-backend", "macos", "--auth-mode", "oauth"], "x"),
++        (
++            [
++                "profile",
++                "create",
++                "--isolated-auth",
++                "work",
++                "--no-credentials",
++                "scratch",
++            ],
++            "hermes",
++        ),
+         (["auth", "login", "--with-token", "github.com"], "gh"),
++        (["workflow", "run", "release.yml"], "gh"),
+         (["--auth-server-whitelist=*.corp.example.com"], "Electron"),
++        (
++            [
++                "--enable-features=AutofillActorMode,BackForwardCache,FullscreenBubbleShowOrigin"
++            ],
++            "Electron",
++        ),
++        (
++            [
++                "--origin-trial-disabled-features=CanvasTextNg|WebAssemblyCustomDescriptors"
++            ],
++            "Electron",
++        ),
+         (["-c", "user.signingkey=ABCDEF0123456789"], "git"),
+         (["-k", "testSessionOwnerByRuntimeId"], "pytest"),
+         (["start-session", "--target", "i-0abc123def4567890"], "aws"),
+-        (["process", "kill", "proc_467899b1fa1b"], "hermes"),
++        (
++            [
++                "-o",
++                "ServerAliveCountMax=3",
++                "-o",
++                "NumberOfPasswordPrompts=0",
++                "-p",
++                "2222",
++                "host",
++            ],
++            "ssh",
++        ),
++        (["-u", "alice", "https://x"], "curl"),
++        (
++            [
++                "run",
++                "python:3.12-slim",
++                "127.0.0.1:8000",
++                "alice@example.com",
++                "git@github.com:org/repo.git",
++            ],
++            "docker",
++        ),
++        (
++            [
++                "HERMES_RELAY_ID_2024=abc",
++                "OPENROUTER_BASE_URL=https://openrouter.ai/api/v1",
++            ],
++            "env",
++        ),
++        (
++            ["--annotation=platform=macosarm64", "--annotation=_version=5.11492.5"],
++            "crashpad",
++        ),
++        (["-c", "launchctl kickstart -k gui/501/com.example.agent"], "bash"),
++        (["--profile", "p" * 120, "zzzzzzzzzzzzzzzzzzzzzzzz"], "x"),
++        (["--author", "daveey", "--keyboard", "us"], "x"),
+     ],
+ )
+ def test_hermes_and_tool_arguments_are_kept(argv, program):
+-    assert mask_argv_secrets(argv, program=program) == argv
++    assert shown(argv, program) == argv
++
++
++def test_lists_are_judged_item_by_item():
++    assert shown([f"--enable-features=Alpha,{KEY},Gamma"]) == [
++        f"--enable-features=Alpha,{MASK},Gamma"
++    ]
++    assert shown([f"--x=a|{KEY}|b"]) == [f"--x=a|{MASK}|b"]
++
++
++def test_paths_and_urls_keep_their_structure_and_mask_only_random_parts():
++    assert shown([f"/srv/cache/{KEY}/data.json"]) == [f"/srv/cache/{MASK}/data.json"]
++    assert shown([f"https://api.example.com/v1/items?token={KEY}&page=2"]) == [
++        f"https://api.example.com/v1/items?token={MASK}&page=2"
++    ]
++    assert shown([f"/tmp={KEY}"]) == [f"/tmp={MASK}"]
++    assert shown([f"~/{KEY}"]) == [f"~/{MASK}"]
++
++
++def test_the_first_word_of_shell_text_is_judged_too():
++    assert shown(["-c", f"{KEY} --help"], "sh") == ["-c", f"{MASK} --help"]
++    assert shown(["-c", f"/opt/{KEY}/run --help"], "sh") == [
++        "-c",
++        f"/opt/{MASK}/run --help",
++    ]
++
++
++@pytest.mark.parametrize(
++    "token",
++    [
++        "0362a20c0e39651291280105e81f7c42f4f435f7",  # a full commit
++        "python@sha256:9f2b8c1e4d7a6053b2e1f0c9d8a7b6e5f4c3d2e1a0b9c8d7e6f5a4b3c2d1e0f9",  # an image digest
++        "/Users/x/.hermes/desktop-ssh/5b38f00bfab44cbcc8f1a2b3c4d5e6f7/token",  # a 32-hex session folder
++    ],
++)
++def test_long_hex_is_masked_like_the_keys_it_resembles(token):
++    """Deliberate: 16+ hex characters are masked whether a digest or a key; short commits stay readable."""
++    assert MASK in shown([token])[0]
+ 
+ 
+ def test_deep_nesting_is_masked_not_a_crash():
+-    assert (
+-        mask_argv_secrets(["a=" * 1000 + "x"], program="x") == [f"a={MASK}"]
+-        or MASK in mask_argv_secrets(["a=" * 1000 + "x"], program="x")[0]
++    out = shown(["a=" * 1000 + "x"])[0]
++    assert out.startswith("a=") and out.endswith(MASK)
++
++
++# ---- fail closed: generated secrets are masked at the documented rate, in every position ------------------------
++
++# Leak rate allowed per secret length (a random string sometimes reads as a name; the shorter, the likelier).
++_LEAK_CEILING = {16: 0.07, 24: 0.03, 32: 0.015, 40: 0.01}
++_SHAPES = [
++    "alnum",
++    "lower_digits",
++    "upper_digits",
++    "base32",
++    "lower_base32",
++    "hex",
++    "mixed_letters",
++    "symbols",
++    "base64",
++    "urlsafe",
++    "lower",
++    "upper",
++    "grouped_dash",
++    "grouped_underscore",
++    "grouped_dot",
++]
++_POSITIONS = {
++    "bare": lambda s: ["worker.py", s],
++    "path": lambda s: [f"/srv/data/{s}/file.json"],
++    "url": lambda s: [f"https://api.example.com/v1/{s}?page=2"],
++    "assignment": lambda s: [f"--config=region={s}"],
++}
++
++
++def _shape(rng: random.Random, kind: str, length: int) -> str:
++    def pick(alphabet: str, n: int = length) -> str:
++        return "".join(rng.choice(alphabet) for _ in range(n))
++
++    def grouped(sep: str, size: int) -> str:
++        groups = [
++            pick(string.ascii_uppercase + string.digits, size)
++            for _ in range(max(3, length // size))
++        ]
++        return sep.join(groups)
++
++    return {
++        "alnum": lambda: pick(string.ascii_letters + string.digits),
++        "lower_digits": lambda: pick(string.ascii_lowercase + string.digits),
++        "upper_digits": lambda: pick(string.ascii_uppercase + string.digits),
++        "base32": lambda: pick(string.ascii_uppercase + "234567"),
++        "lower_base32": lambda: pick(string.ascii_lowercase + "234567"),
++        "hex": lambda: pick("0123456789abcdef"),
++        "mixed_letters": lambda: pick(string.ascii_letters),
++        "symbols": lambda: pick(string.ascii_letters + string.digits + "!@#$%^&*"),
++        "base64": lambda: base64.b64encode(rng.randbytes(length)).decode()[:length],
++        "urlsafe": lambda: base64.urlsafe_b64encode(rng.randbytes(length)).decode()[
++            :length
++        ],
++        "lower": lambda: pick(string.ascii_lowercase),
++        "upper": lambda: pick(string.ascii_uppercase),
++        "grouped_dash": lambda: grouped("-", 4),
++        "grouped_underscore": lambda: grouped("_", 4),
++        "grouped_dot": lambda: grouped(".", 6),
++    }[kind]()
++
++
++@pytest.mark.parametrize("position", sorted(_POSITIONS))
++@pytest.mark.parametrize("kind", _SHAPES)
++@pytest.mark.parametrize("length", sorted(_LEAK_CEILING))
++def test_generated_secrets_are_masked_at_the_documented_rate(position, kind, length):
++    if position in ("path", "url") and kind in ("base64", "symbols"):
++        pytest.skip(
++            "'/', '+', '=', '#', '%' cannot appear unencoded in a path or URL component"
++        )
++    rng = random.Random(f"{position}/{kind}/{length}")
++    leaked = 0
++    for _ in range(400):
++        secret = _shape(rng, kind, length)
++        out = " ".join(shown(_POSITIONS[position](secret), "python3"))
++        leaked += secret in out or secret[-8:] in out
++    assert leaked / 400 <= _LEAK_CEILING[length], (
++        f"{position}/{kind}/{length}: {leaked / 4:.1f}% shown"
+     )
++
++
++@pytest.mark.parametrize(
++    "make, ceiling",
++    [
++        (lambda: _secrets.token_urlsafe(16), _LEAK_CEILING[24]),  # 22 characters
++        (lambda: _secrets.token_hex(16), 0.0),  # 32 hex: always masked
++        (lambda: _secrets.token_urlsafe(32), _LEAK_CEILING[40]),  # 43 characters
++    ],
++)
++def test_python_secrets_module_tokens_are_masked_at_the_documented_rate(make, ceiling):
++    tokens = [make() for _ in range(1000)]
++    leaked = sum(token in " ".join(shown(["--opt", "x", token])) for token in tokens)
++    assert leaked / len(tokens) <= ceiling
+-- 
+2.43.0
+

@@ -1,0 +1,205 @@
+From a61f20d9a702544e1d7a2ad5dbf6bc3972f175b1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 19:36:49 +0000
+Subject: [PATCH] feat(worker-drain): unsent local results hold the census at
+ UNKNOWN [daveey]
+
+Stage 2 slice 1 (t_eeeeee0000000017, creator ruling): a zero
+census count needs every account board readable with an empty kanban_sync_outbox.
+kanban_run_end_lease may drop the Board lease while the completion row is pending,
+so process/lease zeros alone could let the scaler terminate a node holding the
+only copy of a finished result. Pending, unreadable or missing => UNKNOWN (None).
+Tests: pending after real _release, drained, unreadable/corrupt/missing, inventory
+failure. Latch, spawn hooks, helper admission and IID fence are NOT in this commit.
+---
+ hermes_cli/machine_persistent_jobs.py         |  9 ++
+ hermes_cli/worker_drain_results_gate.py       | 61 +++++++++++++
+ .../test_worker_drain_results_gate.py         | 88 +++++++++++++++++++
+ 3 files changed, 158 insertions(+)
+ create mode 100644 hermes_cli/worker_drain_results_gate.py
+ create mode 100644 tests/hermes_cli/test_worker_drain_results_gate.py
+
+diff --git a/hermes_cli/machine_persistent_jobs.py b/hermes_cli/machine_persistent_jobs.py
+index 4e7154f91c..437183e612 100644
+--- a/hermes_cli/machine_persistent_jobs.py
++++ b/hermes_cli/machine_persistent_jobs.py
+@@ -31,6 +31,15 @@ def collect() -> dict:
+     return fresh({'persistent_jobs': len(occupied), 'persistent_jobs_at_ms': at_ms})
+ 
+ 
++def census_count(count: int | None) -> int | None:
++    """The one exit for a complete-census count: a zero needs every local result acknowledged.
++
++    ``None`` means UNKNOWN (no scalar is emitted). Positive counts pass unchanged.
++    """
++    from hermes_cli import worker_drain_results_gate as gate
++    return gate.gate_count(count)
++
++
+ def fresh(sample: dict) -> dict:
+     """Drop incomplete, invalid or aged pairs at the send boundary; never re-stamp."""
+     count, at_ms = (sample.get(key) for key in FIELDS)
+diff --git a/hermes_cli/worker_drain_results_gate.py b/hermes_cli/worker_drain_results_gate.py
+new file mode 100644
+index 0000000000..4f459f2d37
+--- /dev/null
++++ b/hermes_cli/worker_drain_results_gate.py
+@@ -0,0 +1,61 @@
++"""Unsent local card results keep the pre-termination census UNKNOWN, never zero.
++
++A finished run commits its completion locally and the Board learns of it through
++``kanban_sync_outbox``. ``kanban_run_end_lease`` may release the Board lease while
++that row is still pending, so an empty process/lease census says nothing about
++whether the result reached the Board. Terminating the node then destroys it.
++
++``local_results_state`` reads every account board read-only and answers
++``clear`` only when every board was readable and none holds an outbox row (rows are
++deleted on acknowledgement, so any row is unsent or unacknowledged). Any pending
++row or any unreadable/missing board is not clear. This proves no remote custody of
++workspace files or attachment bytes: that stays an INCOMPLETE, separately scoped item.
++"""
++from __future__ import annotations
++
++import sqlite3
++from dataclasses import dataclass
++from pathlib import Path
++
++CLEAR, PENDING, UNKNOWN = 'clear', 'pending', 'unknown'
++
++
++@dataclass(frozen=True)
++class ResultsState:
++    state: str
++    pending: int = 0
++    reason: str = ''
++
++
++def _outbox_rows(path: Path) -> int:
++    """Outbox rows on one board; 0 when the board has no sync tables. Raises on any read failure."""
++    conn = sqlite3.connect(f'{path.resolve(strict=True).as_uri()}?mode=ro', uri=True, timeout=2)
++    try:
++        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_sync_outbox'").fetchone() is None:
++            return 0
++        return int(conn.execute('SELECT COUNT(*) FROM kanban_sync_outbox').fetchone()[0])
++    finally:
++        conn.close()
++
++
++def local_results_state(boards: list[Path] | None = None) -> ResultsState:
++    """Fail closed: unreadable inventory or board is UNKNOWN, a pending row is PENDING."""
++    try:
++        if boards is None:
++            from hermes_cli import worker_account_boards
++            boards = worker_account_boards.paths()
++        pending = 0
++        for path in boards:
++            pending += _outbox_rows(Path(path))
++    except (OSError, ValueError, sqlite3.Error) as exc:
++        return ResultsState(UNKNOWN, reason=f'outbox unreadable: {type(exc).__name__}')
++    if pending:
++        return ResultsState(PENDING, pending, 'unsent local results in kanban_sync_outbox')
++    return ResultsState(CLEAR)
++
++
++def gate_count(count: int | None, boards: list[Path] | None = None) -> int | None:
++    """Pass a census count through the gate: a zero without clear results becomes UNKNOWN (None)."""
++    if count is None or count != 0:
++        return count
++    return 0 if local_results_state(boards).state == CLEAR else None
+diff --git a/tests/hermes_cli/test_worker_drain_results_gate.py b/tests/hermes_cli/test_worker_drain_results_gate.py
+new file mode 100644
+index 0000000000..eecedd0121
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_results_gate.py
+@@ -0,0 +1,88 @@
++"""Unsent local results hold the census at UNKNOWN (never zero)."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import machine_persistent_jobs as jobs, worker_drain_results_gate as gate
++from hermes_cli.kanban_db_sync import SYNC_SCHEMA_SQL
++from hermes_cli.kanban_run_end_lease import _release
++
++
++def _board(tmp_path, rows=0, name='kanban.db'):
++    path = tmp_path / name
++    conn = sqlite3.connect(path)
++    conn.executescript(SYNC_SCHEMA_SQL)
++    for i in range(rows):
++        conn.execute("INSERT INTO kanban_sync_outbox(op_id,table_name,row_uid,op,fields,hlc,created_at) "
++                     "VALUES (?,?,?,?,?,?,?)", (f'op{i}', 'task_runs', f'run{i}', 'upsert', '{"ended_at":1}', 'h', 1))
++    conn.commit()
++    conn.close()
++    return path
++
++
++def test_finished_run_with_pending_completion_and_released_lease_is_unknown(tmp_path):
++    """(a) the completion row stays pending after the lease is gone: zero must become UNKNOWN."""
++    path = _board(tmp_path, rows=1)
++    state = gate.local_results_state([path])
++    assert (state.state, state.pending) == (gate.PENDING, 1)
++    assert gate.gate_count(0, [path]) is None
++
++
++def test_drained_outbox_allows_zero_and_positive_always_passes(tmp_path):
++    """(b) nothing unsent: a zero is allowed; a positive count never needs the gate."""
++    path = _board(tmp_path)
++    assert gate.local_results_state([path]).state == gate.CLEAR
++    assert gate.gate_count(0, [path]) == 0
++    dirty = _board(tmp_path, rows=2, name='b.db')
++    assert gate.gate_count(3, [dirty]) == 3
++
++
++@pytest.mark.parametrize('kind', ['missing', 'corrupt', 'directory'])
++def test_unreadable_outbox_is_unknown(tmp_path, kind):
++    """(c) an unreadable or absent board is never clear."""
++    path = tmp_path / 'kanban.db'
++    if kind == 'corrupt':
++        path.write_bytes(b'not a database' * 100)
++    elif kind == 'directory':
++        path.mkdir()
++    assert gate.local_results_state([path]).state == gate.UNKNOWN
++    assert gate.gate_count(0, [path]) is None
++
++
++def test_inventory_failure_is_unknown(monkeypatch):
++    from hermes_cli import worker_account_boards
++    def boom():
++        raise ValueError('invalid registered board path')
++    monkeypatch.setattr(worker_account_boards, 'paths', boom)
++    assert gate.local_results_state().state == gate.UNKNOWN
++
++
++def test_board_without_sync_tables_has_no_unsent_results(tmp_path):
++    path = tmp_path / 'plain.db'
++    sqlite3.connect(path).close()
++    assert gate.local_results_state([path]).state == gate.CLEAR
++
++
++def test_census_count_exit_uses_the_gate(tmp_path, monkeypatch):
++    path = _board(tmp_path, rows=1)
++    from hermes_cli import worker_account_boards
++    monkeypatch.setattr(worker_account_boards, 'paths', lambda: [path])
++    assert jobs.census_count(0) is None
++    assert jobs.census_count(2) == 2
++
++
++def test_real_release_leaves_pending_row_so_gate_holds(tmp_path, monkeypatch):
++    """The real kanban_run_end_lease._release drops the Board lease with the row pending."""
++    path = _board(tmp_path, rows=1)
++    conn = sqlite3.connect(path)
++    conn.execute('ALTER TABLE kanban_sync_outbox ADD COLUMN retry_after INTEGER')  # migration column
++    conn.execute('CREATE TABLE task_runs(uid TEXT, ended_at INTEGER)')
++    conn.execute("INSERT INTO task_runs VALUES ('u1', 5)")
++    released = []
++    from hermes_cli import kanban_db_sync as sync
++    monkeypatch.setattr(sync, 'release_lease', lambda c, t, u: released.append((t, u)))
++    _release(conn, 't1', 'u1')
++    conn.commit()
++    conn.close()
++    assert released == [('t1', 'u1')]  # lease gone, a process census would be zero
++    assert gate.gate_count(0, [path]) is None
+-- 
+2.43.0
+

@@ -1,0 +1,260 @@
+From 6253b8525e8d4a137f355373a352c70fdd7aecd5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 03:38:26 +0000
+Subject: [PATCH] [daveey] Managed pin gate judges bare custom/empty providers
+ as the turn does
+
+Five whys: (1) A pick the picker offered or session.create accepted still killed
+the chat's first turn with ManagedPinRejectedError. (2) For a bare `custom` or
+empty provider the turn re-derives the provider (canonical_custom_identity /
+empty_provider_identity) before pin_policy; the gate did not, and accepted
+whenever any route named the model (_REDERIVED_PROVIDERS early return).
+(3) The re-derivation lived inline in tui_gateway.agent_factory
+._resolve_agent_model_runtime, so the gate could not call it. (4) Two
+copies of "which provider does this pin run on" can only drift. (5) No test
+compared the gate to the turn on the stored override.
+
+Countermeasure: one public derivation,
+hermes_cli.runtime_provider_custom.rederived_override_provider, used by
+_resolve_agent_model_runtime (behaviour unchanged) and by
+model_options_managed._refusal, which drops _REDERIVED_PROVIDERS and judges
+every non-class pin as pin_policy(model, rederived provider). Reviewer probes now
+refused at session.create (-32602): anthropic-deep on `custom` (stock registry),
+anthropic-deep registered on two levels / two providers with no provider.
+
+Proof:
+- RED on 187108567cfa: 11 new tests fail (5 in test_model_options_managed_pins,
+  6 in test_session_create_managed_pin_guard); GREEN after: 38 pass in the two files.
+- Mutation (old early accept for ""/custom restored): 11 fail (5 + 6).
+- Agreement test: concrete/auto/""/custom x (allowed, unregistered, ambiguous):
+  gate refuses iff _resolve_agent_model_runtime raises ManagedPinRejectedError.
+- Reviewer's 4 files + 7 derivation suites (11 files): 817 passed.
+- scripts/check --base origin/main: ok.
+---
+ hermes_cli/model_options_managed.py           | 18 +++--
+ hermes_cli/runtime_provider_custom.py         | 17 +++++
+ .../test_model_options_managed_pins.py        | 37 +++++++++++
+ .../test_session_create_managed_pin_guard.py  | 65 +++++++++++++++++++
+ tui_gateway/agent_factory.py                  | 15 ++---
+ 5 files changed, 138 insertions(+), 14 deletions(-)
+
+diff --git a/hermes_cli/model_options_managed.py b/hermes_cli/model_options_managed.py
+index f151e2035d..e482aaac7d 100644
+--- a/hermes_cli/model_options_managed.py
++++ b/hermes_cli/model_options_managed.py
+@@ -13,9 +13,6 @@ import logging
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# The agent build re-derives these providers (``empty_provider_identity`` / ``canonical_custom_identity``
+-# in ``tui_gateway.agent_factory``), so for them only "no route names this model" is certain.
+-_REDERIVED_PROVIDERS = frozenset({"", "custom"})
+ # Every per-row list naming model ids; ``total_models`` counts ``models`` (as the aggregator strip does).
+ _ID_LISTS = ("models", "featured_models", "unavailable_models", "subscription_overlap_models")
+ 
+@@ -32,18 +29,27 @@ def _policy(config=None):
+         return None
+ 
+ 
++def _config_model(policy) -> str:
++    """The profile's default model, read as ``agent_factory._config_model_target`` reads it."""
++    cfg_model = policy.get("model")
++    if isinstance(cfg_model, dict):
++        return str(cfg_model.get("default", "") or "").strip()
++    return cfg_model.strip() if isinstance(cfg_model, str) else ""
++
++
+ def _refusal(model, provider, policy, allowed):
+     from agent.model_routing import is_class_selector
+     from agent.model_routing_managed import ManagedPinRejectedError, pin_policy
++    from hermes_cli.runtime_provider_custom import rederived_override_provider
+ 
+     if is_class_selector(model):
+         return None  # routed by class, never pinned
+     if model not in allowed:  # no route names it, on any provider
+         return ManagedPinRejectedError(model, provider, allowed)
+-    if str(provider or "").strip().lower() in _REDERIVED_PROVIDERS:
+-        return None
++    # The turn judges the pin on the provider it re-derives for a bare ``custom`` / empty one.
++    judged = rederived_override_provider(model, provider, config_model=_config_model(policy))
+     try:
+-        pin_policy(model, provider, policy)
++        pin_policy(model, judged, policy)
+     except ManagedPinRejectedError as exc:
+         return exc
+     return None
+diff --git a/hermes_cli/runtime_provider_custom.py b/hermes_cli/runtime_provider_custom.py
+index 791004514b..068b512f11 100644
+--- a/hermes_cli/runtime_provider_custom.py
++++ b/hermes_cli/runtime_provider_custom.py
+@@ -446,6 +446,23 @@ def empty_provider_identity(base_url: Optional[str], model: Optional[str]) -> Op
+     return _find_custom_identity(lambda entry: _route_key(_entry_url(entry)) == url) if url else None
+ 
+ 
++def rederived_override_provider(model: Optional[str], provider: Optional[str], base_url: Optional[str] = None,
++                                *, config_model: str = "") -> Optional[str]:
++    """The provider a turn resolves a dict model override on: the given one, or the entry that heals it.
++
++    A bare ``custom`` provider is recovered through :func:`canonical_custom_identity`; an empty one names
++    no route either, so the entry serving *model* (or owning *base_url*) heals it (#132648), except for
++    the profile's own default model (*config_model*), which the main slot serves. The turn resolves
++    through this before judging the managed pin policy, and the picker / ``session.create`` gate judges
++    through the same function, so the pin they accept is the pin the turn runs."""
++    provider_norm = str(provider or "").strip().lower()
++    if provider_norm == "custom":
++        return _rp().canonical_custom_identity(base_url=base_url or None, model=model or None) or provider
++    if not provider_norm and config_model != model:
++        return empty_provider_identity(base_url, model) or provider
++    return provider
++
++
+ def canonical_custom_identity(*, base_url: Optional[str] = None, config_provider: Optional[str] = None,
+                               model: Optional[str] = None, requested: Optional[str] = None) -> Optional[str]:
+     """Recover the durable menu identity for a bare custom provider. Match a configured
+diff --git a/tests/hermes_cli/test_model_options_managed_pins.py b/tests/hermes_cli/test_model_options_managed_pins.py
+index 105a8968b9..d612b39964 100644
+--- a/tests/hermes_cli/test_model_options_managed_pins.py
++++ b/tests/hermes_cli/test_model_options_managed_pins.py
+@@ -131,3 +131,40 @@ def test_save_key_refreshes_the_row_narrowed_as_the_picker(managed_home, monkeyp
+     resp = server._methods["model.save_key"]("r1", {"slug": "gemini", "api_key": "replacement-" + "value"})
+ 
+     assert resp["result"]["provider"] == {**OFFERED[2], "authenticated": True}, resp
++
++
++@pytest.mark.parametrize("slug", ["custom", ""])
++@pytest.mark.parametrize("routes", [(), (("standard", "anthropic", "anthropic-deep"),),
++                                    (("deep", "openai-codex", "anthropic-deep"),)])
++def test_rederived_provider_rows_drop_exactly_the_ids_the_turn_refuses(monkeypatch, slug, routes):
++    """A row whose slug is ``custom`` / empty is judged on the provider the turn re-derives for it."""
++    from agent.model_routing_managed import ManagedPinRejectedError
++    from hermes_cli.model_options_managed import drop_refused_managed_pins
++    from tui_gateway import server
++
++    cfg = _config()
++    for level, provider, model in routes:
++        cfg["model_routing"]["routes"][level].append(
++            {**cfg["model_routing"]["routes"][level][0], "provider": provider, "model": model})
++    monkeypatch.setattr(server, "_load_cfg", lambda: cfg)  # what the turn reads as its config
++    from hermes_constants import get_hermes_home
++
++    atomic_config_write(get_hermes_home() / "config.yaml", cfg)  # and the runtime resolver's policy
++    ids = ["anthropic-deep", "openai-codex-fast", "gemini-4-argon"]
++    rows = [{"slug": slug, "models": list(ids), "total_models": len(ids)}]
++
++    drop_refused_managed_pins(rows, cfg)
++
++    def turn_refuses(model):
++        try:
++            server._resolve_agent_model_runtime({"model": model, "provider": slug}, None, "s")
++        except ManagedPinRejectedError:
++            return True
++        except Exception:  # credentials/network are not the pin verdict
++            return False
++        return False
++
++    assert rows[0]["models"] == [model for model in ids if not turn_refuses(model)]
++    assert rows[0]["total_models"] == len(rows[0]["models"])
++    if slug == "custom":  # a bare custom pick never matches a subscription route's provider
++        assert rows[0]["models"] == []
+diff --git a/tests/tui_gateway/test_session_create_managed_pin_guard.py b/tests/tui_gateway/test_session_create_managed_pin_guard.py
+index 29e4bdac65..67e136a673 100644
+--- a/tests/tui_gateway/test_session_create_managed_pin_guard.py
++++ b/tests/tui_gateway/test_session_create_managed_pin_guard.py
+@@ -125,3 +125,68 @@ def test_create_accepts_exactly_what_the_picker_offers(_create, tmp_path):
+         for model in row["models"]:
+             response, _ = _create({"model": model, "provider": row["slug"]})
+             assert ("error" not in response) is (model in kept["models"]), (row["slug"], model, response)
++
++
++# --- bare ``custom`` / empty providers: the turn re-derives the provider before judging the pin ---------
++
++
++def _write_routes(home, extra_routes=()):
++    """The stock policy plus ``extra_routes`` (level, provider, model) subscription routes."""
++    cfg = policy()
++    cfg["model"] = {"default": "anthropic-deep", "provider": "anthropic"}
++    cfg["model_routing"]["enforce_subscription_only"] = True
++    for level, provider, model in extra_routes:
++        cfg["model_routing"]["routes"][level].append(
++            {**cfg["model_routing"]["routes"][level][0], "provider": provider, "model": model})
++    atomic_config_write(home / "config.yaml", cfg)
++
++
++@pytest.mark.parametrize("routes, params", [
++    pytest.param((), {"model": "anthropic-deep", "provider": "custom"}, id="custom-on-stock-registry"),
++    pytest.param((("standard", "anthropic", "anthropic-deep"),), {"model": "anthropic-deep"},
++                 id="two-levels-no-provider"),
++    pytest.param((("deep", "openai-codex", "anthropic-deep"),), {"model": "anthropic-deep"},
++                 id="two-providers-no-provider"),
++])
++def test_pin_the_turn_rejects_after_rederiving_the_provider_is_refused(_create, tmp_path, routes, params):
++    _write_routes(tmp_path, routes)
++
++    response, sessions = _create(params)
++
++    assert response["error"]["code"] == -32602, response
++    assert sessions == {}
++
++
++def _turn_rejects(override):
++    """True when the agent build's own resolver raises the policy's refusal for the stored override."""
++    from agent.model_routing_managed import ManagedPinRejectedError
++    from tui_gateway import server  # the resolver runs bound to server's namespace (method_ctx.bind_module)
++
++    try:
++        server._resolve_agent_model_runtime(override, None, "agreement-session")
++    except ManagedPinRejectedError:
++        return True
++    except Exception:  # any other failure (credentials, network) is not the pin verdict
++        return False
++    return False
++
++
++@pytest.mark.parametrize("provider", ["anthropic", "auto", "", "custom"])
++@pytest.mark.parametrize("model", ["anthropic-deep", "gemini-4-argon", "ambiguous-pin"])
++def test_gate_refuses_exactly_what_the_turn_refuses_on_the_stored_override(
++        _create, tmp_path, monkeypatch, model, provider):
++    from hermes_cli.config_effective import load_user_config_effective
++    from hermes_cli.model_options_managed import managed_pin_refusal
++    from tui_gateway import server
++    from tui_gateway.methods_session_model_guard import create_overrides
++
++    _write_routes(tmp_path, (("deep", "anthropic", "ambiguous-pin"), ("fast", "anthropic", "ambiguous-pin")))
++    monkeypatch.setattr(server, "_load_cfg", load_user_config_effective)  # the turn reads its config here
++
++    stored, _, _ = create_overrides({"model": model, "provider": provider})
++    response, sessions = _create({"model": model, "provider": provider})
++
++    refused = managed_pin_refusal(stored["model"], stored["provider"]) is not None
++    assert refused is _turn_rejects(stored), (stored, response)
++    assert ("error" in response) is refused
++    assert bool(sessions) is not refused
+diff --git a/tui_gateway/agent_factory.py b/tui_gateway/agent_factory.py
+index a8a15c651c..ef4fdae2bf 100644
+--- a/tui_gateway/agent_factory.py
++++ b/tui_gateway/agent_factory.py
+@@ -572,14 +572,13 @@ def _resolve_agent_model_runtime(model_override, provider_override, routing_sess
+         override_base_url = model_override.get("base_url")
+         resolve_kwargs = {}
+         provider_norm = str(requested_provider or "").strip().lower()
+-        # An empty provider names no route either; once the main slot targets another model it 404s (#132648).
+-        if provider_norm == "custom":
+-            from hermes_cli.runtime_provider import canonical_custom_identity
+-            if recovered := canonical_custom_identity(base_url=override_base_url or None, model=model or None):
+-                requested_provider = recovered
+-        elif not provider_norm and _config_model_target()[0] != model:
+-            from hermes_cli.runtime_provider_custom import empty_provider_identity
+-            requested_provider = empty_provider_identity(override_base_url, model) or requested_provider
++        # A bare ``custom`` or empty provider is re-derived before the pin is judged, by the function the
++        # managed-pin gate shares; an empty one names no route either, and once the main slot targets another
++        # model it 404s (#132648).
++        from hermes_cli.runtime_provider_custom import rederived_override_provider
++        requested_provider = rederived_override_provider(
++            model, requested_provider, override_base_url,
++            config_model="" if provider_norm else _config_model_target()[0])
+         if provider_norm == "custom" and override_base_url:
+             # Failing identity recovery, still hand base_url to the direct-alias branch so pool/env credentials resolve.
+             resolve_kwargs["explicit_base_url"] = override_base_url
+-- 
+2.43.0
+

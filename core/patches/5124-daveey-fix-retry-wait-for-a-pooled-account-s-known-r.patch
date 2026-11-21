@@ -1,0 +1,228 @@
+From 8fa054f240b9029bee39c7800ab3201e4eb4f59a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 09:09:05 +0000
+Subject: [PATCH] [daveey] fix(retry): wait for a pooled account's known reset
+ instead of a fixed backoff
+
+Example incident (example session): every pooled Anthropic account was cooling down for
+claude-opus-5-5; compute_error_backoff chose a fixed 600 s wait and the retry woke 3 s before the selected account's
+model cooldown ended, so the turn failed.
+
+When every pooled OAuth credential is cooling down for the requested model, wait until the earliest
+reset plus 3 s (POOL_RESET_MARGIN_S) when it is within POOL_RESET_BUDGET_S (cap + 60 s). A reset past the
+budget ends the retry cycle at once with the SubscriptionQuotaUnavailable refusal that names it.
+
+Proof: tests/agent/test_pool_reset_wait.py (603 s reset -> wait in [603, 606] and credential selected after;
+past-budget reset -> no backoff/sleep, error names the reset); 45 turn_recovery/retry-related files green.
+---
+ agent/model_routing_unavailable.py  |  23 ++++++
+ agent/turn_api_error.py             |   9 ++
+ agent/turn_recovery.py              |   8 ++
+ tests/agent/test_pool_reset_wait.py | 122 ++++++++++++++++++++++++++++
+ 4 files changed, 162 insertions(+)
+ create mode 100644 tests/agent/test_pool_reset_wait.py
+
+diff --git a/agent/model_routing_unavailable.py b/agent/model_routing_unavailable.py
+index e6e27bb7cc..5806e17295 100644
+--- a/agent/model_routing_unavailable.py
++++ b/agent/model_routing_unavailable.py
+@@ -107,6 +107,29 @@ def quota_unavailable(pool, model):
+     return None
+ 
+ 
++# Slack after a known reset so the retry lands past the provider's own clock, not on its edge.
++POOL_RESET_MARGIN_S = 3.0
++# Longest known reset worth sleeping through: ``RETRY_AFTER_CAP_S`` plus slack for the margin, so a reset
++# the 600 s cap would have missed by seconds (hub 11-20: 603 s away) is still waited for.
++POOL_RESET_BUDGET_S = 600.0 + 60.0
++
++
++def pool_reset_wait(pool, model, now=None):
++    """``(seconds_until_earliest_reset, SubscriptionQuotaUnavailable)`` when every pooled OAuth
++    credential is cooling down for *model* with a known reset, else None.
++
++    A real ``CredentialPool`` only: anything else (a stub, no pool) carries no reset evidence."""
++    from agent.credential_pool import CredentialPool
++    import time
++
++    if not isinstance(pool, CredentialPool):
++        return None
++    refusal = quota_unavailable(pool, model)
++    if refusal is None:
++        return None
++    return refusal.resets_at - (time.time() if now is None else now), refusal
++
++
+ def half_pool_reset(waits):
+     """The reset by which at least half of the walled accounts behind *waits* can serve again."""
+     ordered = sorted(waits)
+diff --git a/agent/turn_api_error.py b/agent/turn_api_error.py
+index 5ad62fd0a0..1a748e7d6f 100644
+--- a/agent/turn_api_error.py
++++ b/agent/turn_api_error.py
+@@ -426,6 +426,15 @@ def settle_unrecovered_error(
+         logger.info("%sFree-tier cooldown outlasts the attended wait — ending retries after attempt %s",
+                     agent.log_prefix, retry_count)
+         retry_count = max_retries
++    if is_rate_limited and retry_count < max_retries:
++        # Every pooled account is walled past the retry cap: sleeping first would only end the turn
++        # later. End the cycle now, with the refusal that names the reset time.
++        from agent.model_routing_unavailable import POOL_RESET_BUDGET_S, pool_reset_wait
++        _pool_wait = pool_reset_wait(getattr(agent, "_credential_pool", None), _model)
++        if _pool_wait is not None and _pool_wait[0] > POOL_RESET_BUDGET_S:
++            logger.info("%sPool reset in %.0fs is past the retry cap — ending retries after attempt %s",
++                        agent.log_prefix, _pool_wait[0], retry_count)
++            api_error, error_msg, retry_count = _pool_wait[1], str(_pool_wait[1]), max_retries
+     if retry_count >= max_retries:
+         # Before fallback, rebuild the primary client once per API call block for
+         # transient transport errors (stale pool, TCP reset).
+diff --git a/agent/turn_recovery.py b/agent/turn_recovery.py
+index f9e526acb1..1fbc130b81 100644
+--- a/agent/turn_recovery.py
++++ b/agent/turn_recovery.py
+@@ -1482,6 +1482,14 @@ def compute_error_backoff(
+         wait_time, _backoff_policy = adaptive_rate_limit_backoff(
+             retry_count, base_url=str(base_url), model=model, error=api_error, default_wait=wait_time,
+         )
++    if is_rate_limited:
++        # Every pooled account is cooling down and the earliest reset is known: wait for it (plus a
++        # margin) instead of a fixed backoff that can wake seconds before the reset (hub 11-20: a 600s
++        # wait missed an account's reset by 3s). A reset past the cap ends the turn in the caller.
++        from agent.model_routing_unavailable import POOL_RESET_BUDGET_S, POOL_RESET_MARGIN_S, pool_reset_wait
++        _pool_wait = pool_reset_wait(getattr(agent, "_credential_pool", None), model)
++        if _pool_wait is not None and 0 < _pool_wait[0] <= POOL_RESET_BUDGET_S:
++            wait_time, _backoff_policy = _pool_wait[0] + POOL_RESET_MARGIN_S, "pool_reset"
+     _reset = reset_hint(api_error) if _adaptive else ""
+     _free_busy = is_rate_limited and on_free_model(agent, base_url)
+     _wait_reason = ("The free model is busy" if _free_busy
+diff --git a/tests/agent/test_pool_reset_wait.py b/tests/agent/test_pool_reset_wait.py
+new file mode 100644
+index 0000000000..dd7411c4ca
+--- /dev/null
++++ b/tests/agent/test_pool_reset_wait.py
+@@ -0,0 +1,122 @@
++"""A 429 against a pool whose every account has a known reset waits for that reset, not a fixed backoff.
++
++Example incident: a 600 s wait woke 3 s before the selected account's model cooldown ended, so the turn failed. These
++tests use a real ``CredentialPool`` under a sandboxed HERMES_HOME and a controlled clock.
++"""
++from __future__ import annotations
++
++import time
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from agent import credential_pool as cp
++from agent.model_routing_unavailable import POOL_RESET_BUDGET_S, POOL_RESET_MARGIN_S, pool_reset_wait
++from agent.status_output import StatusOutputMixin
++from agent.turn_recovery import compute_error_backoff
++
++MODEL = "claude-opus-5-5"
++URL = "https://api.anthropic.com"
++
++
++def _pool(tmp_path, monkeypatch, resets):
++    """Anthropic OAuth pool, one 429-benched account per entry of *resets* (seconds from now)."""
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    now = time.time()
++    entries = [
++        cp.PooledCredential.from_dict("anthropic", dict(
++            id=f"acct{i}", label=f"acct{i}", auth_type="oauth", priority=i, source="manual:hub_minted",
++            access_token=f"tok-{i}", expires_at_ms=int((now + 86400) * 1000),
++            model_cooldowns={MODEL: now + delta}))  # a model-scoped 429 leaves the credential itself ok
++        for i, delta in enumerate(resets)
++    ]
++    return cp.CredentialPool("anthropic", entries)
++
++
++def _agent(pool):
++    agent = MagicMock()
++    for name in ("_emit_diagnostic_wait", "_buffer_diagnostic_status"):
++        setattr(agent, name, getattr(StatusOutputMixin, name).__get__(agent))
++    agent._client_log_context.return_value = ""
++    agent._credential_pool = pool
++    return agent
++
++
++def _429():
++    err = Exception("HTTP 429: rate_limit_error")
++    err.status_code = 429
++    return err
++
++
++def _backoff(agent):
++    return compute_error_backoff(agent, _429(), retry_count=1, max_retries=3, is_rate_limited=True,
++                                 is_zai_coding_overload=False, base_url=URL, model=MODEL)
++
++
++def test_wait_runs_to_the_earliest_reset_plus_margin_and_the_credential_is_then_selected(tmp_path, monkeypatch):
++    pool = _pool(tmp_path, monkeypatch, [603, 5 * 3600])
++    wait = _backoff(_agent(pool))
++    assert 603 <= wait <= 603 + POOL_RESET_MARGIN_S
++    # After sleeping exactly that long the soonest account is selectable again (and the later one is not).
++    real = time.time
++    monkeypatch.setattr(time, "time", lambda: real() + wait)
++    assert pool.select(model=MODEL).id == "acct0"
++
++
++def test_a_fixed_600s_retry_after_does_not_override_a_known_reset(tmp_path, monkeypatch):
++    """The hub's failing case: Retry-After clamped to 600 s while the reset was 603 s away."""
++    err = _429()
++    err.response = SimpleNamespace(headers={"retry-after": "900"})
++    agent = _agent(_pool(tmp_path, monkeypatch, [603]))
++    wait = compute_error_backoff(agent, err, retry_count=1, max_retries=3, is_rate_limited=True,
++                                 is_zai_coding_overload=False, base_url=URL, model=MODEL)
++    assert 603 <= wait <= 603 + POOL_RESET_MARGIN_S
++
++
++def test_a_pool_with_room_or_no_pool_keeps_the_fixed_backoff(tmp_path, monkeypatch):
++    assert pool_reset_wait(_pool(tmp_path, monkeypatch, [-5]), MODEL) is None  # already reset: room
++    assert pool_reset_wait(None, MODEL) is None
++    assert _backoff(_agent(None)) <= 60  # jittered default, not a pool wait
++
++
++def test_a_reset_past_the_cap_is_not_waited_for_in_backoff(tmp_path, monkeypatch):
++    pool = _pool(tmp_path, monkeypatch, [POOL_RESET_BUDGET_S + 600])
++    wait, _refusal = pool_reset_wait(pool, MODEL)
++    assert wait > POOL_RESET_BUDGET_S
++    assert _backoff(_agent(pool)) <= 60
++
++
++def test_a_reset_past_the_cap_ends_the_turn_without_sleeping_and_names_the_reset(tmp_path, monkeypatch):
++    from agent.turn_api_error import handle_api_error
++    from run_agent import AIAgent
++
++    pool = _pool(tmp_path, monkeypatch, [POOL_RESET_BUDGET_S + 600])
++    reset_at = pool.entries()[0].model_cooldowns[MODEL]
++    with patch("model_tools.get_tool_definitions", return_value=[]), \
++            patch("model_tools.check_toolset_requirements", return_value={}), \
++            patch("agent.process_bootstrap.OpenAI"):
++        agent = AIAgent(api_key="test-key-1234567890", base_url=URL, quiet_mode=True,
++                        skip_context_files=True, skip_memory=True)
++    agent.provider, agent.model, agent._credential_pool = "anthropic", MODEL, pool
++    seen = {}
++
++    def _exhausted(agent_, api_error, classified, **kw):
++        seen["error"] = api_error
++        return {"final_response": str(api_error), "failed": True}
++
++    with patch.object(agent, "_try_activate_fallback", return_value=False), \
++            patch.object(agent, "_try_recover_primary_transport", return_value=False), \
++            patch("agent.turn_api_error.max_retries_exhausted_result", _exhausted), \
++            patch("agent.turn_api_error.compute_error_backoff", side_effect=AssertionError("must not back off")), \
++            patch("agent.turn_api_error.interruptible_backoff_sleep", side_effect=AssertionError("must not sleep")), \
++            patch("agent.turn_recovery_autorecover.auto_recover_after_exhaustion", return_value=None), \
++            patch("agent.turn_api_error.recover_after_classification", return_value=(False, False)):
++        verdict = handle_api_error(
++            agent, api_error=_429(), _retry=SimpleNamespace(primary_recovery_attempted=False), thinking_spinner=None, messages=[],
++            api_messages=[], api_kwargs={}, system_message="", active_system_prompt="",
++            conversation_history=[], approx_tokens=0, retry_count=0, max_retries=3, compression_attempts=0,
++            max_compression_attempts=1, api_call_count=1, api_request_id="r", api_start_time=time.time(),
++            effective_task_id="t", turn_id="u")
++    assert verdict.action == "return"
++    assert str(reset_at) in seen["error"].args[0]
+-- 
+2.43.0
+

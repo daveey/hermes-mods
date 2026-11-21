@@ -1,0 +1,346 @@
+From 19a035a8c7dc9c33801d3f896fbff771b15db3eb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 07:58:37 +0000
+Subject: [PATCH] fix(dashboard): hand off model.options to a warm always-on
+ successor [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem: After an example gateway core rollover, Desktop
+model.options stayed on the predecessor always-on :9149 and 503'd until a manual
+pause-turns+SIGTERM. Successor :9148 had already begun serving.
+
+Why 1: The client's existing TCP splice through :9147 stayed on :9149 — the
+proxy routes only new connections (always_on_rollover.Proxy).
+Why 2: :9149 was already superseded (core-stale logged busy, not left/live_ports)
+so the roller had switched; retirement still required the idle fence
+(web_server_skew_exit._run_retirement_watchdog).
+Why 3: Unpausable turns refused fence.prepare; HTTP Connection: close drain does
+not move the multiplexed WS that carries model.options RPC.
+Why 4: core-stale pause-turns (180s) also refused rather than kill the turn;
+the updater left the process to Desktop reconnect.
+Root (happened): Blue/green converged process replacement, not control-plane
+admission, so a busy predecessor could pin model.options indefinitely.
+Root (not caught): Tests covered idle drain and fence refusal, not successor
+serving + busy predecessor + model.options still on the old process.
+Recurrence: same pattern Nov 12 (hermes-sync core_stale_serve_backends).
+
+Countermeasures:
+- symptom: GET /api/model/options and model.options RPC on a superseded always-on
+  backend return the successor's payload (allowlisted control read only).
+- root: no local picker build on stale modules; writes/prompts are not forwarded;
+  missing successor still 503s; non-always-on ports never read live active.json.
+- detection: tests/hermes_cli/test_always_on_control_handoff.py
+
+Proof: hermes-core-wt test of the new file plus test_code_skew,
+test_model_rpc_skew_guard, test_always_on_drain — 29 passed.
+---
+ hermes_cli/always_on_rollover.py              |  70 ++++++++-
+ hermes_cli/web_routers/models.py              |  19 +++
+ .../test_always_on_control_handoff.py         | 139 ++++++++++++++++++
+ tui_gateway/methods_complete.py               |  11 ++
+ 4 files changed, 235 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_always_on_control_handoff.py
+
+diff --git a/hermes_cli/always_on_rollover.py b/hermes_cli/always_on_rollover.py
+index 70a00762a7..71479810b2 100644
+--- a/hermes_cli/always_on_rollover.py
++++ b/hermes_cli/always_on_rollover.py
+@@ -62,6 +62,10 @@ BACKEND_PORTS = (9148, 9149, 9150, 9151)
+ ENV_BACKEND = "HERMES_ALWAYS_ON_BACKEND"
+ ACTIVE_NAME = "active.json"
+ ACTIVE_SCHEMA = 1
++# Control-plane GETs a busy superseded backend may fetch from the active successor (never writes/prompts).
++CONTROL_READ_PATHS = frozenset({"/api/model/options"})
++HANDOFF_TIMEOUT_S = 5.0
++_THIS_PORT: Optional[int] = None
+ 
+ PROXY_HOLD_S = 30.0          # a client waits this long for an answering backend before its connection is closed
+ PROXY_CONNECT_TIMEOUT_S = 5.0
+@@ -147,6 +151,54 @@ def successor_pending(port: int, home: Optional[Path] = None) -> bool:
+     return port != record["port"] or bool(record["warming"])
+ 
+ 
++def handoff_control_read(port: int, path: str, *, get: Optional[Callable] = None,
++                         home: Optional[Path] = None,
++                         timeout_s: float = HANDOFF_TIMEOUT_S) -> Optional[dict]:
++    """If *port* is superseded, the active successor's GET *path* body.
++
++    None when this process still serves, *path* is not a control read, or the successor
++    did not answer 200 JSON. Never runs the local handler (stale ``sys.modules``)."""
++    try:
++        port = int(port)
++    except (TypeError, ValueError):
++        return None
++    if port not in BACKEND_PORTS:
++        return None
++    parsed = urllib.parse.urlparse(path)
++    if parsed.path not in CONTROL_READ_PATHS:
++        return None
++    try:
++        if not is_superseded(port, home):
++            return None
++        record = read_active(home)
++        if record is None:
++            return None
++        getter = get or _loopback_control_get
++        status, _elapsed, body = getter(record["port"], path, timeout_s)
++    except Exception:  # health: allow BLE001 -- a dead successor is not a stale-module bypass
++        return None
++    return body if status == 200 and isinstance(body, dict) else None
++
++
++def _loopback_control_get(port: int, path: str, timeout: float) -> tuple[Optional[int], float, Optional[dict]]:
++    token, _nonce = aod.ensure_credentials()
++    started = time.monotonic()
++    request = urllib.request.Request(f"http://127.0.0.1:{int(port)}{path}",
++                                     headers={"X-Hermes-Session-Token": token})
++    try:
++        with urllib.request.urlopen(request, timeout=timeout) as response:
++            body = response.read()
++            status = response.status
++    except urllib.error.HTTPError as exc:
++        return exc.code, time.monotonic() - started, None
++    except (OSError, ValueError, http.client.HTTPException):
++        return None, time.monotonic() - started, None
++    parsed = None
++    with contextlib.suppress(ValueError):
++        parsed = json.loads(body) if body[:1] in (b"{", b"[") else None
++    return status, time.monotonic() - started, parsed if isinstance(parsed, dict) else None
++
++
+ def backend_port_for_pid(pid: int, proc: Path = Path("/proc")) -> Optional[int]:
+     """The port of the ``hermes-always-on-backend@<port>.service`` unit whose cgroup holds *pid*, else None.
+     By cgroup, not environment: an agent child of a backend inherits its environment, not its unit."""
+@@ -160,8 +212,17 @@ def backend_port_for_pid(pid: int, proc: Path = Path("/proc")) -> Optional[int]:
+ def pop_backend_port(environ=os.environ) -> Optional[int]:
+     """In a backend: the port its unit passed in ``HERMES_ALWAYS_ON_BACKEND``, removed from the environment
+     so agent children never inherit it. None everywhere else."""
++    global _THIS_PORT
+     raw = environ.pop(ENV_BACKEND, "")
+-    return int(raw) if raw.isdigit() and 0 < int(raw) < 65536 else None
++    port = int(raw) if raw.isdigit() and 0 < int(raw) < 65536 else None
++    if port is not None:
++        _THIS_PORT = port
++    return port
++
++
++def this_backend_port() -> Optional[int]:
++    """The always-on backend port this process was started as, else None."""
++    return _THIS_PORT
+ 
+ 
+ def request_roll(run: Callable = subprocess.run) -> bool:
+@@ -853,7 +914,8 @@ def stop_all(run: Callable = aod._run) -> None:
+ 
+ __all__ = [
+     "BACKEND_PORTS", "ENV_BACKEND", "PROXY_UNIT", "Proxy", "Roller", "backend_port_for_pid", "bind_listener",
+-    "cmd_backend", "cmd_proxy", "cmd_roll", "install_units", "is_superseded", "pop_backend_port",
+-    "read_active", "render_units", "request_roll", "route_always_on_backends", "stop_all", "successor_pending",
+-    "verify_backend_custody", "write_active", "write_backend_custody",
++    "cmd_backend", "cmd_proxy", "cmd_roll", "handoff_control_read", "install_units", "is_superseded",
++    "pop_backend_port", "read_active", "render_units", "request_roll", "route_always_on_backends",
++    "stop_all", "successor_pending", "this_backend_port", "verify_backend_custody", "write_active",
++    "write_backend_custody",
+ ]
+diff --git a/hermes_cli/web_routers/models.py b/hermes_cli/web_routers/models.py
+index 0c3de56179..489e26cb4f 100644
+--- a/hermes_cli/web_routers/models.py
++++ b/hermes_cli/web_routers/models.py
+@@ -151,6 +151,25 @@ async def get_model_options(
+     with http_failure("GET /api/model/options failed", 500, detail="Failed to list model options"):
+         skew_msg = _dashboard_code_skew_guard()
+         if skew_msg:
++            from hermes_cli.always_on_rollover import handoff_control_read, this_backend_port
++
++            query = []
++            if profile:
++                query.append(("profile", profile))
++            if refresh:
++                query.append(("refresh", "true"))
++            if include_unconfigured:
++                query.append(("include_unconfigured", "true"))
++            if explicit_only:
++                query.append(("explicit_only", "true"))
++            path = "/api/model/options"
++            if query:
++                from urllib.parse import urlencode
++
++                path = f"{path}?{urlencode(query)}"
++            handed = handoff_control_read(this_backend_port() or 0, path)
++            if handed is not None:
++                return handed
+             _log.warning("GET /api/model/options refused: %s", skew_msg)
+             raise HTTPException(status_code=503, detail=f"Restart required: {skew_msg}")
+ 
+diff --git a/tests/hermes_cli/test_always_on_control_handoff.py b/tests/hermes_cli/test_always_on_control_handoff.py
+new file mode 100644
+index 0000000000..2a7acde3b4
+--- /dev/null
++++ b/tests/hermes_cli/test_always_on_control_handoff.py
+@@ -0,0 +1,139 @@
++"""Busy always-on predecessor must not pin Desktop model.options after a warm successor serves.
++
++Example incident: roller switched active.json to :9148 while :9149 stayed busy
++(unpausable turns). The TCP-splice proxy kept the client's existing sockets on
++:9149, which 503'd model.options on code skew. Retirement correctly refused to
++kill the turn. Control-plane reads must hand off to the successor instead.
++"""
++
++from __future__ import annotations
++
++import asyncio
++from unittest.mock import Mock
++
++import pytest
++from fastapi import HTTPException
++
++import hermes_cli.always_on_rollover as ro
++import hermes_cli.web_routers.models as _rt_models
++from gateway import code_skew
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    monkeypatch.setenv("HOME", str(tmp_path))
++    monkeypatch.delenv("HERMES_HOME", raising=False)
++    if hasattr(ro, "_THIS_PORT"):
++        monkeypatch.setattr(ro, "_THIS_PORT", None)
++    return tmp_path
++
++
++def _get_ok(port, path, timeout):
++    return 200, 0.01, {"providers": [{"slug": "xai", "models": ["grok-4"]}]}
++
++
++def test_superseded_backend_hands_model_options_to_the_active_successor(home):
++    ro.write_active(9148)
++    calls = []
++
++    def get(port, path, timeout):
++        calls.append((port, path, timeout))
++        return _get_ok(port, path, timeout)
++
++    body = ro.handoff_control_read(9149, "/api/model/options?explicit_only=true", get=get)
++    assert body == {"providers": [{"slug": "xai", "models": ["grok-4"]}]}
++    assert calls == [(9148, "/api/model/options?explicit_only=true", ro.HANDOFF_TIMEOUT_S)]
++
++
++def test_active_or_warming_backend_does_not_handoff(home):
++    ro.write_active(9149, warming=[9148])
++
++    def get(*_a, **_k):
++        raise AssertionError("successor must not be queried while this port still serves")
++
++    assert ro.handoff_control_read(9149, "/api/model/options", get=get) is None
++    ro.write_active(9149)
++    assert ro.handoff_control_read(9149, "/api/model/options", get=get) is None
++
++
++def test_handoff_does_not_forward_writes_or_prompts(home):
++    ro.write_active(9148)
++    hits = []
++
++    def get(port, path, timeout):
++        hits.append(path)
++        return 200, 0.0, {"ok": True}
++
++    assert ro.handoff_control_read(9149, "/api/model/set", get=get) is None
++    assert ro.handoff_control_read(9149, "/api/prompt/submit", get=get) is None
++    assert hits == []
++
++
++def test_failed_or_non_json_successor_read_is_not_a_stale_bypass(home):
++    ro.write_active(9148)
++    assert ro.handoff_control_read(9149, "/api/model/options", get=lambda *_: (503, 0, {"detail": "no"})) is None
++    assert ro.handoff_control_read(9149, "/api/model/options", get=lambda *_: (200, 0, "not-a-dict")) is None
++
++    def boom(*_a, **_k):
++        raise OSError("successor down")
++
++    assert ro.handoff_control_read(9149, "/api/model/options", get=boom) is None
++
++
++def test_stale_superseded_dashboard_returns_successor_payload_without_local_build(home, monkeypatch):
++    monkeypatch.setattr(code_skew, "detect_code_skew", lambda: ("74e8765b42", "fcda64965f"))
++    monkeypatch.setattr(ro, "this_backend_port", lambda: 9149)
++    ro.write_active(9148)
++    monkeypatch.setattr(ro, "handoff_control_read", lambda *a, **k: {"providers": [{"slug": "xai", "models": ["grok-4"]}]})
++    builds = []
++    monkeypatch.setattr(
++        "hermes_cli.inventory.build_model_options_payload",
++        lambda *a, **k: builds.append(1) or {"providers": []},
++    )
++    result = asyncio.run(_rt_models.get_model_options())
++    assert result == {"providers": [{"slug": "xai", "models": ["grok-4"]}]}
++    assert builds == []
++
++
++def test_stale_backend_without_successor_still_503s(home, monkeypatch):
++    monkeypatch.setattr(code_skew, "detect_code_skew", lambda: ("74e8765b42", "fcda64965f"))
++    monkeypatch.setattr(ro, "this_backend_port", lambda: 9149)
++    monkeypatch.setattr(ro, "handoff_control_read", lambda *a, **k: None)
++    builds = []
++    monkeypatch.setattr(
++        "hermes_cli.inventory.build_model_options_payload",
++        lambda *a, **k: builds.append(1) or {"providers": []},
++    )
++    with pytest.raises(HTTPException) as excinfo:
++        asyncio.run(_rt_models.get_model_options())
++    assert excinfo.value.status_code == 503
++    assert "restart" in str(excinfo.value.detail).lower()
++    assert builds == []
++
++
++def test_stale_model_options_rpc_hands_off_to_successor(home, monkeypatch):
++    from tui_gateway import server
++
++    monkeypatch.setattr(code_skew, "detect_code_skew", lambda: ("74e8765b42", "fcda64965f"))
++    monkeypatch.setattr(ro, "this_backend_port", lambda: 9149)
++    payload = {"providers": [{"slug": "xai", "models": ["grok-4"]}]}
++    monkeypatch.setattr(ro, "handoff_control_read", lambda *a, **k: payload)
++    builds = []
++    monkeypatch.setattr("hermes_cli.inventory.build_model_options_payload",
++                        Mock(side_effect=lambda *a, **k: builds.append(1)))
++    resp = server._methods["model.options"]("rid", {})
++    assert resp.get("result") == payload, resp
++    assert builds == []
++
++
++def test_stale_model_save_key_still_refuses_when_a_successor_serves(home, monkeypatch):
++    from tui_gateway import server
++
++    monkeypatch.setattr(code_skew, "detect_code_skew", lambda: ("74e8765b42", "fcda64965f"))
++    monkeypatch.setattr(ro, "this_backend_port", lambda: 9149)
++    monkeypatch.setattr(ro, "handoff_control_read", lambda *a, **k: {"providers": []})
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    resp = server._methods["model.save_key"]("rid", {"slug": "zai", "api_key": "sk-canary"})
++    assert resp.get("error", {}).get("code") == 5098, resp
++    env = home / ".env"
++    assert not env.exists() or "sk-canary" not in env.read_text(encoding="utf-8")
+diff --git a/tui_gateway/methods_complete.py b/tui_gateway/methods_complete.py
+index b3df99963b..0ab69d9dfc 100644
+--- a/tui_gateway/methods_complete.py
++++ b/tui_gateway/methods_complete.py
+@@ -323,6 +323,17 @@ def _model_skew_err(rid) -> dict | None:
+ def _(rid, params: dict) -> dict:
+     skew = _model_skew_err(rid)
+     if skew is not None:
++        from hermes_cli.always_on_rollover import handoff_control_read, this_backend_port
++        from urllib.parse import urlencode
++
++        query = {k: params[k] for k in ("explicit_only", "include_unconfigured", "refresh", "profile")
++                 if k in params and params[k] not in (None, "")}
++        path = "/api/model/options"
++        if query:
++            path = f"{path}?{urlencode(query)}"
++        handed = handoff_control_read(this_backend_port() or 0, path)
++        if handed is not None:
++            return _ok(rid, handed)
+         return skew
+     from hermes_cli.inventory import build_model_options_payload
+     # A spawned agent owns the live provider/model/base_url; empty attributes must
+-- 
+2.43.0
+

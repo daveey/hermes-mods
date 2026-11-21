@@ -1,0 +1,508 @@
+From 95972fe3e00b9ffed86ad60297f30dbd1a495e5e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:01:47 +0000
+Subject: [PATCH] [daveey] Retain queued reviews and async housekeeping drain
+ custody
+
+---
+ agent/review_idle_queue.py                    |  58 +++++--
+ gateway/run.py                                |  15 +-
+ gateway/run_drain_work.py                     |  43 +++++
+ tests/agent/test_review_queue_drain.py        | 164 ++++++++++++++++++
+ .../test_worker_drain_housekeeping.py         | 120 +++++++++++++
+ 5 files changed, 387 insertions(+), 13 deletions(-)
+ create mode 100644 gateway/run_drain_work.py
+ create mode 100644 tests/agent/test_review_queue_drain.py
+ create mode 100644 tests/hermes_cli/test_worker_drain_housekeeping.py
+
+diff --git a/agent/review_idle_queue.py b/agent/review_idle_queue.py
+index a85034d0ea..87032079ce 100644
+--- a/agent/review_idle_queue.py
++++ b/agent/review_idle_queue.py
+@@ -70,6 +70,20 @@ class _PendingReview:
+     # of the agent's review spawn. ``kwargs["task_cfg"]`` still drives the age-out.
+     dispatch: Optional[Callable[[], None]] = None
+     work: Any = None  # dispatch custody, reserved atomically with the pop (never held while merely queued)
++    drain: Any = None  # independent custody from enqueue through dispatch/cleanup
++
++    def close_drain(self) -> None:
++        if self.drain is not None:
++            self.drain.close()
++            self.drain = None
++
++    def finish(self) -> None:
++        try:
++            work, self.work = self.work, None
++            if work is not None:
++                work.release()
++        finally:
++            self.close_drain()
+ 
+ 
+ class ReviewIdleQueue:
+@@ -103,12 +117,26 @@ class ReviewIdleQueue:
+                 dispatch: Optional[Callable[[], None]] = None) -> None:
+         """Add (or replace — newest snapshot wins) a session's pending review, keeping the ORIGINAL
+         enqueue time on coalesce so a busy session cannot push its age-out forever."""
+-        with self._lock:
+-            existing = self._pending.get(session_key)
+-            enqueued_at = existing.enqueued_at if existing is not None else self._now()
+-            self._pending[session_key] = _PendingReview(
+-                agent, session_key, kwargs, enqueued_at, contextvars.copy_context(), dispatch)
+-        self._ensure_thread()
++        from hermes_cli.worker_drain_fence import admit
++
++        lease = admit('background_review.queued')
++        item = _PendingReview(agent, session_key, kwargs, self._now(),
++                              contextvars.copy_context(), dispatch, drain=lease)
++        try:
++            with self._lock:
++                existing = self._pending.get(session_key)
++                if existing is not None:
++                    item.enqueued_at = existing.enqueued_at
++                self._pending[session_key] = item
++                if existing is not None:
++                    existing.close_drain()  # successor already owns independent custody
++            self._ensure_thread()
++        except BaseException:
++            with self._lock:
++                if self._pending.get(session_key) is item:
++                    del self._pending[session_key]
++                    item.close_drain()
++            raise
+         self._wake.set()
+         logger.info("Background review deferred (session=%s, queued=%d)", session_key[-12:], len(self._pending))
+ 
+@@ -123,6 +151,7 @@ class ReviewIdleQueue:
+             item = self._pending.get(session_key)
+             if item is not None and item.dispatch is dispatch:
+                 del self._pending[session_key]
++                item.close_drain()
+ 
+     def _ensure_thread(self) -> None:
+         with self._lock:
+@@ -165,13 +194,14 @@ class ReviewIdleQueue:
+                 if not self._pending:
+                     return None
+                 candidate = min(self._pending.values(), key=lambda p: p.enqueued_at)
+-            item = self._pending.pop(candidate.session_key, None)
++            item = self._pending.get(candidate.session_key)
+             if item is not None:
+                 # Reserve in the same critical section as the pop: a selected item is never untracked, while
+                 # an empty/not-yet-idle poll (returned None above) reserves nothing.
+                 from agent import local_work_agent
+                 item.work = item.context.run(
+                     local_work_agent.reserve, "background_review", "agent.review_idle_queue._dispatch")
++                del self._pending[candidate.session_key]
+             return item
+ 
+     def _run(self) -> None:
+@@ -191,13 +221,21 @@ class ReviewIdleQueue:
+             except Exception:
+                 logger.warning("Deferred review dispatch failed", exc_info=True)
+             finally:
+-                if item is not None and item.work is not None:
+-                    # After _spawn_background_review_now reserved its own token (or failed).
+-                    item.work.release()
++                if item is not None:
++                    item.finish()  # also covers failure to enter the saved context
+             if item is None:
+                 time.sleep(_POLL_INTERVAL_S)
+ 
+     def _dispatch(self, item: _PendingReview) -> None:
++        from hermes_cli.worker_drain_fence import lease_scope
++
++        try:
++            with lease_scope(item.drain):
++                self._dispatch_held(item)
++        finally:
++            item.finish()
++
++    def _dispatch_held(self, item: _PendingReview) -> None:
+         if item.dispatch is not None:
+             item.dispatch()
+             return
+diff --git a/gateway/run.py b/gateway/run.py
+index 0f6869e0fa..75614e2ce3 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4163,19 +4163,28 @@ def _run_planned_stop_watcher(
+ def _housekeeping_chore(label: str, fn, *args, **kwargs) -> None:
+     """Run one housekeeping chore; failures log at debug (a persistent failure such as a broken
+     import after a partial update would otherwise warn every tick forever) and never stop the loop."""
++    from hermes_cli.worker_drain_fence import admit, lease_scope
++
++    lease = None
+     try:
+-        fn(*args, **kwargs)
++        lease = admit('gateway.housekeeping')
++        with lease_scope(lease):
++            fn(*args, **kwargs)
+     except Exception as exc:
+         logger.debug("%s error: %s", label, exc)
++    finally:
++        if lease is not None:
++            lease.close()
+ 
+ 
+ def _housekeeping_channel_directory(adapters, loop) -> None:
+     from gateway.channel_directory import build_channel_directory
++    from gateway.run_drain_work import schedule_chore
+     if loop is not None:
+         # build_channel_directory is async (Slack web calls) and this is a background thread:
+         # schedule onto the gateway loop and wait briefly so refresh failures still log.
+-        fut = safe_schedule_threadsafe(
+-            build_channel_directory(adapters), loop, logger=logger,
++        fut = schedule_chore(
++            lambda: build_channel_directory(adapters), loop, logger=logger,
+             log_message="Channel directory refresh scheduling error")
+         if fut is not None:
+             fut.result(timeout=30)
+diff --git a/gateway/run_drain_work.py b/gateway/run_drain_work.py
+new file mode 100644
+index 0000000000..3d32669a7d
+--- /dev/null
++++ b/gateway/run_drain_work.py
+@@ -0,0 +1,43 @@
++"""Drain custody for gateway housekeeping work crossing a sync/async boundary."""
++from __future__ import annotations
++
++
++def schedule_chore(factory, loop, **kwargs):
++    """Retain independent custody until the scheduled coroutine really completes.
++
++    A concurrent Future's cancellation can precede asyncio cancellation cleanup.
++    Revoke daemon exemption before releasing in that case; no unleased survivor
++    can then be mistaken for idle. A caller's result(timeout=...) releases nothing.
++    The factory is called only inside the admitted coroutine, never at enqueue.
++    """
++    from agent.async_utils import safe_schedule_threadsafe
++    from hermes_cli.worker_drain_fence import admit, lease_scope
++
++    lease = admit('gateway.housekeeping.async')
++
++    async def run():
++        with lease_scope(lease):
++            return await factory()
++
++    coro = run()
++    try:
++        future = safe_schedule_threadsafe(coro, loop, **kwargs)
++    except BaseException:
++        coro.close()
++        if lease is not None:
++            lease.close()
++        raise
++    if future is None:
++        if lease is not None:
++            lease.close()
++        return None
++
++    def finished(done):
++        if done.cancelled():
++            from hermes_cli.worker_drain_capability import revoke
++            revoke('housekeeping async cancellation may still be cleaning up')
++        if lease is not None:
++            lease.close()
++
++    future.add_done_callback(finished)
++    return future
+diff --git a/tests/agent/test_review_queue_drain.py b/tests/agent/test_review_queue_drain.py
+new file mode 100644
+index 0000000000..52a7b20e74
+--- /dev/null
++++ b/tests/agent/test_review_queue_drain.py
+@@ -0,0 +1,164 @@
++"""Deferred snapshots own independent drain custody, not a copied turn fd."""
++from types import SimpleNamespace
++
++import pytest
++
++from agent import review_idle_queue as queue
++from hermes_cli import worker_drain_fence as fence
++
++
++@pytest.fixture
++def harness(monkeypatch):
++    events, leases = [], []
++
++    class Lease:
++        closed = False
++
++        def close(self):
++            assert not self.closed
++            self.closed = True
++            events.append(('close', self))
++
++    def admit(purpose):
++        lease = Lease()
++        leases.append(lease)
++        events.append(('admit', lease))
++        return lease
++
++    monkeypatch.setattr(fence, 'admit', admit)
++    q = queue.ReviewIdleQueue()
++    monkeypatch.setattr(q, '_ensure_thread', lambda: None)
++    q._update_held = lambda: False
++    q._now = lambda: 10000
++    q._server_idle = lambda: True
++    q._quiet_since = 0
++    return q, events, leases
++
++
++def test_queue_retains_lease_and_replacement_has_no_gap(harness):
++    q, events, leases = harness
++    first, second = lambda: None, lambda: None
++    q.enqueue(None, 's', {}, dispatch=first)
++    assert len(leases) == 1 and not leases[0].closed
++    q.enqueue(None, 's', {}, dispatch=second)
++    assert [e[0] for e in events] == ['admit', 'admit', 'close']
++    q.discard('s', first)
++    assert not leases[1].closed
++    q.discard('s', second)
++    assert leases[1].closed and q.pending_count() == 0
++
++
++def test_dispatch_uses_retained_authority_and_releases_after_failure(harness):
++    q, events, leases = harness
++
++    def dispatch():
++        assert fence._authority.get() is leases[0]
++        assert not leases[0].closed
++        events.append(('dispatch', None))
++        raise ValueError('dispatch failure')
++
++    q.enqueue(None, 's', {}, dispatch=dispatch)
++    item = q._pop_dispatchable()
++    assert item is not None and not leases[0].closed
++    try:
++        with pytest.raises(ValueError, match='dispatch failure'):
++            item.context.run(q._dispatch, item)
++        assert leases[0].closed
++        assert [e[0] for e in events] == ['admit', 'dispatch', 'close']
++    finally:
++        if item.work is not None:
++            item.work.release()
++
++
++def test_spawn_failure_removes_and_releases_queued_custody(harness, monkeypatch):
++    q, _, leases = harness
++
++    def fail():
++        raise RuntimeError('thread start failed')
++
++    monkeypatch.setattr(q, '_ensure_thread', fail)
++    with pytest.raises(RuntimeError, match='thread start failed'):
++        q.enqueue(None, 's', {})
++    assert q.pending_count() == 0
++    assert leases[0].closed
++
++
++def test_reservation_failure_preserves_queue_and_lease(harness, monkeypatch):
++    from agent import local_work_agent
++    q, _, leases = harness
++    q.enqueue(None, 's', {})
++
++    def fail(*args):
++        raise RuntimeError('reservation failed')
++
++    monkeypatch.setattr(local_work_agent, 'reserve', fail)
++    with pytest.raises(RuntimeError, match='reservation failed'):
++        q._pop_dispatchable()
++    assert q.pending_count() == 1
++    assert not leases[0].closed
++    q.discard('s', None)
++    assert leases[0].closed
++
++
++def test_disabled_review_releases_without_spawn(harness, monkeypatch):
++    q, _, leases = harness
++    agent = SimpleNamespace(_spawn_background_review_now=lambda **kw: pytest.fail('disabled spawn'))
++    q.enqueue(agent, 's', {})
++    monkeypatch.setattr(q, '_still_enabled', lambda item: False)
++    q._dispatch(q._pending.pop('s'))
++    assert leases[0].closed
++
++
++def test_dispatch_cleanup_keeps_lease_even_when_reservation_cleanup_raises(harness):
++    q, events, leases = harness
++    q.enqueue(None, 's', {}, dispatch=lambda: None)
++    item = q._pending.pop('s')
++
++    def release():
++        assert not leases[0].closed
++        events.append(('cleanup', None))
++        raise ValueError('cleanup failure')
++
++    item.work = SimpleNamespace(release=release)
++    with pytest.raises(ValueError, match='cleanup failure'):
++        q._dispatch(item)
++    assert leases[0].closed
++    assert [e[0] for e in events] == ['admit', 'cleanup', 'close']
++    item.finish()  # outer dispatcher cleanup is idempotent
++
++
++def test_real_queued_lease_survives_turn_close_and_admits_child_during_drain(tmp_path, monkeypatch):
++    import os
++
++    ident = fence.Identity('i-0123456789abcdef0', fence.read_boot_id(), 'queue-proof')
++    fence.install_state(tmp_path, ident)
++    monkeypatch.setattr(fence, 'load_activation', lambda *a: {'uid': os.getuid()})
++    monkeypatch.setattr(fence, '_activation_root', lambda act: tmp_path)
++    monkeypatch.setattr(fence, 'current_identity', lambda *a, **k: ident)
++    q = queue.ReviewIdleQueue()
++    monkeypatch.setattr(q, '_ensure_thread', lambda: None)
++    children = []
++
++    def dispatch():
++        children.append(fence.admit('retained.child'))
++
++    parent = fence.admit('turn')
++    with fence.lease_scope(parent):
++        q.enqueue(None, 's', {}, dispatch=dispatch)
++    parent.close()
++    assert fence.busy_leases(tmp_path) == 1
++    latch = fence.read_latch(tmp_path, ident)
++    latch['phase'] = 'draining'
++    fence._write_atomic(tmp_path / 'core-update' / fence.LATCH_FILE, latch)
++    item = q._pending.pop('s')
++    try:
++        item.context.run(q._dispatch, item)
++        assert len(children) == 1
++        assert fence.busy_leases(tmp_path) == 1  # child survives queue release
++        with pytest.raises(fence.DrainRefused):
++            fence.admit('unrelated')
++    finally:
++        item.close_drain()
++        for child in children:
++            child.close()
++    assert fence.busy_leases(tmp_path) == 0
+diff --git a/tests/hermes_cli/test_worker_drain_housekeeping.py b/tests/hermes_cli/test_worker_drain_housekeeping.py
+new file mode 100644
+index 0000000000..300786881d
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_housekeeping.py
+@@ -0,0 +1,120 @@
++"""Individual housekeeping passes and async completion retain drain custody."""
++from concurrent.futures import Future, TimeoutError
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import worker_drain_fence as fence
++
++
++@pytest.fixture
++def custody(monkeypatch):
++    events = []
++    lease = SimpleNamespace(closed=False)
++
++    def close():
++        assert not lease.closed
++        lease.closed = True
++        events.append('close')
++
++    lease.close = close
++    monkeypatch.setattr(fence, 'admit', lambda purpose: (events.append('admit') or lease))
++    return lease, events
++
++
++def test_housekeeping_holds_through_cleanup(custody):
++    from gateway.run import _housekeeping_chore
++    lease, events = custody
++
++    def chore():
++        assert not lease.closed and fence._authority.get() is lease
++        events.append('chore')
++        raise ValueError('logged failure')
++
++    _housekeeping_chore('fixture', chore)
++    assert events == ['admit', 'chore', 'close']
++
++
++def test_housekeeping_does_not_call_when_admission_refused(monkeypatch):
++    from gateway.run import _housekeeping_chore
++
++    def refuse(purpose):
++        raise fence.DrainRefused('draining')
++
++    monkeypatch.setattr(fence, 'admit', refuse)
++    _housekeeping_chore('fixture', lambda: pytest.fail('ran during drain'))
++
++
++@pytest.mark.parametrize('cancel', [False, True])
++def test_async_timeout_retains_until_completion_or_revokes_before_cancel_close(custody, monkeypatch, cancel):
++    from hermes_cli import worker_drain_capability as capability
++    from agent import async_utils
++    from gateway.run_drain_work import schedule_chore
++    lease, events = custody
++    future = Future()
++    coroutines = []
++
++    def schedule(coro, loop, **kwargs):
++        coroutines.append(coro)
++        return future
++
++    monkeypatch.setattr(async_utils, 'safe_schedule_threadsafe', schedule)
++    monkeypatch.setattr(capability, 'revoke', lambda reason: events.append('revoke'))
++
++    async def work():
++        assert fence._authority.get() is lease
++
++    returned = schedule_chore(work, object())
++    assert returned is future
++    with pytest.raises(TimeoutError):
++        future.result(timeout=0)
++    assert not lease.closed
++    if cancel:
++        future.cancel()
++        assert events == ['admit', 'revoke', 'close']
++    else:
++        future.set_result(None)
++        assert events == ['admit', 'close']
++    coroutines[0].close()
++
++
++def test_scheduled_coroutine_enters_lease_authority(custody, monkeypatch):
++    import asyncio
++    from agent import async_utils
++    from gateway.run_drain_work import schedule_chore
++    lease, events = custody
++    future = Future()
++    coroutines = []
++
++    def schedule(coro, loop, **kwargs):
++        coroutines.append(coro)
++        return future
++
++    monkeypatch.setattr(async_utils, 'safe_schedule_threadsafe', schedule)
++
++    async def work():
++        assert fence._authority.get() is lease and not lease.closed
++        events.append('work')
++        await asyncio.sleep(0)
++        assert not lease.closed
++        return 'complete'
++
++    schedule_chore(work, object())
++    result = asyncio.run(coroutines[0])
++    assert result == 'complete' and not lease.closed
++    future.set_result(result)
++    assert events == ['admit', 'work', 'close']
++    assert fence._authority.get() is None
++
++
++def test_schedule_failure_releases_without_creating_inner_coroutine(custody, monkeypatch):
++    from agent import async_utils
++    from gateway.run_drain_work import schedule_chore
++    lease, events = custody
++
++    def reject(coro, *args, **kwargs):
++        coro.close()
++
++    monkeypatch.setattr(async_utils, 'safe_schedule_threadsafe', reject)
++    assert schedule_chore(lambda: pytest.fail('must not start'), None) is None
++    assert events == ['admit', 'close'] and lease.closed
+-- 
+2.43.0
+

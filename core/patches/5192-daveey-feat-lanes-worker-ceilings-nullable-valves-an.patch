@@ -1,0 +1,424 @@
+From 049a56c209f1e4c39bf4d72c5847f9ff453aebbb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 12:44:45 +0000
+Subject: [PATCH] [daveey] feat(lanes): worker ceilings, nullable valves and
+ dependency blockers
+
+Persist max_workers alongside lane configuration, filter ready/review candidates
+and recheck the observed running count at the local claim CAS. Zero stops new
+claims; null leaves existing behavior unchanged. Existing fleet census is used;
+this is not an atomic cross-gateway reservation (documented explicitly).
+
+Distinguish omitted daily limits from explicit null; expose repeatable --unset
+and --max-workers in lanes set. Report all open parent IDs and their PRs on dep
+waits, preserving first blocker shorthand and avoiding own-card PR inference.
+
+Proof: initial regression RED 5 failures; GREEN 16 consumer/docs files, 289 tests
+passed, zero failed. Claim-ceiling removal mutant killed by six regressions.
+Full scripts/check --base origin/main passed. Plugin compatibility lives in the
+companion hermes-mods change; no production configuration changed.
+---
+ hermes_cli/kanban_admission.py              |   3 +
+ hermes_cli/kanban_db_dispatch_queries.py    |   3 +-
+ hermes_cli/kanban_lane_workers.py           |  42 ++++++++
+ hermes_cli/kanban_lanes.py                  |   8 +-
+ hermes_cli/kanban_lanes_cli.py              |  25 +++--
+ hermes_cli/kanban_lanes_flow.py             |  18 +++-
+ hermes_cli/kanban_parser.py                 |   6 +-
+ tests/hermes_cli/test_kanban_lane_valves.py | 112 ++++++++++++++++++++
+ tests/hermes_cli/test_kanban_lanes_flow.py  |   2 +-
+ website/docs/user-guide/features/kanban.md  |   7 ++
+ 10 files changed, 213 insertions(+), 13 deletions(-)
+ create mode 100644 hermes_cli/kanban_lane_workers.py
+ create mode 100644 tests/hermes_cli/test_kanban_lane_valves.py
+
+diff --git a/hermes_cli/kanban_admission.py b/hermes_cli/kanban_admission.py
+index dd1fd9cf12..55fffd98bb 100644
+--- a/hermes_cli/kanban_admission.py
++++ b/hermes_cli/kanban_admission.py
+@@ -268,6 +268,9 @@ def claim_and_open_run(conn, task_id, source_status, lock, expires, now, *, even
+     # [daveey] Review F5: this claim's own grant may already have been echoed ``running`` (own holder, its run uid,
+     # no lock) before the txn; ``gate.echo`` is that proof, re-checked here in the same txn, so the CAS adopts the
+     # row instead of losing to it. Any other ``running`` row still loses.
++    from hermes_cli.kanban_lane_workers import at_capacity
++    if at_capacity(conn, task_id):
++        return None
+     echo = getattr(gate, "echo", None)
+     if echo is not None:
+         from hermes_cli.kanban_grant_echo import match_rows
+diff --git a/hermes_cli/kanban_db_dispatch_queries.py b/hermes_cli/kanban_db_dispatch_queries.py
+index 55623d7892..7bf8d833a0 100644
+--- a/hermes_cli/kanban_db_dispatch_queries.py
++++ b/hermes_cli/kanban_db_dispatch_queries.py
+@@ -41,7 +41,8 @@ def lane_rows(conn: sqlite3.Connection, status: str, *, marked_first: bool = Fal
+     rows = drop_held(conn, rows)
+     from hermes_cli.kanban_dispatch_priority import order_with_remote_waiters
+     from hermes_cli.kanban_lanes import drop_paused
+-    rows = order_with_remote_waiters(conn, drop_paused(conn, rows))
++    from hermes_cli.kanban_lane_workers import drop_full
++    rows = order_with_remote_waiters(conn, drop_full(conn, drop_paused(conn, rows)))
+     if marked_first:  # replica donation reorders within a class, never across the pool partition
+         rows.sort(key=lambda row: row["admission_class"] not in ("capacity", "urgent"))
+     return rows
+diff --git a/hermes_cli/kanban_lane_workers.py b/hermes_cli/kanban_lane_workers.py
+new file mode 100644
+index 0000000000..5eb52c89ff
+--- /dev/null
++++ b/hermes_cli/kanban_lane_workers.py
+@@ -0,0 +1,42 @@
++"""Hard lane worker ceilings, independent of soft shares and priority exceptions.
++
++Use the existing fleet/local running census. The final check is inside the local
++claim transaction, so serial claims cannot spend one local slot twice. Replica
++observations are not a distributed reservation across gateways.
++"""
++from hermes_cli import kanban_lanes as lanes
++
++
++def _policy():
++    pol = lanes.safe_policy()
++    if pol is None or pol.shadow or not any(s.max_workers is not None for s in pol.lanes.values()):
++        return None
++    return pol
++
++
++def at_capacity(conn, task_id):
++    """Recheck immediately before ready/review CAS; an echoed own claim counts only once."""
++    pol = _policy()
++    if pol is None:
++        return False
++    row = conn.execute("SELECT tenant, status FROM tasks WHERE id=?", (task_id,)).fetchone()
++    if row is None:
++        return False
++    name = pol.lane_of(row["tenant"])
++    cap = pol.lanes[name].max_workers
++    if cap is None:
++        return False
++    count = lanes._running(conn, pol)[name] - int(row["status"] == "running")
++    return count >= cap
++
++
++def drop_full(conn, rows):
++    """Filter full lanes without consuming slots for candidates not actually claimed."""
++    pol = _policy()
++    if pol is None or not rows:
++        return rows
++    counts = lanes._running(conn, pol)
++    names, _alarms = lanes._candidate_lanes(conn, pol, [row["id"] for row in rows])
++    full = {name for name, spec in pol.lanes.items()
++            if spec.max_workers is not None and counts[name] >= spec.max_workers}
++    return [row for row in rows if names.get(row["id"], pol.default) not in full]
+diff --git a/hermes_cli/kanban_lanes.py b/hermes_cli/kanban_lanes.py
+index 8c30409e6a..a4666c1ece 100644
+--- a/hermes_cli/kanban_lanes.py
++++ b/hermes_cli/kanban_lanes.py
+@@ -80,6 +80,7 @@ class Lane:
+     admit_per_day: Optional[int] = None
+     cards_per_day: Optional[int] = None
+     usd_per_day: Optional[float] = None
++    max_workers: Optional[int] = None
+     paused: bool = False
+     describe: str = ""
+     creators: frozenset = frozenset()
+@@ -140,7 +141,7 @@ def _lane(name, raw) -> Lane:
+     raw = {} if raw is None else raw
+     if not isinstance(raw, dict):
+         raise ValueError(f"lane {name} must be a mapping")
+-    known = {"share", "gated", "admit_per_day", "cards_per_day", "usd_per_day", "paused", "describe",
++    known = {"share", "gated", "admit_per_day", "cards_per_day", "usd_per_day", "max_workers", "paused", "describe",
+              "match", "gate_exempt", "never_admit"}
+     if unknown := sorted(set(raw) - known):
+         raise ValueError(f"lane {name}: unknown key(s) {', '.join(map(str, unknown))}")
+@@ -157,12 +158,15 @@ def _lane(name, raw) -> Lane:
+     if usd_per_day is not None and (type(usd_per_day) not in (int, float) or not math.isfinite(usd_per_day)
+                                     or usd_per_day < 0):
+         raise ValueError(f"lane {name}: usd_per_day must be a finite nonnegative number")
++    max_workers = raw.get("max_workers")
++    if max_workers is not None and (type(max_workers) is not int or max_workers < 0):
++        raise ValueError(f"lane {name}: max_workers must be a nonnegative integer")
+     match = raw.get("match") or {}
+     if not isinstance(match, dict) or set(match) - {"creators", "key_prefixes", "repos", "self_work"}:
+         raise ValueError(f"lane {name}: match takes creators, key_prefixes, repos, self_work")
+     return Lane(
+         name=name, share=float(share), gated=raw.get("gated") is True, admit_per_day=per_day,
+-        cards_per_day=cards_per_day,
++        cards_per_day=cards_per_day, max_workers=max_workers,
+         usd_per_day=None if usd_per_day is None else float(usd_per_day),
+         paused=raw.get("paused") is True, describe=str(raw.get("describe") or ""),
+         creators=frozenset(_strings(match.get("creators"), "match.creators")),
+diff --git a/hermes_cli/kanban_lanes_cli.py b/hermes_cli/kanban_lanes_cli.py
+index af5532bf32..e6ba745c1e 100644
+--- a/hermes_cli/kanban_lanes_cli.py
++++ b/hermes_cli/kanban_lanes_cli.py
+@@ -145,7 +145,11 @@ def _pin(args) -> int:
+     return 0
+ 
+ 
+-def set_lane(lane: str, *, share=None, admit_per_day=None, cards_per_day=None, usd_per_day=None,
++UNSET = object()  # omitted is distinct from explicit null (clear a nullable limit)
++
++
++def set_lane(lane: str, *, share=None, admit_per_day=None, cards_per_day=UNSET, usd_per_day=UNSET,
++             max_workers=UNSET,
+              paused=None) -> None:
+     """Change one lane's share, daily admit/cards/spend budget or pause state; raises ValueError.
+ 
+@@ -168,16 +172,19 @@ def set_lane(lane: str, *, share=None, admit_per_day=None, cards_per_day=None, u
+         raise ValueError("share must be a finite nonnegative number")
+     if admit_per_day is not None and (type(admit_per_day) is not int or admit_per_day < 0):
+         raise ValueError("admit_per_day must be a nonnegative integer")
+-    if cards_per_day is not None and (type(cards_per_day) is not int or cards_per_day < 0):
++    if cards_per_day is not UNSET and cards_per_day is not None and (type(cards_per_day) is not int or cards_per_day < 0):
+         raise ValueError("cards_per_day must be a nonnegative integer")
+-    if usd_per_day is not None and (type(usd_per_day) not in (int, float) or not math.isfinite(usd_per_day)
++    if usd_per_day is not UNSET and usd_per_day is not None and (type(usd_per_day) not in (int, float) or not math.isfinite(usd_per_day)
+                                     or usd_per_day < 0):
+         raise ValueError("usd_per_day must be a finite nonnegative number")
+     if paused is not None and type(paused) is not bool:
+         raise ValueError("paused must be true or false")
+-    changes = {"share": share, "admit_per_day": admit_per_day, "cards_per_day": cards_per_day,
+-               "usd_per_day": usd_per_day, "paused": paused}
++    if max_workers is not UNSET and max_workers is not None and (type(max_workers) is not int or max_workers < 0):
++        raise ValueError("max_workers must be a nonnegative integer")
++    changes = {"share": share, "admit_per_day": admit_per_day, "paused": paused}
+     changes = {key: value for key, value in changes.items() if value is not None}
++    changes.update({key: value for key, value in {"cards_per_day": cards_per_day,
++                    "usd_per_day": usd_per_day, "max_workers": max_workers}.items() if value is not UNSET})
+     if not changes:
+         raise ValueError("nothing to set: give a share, a daily admit/cards/spend budget, pause or resume")
+     path = Path(get_default_hermes_root()) / "config.yaml"
+@@ -191,9 +198,13 @@ def set_lane(lane: str, *, share=None, admit_per_day=None, cards_per_day=None, u
+ 
+ 
+ def _set(args) -> int:
++    limits = {key: getattr(args, key, UNSET) for key in ("cards_per_day", "usd_per_day", "max_workers")}
++    for key in getattr(args, "unset", None) or []:
++        if limits[key] is not UNSET:
++            raise ValueError(f"cannot set and unset {key} together")
++        limits[key] = None
+     set_lane(args.lane, share=args.share, admit_per_day=args.admit_per_day,
+-             cards_per_day=getattr(args, "cards_per_day", None),
+-             usd_per_day=getattr(args, "usd_per_day", None),
++             **limits,
+              paused=True if args.pause else False if args.resume else None)
+     return 0
+ 
+diff --git a/hermes_cli/kanban_lanes_flow.py b/hermes_cli/kanban_lanes_flow.py
+index fc42883f9b..acfb1be77b 100644
+--- a/hermes_cli/kanban_lanes_flow.py
++++ b/hermes_cli/kanban_lanes_flow.py
+@@ -234,6 +234,18 @@ def _parents_open(conn, task_id: str) -> bool:
+     return bool(kb.unsatisfied_parents(conn, task_id))
+ 
+ 
++def _blockers(conn, task_id: str) -> list:
++    from hermes_cli import kanban_db as kb
++
++    out = []
++    for parent_id, _status in kb.unsatisfied_parents(conn, task_id):
++        parent = conn.execute("SELECT * FROM tasks WHERE id=?", (parent_id,)).fetchone()
++        events = _events(conn, parent_id) if parent is not None else []
++        pr = _pr_snapshot(parent, events, _awaiting(parent, events)) if parent is not None else None
++        out.append({"id": parent_id, "pr": (pr or {}).get("url")})
++    return out
++
++
+ def _awaiting(task, events=()) -> Optional[dict]:
+     if task["status"] != "scheduled":
+         return None
+@@ -305,6 +317,9 @@ def snapshot(conn, *, window: str = "6h", now: Optional[float] = None, pol=None)
+         cards.append({"id": card["id"], "title": card["title"] or "",
+                       "lane": pol.lane_of(card["tenant"]), "step": step, "reason": reason,
+                       "source": source, "age_h": card["age_h"], "pr": pr})
++        if reason == "dep":
++            blockers = _blockers(conn, card["id"])
++            cards[-1].update(blockers=blockers, blocker=blockers[0] if blockers else None)
+     out_lanes = {}
+     for name, spec in pol.lanes.items():
+         row = usage[name]
+@@ -312,7 +327,8 @@ def snapshot(conn, *, window: str = "6h", now: Optional[float] = None, pol=None)
+             "done": row["done"],
+             "run_hours": round(row["run_seconds"] / 3600, 1),
+             "cost_usd": row["cost_usd"],
+-            "limits": {"cards_per_day": spec.cards_per_day, "usd_per_day": spec.usd_per_day},
++            "limits": {"cards_per_day": spec.cards_per_day, "usd_per_day": spec.usd_per_day,
++                       "max_workers": spec.max_workers},
+             "usage": {"cards_today": lanes.cards_today(conn, name, now=now, pol=pol),
+                       "usd_today": lanes.spent_today(conn, pol, name, now=now)},
+         }
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index e1b6796b73..44d45ded4d 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -701,7 +701,11 @@ _SPECS = [
+         _cmd("pin", [_TASK_ID, _arg("--off", action="store_true", help="Remove the pin")],
+              help="Keep the planner from reprioritizing a card"),
+         _cmd("set", [_arg("lane"), _arg("--share", type=float), _arg("--admit-per-day", type=int),
+-                     _arg("--cards-per-day", type=int), _arg("--usd-per-day", type=float),
++                     _arg("--cards-per-day", type=int, default=argparse.SUPPRESS),
++                     _arg("--usd-per-day", type=float, default=argparse.SUPPRESS),
++                     _arg("--max-workers", type=int, default=argparse.SUPPRESS),
++                     _arg("--unset", action="append", choices=("cards_per_day", "usd_per_day", "max_workers"),
++                          help="Clear a limit (repeatable; unlimited)"),
+                      _arg("--pause", action="store_true"), _arg("--resume", action="store_true")],
+              help="Change a lane's share, daily admit/cards/spend limits or pause state"),
+         _cmd("apply", [_arg("file", help="JSON action list, or - for stdin"),
+diff --git a/tests/hermes_cli/test_kanban_lane_valves.py b/tests/hermes_cli/test_kanban_lane_valves.py
+new file mode 100644
+index 0000000000..cac15c4551
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_lane_valves.py
+@@ -0,0 +1,112 @@
++"""Lane valve contracts through persisted config, dispatch/claims and flow."""
++import copy
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_lanes as lanes
++from hermes_cli import kanban_lanes_cli as cli
++from hermes_cli import kanban_lanes_flow as flow
++from hermes_cli.kanban_db_dispatch_queries import lane_rows
++from tests.hermes_cli import test_kanban_lanes as base
++
++conn = base.conn
++configured = base.configured
++person = base.person
++
++
++@pytest.mark.parametrize("value", [-1, True, 1.5, "2"])
++def test_worker_limit_validation(value):
++    with pytest.raises(ValueError, match="max_workers"):
++        lanes.parse({"lanes": {"other": {"max_workers": value}}})
++
++
++def test_set_preserves_omitted_and_clears_explicit_null(conn, configured):
++    cli.set_lane("myapp", max_workers=2, cards_per_day=4, usd_per_day=8)
++    cli.set_lane("myapp", share=42)
++    spec = lanes.policy().lanes["myapp"]
++    assert (spec.max_workers, spec.cards_per_day, spec.usd_per_day) == (2, 4, 8)
++    cli.set_lane("myapp", max_workers=None, cards_per_day=None, usd_per_day=None)
++    spec = lanes.policy().lanes["myapp"]
++    assert (spec.max_workers, spec.cards_per_day, spec.usd_per_day) == (None, None, None)
++
++
++@pytest.mark.parametrize("review", [False, True])
++def test_cap_filters_and_atomically_rechecks_claim(conn, configured, review):
++    mapping = copy.deepcopy(base.LANES)
++    mapping["myapp"]["max_workers"] = 1
++    configured(mapping)
++    first = base._ready_in(conn, "myapp", "first")
++    second = base._ready_in(conn, "myapp", "second")
++    other = base._ready_in(conn, "other", "other")
++    status = "review" if review else "ready"
++    if review:
++        conn.execute("UPDATE tasks SET status='review' WHERE id IN (?, ?)", (first, second))
++        conn.commit()
++    claim = kb.claim_review_task if review else kb.claim_task
++    assert first in [row["id"] for row in lane_rows(conn, status)]
++    assert claim(conn, first) is not None
++    assert second not in [row["id"] for row in lane_rows(conn, status)]
++    assert claim(conn, second) is None
++    assert base._task(conn, second)["status"] == status
++    assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id=?", (second,)).fetchone()[0] == 0
++    assert kb.claim_task(conn, other) is not None
++    conn.execute("UPDATE tasks SET status='done', claim_lock=NULL WHERE id=?", (first,))
++    conn.commit()
++    assert claim(conn, second) is not None
++
++
++@pytest.mark.parametrize("shadow,limit,allowed", [(False, 0, False), (False, None, True), (True, 0, True)])
++def test_zero_unlimited_shadow_and_default_lane(conn, configured, shadow, limit, allowed):
++    mapping = copy.deepcopy(base.LANES)
++    mapping["other"]["max_workers"] = limit
++    configured(mapping, lane_shadow=shadow)
++    tid = base._ready_in(conn, "legacy-name", "unknown tenant")
++    assert (kb.claim_task(conn, tid) is not None) is allowed
++
++
++def test_cli_unset_and_omission(conn, configured):
++    from hermes_cli.kanban_parser import build_parser
++    import argparse
++    parser = build_parser(argparse.ArgumentParser().add_subparsers())
++    cli._set(parser.parse_args(["lanes", "set", "myapp", "--cards-per-day", "2", "--usd-per-day", "3", "--max-workers", "1"]))
++    cli._set(parser.parse_args(["lanes", "set", "myapp", "--share", "40"]))
++    assert lanes.policy().lanes["myapp"].cards_per_day == 2
++    cli._set(parser.parse_args(["lanes", "set", "myapp", "--unset", "cards_per_day", "--unset", "usd_per_day", "--unset", "max_workers"]))
++    spec = lanes.policy().lanes["myapp"]
++    assert (spec.cards_per_day, spec.usd_per_day, spec.max_workers) == (None, None, None)
++    with pytest.raises(ValueError, match="set and unset"):
++        cli._set(parser.parse_args(["lanes", "set", "myapp", "--max-workers", "1", "--unset", "max_workers"]))
++
++
++@pytest.mark.parametrize("marked", ["urgent", "capacity", "regular"])
++def test_zero_cap_has_no_priority_or_alarm_exception(conn, configured, marked):
++    mapping = copy.deepcopy(base.LANES)
++    mapping["myapp"]["max_workers"] = 0
++    configured(mapping)
++    tid = base._ready_in(conn, "myapp", "alarm")
++    conn.execute("UPDATE tasks SET admission_class=?, idempotency_key='alarm:example' WHERE id=?", (marked, tid))
++    conn.commit()
++    assert tid not in [row["id"] for row in lane_rows(conn, "ready")]
++    assert kb.claim_task(conn, tid) is None
++
++
++def test_flow_limits_and_all_open_blockers(conn, configured, monkeypatch):
++    from hermes_cli import kanban_lanes_flow_pr
++    monkeypatch.setattr(kanban_lanes_flow_pr.Reader, "prefetch", lambda *_: None)
++    cli.set_lane("myapp", max_workers=3)
++    parent = base._ready_in(conn, "myapp", "parent")
++    parent2 = base._ready_in(conn, "other", "parent2")
++    conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", ("https://github.com/example/repo/pull/42", parent))
++    conn.commit()
++    child = kb.create_task(conn, title="child", assignee="default", parents=[parent, parent2], tenant="myapp")
++    data = flow.snapshot(conn)
++    assert data["lanes"]["myapp"]["limits"]["max_workers"] == 3
++    card = next(c for c in data["cards"] if c["id"] == child)
++    assert card["reason"] == "dep"
++    assert {b["id"] for b in card["blockers"]} == {parent, parent2}
++    assert next(b["pr"] for b in card["blockers"] if b["id"] == parent) == "https://github.com/example/repo/pull/42"
++    conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
++    conn.commit()
++    card = next(c for c in flow.snapshot(conn)["cards"] if c["id"] == child)
++    assert card["blockers"] == [{"id": parent2, "pr": None}]
+diff --git a/tests/hermes_cli/test_kanban_lanes_flow.py b/tests/hermes_cli/test_kanban_lanes_flow.py
+index b9c8c29416..0bdbc3d7b4 100644
+--- a/tests/hermes_cli/test_kanban_lanes_flow.py
++++ b/tests/hermes_cli/test_kanban_lanes_flow.py
+@@ -148,7 +148,7 @@ def test_flow_json_shape_and_window(conn, configured, capsys):
+     assert card["source"]["kind"] in ("session", "automation", "user")
+     lane = data["lanes"]["myapp"]
+     assert set(lane) >= {"done", "run_hours", "cost_usd", "limits", "usage"}
+-    assert set(lane["limits"]) == {"cards_per_day", "usd_per_day"}
++    assert set(lane["limits"]) == {"cards_per_day", "usd_per_day", "max_workers"}
+     assert set(lane["usage"]) == {"cards_today", "usd_today"}
+     assert lane["limits"]["cards_per_day"] is None and lane["limits"]["usd_per_day"] is None
+ 
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index fadc2e1bae..3871c66fc8 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1622,6 +1622,7 @@ kanban:
+         admit_per_day: 50
+         cards_per_day: 50        # optional; new cards wait at the gate after this many admissions today
+         usd_per_day: 40          # optional; new cards wait at the gate after this much run spend today
++        max_workers: 4          # optional; ceiling on observed running workers (ready and review claims)
+         match: {creators: [self-heal], key_prefixes: ["ci-main-watch:"], repos: [hermes-agent], self_work: true}
+         gate_exempt: ['independent review']
+         never_admit: ['lifecycle guard']
+@@ -1635,6 +1636,12 @@ kanban:
+ - **Priority cap.** `agent_priority_cap` bounds the stored priority of a card the user did not create, at creation. Later edits are not capped, and the planner may set 0 to 1000.
+ - **Limits.** Worker nodes order foreign pickup with their own board copy, so lane order is exact only on the board that holds the cards; `paused` applies where `lanes` is configured. A worker that parks on a held follow-up card waits until that card is admitted.
+ 
++`max_workers` is an optional nonnegative integer ceiling on observed running cards, including ready and review claims. Unset/null is unlimited, zero stops new claims, and lowering it never kills an existing worker. Marked/alarm priority does not bypass it. Dispatch filters full lanes and rechecks in the local claim transaction using the existing fleet-running census. This is not a distributed reservation: concurrent claims on different gateways can temporarily overshoot a stale replica count; lanes configuration applies on gateways where installed. Shadow mode does not enforce it.
++
++Use `hermes kanban lanes set hermes --max-workers 4` to set it, or `--unset max_workers` to clear it. Daily caps can likewise be cleared with `--unset cards_per_day --unset usd_per_day`; setting and unsetting the same key together is rejected. Programmatic `set_lane` distinguishes omitted arguments (preserve) from explicit `None` (clear).
++
++Flow dependency waits include `blockers: [{id, pr}]` for all unsatisfied direct parents, plus `blocker` for the first one. A missing parent's PR is null; a card's own PR is never substituted. The field is additive so older clients can ignore it.
++
+ `usd_per_day` counts only `usage.cost_usd` reported on worker-result receipts; runs reporting tokens but no cost add zero, not an inferred price. Daily caps reserve admissions, not running slots: lowering a limit does not interrupt admitted work. Review/landing titles in `gate_exempt` under an admitted creator remain exempt. Daily-limit-only waits in ungated lanes are reconsidered by dispatcher readiness maintenance (including after local midnight); ordinary gated lanes still require admission, and agent/planner admission checks both daily limits. A person's explicit admission remains an override and counts toward `cards_per_day` even when outside the planner budget.
+ 
+ Flow uses the latest scheduled event's `awaiting` record, current review/rework events, and bounded read-only GitHub PR observations (a 30-second wall-clock budget per report, concurrent reads cached per unique PR). Flow observes native non-author GitHub approvals or commit-bound COMMENT reviews starting with `VERDICT: APPROVE` (optionally bold, case-insensitive), the fleet's shared-login review format. The latest explicit verdict supersedes older verdicts from that login; bots, old-head approvals and ordinary prose do not approve. This display signal is not ship authorization: independent reviewer-session custody is still verified by ship. The COMMENT verdict must start the first nonempty line; other approval-like prose is deliberately not interpreted. Known failing required checks, like pending checks, report `ci`. Missing checks or exhausted lookup budget never establish green; absent evidence stays `landing_unclassified`. A merged PR stays in deploy until there is explicit live readback. Deployment systems can persist `metadata.flow_pr: {url: <PR URL>, merged: true, deployed: true, verified: false}` on a task event to report live verification (`test`); this is observation only, not authority to merge or declare success. All three flags are strict booleans and the URL must match the card's PR. The command does not infer installation from merge time.
+-- 
+2.43.0
+

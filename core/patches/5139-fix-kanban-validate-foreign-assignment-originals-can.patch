@@ -1,0 +1,469 @@
+From 464e6f01ca52f6bc75b9e8bac6bda35c75a5b518 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 02:58:22 +0000
+Subject: [PATCH] fix(kanban): validate foreign assignment originals
+ canonically [daveey]
+
+Assignment repair completion assumed its original task was in the executor's
+local database. Portable repair execution can have split custody, causing a
+valid repair to retry completion indefinitely.
+
+Read a missing original and complete blocked history from the enrolled Board's
+atomic execution-evidence endpoint before taking the writer lock. Bind the
+short-lived observation to the repair key, refuse changed custody, and retain
+capability/model and execution-authority validation. Never consult stale replica
+rows or mutate the original. Scratch wire rows need no host-local path; other
+workspace kinds refuse absent path evidence.
+
+Proof: new foreign-original regression RED on base (5 failing, 11 passing),
+GREEN with fix; eight affected suites passed 224 tests before additional race
+controls; final custody/routing/model suites pass. scripts/check --base
+origin/main passes. Read-only live canonical contract probe validates the exact
+original assignment and one matching block without printing payloads.
+
+Preliminary independent review found a local-materialization race; fixed by
+refusing changed custody, with fresh/expired observation regressions. Final
+exact-head review and required CI remain required before landing.
+---
+ hermes_cli/kanban_assignment_original.py      | 135 ++++++++++++
+ hermes_cli/kanban_assignment_routing.py       |  23 +-
+ hermes_cli/kanban_db.py                       |  10 +-
+ .../test_kanban_assignment_custody.py         | 200 ++++++++++++++++++
+ 4 files changed, 356 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/kanban_assignment_original.py
+ create mode 100644 tests/hermes_cli/test_kanban_assignment_custody.py
+
+diff --git a/hermes_cli/kanban_assignment_original.py b/hermes_cli/kanban_assignment_original.py
+new file mode 100644
+index 0000000000..f97a1ab1a1
+--- /dev/null
++++ b/hermes_cli/kanban_assignment_original.py
+@@ -0,0 +1,135 @@
++"""Fresh canonical evidence for an assignment repair whose original has foreign custody.
++
++The Board's atomic execution inventory supplies the assignment AND its blocked
++history. Replicas are not authority. Fetch before the writer lock; bind the
++short-lived observation to the exact repair key and recheck local state inside
++completion. This reads only: it never adopts, edits or releases the original.
++"""
++from __future__ import annotations
++
++import json
++import time
++from dataclasses import dataclass
++from types import SimpleNamespace
++from urllib.parse import quote
++
++from hermes_cli.kanban_assignment_routing import AssignmentRoutingError, _SUPERVISOR_PREFIX
++
++_BUDGET_S = 10
++_FIELDS = ('assignee', 'requires', 'workspace_kind', 'skills',
++           'model_override', 'provider_override')
++
++
++def repair_key(conn, task_id):
++    row = conn.execute('SELECT idempotency_key FROM tasks WHERE id=?', (task_id,)).fetchone()
++    key = row[0] if row else None
++    return key if isinstance(key, str) and key.startswith(_SUPERVISOR_PREFIX) else None
++
++
++@dataclass(frozen=True)
++class OriginalObservation:
++    repair: str
++    key: str
++    expires: float
++    original: SimpleNamespace
++    blocked_payloads: tuple[str, ...]
++
++
++def _invalid():
++    return AssignmentRoutingError('Assignment repair original has no complete canonical validation evidence')
++
++
++def _list(value):
++    if isinstance(value, str):
++        value = json.loads(value)
++    if value is not None and (not isinstance(value, list)
++                              or any(not isinstance(v, str) or not v for v in value)):
++        raise _invalid()
++    return value
++
++
++def _inventory(data, board, original, repair):
++    if (not isinstance(data, dict) or type(data.get('version')) is not int or data['version'] != 1
++            or data.get('board') != board or data.get('task_id') != original
++            or data.get('events_complete') is not True or data.get('runs_complete') is not True
++            or not isinstance(data.get('events'), list) or not isinstance(data.get('runs'), list)):
++        raise _invalid()
++    task = data.get('task')
++    if (not isinstance(task, dict) or task.get('id') != original or task.get('uid') != original
++            or task.get('deleted_at') is not None or any(k not in task for k in _FIELDS)
++            or not isinstance(task['assignee'], str) or not task['assignee'].strip()
++            or task['workspace_kind'] not in ('scratch', 'dir', 'worktree')):
++        raise _invalid()
++    fields = {k: task[k] for k in _FIELDS}
++    # Workspace paths are host-local and omitted by the Board wire projection.
++    # Scratch needs none; foreign dir/worktree validation must still fail closed.
++    fields['workspace_path'] = task.get('workspace_path')
++    for field in ('workspace_path', 'model_override', 'provider_override'):
++        if fields[field] is not None and not isinstance(fields[field], str):
++            raise _invalid()
++    fields['requires'], fields['skills'] = _list(fields['requires']), _list(fields['skills'])
++    if fields['workspace_kind'] != 'scratch' and not fields['workspace_path']:
++        raise _invalid()
++    payloads, seen, orders = [], set(), set()
++    for event in data['events']:
++        if (not isinstance(event, dict) or not isinstance(event.get('uid'), str) or not event['uid']
++                or event['uid'] in seen or event.get('task_id') != original
++                or event.get('deleted_at') is not None or type(event.get('ord')) is not int
++                or event['ord'] in orders or not isinstance(event.get('kind'), str)):
++            raise _invalid()
++        seen.add(event['uid'])
++        orders.add(event['ord'])
++        if event['kind'] == 'blocked':
++            raw = event.get('payload')
++            value = json.loads(raw) if isinstance(raw, str) else None
++            if not isinstance(value, dict):
++                raise _invalid()
++            if value.get('supervisor_task_id') == repair:
++                if not isinstance(value.get('reason'), str):
++                    raise _invalid()
++                payloads.append((event['ord'], raw))
++    # A complete history with no matching repair is not authority to release it.
++    if not payloads:
++        raise _invalid()
++    return SimpleNamespace(id=original, **fields), tuple(raw for _, raw in sorted(payloads, reverse=True))
++
++
++def prepare(conn, task_id):
++    """One bounded authenticated read, only for missing local originals on synced boards."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli.kanban_db_connect import _main_db_file
++
++    key = repair_key(conn, task_id)
++    if key is None or kb.get_task(conn, key.removeprefix(_SUPERVISOR_PREFIX)) is not None:
++        return None
++    if conn.in_transaction:
++        raise _invalid()  # network under a writer transaction is never permitted
++    path = _main_db_file(conn)
++    config = sync.sync_config()
++    if not path or not config.get('enabled') or not sync.board_selected(path, config):
++        raise _invalid()
++    board = sync.board_slug_for_path(path)
++    original = key.removeprefix(_SUPERVISOR_PREFIX)
++    expires = time.monotonic() + _BUDGET_S
++    hub = None
++    try:
++        hub = client.Hub(client.load_identity(), timeout=_BUDGET_S, deadline=expires)
++        data = hub._call('GET', f'/v2/boards/{quote(board, safe="")}/tasks/'
++                         f'{quote(original, safe="")}/execution-evidence')
++        task, payloads = _inventory(data, board, original, task_id)
++        return OriginalObservation(task_id, key, expires, task, payloads)
++    except (OSError, ValueError, TypeError, KeyError, client.HubError, client.Resync) as exc:
++        raise _invalid() from exc
++    finally:
++        if hub is not None:
++            hub.close()
++
++
++def resolve(conn, task_id, key, observation):
++    """Transaction-local key check and bounded lifetime; never accept an old cached replica."""
++    if (not isinstance(observation, OriginalObservation) or observation.repair != task_id
++            or observation.key != key or time.monotonic() >= observation.expires):
++        raise _invalid()
++    return observation.original, observation.blocked_payloads
+diff --git a/hermes_cli/kanban_assignment_routing.py b/hermes_cli/kanban_assignment_routing.py
+index f73143f2f8..1d0d287169 100644
+--- a/hermes_cli/kanban_assignment_routing.py
++++ b/hermes_cli/kanban_assignment_routing.py
+@@ -187,21 +187,30 @@ NO_SECOND_PROFILE_ROUTES = (
+ )
+ 
+ 
+-def validate_repair_completion(conn, task_id):
++def validate_repair_completion(conn, task_id, *, observation=None):
+     """A completed repair must not release an invalid assignment after policy drift."""
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_assignment_original import repair_key, resolve
+ 
+-    row = conn.execute('SELECT idempotency_key FROM tasks WHERE id=?', (task_id,)).fetchone()
+-    key = row[0] if row else None
+-    if not key or not key.startswith(_SUPERVISOR_PREFIX):
++    key = repair_key(conn, task_id)
++    if key is None:
++        if observation is not None:
++            raise AssignmentRoutingError('Assignment repair key changed during validation; retry')
+         return
+     original = kb.get_task(conn, key.removeprefix(_SUPERVISOR_PREFIX))
+-    if original is None or original.assignee is None:
++    if observation is not None and original is not None:
++        raise AssignmentRoutingError('Assignment repair original custody changed during validation; retry')
++    if original is None:
++        original, payloads = resolve(conn, task_id, key, observation)
++    else:
++        payloads = tuple(row[0] for row in conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' ORDER BY id DESC",
++            (original.id,)).fetchall())
++    if original.assignee is None:
+         raise AssignmentRoutingError('Assignment repair has no assigned original task')
+     # A verified profile is not a recovery when the original asked for authority no profile has.
+     import json
+-    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' "
+-                               "ORDER BY id DESC", (original.id,)).fetchall():
++    for raw in payloads:
+         try:
+             data = json.loads(raw) if raw else {}
+         except ValueError:
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index e8c374a33e..80f4434a9f 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2450,6 +2450,8 @@ def complete_task(
+     """
+     from hermes_cli.kanban_review_required import require_review
+     from hermes_cli.kanban_containment_authority import require_acknowledgement
++    from hermes_cli.kanban_assignment_routing import validate_repair_completion
++    from hermes_cli.kanban_assignment_original import prepare as prepare_repair
+     if not placement_settled:  # a settling placement stub cannot resume/retain; gating it would park forever
+         require_acknowledgement(conn, task_id, metadata)
+     require_review(conn, task_id, expected_run_id, placement_settled=placement_settled)
+@@ -2469,7 +2471,7 @@ def complete_task(
+     if acceptance is False:
+         return False
+     from hermes_cli.kanban_metadata_files import discard_on_error
+-    staged: list[Path] = []
++    staged, repair_observation = [], prepare_repair(conn, task_id)
+     with _prestaged(conn, task_id, metadata), discard_on_error(staged), write_txn(conn):
+         if not placement_settled:
+             require_acknowledgement(conn, task_id, metadata)
+@@ -2477,8 +2479,7 @@ def complete_task(
+         if not _parents_satisfied(conn, task_id):
+             return False
+         receipt_admission.recheck(conn, task_id, receipt_owners)
+-        from hermes_cli.kanban_assignment_routing import validate_repair_completion
+-        validate_repair_completion(conn, task_id)
++        validate_repair_completion(conn, task_id, observation=repair_observation)
+         from hermes_cli.kanban_goal_receipt import record as record_goal
+         goal_event_id = record_goal(conn, task_id, goal_verification, (summary or result or '').strip())
+         acceptance_event_id = record_acceptance(conn, task_id, acceptance) if acceptance is not None else None
+@@ -2526,8 +2527,7 @@ def complete_task(
+                 synth_summary = _REVIEW_APPROVED_NOTE
+                 synth_metadata = {"source_status": "review", "approval": "manual"}
+             run_id = _synthesize_ended_run(
+-                conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata,
+-            )
++                conn, task_id, outcome="completed", summary=synth_summary, metadata=synth_metadata)
+         event_summary = handoff_summary
+         if prior_status == "review" and not event_summary:
+             event_summary = _REVIEW_APPROVED_NOTE
+diff --git a/tests/hermes_cli/test_kanban_assignment_custody.py b/tests/hermes_cli/test_kanban_assignment_custody.py
+new file mode 100644
+index 0000000000..5b2182437d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_assignment_custody.py
+@@ -0,0 +1,200 @@
++"""Assignment repairs read foreign originals from the authenticated Board, never replicas."""
++import copy
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_assignment_routing as routing
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_assignment_routing as local_tests
++
++board = local_tests.board
++payload = local_tests.payload
++task_with_drift = local_tests.task_with_drift
++
++
++@pytest.fixture
++def foreign(board, monkeypatch):
++    conn, home = board
++    original = task_with_drift(board)
++    assert kb.block_task(conn, original, kind='assignment', reason='Wrong worker')
++    repair = payload(conn, original)['supervisor_task_id']
++    task = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (original,)).fetchone())
++    task.update(uid=original, deleted_at=None)
++    events = [dict(row) for row in conn.execute('SELECT * FROM task_events WHERE task_id=?', (original,))]
++    for index, event in enumerate(events):
++        event.update(uid=f'event-{index}', ord=index, deleted_at=None)
++    evidence = dict(version=1, board='default', task_id=original, task=task,
++                    runs=[], events=events, runs_complete=True, events_complete=True)
++    conn.execute('DELETE FROM task_links WHERE child_id=?', (original,))
++    conn.execute('DELETE FROM task_events WHERE task_id=?', (original,))
++    conn.execute('DELETE FROM tasks WHERE id=?', (original,))
++    conn.commit()
++    calls = []
++    monkeypatch.setattr(sync, 'sync_config', lambda: {'enabled': True})
++    monkeypatch.setattr(sync, 'board_selected', lambda *args: True)
++    monkeypatch.setattr(sync, 'board_slug_for_path', lambda *args: 'default')
++    monkeypatch.setattr(client, 'load_identity', lambda: SimpleNamespace())
++
++    def read(self, method, path, *args, **kwargs):
++        assert not conn.in_transaction, 'network must precede the completion writer lock'
++        assert method == 'GET'
++        assert path == f'/v2/boards/default/tasks/{original}/execution-evidence'
++        calls.append(path)
++        return copy.deepcopy(evidence)
++
++    monkeypatch.setattr(client.Hub, '_call', read)
++    return conn, home, repair, original, evidence, calls
++
++
++def test_foreign_original_completes_normally_without_materializing_it(foreign):
++    conn, _, repair, original, _, calls = foreign
++    assert kb.complete_task(conn, repair, result='Verified assignment')
++    assert kb.get_task(conn, repair).status == 'done'
++    assert kb.get_task(conn, original) is None
++    assert len(calls) == 1
++
++
++@pytest.mark.parametrize('mutate', [
++    lambda e: e.update(task=None),
++    lambda e: e['task'].update(assignee=None),
++    lambda e: e['task'].update(deleted_at=1),
++    lambda e: e['task'].update(id='t_0000000000000000'),
++    lambda e: e.update(events_complete=False),
++    lambda e: e['task'].pop('requires'),
++    lambda e: e['task'].update(requires='{'),
++    lambda e: e.update(events=[]),
++    lambda e: next(row for row in e['events'] if row['kind'] == 'blocked').update(payload='{'),
++    lambda e: e['task'].update(workspace_kind='dir', workspace_path=None),
++], ids=['missing', 'unassigned', 'deleted', 'wrong-task', 'incomplete', 'missing-field',
++        'bad-requires', 'missing-block', 'bad-block', 'missing-directory-path'])
++def test_foreign_evidence_fails_closed(foreign, mutate):
++    conn, _, repair, _, evidence, _ = foreign
++    mutate(evidence)
++    with pytest.raises(routing.AssignmentRoutingError):
++        kb.complete_task(conn, repair, result='Verified')
++    assert kb.get_task(conn, repair).status != 'done'
++
++
++@pytest.mark.parametrize('reason', ['unblock t_0000000000000000',
++                                   'change model for t_0000000000000000'])
++def test_foreign_original_authority_is_not_granted_by_profile(foreign, reason):
++    conn, _, repair, _, evidence, _ = foreign
++    event = next(e for e in evidence['events'] if e['kind'] == 'blocked')
++    data = json.loads(event['payload'])
++    data['reason'] = reason
++    event['payload'] = json.dumps(data)
++    with pytest.raises(routing.ExecutionAuthorityMismatch):
++        kb.complete_task(conn, repair, result='Verified')
++    assert kb.get_task(conn, repair).status != 'done'
++
++
++def test_foreign_policy_drift_still_refuses(foreign):
++    from hermes_cli.kanban_capabilities import CapabilityMismatchError
++    conn, home, repair, _, _, _ = foreign
++    (home / 'profiles/supervisor/config.yaml').write_text('platform_toolsets:\n  cli: [web]\n')
++    with pytest.raises(CapabilityMismatchError):
++        kb.complete_task(conn, repair, result='Verified')
++
++
++def test_foreign_model_validation_is_not_skipped(foreign, monkeypatch):
++    from hermes_cli import kanban_model_assignment as models
++    conn, _, repair, _, evidence, _ = foreign
++    evidence['task'].update(model_override='fixture-model', provider_override='fixture-provider')
++
++    def refuse(assignee, model, provider):
++        assert (assignee, model, provider) == ('supervisor', 'fixture-model', 'fixture-provider')
++        raise ValueError('model refused')
++
++    monkeypatch.setattr(models, 'validate_model_assignment', refuse)
++    with pytest.raises(ValueError, match='model refused'):
++        kb.complete_task(conn, repair, result='Verified')
++
++
++def test_board_failure_has_no_replica_fallback(foreign, monkeypatch):
++    conn, _, repair, _, _, _ = foreign
++
++    def unavailable(*args, **kwargs):
++        raise OSError('unavailable')
++
++    monkeypatch.setattr(client.Hub, '_call', unavailable)
++    with pytest.raises(routing.AssignmentRoutingError):
++        kb.complete_task(conn, repair, result='Verified')
++
++
++def test_local_original_never_needs_board(board, monkeypatch):
++    conn, _ = board
++    original = task_with_drift(board)
++    assert kb.block_task(conn, original, kind='assignment', reason='Wrong worker')
++    repair = payload(conn, original)['supervisor_task_id']
++
++    def forbidden(*args, **kwargs):
++        pytest.fail('local assignment must not need network')
++
++    monkeypatch.setattr(client, 'load_identity', forbidden)
++    assert kb.complete_task(conn, repair, result='Verified')
++
++
++@pytest.mark.parametrize('tamper', ['expired', 'key-changed', 'key-removed'])
++def test_preflight_cannot_be_reused_for_another_key_or_after_deadline(foreign, monkeypatch, tamper):
++    from hermes_cli import kanban_assignment_original as originals
++    conn, _, repair, _, _, _ = foreign
++    observation = originals.prepare(conn, repair)
++    assert observation is not None
++    if tamper == 'expired':
++        monkeypatch.setattr(originals.time, 'monotonic', lambda: observation.expires)
++    else:
++        key = 'assignment-repair:t_0000000000000000' if tamper == 'key-changed' else None
++        conn.execute('UPDATE tasks SET idempotency_key=? WHERE id=?', (key, repair))
++        conn.commit()
++    with kb.write_txn(conn), pytest.raises(routing.AssignmentRoutingError):
++        routing.validate_repair_completion(conn, repair, observation=observation)
++
++
++def test_no_network_if_caller_already_holds_transaction(foreign):
++    from hermes_cli import kanban_assignment_original as originals
++    conn, _, repair, _, _, calls = foreign
++    with kb.write_txn(conn), pytest.raises(routing.AssignmentRoutingError):
++        originals.prepare(conn, repair)
++    assert not calls
++
++
++def test_board_http_refusal_is_typed(foreign, monkeypatch):
++    conn, _, repair, _, _, _ = foreign
++
++    def unavailable(*args, **kwargs):
++        raise client.HubError(403, 'fixture denied')
++
++    monkeypatch.setattr(client.Hub, '_call', unavailable)
++    with pytest.raises(routing.AssignmentRoutingError):
++        kb.complete_task(conn, repair, result='Verified')
++
++
++def test_scratch_wire_projection_needs_no_host_local_path(foreign):
++    conn, _, repair, _, evidence, _ = foreign
++    del evidence['task']['workspace_path']
++    assert kb.complete_task(conn, repair, result='Verified')
++
++
++@pytest.mark.parametrize('expired', [False, True])
++def test_local_materialization_cannot_bypass_canonical_observation(foreign, monkeypatch, expired):
++    from hermes_cli import kanban_assignment_original as originals
++    conn, _, repair, original, evidence, _ = foreign
++    observation = originals.prepare(conn, repair)
++    assert observation is not None
++    # Mimic task-before-history pickup while the preflight waits outside the writer lock.
++    columns = [r[1] for r in conn.execute('PRAGMA table_info(tasks)') if r[1] in evidence['task']]
++    conn.execute('INSERT INTO tasks (' + ','.join(columns) + ') VALUES ('
++                 + ','.join('?' for _ in columns) + ')', [evidence['task'][c] for c in columns])
++    conn.commit()
++    assert kb.get_task(conn, original) is not None
++    assert not conn.execute('SELECT 1 FROM task_events WHERE task_id=?', (original,)).fetchone()
++    if expired:
++        monkeypatch.setattr(originals.time, 'monotonic', lambda: observation.expires)
++    with kb.write_txn(conn), pytest.raises(routing.AssignmentRoutingError, match='custody changed'):
++        routing.validate_repair_completion(conn, repair, observation=observation)
++    assert kb.get_task(conn, repair).status != 'done'
++
+-- 
+2.43.0
+

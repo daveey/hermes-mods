@@ -1,0 +1,342 @@
+From bd7e66845d0ab9bd98551fe6faf5b0d5acf552fb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 04:16:39 +0000
+Subject: [PATCH] fix(kanban): fence spend-limited claims on every executor
+ [daveey]
+
+Problem: home spend holds lost to concurrent foreign ready/review claims.
+Why 1: hold() returned on foreign_copy before pending-decision or spend reads
+(kanban_spend_budget.py:318-319); worker-a1 performed no spend computation.
+Why 2: low-level claim functions fenced containment but not spend decisions.
+Why 3: home triage was asynchronously synced; a new live lease rejected status.
+Root (happened): spend enforcement existed at home-owned triage, not executor CAS.
+Root (not caught): hold/unblock suites omitted foreign pickup and unpublished holds.
+Recurrence: #3803 publication sparing and #3819 refusal accounting did not address
+claim arbitration. Both contracts and their existing suites remain unchanged.
+
+Prepare a read-only predicate before lease acquisition, then recheck pending stop,
+existing spend accounting/card limits and recognised publication identity inside
+the claim transaction. PR network reads stay outside the write transaction.
+Only home writes triage and decision producers; no budgets/caps/priorities change.
+
+Proof: two-gateway reclaim/hold/claim ready+review regressions fail on old code
+and pass after the fix; first exhaustion without a stop is also RED/GREEN.
+Focused new tests: 15 passed. Existing nine spend suites: 202 passed unchanged.
+Full scripts/check: 21 checks pass after refreshing the stale base.
+Retrospective read-only replay refuses all three captured cases, plus worker-a1's
+retained copy. Historical current rows are not claim-time DB snapshots; retained
+stop evidence proves refusal independently of retrospective run-window counts.
+
+Hermes-Card: t_eeeeee000000003d
+---
+ hermes_cli/kanban_db.py                       |  18 +--
+ hermes_cli/kanban_spend_claim.py              |  32 +++++
+ tests/hermes_cli/test_kanban_spend_claim.py   | 128 ++++++++++++++++++
+ .../test_kanban_spend_claim_accounting.py     |  67 +++++++++
+ 4 files changed, 236 insertions(+), 9 deletions(-)
+ create mode 100644 hermes_cli/kanban_spend_claim.py
+ create mode 100644 tests/hermes_cli/test_kanban_spend_claim.py
+ create mode 100644 tests/hermes_cli/test_kanban_spend_claim_accounting.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 252127c2a8..281706d350 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -38,7 +38,7 @@ from hermes_cli.kanban_db_event import Event  # public kb.Event; helpers import
+ from hermes_cli.kanban_worker_placement import resolved_db_placement, validate_creation
+ from hermes_cli import kanban_dup_detector as _dup_detector, kanban_placement_forward as _placement_fwd  # no cycle
+ from hermes_cli import kanban_run_end_lease as _run_end_lease  # stdlib-only at import: no cycle
+-from hermes_cli import kanban_containment_connections as _containment
++from hermes_cli import kanban_containment_connections as _containment, kanban_spend_claim as _spend_claim
+ from hermes_cli.kanban_host_identity import is_local_claim as _claim_is_local
+ from hermes_cli.kanban_db_dispatch_queries import DISPATCH_ORDER  # stdlib-only at import: no cycle
+ from hermes_cli.kanban_terminal_guard import unblock_refusal  # stdlib-only at import: no cycle; re-exported for plugins
+@@ -2022,18 +2022,17 @@ def claim_task(
+     now = int(time.time())
+     lock = claimer or _claimer_id()
+     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+-    # [daveey] Refuse a held fence, and a lock-free hub CPU advisory (final gate is under the lock), before the lease.
+-    if _containment.held(conn, task_id) or admission_hold_set(task_id) or hub_cpu_advisory(task_id, conn=conn):
++    # [daveey] Spend decisions are home-owned, but every executor must honour their hold before taking a lease.
++    spend_check = _spend_claim.claim_check(conn, task_id)
++    if _containment.held(conn, task_id) or spend_check() or admission_hold_set(task_id) or hub_cpu_advisory(task_id, conn=conn):
+         return None
+     gate = _sync.claim_gate(conn, task_id, expires)
+     if gate.deferred:
+         return None
+     with gate, claim_transaction(conn, task_id=task_id, gate=gate) as admitted:
+-        if not admitted or _containment.held(conn, task_id) or (admission_check is not None and admission_check()):  # [daveey] same txn as the CAS
++        if not admitted or _containment.held(conn, task_id) or spend_check() or (admission_check is not None and admission_check()):  # [daveey] same txn as the CAS
+             return None
+-        # Single enforcement point: never ready -> running with an undone
+-        # parent, whichever writer set 'ready'. Demote to 'todo';
+-        # recompute_ready re-promotes when the parents finish.
++        # Never ready -> running with an undone parent; recompute_ready re-promotes when parents finish.
+         if not _parents_satisfied(conn, task_id):
+             conn.execute(
+                 "UPDATE tasks SET status = 'todo' "
+@@ -2064,13 +2063,14 @@ def claim_review_task(
+     now = int(time.time())
+     lock = claimer or _claimer_id()
+     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+-    if _containment.held(conn, task_id) or admission_hold_set(task_id) or hub_cpu_advisory(task_id, conn=conn):  # [daveey] before the Board-service lease (see claim_task)
++    spend_check = _spend_claim.claim_check(conn, task_id)
++    if _containment.held(conn, task_id) or spend_check() or admission_hold_set(task_id) or hub_cpu_advisory(task_id, conn=conn):  # [daveey] before the Board-service lease (see claim_task)
+         return None
+     gate = _sync.claim_gate(conn, task_id, expires, lane="review")
+     if gate.deferred:
+         return None
+     with gate, claim_transaction(conn, task_id=task_id, gate=gate) as admitted:
+-        if not admitted or _containment.held(conn, task_id) or (admission_check is not None and admission_check()):  # [daveey] same txn as the CAS
++        if not admitted or _containment.held(conn, task_id) or spend_check() or (admission_check is not None and admission_check()):  # [daveey] same txn as the CAS
+             return None
+         if not _parents_satisfied(conn, task_id):
+             demoted = conn.execute(
+diff --git a/hermes_cli/kanban_spend_claim.py b/hermes_cli/kanban_spend_claim.py
+new file mode 100644
+index 0000000000..53e937d80e
+--- /dev/null
++++ b/hermes_cli/kanban_spend_claim.py
+@@ -0,0 +1,32 @@
++"""Read-only spend admission on every executor, separate from home-owned triage. [daveey]"""
++from __future__ import annotations
++
++
++def claim_check(conn, task_id):
++    """Prepare outside the write lock; the returned predicate rechecks in the claim transaction.
++
++    The same accounting, per-card overrides and publication-owner exception as ``hold`` apply to
++    local and foreign claims. Only home writes triage/notices. A PR observation is obtained outside
++    the transaction and may spare only that same recognised publication on the transactional read.
++    A newly exhausted budget without a preflight PR observation refuses until the next attempt.
++    """
++    from hermes_cli import kanban_spend_budget as budget
++    from hermes_cli import kanban_spend_decision as decision
++    from hermes_cli import kanban_spend_pr_owner as owner
++
++    board = budget.limits()
++    pr = None
++    if not decision.pending(conn, task_id):
++        lim = budget.card_limits(conn, task_id, board)
++        if budget.over(budget.spend(conn, task_id), lim) is not None:
++            pr = owner.open_core_pr(conn, task_id)
++
++    def refused():
++        if decision.pending(conn, task_id):
++            return True
++        lim = budget.card_limits(conn, task_id, board)
++        if budget.over(budget.spend(conn, task_id), lim) is None:
++            return False
++        return pr is None or pr not in owner.recognised_prs(conn, task_id)
++
++    return refused
+diff --git a/tests/hermes_cli/test_kanban_spend_claim.py b/tests/hermes_cli/test_kanban_spend_claim.py
+new file mode 100644
+index 0000000000..b251e04b8b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_claim.py
+@@ -0,0 +1,128 @@
++"""A home-owned spend decision must fence claims on a foreign executor too. [daveey]"""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_spend_budget as budget
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_spend_budget as spend_helpers
++from tests.hermes_cli import test_kanban_worker_node as helpers
++
++kanban_home = spend_helpers.kanban_home
++
++svc = helpers.svc
++gws = helpers.gws
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_reclaimed_copy_cannot_claim_while_home_reholds(gws, svc, monkeypatch, lane):
++    """Real pickup/sync, stale ready copy, home hold not yet published: no new lease/run."""
++    hub, worker = gws
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="Previously stopped spending", assignee="default", runs_on=["linux"])
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET status=? WHERE id=?", (lane, tid))
++    claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++    assert claim(hub.conn, tid) is not None
++    with kb.write_txn(hub.conn):
++        kb._append_event(hub.conn, tid, decision.EVENT, {"reason": "budget already spent"})
++    assert kb.reclaim_task(hub.conn, tid, reason="scratch updater requeue", signal_fn=lambda *a: None)
++    assert kb.get_task(hub.conn, tid).status == lane
++    hub.round()
++    worker.round()
++    worker.enter()
++    assert wn.pickup(worker.conn, budget=1) == [tid]
++    assert decision.pending(worker.conn, tid)
++    assert worker.conn.execute("SELECT created_on FROM tasks WHERE id=?", (tid,)).fetchone()[0] == helpers.HUB
++    before = len(helpers._runs(worker.conn, tid))
++    hub.enter()
++    monkeypatch.setattr(decision, "safe_ensure_producer", lambda *a: None)
++    assert budget.hold(hub.conn, tid) == "triage"
++    # Deliberately do NOT sync the status hold before the foreign claim.
++    worker.enter()
++    assert kb.get_task(worker.conn, tid).status == lane
++    claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++    assert claim(worker.conn, tid) is None
++    assert len(helpers._runs(worker.conn, tid)) == before
++    assert svc.board(helpers.BOARD)["rows"]["tasks"][tid]["status"] == lane
++    worker.round()
++    hub.round()
++    worker.round()
++    assert kb.get_task(worker.conn, tid).status == "triage"
++    assert not worker.conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='claimed' "
++                                   "AND origin_gateway=?", (tid, helpers.WORKER)).fetchall()
++    hub.enter()
++    assert kb.promote_task(hub.conn, tid, actor="operator", reason="bounded new scope")[0]
++    hub.round()
++    worker.round()
++    worker.enter()
++    assert not decision.pending(worker.conn, tid)
++    assert kb.claim_task(worker.conn, tid) is not None
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_first_budget_crossing_on_foreign_copy_refuses_without_home_stop(gws, lane):
++    hub, worker = gws
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="First spend crossing", assignee="default", runs_on=["linux"])
++    spend_helpers._runs(hub.conn, tid, budget.DEFAULT_RUNS)
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET status=? WHERE id=?", (lane, tid))
++    hub.round()
++    worker.round()
++    worker.enter()
++    assert wn.pickup(worker.conn, budget=1) == [tid]
++    assert not decision.pending(worker.conn, tid)
++    assert budget.spend(worker.conn, tid).runs == budget.DEFAULT_RUNS
++    claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++    before = len(helpers._runs(worker.conn, tid))
++    assert claim(worker.conn, tid) is None
++    assert len(helpers._runs(worker.conn, tid)) == before
++    assert not decision.pending(worker.conn, tid)  # only home may produce the decision
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_stop_arriving_during_lease_acquisition_refuses_claim(kanban_home, monkeypatch, lane):
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db_sync as sync
++
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Stop arrived during admission", assignee="default")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (lane, tid))
++        real = sync.claim_gate
++        entered = []
++
++        def arriving(c, task_id, expires, **kw):
++            gate = real(c, task_id, expires, **kw)
++            with kb.write_txn(c):
++                kb._append_event(c, task_id, decision.EVENT, {"reason": "concurrent stop"})
++            entered.append(task_id)
++            return gate
++
++        monkeypatch.setattr(sync, "claim_gate", arriving)
++        claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++        assert claim(conn, tid) is None
++        assert entered == [tid]
++        assert not conn.execute("SELECT id FROM task_runs WHERE task_id=?", (tid,)).fetchall()
++        assert kb.get_task(conn, tid).status == lane
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++def test_pending_stop_refuses_before_any_lease(kanban_home, monkeypatch, lane):
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db_sync as sync
++
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Unreleased stop", assignee="default")
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, decision.EVENT, {"reason": "spent"})
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (lane, tid))
++
++        def forbidden(*a, **kw):
++            pytest.fail("pending spend decision must not acquire a Board lease")
++
++        monkeypatch.setattr(sync, "claim_gate", forbidden)
++        claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++        assert claim(conn, tid) is None
++        assert not conn.execute("SELECT id FROM task_runs WHERE task_id=?", (tid,)).fetchall()
+diff --git a/tests/hermes_cli/test_kanban_spend_claim_accounting.py b/tests/hermes_cli/test_kanban_spend_claim_accounting.py
+new file mode 100644
+index 0000000000..b32a808622
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_claim_accounting.py
+@@ -0,0 +1,67 @@
++"""Spend admission keeps the existing accounting and publication-owner contracts. [daveey]"""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_budget as budget
++from hermes_cli import kanban_spend_claim as admission
++from hermes_cli import kanban_spend_pr_owner as owner
++from tests.hermes_cli import test_kanban_spend_pr_owner as helpers
++
++kanban_home = helpers.kanban_home
++github = helpers.github
++
++
++@pytest.mark.parametrize("lane", ["ready", "review"])
++@pytest.mark.parametrize("open_pr", [False, True])
++def test_claim_keeps_publication_owner_exception(kanban_home, github, lane, open_pr):
++    github[0]["state"] = "OPEN" if open_pr else "CLOSED"
++    with kbc.connect_closing() as conn:
++        tid = helpers.owner(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (lane, tid))
++        claim = kb.claim_task if lane == "ready" else kb.claim_review_task
++        assert (claim(conn, tid) is not None) == open_pr
++        assert budget.spend(conn, tid).runs == budget.DEFAULT_RUNS
++
++
++def test_publication_observation_never_runs_under_claim_write_lock(kanban_home, github, monkeypatch):
++    real = owner.open_core_pr
++    calls = []
++
++    def observed(conn, tid):
++        assert not conn.in_transaction
++        calls.append(tid)
++        return real(conn, tid)
++
++    monkeypatch.setattr(owner, "open_core_pr", observed)
++    with kbc.connect_closing() as conn:
++        tid = helpers.owner(conn)
++        assert kb.claim_task(conn, tid) is not None
++        assert calls == [tid]
++
++
++def test_transaction_rechecks_override_and_publication_identity(kanban_home, github):
++    with kbc.connect_closing() as conn:
++        tid = helpers.owner(conn)
++        check = admission.claim_check(conn, tid)
++        with kb.write_txn(conn):
++            assert not check()
++            conn.execute("UPDATE task_runs SET metadata=NULL WHERE task_id=?", (tid,))
++            assert check()  # a preflight OPEN result is not a blanket spend bypass
++        budget.set_override(conn, tid, runs=0, cache_read_tokens=0, by="fixture", reason="disabled control")
++        with kb.write_txn(conn):
++            assert not check()
++
++
++def test_new_exhaustion_after_preflight_waits_for_next_pr_observation(kanban_home, github):
++    from tests.hermes_cli import test_kanban_spend_budget as spending
++
++    with kbc.connect_closing() as conn:
++        tid = helpers.owner(conn, runs=budget.DEFAULT_RUNS - 1)
++        check = admission.claim_check(conn, tid)
++        assert github[1] == []
++        spending._run(conn, tid)
++        with kb.write_txn(conn):
++            assert check()
++        assert not admission.claim_check(conn, tid)()
+-- 
+2.43.0
+

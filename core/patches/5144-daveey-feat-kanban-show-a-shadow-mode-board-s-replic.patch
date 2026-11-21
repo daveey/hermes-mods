@@ -1,0 +1,1077 @@
+From d40e36cb3e4672c5e0112a165e40291b7a18d5fd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:03:25 +0000
+Subject: [PATCH] [daveey] feat(kanban): show a shadow-mode board's replica
+ cards read-only in `kanban list`/`show` and the Desktop board
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A board synced in shadow mode keeps only this gateway's own cards in the live kanban.db; the whole board (the
+example application's queue on an example gateway) lives in sync-shadow/<board>.db, so `hermes kanban --board app list` and the
+Desktop board showed 14 cards of 1,145. Switching the hub to primary or copying rows into the live file is unsafe
+(primary mode partitions live rows by gateway), so the fix is on the read side only.
+
+- hermes_cli/kanban_shadow_view.py: when the live board's kanban_sync_state.mode is `shadow` (and sync is enabled,
+  the replica exists), open the replica read-only (kanban_foreign_card.open_replica) and list/show its cards the
+  live file lacks. A live row wins on an id collision. Rows carry remote/read_only/home_gateway (created_on).
+- `hermes kanban list [--json]` appends the remote rows (`[remote:<gateway>, read-only]`); `show <id>` falls back
+  to the replica for a card only it has (no queue fields: it waits on its home gateway). _print_* helpers moved to
+  kanban_show_print.py to stay under the file-size cap.
+- Dashboard /board: plugins/kanban/dashboard/board_shadow.py merges the replica's cards into the projected
+  payload (done column total/omitted include them), memoised on the replica's file stat. Writes on those cards
+  already answer 409 foreign_card.
+- Desktop: remote cards show a `remote · <gateway>` marker; mergeBoards drops a remote copy when the owning
+  gateway's own live row is in the merge, and de-duplicates two remote copies.
+- No write to the shadow DB, no change to sync mode, claiming or dispatch: the dispatcher reads the live file only.
+
+Proof: tests/hermes_cli/test_kanban_shadow_view.py (CLI list/show, filters, id-collision precedence, non-shadow
+modes unchanged, byte-for-byte no-write on the replica, read-only connection, dispatcher never claims a shadow
+row), tests/plugins/test_kanban_board_shadow.py (board payload, collision, done totals, no-write, replica commit
+visible, HTTP route + 409 on write), card-remote.test.tsx and api.gateways.test.ts (Desktop).
+
+Baseline: scripts/boundary_lint_baseline.json gains plugins/kanban/dashboard/board_shadow.py ->
+hermes_cli.kanban_shadow_view (the one intended plugin->core import: the read-only replica opener).
+---
+ .../src/plugins/kanban/api.gateways.test.ts   |  23 +++
+ apps/desktop/src/plugins/kanban/api.ts        |  28 +++-
+ apps/desktop/src/plugins/kanban/board.tsx     |  32 +++-
+ .../src/plugins/kanban/card-remote.test.tsx   |  61 ++++++++
+ apps/desktop/src/plugins/kanban/i18n.ts       |  11 ++
+ apps/desktop/src/plugins/kanban/types.ts      |   5 +
+ hermes_cli/kanban.py                          |  60 ++------
+ hermes_cli/kanban_shadow_view.py              | 125 +++++++++++++++
+ hermes_cli/kanban_show_print.py               |  41 +++++
+ plugins/kanban/dashboard/board_shadow.py      | 107 +++++++++++++
+ plugins/kanban/dashboard/plugin_api.py        |  13 +-
+ scripts/boundary_lint_baseline.json           |   1 +
+ tests/hermes_cli/test_kanban_shadow_view.py   | 142 ++++++++++++++++++
+ tests/plugins/test_kanban_board_shadow.py     | 129 ++++++++++++++++
+ 14 files changed, 720 insertions(+), 58 deletions(-)
+ create mode 100644 apps/desktop/src/plugins/kanban/card-remote.test.tsx
+ create mode 100644 hermes_cli/kanban_shadow_view.py
+ create mode 100644 hermes_cli/kanban_show_print.py
+ create mode 100644 plugins/kanban/dashboard/board_shadow.py
+ create mode 100644 tests/hermes_cli/test_kanban_shadow_view.py
+ create mode 100644 tests/plugins/test_kanban_board_shadow.py
+
+diff --git a/apps/desktop/src/plugins/kanban/api.gateways.test.ts b/apps/desktop/src/plugins/kanban/api.gateways.test.ts
+index bdf535a375..eb23b8472f 100644
+--- a/apps/desktop/src/plugins/kanban/api.gateways.test.ts
++++ b/apps/desktop/src/plugins/kanban/api.gateways.test.ts
+@@ -218,6 +218,29 @@ describe('mergeBoards', () => {
+     expect(merged.gateway_errors).toBeUndefined()
+   })
+ 
++  it("shows a shadow board's remote copy once, and never over the owner's own live row", () => {
++    const merged = mergeBoards([
++      {
++        board: board({ ready: [task('own', { title: 'hub own' }), task('r1', { home_gateway: 'mini', remote: true })] }),
++        gateway: 'local'
++      },
++      {
++        board: board({ ready: [task('r1', { title: 'mini live' }), task('r2', { home_gateway: 'mini', remote: true })] }),
++        gateway: 'mini'
++      },
++      { board: board({ ready: [task('r2', { home_gateway: 'mini', remote: true })] }), gateway: 'cloud' }
++    ])
++
++    const ready = merged.columns.find(col => col.name === 'ready')!.tasks
++
++    expect(ready.map(t => [t.id, t.gateway, Boolean(t.remote)]).sort()).toEqual([
++      ['own', 'local', false],
++      ['r1', 'mini', false],
++      ['r2', 'mini', true]
++    ])
++    expect(ready.find(t => t.id === 'r1')!.title).toBe('mini live')
++  })
++
+   it('skips a gateway without the board silently and reports other failures', () => {
+     const merged = mergeBoards([
+       { board: board({ ready: [task('a')] }), gateway: 'local' },
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index 1c01c872da..4575956b4b 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -786,6 +786,30 @@ const TERMINAL_ORDER = new Set(['done', 'archived'])
+  *  (never a cursor: see knownCursor). A gateway that lacks the board contributes nothing; any
+  *  other failure is reported in `gateway_errors`. Throws only when no
+  *  gateway answered. */
++// [daveey] A shadow board's replica cards (`remote`) are another gateway's own cards: when that gateway's live read
++// is in the merge its row is the one shown, and two remote copies of one id show once.
++function remoteCardFilter(parts: GatewayBoardPart[]): (task: KanbanTask) => boolean {
++  const liveIds = new Set<string>()
++  const remoteSeen = new Set<string>()
++
++  for (const part of parts) {
++    for (const col of part.board?.columns ?? []) {
++      col.tasks.filter(task => !task.remote).forEach(task => liveIds.add(task.id))
++    }
++  }
++
++  return task => {
++    if (!task.remote) {
++      return true
++    }
++
++    const dropped = liveIds.has(task.id) || remoteSeen.has(task.id)
++    remoteSeen.add(task.id)
++
++    return !dropped
++  }
++}
++
+ export function mergeBoards(parts: GatewayBoardPart[]): KanbanBoard {
+   const answered = parts.filter(part => part.board)
+ 
+@@ -801,6 +825,8 @@ export function mergeBoards(parts: GatewayBoardPart[]): KanbanBoard {
+   const gatewayErrors: Record<string, string> = {}
+   const hubGateways: Record<string, null | number> = {}
+ 
++  const keepTask = remoteCardFilter(parts)
++
+   for (const part of parts) {
+     // A replica-filled part still failed live: keep its error on the board
+     // (the header chip says the gateway is down) next to its hub cards.
+@@ -818,7 +844,7 @@ export function mergeBoards(parts: GatewayBoardPart[]): KanbanBoard {
+ 
+     for (const col of part.board.columns ?? []) {
+       const merged = columns.get(col.name) ?? { name: col.name, tasks: [] }
+-      merged.tasks.push(...col.tasks.map(task => ({ ...task, gateway: part.gateway })))
++      merged.tasks.push(...col.tasks.filter(keepTask).map(task => ({ ...task, gateway: part.gateway })))
+       columns.set(col.name, merged)
+     }
+ 
+diff --git a/apps/desktop/src/plugins/kanban/board.tsx b/apps/desktop/src/plugins/kanban/board.tsx
+index 84ac3087ea..6810e1c4df 100644
+--- a/apps/desktop/src/plugins/kanban/board.tsx
++++ b/apps/desktop/src/plugins/kanban/board.tsx
+@@ -158,6 +158,30 @@ function Meta({ children, icon }: { children: ReactNode; icon: string }) {
+   )
+ }
+ 
++/** [daveey] A shadow board's card owned by another gateway: a read-only synced copy. */
++function RemoteMarker({ home }: { home?: null | string }) {
++  const k = useKanban()
++
++  return (
++    <Tip label={k.remoteCardTip(home || '?')}>
++      <span className="shrink-0 cursor-help text-(--ui-text-quaternary) italic" data-slot="kanban-card-remote">
++        {k.remoteCard(home || '?')}
++      </span>
++    </Tip>
++  )
++}
++
++/** [daveey] The owner didn't answer: this card is the hermes-hub replica's copy. */
++function HubCopyMarker({ syncedAt }: { syncedAt?: null | number }) {
++  const k = useKanban()
++
++  return (
++    <Tip label={k.fromHubTip(ago(syncedAt) ?? '?')}>
++      <span className="shrink-0 cursor-help text-(--ui-text-quaternary) italic">{k.fromHub}</span>
++    </Tip>
++  )
++}
++
+ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
+   const k = useKanban()
+   const created = ago(task.created_at)
+@@ -253,12 +277,8 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
+         <span className="min-w-0 truncate font-mono text-(--ui-text-quaternary)">{shortId(task.id)}</span>
+         {/* [daveey] Which gateway owns the card — the sidebar session row's glyph. */}
+         {task.gateway && <GatewayDeviceIcon gatewayId={task.gateway} />}
+-        {/* [daveey] The owner didn't answer: this is the hermes-hub replica's copy. */}
+-        {task.from_hub && (
+-          <Tip label={k.fromHubTip(ago(task.hub_synced_at) ?? '?')}>
+-            <span className="shrink-0 cursor-help text-(--ui-text-quaternary) italic">{k.fromHub}</span>
+-          </Tip>
+-        )}
++        {task.remote && <RemoteMarker home={task.home_gateway} />}
++        {task.from_hub && <HubCopyMarker syncedAt={task.hub_synced_at} />}
+       </div>
+     </div>
+   )
+diff --git a/apps/desktop/src/plugins/kanban/card-remote.test.tsx b/apps/desktop/src/plugins/kanban/card-remote.test.tsx
+new file mode 100644
+index 0000000000..7ed7fd4b3c
+--- /dev/null
++++ b/apps/desktop/src/plugins/kanban/card-remote.test.tsx
+@@ -0,0 +1,61 @@
++/**
++ * A shadow board's card another gateway owns is merged in read-only by the backend (`remote`, `home_gateway`):
++ * the board marks it with its home gateway and leaves ordinary cards unmarked.
++ */
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++import { cleanup, render, screen, within } from '@testing-library/react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++// eslint-disable-next-line no-restricted-imports
++import { registerPluginLocales } from '@/i18n/plugin-i18n'
++
++import type * as KanbanApi from './api'
++import { $boardSlug } from './api'
++import { KanbanBoardPage } from './board'
++import { KANBAN_LOCALES } from './i18n'
++
++vi.mock('./api', async importOriginal => ({
++  ...(await importOriginal<typeof KanbanApi>()),
++  fetchBoards: vi.fn(async () => ({ boards: [{ name: 'App', project_id: null, slug: 'app', total: 2 }], current: 'app' })),
++  fetchBoard: vi.fn(async () => ({
++    assignees: [],
++    columns: [
++      {
++        name: 'ready',
++        tasks: [
++          { id: 't_1a2b3c', status: 'ready', title: 'Hub card' },
++          { home_gateway: 'mini', id: 't_4d5e6f', read_only: true, remote: true, status: 'ready', title: 'APP-12 feature' }
++        ]
++      }
++    ],
++    latest_event_id: 0,
++    now: 0,
++    tenants: []
++  })),
++  fetchOrchestration: vi.fn(async () => ({ default_assignee: '' })),
++  fetchProfiles: vi.fn(async () => ({ profiles: [] }))
++}))
++
++afterEach(() => {
++  cleanup()
++  $boardSlug.set('')
++})
++
++const tileOf = (title: string) => screen.getByText(title).closest<HTMLElement>('[draggable="true"]')!
++
++describe('kanban board: remote shadow-replica cards', () => {
++  it('marks a remote card with its home gateway and leaves local cards unmarked', async () => {
++    const dispose = registerPluginLocales('kanban', KANBAN_LOCALES)
++
++    render(
++      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
++        <KanbanBoardPage />
++      </QueryClientProvider>
++    )
++    await screen.findByText('APP-12 feature')
++
++    expect(within(tileOf('APP-12 feature')).getByText('remote · mini')).toBeTruthy()
++    expect(tileOf('Hub card').querySelector('[data-slot="kanban-card-remote"]')).toBeNull()
++    dispose()
++  })
++})
+diff --git a/apps/desktop/src/plugins/kanban/i18n.ts b/apps/desktop/src/plugins/kanban/i18n.ts
+index cd9dc8a474..fc9998640d 100644
+--- a/apps/desktop/src/plugins/kanban/i18n.ts
++++ b/apps/desktop/src/plugins/kanban/i18n.ts
+@@ -56,6 +56,9 @@ type KanbanMessages = {
+   /** [daveey] Card marker when the owner was unreachable and the card is the hub replica's copy. */
+   fromHub: string
+   fromHubTip: (ago: string) => string
++  /** [daveey] Card marker for a shadow board's card another gateway owns: read-only here. */
++  remoteCard: (home: string) => string
++  remoteCardTip: (home: string) => string
+   allTenants: string
+   showArchived: string
+   groupRunning: string
+@@ -308,6 +311,8 @@ export const en: KanbanMessages = {
+   gatewayUnreachable: (gateway, error) => `${gateway} didn't answer, so its cards are missing: ${error}`,
+   fromHub: 'from hub',
+   fromHubTip: ago => `Its gateway didn't answer; this is the hermes-hub copy, synced ${ago}`,
++  remoteCard: home => `remote · ${home}`,
++  remoteCardTip: home => `read-only: it lives on ${home}; this is a synced copy`,
+   allTenants: 'All tenants',
+   showArchived: 'Show archived',
+   groupRunning: 'Group Running by profile',
+@@ -558,6 +563,8 @@ const ja: KanbanMessages = {
+   gatewayUnreachable: (gateway, error) => `${gateway} が応答しないため、そのカードは表示されていません: ${error}`,
+   fromHub: 'ハブより',
+   fromHubTip: ago => `ゲートウェイが応答しないため、hermes-hub のコピーを表示しています（同期: ${ago}）`,
++  remoteCard: home => `リモート · ${home}`,
++  remoteCardTip: home => `読み取り専用: ${home} 上のカードの同期コピーです`,
+   allTenants: 'すべてのテナント',
+   showArchived: 'アーカイブを表示',
+   groupRunning: '実行中をプロフィールでグループ化',
+@@ -805,6 +812,8 @@ const zh: KanbanMessages = {
+   gatewayUnreachable: (gateway, error) => `${gateway} 未响应，其卡片未显示：${error}`,
+   fromHub: '来自 hub',
+   fromHubTip: ago => `其网关未响应；这是 hermes-hub 的副本，同步于 ${ago}`,
++  remoteCard: home => `远程 · ${home}`,
++  remoteCardTip: home => `只读：卡片属于 ${home}，这里是同步副本`,
+   allTenants: '所有租户',
+   showArchived: '显示已归档',
+   groupRunning: '按配置档分组运行中',
+@@ -1050,6 +1059,8 @@ const zhHant: KanbanMessages = {
+   gatewayUnreachable: (gateway, error) => `${gateway} 未回應，其卡片未顯示：${error}`,
+   fromHub: '來自 hub',
+   fromHubTip: ago => `其閘道未回應；這是 hermes-hub 的副本，同步於 ${ago}`,
++  remoteCard: home => `遠端 · ${home}`,
++  remoteCardTip: home => `唯讀：卡片屬於 ${home}，這裡是同步副本`,
+   allTenants: '所有租戶',
+   showArchived: '顯示已封存',
+   groupRunning: '依設定檔分組執行中',
+diff --git a/apps/desktop/src/plugins/kanban/types.ts b/apps/desktop/src/plugins/kanban/types.ts
+index c555787c35..6730cafa06 100644
+--- a/apps/desktop/src/plugins/kanban/types.ts
++++ b/apps/desktop/src/plugins/kanban/types.ts
+@@ -49,6 +49,11 @@ export interface KanbanTask {
+   from_hub?: boolean
+   /** [daveey] Epoch seconds the replica copy is known current for. */
+   hub_synced_at?: null | number
++  /** [daveey] A shadow-mode board's card that another gateway owns, merged in
++   *  read-only from this gateway's replica; `home_gateway` names the owner. */
++  remote?: boolean
++  read_only?: boolean
++  home_gateway?: null | string
+ }
+ 
+ export interface KanbanColumn {
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 00fe3310d0..085910cc34 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -31,6 +31,8 @@ from hermes_cli import kanban_swarm as ks
+ from hermes_cli import kanban_workflow
+ from hermes_cli import kanban_contract_cli as _contract_cli
+ from hermes_cli import kanban_foreign_card as _foreign_card
++from hermes_cli import kanban_shadow_view as _shadow_view
++from hermes_cli.kanban_show_print import _print_diagnostics, _print_max_retries, _print_section
+ from hermes_cli import kanban_remote_stop as _remote_stop
+ from hermes_cli import kanban_review_contract as _review_contract
+ from hermes_cli import kanban_spend_budget_cli as _spend_budget_cli
+@@ -613,12 +615,15 @@ def _cmd_list(args: argparse.Namespace) -> int:
+         # write, so a fenced worker/delegate shell skips it: listing must not fail there. [daveey]
+         with contextlib.suppress(PermissionError):
+             kb.recompute_ready(conn)
+-        tasks = kb.list_tasks(
+-            conn, assignee=assignee, status=args.status, tenant=args.tenant, session_id=args.session,
++        filters = dict(
++            assignee=assignee, status=args.status, tenant=args.tenant, session_id=args.session,
+             include_archived=args.archived, order_by=getattr(args, "sort", None),
+             workflow_template_id=args.workflow_template_id, current_step_key=args.current_step_key,
+         )
+-    if _json_out(args, [_task_to_dict(t) for t in tasks]):
++        tasks = kb.list_tasks(conn, **filters)
++        remote = _shadow_view.remote_tasks(conn, **filters)  # [daveey] a shadow board's other gateways' cards, read-only
++    if _json_out(args, [_task_to_dict(t) for t in tasks]
++                 + [_shadow_view.mark(_task_to_dict(t), home) for t, home in remote]):
+         return 0
+     # Passive discoverability: only multi-board users see which board this is.
+     try:
+@@ -629,50 +634,16 @@ def _cmd_list(args: argparse.Namespace) -> int:
+         other_count = len(all_boards) - 1
+         print(f"Board: {kb.get_current_board()} ({other_count} other board{'s' if other_count != 1 else ''} — "
+               f"`hermes kanban boards list`)\n")
+-    if not tasks:
++    if not tasks and not remote:
+         print("(no matching tasks)")
+         return 0
+     for t in tasks:
+         print(_fmt_task_line(t))
++    for t, home in remote:
++        print(f"{_fmt_task_line(t)}  [remote:{home}, read-only]")
+     return 0
+ 
+ 
+-def _print_diagnostics(diags, indent: str, *, with_kind: bool) -> None:
+-    """Shared human rendering for ``show`` and ``diagnostics`` (suggested actions only)."""
+-    sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
+-    for d in diags:
+-        head = f"{d.kind}: {d.title}" if with_kind else d.title
+-        print(f"{indent}{sev_marker.get(d.severity, '?')} [{d.severity}] {head}")
+-        if d.data:
+-            bits = [f"{k}={','.join(str(x) for x in v)}" if isinstance(v, list) else f"{k}={v}"
+-                    for k, v in d.data.items()]
+-            if bits:
+-                print(f"{indent}   data: {' | '.join(bits)}")
+-        for a in d.actions:
+-            if a.suggested:
+-                print(f"{indent}   → {a.label}")
+-
+-
+-def _print_section(title: str, lines) -> None:
+-    """Blank line, ``title``, then each line (``show`` body sections)."""
+-    print()
+-    print(title)
+-    for line in lines:
+-        print(line)
+-
+-
+-def _print_max_retries(task) -> None:
+-    """Effective retry threshold (task > config > default); it explains auto-blocks."""
+-    if task.max_retries is not None:
+-        print(f"  max-retries: {task.max_retries} (task)")
+-        return
+-    cfg_val = _kanban_config().get("failure_limit")
+-    if cfg_val is not None and int(cfg_val) != kb.DEFAULT_FAILURE_LIMIT:
+-        print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
+-    else:
+-        print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
+-
+-
+ def _cmd_wait_check(args: argparse.Namespace) -> int:
+     from hermes_cli import kanban_wait_check
+     return kanban_wait_check.run(args)
+@@ -726,8 +697,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
+         return rc
+     graph = None
+     want_json = getattr(args, "json", False)
+-    with kbc.connect_closing() as conn:
+-        task = kb.get_task(conn, args.task_id)
++    with kbc.connect_closing() as live, contextlib.ExitStack() as _scope:
++        task, conn, remote_home = _shadow_view.open_card(live, _scope, args.task_id)  # [daveey] live, else a shadow replica's
+         if not task:
+             from hermes_cli.kanban_pickup_stall import not_here_note
+             return _err(f"no such task: {args.task_id}{not_here_note(conn, args.task_id)}")
+@@ -748,14 +719,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
+         queue_reason = kqr.latest(conn, args.task_id)
+         # Same ``queue`` as kanban_show and the REST read (kanban-7d720d4ab8): a ready card says where it waits. [daveey]
+         from hermes_cli import kanban_queue_position as kqp, kanban_hub_admission_placement as _hub_admission_show
+-        details = kqp.detail_fields(conn, task, getattr(args, "board", None))
++        details = _shadow_view.show_details(conn, task, getattr(args, "board", None), remote_home)
+         queue = details.get("queue")
+         if not want_json:
+             graph = kb.task_graph_context(conn, task.id)
+ 
+     if want_json:
+         _print_json({
+-            "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
++            "task": _shadow_view.mark(_task_to_dict(task), remote_home), "latest_summary": latest_summary, "parents": parents, "children": children,
+             **custody,
+             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
+             "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
+@@ -772,6 +743,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
+ 
+     print(f"Task {task.id}: {task.title}")
+     field("status", kws.status_text(task.status, wakes))
++    _shadow_view.print_remote(field, remote_home)
+     field("assignee", task.assignee or "-")
+     kqr.print_field(queue_reason, field)
+     field("capacity", details["capacity_note"])
+diff --git a/hermes_cli/kanban_shadow_view.py b/hermes_cli/kanban_shadow_view.py
+new file mode 100644
+index 0000000000..97573df29e
+--- /dev/null
++++ b/hermes_cli/kanban_shadow_view.py
+@@ -0,0 +1,125 @@
++"""Read-only view of a shadow-mode board's replica, merged under the hub-local rows. [daveey]
++
++A board synced in ``shadow`` mode (``kanban_sync_state.mode``) keeps only this gateway's own cards in the live
++``kanban.db``; the whole board (the example application's queue, say) lives in the replica
++``kanban/sync-shadow/<board>.db``. Copying those rows into the live file is unsafe (primary mode partitions live
++rows by gateway), so the read paths (``hermes kanban list`` / ``show`` and the dashboard ``/board``) merge them
++in memory instead:
++
++* the replica is opened read-only (:func:`kanban_foreign_card.open_replica`); nothing is written to it;
++* a live row wins on an id collision;
++* every merged row is marked ``remote`` / ``read_only`` and names its home gateway (``created_on``);
++* the dispatcher, claims and the sync mode never see these rows: they read the live file only.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++from contextlib import contextmanager
++from typing import Any, Iterator, Optional
++
++_log = logging.getLogger(__name__)
++
++MODE = "shadow"
++UNKNOWN_HOME = "unknown"
++
++
++def is_shadow(conn: sqlite3.Connection) -> bool:
++    """Whether the board behind the live connection ``conn`` syncs in shadow mode."""
++    from hermes_cli import kanban_db_sync as sync
++    try:
++        state = sync.sync_state(conn)
++    except sqlite3.Error:
++        return False
++    return bool(state) and state.get("mode") == MODE
++
++
++@contextmanager
++def open_shadow_replica(conn: sqlite3.Connection) -> Iterator[Optional[sqlite3.Connection]]:
++    """A read-only connection to the replica of ``conn``'s board when it is a shadow board, else None."""
++    from hermes_cli import kanban_foreign_card as foreign
++    from hermes_cli.kanban_db_connect import _main_db_file
++    if not is_shadow(conn):
++        yield None
++        return
++    with foreign.open_replica(_main_db_file(conn)) as replica:
++        yield replica
++
++
++def db_file(conn: sqlite3.Connection) -> str:
++    """The main database file behind ``conn`` ('' for an in-memory one)."""
++    from hermes_cli.kanban_db_connect import _main_db_file
++    return _main_db_file(conn) or ""
++
++
++def home_of(replica: sqlite3.Connection, task_id: str) -> str:
++    """The gateway that owns ``task_id`` (its ``created_on``), ``UNKNOWN_HOME`` when unrecorded."""
++    from hermes_cli import kanban_foreign_card as foreign
++    try:
++        owner = foreign.created_on(replica, task_id)
++    except sqlite3.Error:
++        return UNKNOWN_HOME
++    return UNKNOWN_HOME if owner is foreign._UNSET or owner is None else str(owner)
++
++
++def open_card(live: sqlite3.Connection, scope: Any, task_id: str) -> tuple[Any, sqlite3.Connection, Optional[str]]:
++    """``(task, connection, remote home)`` for ``hermes kanban show``: the live row, else a shadow board's replica
++    row read through a read-only connection kept open in the ``ExitStack`` ``scope`` (home None for a live row).
++    A card in neither is ``(None, live, None)``."""
++    from hermes_cli import kanban_db as kb
++    task = kb.get_task(live, task_id)
++    if task:
++        return task, live, None
++    replica = scope.enter_context(open_shadow_replica(live))
++    task = kb.get_task(replica, task_id) if replica is not None else None
++    if not task:
++        return None, live, None
++    return task, replica, home_of(replica, task_id) or UNKNOWN_HOME
++
++
++def _live_ids(conn: sqlite3.Connection, ids: list[str]) -> set[str]:
++    found: set[str] = set()
++    for i in range(0, len(ids), 500):
++        chunk = ids[i:i + 500]
++        marks = ",".join("?" * len(chunk))
++        found.update(r[0] for r in conn.execute(f"SELECT id FROM tasks WHERE id IN ({marks})", chunk))
++    return found
++
++
++def remote_tasks(conn: sqlite3.Connection, **filters: Any) -> list[tuple[Any, str]]:
++    """``[(Task, home gateway)]``: the replica's cards matching ``filters`` (the ``list_tasks`` keywords) that the
++    live file lacks. Empty unless ``conn``'s board is a shadow board with a readable replica."""
++    from hermes_cli import kanban_db as kb
++    with open_shadow_replica(conn) as replica:
++        if replica is None:
++            return []
++        try:
++            tasks = kb.list_tasks(replica, **filters)
++            live = _live_ids(conn, [t.id for t in tasks])
++            return [(t, home_of(replica, t.id)) for t in tasks if t.id not in live]
++        except sqlite3.Error as exc:  # an unreadable replica adds nothing; the live rows still list
++            _log.info("kanban: shadow replica read failed (%s)", exc)
++            return []
++
++
++def mark(d: dict[str, Any], home: Optional[str]) -> dict[str, Any]:
++    """``d`` (a task dict) stamped as a remote, read-only row owned by ``home`` (``unknown`` when the replica row
++    records no owner). ``home`` None is a live row (``show``): ``d`` comes back unchanged."""
++    if home is None:
++        return d
++    return {**d, "remote": True, "read_only": True, "home_gateway": home}
++
++
++def show_details(conn: sqlite3.Connection, task: Any, board: Optional[str], home: Optional[str]) -> dict[str, Any]:
++    """``show``'s queue/capacity fields. A remote card has no queue here: it waits on its home gateway."""
++    if home is not None:
++        return {"capacity_note": f"remote (read-only replica of {home})"}
++    from hermes_cli import kanban_queue_position as kqp
++    return kqp.detail_fields(conn, task, board)
++
++
++def print_remote(field: Any, home: Optional[str]) -> None:
++    if home is not None:
++        field("remote", f"read-only copy; home gateway {home}")
++
++
+diff --git a/hermes_cli/kanban_show_print.py b/hermes_cli/kanban_show_print.py
+new file mode 100644
+index 0000000000..0d64783391
+--- /dev/null
++++ b/hermes_cli/kanban_show_print.py
+@@ -0,0 +1,41 @@
++"""Human rendering shared by ``hermes kanban show`` and ``diagnostics`` (split out of ``kanban``)."""
++from __future__ import annotations
++
++from hermes_cli import kanban_db as kb
++from hermes_cli.kanban_ops import _kanban_config
++
++
++def _print_diagnostics(diags, indent: str, *, with_kind: bool) -> None:
++    """Shared human rendering for ``show`` and ``diagnostics`` (suggested actions only)."""
++    sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
++    for d in diags:
++        head = f"{d.kind}: {d.title}" if with_kind else d.title
++        print(f"{indent}{sev_marker.get(d.severity, '?')} [{d.severity}] {head}")
++        if d.data:
++            bits = [f"{k}={','.join(str(x) for x in v)}" if isinstance(v, list) else f"{k}={v}"
++                    for k, v in d.data.items()]
++            if bits:
++                print(f"{indent}   data: {' | '.join(bits)}")
++        for a in d.actions:
++            if a.suggested:
++                print(f"{indent}   → {a.label}")
++
++
++def _print_section(title: str, lines) -> None:
++    """Blank line, ``title``, then each line (``show`` body sections)."""
++    print()
++    print(title)
++    for line in lines:
++        print(line)
++
++
++def _print_max_retries(task) -> None:
++    """Effective retry threshold (task > config > default); it explains auto-blocks."""
++    if task.max_retries is not None:
++        print(f"  max-retries: {task.max_retries} (task)")
++        return
++    cfg_val = _kanban_config().get("failure_limit")
++    if cfg_val is not None and int(cfg_val) != kb.DEFAULT_FAILURE_LIMIT:
++        print(f"  max-retries: {int(cfg_val)} (config kanban.failure_limit)")
++    else:
++        print(f"  max-retries: {kb.DEFAULT_FAILURE_LIMIT} (default)")
+diff --git a/plugins/kanban/dashboard/board_shadow.py b/plugins/kanban/dashboard/board_shadow.py
+new file mode 100644
+index 0000000000..ad6e85bf4f
+--- /dev/null
++++ b/plugins/kanban/dashboard/board_shadow.py
+@@ -0,0 +1,107 @@
++"""``/board``: a shadow board's replica cards, merged read-only under the live ones. [daveey]
++
++``board_read.project`` renders the live file's rows. A board synced in ``shadow`` mode keeps the other gateways'
++cards (the example application's queue) only in the replica, so this adds them to the projected payload: opened
++read-only (``hermes_cli.kanban_shadow_view``), a live card wins on an id collision, each card is stamped
++``remote`` / ``read_only`` / ``home_gateway``. Writes on those cards are already refused as ``foreign_card`` (409).
++"""
++from __future__ import annotations
++
++import os
++import sqlite3
++import threading
++from contextlib import closing
++from typing import Callable
++
++from hermes_cli import kanban_shadow_view as shadow_view
++from plugins.kanban.dashboard import board_read
++
++_LOCK = threading.Lock()
++_MEMO: dict[tuple, tuple[tuple, dict]] = {}
++_MEMO_MAX = 16
++
++
++def _signature(path: str) -> tuple:
++    """Stat of the replica's main, WAL and shm files: any commit the sync pull makes moves one of them."""
++    sig = []
++    for suffix in ("", "-wal", "-shm"):
++        try:
++            st = os.stat(path + suffix)
++            sig.append((st.st_mtime_ns, st.st_size))
++        except OSError:
++            sig.append(None)
++    return tuple(sig)
++
++
++def _remote_rows(key: tuple, replica_path: str, build: Callable[[], dict]) -> dict:
++    sig = _signature(replica_path)
++    with _LOCK:
++        hit = _MEMO.get(key)
++        if hit is not None and hit[0] == sig:
++            return hit[1]
++    rows = build()
++    with _LOCK:
++        if len(_MEMO) >= _MEMO_MAX:
++            _MEMO.pop(next(iter(_MEMO)))
++        _MEMO[key] = (sig, rows)
++    return rows
++
++
++def clear() -> None:
++    with _LOCK:
++        _MEMO.clear()
++
++
++def for_board(payload: dict, connect: Callable, query: tuple, diagnostic_inputs: Callable,
++              diagnostics_from_inputs: Callable) -> dict:
++    """``merge`` on a fresh live connection; ``query`` = (tenant, include_archived, workflow_template_id,
++    current_step_key, done_limit). A live-file failure leaves the payload as it was."""
++    try:
++        with closing(connect()) as live:
++            return merge(payload, live, *query, diagnostic_inputs=diagnostic_inputs,
++                         diagnostics_from_inputs=diagnostics_from_inputs)
++    except sqlite3.Error:
++        return payload
++
++
++def merge(payload: dict, live, tenant, include_archived, workflow_template_id, current_step_key, done_limit, *,
++          diagnostic_inputs: Callable, diagnostics_from_inputs: Callable) -> dict:
++    """``payload`` (``board_read.project`` of the live rows) plus the replica's cards the live file lacks."""
++    with shadow_view.open_shadow_replica(live) as replica:
++        if replica is None:
++            return payload
++        live_file = shadow_view.db_file(live)
++        replica_file = shadow_view.db_file(replica)
++        key = (live_file, tenant, bool(include_archived), workflow_template_id, current_step_key, int(done_limit or 0))
++        try:
++            rows = _remote_rows(key, replica_file, lambda: board_read.materialize(
++                replica, tenant, include_archived, workflow_template_id, current_step_key, done_limit,
++                diagnostic_inputs=diagnostic_inputs))
++        except Exception:  # health: allow BLE001 -- an unreadable replica must not take the live board down with it
++            shadow_view._log.warning("kanban: shadow replica board read failed", exc_info=True)
++            return payload
++        homes = {t.id: shadow_view.home_of(replica, t.id) for t, _f, _x in rows["cards"]}
++    live_ids = {t["id"] for col in payload["columns"] for t in col["tasks"]}
++    live_ids |= shadow_view._live_ids(live, [i for i in homes if i not in live_ids])
++    remote_ids = set(homes) - live_ids
++    cards = tuple(c for c in rows["cards"] if c[0].id in remote_ids)
++    done_remote = sum(1 for t, _f, _x in cards if t.status == "done")
++    remote = board_read.project({**rows, "cards": cards, "done_total": done_remote}, include_archived,
++                                diagnostics_from_inputs)
++    by_name = {c["name"]: c for c in remote["columns"]}
++    for col in payload["columns"]:
++        extra = by_name.get(col["name"])
++        if extra is None:
++            continue
++        col["tasks"] = col["tasks"] + [shadow_view.mark(t, homes.get(t["id"])) for t in extra["tasks"]]
++        if col["name"] == "done":
++            col["tasks"].sort(key=lambda d: d["id"], reverse=True)
++            col["tasks"].sort(key=lambda d: (d["completed_at"] is None, -(d["completed_at"] or 0)))
++            total = col.get("total", 0) + done_remote
++            if int(done_limit or 0) > 0:
++                col["tasks"] = col["tasks"][:int(done_limit)]
++            col["total"] = total
++            col["omitted"] = total - len(col["tasks"])
++    payload["tenants"] = sorted(set(payload["tenants"]) | set(remote["tenants"]))
++    payload["assignees"] = sorted(set(payload["assignees"]) | set(remote["assignees"]))
++    return payload
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index cad3e5bdf4..4fc07662aa 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -42,9 +42,9 @@ from hermes_cli import kanban_db_dispatch as kbd
+ from hermes_cli import kanban_db_workspace as kbw
+ from hermes_cli import kanban_diagnostics as kd
+ from plugins.kanban.dashboard.board_diagnostics import _attach_diagnostics, _warnings_summary_from_diagnostics
+-from plugins.kanban.dashboard import board_read
++from plugins.kanban.dashboard import board_read, board_shadow
+ from plugins.kanban.dashboard.board_read import (  # BOARD_COLUMNS: the documented column list
+-    BOARD_COLUMNS, diagnostic_inputs as _diagnostic_inputs, diagnostics_from_inputs as _diagnostics_from_inputs)
++    BOARD_COLUMNS, _placeholders, diagnostic_inputs as _diagnostic_inputs, diagnostics_from_inputs as _diagnostics_from_inputs)
+ from plugins.kanban.dashboard.plugin_api_human_request import ask_filing_refusal, classify_request
+ from plugins.kanban.dashboard.plugin_api_comment_actor import CommentBody, admitted_relay, comment_relay, comment_writer
+ from plugins.kanban.dashboard.plugin_api_remote_lease import archive as _archive, lease_refusal, patch_verb, refuse_live_lease
+@@ -216,10 +216,6 @@ def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
+         "size": a.size, "uploaded_by": a.uploaded_by, "stored_path": a.stored_path, "created_at": a.created_at}
+ 
+ 
+-def _placeholders(ids: list) -> str:
+-    return ",".join(["?"] * len(ids))
+-
+-
+ def _compute_task_diagnostics(conn: sqlite3.Connection, task_ids: Optional[list[str]] = None) -> dict[str, list[dict]]:
+     """``{task_id: [diagnostic_dict, ...]}`` (tasks with none omitted) via three aggregate
+     queries (tasks, events, runs) — slurps the board; paginate if profiling shows a hotspot."""
+@@ -294,7 +290,10 @@ def _get_board_uncached(tenant, include_archived, board, workflow_template_id, c
+         rows = board_rows.incremental(
+             (path, tenant, bool(include_archived), workflow_template_id, current_step_key, done_limit),
+             path, build, fallback)
+-    return board_read.project(rows, include_archived, _diagnostics_from_inputs)
++    payload = board_read.project(rows, include_archived, _diagnostics_from_inputs)
++    return board_shadow.for_board(  # [daveey] a shadow-mode board's other gateways' cards, read-only
++        payload, lambda: _conn(board=board), (tenant, include_archived, workflow_template_id, current_step_key, done_limit),
++        _diagnostic_inputs, _diagnostics_from_inputs)
+ 
+ 
+ _read_board = coalesced_read(get_board, admission_key=lambda a: (a.get("board") or "").strip().lower(), max_concurrent=2)  # one read per board, at most 2 boards: hub A/B, a cap of 4 made the default board's cold read time out
+diff --git a/scripts/boundary_lint_baseline.json b/scripts/boundary_lint_baseline.json
+index 914c36421b..f2f9975935 100644
+--- a/scripts/boundary_lint_baseline.json
++++ b/scripts/boundary_lint_baseline.json
+@@ -193,6 +193,7 @@
+     "plugins/kanban/dashboard/board_rows.py hermes_cli.kanban_task_change": 2,
+     "plugins/kanban/dashboard/board_rows.py hermes_cli.loop_accounting": 1,
+     "plugins/kanban/dashboard/board_rows.py hermes_state_guard.ensure_kanban_test_isolation": 1,
++    "plugins/kanban/dashboard/board_shadow.py hermes_cli.kanban_shadow_view": 1,
+     "plugins/kanban/dashboard/plugin_api.py agent.auxiliary_client.call_llm": 1,
+     "plugins/kanban/dashboard/plugin_api.py agent.portal_tags.get_affinity_scope": 1,
+     "plugins/kanban/dashboard/plugin_api.py agent.portal_tags.reset_affinity_scope": 1,
+diff --git a/tests/hermes_cli/test_kanban_shadow_view.py b/tests/hermes_cli/test_kanban_shadow_view.py
+new file mode 100644
+index 0000000000..8f46208907
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_shadow_view.py
+@@ -0,0 +1,142 @@
++"""A shadow-mode board lists and shows the replica's cards read-only; the replica is never written."""
++from contextlib import closing
++import json
++
++import pytest
++
++from hermes_cli import kanban as kanban_cli
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_shadow_view as shadow_view
++
++
++def _replica_card(replica, title, *, home="mini", status=None, tid=None):
++    tid = kb.create_task(replica, title=title, assignee="default")
++    if status:
++        replica.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
++    replica.execute("UPDATE tasks SET created_on = ? WHERE id = ?", (home, tid))
++    return tid
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    """A live board in ``mode`` plus its replica holding two mini cards and one id the live file also has."""
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK"):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setattr(sync, "sync_config", lambda: {"enabled": True, "boards": ["default"]})
++    kb.init_db()
++    with closing(kbc.connect()) as live, live:
++        live_id = kb.create_task(live, title="Hub card", assignee="default")
++        sync.set_mode(live, "shadow")
++    shadow = home / "kanban" / sync.SHADOW_DIR / "default.db"
++    shadow.parent.mkdir(parents=True, exist_ok=True)
++    out = {"live_id": live_id, "shadow": shadow, "home": home}
++    with closing(kbc.connect(shadow)) as replica, replica:
++        if "created_on" not in {r[1] for r in replica.execute("PRAGMA table_info(tasks)")}:
++            replica.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")
++        out["ready_id"] = _replica_card(replica, "Mini ready", status="ready")
++        out["done_id"] = _replica_card(replica, "Mini done", status="done")
++        # Same id as the hub's own card, different title/status: the hub row must win.
++        replica.execute("INSERT INTO tasks (id, title, status, created_at, created_on) VALUES (?, ?, 'ready', 1, 'mini')",
++                        (live_id, "Mini copy of hub card"))
++    return out
++
++
++def _list_json(*args):
++    return json.loads(kanban_cli.run_slash("list --json " + " ".join(args)))
++
++
++def test_list_merges_replica_cards_marked_remote_read_only(board):
++    rows = {r["id"]: r for r in _list_json()}
++    assert board["ready_id"] in rows and board["live_id"] in rows
++    assert board["done_id"] in rows  # `list` shows done cards; only archived are hidden
++    mini = rows[board["ready_id"]]
++    assert (mini["remote"], mini["read_only"], mini["home_gateway"]) == (True, True, "mini")
++    assert "remote" not in rows[board["live_id"]]
++
++
++def test_list_text_names_the_home_gateway(board):
++    out = kanban_cli.run_slash("list")
++    line = next(ln for ln in out.splitlines() if board["ready_id"] in ln)
++    assert "[remote:mini, read-only]" in line
++    hub = next(ln for ln in out.splitlines() if board["live_id"] in ln)
++    assert "remote" not in hub
++
++
++def test_list_filters_apply_to_replica_rows(board):
++    ids = {r["id"] for r in _list_json("--status ready")}
++    assert board["ready_id"] in ids and board["done_id"] not in ids
++
++
++def test_hub_row_wins_on_id_collision(board):
++    rows = [r for r in _list_json() if r["id"] == board["live_id"]]
++    assert len(rows) == 1
++    assert rows[0]["title"] == "Hub card" and "remote" not in rows[0]
++    shown = json.loads(kanban_cli.run_slash(f"show {board['live_id']} --json"))
++    assert shown["task"]["title"] == "Hub card" and "remote" not in shown["task"]
++
++
++def test_show_reads_a_replica_only_card_read_only(board):
++    shown = json.loads(kanban_cli.run_slash(f"show {board['ready_id']} --json"))
++    assert shown["task"]["title"] == "Mini ready"
++    assert (shown["task"]["remote"], shown["task"]["read_only"], shown["task"]["home_gateway"]) == (True, True, "mini")
++    text = kanban_cli.run_slash(f"show {board['ready_id']}")
++    assert "home gateway mini" in text
++
++
++def test_missing_card_still_not_found(board):
++    assert "no such task" in kanban_cli.run_slash("show t_nope")
++
++
++@pytest.mark.parametrize("mode", ["primary", "off"])
++def test_other_modes_do_not_merge(board, mode):
++    with closing(kbc.connect()) as live, live:
++        live.execute("UPDATE kanban_sync_state SET mode = ?", (mode,))
++    assert {r["id"] for r in _list_json()} == {board["live_id"]}
++    assert "no such task" in kanban_cli.run_slash(f"show {board['ready_id']}")
++
++
++def test_sync_disabled_does_not_merge(board, monkeypatch):
++    monkeypatch.setattr(sync, "sync_config", lambda: {"enabled": False})
++    assert {r["id"] for r in _list_json()} == {board["live_id"]}
++
++
++def test_reading_never_writes_the_replica(board):
++    shadow = board["shadow"]
++    before, mtime = shadow.read_bytes(), shadow.stat().st_mtime_ns
++    _list_json()
++    _list_json("--archived")
++    kanban_cli.run_slash("list")
++    kanban_cli.run_slash(f"show {board['ready_id']}")
++    kanban_cli.run_slash(f"show {board['ready_id']} --json")
++    assert shadow.read_bytes() == before and shadow.stat().st_mtime_ns == mtime
++    wal = shadow.with_name(shadow.name + "-wal")
++    assert not wal.exists() or wal.stat().st_size == 0  # no frame was ever appended
++
++
++def test_replica_read_uses_a_read_only_connection(board):
++    with closing(kbc.connect()) as live, shadow_view.open_shadow_replica(live) as replica:
++        assert replica is not None
++        with pytest.raises(Exception, match="readonly|read-only|read only"):
++            replica.execute("UPDATE tasks SET title = 'x'")
++
++
++def test_dispatcher_never_claims_a_shadow_row(board):
++    spawned = []
++    shadow = board["shadow"]
++    before = shadow.read_bytes()
++    with closing(kbc.connect()) as live:
++        res = kbd.dispatch_once(live, spawn_fn=lambda *a, **k: spawned.append(a) or 1234)
++        assert kb.get_task(live, board["ready_id"]) is None  # never imported into the live file
++        assert kb.claim_task(live, board["ready_id"], claimer="worker") is None
++        assert kb.claim_task(live, board["done_id"], claimer="worker") is None
++    assert board["ready_id"] not in {row[0] for row in res.spawned}
++    with closing(kbc.connect(shadow)) as replica:
++        row = replica.execute("SELECT status, claim_lock FROM tasks WHERE id = ?", (board["ready_id"],)).fetchone()
++    assert (row[0], row[1]) == ("ready", None)
++    assert shadow.read_bytes() == before
+diff --git a/tests/plugins/test_kanban_board_shadow.py b/tests/plugins/test_kanban_board_shadow.py
+new file mode 100644
+index 0000000000..ab80ab77a6
+--- /dev/null
++++ b/tests/plugins/test_kanban_board_shadow.py
+@@ -0,0 +1,129 @@
++"""``/board`` on a shadow-mode board adds the replica's cards, read-only; the replica is never written."""
++from __future__ import annotations
++
++from contextlib import closing
++import importlib.util
++import sys
++from pathlib import Path
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++
++
++def _load_plugin():
++    plugin_file = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
++    spec = importlib.util.spec_from_file_location("hermes_kanban_plugin_board_shadow_test", plugin_file)
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
++def _cards(body):
++    return {t["id"]: t for col in body["columns"] for t in col["tasks"]}
++
++
++def _column(body, name):
++    return next(c for c in body["columns"] if c["name"] == name)
++
++
++@pytest.fixture
++def shadow_board(tmp_path, monkeypatch):
++    from plugins.kanban.dashboard import board_rows, board_shadow
++
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    monkeypatch.setattr(sync, "sync_config", lambda: {"enabled": True, "boards": ["default"]})
++    kb.init_db()
++    board_rows.clear()
++    board_shadow.clear()
++    with closing(kbc.connect()) as live, live:
++        live_id = kb.create_task(live, title="Hub card", assignee="default")
++        sync.set_mode(live, "shadow")
++    shadow = home / "kanban" / sync.SHADOW_DIR / "default.db"
++    shadow.parent.mkdir(parents=True, exist_ok=True)
++    out = {"live_id": live_id, "shadow": shadow, "mod": _load_plugin()}
++    with closing(kbc.connect(shadow)) as replica, replica:
++        if "created_on" not in {r[1] for r in replica.execute("PRAGMA table_info(tasks)")}:
++            replica.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")
++        ids = {}
++        for name, status in (("ready", "ready"), ("running", "running"), ("done", "done")):
++            ids[name] = kb.create_task(replica, title=f"Mini {name}", assignee="default")
++            replica.execute("UPDATE tasks SET status = ?, created_on = 'mini' WHERE id = ?", (status, ids[name]))
++        replica.execute("INSERT INTO tasks (id, title, status, created_at, created_on) VALUES (?, ?, 'ready', 1, 'mini')",
++                        (live_id, "Mini copy of hub card"))
++    out.update(ids)
++    yield out
++    board_rows.clear()
++    board_shadow.clear()
++
++
++def _read(env, **kw):
++    return env["mod"]._get_board_uncached(None, kw.get("archived", False), None, None, None, kw.get("done_limit", 80))
++
++
++def test_board_shows_replica_cards_marked_remote_read_only(shadow_board):
++    cards = _cards(_read(shadow_board))
++    for name, column in (("ready", "ready"), ("running", "running"), ("done", "done")):
++        card = cards[shadow_board[name]]
++        assert (card["remote"], card["read_only"], card["home_gateway"]) == (True, True, "mini")
++        assert card["status"] == column
++    assert "remote" not in cards[shadow_board["live_id"]]
++
++
++def test_board_hub_row_wins_on_id_collision(shadow_board):
++    body = _read(shadow_board)
++    rows = [t for col in body["columns"] for t in col["tasks"] if t["id"] == shadow_board["live_id"]]
++    assert len(rows) == 1 and rows[0]["title"] == "Hub card" and "remote" not in rows[0]
++
++
++def test_board_done_column_total_counts_remote_cards(shadow_board):
++    done = _column(_read(shadow_board), "done")
++    assert done["total"] == 1 and done["omitted"] == 0
++    capped = _column(_read(shadow_board, done_limit=1), "done")
++    assert len(capped["tasks"]) == 1 and capped["total"] == 1
++
++
++def test_board_without_shadow_mode_is_live_only(shadow_board):
++    with closing(kbc.connect()) as live, live:
++        live.execute("UPDATE kanban_sync_state SET mode = 'primary'")
++    assert set(_cards(_read(shadow_board))) == {shadow_board["live_id"]}
++
++
++def test_board_read_never_writes_the_replica(shadow_board):
++    shadow = shadow_board["shadow"]
++    before, mtime = shadow.read_bytes(), shadow.stat().st_mtime_ns
++    _read(shadow_board)
++    _read(shadow_board, archived=True)
++    assert shadow.read_bytes() == before and shadow.stat().st_mtime_ns == mtime
++    wal = shadow.with_name(shadow.name + "-wal")
++    assert not wal.exists() or wal.stat().st_size == 0
++
++
++def test_board_follows_a_replica_commit(shadow_board):
++    first = _cards(_read(shadow_board))
++    with closing(kbc.connect(shadow_board["shadow"])) as replica, replica:
++        replica.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (shadow_board["ready"],))
++    assert first[shadow_board["ready"]]["status"] == "ready"
++    assert _cards(_read(shadow_board))[shadow_board["ready"]]["status"] == "blocked"
++
++
++def test_http_board_route_and_writes_on_remote_card_refused(shadow_board):
++    app = FastAPI()
++    app.include_router(shadow_board["mod"].router, prefix="/api/plugins/kanban")
++    client = TestClient(app)
++    res = client.get("/api/plugins/kanban/board")
++    assert res.status_code == 200
++    card = _cards(res.json())[shadow_board["ready"]]
++    assert card["read_only"] is True and card["home_gateway"] == "mini"
++    patch = client.patch(f"/api/plugins/kanban/tasks/{shadow_board['ready']}", json={"status": "done"})
++    assert patch.status_code == 409 and "foreign_card" in patch.text
++    shown = client.get(f"/api/plugins/kanban/tasks/{shadow_board['ready']}")
++    assert shown.status_code == 200 and shown.json()["source"] == "replica"
+-- 
+2.43.0
+

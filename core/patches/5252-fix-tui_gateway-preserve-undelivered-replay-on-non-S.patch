@@ -1,0 +1,175 @@
+From f6b102334b0c26e149ea1c4b6e468f83fad4f192 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 14:35:25 +0000
+Subject: [PATCH] fix(tui_gateway): preserve undelivered replay on non-Stop
+ interrupts [daveey]
+
+Send-now, rewind, deletion and plugin interrupt origins stop the current turn,
+not automation notices that have never reached its transcript. Scope the replay
+cancellation fence to plain Stop origins in both interrupt RPC paths while
+preserving the existing interruption/queue policy.
+
+Exercise the durable successful-context fence through the actual prompt worker,
+with unpersisted, later-joined and foreign-profile controls. Exercise admitted
+crash recovery through the actual consumer, not a direct journal settle call.
+
+Proof: non-Stop regression reproduced eight failures on reviewed head; both
+compute and in-process paths pass after the fix. Canonical tests and targeted
+source mutants cover the durable success watermark and admitted consumer seam.
+---
+ .../test_automation_replay_dispatch.py         | 17 +++++++++++++++++
+ tests/tui_gateway/test_refused_turn_retry.py   | 18 ++++++++++++++++++
+ .../test_update_hold_submit_queue.py           | 17 +++++++++++++++++
+ tui_gateway/methods_session_interrupt.py       |  5 +++--
+ tui_gateway/session_lifecycle.py               |  6 ++++--
+ 5 files changed, 59 insertions(+), 4 deletions(-)
+
+diff --git a/tests/tui_gateway/test_automation_replay_dispatch.py b/tests/tui_gateway/test_automation_replay_dispatch.py
+index a34460926c..6427eca715 100644
+--- a/tests/tui_gateway/test_automation_replay_dispatch.py
++++ b/tests/tui_gateway/test_automation_replay_dispatch.py
+@@ -65,6 +65,23 @@ def test_admitted_receipt_recovers_without_assistant_or_second_dispatch(store):
+     assert journal.owners() == []
+ 
+ 
++def test_consumer_settles_admitted_crash_without_another_wake(store, monkeypatch):
++    from tui_gateway import automation_replay as ar
++    db, journal, batch = store
++    pending, _ = stage(db, journal, batch)
++    assert pending.admit()
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: None)
++    monkeypatch.setattr(ar, "_holder_alive", lambda _: False)
++    monkeypatch.setattr(ar, "_deliveries", {})
++    wakes = []
++    for _ in range(3):
++        ar.consume_handoffs([journal.path.parent], now=100,
++                            wake=lambda *a, **kw: wakes.append(a) or "started")
++    assert wakes == []
++    assert journal.owners() == []
++    assert len(db.get_messages("chat")) == 1
++
++
+ def test_admitted_quota_rewall_can_transfer_to_new_attempt(store):
+     db, journal, batch = store
+     pending, _ = stage(db, journal, batch)
+diff --git a/tests/tui_gateway/test_refused_turn_retry.py b/tests/tui_gateway/test_refused_turn_retry.py
+index 9c74c679c6..3267528606 100644
+--- a/tests/tui_gateway/test_refused_turn_retry.py
++++ b/tests/tui_gateway/test_refused_turn_retry.py
+@@ -217,7 +217,21 @@ def test_successful_prompt_uses_its_context_start_for_replay_cancellation(
+     schedule("unpersisted", persisted=False)
+     schedule("foreign", profile=foreign)
+ 
++    from hermes_state import SessionDB
++    from tui_gateway.automation_replay_handoff import Journal
++    from tests.tui_gateway.test_automation_replay_handoff import item
++    import json
++
++    for profile in (home, foreign):
++        profile.mkdir(parents=True, exist_ok=True)
++        SessionDB(profile / "state.db").close()
++    journal, other = Journal(home), Journal(foreign)
++    journal.publish("session-key", [item("carried", created=90),
++                                   item("unpersisted", created=90, persisted=False)])
++    other.publish("session-key", [item("foreign", created=90)])
++
+     def run(message, **kwargs):
++        journal.publish("session-key", [item("joined", created=110)])
+         schedule("joined after context", now=110)
+         clock["now"] = 120.0
+         return dict(OK)
+@@ -229,6 +243,10 @@ def test_successful_prompt_uses_its_context_start_for_replay_cancellation(
+     assert [i.text for i in replay._entries[(str(home), "session-key")].items] == [
+         "unpersisted", "joined after context"]
+     assert [i.text for i in replay._entries[(str(foreign), "session-key")].items] == ["foreign"]
++    surviving = journal.claim("session-key", 5000, "probe", lambda _: False)
++    assert {i["id"] for i in json.loads(surviving["payload"])} == {"unpersisted", "joined"}
++    untouched = other.claim("session-key", 5000, "probe", lambda _: False)
++    assert {i["id"] for i in json.loads(untouched["payload"])} == {"foreign"}
+ 
+ 
+ @pytest.mark.parametrize("kind", KINDS)
+diff --git a/tests/tui_gateway/test_update_hold_submit_queue.py b/tests/tui_gateway/test_update_hold_submit_queue.py
+index 2a84436166..08ce2aa4d2 100644
+--- a/tests/tui_gateway/test_update_hold_submit_queue.py
++++ b/tests/tui_gateway/test_update_hold_submit_queue.py
+@@ -537,6 +537,23 @@ def test_non_stop_gestures_clear_the_held_queue_as_before(stoppable, origin, com
+     assert read_turn_marker(held.home, "session-key") is None
+ 
+ 
++@pytest.mark.parametrize("origin", [None, "esc", "send_now", "rewind", "delete", "plugin:hermes-bots"])
++@pytest.mark.parametrize("compute_host", [False, True])
++def test_only_plain_stop_cancels_unpersisted_replay(stoppable, origin, compute_host, monkeypatch):
++    from tui_gateway.automation_replay_handoff import Journal
++    from tests.tui_gateway.test_automation_replay_handoff import item
++    held = stoppable
++    # Delivery has not reached this chat's transcript; interrupting for another operation must keep it.
++    with sqlite3.connect(held.home / "state.db"):
++        pass
++    journal = Journal(held.home)
++    journal.publish("session-key", [item("undelivered", persisted=False)])
++    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: compute_host)
++    response = _interrupt(**({"origin": origin} if origin else {}))
++    assert response["result"]["status"] == "interrupted", response
++    assert journal.owners() == ([] if origin in (None, "esc") else ["session-key"])
++
++
+ def test_idle_stop_still_clears_an_ordinary_queue(stoppable):
+     """Negative control: only the update-held envelope survives; an unlabelled queued prompt is cancelled."""
+     held = stoppable
+diff --git a/tui_gateway/methods_session_interrupt.py b/tui_gateway/methods_session_interrupt.py
+index 418e291d5b..c512a94b8d 100644
+--- a/tui_gateway/methods_session_interrupt.py
++++ b/tui_gateway/methods_session_interrupt.py
+@@ -210,7 +210,7 @@ def _(rid, params: dict) -> dict:
+             outcome: dict = {}
+             try:
+                 _interrupt_session_turn(sid, session, request_id=f"interrupt-{rid}", keep_update_held_queue=keep_held,
+-                                        outcome=outcome)
++                                        outcome=outcome, cancel_automation_replays=keep_held)
+             except Exception as exc:  # health: allow BLE001 -- the bridge raises transport-specific errors unknown here; logged, and Stop recovers the session instead of failing
+                 logger.warning("session.interrupt: compute-host interrupt failed for %s: %s", sid, exc)
+                 _recover_unreachable_compute_host_turn(sid, session, inflight_at_interrupt,
+@@ -220,7 +220,8 @@ def _(rid, params: dict) -> dict:
+         # failed Stop with 5032 once the build failed or outlived 30s (and started a build for a lazy session), so
+         # the Desktop, which interrupts before session.close, could not delete such a session (#133262).
+         outcome = {}
+-        _interrupt_session_turn(sid, session, keep_update_held_queue=keep_held, outcome=outcome)
++        _interrupt_session_turn(sid, session, keep_update_held_queue=keep_held, outcome=outcome,
++                                cancel_automation_replays=keep_held)
+         if outcome.get("kept_update_held_queue"):
+             # Decided with the keep, under the same lock (never re-read here: the hold can lift and a drain start
+             # the kept turn, with its own marker and key, after the helper returned). The kept queue's durable
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index 1a7c848c45..caa4b18afc 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -923,7 +923,7 @@ def _cancel_background_review_on_stop(session: dict) -> None:
+ 
+ def _interrupt_session_turn(
+     sid: str, session: dict, *, request_id: str | None = None, orphan: bool = False, reason: str | None = None,
+-    keep_update_held_queue: bool = False, outcome: dict | None = None,
++    keep_update_held_queue: bool = False, outcome: dict | None = None, cancel_automation_replays: bool = True,
+ ) -> bool:
+     """Apply the shared ``session.interrupt`` contract to one claimed session; returns whether the compute-host control
+     channel was used. The WS orphan reaper reuses this so a dead client gets the same partial-history/queue semantics.
+@@ -940,13 +940,15 @@ def _interrupt_session_turn(
+     The keep is decided ONCE, under ``history_lock`` and before any compute-host I/O, and a kept Stop is a
+     no-op for the turn machinery: no child interrupt frame (the child would bump its own queue generation
+     while the parent's stays, so the drained turn would arrive stale and end as ``interrupted`` unseen).
++    ``cancel_automation_replays`` is false for interrupts serving send-now/rewind/delete/plugin operations:
++    those stop the current turn, not automation deliveries that never reached its transcript.
+     ``outcome`` (optional, filled in place): ``kept_update_held_queue`` (that decision) and
+     ``stale_marker_key`` (an ``_active_turn_marker_key`` of an earlier turn, taken under the same lock when
+     kept), so a caller acts on this Stop's decision instead of re-reading state a drain may have changed since.
+     """
+     reason = reason or ("ws_orphan" if orphan else "user_stop")
+     agent_tool_reason = None if reason == "user_stop" else reason.replace("_", " ")
+-    if reason == "user_stop":  # [daveey] an explicit Stop fences handed-off automation replays (shutdown does not)
++    if reason == "user_stop" and cancel_automation_replays:  # [daveey] only a plain Stop cancels undelivered work
+         from tui_gateway import automation_replay
+         import time as _time
+         automation_replay.cancel_durable(session.get("profile_home"), (session.get("session_key"),),
+-- 
+2.43.0
+

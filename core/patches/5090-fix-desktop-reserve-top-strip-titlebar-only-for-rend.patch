@@ -1,0 +1,155 @@
+From 4990c8adab26fbe99e535c3ed148101d85bf62cc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 04:37:46 +0000
+Subject: [PATCH] fix(desktop): reserve top strip titlebar only for rendered
+ content [daveey]
+
+Measure the mounted shell strip's natural height and observe its resizes.
+Null-rendering contributors keep the old titlebar geometry while remaining
+mounted, allowing their own asynchronous state to reveal content later.
+Keep pane identity stable as the band appears and disappears.
+
+Cause: registration count was treated as rendered height, but lanes stays
+registered while returning null before configuration or API readiness.
+
+Proof: regression fails against ee0f2cd1cd's top-strip.tsx (1 failed/3 passed);
+with the fix top-strip, top-strip-layout and single-main-tab pass (13 tests).
+Desktop tsc --noEmit passes with a 3072MB heap; full scripts/check passes.
+No SDK or plugin changes, no Desktop restart.
+
+Implemented-by: gpt-6.1-sol (OpenAI)
+---
+ apps/desktop/src/app/shell/top-strip.test.tsx | 54 ++++++++++++++++++-
+ apps/desktop/src/app/shell/top-strip.tsx      | 27 +++++++++-
+ 2 files changed, 78 insertions(+), 3 deletions(-)
+
+diff --git a/apps/desktop/src/app/shell/top-strip.test.tsx b/apps/desktop/src/app/shell/top-strip.test.tsx
+index 318fa31cc3..c8c0801fe2 100644
+--- a/apps/desktop/src/app/shell/top-strip.test.tsx
++++ b/apps/desktop/src/app/shell/top-strip.test.tsx
+@@ -1,6 +1,7 @@
+ // @vitest-environment jsdom
+ import { act, cleanup, render, screen } from '@testing-library/react'
+-import { afterEach, expect, it, vi } from 'vitest'
++import { useState } from 'react'
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+ 
+ import { registry } from '@/contrib/registry'
+ import * as areas from '@/sdk/areas'
+@@ -17,9 +18,60 @@ vi.mock('@/components/pane-shell/tree/renderer', () => ({
+ vi.mock('./use-touch-titlebar', () => ({ useTitlebarHeight: () => 34 }))
+ 
+ const disposers: (() => void)[] = []
++const resizeCallbacks = new Set<() => void>()
++beforeEach(() => {
++  // jsdom has no layout; model the strip's natural block height from its content.
++  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
++    return { height: this.querySelector('button') ? 24 : 0 } as DOMRect
++  })
++  vi.stubGlobal(
++    'ResizeObserver',
++    class {
++      constructor(private callback: () => void) {}
++      observe() {
++        resizeCallbacks.add(this.callback)
++      }
++      disconnect() {
++        resizeCallbacks.delete(this.callback)
++      }
++    }
++  )
++})
+ afterEach(() => {
+   cleanup()
+   disposers.splice(0).forEach(dispose => dispose())
++  expect(resizeCallbacks.size).toBe(0)
++  vi.restoreAllMocks()
++  vi.unstubAllGlobals()
++})
++
++it('keeps old geometry for a registered component returning null, including internal state transitions', () => {
++  let setVisible!: (visible: boolean) => void
++
++  function Strip() {
++    const [visible, update] = useState(false)
++    setVisible = update
++
++    return visible ? <button>Working</button> : null
++  }
++
++  disposers.push(registry.register({ id: 'conditional', area: 'shell.topStrip', render: () => <Strip /> }))
++  const { container } = render(<ShellWorkspace />)
++  const workspace = screen.getByTestId('workspace')
++
++  const assertGeometry = (visible: boolean) => {
++    expect(container.querySelector('[data-shell-titlebar-band]') !== null).toBe(visible)
++    expect(workspace.dataset.titlebar).toBe(String(!visible))
++    expect(screen.getByTestId('workspace')).toBe(workspace)
++  }
++
++  assertGeometry(false)
++  act(() => setVisible(true))
++  act(() => resizeCallbacks.forEach(callback => callback()))
++  assertGeometry(true)
++  act(() => setVisible(false))
++  act(() => resizeCallbacks.forEach(callback => callback()))
++  assertGeometry(false)
+ })
+ 
+ it('exports the shell-wide area alongside the statusbar areas', () => {
+diff --git a/apps/desktop/src/app/shell/top-strip.tsx b/apps/desktop/src/app/shell/top-strip.tsx
+index cd537f37ad..2779d6141d 100644
+--- a/apps/desktop/src/app/shell/top-strip.tsx
++++ b/apps/desktop/src/app/shell/top-strip.tsx
+@@ -1,3 +1,5 @@
++import { useLayoutEffect, useRef, useState } from 'react'
++
+ import { LayoutTreeRoot } from '@/components/pane-shell/tree/renderer'
+ import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
+ import { useContributions } from '@/contrib/react/use-contributions'
+@@ -11,7 +13,27 @@ import { useTitlebarHeight } from './use-touch-titlebar'
+ export function ShellWorkspace() {
+   const items = useContributions(TOP_STRIP_AREA).filter(item => item.render)
+   const titlebarHeight = useTitlebarHeight()
+-  const hasStrip = items.length > 0
++  const stripRef = useRef<HTMLDivElement>(null)
++  const [hasContent, setHasContent] = useState(false)
++  const hasItems = items.length > 0
++  const hasStrip = hasItems && hasContent
++
++  useLayoutEffect(() => {
++    const strip = stripRef.current
++
++    if (!strip) {
++      return
++    }
++
++    // Keep contributors mounted even at zero height: their own state can reveal
++    // content without changing the registry. Observe natural height, not count.
++    const measure = () => setHasContent(strip.getBoundingClientRect().height > 0)
++    measure()
++    const observer = new ResizeObserver(measure)
++    observer.observe(strip)
++
++    return () => observer.disconnect()
++  }, [hasItems])
+ 
+   return (
+     <>
+@@ -24,11 +46,12 @@ export function ShellWorkspace() {
+           style={{ height: titlebarHeight }}
+         />
+       )}
+-      {hasStrip && (
++      {hasItems && (
+         <div
+           className="flex w-full min-w-0 shrink-0 flex-col [-webkit-app-region:no-drag]"
+           data-shell-top-strip=""
+           key="strip"
++          ref={stripRef}
+         >
+           {items.map(item => (
+             <ContribBoundary id={item.id} key={`${item.source ?? 'core'}:${item.id}`} variant="chip">
+-- 
+2.43.0
+

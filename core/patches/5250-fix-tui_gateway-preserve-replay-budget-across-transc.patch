@@ -1,0 +1,136 @@
+From 8de01db60d278c7a388b36394bf25549938c0ba3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:10:42 +0000
+Subject: [PATCH] fix(tui_gateway): preserve replay budget across transcript
+ ownership refusals [daveey]
+
+---
+ .../test_automation_replay_custody_edges.py   | 51 +++++++++++++++++++
+ .../test_automation_replay_dispatch.py        | 24 +++++++++
+ tui_gateway/automation_replay_dispatch.py     |  6 ++-
+ 3 files changed, 79 insertions(+), 2 deletions(-)
+
+diff --git a/tests/tui_gateway/test_automation_replay_custody_edges.py b/tests/tui_gateway/test_automation_replay_custody_edges.py
+index e5cdd15764..f0cec403aa 100644
+--- a/tests/tui_gateway/test_automation_replay_custody_edges.py
++++ b/tests/tui_gateway/test_automation_replay_custody_edges.py
+@@ -142,6 +142,57 @@ def test_transfer_in_progress_fences_local_admission_and_stop_fences_late_publis
+     assert not permits[0].admit()
+ 
+ 
++def test_handoff_never_consumes_replacement_created_during_publication(wired, monkeypatch):
++    import threading
++    from concurrent.futures import ThreadPoolExecutor
++    from tui_gateway.automation_replay_handoff import Journal
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: None)
++    helpers._arm_mixed(wired.path.parent)
++    original = Journal.publish
++    entered, release = threading.Event(), threading.Event()
++    published = []
++    def delayed(self, owner, items):
++        published.append([i["id"] for i in items])
++        if len(published) == 1:
++            entered.set()
++            assert release.wait(10)
++        return original(self, owner, items)
++    monkeypatch.setattr(Journal, "publish", delayed)
++    with ThreadPoolExecutor(max_workers=1) as pool:
++        transferred = pool.submit(ar.handoff, KEY)
++        try:
++            assert entered.wait(10)
++            ar.reset()
++            ar.schedule(KEY, text="replacement", display_kind="process_complete", display_metadata={},
++                        due=9000, cause="quota", persisted=False, now=5000, profile_home=wired.path.parent)
++        finally:
++            release.set()
++        assert transferred.result(timeout=10)
++    assert len(published) == 1
++    replacement = ar._entries[(str(wired.path.parent), KEY)]
++    assert [i.text for i in replacement.items] == ["replacement"]
++    assert not replacement.transferring and replacement.due == 9000
++
++
++def test_partial_cancel_during_worker_admission_rearms_only_survivor(wired, monkeypatch):
++    from tui_gateway import server
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: None)
++    permits = []
++    monkeypatch.setattr(server, "_wake_session_turn", lambda *a, **kw:
++                        permits.append(kw["replay_delivery"]) or "started")
++    helpers._arm_mixed(wired.path.parent)
++    ar._entries[(str(wired.path.parent), KEY)].items[0].persisted = False
++    ar._fire(KEY)
++    ar.cancel_carried(KEY, profile_home=wired.path.parent, through=1e20)
++    assert not permits[0].admit()
++    entry = ar._entries[(str(wired.path.parent), KEY)]
++    assert len(entry.items) == 1 and not entry.items[0].persisted
++    assert entry.fire_token is None
++    ar._fire(KEY)
++    assert len(permits) == 2 and permits[1].admit()
++    assert not ar.pending(KEY)
++
++
+ def test_failed_transfer_rearms_without_spending_local_busy_budget(wired, monkeypatch):
+     from tui_gateway import server
+     from tui_gateway.automation_replay_handoff import Journal
+diff --git a/tests/tui_gateway/test_automation_replay_dispatch.py b/tests/tui_gateway/test_automation_replay_dispatch.py
+index 7a9ecc3526..a34460926c 100644
+--- a/tests/tui_gateway/test_automation_replay_dispatch.py
++++ b/tests/tui_gateway/test_automation_replay_dispatch.py
+@@ -116,6 +116,30 @@ def test_wrong_profile_store_cannot_write_replay(store, tmp_path):
+         other.close()
+ 
+ 
++@pytest.mark.parametrize("refusal", ["foreign_lease", "compression_rotation"])
++def test_foreign_live_turn_lease_refuses_staging_without_spending_budget(store, monkeypatch, refusal):
++    from tui_gateway import server, automation_replay as ar
++    db, journal, batch = store
++    if refusal == "foreign_lease":
++        assert db.try_acquire_session_turn_lease("chat", "foreign-live-turn", ttl_seconds=300)
++    else:
++        db.end_session("chat", "compression")
++    session = {"session_key": "chat", "history_lock": threading.RLock()}
++    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _: True)
++    monkeypatch.setattr(server, "_session_db", lambda _: nullcontext(db))
++    monkeypatch.setattr(server, "_notif_release_claim", lambda *a: None)
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: None)
++    def wake(owner, text, **kw):
++        accepted = kw["replay_delivery"].submit("rid", "sid", session, text,
++                                             kw["display_kind"], kw["display_metadata"], "test")
++        return "started" if accepted else "refused"
++    for _ in range(ar.HANDOFF_FAILURES_MAX + 2):
++        ar._run_batch(journal, batch, "chat", None, wake)
++        batch = journal.claim("chat", 100, "successor", lambda _: False)
++        assert batch is not None and batch.get("failures", 0) == 0
++    assert db.get_messages("chat") == []
++
++
+ def test_real_dispatch_storage_refusal_releases_claim_without_failure_charge(store, monkeypatch):
+     from tui_gateway import server, automation_replay as ar
+     db, journal, batch = store
+diff --git a/tui_gateway/automation_replay_dispatch.py b/tui_gateway/automation_replay_dispatch.py
+index 4397461525..80f7150c3c 100644
+--- a/tui_gateway/automation_replay_dispatch.py
++++ b/tui_gateway/automation_replay_dispatch.py
+@@ -2,6 +2,8 @@
+ from pathlib import Path
+ import sqlite3
+ 
++from hermes_state_errors import SessionTurnLeaseLostError, CompressionSessionClosedError
++
+ 
+ class Delivery:
+     def __init__(self, journal, batch):
+@@ -68,8 +70,8 @@ class Delivery:
+                                              display_metadata=self.staged.get("display_metadata"),
+                                              replay_delivery=self)
+             return accepted
+-        except sqlite3.Error:
+-            # Storage is not a failed model/build attempt; keep the durable budget intact.
++        except (sqlite3.Error, SessionTurnLeaseLostError, CompressionSessionClosedError):
++            # Storage/ownership/rotation waits are not failed model or build attempts.
+             return False
+         finally:
+             if not accepted:
+-- 
+2.43.0
+

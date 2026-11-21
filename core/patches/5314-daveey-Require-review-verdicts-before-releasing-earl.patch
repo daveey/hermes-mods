@@ -1,0 +1,152 @@
+From cf485278e0b542a2f894c735d53f6bd1d208724a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:56:21 +0000
+Subject: [PATCH] [daveey] Require review verdicts before releasing earlier
+ head authors
+
+Keep unknown authors conservative even in mixed concrete epochs. Reproduce scheduled, blocked and crashed reviewers through real lifecycle APIs, with a request_changes control.
+
+Proof: 40 consumer files, 1096 tests pass; 8 mutants killed, including a14 launch-as-verdict regression (five assertion failures). Four focused regressions red on a14 before fix. Read-only replay: 850 ordinary review histories, 17 changed exclusion sets versus full history, all nonempty with actual verdict boundaries. Independent exact-head re-review required.
+---
+ hermes_cli/kanban_review_model.py             | 13 +++-
+ .../test_kanban_review_model_cycles.py        | 65 +++++++++++++++++--
+ 2 files changed, 69 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index 0ac6029968..bf7c829667 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -125,15 +125,18 @@ def _current_authors(conn, task_id):
+     from hermes_cli.kanban_review_retry import rehandoff_runs
+     repeats = rehandoff_runs(conn, task_id)
+     models = set()
+-    for row in conn.execute("SELECT id FROM task_runs WHERE task_id=? ORDER BY id DESC",
++    unknown_author = False
++    for row in conn.execute("SELECT id, outcome FROM task_runs WHERE task_id=? ORDER BY id DESC",
+                             (task_id,)).fetchall():
+         events = conn.execute("SELECT kind, payload FROM task_events WHERE task_id=? AND run_id=? "
+                               "ORDER BY id DESC", (task_id, row[0])).fetchall()
+         reviewing = any(event[0] in ("model_tier", "run_route") and
+                         _payload(event[1]).get("lane") == "review" for event in events)
+         if reviewing:
+-            ran = any(event[0] in ("worker_result", "spawned") for event in events)
+-            if ran and models:
++            # Launch/result receipts prove execution, not that anyone judged the
++            # head. Parked and crashed reviewers must not release its authors.
++            verdict = row[1] in ("changes_requested", "completed")
++            if verdict and models and not unknown_author:
+                 return models, True
+             continue
+         if row[0] in repeats:
+@@ -142,6 +145,10 @@ def _current_authors(conn, task_id):
+                  or _run_model(conn, task_id, row[0], "run_route", "model"))
+         if model:
+             models.add(model)
++        else:
++            # An unknown author anywhere in this epoch retains earlier evidence
++            # and the concrete pin, even alongside known current authors.
++            unknown_author = True
+     return models, False
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_review_model_cycles.py b/tests/hermes_cli/test_kanban_review_model_cycles.py
+index bb9728f079..50d4cc6bab 100644
+--- a/tests/hermes_cli/test_kanban_review_model_cycles.py
++++ b/tests/hermes_cli/test_kanban_review_model_cycles.py
+@@ -14,7 +14,10 @@ MODELS = [helpers.OPUS, helpers.FABLE, helpers.SONNET, "claude-review-four"]
+ 
+ 
+ def run(conn, tid, model, lane="ready"):
+-    return provenance._run(conn, tid, model=model, receipt=model, lane=lane)
++    rid = provenance._run(conn, tid, model=model, receipt=model, lane=lane)
++    if lane == "review":
++        conn.execute("UPDATE task_runs SET outcome='changes_requested' WHERE id=?", (rid,))
++    return rid
+ 
+ 
+ def test_fifth_review_reuses_older_models_not_current_author(board):
+@@ -49,19 +52,31 @@ def test_current_epoch_excludes_all_authors_even_across_review_retries(board, cu
+         assert model not in authors
+ 
+ 
+-@pytest.mark.parametrize("started", [False, True])
+-def test_refused_spawn_is_not_a_review_boundary(board, started):
++@pytest.mark.parametrize("outcome", ["spawn_failed", "scheduled", "crashed"])
++def test_refused_spawn_is_not_a_review_boundary(board, outcome):
+     with kbc.connect() as conn:
+         task = kb.get_task(conn, kb.create_task(conn, title="epoch fixture", assignee="default"))
+         run(conn, task.id, MODELS[0])
+         review_id = run(conn, task.id, MODELS[1], "review")
+         conn.execute("DELETE FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_result'",
+                      (task.id, review_id))
+-        if started:
++        conn.execute("UPDATE task_runs SET outcome=? WHERE id=?", (outcome, review_id))
++        if outcome != "spawn_failed":
+             kb._append_event(conn, task.id, "spawned", {"pid": 123}, run_id=review_id)
+         run(conn, task.id, MODELS[2])
+-        expected = {MODELS[2]} if started else {MODELS[0], MODELS[2]}
+-        assert review.implementer_models(conn, kb.get_task(conn, task.id)) == expected
++        assert review.implementer_models(conn, kb.get_task(conn, task.id)) == {MODELS[0], MODELS[2]}
++
++
++@pytest.mark.parametrize("pin", [None, MODELS[0]])
++def test_missing_receipt_in_mixed_epoch_retains_earlier_authors(board, pin):
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, kb.create_task(conn, title="mixed epoch", assignee="default",
++                                              model_override=pin, provider_override="anthropic" if pin else None))
++        run(conn, task.id, MODELS[0])
++        run(conn, task.id, MODELS[1], "review")
++        run(conn, task.id, None)
++        run(conn, task.id, MODELS[2])
++        assert review.implementer_models(conn, kb.get_task(conn, task.id)) == {MODELS[0], MODELS[2]}
+ 
+ 
+ def test_missing_current_receipt_keeps_previous_author_evidence(board):
+@@ -74,6 +89,44 @@ def test_missing_current_receipt_keeps_previous_author_evidence(board):
+         assert review.implementer_models(conn, kb.get_task(conn, task.id)) == {MODELS[0]}
+ 
+ 
++@pytest.mark.parametrize("how", ["schedule", "block", "crash", "verdict"])
++def test_real_reviewer_lifecycle_only_verdict_releases_authors(board, how):
++    cfg = helpers.config(board, strong=MODELS[0], routes=MODELS)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="lifecycle epoch", assignee="default")
++
++        def implement(model):
++            claimed = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++            assert claimed is not None
++            kb._append_event(conn, tid, "run_route", {"model": model, "lane": "ready"},
++                             run_id=claimed.current_run_id)
++            assert kb.request_review(conn, tid)
++
++        implement(MODELS[0])
++        claimed = kb.claim_review_task(conn, tid, claimer=kb._claimer_id())
++        assert claimed is not None
++        rid = claimed.current_run_id
++        kb._append_event(conn, tid, "model_tier", {"model": MODELS[1], "lane": "review"}, run_id=rid)
++        kb._append_event(conn, tid, "spawned", {"pid": 123}, run_id=rid)
++        if how == "verdict":
++            assert kb.request_changes(conn, tid, reason="rework")[0]
++        elif how == "crash":
++            provenance._end_run(conn, rid)
++            conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL, current_run_id=NULL WHERE id=?", (tid,))
++        else:
++            if how == "schedule":
++                from hermes_cli.kanban_db_schedule import schedule_task
++                assert schedule_task(conn, tid, reason="CI", clock_only=True)
++            else:
++                assert kb.block_task(conn, tid, reason="wall", kind="transient", clock_only=True)
++            assert kb.unblock_task(conn, tid)
++        implement(MODELS[2])
++        authors = review.implementer_models(conn, kb.get_task(conn, tid))
++        assert authors == ({MODELS[2]} if how == "verdict" else {MODELS[0], MODELS[2]})
++        model, _, _ = tier.resolve_model_tier(conn, kb.get_task(conn, tid), lane="review", cfg=cfg)
++        assert model not in authors
++
++
+ def test_provider_wall_does_not_become_structural_exhaustion(board, monkeypatch):
+     cfg = helpers.config(board)
+     from hermes_cli import kanban_provider_walls as walls
+-- 
+2.43.0
+

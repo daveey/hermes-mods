@@ -1,0 +1,201 @@
+From e0a99816ec0fa3a1f01aebf20d1a161e51b0ddd3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 06:11:27 +0000
+Subject: [PATCH] fix(kanban): let capped queued cards escape held machine pins
+ [daveey]
+
+A held draining worker cannot claim its machine-pinned ready cards. The
+move cap previously stranded portable work there after three moves.
+Extend the existing queued dead-pin rescue with affirmative boolean hold
+evidence from the same fresh registry read. Audit held_pin separately,
+keep counting the rescue, and retain all target, ping-pong and source guards.
+No source hold, scaler, or max_moves configuration is changed.
+
+Proof: RED three regression cases fail with move_limit; GREEN 426 tests
+in 22 move/source/capability files and 806 tests in 26 other consumer files.
+Five condition mutants killed, including running/multi-pin/malformed-hold
+controls. Real registry cache expiry and failed-refresh TTL tested.
+scripts/check --base origin/main: 21 checks ok, no health findings.
+
+Hermes-Card: t_eeeeee000000003e
+---
+ hermes_cli/kanban_move.py                     |  20 ++--
+ tests/hermes_cli/test_kanban_move.py          |   3 +-
+ tests/hermes_cli/test_kanban_move_held_pin.py | 106 ++++++++++++++++++
+ 3 files changed, 120 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_move_held_pin.py
+
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index b779296ced..e670db963e 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -13,9 +13,9 @@ Guards:
+   this machine, while a queued card may target it (``machine:<x>`` for an unregistered x never is);
+ * ``machine:<x>`` needs x to advertise pickup (``placement_unavailable`` otherwise: x would never copy the card,
+   :func:`hermes_cli.kanban_worker_node.check_machine_pins`);
+-* ``kanban.move.max_moves`` (default 3) moves per card, except a queued card's move off a retired ``machine:<x>`` pin
+-  (:func:`dead_pin`: x absent from, or revoked in, a successful registry read); that move still counts, and its
+-  event carries ``dead_pin``;
++* ``kanban.move.max_moves`` (default 3) moves per card, except a queued card's move off a retired or held
++  ``machine:<x>`` pin backed by a successful registry read. That move still counts, and its event carries
++  ``dead_pin`` or ``held_pin`` respectively; holds remain unchanged;
+ * moving back to a machine the card already left is ping-pong: refused unless ``force``, and it still counts;
+ * ``dir`` workspaces exist only on their creator, so those cards never move; a ``worktree`` card moves only with
+   portable workspace_source custody (published branch, :mod:`hermes_cli.kanban_source_move`);
+@@ -249,15 +249,21 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+ 
+ def _spend_budget(conn: sqlite3.Connection, task_id: str, row: Any, pool: Mapping[str, Mapping[str, Any]], *,
+                   me: str, cfg: Optional[dict], host: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+-    """The card's move history and event fields, or ``move_limit``. A queued card pinned to a retired machine can
+-    never be leased again: moving it off is not a bounce, and the cap must not strand it (t_0b716b01a47db7f6 on
+-    worker-6). That move still counts, so later moves stay capped."""
++    """History and audit fields, or ``move_limit``. A queued card pinned to a retired or held machine
++    cannot be leased there: moving it off is not a bounce, and the cap must not strand it.
++    That move still counts, so later moves stay capped; this does not change the source's hold."""
+     from hermes_cli import kanban_worker_node as wn
+     past = history(conn, task_id)
+     limit = max_moves(cfg)
+     if len(past) < limit:
+         return past, host
+-    dead = None if row["status"] == "running" else dead_pin(wn._parse(row["runs_on"]), pool, me=me)
++    previous = wn._parse(row["runs_on"])
++    dead = None if row["status"] == "running" else dead_pin(previous, pool, me=me)
++    pins = [label.removeprefix("machine:") for label in previous or [] if label.startswith("machine:")]
++    held = (pins[0] if row["status"] != "running" and len(pins) == 1
++            and pool.get(pins[0], {}).get("hold") is True else None)
++    if held is not None:
++        return past, {**host, "held_pin": held}
+     if dead is None:
+         raise MoveRefused("move_limit", f"card already moved {len(past)} time(s) (kanban.move.max_moves {limit}); "
+                                         "finish it here or block it")
+diff --git a/tests/hermes_cli/test_kanban_move.py b/tests/hermes_cli/test_kanban_move.py
+index e304e6c557..46f1576ee5 100644
+--- a/tests/hermes_cli/test_kanban_move.py
++++ b/tests/hermes_cli/test_kanban_move.py
+@@ -221,10 +221,9 @@ def test_dead_pin_budget_requires_nonfailed_registry_read(gws, monkeypatch, outa
+ 
+ 
+ @pytest.mark.parametrize("entry", [
+-    {"state": "active", "hold": True},  # held: drains and comes back
+     {"state": "active", "hold": False, "last_seen": 1},  # stale telemetry: maybe asleep, not retired
+     {"state": "active", "hold": False, "max_card_runs": 1},  # busy: a queue, not a dead pin
+-], ids=["held", "stale", "busy"])
++], ids=["stale", "busy"])
+ def test_a_capped_move_off_a_live_pinned_machine_is_still_refused(gws, entry):
+     hub, _ = gws
+     tid = _capped_card_pinned_to(hub, "worker-6")
+diff --git a/tests/hermes_cli/test_kanban_move_held_pin.py b/tests/hermes_cli/test_kanban_move_held_pin.py
+new file mode 100644
+index 0000000000..0ce1360af2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_move_held_pin.py
+@@ -0,0 +1,106 @@
++"""Capped queued cards may escape affirmative registry holds, never stale discovery."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_move as km
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_move as helpers
++
++svc = helpers.svc
++gws = helpers.gws
++
++
++def held_registry(source):
++    return {**helpers.LIVE, source: {"name": source, "state": "active", "labels": ["linux"],
++                                    "pickup": "explicit", "hold": True}}
++
++
++@pytest.mark.parametrize("source", ["worker-6", helpers.HUB])
++def test_capped_held_pin_escape_is_audited_and_still_counts(gws, source):
++    hub, _ = gws
++    tid = helpers._capped_card_pinned_to(hub, source)
++    registry = held_registry(source)
++    res = km.move_queued(hub.conn, tid, runs_on=["linux"], reason="worker draining", machines=registry, me=helpers.HUB)
++    assert res["ok"] and res["move_no"] == 4, res
++    event = helpers._events(hub.conn, tid)[-1]
++    assert event["held_pin"] == source and "dead_pin" not in event
++    assert event["previous_runs_on"] == [f"machine:{source}"]
++    assert registry[source]["hold"] is True
++    again = km.move_queued(hub.conn, tid, runs_on=["linux"], reason="again", machines=registry, me=helpers.HUB)
++    assert again["reason_code"] == "move_limit", again
++
++
++@pytest.mark.parametrize("outage", [False, True])
++def test_held_pin_uses_real_registry_cache_and_refuses_failed_refresh(gws, monkeypatch, outage):
++    hub, _ = gws
++    tid = helpers._capped_card_pinned_to(hub, "worker-6")
++    calls = []
++
++    def fetch():
++        calls.append(True)
++        if outage and len(calls) > 1:
++            raise OSError("registry offline")
++        return {"me": helpers.HUB, "machines": list(held_registry("worker-6").values())}
++
++    wn.set_registry_fetch(fetch)
++    assert wn.registry()["machines"]["worker-6"]["hold"] is True
++    monkeypatch.setitem(wn._REGISTRY, "at", -1e9)
++    before = helpers._events(hub.conn, tid)
++    res = km.move_queued(hub.conn, tid, runs_on=["linux"], reason="draining", me=helpers.HUB)
++    assert len(calls) == 2
++    if not outage:
++        assert res["ok"] and res["move_no"] == 4, res
++        return
++    for result in (res, km.move_queued(hub.conn, tid, runs_on=["linux"], reason="retry", me=helpers.HUB)):
++        assert result["reason_code"] == "registry_unavailable", result
++    assert len(calls) == 2
++    assert helpers._events(hub.conn, tid) == before
++    assert json.loads(hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]) == ["machine:worker-6"]
++
++
++def test_held_pin_does_not_exempt_running_or_unpinned_cards(gws):
++    hub, _ = gws
++    tid = helpers._capped_card_pinned_to(hub, "worker-6")
++    registry = held_registry("worker-6")
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
++    with pytest.raises(km.MoveRefused) as exc:
++        km.check(hub.conn, tid, ["linux"], machines=registry, me=helpers.HUB, reason="r")
++    assert exc.value.code == "move_limit"
++    with kb.write_txn(hub.conn):
++        hub.conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++        wn.set_runs_on(hub.conn, tid, ["linux"])
++    res = km.move_queued(hub.conn, tid, runs_on=["linux"], machines=registry, me=helpers.HUB, reason="r")
++    assert res["reason_code"] == "move_limit"
++
++
++@pytest.mark.parametrize("previous,hold", [
++    (["machine:worker-6", "machine:hub"], True),
++    (["machine:worker-6"], False),
++    (["machine:worker-6"], "true"),
++    (["machine:worker-6"], 1),
++])
++def test_held_exception_requires_one_pin_and_boolean_hold(gws, previous, hold):
++    hub, _ = gws
++    tid = helpers._capped_card_pinned_to(hub, "worker-6")
++    registry = held_registry("worker-6")
++    registry["worker-6"]["hold"] = hold
++    with kb.write_txn(hub.conn):
++        wn.set_runs_on(hub.conn, tid, previous)
++    before = helpers._events(hub.conn, tid)
++    res = km.move_queued(hub.conn, tid, runs_on=["linux"], reason="r", machines=registry, me=helpers.HUB)
++    assert res["reason_code"] == "move_limit", res
++    assert helpers._events(hub.conn, tid) == before
++
++
++def test_held_rescue_preserves_target_and_ping_pong_guards(gws):
++    hub, _ = gws
++    tid = helpers._capped_card_pinned_to(hub, "worker-6")
++    registry = held_registry("worker-6")
++    res = km.move_queued(hub.conn, tid, runs_on=["machine:worker-6"], reason="r", machines=registry, me=helpers.HUB)
++    assert res["reason_code"] == "no_machine", res
++    res = km.move_queued(hub.conn, tid, runs_on=[f"machine:{helpers.WORKER}"], host_reason=helpers.HR,
++                         reason="r", machines=registry, me=helpers.HUB)
++    assert res["reason_code"] == "ping_pong", res
+-- 
+2.43.0
+

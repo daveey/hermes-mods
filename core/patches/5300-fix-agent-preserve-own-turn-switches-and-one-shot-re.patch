@@ -1,0 +1,320 @@
+From 3c353e87c39abb2d0b3296fc8e7ba40fa20dd8e8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 21:28:13 +0000
+Subject: [PATCH] fix(agent): preserve own-turn switches and one-shot refusal
+ semantics [daveey]
+
+Review rework: a model switch on an external RPC thread must not replace a running turn's runtime, but the executing turn must retain its deliberate Nous wire transition. Reuse the existing local origin custody scope, live holder and execution-thread identity for the exemption; copied contexts and stale thread IDs confer no authority. Both managed staged and unmanaged in-place branches retain the admission lock.
+
+MoA one-shots refuse a lost admission race instead of replaying as a permanent pin. Stage their restore locally until success, preserving an existing turn's restore on a failed second command. Propagate deferred reset results rather than reporting reset_done, and acknowledge the exact stash result rather than an older pending pick.
+
+Proof: all four independent reviewer probes failed on 0ec450a4d7. The new real-facade own-turn cases fail 2/2 without the exemption and pass with it; the same cases reject copied-context foreign threads. Final managed-switch and gateway regressions: 42 passed across five files. Expanded consumer run: 5076 passed, 2 skipped across 286 files. scripts/check: all 21 checks passed. New exact-head CI and independent review remain mandatory before canonical ship lands this head.
+
+Hermes-Card: t_eeeeee0000000032
+---
+ agent/agent_runtime_switch.py                 |  5 +-
+ agent/origin_turn_custody.py                  | 17 ++++
+ tests/agent/test_managed_switch_own_turn.py   | 96 +++++++++++++++++++
+ .../test_model_switch_lost_turn_race.py       | 45 +++++++++
+ tui_gateway/methods_tools.py                  | 17 ++--
+ tui_gateway/model_switch.py                   | 14 ++-
+ 6 files changed, 179 insertions(+), 15 deletions(-)
+ create mode 100644 tests/agent/test_managed_switch_own_turn.py
+
+diff --git a/agent/agent_runtime_switch.py b/agent/agent_runtime_switch.py
+index fae124f801..d933fb5180 100644
+--- a/agent/agent_runtime_switch.py
++++ b/agent/agent_runtime_switch.py
+@@ -64,6 +64,7 @@ def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabili
+     """Prepare managed switches privately, then publish after the allocation commits."""
+     from agent.agent_runtime_helpers import _switch_model_runtime
+     from agent.turn_facade_lease import turn_admission_lock
++    from agent.origin_turn_custody import owns_turn
+     from agent.model_routing_managed import managed_config, resolve_managed_runtime
+     from agent.model_routing_agent import persist_class_metadata
+ 
+@@ -76,7 +77,7 @@ def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabili
+     admission = turn_admission_lock(agent)
+     if config is None and not temporary:
+         with admission:  # swaps the live agent in place: check and mutation exclude admission
+-            if getattr(agent, '_active_session_turn_lease_holder', None) is not None:
++            if getattr(agent, '_active_session_turn_lease_holder', None) is not None and not owns_turn(agent):
+                 raise TurnAdmittedDuringSwitch('a turn is active; model switch not applied')
+             return _switch_model_runtime(agent, model, provider, api_key, base_url, api_mode, capabilities)
+     staged = copy(agent)
+@@ -109,7 +110,7 @@ def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabili
+         staged.context_compressor._session_db = backend.backend
+     with turn_admission_lock(agent):
+         holder = getattr(agent, '_active_session_turn_lease_holder', None)
+-        if holder is not None:
++        if holder is not None and not owns_turn(agent):
+             # A turn can win before OR after the snapshot. Neither may see a swapped runtime.
+             raise TurnAdmittedDuringSwitch('a turn is active; model switch not applied')
+         vars(agent).update(_without_turn_custody(vars(staged)))
+diff --git a/agent/origin_turn_custody.py b/agent/origin_turn_custody.py
+index f76ee8763e..d8f7c6ea7b 100644
+--- a/agent/origin_turn_custody.py
++++ b/agent/origin_turn_custody.py
+@@ -27,6 +27,23 @@ def scope(lease):
+         _current.reset(token)
+ 
+ 
++def owns_turn(agent):
++    """Only the executing turn may deliberately replace its own runtime, never an RPC caller.
++
++    Require both the existing local custody scope and the execution thread: copied context in an
++    auxiliary worker, stale thread IDs and scopes retained after release confer no switch authority.
++    """
++    import threading
++    value = _current.get()
++    if value is None:
++        return False
++    lease, pid, *_ = value
++    return (pid == os.getpid() and lease.agent is agent and lease.is_turn_active()
++            and not lease.stop.is_set()
++            and getattr(agent, '_execution_thread_id', None) == threading.get_ident()
++            and getattr(agent, '_active_session_turn_lease_holder', None) == lease.holder)
++
++
+ def origin():
+     """Revalidate the exact holder on every capture; a copied context is no lease."""
+     from agent.delegation_context import is_delegated_child_process_context
+diff --git a/tests/agent/test_managed_switch_own_turn.py b/tests/agent/test_managed_switch_own_turn.py
+new file mode 100644
+index 0000000000..4dda0de27a
+--- /dev/null
++++ b/tests/agent/test_managed_switch_own_turn.py
+@@ -0,0 +1,96 @@
++"""The real turn facade may switch its own wire; external/copy-context workers may not."""
++import contextvars
++import threading
++
++import pytest
++
++from agent import nous_wire
++from agent.agent_runtime_switch import TurnAdmittedDuringSwitch
++from tests.agent import test_managed_switch_turn_custody as custody
++
++managed = custody.managed
++routing_home = custody.routing_home
++streaming_route = custody.streaming_route
++destinations = custody.destinations
++live = custody.live
++
++
++@pytest.mark.parametrize('managed_switch', [False, True])
++def test_executing_turn_can_switch_but_copied_worker_cannot(live, monkeypatch, managed_switch):
++    agent, _db = live
++    calls = []
++
++    def loop(current, *_args, **_kwargs):
++        # build_turn_context sets this before turn_iteration_prep applies the pending wire.
++        current._execution_thread_id = threading.get_ident()
++        assert current._active_session_turn_lease_holder
++        before = current._active_session_turn_lease_holder
++        ctx, errors = contextvars.copy_context(), []
++
++        def foreign():
++            try:
++                current.switch_model(custody.TARGET, 'anthropic')
++            except BaseException as exc:
++                errors.append(exc)
++
++        worker = threading.Thread(target=lambda: ctx.run(foreign))
++        worker.start()
++        worker.join(30)
++        assert not worker.is_alive()
++        assert [type(exc) for exc in errors] == [TurnAdmittedDuringSwitch]
++        if managed_switch:
++            current.switch_model(custody.TARGET, 'anthropic')
++            assert current.model == custody.TARGET
++        else:
++            current._nous_wire_pending = ('anthropic_messages', 'gmi')
++            assert nous_wire.apply_pending_wire_switch(current) is True
++            assert len(calls) == 1
++        assert current._active_session_turn_lease_holder == before
++        return {'final_response': 'ok', 'messages': []}
++
++    monkeypatch.setattr('agent.conversation_loop.run_conversation', loop)
++    if not managed_switch:
++        monkeypatch.setattr('agent.model_routing_managed.managed_config', lambda: None)
++        monkeypatch.setattr('agent.agent_runtime_helpers._switch_model_runtime',
++                            lambda *args, **kwargs: calls.append(args[1:]))
++    result = agent._run_conversation_scoped('fixture')
++    assert result['final_response'] == 'ok'
++    assert agent._active_session_turn_lease_holder is None
++
++
++def test_stale_execution_thread_id_does_not_authorize_rpc_switch(live):
++    agent, _db = live
++    lease = custody.admit(agent)
++    agent._execution_thread_id = threading.get_ident()
++    try:
++        with pytest.raises(TurnAdmittedDuringSwitch):
++            agent.switch_model(custody.TARGET, 'anthropic')
++    finally:
++        lease.release()
++
++
++@pytest.mark.parametrize('invalid', ['pid', 'agent', 'inactive', 'stopped', 'thread', 'holder'])
++def test_own_turn_exemption_revalidates_custody(live, monkeypatch, invalid):
++    from agent import origin_turn_custody as custody_scope
++    agent, _db = live
++    lease = custody.admit(agent)
++    lease.turn_active = True
++    agent._execution_thread_id = threading.get_ident()
++    try:
++        with custody_scope.scope(lease):
++            assert custody_scope.owns_turn(agent)
++            changes = {
++                'pid': lambda: monkeypatch.setattr(custody_scope.os, 'getpid', lambda: -1),
++                'agent': lambda: monkeypatch.setattr(lease, 'agent', object()),
++                'inactive': lambda: monkeypatch.setattr(lease, 'turn_active', False),
++                'stopped': lease.stop.set,
++                'thread': lambda: monkeypatch.setattr(agent, '_execution_thread_id', -1),
++                'holder': lambda: monkeypatch.setattr(agent, '_active_session_turn_lease_holder', 'successor'),
++            }
++            changes[invalid]()
++            assert not custody_scope.owns_turn(agent)
++    finally:
++        monkeypatch.undo()
++        lease.agent = agent
++        agent._active_session_turn_lease_holder = lease.holder
++        lease.release()
+diff --git a/tests/tui_gateway/test_model_switch_lost_turn_race.py b/tests/tui_gateway/test_model_switch_lost_turn_race.py
+index 8412353839..22d44ae5a1 100644
+--- a/tests/tui_gateway/test_model_switch_lost_turn_race.py
++++ b/tests/tui_gateway/test_model_switch_lost_turn_race.py
+@@ -78,3 +78,48 @@ def test_refused_switch_replays_original_intent(idle_session, monkeypatch, optio
+     server._apply_pending_model_switch('sid', idle_session)
+     assert calls == [('sid', idle_session, TARGET, {'confirm_expensive_model': True, **options})]
+     assert 'pending_model_switch' not in idle_session
++
++
++def test_refused_moa_command_does_not_queue_a_permanent_pin(idle_session):
++    response = server._cmd_moa('1', {'session_id': 'sid'}, idle_session, 'moa', 'fixture prompt')
++    assert response['error']['code'] == 5030
++    assert 'moa_one_shot_restore' not in idle_session
++    assert 'pending_model_switch' not in idle_session
++    assert 'model_override' not in idle_session
++    assert idle_session['agent'].model == 'old'
++
++
++def test_user_pick_during_moa_still_defers(idle_session):
++    idle_session['moa_one_shot_restore'] = {'model': 'old'}
++    result = server._apply_model_switch('sid', idle_session, TARGET, confirm_expensive_model=True)
++    assert result['deferred'] is True
++    assert idle_session['pending_model_switch']['raw'] == TARGET
++
++
++def test_refused_second_moa_keeps_the_first_turn_restore(idle_session):
++    restore = {'model': 'previous-model', 'provider': 'anthropic', 'override': None}
++    idle_session['moa_one_shot_restore'] = restore
++    idle_session['agent'].model = 'moa-preset'
++    response = server._cmd_moa('1', {'session_id': 'sid'}, idle_session, 'moa', 'second prompt')
++    assert response['error']['code'] == 5030
++    assert idle_session['moa_one_shot_restore'] is restore
++    assert 'pending_model_switch' not in idle_session
++
++
++def test_deferred_reset_does_not_report_done(idle_session, monkeypatch):
++    idle_session['model_override'] = {'model': 'old', 'provider': 'anthropic'}
++    monkeypatch.setattr(server, '_config_model_target', lambda: (TARGET, 'anthropic'))
++    monkeypatch.setattr(server, '_persist_live_session_runtime', lambda *a: pytest.fail('persisted before replay'))
++    result = server._reset_session_model_override('sid', idle_session)
++    assert idle_session['agent'].model == 'old'
++    assert idle_session['pending_model_switch']['display_model'] == TARGET
++    assert result.get('deferred') is True and result['warning'] == ''
++
++
++def test_stash_warning_does_not_ack_an_older_pick(idle_session, monkeypatch):
++    older = {'raw': 'older-pick', 'confirm_expensive_model': True}
++    idle_session['pending_model_switch'] = older
++    monkeypatch.setattr(server, '_pending_switch_selection_warning', lambda *a: 'costly')
++    with pytest.raises(ValueError, match='pick claude-target again'):
++        server._apply_model_switch('sid', idle_session, TARGET)
++    assert idle_session['pending_model_switch'] is older
+diff --git a/tui_gateway/methods_tools.py b/tui_gateway/methods_tools.py
+index 5fb9149821..ff6bed4f47 100644
+--- a/tui_gateway/methods_tools.py
++++ b/tui_gateway/methods_tools.py
+@@ -687,22 +687,21 @@ def _cmd_moa(rid, params, session, name, arg):
+         # place: session["model_override"] alone never switches an already-built agent.
+         agent = session.get("agent")
+         # See #53444.
+-        session["moa_one_shot_restore"] = {
++        restore = session.get('moa_one_shot_restore') or {
+             "override": session.get("model_override"), "model": getattr(agent, "model", None),
+             "provider": getattr(agent, "provider", None)}
+         if agent is not None:
+-            try:  # persist_override=False: turn-scoped, never persist the MoA provider to config.yaml
+-                _apply_model_switch(
+-                    params.get("session_id", ""), session, f"{preset} --provider moa",
+-                    confirm_expensive_model=False, pin_session_override=True, persist_override=False,
+-                    count_switch=False)
+-            except Exception:
+-                session.pop("moa_one_shot_restore", None)
+-                raise
++            # No restore mutation until the swap succeeds: a refused second command must not
++            # overwrite (or clear) the restore belonging to the currently running one-shot.
++            _apply_model_switch(
++                params.get("session_id", ""), session, f"{preset} --provider moa",
++                confirm_expensive_model=False, pin_session_override=True, persist_override=False,
++                count_switch=False, defer_if_busy=False)
+         else:  # lazy/fresh session: the override is consumed by the first build
+             session["model_override"] = {
+                 "provider": "moa", "model": preset, "base_url": "moa://local",
+                 "api_key": "moa-virtual-provider", "api_mode": "chat_completions"}
++        session['moa_one_shot_restore'] = restore
+         notice = f"MoA one-shot queued with preset {preset}; previous model will be restored after this turn."
+         return _ok(rid, {"type": "send", "notice": notice, "message": arg})
+     except SessionNotOwned as exc:
+diff --git a/tui_gateway/model_switch.py b/tui_gateway/model_switch.py
+index 7cc298b294..18e1af20a2 100644
+--- a/tui_gateway/model_switch.py
++++ b/tui_gateway/model_switch.py
+@@ -392,7 +392,7 @@ def _commit_agentless_switch(session: dict, result, override: dict) -> None:
+ def _apply_model_switch(
+     sid: str, session: dict, raw_input: str, *, confirm_expensive_model: bool = False,
+     pin_session_override: bool = True, parsed_flags: Any | None = None,
+-    persist_override: bool | None = None, count_switch: bool = True) -> dict:
++    persist_override: bool | None = None, count_switch: bool = True, defer_if_busy: bool = True) -> dict:
+     """``count_switch=False``: an internal swap (config adoption, MoA one-shot and its restore), not a
+     user's /model pick, so it stays out of the shared-metrics switch count."""
+     from hermes_cli.model_switch import parse_model_switch_args
+@@ -435,12 +435,16 @@ def _apply_model_switch(
+         _commit_recording_composer_profile(
+             sid, session, agent, result, current_model, restore_snapshot, records_composer_override)
+     except TurnAdmittedDuringSwitch as exc:
++        if not defer_if_busy:
++            # The caller owns a turn-scoped restore lifecycle, which cannot follow a queued pick
++            # into another turn. Refuse without changing either the live runtime or the queue.
++            raise
+         # The caller's unlocked running check lost to a turn admission: nothing was published and no
+         # session state changed, so queue the pick for the next turn start like a busy-time pick.
+-        _stash_pending_model_switch(
++        stashed = _stash_pending_model_switch(
+             None, "model", raw_input, session, confirm_expensive_model, parsed_flags,
+             pin_session_override=pin_session_override, persist_override=persist_override, count_switch=count_switch)
+-        if not session.get("pending_model_switch"):
++        if not stashed.get('result', {}).get('deferred'):
+             raise ValueError(f"{exc}; pick {result.new_model} again once the turn ends.") from exc
+         return {"value": result.new_model, "warning": "", "confirm_required": False, "deferred": True,
+                 "scope": "once" if one_turn else ("global" if persist_global else "session")}
+@@ -497,10 +501,12 @@ def _reset_session_model_override(sid: str, session: dict) -> dict:
+         agent = session.get("agent")
+         if model and agent is not None and (
+                 model != getattr(agent, "model", "") or (provider and provider != getattr(agent, "provider", ""))):
+-            _apply_model_switch(
++            switched = _apply_model_switch(
+                 sid, session, f"{model} --provider {provider}" if provider else model,
+                 confirm_expensive_model=True, pin_session_override=False, persist_override=False,
+                 count_switch=False)
++            if switched.get('deferred'):
++                return switched
+         _persist_live_session_runtime(session)
+     _emit_session_info(sid, session)
+     shown = model or getattr(agent, "model", "") or t("gateway.shared.unknown_value")
+-- 
+2.43.0
+

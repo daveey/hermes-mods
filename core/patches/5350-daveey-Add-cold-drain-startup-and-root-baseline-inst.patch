@@ -1,0 +1,881 @@
+From 7f4e5d8a8aecd6cda052b2e9bf77b9fe94552976 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 21:38:17 +0000
+Subject: [PATCH] [daveey] Add cold drain startup and root baseline
+ installation boundary
+
+---
+ agent/turn_facade.py                          |  12 +-
+ hermes_cli/gateway.py                         |   4 +-
+ hermes_cli/gateway_drain_startup.py           |   9 ++
+ hermes_cli/plugins_loader.py                  |   8 ++
+ hermes_cli/worker_drain_baseline.py           |  75 +++++++++---
+ hermes_cli/worker_drain_baseline_cli.py       |  64 ++++++++++
+ hermes_cli/worker_drain_capability.py         |  49 +++++++-
+ hermes_cli/worker_drain_spawn_inventory.json  |   8 +-
+ .../test_worker_drain_baseline_cli.py         |  57 +++++++++
+ .../test_worker_drain_capability.py           |  11 +-
+ .../test_worker_drain_daemon_startup.py       | 113 ++++++++++++++++++
+ .../hermes_cli/test_worker_drain_producer.py  |   1 +
+ .../hermes_cli/test_worker_drain_roundtrip.py |  74 ++++++++++++
+ .../test_worker_drain_source_scan.py          |   5 +-
+ .../test_worker_drain_writer_paths.py         |  63 ++++++++++
+ tests/tools/test_worker_drain_dispatch.py     |  39 ++++++
+ tools/registry.py                             |  13 +-
+ 17 files changed, 572 insertions(+), 33 deletions(-)
+ create mode 100644 hermes_cli/gateway_drain_startup.py
+ create mode 100644 hermes_cli/worker_drain_baseline_cli.py
+ create mode 100644 tests/hermes_cli/test_worker_drain_baseline_cli.py
+ create mode 100644 tests/hermes_cli/test_worker_drain_daemon_startup.py
+ create mode 100644 tests/hermes_cli/test_worker_drain_roundtrip.py
+ create mode 100644 tests/hermes_cli/test_worker_drain_writer_paths.py
+ create mode 100644 tests/tools/test_worker_drain_dispatch.py
+
+diff --git a/agent/turn_facade.py b/agent/turn_facade.py
+index 64ff6a1629..7ad5d1750b 100644
+--- a/agent/turn_facade.py
++++ b/agent/turn_facade.py
+@@ -222,10 +222,16 @@ class TurnFacadeMixin:
+         """One local-work reservation spanning the whole turn: before the durable lease admits, through the
+         outermost finally after it releases, on every exit (including pre-agent failures)."""
+         from agent import local_work_agent
++        from hermes_cli.worker_drain_fence import admit, lease_scope
+ 
+-        with local_work_agent.scope("agent_turn", "agent.turn_facade.run_conversation"):
+-            # Through the class, not self: callers drive this on stand-in agents (tests, relays).
+-            return TurnFacadeMixin._run_conversation_scoped(self, *args, **kwargs)
++        lease = admit('agent.turn')
++        try:
++            with lease_scope(lease), local_work_agent.scope("agent_turn", "agent.turn_facade.run_conversation"):
++                # Through the class, not self: callers drive this on stand-in agents (tests, relays).
++                return TurnFacadeMixin._run_conversation_scoped(self, *args, **kwargs)
++        finally:
++            if lease is not None:
++                lease.close()
+ 
+     # Signature (inspect/autospec) follows the scoped body; __name__/__qualname__ stay run_conversation.
+     run_conversation.__dict__["__wrapped__"] = _run_conversation_scoped
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index c201368bff..93dd971aaf 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -4522,8 +4522,8 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
+     _guard_existing_gateway_process_conflict(replace=replace)
+     sys.path[:0] = [] if str(PROJECT_ROOT) in sys.path else [str(PROJECT_ROOT)]
+     _apply_startup_watchdog_config()
+-    from hermes_cli.observability.shared_metrics_process import begin_process
+-    begin_process("gateway")
++    from hermes_cli.gateway_drain_startup import begin_gateway_process
++    begin_gateway_process()
+ 
+     # Detached Windows runs (HERMES_GATEWAY_DETACHED=1, or non-TTY for older wrappers) ignore
+     # console-control broadcasts from sibling CLIs; foreground runs keep Ctrl+C-to-stop.
+diff --git a/hermes_cli/gateway_drain_startup.py b/hermes_cli/gateway_drain_startup.py
+new file mode 100644
+index 0000000000..49bf504751
+--- /dev/null
++++ b/hermes_cli/gateway_drain_startup.py
+@@ -0,0 +1,9 @@
++"""Cold gateway boundary: bootstrap observers, then drain capability, before work."""
++
++
++def begin_gateway_process():
++    from hermes_cli.observability.shared_metrics_process import begin_process
++    from hermes_cli.worker_drain_capability import start_daemon_capability
++
++    begin_process('gateway')
++    start_daemon_capability()
+diff --git a/hermes_cli/plugins_loader.py b/hermes_cli/plugins_loader.py
+index 53c35848d0..af62745435 100644
+--- a/hermes_cli/plugins_loader.py
++++ b/hermes_cli/plugins_loader.py
+@@ -570,6 +570,8 @@ class PluginLoaderMixin:
+ 
+     def _load_plugin(self, manifest: PluginManifest) -> None:
+         """Import a plugin module and call its ``register(ctx)`` function."""
++        from hermes_cli.worker_drain_capability import revoke
++        revoke('plugin package has no reviewed drain coverage')
+         with self._discovery_lock, _plugin_home_scope(self.home_path):
+             self._load_plugin_scoped(manifest)
+ 
+@@ -755,6 +757,8 @@ class PluginLoaderMixin:
+ 
+     def _load_portable_plugin(self, manifest: PluginManifest, loaded: LoadedPlugin) -> None:
+         """Load validated portable components without importing Python code."""
++        from hermes_cli.worker_drain_capability import revoke
++        revoke('portable plugin has no reviewed drain coverage')
+         from hermes_cli.plugins import PluginContext
+         lookup_key = manifest_key(manifest)
+         try:
+@@ -831,6 +835,8 @@ class PluginLoaderMixin:
+     ) -> types.ModuleType:
+         """Import a directory plugin as ``hermes_plugins.<slug>`` (slug from ``manifest.key`` so
+         ``image_gen/openai`` cannot collide with ``tts/openai``)."""
++        from hermes_cli.worker_drain_capability import revoke
++        revoke('directory plugin has no reviewed drain coverage')
+         plugin_dir = Path(manifest.path)  # type: ignore[arg-type]
+         init_file = plugin_dir / "__init__.py"
+         if not init_file.exists():
+@@ -866,6 +872,8 @@ class PluginLoaderMixin:
+     def _load_entrypoint_module(self, manifest: PluginManifest) -> types.ModuleType | Callable[..., Any]:
+         """Load a pip-installed plugin via its entry-point reference: the module for a bare ``module`` target,
+         the referenced attribute (normally ``register``) for the ``module:function`` form."""
++        from hermes_cli.worker_drain_capability import revoke
++        revoke('entrypoint plugin has no reviewed drain coverage')
+         for ep in _select_entry_point_group(importlib.metadata.entry_points(), ENTRY_POINTS_GROUP):
+             if ep.name == manifest.name:
+                 return ep.load()
+diff --git a/hermes_cli/worker_drain_baseline.py b/hermes_cli/worker_drain_baseline.py
+index 9c670607e1..141a02b2e5 100644
+--- a/hermes_cli/worker_drain_baseline.py
++++ b/hermes_cli/worker_drain_baseline.py
+@@ -108,24 +108,42 @@ def capture(manifest_path, ident, *, proc_root='/proc') -> dict:
+             'manifest_digest': fence.request_hash(manifest), 'idle': idle}
+ 
+ 
+-def validate_baseline(base, ident) -> bool:
++def validate_baseline(base, ident, *, proc_root='/proc') -> bool:
+     """Re-read provenance AND daemon capability on every census, not only capture."""
+     try:
+         manifest = load_manifest(MANIFEST_PATH)
+         if fence.request_hash(manifest) != base.manifest_digest:
+             return False
+-        entries = [_unit_entry(unit, unit_state(unit), '/proc', ident, manifest) for unit in manifest['units']]
++        entries = [_unit_entry(unit, unit_state(unit), proc_root, ident, manifest) for unit in manifest['units']]
+         return frozenset(census._entry_identity(e) for e in entries) == base.idle
+     except (OSError, ValueError, CaptureRefused):
+         return False
+ 
+ 
+-def write_baseline(path: Path, doc: dict) -> None:
+-    if os.geteuid() != 0:  # windows-footgun: ok -- root-only Linux installer
+-        raise CaptureRefused('baseline writer requires root')
+-    path = Path(path)
+-    tmp = path.with_name(f'.{path.name}.{uuid.uuid4().hex}')
+-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
++def _trusted_parent(path: Path) -> int:
++    """Pin every root-owned, non-mutable directory without following symlinks."""
++    if not path.is_absolute() or '..' in path.parts:
++        raise CaptureRefused('baseline parent must be an absolute trusted path')
++    flags = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
++    fd = os.open('/', flags)
++    try:
++        for component in path.parent.parts[1:]:
++            next_fd = os.open(component, flags, dir_fd=fd)
++            os.close(fd)
++            fd = next_fd
++            st = os.fstat(fd)
++            if st.st_uid != 0 or st.st_mode & 0o022:
++                raise CaptureRefused('baseline parent is not root-owned and immutable')
++        return fd
++    except (OSError, CaptureRefused):
++        os.close(fd)
++        raise
++
++
++def _write_at(dfd: int, name: str, doc: dict) -> None:
++    tmp = f'.{name}.{uuid.uuid4().hex}'
++    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
++                 0o600, dir_fd=dfd)
+     try:
+         os.fchown(fd, 0, 0)
+         with os.fdopen(fd, 'wb', closefd=False) as fh:
+@@ -133,15 +151,25 @@ def write_baseline(path: Path, doc: dict) -> None:
+             fh.flush()
+             os.fchmod(fd, 0o644)
+             os.fsync(fd)
+-        os.replace(tmp, path)
+-        dfd = os.open(path.parent, os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+-        try:
+-            os.fsync(dfd)
+-        finally:
+-            os.close(dfd)
++        os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
++        os.fsync(dfd)
+     finally:
+         os.close(fd)
+-        tmp.unlink(missing_ok=True)
++        try:
++            os.unlink(tmp, dir_fd=dfd)
++        except FileNotFoundError:
++            pass
++
++
++def write_baseline(path: Path, doc: dict) -> None:
++    if os.geteuid() != 0:  # windows-footgun: ok -- root-only Linux installer
++        raise CaptureRefused('baseline writer requires root')
++    path = Path(path)
++    dfd = _trusted_parent(path)
++    try:
++        _write_at(dfd, path.name, doc)
++    finally:
++        os.close(dfd)
+ 
+ 
+ def install(manifest_path=MANIFEST_PATH, ident=None, *, path=Path(census.BASELINE_PATH)) -> dict:
+@@ -149,7 +177,16 @@ def install(manifest_path=MANIFEST_PATH, ident=None, *, path=Path(census.BASELIN
+         raise CaptureRefused('baseline installation requires root')
+     # Failed re-capture must invalidate a previous baseline, never retain an old
+     # daemon attestation after an unsuccessful upgrade/activation.
+-    Path(path).unlink(missing_ok=True)
+-    doc = capture(manifest_path, ident)
+-    write_baseline(Path(path), doc)
+-    return doc
++    path = Path(path)
++    dfd = _trusted_parent(path)
++    try:
++        try:
++            os.unlink(path.name, dir_fd=dfd)
++        except FileNotFoundError:
++            pass
++        os.fsync(dfd)
++        doc = capture(manifest_path, ident)
++        _write_at(dfd, path.name, doc)
++        return doc
++    finally:
++        os.close(dfd)
+diff --git a/hermes_cli/worker_drain_baseline_cli.py b/hermes_cli/worker_drain_baseline_cli.py
+new file mode 100644
+index 0000000000..2fbb4cc613
+--- /dev/null
++++ b/hermes_cli/worker_drain_baseline_cli.py
+@@ -0,0 +1,64 @@
++"""Root installation boundary for the image-authored drain manifest.
++
++prepare must run after activation and before starting the daemon. capture runs
++later as a standalone oneshot on the idle host; neither operation learns an
++allowlist from /proc. Reboot requires prepare + daemon restart + capture again.
++"""
++from __future__ import annotations
++
++import argparse
++import copy
++import json
++import os
++import sys
++import time
++
++from hermes_cli import worker_drain_baseline as baseline
++from hermes_cli import worker_drain_fence as fence
++
++
++def boot_ticks() -> int:
++    # /proc/PID/stat starttime uses time since boot, including suspend. Round up
++    # so processes created in the same scheduler tick cannot claim a cold start.
++    return (time.clock_gettime_ns(time.CLOCK_BOOTTIME) * os.sysconf('SC_CLK_TCK')
++            + 999_999_999) // 1_000_000_000
++
++
++def prepare(image_manifest) -> dict:
++    if os.geteuid() != 0:  # windows-footgun: ok -- Linux root-only image installer
++        raise baseline.CaptureRefused('manifest preparation requires root')
++    act = fence.load_activation()
++    if act is None:
++        raise baseline.CaptureRefused('activate fence before preparing manifest')
++    ident = fence.current_identity(act)
++    doc = copy.deepcopy(baseline.load_manifest(image_manifest))
++    try:
++        runtime = doc['runtime']
++        tick = boot_ticks()
++        runtime.update(installed_boot_id=ident.boot, installed_start_ticks=tick, activation_start_ticks=tick)
++    except (KeyError, TypeError) as exc:
++        raise baseline.CaptureRefused('image manifest needs a reviewed runtime contract') from exc
++    from hermes_cli.worker_drain_capability import verified_contract
++    verified_contract(doc)  # Verify the authored hashes; never replace them with observed hashes.
++    baseline.write_baseline(baseline.MANIFEST_PATH, doc)
++    return doc
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    commands = parser.add_subparsers(dest='command', required=True)
++    setup = commands.add_parser('prepare', help='install image-authored hashes before daemon startup')
++    setup.add_argument('image_manifest')
++    commands.add_parser('capture', help='capture only declared, idle process identities')
++    args = parser.parse_args(argv)
++    try:
++        doc = prepare(args.image_manifest) if args.command == 'prepare' else baseline.install()
++    except (OSError, ValueError, baseline.CaptureRefused, fence.DrainRefused) as exc:
++        print(f'drain baseline refused: {exc}', file=sys.stderr)
++        return 1
++    print(json.dumps(doc, sort_keys=True))
++    return 0
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/hermes_cli/worker_drain_capability.py b/hermes_cli/worker_drain_capability.py
+index e4a3d3e74a..9a92e7a394 100644
+--- a/hermes_cli/worker_drain_capability.py
++++ b/hermes_cli/worker_drain_capability.py
+@@ -52,7 +52,14 @@ def verified_contract(manifest: dict) -> dict:
+ 
+ 
+ def startup_is_cold() -> bool:
+-    if threading.active_count() != 1:
++    # These two bootstrap observers do not execute application work. Unknown
++    # threads or an already-created plugin manager make this a warm runtime.
++    observers = {'gateway-startup-watchdog', 'hermes-exit-metrics'}
++    if any(t is not threading.main_thread() and t.name not in observers for t in threading.enumerate()):
++        return False
++    plugins = sys.modules.get('hermes_cli.plugins')
++    if plugins is not None and (getattr(plugins, '_plugin_manager', None) is not None
++                               or getattr(plugins, '_plugin_managers_by_home', {})):
+         return False
+     try:
+         asyncio.get_running_loop()
+@@ -76,7 +83,10 @@ def create_capability(ident, manifest, *, entry=None) -> int:
+     entry = census.process_identity('/proc', str(os.getpid())) if entry is None else entry
+     if entry[0] != os.getpid():
+         raise CaptureRefused('cannot attest another process')
+-    payload = _payload(ident, entry, verified_contract(manifest))
++    contract = verified_contract(manifest)
++    if Path(contract['core_root']).resolve() != Path(__file__).resolve().parents[1]:
++        raise CaptureRefused('running core is not the reviewed installed runtime')
++    payload = _payload(ident, entry, contract)
+     fd = os.memfd_create(NAME, os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC)
+     try:
+         with os.fdopen(fd, 'wb', closefd=False) as fh:
+@@ -89,6 +99,41 @@ def create_capability(ident, manifest, *, entry=None) -> int:
+         raise
+ 
+ 
++_daemon_fd: int | None = None
++_revoked = False
++_daemon_lock = threading.RLock()
++
++
++def revoke(reason: str) -> None:
++    """One-way loss of exemption, before any unsupported code can execute."""
++    global _daemon_fd, _revoked
++    with _daemon_lock:
++        _revoked = True
++        if _daemon_fd is not None:
++            os.close(_daemon_fd)
++            _daemon_fd = None
++
++
++def start_daemon_capability() -> bool:
++    """Only the cold entry calls this; failure disables exemption, not startup."""
++    global _daemon_fd
++    from hermes_cli.worker_drain_baseline import MANIFEST_PATH, load_manifest
++    with _daemon_lock:
++        if _revoked:
++            return False
++        if _daemon_fd is not None:
++            return True
++        try:
++            act = fence.load_activation()
++            if act is None:
++                return False
++            _daemon_fd = create_capability(fence.current_identity(act), load_manifest(MANIFEST_PATH))
++            return True
++        except (OSError, ValueError, CaptureRefused, fence.DrainRefused):
++            revoke('capability startup refused')
++            return False
++
++
+ def validate_capability(pid, entry, ident, manifest, *, proc_root='/proc') -> None:
+     if fcntl is None:
+         raise CaptureRefused('daemon capability requires Linux')
+diff --git a/hermes_cli/worker_drain_spawn_inventory.json b/hermes_cli/worker_drain_spawn_inventory.json
+index cfb434a093..aeeddf6001 100644
+--- a/hermes_cli/worker_drain_spawn_inventory.json
++++ b/hermes_cli/worker_drain_spawn_inventory.json
+@@ -1000,6 +1000,11 @@
+    "routed": 0,
+    "status": "pending"
+   },
++  "hermes_cli/worker_drain_baseline.py": {
++   "direct": 1,
++   "routed": 0,
++   "status": "pending"
++  },
+   "hermes_cli/worktree_archive.py": {
+    "direct": 2,
+    "routed": 0,
+@@ -1537,8 +1542,7 @@
+   }
+  },
+  "incomplete_seams": {
+-  "gateway/session_worker_spawn.py": "acquire_process runs a caller-supplied spawn callable with no drain lease; its one caller spawns in gateway/session_managed_worker.py (pending)",
+-  "tools/registry.py": "registry.dispatch takes no drain lease: a tool handler is covered only where its own spawn site is fenced; handlers that spawn through a pending file run unfenced"
++  "gateway/session_worker_spawn.py": "acquire_process runs a caller-supplied spawn callable with no drain lease; its one caller spawns in gateway/session_managed_worker.py (pending)"
+  },
+  "version": 1
+ }
+diff --git a/tests/hermes_cli/test_worker_drain_baseline_cli.py b/tests/hermes_cli/test_worker_drain_baseline_cli.py
+new file mode 100644
+index 0000000000..a9b37101de
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_baseline_cli.py
+@@ -0,0 +1,57 @@
++"""Install is explicit, root-only and never discovers a process allowlist."""
++import json
++
++import pytest
++
++from hermes_cli import worker_drain_baseline as baseline
++from hermes_cli import worker_drain_baseline_cli as cli
++from hermes_cli import worker_drain_fence as fence
++
++pytestmark = pytest.mark.platforms('linux')
++
++
++def test_capture_command_calls_strict_installer(monkeypatch, capsys):
++    calls = []
++    monkeypatch.setattr(baseline, 'install', lambda: calls.append('capture') or {'version': 2})
++    assert cli.main(['capture']) == 0
++    assert calls == ['capture']
++    assert json.loads(capsys.readouterr().out) == {'version': 2}
++
++
++def test_refusal_has_nonzero_status_without_fake_observation(monkeypatch, capsys):
++    def refuse():
++        raise baseline.CaptureRefused('undeclared live process')
++    monkeypatch.setattr(baseline, 'install', refuse)
++    assert cli.main(['capture']) == 1
++    captured = capsys.readouterr()
++    assert not captured.out
++    assert 'undeclared live process' in captured.err
++
++
++def test_prepare_binds_current_boot_and_post_activation_ticks(monkeypatch):
++    manifest = {'version': 1, 'units': [], 'runtime': {'installed_start_ticks': 0}}
++    calls = []
++    monkeypatch.setattr(cli.os, 'geteuid', lambda: 0)
++    monkeypatch.setattr(baseline, 'load_manifest', lambda path: manifest)
++    monkeypatch.setattr(baseline, 'write_baseline', lambda path, doc: calls.append((path, doc)))
++    monkeypatch.setattr(fence, 'load_activation', dict)
++    monkeypatch.setattr(fence, 'current_identity', lambda act: fence.Identity('i-12345678', 'boot-a', 'epoch-a'))
++    from hermes_cli import worker_drain_capability as cap
++    monkeypatch.setattr(cap, 'verified_contract', lambda doc: {'digest': 'verified'})
++    monkeypatch.setattr(cli, 'boot_ticks', lambda: 1000)
++    doc = cli.prepare('image-manifest')
++    assert doc['runtime']['installed_boot_id'] == 'boot-a'
++    assert doc['runtime']['installed_start_ticks'] == 1000
++    assert doc['runtime']['activation_start_ticks'] == 1000
++    assert calls == [(baseline.MANIFEST_PATH, doc)]
++    assert manifest['runtime'] == {'installed_start_ticks': 0}  # caller template is not mutated
++
++
++def test_prepare_requires_activation_and_root(monkeypatch):
++    monkeypatch.setattr(cli.os, 'geteuid', lambda: 1000)
++    with pytest.raises(baseline.CaptureRefused, match='root'):
++        cli.prepare('image')
++    monkeypatch.setattr(cli.os, 'geteuid', lambda: 0)
++    monkeypatch.setattr(fence, 'load_activation', lambda: None)
++    with pytest.raises(baseline.CaptureRefused, match='activat'):
++        cli.prepare('image')
+diff --git a/tests/hermes_cli/test_worker_drain_capability.py b/tests/hermes_cli/test_worker_drain_capability.py
+index afd4d3e930..a22953478f 100644
+--- a/tests/hermes_cli/test_worker_drain_capability.py
++++ b/tests/hermes_cli/test_worker_drain_capability.py
+@@ -1,6 +1,7 @@
+ """Kernel-sealed daemon capability lifetime and identity controls."""
+ from __future__ import annotations
+ 
++from pathlib import Path
+ import os
+ 
+ import pytest
+@@ -18,7 +19,8 @@ def capability(monkeypatch):
+     entry = census.process_identity('/proc', str(os.getpid()))
+     ident = fence.Identity('i-12345678', 'boot-a', 'epoch-a', os.getuid())
+     contract = {'digest': 'core-digest', 'installed_boot_id': 'boot-a', 'installed_start_ticks': entry[1] - 1,
+-                'activation_start_ticks': entry[1] - 1, 'homes': ['/home/worker/.hermes']}
++                'activation_start_ticks': entry[1] - 1, 'homes': ['/home/worker/.hermes'],
++                'core_root': str(Path(cap.__file__).resolve().parents[1])}
+     monkeypatch.setattr(cap, 'verified_contract', lambda manifest: contract)
+     monkeypatch.setattr(cap, 'startup_is_cold', lambda: True)
+     fd = cap.create_capability(ident, {}, entry=entry)
+@@ -68,6 +70,13 @@ def test_capability_disappears_with_descriptor(capability):
+         cap.validate_capability(entry[0], entry, ident, {})
+ 
+ 
++def test_mint_cannot_attest_a_different_installed_tree(capability):
++    ident, entry, _, contract = capability
++    contract['core_root'] = '/other/reviewed/core'
++    with pytest.raises(CaptureRefused, match='running core'):
++        cap.create_capability(ident, {}, entry=entry)
++
++
+ def test_warm_daemon_cannot_gain_capability(capability, monkeypatch):
+     ident, entry, _, _ = capability
+     monkeypatch.setattr(cap, 'startup_is_cold', lambda: False)
+diff --git a/tests/hermes_cli/test_worker_drain_daemon_startup.py b/tests/hermes_cli/test_worker_drain_daemon_startup.py
+new file mode 100644
+index 0000000000..293cf960fa
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_daemon_startup.py
+@@ -0,0 +1,113 @@
++"""Cold minting and one-way capability revocation before foreign code executes."""
++import os
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import worker_drain_capability as cap
++from hermes_cli import worker_drain_fence as fence
++
++pytestmark = pytest.mark.platforms('linux')
++
++
++@pytest.fixture
++def daemon(monkeypatch):
++    fd = os.open('/dev/null', os.O_RDONLY)
++    monkeypatch.setattr(cap, '_daemon_fd', None, raising=False)
++    monkeypatch.setattr(cap, '_revoked', False, raising=False)
++    monkeypatch.setattr(fence, 'load_activation', lambda: {'uid': os.getuid()})
++    monkeypatch.setattr(fence, 'current_identity', lambda act: 'identity')
++    monkeypatch.setattr(cap, 'create_capability', lambda ident, manifest: os.dup(fd))
++    from hermes_cli import worker_drain_baseline as baseline
++    monkeypatch.setattr(baseline, 'load_manifest', lambda path: {})
++    try:
++        yield
++    finally:
++        cap.revoke('test teardown')
++        os.close(fd)
++
++
++def test_start_retains_descriptor_and_revoke_is_irreversible(daemon):
++    assert cap.start_daemon_capability()
++    fd = cap._daemon_fd
++    os.fstat(fd)
++    cap.revoke('unreviewed plugin')
++    with pytest.raises(OSError):
++        os.fstat(fd)
++    assert not cap.start_daemon_capability()
++    assert cap._daemon_fd is None
++
++
++def test_no_activation_never_mints(daemon, monkeypatch):
++    monkeypatch.setattr(fence, 'load_activation', lambda: None)
++    assert not cap.start_daemon_capability()
++    assert cap._daemon_fd is None
++
++
++def test_mint_failure_does_not_break_gateway(daemon, monkeypatch):
++    from hermes_cli.worker_drain_baseline import CaptureRefused
++    def refuse(*args):
++        raise CaptureRefused('warm startup')
++    monkeypatch.setattr(cap, 'create_capability', refuse)
++    assert not cap.start_daemon_capability()
++    assert cap._daemon_fd is None
++
++
++def test_cold_boundary_preserves_watchdog_but_rejects_unknown_threads(monkeypatch):
++    from hermes_cli import plugins
++    monkeypatch.setattr(plugins, '_plugin_manager', None)
++    monkeypatch.setattr(plugins, '_plugin_managers_by_home', {})
++    main = threading.main_thread()
++    monkeypatch.setattr(threading, 'enumerate', lambda: [main, SimpleNamespace(name='gateway-startup-watchdog'),
++                                                       SimpleNamespace(name='hermes-exit-metrics')])
++    assert cap.startup_is_cold()
++    monkeypatch.setattr(threading, 'enumerate', lambda: [main, SimpleNamespace(name='arbitrary-work')])
++    assert not cap.startup_is_cold()
++
++
++def test_entry_calls_capability_before_starting_application(monkeypatch):
++    from hermes_cli import gateway
++    class BoundaryReached(RuntimeError):
++        pass
++    def boundary():
++        raise BoundaryReached('before application work')
++    monkeypatch.setattr(cap, 'start_daemon_capability', boundary)
++    for name in ('_guard_official_docker_root_gateway', '_attach_to_host_gateway_or_guard',
++                 '_guard_supervised_gateway_conflict', '_guard_existing_gateway_process_conflict',
++                 '_apply_startup_watchdog_config'):
++        monkeypatch.setattr(gateway, name, lambda *a, **kw: None)
++    from hermes_cli.observability import shared_metrics_process
++    monkeypatch.setattr(shared_metrics_process, 'begin_process', lambda *a: None)
++    def application_started():
++        pytest.fail('application started before capability boundary')
++    monkeypatch.setattr(gateway, '_stdin_is_tty', application_started)
++    with pytest.raises(BoundaryReached):
++        gateway.run_gateway()
++
++
++@pytest.mark.parametrize('method', ['_load_plugin', '_load_directory_module', '_load_entrypoint_module',
++                                  '_load_portable_plugin'])
++def test_unreviewed_plugin_revokes_before_any_plugin_execution(daemon, monkeypatch, method):
++    from hermes_cli.plugins_loader import PluginLoaderMixin
++    assert cap.start_daemon_capability()
++    original = cap.revoke
++    class Revoked(RuntimeError):
++        pass
++    def boundary(reason):
++        original(reason)
++        raise Revoked('before plugin code')
++    monkeypatch.setattr(cap, 'revoke', boundary)
++    args = (object(), object()) if method == '_load_portable_plugin' else (object(),)
++    try:
++        with pytest.raises(Revoked):
++            getattr(PluginLoaderMixin, method)(object(), *args)
++        assert cap._daemon_fd is None
++    finally:
++        monkeypatch.setattr(cap, 'revoke', original)
++
++
++def test_plugins_loaded_before_mint_make_startup_warm(monkeypatch):
++    from hermes_cli import plugins
++    monkeypatch.setattr(plugins, '_plugin_managers_by_home', {'home': object()})
++    assert not cap.startup_is_cold()
+diff --git a/tests/hermes_cli/test_worker_drain_producer.py b/tests/hermes_cli/test_worker_drain_producer.py
+index 5f8aef8111..b1a1d6248b 100644
+--- a/tests/hermes_cli/test_worker_drain_producer.py
++++ b/tests/hermes_cli/test_worker_drain_producer.py
+@@ -80,6 +80,7 @@ def test_atomic_writer_owner_mode_and_failed_capture_invalidates(tmp_path, monke
+     # own control and the production writer always uses fchown(0, 0).
+     path = tmp_path / 'baseline.json'
+     monkeypatch.setattr(producer.os, 'geteuid', lambda: 0)
++    monkeypatch.setattr(producer, '_trusted_parent', lambda path: os.open(path.parent, os.O_DIRECTORY), raising=False)
+     chowns = []
+     monkeypatch.setattr(producer.os, 'fchown', lambda fd, uid, gid: chowns.append((uid, gid)))
+     producer.write_baseline(path, {'version': 2})
+diff --git a/tests/hermes_cli/test_worker_drain_roundtrip.py b/tests/hermes_cli/test_worker_drain_roundtrip.py
+new file mode 100644
+index 0000000000..9e9f14d3bf
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_roundtrip.py
+@@ -0,0 +1,74 @@
++"""Compose real manifest parsing, capture, writer, loader and live revalidation."""
++import json
++import os
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import worker_drain_baseline as producer
++from hermes_cli import worker_drain_census as census
++from hermes_cli import worker_drain_fence as fence
++from tests.hermes_cli.test_worker_drain_baseline import process
++
++pytestmark = pytest.mark.platforms('linux')
++
++
++@pytest.fixture
++def composed(tmp_path, monkeypatch):
++    proc = tmp_path / 'proc'
++    proc.mkdir()
++    exe = tmp_path / 'image-executable'
++    exe.write_bytes(b'reviewed image executable')
++    fragment = tmp_path / 'idle.service'
++    fragment.write_text('[Service]\nExecStart=/image/idled\n')
++    process(proc, exe=str(exe))
++    manifest = tmp_path / 'manifest.json'
++    manifest.write_text(json.dumps({'version': 1, 'units': [{
++        'name': 'idle.service', 'kind': 'infrastructure',
++        'fragment_sha256': producer.file_digest(fragment),
++        'exe_sha256': producer.file_digest(exe)}]}))
++    manifest.chmod(0o644)
++    ident = fence.Identity('i-12345678', 'boot-a', 'epoch-a', os.getuid())
++    monkeypatch.setattr(fence, 'load_activation', dict)
++    monkeypatch.setattr(fence, 'current_identity', lambda act: ident)
++    monkeypatch.setattr(producer, 'MANIFEST_PATH', manifest)
++    monkeypatch.setattr(producer, 'unit_state', lambda unit: {
++        'MainPID': '10', 'ControlGroup': '/system.slice/idle.service', 'FragmentPath': str(fragment)})
++    # Only the system-manager and host-path boundaries are routed into the
++    # fixture. All manifest/digest/identity/schema decisions are production code.
++    validate = producer.validate_baseline
++    monkeypatch.setattr(producer, 'validate_baseline', lambda base, ident: validate(base, ident, proc_root=str(proc)))
++    real_fstat = os.fstat
++    def root_stat(fd):
++        st = real_fstat(fd)
++        return SimpleNamespace(st_uid=0, st_mode=st.st_mode, st_nlink=st.st_nlink,
++                               st_size=st.st_size, st_gid=st.st_gid)
++    monkeypatch.setattr(os, 'fstat', root_stat)
++    monkeypatch.setattr(os, 'geteuid', lambda: 0)
++    monkeypatch.setattr(os, 'fchown', lambda *a: None)
++    monkeypatch.setattr(producer, '_trusted_parent', lambda path: os.open(path.parent, os.O_DIRECTORY))
++    path = tmp_path / 'baseline.json'
++    producer.write_baseline(path, producer.capture(manifest, ident, proc_root=str(proc)))
++    return proc, path, exe, fragment
++
++
++def test_capture_load_idle_extra_process_and_reboot(composed, monkeypatch):
++    proc, path, _, _ = composed
++    base = census.load_baseline(str(path))
++    assert base is not None
++    assert census.observe_processes(str(proc), base).state == census.ZERO
++    process(proc, pid=11)
++    assert census.observe_processes(str(proc), base).state == census.POSITIVE
++    monkeypatch.setattr(fence, 'current_identity', lambda act: fence.Identity('i-12345678', 'new-boot', 'epoch-a'))
++    assert census.load_baseline(str(path)) is None
++    assert census.observe_processes(str(proc), base).state == census.UNKNOWN
++
++
++@pytest.mark.parametrize('index', [2, 3])
++def test_live_package_mutation_invalidates_persisted_baseline(composed, index):
++    _, path, _, _ = composed
++    base = census.load_baseline(str(path))
++    assert base is not None
++    composed[index].write_bytes(b'changed package')
++    assert census.load_baseline(str(path)) is None
++    assert not census.baseline_is_live(base)
+diff --git a/tests/hermes_cli/test_worker_drain_source_scan.py b/tests/hermes_cli/test_worker_drain_source_scan.py
+index b6d62d5f53..c1ebd3dd3e 100644
+--- a/tests/hermes_cli/test_worker_drain_source_scan.py
++++ b/tests/hermes_cli/test_worker_drain_source_scan.py
+@@ -58,8 +58,6 @@ REQUIRED_SEAMS = {
+ # either. They are INCOMPLETE, recorded in the inventory, and stay listed until the file carries the
+ # fence (the test then fails so the entry is removed with a real test of the new fence).
+ INCOMPLETE_SEAMS = {
+-    'tools/registry.py': 'registry.dispatch takes no drain lease: a tool handler is covered only where its own '
+-                         'spawn site is fenced; handlers that spawn through a pending file run unfenced',
+     'gateway/session_worker_spawn.py': 'acquire_process runs a caller-supplied spawn callable with no drain lease; '
+                                        'its one caller spawns in gateway/session_managed_worker.py (pending)',
+ }
+@@ -240,8 +238,9 @@ def test_required_seams_are_accounted_for():
+     for label, prefix in REQUIRED_SEAMS.items():
+         assert (REPO / prefix).exists(), f'{label}: {prefix} moved; update REQUIRED_SEAMS'
+         inventoried = any(k == prefix or k.startswith(prefix.rstrip('/') + '/') for k in inv)
+-        if not inventoried and prefix not in INCOMPLETE_SEAMS:
++        if not inventoried and prefix not in INCOMPLETE_SEAMS and prefix != 'tools/registry.py':
+             missing[label] = prefix
++    assert _has_fence('tools/registry.py'), 'registry dispatch lost its tested admission fence'
+     assert not missing, f'required drain seams neither inventoried nor recorded INCOMPLETE: {missing}'
+     assert doc.get('incomplete_seams') == INCOMPLETE_SEAMS, 'regenerate the inventory (--write)'
+ 
+diff --git a/tests/hermes_cli/test_worker_drain_writer_paths.py b/tests/hermes_cli/test_worker_drain_writer_paths.py
+new file mode 100644
+index 0000000000..7e08be2a0f
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_writer_paths.py
+@@ -0,0 +1,63 @@
++"""Root baseline writes must never traverse a mutable or symlinked parent."""
++import json
++import os
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import worker_drain_baseline as producer
++
++pytestmark = pytest.mark.platforms('linux')
++
++
++@pytest.fixture
++def root_dirs(monkeypatch, tmp_path):
++    real = os.fstat
++    def root_stat(fd):
++        st = real(fd)
++        # The runner's scratch ancestors are intentionally mutable. Model the
++        # root-owned deployment ancestors, retaining real modes in our fixture.
++        mode = st.st_mode if os.readlink(f'/proc/self/fd/{fd}').startswith(str(tmp_path)) else st.st_mode & ~0o022
++        return SimpleNamespace(st_uid=0, st_mode=mode)
++    monkeypatch.setattr(producer.os, 'fstat', root_stat)
++    monkeypatch.setattr(producer.os, 'geteuid', lambda: 0)
++    monkeypatch.setattr(producer.os, 'fchown', lambda *args: None)
++
++
++def test_symlinked_ancestor_cannot_redirect_writer(tmp_path, root_dirs):
++    real = tmp_path / 'real'
++    real.mkdir()
++    link = tmp_path / 'link'
++    link.symlink_to(real, target_is_directory=True)
++    with pytest.raises((producer.CaptureRefused, OSError)):
++        producer.write_baseline(link / 'baseline.json', {})
++    assert not (real / 'baseline.json').exists()
++
++
++def test_mutable_parent_cannot_receive_root_baseline(tmp_path, root_dirs):
++    mutable = tmp_path / 'mutable'
++    mutable.mkdir(mode=0o777)
++    mutable.chmod(0o777)
++    with pytest.raises(producer.CaptureRefused, match='parent'):
++        producer.write_baseline(mutable / 'baseline.json', {})
++    assert not (mutable / 'baseline.json').exists()
++
++
++def test_install_refuses_before_unlink_or_capture(tmp_path, root_dirs, monkeypatch):
++    mutable = tmp_path / 'mutable'
++    mutable.mkdir()
++    path = mutable / 'baseline.json'
++    path.write_text('preserve foreign bytes')
++    mutable.chmod(0o777)
++    monkeypatch.setattr(producer, 'capture', lambda *a, **k: pytest.fail('capture before path trust'))
++    with pytest.raises(producer.CaptureRefused, match='parent'):
++        producer.install(path=path)
++    assert path.read_text() == 'preserve foreign bytes'
++
++
++def test_atomic_replace_uses_pinned_directory(tmp_path, root_dirs):
++    path = tmp_path / 'baseline.json'
++    producer.write_baseline(path, {'version': 2})
++    assert json.loads(path.read_text()) == {'version': 2}
++    assert path.stat().st_mode & 0o777 == 0o644
++    assert not list(tmp_path.glob('.baseline.json.*'))
+diff --git a/tests/tools/test_worker_drain_dispatch.py b/tests/tools/test_worker_drain_dispatch.py
+new file mode 100644
+index 0000000000..45ec7a9f17
+--- /dev/null
++++ b/tests/tools/test_worker_drain_dispatch.py
+@@ -0,0 +1,39 @@
++"""Shared turn and tool entry points hold real kernel drain leases."""
++import pytest
++
++from hermes_cli import worker_drain_fence as fence
++from tests.tools import test_worker_drain_spawn as helpers
++
++node = helpers.node
++pytestmark = pytest.mark.platforms('linux')
++
++
++@pytest.mark.parametrize('kind', ['turn', 'tool'])
++def test_shared_entry_holds_lease_and_refuses_late_work(node, monkeypatch, kind):
++    root, ident = node
++    calls = []
++
++    def body(*args, **kwargs):
++        calls.append(fence.busy_leases(root))
++        return {'final_response': 'ok'}
++
++    if kind == 'turn':
++        from agent.turn_facade import TurnFacadeMixin
++        monkeypatch.setattr(TurnFacadeMixin, '_run_conversation_scoped', body)
++        from agent import local_work_agent
++        from contextlib import nullcontext
++        monkeypatch.setattr(local_work_agent, 'scope', lambda *a: nullcontext())
++        invoke = lambda: TurnFacadeMixin.run_conversation(object(), 'hello')
++    else:
++        from tools.registry import ToolRegistry
++        registry = ToolRegistry()
++        registry.register(name='drain_test', toolset='test', schema={'name': 'drain_test', 'parameters': {}},
++                          handler=body)
++        invoke = lambda: registry.dispatch('drain_test', {})
++    invoke()
++    assert calls == [1]
++    assert fence.busy_leases(root) == 0
++    helpers.latch(root, ident)
++    with pytest.raises(fence.DrainRefused, match='draining'):
++        invoke()
++    assert calls == [1]
+diff --git a/tools/registry.py b/tools/registry.py
+index 668f70383a..b2586decf2 100644
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -1138,7 +1138,18 @@ class ToolRegistry:
+             f"Tool handler returned unsupported result type: {result_type}",
+             error_type="tool_result_contract", tool=name, result_type=result_type)
+ 
+-    def dispatch(
++    def dispatch(self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:
++        """Hold admission through the handler, including async bridging and cleanup."""
++        from hermes_cli.worker_drain_fence import admit, lease_scope
++        lease = admit('registry.dispatch')
++        try:
++            with lease_scope(lease):
++                return self._dispatch_admitted(name, args, scope=scope, **kwargs)
++        finally:
++            if lease is not None:
++                lease.close()
++
++    def _dispatch_admitted(
+         self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:
+         """Execute a tool handler by name: async handlers bridged via ``_run_async()``,
+         results normalized, every exception returned as ``{"error": ...}``."""
+-- 
+2.43.0
+

@@ -1,0 +1,537 @@
+From 1a4837f56a9554dee8f439ab5c2950f70261cedf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 04:23:54 +0000
+Subject: [PATCH] [daveey] Keep containment release decisions with open
+ authorities
+
+Refuse terminal authorities when creating new containment episodes, and require authorities to release or explicitly retain their episodes before completing. Surface those episodes in worker context, including replica-only targets. Preserve unsafe descendant containment and producer release semantics.
+
+Proof: regression suite red on main (8 failed), 628 focused tests passed with one schema-size failure then schema regression rerun green; ten behavioral mutants killed. Read-only hub replay: 11 held episodes across example boards, 10 terminal authority nominations refused if nominated now; lookup matches all 11. Ship verdict reader accepts containment_retained.
+---
+ hermes_cli/kanban.py                          |   4 +
+ hermes_cli/kanban_containment_authority.py    | 114 ++++++++++++++
+ hermes_cli/kanban_containment_lifecycle.py    |   3 +
+ hermes_cli/kanban_containment_remote.py       |   5 +-
+ hermes_cli/kanban_db.py                       |  19 +--
+ hermes_cli/kanban_db_context.py               |  16 ++
+ .../test_kanban_containment_authority.py      | 149 ++++++++++++++++++
+ .../test_kanban_containment_authority.py      |  42 +++++
+ tools/kanban_containment_tools.py             |   2 +
+ tools/kanban_tools.py                         |   5 +
+ tools/kanban_tools_schemas.py                 |   1 +
+ 11 files changed, 347 insertions(+), 13 deletions(-)
+ create mode 100644 hermes_cli/kanban_containment_authority.py
+ create mode 100644 tests/hermes_cli/test_kanban_containment_authority.py
+ create mode 100644 tests/tools/test_kanban_containment_authority.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 6bea68f806..00fe3310d0 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1256,6 +1256,7 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint:
+ 
+ def _cmd_complete(args: argparse.Namespace) -> int:
+     """Mark one or more tasks done. Supports a single id or a list."""
++    from hermes_cli.kanban_containment_authority import AuthorityOpen
+     ids, rc = _require_ids(args)
+     if rc:
+         return rc
+@@ -1294,6 +1295,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+                                         goal_verification=verified[0] if verified else None,
+                                         expected_run_id=own_run,
+                                         force=bool(getattr(args, "force", False)))
++            except AuthorityOpen as authority_err:
++                fail_msg[tid] = f"cannot complete {tid}: {authority_err}"
++                return False
+             except _review_contract.IndependenceRefused as outside:  # --force does not override it [daveey]
+                 fail_msg[tid] = f"cannot complete {tid}: {outside}"
+                 return False
+diff --git a/hermes_cli/kanban_containment_authority.py b/hermes_cli/kanban_containment_authority.py
+new file mode 100644
+index 0000000000..c5d5929c8b
+--- /dev/null
++++ b/hermes_cli/kanban_containment_authority.py
+@@ -0,0 +1,114 @@
++"""Visible, explicitly acknowledged custody of open containment episodes."""
++from __future__ import annotations
++
++import json
++import logging
++import sqlite3
++
++from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
++
++_log = logging.getLogger(__name__)
++
++
++class AuthorityTerminal(ContainmentRefused):
++    """A new episode needs an authority that can still decide its release."""
++
++    code = "authority_terminal"
++
++
++def require_open(status: str | None) -> None:
++    if status in ("done", "archived"):
++        raise AuthorityTerminal(
++            "Name an open authority card whose later run will decide the release; "
++            "to wait for a review use kanban_request_review, or link the review card "
++            "as parent and kanban_block(kind='dependency')."
++        )
++
++
++class AuthorityOpen(ValueError):
++    """Completion needs a release or an explicit retained-episode handoff."""
++
++    code = "containment_authority_open"
++
++    def __init__(self, episodes: list[dict]):
++        self.episodes = episodes
++        super().__init__(
++            f"{self.code}: open containment episodes {json.dumps(episodes)}. "
++            "Call kanban_resume_contained(task_id, episode, kind='authority'), or "
++            "complete again with metadata.containment_retained=[<episode uids>] "
++            "and explain why the hold is retained in the summary."
++        )
++
++
++def _rows(conn: sqlite3.Connection) -> dict[str, tuple[str, dict]]:
++    # Unsynced boards predating portable events cannot contain an episode.
++    columns = {row[1] for row in conn.execute("PRAGMA table_info(task_events)")}
++    if "uid" not in columns:
++        return {}
++    rows = {}
++    for tid, title, episode, payload in conn.execute(
++        "SELECT t.id,t.title,t.containment_episode,e.payload FROM tasks t "
++        "LEFT JOIN task_events e ON e.uid=t.containment_episode "
++        "AND e.task_id=t.id AND e.kind='contained' WHERE t.containment_episode IS NOT NULL"
++    ):
++        data = json.loads(payload) if payload else None
++        rows[tid] = (episode, {"title": title, "payload": data})
++    return rows
++
++
++def open_episodes(conn: sqlite3.Connection, task_id: str) -> list[dict]:
++    """Current markers + their exact stop events, local custody before replica.
++
++    A local cleared marker overrides a stale replica hold; only foreign targets
++    fall back to sync-shadow. No network or writes occur during this lookup.
++    """
++    from hermes_cli.kanban_db_connect import _main_db_file
++    from hermes_cli.kanban_foreign_card import open_replica
++
++    local = _rows(conn)
++    with open_replica(_main_db_file(conn)) as replica:
++        rows = _rows(replica) if replica is not None else {}
++    rows = {tid: row for tid, row in rows.items()
++            if not conn.execute("SELECT 1 FROM tasks WHERE id=?", (tid,)).fetchone()}
++    rows.update(local)
++    found = []
++    for tid, (episode, row) in rows.items():
++        payload = row["payload"]
++        if not episode or not isinstance(payload, dict):
++            continue
++        policy = payload.get("policy")
++        authority = policy.get("authority") if isinstance(policy, dict) else None
++        if isinstance(authority, dict) and authority.get("task_id") == task_id:
++            found.append({"task_id": tid, "episode": episode, "title": row["title"]})
++    return sorted(found, key=lambda item: (item["task_id"], item["episode"]))
++
++
++def _lookup(conn: sqlite3.Connection, task_id: str) -> list[dict]:
++    try:
++        return open_episodes(conn, task_id)
++    except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
++        _log.warning("Containment authority lookup failed for %s: %s", task_id, exc)
++        return []
++
++
++def require_acknowledgement(conn: sqlite3.Connection, task_id: str, metadata: dict | None) -> None:
++    episodes = _lookup(conn, task_id)
++    retained = metadata.get("containment_retained") if isinstance(metadata, dict) else None
++    acknowledged = set(retained) if isinstance(retained, list) and all(isinstance(e, str) for e in retained) else set()
++    missing = [item for item in episodes if item["episode"] not in acknowledged]
++    if missing:
++        raise AuthorityOpen(missing)
++
++
++def render_context(conn: sqlite3.Connection, task_id: str) -> str:
++    episodes = _lookup(conn, task_id)
++    if not episodes:
++        return ""
++    lines = ["## Containment authority", "You own the release decision for these open episodes:"]
++    for item in episodes:
++        lines.append(
++            f"- {item['task_id']} ({item['title']}), episode {item['episode']}: "
++            f"kanban_resume_contained(task_id='{item['task_id']}', episode='{item['episode']}', kind='authority')"
++        )
++    lines.append("Before completing, resume them or set metadata.containment_retained to the retained episode uids and explain why in the summary.")
++    return "\n".join(lines) + "\n"
+diff --git a/hermes_cli/kanban_containment_lifecycle.py b/hermes_cli/kanban_containment_lifecycle.py
+index 222952f9f9..753b979633 100644
+--- a/hermes_cli/kanban_containment_lifecycle.py
++++ b/hermes_cli/kanban_containment_lifecycle.py
+@@ -176,6 +176,9 @@ def contain_local(conn: sqlite3.Connection, *, target: dict, resume_policy: dict
+             raise ContainmentRefused("foreign containment requires an unclaimed descendant")
+         if guard.pending(conn, tid, verify_release=lambda r, s: verified_release(conn, r, s)):
+             raise ContainmentRefused("task is already contained; resume its exact episode")
++        from hermes_cli.kanban_containment_authority import require_open
++        authority = conn.execute("SELECT status FROM tasks WHERE id=?", (spec["authority"]["task_id"],)).fetchone()
++        require_open(authority[0] if authority else None)
+         _nominees(conn, target, spec)
+         baseline = _baseline(conn, spec)
+         payload = {"version": 1, "target": target, "policy": spec, "producer_baseline": baseline}
+diff --git a/hermes_cli/kanban_containment_remote.py b/hermes_cli/kanban_containment_remote.py
+index d50de71c0b..e40c7f0283 100644
+--- a/hermes_cli/kanban_containment_remote.py
++++ b/hermes_cli/kanban_containment_remote.py
+@@ -124,7 +124,10 @@ def contain(
+         if request is None:
+             data = context(hub, board, task, producer)
+             target = data["target"]
+-            spec = {"version": 1, "authority": context(hub, board, authority)["target"]}
++            from hermes_cli.kanban_containment_authority import require_open
++            authority_context = context(hub, board, authority)
++            require_open(authority_context.get("status"))
++            spec = {"version": 1, "authority": authority_context["target"]}
+             if producer is not None:
+                 spec["producer"] = identity(data.get("producer"))
+                 if spec["producer"]["task_id"] != producer:
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 44fde8e335..ead5513532 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2449,6 +2449,8 @@ def complete_task(
+     auditable event. Approving a card out of ``review`` stays exempt.
+     """
+     from hermes_cli.kanban_review_required import require_review
++    from hermes_cli.kanban_containment_authority import require_acknowledgement
++    require_acknowledgement(conn, task_id, metadata)
+     require_review(conn, task_id, expected_run_id, placement_settled=placement_settled)
+     from hermes_cli import kanban_completion_receipt as receipt_admission
+     metadata, receipt_owners = receipt_admission.prepare(conn, task_id, metadata, summary=summary or result)
+@@ -2468,6 +2470,7 @@ def complete_task(
+     from hermes_cli.kanban_metadata_files import discard_on_error
+     staged: list[Path] = []
+     with _prestaged(conn, task_id, metadata), discard_on_error(staged), write_txn(conn):
++        require_acknowledgement(conn, task_id, metadata)
+         require_review(conn, task_id, expected_run_id, placement_settled=placement_settled)
+         if not _parents_satisfied(conn, task_id):
+             return False
+@@ -3572,6 +3575,8 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str, *, recovery_tai
+     now = int(time.time())
+     lines: list[str] = []
+     _ctx_header(lines, task, conn=conn)
++    from hermes_cli.kanban_containment_authority import render_context
++    lines.append(render_context(conn, task_id))
+     _ctx_standing(lines, task, list_comments(conn, task_id))  # [daveey]
+     from hermes_cli.kanban_continuation import render_checkpoint_context
+     checkpoint = render_checkpoint_context(conn, task_id)
+@@ -3601,18 +3606,8 @@ def _ctx_standing(lines: list[str], task: Task, comments: list[Comment]) -> None
+ 
+     The comment thread is tail-capped (``_CTX_MAX_COMMENTS``), so a standing "don't wait" written early on a
+     busy card would otherwise drop out of the worker's prompt."""
+-    from agent import standing_instructions as si
+-    found = si.explicit_lines(task.body or "")
+-    for c in comments:
+-        found += si.explicit_lines(c.body or "")
+-    found = si.dedupe(found)
+-    if not found:
+-        return
+-    lines.append("## Standing instructions (from the user; in force for this card)")
+-    lines += [f"standing: {line}" for line in found]
+-    lines.append("(These still govern this run: e.g. a standing \"don't wait\" means decide it yourself instead "
+-                 "of blocking on the user, unless only a human can act — a credential, a physical step.)")
+-    lines.append("")
++    from hermes_cli.kanban_db_context import _ctx_standing as render_standing
++    render_standing(lines, task, comments)
+ 
+ 
+ # --- Stats + SLA helpers ---
+diff --git a/hermes_cli/kanban_db_context.py b/hermes_cli/kanban_db_context.py
+index f4f8d0d0e5..13f7b5e68a 100644
+--- a/hermes_cli/kanban_db_context.py
++++ b/hermes_cli/kanban_db_context.py
+@@ -28,6 +28,22 @@ _CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
+ _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
+ 
+ 
++def _ctx_standing(lines: list[str], task: Task, comments: list) -> None:
++    """Preserve explicit standing instructions even when comment history is capped."""
++    from agent import standing_instructions as si
++    found = si.explicit_lines(task.body or "")
++    for c in comments:
++        found += si.explicit_lines(c.body or "")
++    found = si.dedupe(found)
++    if not found:
++        return
++    lines.append("## Standing instructions (from the user; in force for this card)")
++    lines += [f"standing: {line}" for line in found]
++    lines.append("(These still govern this run: e.g. a standing \"don't wait\" means decide it yourself instead "
++                 "of blocking on the user, unless only a human can act — a credential, a physical step.)")
++    lines.append("")
++
++
+ def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
+     """``just now`` / ``18h ago`` / ``3d ago``; "" for a missing/invalid ts. An LLM
+     reads a bare absolute timestamp as current fact — the relative age is what
+diff --git a/tests/hermes_cli/test_kanban_containment_authority.py b/tests/hermes_cli/test_kanban_containment_authority.py
+new file mode 100644
+index 0000000000..b382a2ecdb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_containment_authority.py
+@@ -0,0 +1,149 @@
++"""Authority admission and explicit retention, separate from review verdicts."""
++from __future__ import annotations
++
++from contextlib import contextmanager
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_containment_lifecycle as lifecycle
++from tests.hermes_cli import test_kanban_containment_lifecycle as local
++from tests.hermes_cli import test_kanban_containment_remote as remote
++
++board = local.board
++
++
++@pytest.mark.parametrize("status", ["done", "archived"])
++def test_terminal_authority_cannot_be_nominated(board, status):
++    relay, _, authority, target, spec = local.setup(board)
++    board.execute("UPDATE tasks SET status=? WHERE id=?", (status, authority))
++    with pytest.raises(lifecycle.ContainmentRefused) as refused:
++        local.contain(board, relay, target, spec)
++    assert refused.value.code == "authority_terminal"
++    assert "kanban_request_review" in str(refused.value)
++    assert kb.get_task(board, relay).status == "running"
++
++
++@pytest.mark.parametrize("status", ["done", "archived"])
++def test_remote_terminal_authority_refused_before_staging(board, monkeypatch, status):
++    from gateway.session_context import scoped_current_session_id
++    from hermes_cli import kanban_containment_service as service
++    target, authority, session, hub = remote.setup(board, monkeypatch)
++    hub.rows[("tasks", authority)]["status"] = status
++    with scoped_current_session_id(session), pytest.raises(lifecycle.ContainmentRefused) as refused:
++        service.contain(board, authority=authority, summary="Unsafe fixture run")
++    assert refused.value.code == "authority_terminal"
++    assert hub.posts == []
++    assert kb.get_task(board, target).status == "running"
++
++
++def test_remote_missing_status_preserves_compatible_context(board, monkeypatch):
++    from gateway.session_context import scoped_current_session_id
++    from hermes_cli import kanban_containment_service as service
++    target, authority, session, hub = remote.setup(board, monkeypatch)
++    original = hub.containment_context
++    def without_status(*args):
++        data = original(*args)
++        data.pop("status")
++        return data
++    monkeypatch.setattr(hub, "containment_context", without_status)
++    with scoped_current_session_id(session):
++        result = service.contain(board, authority=authority, summary="Unsafe fixture")
++    assert result["status"] == "triage"
++    assert kb.get_task(board, target).containment_episode == result["episode"]
++
++
++@pytest.mark.parametrize("retained", [None, "wrong", ["wrong"], [{}], []])
++def test_malformed_or_stale_retention_does_not_acknowledge(board, retained):
++    from hermes_cli import kanban_containment_authority as authority_gate
++    relay, _, authority, target, spec = local.setup(board)
++    local.contain(board, relay, target, spec)
++    with pytest.raises(authority_gate.AuthorityOpen):
++        authority_gate.require_acknowledgement(board, authority, {"containment_retained": retained})
++    assert authority_gate.open_episodes(board, relay) == []
++    assert authority_gate.render_context(board, relay) == ""
++
++
++def test_authority_must_release_or_explicitly_retain(board):
++    from hermes_cli import kanban_containment_authority as authority_gate
++    relay, _, authority, target, spec = local.setup(board)
++    episode = local.contain(board, relay, target, spec)["episode"]
++    episodes = authority_gate.open_episodes(board, authority)
++    assert episodes == [{"task_id": relay, "episode": episode, "title": kb.get_task(board, relay).title}]
++    context = kb.build_worker_context(board, authority)
++    assert "## Containment authority" in context
++    assert episode in context and "kanban_resume_contained" in context
++    with pytest.raises(authority_gate.AuthorityOpen) as refused:
++        kb.complete_task(board, authority, summary="Review finished")
++    assert refused.value.code == "containment_authority_open"
++    assert refused.value.episodes == episodes
++    assert kb.get_task(board, authority).status == "running"
++    local.release(board, target, episode, authority)
++    assert authority_gate.open_episodes(board, authority) == []
++    assert kb.complete_task(board, authority, summary="Released unsafe run")
++
++
++def test_retained_episode_is_explicit_and_persisted(board):
++    from hermes_cli import kanban_containment_authority as authority_gate
++    relay, _, authority, target, spec = local.setup(board)
++    episode = local.contain(board, relay, target, spec)["episode"]
++    with pytest.raises(authority_gate.AuthorityOpen):
++        kb.complete_task(board, authority, summary="Keep hold", metadata={"containment_retained": ["wrong"]})
++    metadata = {"verdict": "approve", "containment_retained": [episode]}
++    assert kb.complete_task(board, authority, summary="Retain hold: unsafe fixture remains", metadata=metadata)
++    assert kb.latest_run(board, authority).metadata["containment_retained"] == [episode]
++    assert kb.get_task(board, relay).status == "triage"
++
++
++def test_replica_only_episode_and_local_release_override(board, monkeypatch, tmp_path):
++    from hermes_cli import kanban_containment_authority as authority_gate
++    from hermes_cli import kanban_foreign_card as foreign
++    relay, _, authority, target, spec = local.setup(board)
++    episode = local.contain(board, relay, target, spec)["episode"]
++    import sqlite3
++    replica = sqlite3.connect(tmp_path / "replica.db", isolation_level=None)
++    replica.row_factory = sqlite3.Row
++    board.backup(replica)
++    local.release(board, target, episode, authority)
++    @contextmanager
++    def open_replica(path):
++        yield replica
++    monkeypatch.setattr(foreign, "open_replica", open_replica)
++    assert authority_gate.open_episodes(board, authority) == []
++    # A separate gateway has no target row or history; its replica carries it.
++    with sqlite3.connect(":memory:") as peer:
++        peer.execute("CREATE TABLE tasks (id TEXT,title TEXT,containment_episode TEXT)")
++        peer.execute("CREATE TABLE task_events (uid TEXT,task_id TEXT,kind TEXT,payload TEXT)")
++        assert authority_gate.open_episodes(peer, authority)[0]["episode"] == episode
++    replica.close()
++
++
++def test_lookup_error_fails_open(board, monkeypatch, caplog):
++    from hermes_cli import kanban_containment_authority as authority_gate
++    import sqlite3
++    _, _, authority, _, _ = local.setup(board)
++    def broken(*args):
++        raise sqlite3.OperationalError("fixture lookup failed")
++    monkeypatch.setattr(authority_gate, "open_episodes", broken)
++    assert kb.complete_task(board, authority, summary="Review complete despite advisory lookup failure")
++    assert "fixture lookup failed" in caplog.text
++
++
++def test_producer_release_still_works_with_done_authority(board):
++    from hermes_cli.kanban_db_sync import uuid7
++    relay, _, authority, target, spec = local.setup(board)
++    producer = kb.create_task(board, title="New evidence fixture", assignee="default")
++    spec["producer"] = {**target, "task_id": producer}
++    episode = local.contain(board, relay, target, spec)["episode"]
++    assert kb.complete_task(board, authority, summary="Retain pending producer evidence",
++                            metadata={"containment_retained": [episode]})
++    assert kb.claim_task(board, producer, claimer="default")
++    board.execute("UPDATE task_runs SET uid=? WHERE task_id=?", (uuid7(), producer))
++    assert kb.complete_task(board, producer, summary="New evidence ready")
++    board.execute("UPDATE task_events SET uid=? WHERE task_id=? AND kind='completed'", (uuid7(), producer))
++    actor = kb.create_task(board, title="Release executor fixture", assignee="default")
++    assert kb.claim_task(board, actor, claimer="default")
++    board.execute("UPDATE task_runs SET uid=? WHERE task_id=?", (uuid7(), actor))
++    result = lifecycle.resume_local(board, target=target, episode=episode, actor_task=actor,
++                                    actor_run_uid=local.run_uid(board, actor), kind="producer")
++    assert result["status"] == "ready"
+diff --git a/tests/tools/test_kanban_containment_authority.py b/tests/tools/test_kanban_containment_authority.py
+new file mode 100644
+index 0000000000..bbb219d633
+--- /dev/null
++++ b/tests/tools/test_kanban_containment_authority.py
+@@ -0,0 +1,42 @@
++"""Completion adapters preserve explicit authority decisions and their findings."""
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++from hermes_cli import kanban_db as kb
++from tests.hermes_cli import test_kanban_containment_lifecycle as local
++
++board = local.board
++
++
++def test_tool_refuses_then_persists_retained_episode(board, monkeypatch):
++    from tools import kanban_tools as kt
++    relay, _, authority, target, spec = local.setup(board)
++    episode = local.contain(board, relay, target, spec)["episode"]
++    monkeypatch.setenv("HERMES_KANBAN_TASK", authority)
++    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb.get_task(board, authority).current_run_id))
++    args = {"summary": "Retain unsafe hold: findings unresolved"}
++    out = json.loads(kt._handle_complete(args))
++    assert out["code"] == "containment_authority_open"
++    assert out["rejection"] in kt.COMPLETE_REJECTION_CLASSES
++    assert out["episodes"][0]["episode"] == episode
++    assert kb.get_task(board, authority).status == "running"
++    args["metadata"] = {"containment_retained": [episode], "findings": ["Unsafe fixture remains"]}
++    assert json.loads(kt._handle_complete(args))["ok"]
++    assert kb.latest_run(board, authority).metadata["findings"] == ["Unsafe fixture remains"]
++    assert kb.get_task(board, relay).status == "triage"
++
++
++def test_cli_refuses_then_accepts_retention_even_with_force(board, capsys):
++    from hermes_cli import kanban
++    relay, _, authority, target, spec = local.setup(board)
++    episode = local.contain(board, relay, target, spec)["episode"]
++    args = SimpleNamespace(task_ids=[authority], summary="Retain: unsafe fixture", result=None,
++                           metadata=None, force=True)
++    assert kanban._cmd_complete(args) != 0
++    assert "containment_authority_open" in capsys.readouterr().err
++    assert kb.get_task(board, authority).status == "running"
++    args.metadata = json.dumps({"containment_retained": [episode]})
++    assert kanban._cmd_complete(args) == 0
++    assert kb.get_task(board, authority).status == "done"
+diff --git a/tools/kanban_containment_tools.py b/tools/kanban_containment_tools.py
+index 8431a0b6d6..00713207ef 100644
+--- a/tools/kanban_containment_tools.py
++++ b/tools/kanban_containment_tools.py
+@@ -19,6 +19,8 @@ CONTAIN_SCHEMA = _schema("kanban_contain",
+     "Contain an admitted run without satisfying dependencies. Protected NON-HUMAN triage preserves all open edges "
+     "without dispatching review or asking a human. Can also contain an unclaimed descendant. Resume requires the exact "
+     "episode and a live scoped authority or genuinely new producer completion; generic unblock cannot release it. "
++    "The authority is an open card whose later run decides release, not the actor containing it. "
++    "Containment is not a way to wait for a review; use kanban_request_review instead. "
+     "Synced boards refuse until canonical containment capability is installed. After terminal_for_run=true, stop.",
+     {"task_id": {"type": "string"}, "authority": {"type": "string"},
+      "producer": {"type": "string"}, "summary": {"type": "string", "minLength": 1,
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 170d3db5ef..69c68aa1b5 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -158,6 +158,7 @@ def _check(cond: Any, message: str, rejection: Optional[str] = None) -> None:
+ # Stable ``rejection`` classes on every kanban_complete tool_error. Consumers
+ # (coach digests, board analytics) key on these strings: add, never rename.
+ COMPLETE_REJECTION_CLASSES = frozenset({
++    "containment_authority_open",  # explicit release/retention decision required [daveey]
+     "review_required", "goal_judge",  # required review or goal-mode judge refused completion
+     "phantom_cards",  # created_cards names ids this worker did not create
+     "artifacts",      # declared artifacts could not be preserved
+@@ -856,6 +857,7 @@ def _handle_complete(args: dict, **kw) -> str:
+     """Mark the current task done with a structured handoff. Every refusal
+     carries a ``rejection`` class from ``COMPLETE_REJECTION_CLASSES``."""
+     from hermes_cli.kanban_review_required import ReviewRequiredError, require_review
++    from hermes_cli.kanban_containment_authority import AuthorityOpen
+     try:
+         tid = _worker_guard("kanban_complete", args)
+     except _Reject as e:
+@@ -903,6 +905,9 @@ def _handle_complete(args: dict, **kw) -> str:
+             ok = kb.complete_task(
+                 conn, tid, result=result, summary=summary, metadata=metadata,
+                 created_cards=created_cards, expected_run_id=run_id, goal_verification=goal_verification)
++        except AuthorityOpen as authority_err:
++            return tool_error(str(authority_err), code=authority_err.code,
++                              rejection=authority_err.code, episodes=authority_err.episodes)
+         except ReviewRequiredError as review_err:
+             return tool_error(str(review_err), rejection="review_required")
+         except kb.ArtifactPreservationError as artifact_err:
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index eee1c7b70e..880ad0f547 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -222,6 +222,7 @@ KANBAN_COMPLETE_SCHEMA = _schema(
+                 "workers alongside ``summary``."
+         )), "properties": {
+             "completion_receipt": _completion_receipt_schema(),
++            "containment_retained": {"description": "Retained episode uids; explain why in summary."},
+             # Advertise canonical values without narrowing formerly free-form metadata.
+             # Existing readers and ship gates, not deferred transport, own validation.
+             "verdict": {"description": "Review verdict: use approve or request_changes for ship reviews."},
+-- 
+2.43.0
+

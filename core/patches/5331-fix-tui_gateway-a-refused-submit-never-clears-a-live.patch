@@ -1,0 +1,860 @@
+From 493da4155db1357386ab046a6ada125ccd4c189e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:33:16 +0000
+Subject: [PATCH] fix(tui_gateway): a refused submit never clears a live turn's
+ marker or state [daveey]
+
+Example gateway incident, chat 20260103_000000_abc125: an auto-continue turn started;
+shortly afterward a second automatic submit on the same chat was refused
+at _admit_prompt_turn (SESSION_NOT_OWNED). The refusal's terminal error frame ran
+with the default retire_marker=True, so _retire_turn_marker -> clear_turn_marker
+deleted the LIVE turn's marker by session_key (the refused submit never wrote
+one). The live turn sat in a clarify; every update-pause hook read "no turn
+marker", so nothing withdrew the clarify and hermes-sync refused the core update
+over that turn's unpublished admission reservation. In another example the
+cross-process variant happened: one process refused a turn and deleted another
+process's marker in the shared HERMES_HOME.
+
+- The ownership refusal passes retire_marker=False: a refused submit never
+  removes a marker it did not write.
+- Backstop: the non-concluding retire path (clear_turn_marker owner_only=True)
+  deletes only a marker whose writer_pid is this process or whose writer is dead;
+  otherwise it keeps it and logs INFO with the session and writer pid.
+- A refusal on a record where an admitted turn is live (_admitted_live_turn, set
+  at admission and popped by settle) leaves running, the admission ref, the
+  in-flight turn and the client frame alone. _run_admitted_prompt,
+  _notif_submit and the auto-continue kickoff read the refusal verdict
+  (refusal_spared_live_turn) and release only what that submit took; the Kanban
+  caller still rewinds its refused notice. Without a live turn the refusal
+  behaves as before. A fresh admission claim drops a leftover record.
+- Diagnosis: reservation files record session, work and thread
+  (admission_fence state-details reads them back), and a pause hook that finds no
+  marker for a running turn whose _active_turn_marker_key matches logs WARNING
+  "live turn lost its marker" once per turn.
+- #3828 nit: _dropped's ContainmentRefused branch was unreachable (withhold calls
+  subjects uncaught), so it is removed; the test name says "rows naming no known
+  task" instead of "unidentifiable".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/admission_fence.py                 |  11 +-
+ hermes_cli/backend_retirement.py              |  12 +-
+ .../kanban_sync_quarantine_release_live.py    |  10 +-
+ ...est_kanban_receipt_quarantine_followups.py |   6 +-
+ .../test_reservation_holder_label.py          |  62 ++++
+ .../tui_gateway/test_turn_marker_ownership.py | 320 ++++++++++++++++++
+ tui_gateway/prompt_turn.py                    |  32 +-
+ tui_gateway/session_auto_continue.py          |   8 +-
+ tui_gateway/session_notifications.py          |   7 +-
+ tui_gateway/turn_admission.py                 |  42 ++-
+ tui_gateway/turn_marker.py                    |  12 +-
+ tui_gateway/update_pause.py                   |  15 +
+ 12 files changed, 497 insertions(+), 40 deletions(-)
+ create mode 100644 tests/hermes_cli/test_reservation_holder_label.py
+ create mode 100644 tests/tui_gateway/test_turn_marker_ownership.py
+
+diff --git a/hermes_cli/admission_fence.py b/hermes_cli/admission_fence.py
+index 6749b3a1fb..89b1ff6774 100644
+--- a/hermes_cli/admission_fence.py
++++ b/hermes_cli/admission_fence.py
+@@ -88,14 +88,16 @@ class Reservation:
+         self.path = path
+         self._lock = threading.Lock()
+ 
+-    def describe(self, purpose, session=None):
++    def describe(self, purpose, session=None, work=None, thread=None):
+         """[daveey] Record who holds this reservation, for ``state-details`` (t_01a1d521213ff881).
+ 
+         Diagnostic only: the lock, not the body, is the claim, so the v1 count protocol is unchanged and
+         an empty or unreadable body (an older core, a write that failed) only reads as an unnamed holder.
+         Never raises."""
+         body = json.dumps({"purpose": str(purpose), "pid": os.getpid(),
+-                           "session": None if session is None else str(session), "created_at": time.time()})
++                           "session": None if session is None else str(session),
++                           "work": None if work is None else str(work),
++                           "thread": None if thread is None else str(thread), "created_at": time.time()})
+         with self._lock:
+             if self.fd is None:
+                 return
+@@ -263,7 +265,8 @@ def _state_locked(root, *, details=False):
+ 
+ def _reservation_record(fd, name):
+     """One held reservation's owner record (``Reservation.describe``); unnamed fields are None. Never raises."""
+-    record = {"id": name, "purpose": None, "pid": None, "session": None, "age_s": None}
++    record = {"id": name, "purpose": None, "pid": None, "session": None, "work": None, "thread": None,
++              "age_s": None}
+     created = None
+     try:
+         body = json.loads(os.pread(fd, 4096, 0).decode("utf-8"))
+@@ -272,6 +275,8 @@ def _reservation_record(fd, name):
+             record["purpose"] = purpose if isinstance(purpose, str) else None
+             record["pid"] = pid if type(pid) is int else None
+             record["session"] = session if isinstance(session, str) else None
++            for field in ("work", "thread"):
++                record[field] = body[field] if isinstance(body.get(field), str) else None
+             if isinstance(body.get("created_at"), (int, float)):
+                 created = float(body["created_at"])
+     except (OSError, ValueError):
+diff --git a/hermes_cli/backend_retirement.py b/hermes_cli/backend_retirement.py
+index abbd703031..2575694cc7 100644
+--- a/hermes_cli/backend_retirement.py
++++ b/hermes_cli/backend_retirement.py
+@@ -140,11 +140,12 @@ def _reserve(root, busy_wait_s, what):
+ 
+ 
+ 
+-def _describe(pending, purpose, session=None):
++def _describe(pending, purpose, session=None, *, work=None, thread=None):
+     """Label a reservation for ``admission_fence state-details``; a test double without the method is fine."""
+     describe = getattr(pending, "describe", None)
+     if describe is not None:
+-        describe(purpose, session)
++        extra = {k: v for k, v in (("work", work), ("thread", thread)) if v is not None}
++        describe(purpose, session, **extra)
+ 
+ 
+ # [daveey] Background reviews (the post-turn memory/skill review fork) run on a daemon thread with
+@@ -311,7 +312,7 @@ class RetirementFence:
+                 self.release()
+ 
+     @contextmanager
+-    def reservation(self, home=None, *, busy_wait_s=None):
++    def reservation(self, home=None, *, busy_wait_s=None, session=None, work=None, thread=None):
+         """Compose process retirement with the cross-process update reservation.
+ 
+         Neither lock is held while acquiring the other, or while callers hold
+@@ -319,7 +320,8 @@ class RetirementFence:
+         A briefly busy admission.lock is retried for ``busy_wait_s`` (default
+         BUSY_WAIT_S; 0 = one 50 ms try, for callers holding the session resume
+         lock, also forced by ``single_lock_try()``); the refusal reason is
+-        readable afterwards through ``last_refusal()``.
++        readable afterwards through ``last_refusal()``. ``session``/``work``/``thread`` [daveey] name the
++        holder in the reservation file (``admission_fence state-details``).
+         """
+         from hermes_constants import get_default_hermes_root, get_hermes_home
+         from hermes_cli.admission_fence import HOLD_MESSAGE, SUPPORTED
+@@ -343,7 +345,7 @@ class RetirementFence:
+                 if reason == "held":
+                     _log.info(HOLD_MESSAGE)
+                 elif pending is not None:
+-                    _describe(pending, "turn_admission")
++                    _describe(pending, "turn_admission", session, work=work, thread=thread)
+             _refusal.set(reason)
+             yield admitted and pending is not None
+         finally:
+diff --git a/hermes_cli/kanban_sync_quarantine_release_live.py b/hermes_cli/kanban_sync_quarantine_release_live.py
+index 95408197b4..4c5553e8bb 100644
+--- a/hermes_cli/kanban_sync_quarantine_release_live.py
++++ b/hermes_cli/kanban_sync_quarantine_release_live.py
+@@ -13,8 +13,6 @@ from __future__ import annotations
+ 
+ import json
+ 
+-from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
+-
+ 
+ def first_seen(seen, uid: str) -> int | None:
+     """The first-seen stamp (ms) ``seen`` (the replica) gave ``uid``'s quarantine, or None."""
+@@ -29,7 +27,8 @@ def _dropped(conn, freed: set[str], blocked: set[str]) -> list[str]:
+     """This file's withheld wires of the freed tasks (none still held by another receipt). Dropping them is safe
+     even for a freed task absent from this file: a non-primary file never replays withheld rows (``replay=False``),
+     and the replica's certified rows of each freed task it holds are what the lift applies. A row naming a task
+-    another receipt still holds, or naming no identifiable task, stays withheld."""
++    another receipt still holds, or naming no known task, stays withheld. ``subjects`` cannot refuse here: a row
++    it refuses was never withheld (``withhold`` calls it uncaught)."""
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_sync_quarantine as quarantine
+     if not freed or not quarantine._exists(conn, "containment_sync_withheld"):
+@@ -37,10 +36,7 @@ def _dropped(conn, freed: set[str], blocked: set[str]) -> list[str]:
+     out = []
+     for (text,) in conn.execute("SELECT wire FROM containment_sync_withheld ORDER BY ord,rowid").fetchall():
+         ch = sync.RemoteChange(**json.loads(text))
+-        try:
+-            names = quarantine.subjects(conn, ch.table, ch.uid, ch.fields)
+-        except ContainmentRefused:
+-            continue  # unidentifiable: stays withheld
++        names = quarantine.subjects(conn, ch.table, ch.uid, ch.fields)
+         if names & freed and not names & blocked:
+             out.append(text)
+     return out
+diff --git a/tests/hermes_cli/test_kanban_receipt_quarantine_followups.py b/tests/hermes_cli/test_kanban_receipt_quarantine_followups.py
+index 9fec709fef..aa0922abae 100644
+--- a/tests/hermes_cli/test_kanban_receipt_quarantine_followups.py
++++ b/tests/hermes_cli/test_kanban_receipt_quarantine_followups.py
+@@ -227,10 +227,10 @@ def test_refused_quarantine_shape_while_opening_the_replica_exits_1(synced_conn,
+     assert "receipt-x not released" in out and "earlier unreleased quarantine shape" in out
+ 
+ 
+-# --- review of #3828: the item-6 deletion keeps rows another receipt holds and unidentifiable rows ------------
++# --- review of #3828: the item-6 deletion keeps rows another receipt holds and rows naming no known task -------
+ 
+-def test_non_primary_lift_keeps_withheld_rows_of_another_receipt_and_unidentifiable_rows(synced_conn, kanban_home,
+-                                                                                         monkeypatch, capsys):
++def test_non_primary_lift_keeps_withheld_rows_of_another_receipt_and_rows_naming_no_known_task(
++        synced_conn, kanban_home, monkeypatch, capsys):
+     shadow = synced_conn
+     case = _picked_up(shadow, kanban_home)
+     other = "t_held_by_receipt_r"
+diff --git a/tests/hermes_cli/test_reservation_holder_label.py b/tests/hermes_cli/test_reservation_holder_label.py
+new file mode 100644
+index 0000000000..d430d59401
+--- /dev/null
++++ b/tests/hermes_cli/test_reservation_holder_label.py
+@@ -0,0 +1,62 @@
++"""[daveey] A turn-admission reservation file names its holder: session, work and thread (example incident).
++
++hermes-sync refused the hub's core update for 30+ min over "1 unpublished reservation(s)" and nothing said whose.
++``admission_fence state-details`` now reads back the session key, the work name and the thread that reserved.
++"""
++
++from __future__ import annotations
++
++import threading
++
++import pytest
++
++from hermes_cli import admission_fence as af, backend_retirement
++from tui_gateway import turn_admission
++
++pytestmark = pytest.mark.platforms("posix")
++
++
++@pytest.fixture()
++def home(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(backend_retirement, "retirement", backend_retirement.RetirementFence())
++    return tmp_path
++
++
++def _records(home):
++    return af.state(home, details=True)["reservation_records"]
++
++
++def test_acquire_records_session_work_and_thread(home):
++    token = turn_admission.acquire(str(home), session={"session_key": "20260103_000000_abc125"},
++                                   work="auto-continue-b9ae3e9c")
++    assert token is not None
++    try:
++        [record] = _records(home)
++        assert record["purpose"] == "turn_admission"
++        assert record["session"] == "20260103_000000_abc125"
++        assert record["work"] == "auto-continue-b9ae3e9c"
++        assert record["thread"] == threading.current_thread().name
++    finally:
++        token.release()
++    assert _records(home) == []
++
++
++def test_prepared_turn_work_names_its_reservation(home):
++    session = {"session_key": "chat-key", "history_lock": threading.RLock(), "profile_home": str(home)}
++    work = turn_admission.prepare_work(lambda: None, name="prompt-turn-ui-sid", session=session)
++    assert work is not None
++    try:
++        [record] = _records(home)
++        assert (record["session"], record["work"]) == ("chat-key", "prompt-turn-ui-sid")
++    finally:
++        work.cancel()
++    assert _records(home) == []
++
++
++def test_a_turn_claim_names_its_session(home):
++    session = {"session_key": "claimed-chat", "history_lock": threading.RLock(), "profile_home": str(home)}
++    with turn_admission.admission(session) as admitted:
++        assert admitted
++        [record] = _records(home)
++        assert (record["session"], record["work"]) == ("claimed-chat", "turn-claim")
+diff --git a/tests/tui_gateway/test_turn_marker_ownership.py b/tests/tui_gateway/test_turn_marker_ownership.py
+new file mode 100644
+index 0000000000..7aff3182c7
+--- /dev/null
++++ b/tests/tui_gateway/test_turn_marker_ownership.py
+@@ -0,0 +1,320 @@
++"""[daveey] A refused submit never clears a live turn's marker or state (example gateway incident, chat 20260103_000000_abc125).
++
++An auto-continue turn started; shortly afterward a second automatic submit on the same chat was refused at
++``_admit_prompt_turn`` (SESSION_NOT_OWNED). That refusal emitted its terminal error with the default
++``retire_marker=True`` and deleted the LIVE turn's marker (the refused submit never wrote one). The live turn then
++sat in a clarify; every update-pause hook read "no turn marker", so the clarify was never withdrawn and the hub's
++core update waited on the turn's unpublished admission reservation. In a cross-process variant, one process
++refused a turn and deleted another process's marker in the shared HERMES_HOME.
++
++These tests drive the REAL ``_run_prompt_submit`` (a live turn on its own worker thread, its marker and admission
++on disk) and the real refusal paths.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import subprocess
++import sys
++import threading
++import time
++import types
++
++import pytest
++
++from hermes_cli import admission_fence as af, backend_retirement
++from tools import clarify_early
++from tools.clarify_tool import clarify_tool
++from tui_gateway import server
++from tui_gateway import update_pause as up
++from tui_gateway.turn_marker import read_turn_marker, record_turn_start
++
++pytestmark = pytest.mark.platforms("posix")
++
++KEY = "20260103_000000_abc125"
++CFG = {"desktop": {"auto_continue": {"enabled": True, "resume_on_startup": True, "freshness_minutes": 240,
++                                     "max_attempts": 2}}}
++WAIT_S = 10
++NOT_OWNED = types.SimpleNamespace(reason="SESSION_NOT_OWNED")
++QUESTIONS = [{"question": "Which runner pool?", "choices": ["org", "personal"]}]
++
++
++class LiveAgent:
++    """An agent whose turn blocks until released (``body`` runs inside the turn, e.g. a clarify)."""
++
++    def __init__(self, body=None):
++        self.session_id = KEY
++        self.entered = threading.Event()
++        self.release = threading.Event()
++        self.body = body
++        self.step_boundary_pause = None
++
++    def clear_interrupt(self):
++        pass
++
++    def run_conversation(self, message, **kw):
++        self.entered.set()
++        if self.body is not None:
++            return self.body(self)
++        self.release.wait(WAIT_S)
++        return {"final_response": "done", "messages": []}
++
++
++@pytest.fixture()
++def env(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(backend_retirement, "retirement", backend_retirement.RetirementFence())
++    monkeypatch.setattr(server, "_hermes_home", tmp_path)
++    monkeypatch.setattr(server, "_load_cfg", lambda: CFG)
++    frames: list = []
++    monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None, *a, **k: frames.append((event, sid, payload)))
++    for name in ("_wire_callbacks", "_register_session_cwd"):
++        monkeypatch.setattr(server, name, lambda *a, **k: None)
++    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)
++    monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
++    monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
++    monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
++    monkeypatch.setattr(server, "_get_usage", lambda agent: {})
++    monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: True)
++    monkeypatch.setattr(server, "_session_moved_refusal", lambda session: None)
++    # The live turn passed its ownership fence; from `slot["refuse"]` on, the chat is held elsewhere.
++    slot = {"refuse": None}
++    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda sid, session, **kw: slot["refuse"])
++    watchers: list = []
++    monkeypatch.setattr(up, "start_in_place_watcher", lambda sid, session, key: watchers.append(key))
++    monkeypatch.setattr(clarify_early, "POLL_INTERVAL_S", 0.05)
++    monkeypatch.setattr(up, "_clarify_provider_installed", False, raising=False)
++    clarify_early.reset_for_tests()
++    yield types.SimpleNamespace(home=tmp_path, frames=frames, slot=slot, watchers=watchers)
++    clarify_early.reset_for_tests()
++    af.clear_hold(tmp_path)
++
++
++def _record(home, agent, sid):
++    return {"agent": agent, "session_key": KEY, "history": [], "history_lock": threading.RLock(),
++            "history_version": 0, "running": False, "attached_images": [], "image_counter": 0, "cols": 80,
++            "slash_worker": None, "show_reasoning": False, "tool_progress_mode": "all", "inflight_turn": None,
++            "profile_home": str(home), "source": "desktop", "_test_sid": sid}
++
++
++def _start_live_turn(env, monkeypatch, body=None):
++    """Example auto-continue: a kickoff-style claim (running + its claim object), then the real submit."""
++    agent = LiveAgent(body)
++    live = _record(env.home, agent, "ui-live")
++    monkeypatch.setitem(server._sessions, "ui-live", live)
++    with live["history_lock"]:
++        live["running"] = True
++        live["_notif_turn_claim"] = object()
++    assert server._run_prompt_submit("rid-live", "ui-live", live, "continue the paused turn",
++                                     display_kind="auto_continue") is True
++    assert agent.entered.wait(WAIT_S), "the live turn never reached the model"
++    marker = read_turn_marker(env.home, KEY)
++    assert marker is not None and marker["prompt"] == "continue the paused turn"
++    return live, agent
++
++
++def _finish(live, agent):
++    agent.release.set()
++    thread = live.get("_run_thread")
++    if thread is not None:
++        thread.join(WAIT_S)
++        assert not thread.is_alive()
++
++
++def _refuse_sibling_notice(env):
++    """A second automatic submit on the same chat, from a sibling record, refused at ``_admit_prompt_turn``."""
++    sibling = _record(env.home, types.SimpleNamespace(session_id=KEY, clear_interrupt=lambda: None), "ui-sibling")
++    assert server._notif_claim_turn(sibling) is True
++    env.slot["refuse"] = NOT_OWNED
++    accepted = server._notif_submit("rid-notice", "ui-sibling", sibling, "kanban notice", "kanban dispatch failed")
++    assert accepted is False
++    return sibling
++
++
++# --- T1: the incident --------------------------------------------------------------------------------------------
++
++def test_refused_sibling_submit_keeps_the_live_turns_marker(env, monkeypatch, caplog):
++    live, agent = _start_live_turn(env, monkeypatch)
++    try:
++        caplog.set_level(logging.INFO)
++        sibling = _refuse_sibling_notice(env)
++        assert any("Refusing turn for session" in r.getMessage() and "SESSION_NOT_OWNED" in r.getMessage()
++                   for r in caplog.records)
++        # Before the fix the refusal's terminal frame retired the marker by session_key: the live turn's.
++        assert read_turn_marker(env.home, KEY) is not None, "the refused submit deleted the live turn's marker"
++        # The refused submit's own state is still released as before: its claim and its card.
++        assert sibling["running"] is False and "_notif_turn_claim" not in sibling
++        errors = [p for e, sid, p in env.frames if e == "message.complete" and sid == "ui-sibling"]
++        assert len(errors) == 1 and errors[0]["error_surface"]["code"] == "SESSION_NOT_OWNED"
++        assert live["running"] is True
++    finally:
++        _finish(live, agent)
++    # The marker's owner still retires it when its turn concludes.
++    assert read_turn_marker(env.home, KEY) is None
++    assert af.state(env.home)["reservations"] == 0
++
++
++# --- T2: the retire backstop never deletes a live sibling process's marker ----------------------------------------
++
++def _write_marker(home, writer_pid):
++    path = home / "desktop" / "interrupted_turns.json"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps({KEY: {"attempts": 0, "prompt": "p", "started_at": time.time(),
++                                      "auto_continue": True, "writer_pid": writer_pid}}))
++
++
++@pytest.fixture()
++def other_pids():
++    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
++    dead = subprocess.Popen([sys.executable, "-c", "pass"])
++    dead.wait()
++    yield types.SimpleNamespace(live=live.pid, dead=dead.pid)
++    live.kill()
++    live.wait()
++
++
++def test_retire_backstop_keeps_a_live_writers_marker_and_clears_a_dead_ones(env, other_pids, caplog):
++    session = _record(env.home, types.SimpleNamespace(), "ui-a")
++    caplog.set_level(logging.INFO)
++    _write_marker(env.home, other_pids.live)  # process B, alive, mid-turn on the shared HERMES_HOME
++    server._retire_turn_marker(session)
++    assert read_turn_marker(env.home, KEY) is not None, "process A deleted live process B's marker"
++    assert any("turn marker for session" in r.getMessage() and KEY in r.getMessage()
++               and str(other_pids.live) in r.getMessage() for r in caplog.records)
++
++    _write_marker(env.home, other_pids.dead)  # a dead writer's marker is still cleared
++    server._retire_turn_marker(session)
++    assert read_turn_marker(env.home, KEY) is None
++
++    record_turn_start(env.home, KEY, "my own turn")  # this process's own marker is cleared
++    server._retire_turn_marker(session)
++    assert read_turn_marker(env.home, KEY) is None
++
++
++def test_refusal_in_this_process_keeps_a_live_sibling_process_marker(env, other_pids):
++    _write_marker(env.home, other_pids.live)
++    _refuse_sibling_notice(env)
++    assert read_turn_marker(env.home, KEY)["writer_pid"] == other_pids.live
++
++
++# --- T4: end to end, the clarify is withdrawn and the reservation released ---------------------------------------
++
++def test_clarify_blocked_turn_still_pauses_after_a_refused_sibling_submit(env, monkeypatch):
++    surface_entered, surface_answer = threading.Event(), threading.Event()
++    seen: dict = {}
++
++    class Surface:
++        cancel_reasons: list = []
++
++        def __call__(self, questions):
++            surface_entered.set()
++            surface_answer.wait(WAIT_S)
++            return {"answers": {}, "outcome": "cancelled"}
++
++        def cancel_early(self, reason):
++            self.cancel_reasons.append(reason)
++            surface_answer.set()
++            return True
++
++    def body(agent):
++        seen["clarify"] = json.loads(clarify_tool(QUESTIONS, callback=Surface(), session_id=KEY, tool_call_id="tc1"))
++        seen["boundary"] = agent.step_boundary_pause() if agent.step_boundary_pause else None
++        # The agent loop ends a turn its boundary hook paused like this (run_agent's paused_for_update).
++        return {"final_response": "", "messages": [], "paused_for_update": seen["boundary"]}
++
++    live, agent = _start_live_turn(env, monkeypatch, body)
++    try:
++        assert surface_entered.wait(WAIT_S), "the live turn never blocked in its clarify"
++        _refuse_sibling_notice(env)
++        af.set_hold(env.home)
++        af.request_pause(env.home, expires_at=time.time() + 120)
++    finally:
++        _finish(live, agent)
++    assert seen["clarify"]["status"] == up.CLARIFY_PAUSE_STATUS, seen
++    assert seen["boundary"] == up.PAUSE_REASON
++    assert read_turn_marker(env.home, KEY)["reason"] == up.PAUSE_REASON
++    assert live["running"] is False and "_turn_admission" not in live
++    assert af.state(env.home)["reservations"] == 0, "the live turn's reservation was not released"
++
++
++# --- T5: a refused submit on the live turn's own record leaves its running state alone -----------------------------
++
++def test_refused_submit_on_the_live_record_keeps_running_ref_and_inflight(env, monkeypatch):
++    live, agent = _start_live_turn(env, monkeypatch)
++    rewound: list = []
++    real_claim = server._notif_claim_turn
++    try:
++        with live["history_lock"]:
++            token = live["_turn_admission"]
++            refs, inflight, claim = token.refs, live["inflight_turn"], live["_notif_turn_claim"]
++        # The sibling reached admission on this record (its claim raced the live turn's); the poll is the real one.
++        monkeypatch.setattr(server, "_notif_claim_turn", lambda session: True)
++        monkeypatch.setattr(server, "_kb_settle_held", lambda session: None)
++        monkeypatch.setattr(server, "_kb_gateway_owns", lambda session: False)
++        monkeypatch.setattr(server, "_kb_owner_refusal", lambda sid, session: None)
++        monkeypatch.setattr(server, "_kb_persist_batch", lambda session, batch, diagnostic: ("unkeyed", batch, {}))
++        monkeypatch.setattr(server, "_kb_rewind_refused",
++                            lambda session, batch, not_owned=False: rewound.append((list(batch), not_owned)))
++        live["_kanban_pending"] = ["task t_1 done"]
++        env.slot["refuse"] = NOT_OWNED
++        server._notif_poll_kanban_scoped("ui-live", live, prepared=([], []))
++
++        # The refused notice is handed back exactly as before (an owner refusal: not_owned, per its backoff).
++        assert [batch for batch, _ in rewound] == [["task t_1 done"]], "the refused kanban notice was not rewound"
++        with live["history_lock"]:
++            assert live["running"] is True
++            assert live["_turn_admission"] is token and token.refs == refs
++            assert live["inflight_turn"] is inflight and live["inflight_turn"].get("status") != "error"
++            assert live["_notif_turn_claim"] is claim
++        assert read_turn_marker(env.home, KEY) is not None
++        assert not [p for e, sid, p in env.frames if e == "message.complete"], "the live turn's client got a refusal"
++        assert real_claim(live) is False, "a second submit started over the live turn"
++    finally:
++        _finish(live, agent)
++    assert live["running"] is False
++    assert af.state(env.home)["reservations"] == 0
++
++
++# --- T7: a live turn that lost its marker is a WARNING, once -------------------------------------------------------
++
++def test_pause_hook_warns_once_when_a_live_turn_lost_its_marker(env, monkeypatch, caplog):
++    agent = types.SimpleNamespace(session_id=KEY, step_boundary_pause=lambda: None)
++    session = _record(env.home, agent, "ui-warn")
++    session.update(running=True, _active_turn_marker_key=KEY)
++    monkeypatch.setitem(server._sessions, "ui-warn", session)
++    af.set_hold(env.home)
++    af.request_pause(env.home, expires_at=time.time() + 120)
++    caplog.set_level(logging.INFO)
++    assert up.clarify_pause_provider(KEY, "tc1") is None
++    assert up.clarify_pause_provider(KEY, "tc1") is None
++    warnings = [r for r in caplog.records if r.levelno == logging.WARNING
++                and "live turn lost its marker" in r.getMessage()]
++    assert len(warnings) == 1 and KEY in warnings[0].getMessage()
++
++    caplog.clear()
++    session["_active_turn_marker_key"] = "another-key"  # not this turn's marker: the ordinary decline only
++    session.pop("_lost_marker_warned", None)
++    assert up.not_resumable_reason(session, KEY) == "no turn marker"
++    assert not [r for r in caplog.records if "live turn lost its marker" in r.getMessage()]
++
++
++# --- review: the live-turn record never spares a refusal that owns its own claim ------------------------------------
++
++def test_a_turn_refused_for_a_missing_agent_leaves_no_live_turn_record(env, monkeypatch):
++    from tui_gateway.turn_admission import LIVE_TURN
++    session = _record(env.home, None, "ui-noagent")
++    session["running"] = True
++    assert server._run_prompt_submit("rid", "ui-noagent", session, "hello") is False
++    assert LIVE_TURN not in session and session["running"] is False
++
++
++def test_a_fresh_claim_drops_a_leftover_live_turn_record_and_its_refusal_releases(env):
++    from tui_gateway.turn_admission import LIVE_TURN
++    session = _record(env.home, types.SimpleNamespace(session_id=KEY, clear_interrupt=lambda: None), "ui-claim")
++    session[LIVE_TURN] = object()  # a record no turn settled (a gap the review traced): never a live turn here
++    assert server._notif_claim_turn(session) is True
++    env.slot["refuse"] = NOT_OWNED
++    assert server._notif_submit("rid", "ui-claim", session, "notice", "dispatch failed") is False
++    assert session["running"] is False and "_turn_admission" not in session
++    assert af.state(env.home)["reservations"] == 0
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 45316118e2..23b47ec833 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -137,7 +137,8 @@ def _admit_prompt_turn(
+     """Ownership + liveness gate every turn source must cross; ``(images, agent)`` or None.
+     Synthesized turns (auto-continue, wake-ups) call ``_run_prompt_submit`` directly — the
+     bypass that once let a second backend run a duplicate turn."""
+-    from tui_gateway.turn_admission import owns
++    from tui_gateway.turn_admission import live_turn_holds, mark_live_turn, note_refusal, owns
++    note_refusal(spared_live_turn=False)
+     with session["history_lock"]:
+         if not owns(session):
+             return None
+@@ -153,18 +154,27 @@ def _admit_prompt_turn(
+         with session["history_lock"]:
+             if not owns(session):
+                 return None
+-            session["running"] = False
+-            staged = session.pop("_submit_user_row", None)
+-            if _retain_unadmitted_submit_row(session["history"], staged):
+-                session["history_version"] = int(session.get("history_version", 0)) + 1
++            # [daveey] A submit refused while an admitted turn runs on this record owns none of that turn's
++            # state: its running, admission ref, in-flight turn and marker stay the live turn's (example incident).
++            spared = live_turn_holds(session)
++            if not spared:
++                session["running"] = False
++                staged = session.pop("_submit_user_row", None)
++                if _retain_unadmitted_submit_row(session["history"], staged):
++                    session["history_version"] = int(session.get("history_version", 0)) + 1
+         reason = getattr(ownership_refusal, "reason", None) or "SESSION_COORDINATION_UNAVAILABLE"
+         # [daveey] Read by the notification poller (_notif_after_submit): a synthesized turn refused for
+         # ownership backs off instead of re-running every poll (139 refusal cards in 110 s, 2026-10-28).
+         session["_turn_owner_refusal"] = reason
+-        if report_ownership_refusal:
++        note_refusal(spared_live_turn=spared)
++        if spared:
++            logger.info("Refused submit for session %s left the live turn's state alone",
++                        session.get("session_key") or sid)
++        elif report_ownership_refusal:
++            # [daveey] retire_marker=False: this submit wrote no marker; the one on disk is a live turn's.
+             _emit_terminal_turn_error(
+                 sid, session, str(ownership_refusal),
+-                error_surface={"layer": "gateway", "code": reason, "retryable": False})
++                error_surface={"layer": "gateway", "code": reason, "retryable": False}, retire_marker=False)
+         return None
+     with session["history_lock"]:
+         if not owns(session):
+@@ -202,6 +212,7 @@ def _admit_prompt_turn(
+         if agent is None:
+             session["running"] = False
+         else:
++            mark_live_turn(session)
+             with contextlib.suppress(Exception):
+                 agent.clear_interrupt()
+     if agent is None:
+@@ -1384,9 +1395,10 @@ def _run_admitted_prompt(
+         sid, session, text, image_paths, queued_prompt_generation, display_kind, display_metadata,
+         report_ownership_refusal=report_ownership_refusal)
+     if admitted is None:
+-        from tui_gateway.turn_admission import settle
+-        with session["history_lock"]:
+-            settle(session)
++        from tui_gateway.turn_admission import refusal_spared_live_turn, settle
++        if not refusal_spared_live_turn():  # never the live turn's admission ref
++            with session["history_lock"]:
++                settle(session)
+         return False
+     images, agent = admitted
+     # [daveey] pre_llm_call's input_origin (tui_gateway/human_input.py): set every turn, so an injected turn
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index cf1d00c301..1413de4bf4 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -80,8 +80,8 @@ def _retire_turn_marker(session: dict, *keys: str, concluding_turn: frozenset |
+     home = _session_home(session)
+     for key in dict.fromkeys((*keys, str(session.get("session_key") or ""))):
+         if key:
+-            if concluding_turn is None:
+-                clear_turn_marker(home, key)
++            if concluding_turn is None:  # [daveey] not this turn's identity: only this process's, or a dead writer's
++                clear_turn_marker(home, key, owner_only=True)
+             else:
+                 clear_turn_marker(home, key, concluding_turn=concluding_turn)
+ 
+@@ -368,7 +368,9 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+             _drop_kickoff_marker_inputs(session, marker)
+             return
+         if accepted is False:
+-            _notif_release_claim(session, claim)  # still ours only if admission did not release it
++            from tui_gateway.turn_admission import refusal_spared_live_turn
++            if not refusal_spared_live_turn():  # [daveey] a live turn's ``running`` is not this kickoff's
++                _notif_release_claim(session, claim)  # still ours only if admission did not release it
+             _auto_continue_refused(sid, session, session_key, paused, "submit refused at admission", marker)
+     if _start_session_work(kickoff, name=f"auto-continue-{sid}", home=session.get("profile_home")) is None:
+         session["_auto_continue_scheduled"] = False
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index addced7bb8..55ad719832 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -388,6 +388,8 @@ def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwa
+     that already took the notice off a durable store put it back. Every caller claimed ``running`` just
+     before, so the token read here is its own; nothing else can claim while ``running`` stays True."""
+     claim = session.get("_notif_turn_claim")
++    from tui_gateway.turn_admission import note_refusal
++    note_refusal(spared_live_turn=False)  # a stale verdict of this thread's earlier refusal never carries over
+     # [daveey] The first ownership refusal of a streak shows its one notice; later probes in the streak are
+     # silent (_notif_owner_preflight / the owner-refusal backoff).
+     kwargs.setdefault("report_ownership_refusal", not session.get("_notif_owner_refusal_delay"))
+@@ -398,7 +400,10 @@ def _notif_submit(rid: str, sid: str, session: dict, text: str, what: str, **kwa
+         else:
+             # A refusing admission already released ``running``, and a user prompt may own it since. A caller
+             # that requeues the notice backs off first (_notif_refusal_backoff); the rest return at once.
+-            _notif_release_claim(session, claim)
++            # [daveey] A refusal over a live turn on this record leaves its ``running`` and claim alone.
++            from tui_gateway.turn_admission import refusal_spared_live_turn
++            if not refusal_spared_live_turn():
++                _notif_release_claim(session, claim)
+         return accepted
+     except Exception as exc:
+         _notif_log_failure(what, exc)
+diff --git a/tui_gateway/turn_admission.py b/tui_gateway/turn_admission.py
+index b4fe0c15fa..b3d3d386ee 100644
+--- a/tui_gateway/turn_admission.py
++++ b/tui_gateway/turn_admission.py
+@@ -10,6 +10,30 @@ from hermes_cli.worker_drain_fence import admit, DrainRefused, lease_scope
+ 
+ _current: ContextVar[tuple | None] = ContextVar("turn_admission_owner", default=None)
+ _KEY = "_turn_admission"
++# [daveey] Set when ``_admit_prompt_turn`` admits a turn, popped when that turn settles: while it is set and
++# ``running`` holds, a refused submit on the record is a sibling of a live turn and owns none of its state.
++LIVE_TURN = "_admitted_live_turn"
++_spared: ContextVar[bool] = ContextVar("turn_admission_refusal_spared_live_turn", default=False)
++
++
++def mark_live_turn(session):
++    """Caller holds history_lock: an admitted turn now owns ``running``, the admission ref and ``inflight_turn``."""
++    session[LIVE_TURN] = object()
++
++
++def live_turn_holds(session):
++    """Caller holds history_lock. True while an admitted turn owns this record's running state."""
++    return bool(session.get("running")) and session.get(LIVE_TURN) is not None
++
++
++def note_refusal(*, spared_live_turn):
++    """Record (for this thread's caller of ``_run_prompt_submit``) whether its refusal left a live turn alone."""
++    _spared.set(bool(spared_live_turn))
++
++
++def refusal_spared_live_turn():
++    """True when this thread's last admission refusal found a live turn: the caller releases nothing it shares."""
++    return _spared.get()
+ 
+ 
+ class TurnAdmission:
+@@ -38,11 +62,14 @@ class TurnAdmission:
+                         self.drain_lease.close()
+ 
+ 
+-def acquire(home=None, *, busy_wait_s=None):
++def acquire(home=None, *, busy_wait_s=None, session=None, work=None):
+     from hermes_cli.backend_retirement import retirement
++    # [daveey] The reservation file names its holder (hermes-sync's refusal line reads it back).
++    label = {"session": str(session.get("session_key") or "") or None if isinstance(session, dict) else None,
++             "work": work, "thread": threading.current_thread().name}
+     # busy_wait_s=None keeps the fence's default busy-lock retry; 0 is one short try (resume-lock callers).
+-    reservation = (retirement.reservation(home) if busy_wait_s is None
+-                   else retirement.reservation(home, busy_wait_s=busy_wait_s))
++    reservation = (retirement.reservation(home, **label) if busy_wait_s is None
++                   else retirement.reservation(home, busy_wait_s=busy_wait_s, **label))
+     try:
+         drain_lease = admit('turn.admission')
+     except DrainRefused:
+@@ -75,6 +102,7 @@ def settle(session):
+     """Caller holds history_lock. A stale worker cannot settle a newer turn."""
+     if not owns(session):
+         return False
++    session.pop(LIVE_TURN, None)
+     token = session.pop(_KEY, None)
+     if token is not None:
+         if session.get("_turn_admission_generation") is token:
+@@ -84,11 +112,12 @@ def settle(session):
+ 
+ 
+ @contextmanager
+-def admission(session, *, busy_wait_s=None):
+-    token = acquire(session.get("profile_home"), busy_wait_s=busy_wait_s)
++def admission(session, *, busy_wait_s=None, work="turn-claim"):
++    token = acquire(session.get("profile_home"), busy_wait_s=busy_wait_s, session=session, work=work)
+     with session["history_lock"]:
+         claimed = token is not None and not session.get("running")
+         if claimed:
++            session.pop(LIVE_TURN, None)  # nothing runs here: a leftover record must not spare this claim's refusal
+             old = session.pop(_KEY, None)
+             if old is not None:
+                 old.release()
+@@ -237,7 +266,8 @@ def prepare_work(target, *, name, session=None, home=None, busy_wait_s=None):
+         token = None
+     installed = False
+     if token is None:
+-        token = acquire(home or (session or {}).get("profile_home"), busy_wait_s=busy_wait_s)
++        token = acquire(home or (session or {}).get("profile_home"), busy_wait_s=busy_wait_s, session=session,
++                        work=name)
+         if token is not None and session is not None:
+             with session["history_lock"]:
+                 existing = session.get(_KEY)
+diff --git a/tui_gateway/turn_marker.py b/tui_gateway/turn_marker.py
+index c2333d3e2b..14defaca50 100644
+--- a/tui_gateway/turn_marker.py
++++ b/tui_gateway/turn_marker.py
+@@ -299,11 +299,19 @@ def merge_receipts(home: Path | str, session_key: str, jobs: list, merge, *, cre
+     return bool(session_key) and _update(home, session_key, mutate, "journal jobs")
+ 
+ 
+-def clear_turn_marker(home: Path | str, session_key: str, *, concluding_turn: frozenset | None = None) -> None:
+-    """Remove a concluded marker. A late backstop must name its owner; compare and delete under the same lock."""
++def clear_turn_marker(home: Path | str, session_key: str, *, concluding_turn: frozenset | None = None,
++                      owner_only: bool = False) -> None:
++    """Remove a concluded marker. A late backstop must name its owner; compare and delete under the same lock.
++    [daveey] ``owner_only``: delete only a marker this process wrote or whose writer is dead; a live sibling's
++    marker is its running turn's (a refused submit in one process deleted another process's marker)."""
+     def mutate(entries):
+         if session_key not in entries:
+             return None
++        entry = entries[session_key]
++        if owner_only and entry.get("writer_pid") != os.getpid() and marker_writer_state(entry) != "dead":
++            logger.info("turn marker for session %s kept: writer pid %s is not this process (%s) nor known dead",
++                        session_key, entry.get("writer_pid"), os.getpid())
++            return None
+         if concluding_turn is not None:
+             from hermes_state_outcome import turn_identity
+             identity = turn_identity(marker=entries[session_key])
+diff --git a/tui_gateway/update_pause.py b/tui_gateway/update_pause.py
+index e38d1b76d6..85239dbe3a 100644
+--- a/tui_gateway/update_pause.py
++++ b/tui_gateway/update_pause.py
+@@ -162,6 +162,7 @@ def not_resumable_reason(session: dict, marker_key: str) -> str | None:
+         return "desktop.auto_continue.resume_on_startup is off"
+     marker = read_turn_marker(_home(session), marker_key)
+     if marker is None:
++        _warn_live_turn_lost_marker(session, marker_key)
+         return "no turn marker"
+     if not marker["auto_continue"]:
+         return "turn opted out of auto-continue"
+@@ -174,6 +175,20 @@ def not_resumable_reason(session: dict, marker_key: str) -> str | None:
+     return None
+ 
+ 
++def _warn_live_turn_lost_marker(session: dict, marker_key: str) -> None:
++    """[daveey] A running turn that recorded this marker should still have it: a turn without one never pauses,
++    so hermes-sync's update waits on it (example incident). Once per live turn, not per poll."""
++    from tui_gateway.turn_admission import LIVE_TURN
++    if not session.get("running") or session.get("_active_turn_marker_key") != marker_key:
++        return
++    stamp = (marker_key, session.get(LIVE_TURN))
++    if session.get("_lost_marker_warned") == stamp:
++        return
++    session["_lost_marker_warned"] = stamp
++    logger.warning("core-update pause: live turn lost its marker: session %s has no turn marker on disk, so it "
++                   "cannot pause for the update", marker_key)
++
++
+ def _command_head(command: str, limit: int = 80) -> str:
+     head = " ".join(str(command or "").split())
+     return head if len(head) <= limit else head[:limit - 3] + "..."
+-- 
+2.43.0
+

@@ -1,0 +1,168 @@
+From c99417f4aa64b1a29dedad001e3bfb4b396ecb16 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 14:58:07 +0000
+Subject: [PATCH] fix(tests): await host-loop lease import during retirement
+ reset [daveey]
+
+CI run 44753359633 job 136347244094 preserved the actual first-attempt
+traceback: websocket client-kind assertions all passed, but teardown read
+host_loop_lease from sys.modules before its background import initialized
+_RETIRE_MU. sys.modules publication is not import completion.
+
+Move reset into a small test helper and use import_module to synchronize
+with the import lock only if the module has already been used. Preserve
+the retirement mutex, clearing semantics and all real websocket assertions.
+
+Proof: an Event-gated real import reproduces the exact AttributeError
+with the former direct lookup and passes with synchronization. Verify
+unused modules remain unimported, clearing owns the mutex, and the autouse
+fixture calls the helper only during teardown. Client-kind=None mutation
+fails both agent variants and renderer assertions (3 failures). Restored
+4-file focused suite: 30 passed, HERMES_TEST_FILE_RETRIES=0. Historical
+merge f0cfeb3f91ecce5019e26719ab00c4f913f1fd90 and current main both pass
+ordinary whole-file (4) and focused (2) runs; natural recurrence was not
+needed for the controlled import-race proof. Full scripts/check: 21 ok.
+---
+ tests/_fixtures/host_loop_reset.py     | 13 ++++
+ tests/hermes_cli/conftest.py           |  6 +-
+ tests/test_conftest_host_loop_reset.py | 94 ++++++++++++++++++++++++++
+ 3 files changed, 109 insertions(+), 4 deletions(-)
+ create mode 100644 tests/_fixtures/host_loop_reset.py
+ create mode 100644 tests/test_conftest_host_loop_reset.py
+
+diff --git a/tests/_fixtures/host_loop_reset.py b/tests/_fixtures/host_loop_reset.py
+new file mode 100644
+index 0000000000..86c79e5404
+--- /dev/null
++++ b/tests/_fixtures/host_loop_reset.py
+@@ -0,0 +1,13 @@
++"""Reset host-loop retirement without racing a background import."""
++
++import importlib
++import sys
++
++
++def reset_retired_host_loops(module_name="hermes_cli.host_loop_lease"):
++    if module_name in sys.modules:
++        # sys.modules publishes before exec_module completes on a background thread.
++        # import_module waits for that thread's import lock; a direct lookup does not.
++        lease = importlib.import_module(module_name)
++        with lease._RETIRE_MU:
++            lease._RETIRED.clear()
+diff --git a/tests/hermes_cli/conftest.py b/tests/hermes_cli/conftest.py
+index f1a1488802..90d02791c5 100644
+--- a/tests/hermes_cli/conftest.py
++++ b/tests/hermes_cli/conftest.py
+@@ -257,7 +257,5 @@ def _sync_repair_local_write_window(request, monkeypatch):
+ def _reset_retired_host_loops():
+     """A superseded or code-skewed watchdog under test retires this process's host loops; undo it after."""
+     yield
+-    import sys
+-    if (lease := sys.modules.get("hermes_cli.host_loop_lease")) is not None:
+-        with lease._RETIRE_MU:
+-            lease._RETIRED.clear()
++    from tests._fixtures.host_loop_reset import reset_retired_host_loops
++    reset_retired_host_loops()
+diff --git a/tests/test_conftest_host_loop_reset.py b/tests/test_conftest_host_loop_reset.py
+new file mode 100644
+index 0000000000..d5ccf2695d
+--- /dev/null
++++ b/tests/test_conftest_host_loop_reset.py
+@@ -0,0 +1,94 @@
++"""Retirement reset must await a module's import lock before reading its globals."""
++if not __name__.startswith("tests."): raise ImportError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")  # unittest-discovery guard
++
++import importlib
++import sys
++import threading
++import types
++
++from tests._fixtures.host_loop_reset import reset_retired_host_loops
++from tests.waiting import wait_until
++
++_PROBE = "_host_loop_reset_probe"
++_GATE = "_host_loop_reset_gate"
++
++
++def _inside_import_machinery(thread):
++    frame = sys._current_frames().get(thread.ident)
++    while frame is not None:
++        if frame.f_code.co_filename.startswith("<frozen importlib._bootstrap"):
++            return True
++        frame = frame.f_back
++    return False
++
++
++def test_reset_waits_for_import_before_clearing_retirement(tmp_path, monkeypatch):
++    gate = types.SimpleNamespace(entered=threading.Event(), release=threading.Event())
++    monkeypatch.setitem(sys.modules, _GATE, gate)
++    monkeypatch.delitem(sys.modules, _PROBE, raising=False)
++    (tmp_path / f"{_PROBE}.py").write_text(
++        f"import {_GATE} as gate\n"
++        "import threading\n"
++        "_RETIRED = {'superseded': 'old backend'}\n"
++        "gate.entered.set()\n"
++        "assert gate.release.wait(30), 'import gate never released'\n"
++        "_RETIRE_MU = threading.Lock()\n", encoding="utf-8")
++    monkeypatch.syspath_prepend(str(tmp_path))
++    errors = []
++
++    def reset():
++        try:
++            reset_retired_host_loops(_PROBE)
++        except Exception as exc:  # health: allow BLE001 -- asserted in the parent thread
++            errors.append(exc)
++
++    importer = threading.Thread(target=importlib.import_module, args=(_PROBE,), daemon=True)
++    resetter = threading.Thread(target=reset, daemon=True)
++    importer.start()
++    try:
++        assert gate.entered.wait(30), "probe import never started"
++        resetter.start()
++        wait_until(lambda: not resetter.is_alive() or _inside_import_machinery(resetter),
++                   timeout=30, what="reset to finish or wait for the import lock")
++    finally:
++        gate.release.set()
++        importer.join(30)
++        if resetter.ident is not None:
++            resetter.join(30)
++    assert not importer.is_alive() and not resetter.is_alive()
++    assert errors == []
++    assert sys.modules[_PROBE]._RETIRED == {}
++
++
++def test_autouse_fixture_delegates_after_test(monkeypatch):
++    from tests._fixtures import host_loop_reset
++    from tests.hermes_cli import conftest
++
++    calls = []
++    monkeypatch.setattr(host_loop_reset, "reset_retired_host_loops", lambda: calls.append("reset"))
++    fixture = conftest._reset_retired_host_loops.__wrapped__()
++    next(fixture)
++    assert calls == []
++    assert next(fixture, "finished") == "finished"
++    assert calls == ["reset"]
++
++
++def test_reset_does_not_import_unused_module(monkeypatch):
++    monkeypatch.delitem(sys.modules, _PROBE, raising=False)
++    reset_retired_host_loops(_PROBE)
++    assert _PROBE not in sys.modules
++
++
++def test_reset_clears_only_while_holding_retirement_lock(monkeypatch):
++    lock = threading.Lock()
++
++    class Retired(dict):
++        def clear(self):
++            assert lock.locked()
++            super().clear()
++
++    retired = Retired(superseded="old backend")
++    monkeypatch.setitem(sys.modules, _PROBE, types.SimpleNamespace(_RETIRE_MU=lock, _RETIRED=retired))
++    reset_retired_host_loops(_PROBE)
++    assert retired == {}
++    assert not lock.locked()
+-- 
+2.43.0
+

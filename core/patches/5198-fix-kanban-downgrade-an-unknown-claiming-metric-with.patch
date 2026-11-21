@@ -1,0 +1,160 @@
+From 6195086db100bdaedb4d1fdc7e062fc80c94ca48 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:11:39 +0000
+Subject: [PATCH] fix(kanban): downgrade an unknown claiming metric without
+ dropping the report [daveey]
+
+An older Board rejects metrics.claiming with 400. Putting that field in
+ADDITIVE_FIELDS made the rejection disable counters and strip drain,
+admission and CPU. Drop claiming once, then keep the older chain.
+
+Review t_eeeeee0000000022 on 41ce74d06b94.
+---
+ hermes_cli/machine_drain_metrics.py           | 16 +++++--
+ .../hermes_cli/test_machine_drain_metrics.py  | 42 +++++++++++++++++++
+ tests/hermes_cli/test_machine_metrics.py      | 15 ++++---
+ 3 files changed, 63 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/machine_drain_metrics.py b/hermes_cli/machine_drain_metrics.py
+index 996495cd3a..597fbf99f6 100644
+--- a/hermes_cli/machine_drain_metrics.py
++++ b/hermes_cli/machine_drain_metrics.py
+@@ -33,8 +33,9 @@ def collect():
+ 
+ 
+ # Fields newer Boards accept and older Boards reject (400, atomically). CPU busy fields are never resent: the
+-# compatibility retry strips them, so an old CPU sample is never re-stamped as fresh.
+-ADDITIVE_FIELDS = ("drain_active", "drain_until_ms", "claiming", "cpu_busy_pct", "cpu_busy_window_ms", "cpu_busy_sample_end_ms") + ADMISSION_FIELDS
++# compatibility retry strips them, so an old CPU sample is never re-stamped as fresh. ``claiming`` is newer than
++# these and has its own downgrade so a Board that predates it does not discard drain, admission or counters.
++ADDITIVE_FIELDS = ("drain_active", "drain_until_ms", "cpu_busy_pct", "cpu_busy_window_ms", "cpu_busy_sample_end_ms") + ADMISSION_FIELDS
+ 
+ 
+ def send_compatible(send, sample, on_counters_rejected=None):
+@@ -46,8 +47,9 @@ def send_compatible(send, sample, on_counters_rejected=None):
+     Throughput counters (``machine_throughput_metrics.FIELDS``) are newer still: a Board that predates them answers
+     400 "unknown field(s): ...". That answer first drops just the counters (calling ``on_counters_rejected`` so the
+     caller stops sending them for a while) and the CPU busy fields, keeping drain fields for a Board that accepts
+-    those. The newest ``tokens_by_model`` map is dropped first on a 400, preserving
+-    scalar counters for Boards that support them. Older counter/drain fallbacks
++    those. ``tokens_by_model`` is dropped before the scalar counters, preserving
++    those counters for Boards that support the scalars. ``claiming`` is newer than both: a Board that
++    rejects it drops only that field, then the older chain runs. Older counter/drain fallbacks
+     remain available if that downgraded request is also rejected."""
+     from hermes_cli.kanban_sync_client import HubError
+     from hermes_cli.machine_throughput_metrics import FIELDS as COUNTERS
+@@ -66,6 +68,12 @@ def send_compatible(send, sample, on_counters_rejected=None):
+             from hermes_cli.machine_cpu_metrics import FIELDS as CPU
+             return send_compatible(send, {k: v for k, v in sample.items()
+                                           if k not in persistent and k not in CPU}, on_counters_rejected)
++        if "claiming" in sample:
++            # Newest field. An older Board rejects it atomically; drop it once and
++            # keep counters, drain and admission for the next generation.
++            from hermes_cli.machine_cpu_metrics import FIELDS as CPU
++            return send_compatible(send, {k: v for k, v in sample.items()
++                                          if k != "claiming" and k not in CPU}, on_counters_rejected)
+         if "tokens_by_model" in sample:
+             # A scalar-capable Board may predate the model map. Keep its counters
+             # enabled, and never restamp the already attempted CPU sample.
+diff --git a/tests/hermes_cli/test_machine_drain_metrics.py b/tests/hermes_cli/test_machine_drain_metrics.py
+index ebc6e79d56..7d1b76a740 100644
+--- a/tests/hermes_cli/test_machine_drain_metrics.py
++++ b/tests/hermes_cli/test_machine_drain_metrics.py
+@@ -79,6 +79,48 @@ def test_reporter_falls_back_without_discarding_capacity():
+     assert sent == [sample, {"cpu_load1": 1, "active_card_runs": 0}]
+ 
+ 
++def test_unknown_claiming_drops_only_itself_and_keeps_counters():
++    """An older Board that rejects ``claiming`` must not disable counters or drain."""
++    sent, rejected = [], []
++    cpu = {"cpu_busy_pct": 12.5, "cpu_busy_window_ms": 1000, "cpu_busy_sample_end_ms": 1}
++    counters = {"tokens_io_total": 45, "tokens_cache_total": 310,
++                "sessions_started_total": 3, "sessions_ended_total": 2}
++    sample = {"cpus": 4, "cpu_load1": 1.0, "active_card_runs": 0,
++              "drain_active": 0, "claiming": 1, **cpu, **counters}
++
++    def board(value):
++        sent.append(dict(value))
++        if "claiming" in value:
++            raise HubError(400, "unknown field(s): claiming")
++
++    md.send_compatible(board, sample, lambda: rejected.append(True))
++    assert rejected == []
++    assert len(sent) == 2
++    assert "claiming" not in sent[1]
++    assert "cpu_busy_pct" not in sent[1]
++    assert sent[1]["drain_active"] == 0
++    assert sent[1]["tokens_io_total"] == 45
++
++
++def test_claiming_rejection_still_walks_older_board_generations():
++    """Dropping claiming once must not skip the counter and drain downgrades."""
++    sent, rejected = [], []
++    sample = {"cpus": 4, "drain_active": 0, "claiming": 0,
++              "cpu_busy_pct": 1, "tokens_io_total": 9, "tokens_by_model": {"m": 1}}
++
++    def ancient(value):
++        sent.append(dict(value))
++        if set(value) - {"cpus"}:
++            raise HubError(400, "unknown field(s): " + ",".join(sorted(set(value) - {"cpus"})))
++
++    md.send_compatible(ancient, sample, lambda: rejected.append(True))
++    assert "claiming" not in sent[1] and "cpu_busy_pct" not in sent[1]
++    assert "tokens_by_model" in sent[1]  # claiming drops alone; the older map stays for its own step
++    assert "tokens_by_model" not in sent[2]
++    assert rejected == [True]
++    assert sent[-1] == {"cpus": 4}
++
++
+ def test_no_retry_of_other_board_errors():
+     sent = []
+     def send(value):
+diff --git a/tests/hermes_cli/test_machine_metrics.py b/tests/hermes_cli/test_machine_metrics.py
+index 4dfbcadf7a..fd67694043 100644
+--- a/tests/hermes_cli/test_machine_metrics.py
++++ b/tests/hermes_cli/test_machine_metrics.py
+@@ -287,7 +287,7 @@ COUNTERS = {"tokens_io_total": 45, "tokens_cache_total": 310, "sessions_started_
+ 
+ def test_board_without_counters_gets_the_normal_report_and_is_not_asked_again_for_600s():
+     sent, now = [], [1000.0]
+-    sample = {"cpus": 4, "drain_active": 0, **COUNTERS}
++    sample = {"cpus": 4, "drain_active": 0, "claiming": 1, **COUNTERS}
+ 
+     def old_board(value):
+         sent.append(value)
+@@ -295,24 +295,27 @@ def test_board_without_counters_gets_the_normal_report_and_is_not_asked_again_fo
+             raise ksc.HubError(400, '{"error":"unknown field(s): tokens_io_total, tokens_cache_total"}')
+     r = mm.Reporter(old_board, collect_fn=lambda: dict(sample), clock=lambda: now[0])
+     assert r.report_due()
+-    assert sent == [sample, {"cpus": 4, "drain_active": 0}]  # drain fields survive: only the counters go
++    without_claiming = {k: v for k, v in sample.items() if k != "claiming"}
++    assert sent == [sample, without_claiming, {"cpus": 4, "drain_active": 0}]
+     assert r.counters_off_until == now[0] + mm.UNSUPPORTED_RETRY_S
+     now[0] += mm.REPORT_EVERY_S
+-    assert r.report_due() and sent[2:] == [{"cpus": 4, "drain_active": 0}]  # one request, no failing first try
++    assert r.report_due() and sent[3:] == [{"cpus": 4, "drain_active": 0, "claiming": 1}]
+     now[0] = 1000.0 + mm.UNSUPPORTED_RETRY_S
+-    assert r.report_due() and len(sent) == 5 and sent[3] == sample  # asks again after the backoff
++    assert r.report_due() and sent[4] == sample  # asks again after the backoff, claiming included
+ 
+ 
+ def test_counter_retry_drops_cpu_sample_and_still_falls_back_for_pre_drain_boards():
+     sent = []
+-    sample = {"cpus": 4, "drain_active": 0, **CPU, **COUNTERS}
++    sample = {"cpus": 4, "drain_active": 0, "claiming": 1, **CPU, **COUNTERS}
+ 
+     def ancient(value):
+         sent.append(value)
+         if set(value) - {"cpus"}:
+             raise ksc.HubError(400, "unknown field(s): drain_active")
+     md.send_compatible(ancient, sample)
+-    assert sent[1] == {"cpus": 4, "drain_active": 0} and sent[2:] == [{"cpus": 4}]
++    assert "claiming" not in sent[1] and "cpu_busy_pct" not in sent[1]
++    assert sent[1]["tokens_io_total"] == COUNTERS["tokens_io_total"]
++    assert sent[2] == {"cpus": 4, "drain_active": 0} and sent[3:] == [{"cpus": 4}]
+ 
+ 
+ def test_other_400_with_counters_is_not_treated_as_an_old_board():
+-- 
+2.43.0
+

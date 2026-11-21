@@ -1,0 +1,174 @@
+From ecfc3975de428042124a2989ff825831f0426a5b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:45:44 +0000
+Subject: [PATCH] fix(kanban): retain full authorship for unproven replacement
+ artifacts [daveey]
+
+Replacement PR identity and unattributed range commits cannot release historical implementers. Fall back to full implementation history, retaining review-run and proven no-code rehandoff classification. Missing ranges stay fail closed; complete attributable same-PR disjoint ranges retain narrowing.
+
+Proof: independent reviewer probe b0e6cd5bafeb red on 49d350bd3e (1 failed), green after fix. Canonical 18-file consumer suite: 497 passed. Five focused mutants killed, including uncovered commits and replacement PR without old range. Read-only local/replica replay: 52 artifact histories, one broadened run set, no removals. Full scripts/check needs canonical rebase: unrelated tree-group health ratchet on stale base.
+---
+ hermes_cli/kanban_review_artifacts.py         | 25 +++++++
+ .../test_kanban_review_model_artifacts.py     | 27 ++++++++
+ .../test_review_artifact_independent_probe.py | 68 +++++++++++++++++++
+ 3 files changed, 120 insertions(+)
+ create mode 100644 tests/hermes_cli/test_review_artifact_independent_probe.py
+
+diff --git a/hermes_cli/kanban_review_artifacts.py b/hermes_cli/kanban_review_artifacts.py
+index e92d2a945f..7ca4f64137 100644
+--- a/hermes_cli/kanban_review_artifacts.py
++++ b/hermes_cli/kanban_review_artifacts.py
+@@ -62,6 +62,28 @@ def _review_runs(conn, task_id):
+     return reviewing
+ 
+ 
++def _unproven_custody(rows, reviewing, target, target_commits):
++    """Never narrow across replacement PRs or unaccounted-for range commits.
++
++    The latest handoff attributes its head to its delivering run. Earlier commits
++    need earlier delivery evidence, not the latest worker's assertion that they
++    are in the diff. A changed PR identity invalidates that attribution context.
++    No review verdict alone clears missing delivery evidence.
++    """
++    if target is None or target_commits is None:
++        return True
++    covered = {target[1]}
++    deliveries = [(rid, _mapping(raw)) for rid, outcome, raw in rows
++                  if outcome == 'review_requested' and rid not in reviewing]
++    for _, metadata in deliveries[:-1]:
++        identity = _identity(metadata)
++        if identity is None or identity[0] != target[0]:
++            return True
++        covered.add(identity[1])
++        covered.update(_commit_range(metadata, identity) or ())
++    return not target_commits.issubset(covered)
++
++
+ def artifact_author_runs(conn, task_id):
+     """Author run ids for the latest artifact, or None for legacy artifact-less cards.
+ 
+@@ -82,6 +104,9 @@ def artifact_author_runs(conn, task_id):
+     target_commits = _commit_range(target_metadata, target)
+     reviewing = _review_runs(conn, task_id)
+     repeats = rehandoff_runs(conn, task_id)
++    full_history = {rid for rid, _, _ in rows if rid not in reviewing and rid not in repeats}
++    if _unproven_custody(rows, reviewing, target, target_commits):
++        return full_history
+     pending, authors = set(), set()
+     for rid, outcome, raw in rows:
+         if rid in reviewing:
+diff --git a/tests/hermes_cli/test_kanban_review_model_artifacts.py b/tests/hermes_cli/test_kanban_review_model_artifacts.py
+index ff39d11e50..ead4b55463 100644
+--- a/tests/hermes_cli/test_kanban_review_model_artifacts.py
++++ b/tests/hermes_cli/test_kanban_review_model_artifacts.py
+@@ -37,6 +37,33 @@ def test_complete_ranges_control_same_pr_author_custody(board, overlap):
+         assert excluded == ({authors.ASTRA, authors.OPUS} if overlap else {authors.OPUS})
+ 
+ 
++@pytest.mark.parametrize('replacement', [False, True])
++def test_unproven_range_keeps_full_history(board, replacement):
++    with authors.kbc.connect() as conn:
++        tid = authors._card(conn)
++        handoff(conn, tid, authors.ASTRA, {**ARTIFACT,
++                'review_commit_range': receipt('b' * 40, ['b' * 40])})
++        second = {**ARTIFACT, 'reviewed_sha': 'd' * 40, 'merge_commit': None,
++                  'review_commit_range': receipt('d' * 40, ['d' * 40, 'e' * 40])}
++        if replacement:
++            second['published_pr'] = 'https://github.com/example/project/pull/13'
++            second['review_commit_range'] = receipt('d' * 40, ['d' * 40])
++        handoff(conn, tid, authors.OPUS, second)
++        assert review.implementer_models(conn, kb.get_task(conn, tid)) == {authors.ASTRA, authors.OPUS}
++
++
++def test_prior_delivery_range_accounts_for_non_head_commit(board):
++    with authors.kbc.connect() as conn:
++        tid = authors._card(conn)
++        handoff(conn, tid, authors.GROK, {**ARTIFACT, 'reviewed_sha': 'f' * 40, 'merge_commit': None,
++                'review_commit_range': receipt('f' * 40, ['f' * 40])})
++        handoff(conn, tid, authors.ASTRA, {**ARTIFACT, 'merge_commit': None,
++                'review_commit_range': receipt('b' * 40, ['b' * 40, 'e' * 40])})
++        handoff(conn, tid, authors.OPUS, {**ARTIFACT, 'reviewed_sha': 'd' * 40, 'merge_commit': None,
++                'review_commit_range': receipt('d' * 40, ['d' * 40, 'e' * 40])})
++        assert review.implementer_models(conn, kb.get_task(conn, tid)) == {authors.ASTRA, authors.OPUS}
++
++
+ @pytest.mark.parametrize('bad', [None, {}, [], {'base': 'bad'},
+     receipt('e' * 40, ['e' * 40]), receipt('d' * 40, []),
+     receipt('d' * 40, ['d' * 40, 'bad']), receipt('d' * 40, ['d' * 40, 'd' * 40]),
+diff --git a/tests/hermes_cli/test_review_artifact_independent_probe.py b/tests/hermes_cli/test_review_artifact_independent_probe.py
+new file mode 100644
+index 0000000000..1c62a5d36f
+--- /dev/null
++++ b/tests/hermes_cli/test_review_artifact_independent_probe.py
+@@ -0,0 +1,68 @@
++"""Independent reviewer probes for artifact custody across PR identities."""
++import pytest
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_review_model as review
++from hermes_cli import kanban_model_tier as tier
++from tests.hermes_cli import test_kanban_review_model as helpers
++from tests.hermes_cli.test_kanban_review_model_cycles import MODELS, verdict
++from tests.hermes_cli.test_kanban_review_retry_custody import ARTIFACT
++
++board = helpers.board
++
++@pytest.mark.parametrize('prior_range', [False, True])
++def test_known_prior_head_in_new_pr_range_stays_excluded(board, prior_range):
++    cfg = helpers.config(board, strong=MODELS[0], routes=MODELS)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='artifact cross-PR custody', assignee='default')
++        def deliver(model, artifact):
++            claimed = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++            assert claimed
++            kb._append_event(conn, tid, 'run_route', {'model': model, 'lane': 'ready'}, run_id=claimed.current_run_id)
++            assert kb.request_review(conn, tid, metadata=artifact)
++        first = dict(ARTIFACT)
++        if prior_range:
++            first['review_commit_range'] = {'base': '0'*40, 'head': 'b'*40, 'commits': ['b'*40]}
++        deliver(MODELS[0], first)
++        verdict(conn, tid, MODELS[1])
++        deliver(MODELS[2], {**ARTIFACT, 'published_pr': 'https://github.com/example/project/pull/13',
++            'reviewed_sha': 'd'*40, 'merge_commit': 'c'*40,
++            'review_commit_range': {'base': '0'*40, 'head': 'd'*40, 'commits': ['b'*40, 'd'*40]}})
++        claimed = kb.claim_review_task(conn, tid, claimer=kb._claimer_id())
++        excluded = review.implementer_models(conn, claimed)
++        chosen, _, _ = tier.resolve_model_tier(conn, claimed, lane='review', cfg=cfg)
++        print('prior_range=', prior_range, 'authors=', excluded, 'reviewer=', chosen)
++        assert MODELS[0] in excluded
++        assert chosen != MODELS[0]
++
++@pytest.mark.parametrize('with_ranges', [False, True])
++def test_fifth_artifact_review_dispatch(board, monkeypatch, with_ranges):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    helpers.config(board, strong=MODELS[0], routes=MODELS)
++    monkeypatch.setenv('HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS', '0')
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='five artifact cycles', assignee='default')
++        for index in range(5):
++            model = MODELS[index % 4]
++            sha = str(index + 1) * 40
++            artifact = {'published_pr': ARTIFACT['published_pr'], 'reviewed_sha': sha}
++            if with_ranges:
++                artifact['review_commit_range'] = {'base': '0'*40, 'head': sha, 'commits': [sha]}
++            claimed = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++            assert claimed
++            kb._append_event(conn, tid, 'run_route', {'model': model, 'lane': 'ready'}, run_id=claimed.current_run_id)
++            assert kb.request_review(conn, tid, metadata=artifact)
++            if index < 4:
++                verdict(conn, tid, MODELS[(index + 1) % 4])
++        spawned = []
++        dispatch.dispatch_once(conn, spawn_fn=lambda *args: spawned.append(args) or 4242)
++        stored = kb.get_task(conn, tid)
++        if with_ranges:
++            assert len(spawned) == 1
++            events = [e.payload for e in kb.list_events(conn, tid) if e.kind == 'model_tier']
++            assert events[-1]['model'] != MODELS[0]
++            assert events[-1]['implementer_models'] == [MODELS[0]]
++        else:
++            assert spawned == []
++            assert stored.status == 'triage'
++            assert 'No eligible' in stored.last_failure_error
+-- 
+2.43.0
+

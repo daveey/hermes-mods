@@ -1,0 +1,118 @@
+From 103cb87dafd60552e6919ececb8fc08d771da53d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 09:11:24 +0000
+Subject: [PATCH] fix: report an ask that opens on an unchanged non-red stripe
+ [daveey]
+
+Review 5989473977 on #3735, two non-blocking points.
+
+Problem: recordStripeTransition returned before the invariant check when the stripe was unchanged and not red, so an ask that opened while the stripe stayed green was never reported. mark_unknown already dropped needs_you on a failed read, but no test failed if that pop was removed.
+
+Why 1: the change key compared the stripe and, for red only, the stuck reasons. Evidence: session-dot-state.ts early return; a row first seen done, then done with kanban_blocked:1, called the reporter 0 times.
+Why 2: a failed annotation read is unknown, never "no work", and the needs_you drop had no test. Evidence: deleting row.pop("needs_you") left the new test failing and the prior suite green.
+
+Root (happened): the diagnostic change key omitted the violation.
+Root (not caught): the new report path was tested only on first sighting and on a stripe change.
+Recurrence: first time for this edge (review 5989473977).
+
+Countermeasures:
+- symptom: include the violation in the change key. Proof: vitest "reports an ask that opens while the stripe stays non-red" failed (0 calls) on 977b2dc511 and passes after (91 passed in session-dot-state.test.ts).
+- detection: test_failed_read_drops_needs_you fails when the pop is removed and passes with it (9 passed in test_kanban_relay_blocked_reason.py).
+
+Implemented-by: grok-4.7 (xAI)
+---
+ .../src/store/session-dot-state.test.ts       | 19 +++++++++++++++++++
+ apps/desktop/src/store/session-dot-state.ts   | 10 ++++++----
+ .../test_kanban_relay_blocked_reason.py       | 15 +++++++++++++++
+ 3 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index da30fa27f7..f486b507e4 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -1304,4 +1304,23 @@ describe('open human ask invariant (blocked > 0 && !parked => stuck)', () => {
+     expect(report.mock.calls.flatMap((call: unknown[]) => call[3] as string[])).not.toContain('needs_you:1')
+     setStripeReasonReporter(null)
+   })
++
++  // [daveey] An ask that opens while the stripe stays non-red is still a violation report.
++  // The original incident shape, if a caller bypasses the invariant that would have painted red.
++  it('reports an ask that opens while the stripe stays non-red', () => {
++    const report = vi.fn()
++    setStripeReasonReporter(report)
++    resetStripeTransitionLog()
++
++    recordStripeTransition({ id: 'late' } as never, 'done', 'idle', 1_000, true)
++    expect(report).not.toHaveBeenCalled()
++
++    recordStripeTransition({ id: 'late', kanban_blocked: 1 } as never, 'done', 'idle', 2_000, true)
++    expect(report).toHaveBeenCalledTimes(1)
++    expect(report.mock.calls[0].slice(1)).toEqual(['done', 'done', ['needs_you:1']])
++
++    recordStripeTransition({ id: 'late', kanban_blocked: 1 } as never, 'done', 'idle', 3_000, true)
++    expect(report).toHaveBeenCalledTimes(1)
++    setStripeReasonReporter(null)
++  })
+ })
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 4fa04aa15f..d8d83070e8 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -870,7 +870,7 @@ const STRIPE_TRANSITION_WINDOW_MS = 60_000
+ 
+ interface StripeTraceEntry {
+   stripe: null | SessionStatusStripe
+-  /** The red reasons last logged (`stuckReasons` joined); empty unless `stuck`. */
++  /** Last reported cause: stuck reasons, or `needs_you:N` when a non-red stripe still has an ask. */
+   reasonsKey: string
+   emitted: number[]
+   suppressed: number
+@@ -1127,8 +1127,10 @@ export function recordStripeTransition(
+     const key = `${row.connection_id ?? ''}\u0000${row.profile ?? ''}\u0000${row.id}`
+     const entry = stripeTrace.get(key)
+     const reasons = stripe === 'stuck' ? stuckReasons(row, dotState, now / 1000) : []
+-    const reasonsKey = reasons.join('|')
+     const violation = stripeInvariantViolation(row, stripe, now / 1000, live)
++    // [daveey] Violation is part of the change key, same as a red row's reasons: an ask that
++    // opens while the stripe stays non-red is still reported.
++    const reasonsKey = [...reasons, ...(violation ? [violation] : [])].join('|')
+ 
+     if (!entry) {
+       stripeTrace.set(key, { emitted: [], reasonsKey, stripe, suppressed: 0 })
+@@ -1144,8 +1146,8 @@ export function recordStripeTransition(
+       return
+     }
+ 
+-    // A red row whose cause changed (the prompt answered but a card blocked) is a new red: log and report it.
+-    if (entry.stripe === stripe && (stripe !== 'stuck' || entry.reasonsKey === reasonsKey)) {
++    // A red row whose cause changed, or a non-red row whose ask count changed, is a new report.
++    if (entry.stripe === stripe && entry.reasonsKey === reasonsKey) {
+       return
+     }
+ 
+diff --git a/tests/hermes_cli/test_kanban_relay_blocked_reason.py b/tests/hermes_cli/test_kanban_relay_blocked_reason.py
+index 19d835c236..087f22d680 100644
+--- a/tests/hermes_cli/test_kanban_relay_blocked_reason.py
++++ b/tests/hermes_cli/test_kanban_relay_blocked_reason.py
+@@ -62,3 +62,18 @@ def test_reason_uses_frozen_count_snapshot_and_clears_retired_reason(monkeypatch
+     ksa.annotate_kanban_activity([row])
+     assert row["kanban_unknown"]
+     assert "kanban_blocked_on" not in row
++
++
++def test_failed_read_drops_needs_you(monkeypatch):
++    """A failed annotation read is unknown, so a carried ask must not stay on the row."""
++    monkeypatch.setattr(ksa, "_annotation_snapshot", lambda: None)
++    row = {
++        "id": "s1",
++        "needs_you": [{"kind": "card", "ref": "default/t1", "question": ""}],
++        "kanban_blocked": 1,
++        "kanban_blocked_on": ["default/t1"],
++    }
++    ksa.annotate_kanban_activity([row])
++    assert row["kanban_unknown"]
++    assert "needs_you" not in row
++    assert "kanban_blocked" not in row
+-- 
+2.43.0
+

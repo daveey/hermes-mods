@@ -1,0 +1,2076 @@
+From 21f87ab209f76fc4ad4f1dcdec923c66a03a5066 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 04:59:42 +0000
+Subject: [PATCH] feat(kanban): external-run card state (light blue / red),
+ watch adapters, hover fields [daveey]
+
+Cards parked on work that runs elsewhere (awaiting kind ci/deploy/external) get a derived state:
+external_running / external_unknown / external_down, with `external` {service, adapter, job, health, reason, url,
+observed_at, next_due_at} on wait info and kanban_external / _unknown / _down counts plus kanban_external_cards
+(cap 10) on session rows (interface.md, interface-hover.md).
+
+- kanban_external_state: pure clock-injected state machine (1 failed poll or 429 = unknown; 2 consecutive
+  down/unreachable, auth_failed, host silent > 2x every, or no watch = down; terminal job wakes, a failed job is
+  not an outage; 429 honours retry_after and never counts toward red).
+- kanban_external_adapters: github_run / github_pr_checks (wrap kanban_ci_progress, fetch= injection kept) and
+  shell (legacy rc 0/1/3/other + optional `HERMES_WATCH {json}` line).
+- kanban_external_watch: records as `external_watch` task_events (the Board sync has no per-card LWW table:
+  spike in the card), wake with external_result, shared blocker service-down.<adapter>.<scope> (one probe card
+  woken, cleared on the first ok poll, external_recovered event).
+- Wired into kanban_ci_progress.sweep and kanban_wake_check.apply_result; read side in
+  kanban_external_activity (wait info overlay, session counts/cards).
+
+Proof: tests/hermes_cli/test_kanban_external_{state,adapters,watch,activity}.py.
+---
+ hermes_cli/kanban_ci_progress.py              |  70 ++-
+ hermes_cli/kanban_external_activity.py        | 132 ++++++
+ .../kanban_external_adapters/__init__.py      |   6 +
+ hermes_cli/kanban_external_adapters/github.py | 196 +++++++++
+ hermes_cli/kanban_external_adapters/shell.py  |  78 ++++
+ hermes_cli/kanban_external_state.py           | 148 +++++++
+ hermes_cli/kanban_external_watch.py           | 351 +++++++++++++++
+ hermes_cli/kanban_session_activity.py         |   4 +-
+ hermes_cli/kanban_session_wait_rows.py        |   8 +-
+ hermes_cli/kanban_wake_check.py               |   7 +-
+ .../test_kanban_external_activity.py          |  98 +++++
+ .../test_kanban_external_adapters.py          | 245 +++++++++++
+ .../hermes_cli/test_kanban_external_state.py  | 143 +++++++
+ .../hermes_cli/test_kanban_external_watch.py  | 401 ++++++++++++++++++
+ 14 files changed, 1875 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/kanban_external_activity.py
+ create mode 100644 hermes_cli/kanban_external_adapters/__init__.py
+ create mode 100644 hermes_cli/kanban_external_adapters/github.py
+ create mode 100644 hermes_cli/kanban_external_adapters/shell.py
+ create mode 100644 hermes_cli/kanban_external_state.py
+ create mode 100644 hermes_cli/kanban_external_watch.py
+ create mode 100644 tests/hermes_cli/test_kanban_external_activity.py
+ create mode 100644 tests/hermes_cli/test_kanban_external_adapters.py
+ create mode 100644 tests/hermes_cli/test_kanban_external_state.py
+ create mode 100644 tests/hermes_cli/test_kanban_external_watch.py
+
+diff --git a/hermes_cli/kanban_ci_progress.py b/hermes_cli/kanban_ci_progress.py
+index e63935645d..d88a6259c5 100644
+--- a/hermes_cli/kanban_ci_progress.py
++++ b/hermes_cli/kanban_ci_progress.py
+@@ -670,10 +670,58 @@ def _apply_per_pr(conn: sqlite3.Connection, task_id: str, ref: str, p: Progress)
+     return woke
+ 
+ 
++def _wall_now() -> float:
++    """Wall clock of a sweep; the one seam tests move (``monotonic`` only spaces the reads)."""
++    return time.time()
++
++
++def _record_watch(conn: sqlite3.Connection, task_id: str, watched, wall: float) -> Optional[str]:
++    """[daveey] Write the poll as the card's external-watch record (and wake / assert / clear as it says). A failure
++    to record never fails the sweep. Returns the wake event kind or None."""
++    from hermes_cli import kanban_external_watch as kew
++    from hermes_cli.kanban_external_state import DEFAULT_CI_EVERY, clamp_every
++    try:
++        ctx = kew.park_context(conn, task_id) or {"payload": {}}
++        declared = ctx["payload"].get("watch") if isinstance(ctx["payload"].get("watch"), dict) else {}
++        return kew.apply_poll(conn, task_id, watched.poll, now=wall, adapter=watched.adapter, scope=watched.scope,
++                              every=clamp_every(declared.get("every"), DEFAULT_CI_EVERY),
++                              service_name=watched.service_name)
++    except (sqlite3.Error, OSError, ValueError, KeyError, TypeError):
++        logger.warning("kanban external watch: could not record the poll of %s", task_id, exc_info=True)
++        return None
++
++
++def _due_wall(conn: sqlite3.Connection, task_id: str, wall: float) -> bool:
++    """False while a 429's ``retry_after`` has not elapsed since the card's last record: the sweep's coarse
++    ``RECHECK_SECONDS`` spacing alone would read a rate-limited run too soon. Otherwise the interval is
++    ``_declared_every``."""
++    from hermes_cli import kanban_external_watch as kew
++    try:
++        ctx = kew.park_context(conn, task_id)
++        rec = kew.latest_record(conn, task_id, ctx["event_id"]) if ctx else None
++    except sqlite3.Error:
++        return True
++    return rec is None or wall >= float(rec.get("observed_at") or 0) + float(rec.get("retry_after") or 0)
++
++
++def _declared_every(conn: sqlite3.Connection, task_id: str) -> int:
++    """Seconds between reads of this card: its park's declared ``watch.every`` (min 120), else ``RECHECK_SECONDS``."""
++    from hermes_cli import kanban_external_watch as kew
++    from hermes_cli.kanban_external_state import clamp_every
++    try:
++        ctx = kew.park_context(conn, task_id)
++    except sqlite3.Error:
++        return RECHECK_SECONDS
++    watch = ((ctx or {}).get("payload") or {}).get("watch")
++    if isinstance(watch, dict) and watch.get("every") is not None:
++        return clamp_every(watch["every"])
++    return RECHECK_SECONDS
++
++
+ def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None,
+-          fetch_runners: Optional[FetchRunners] = None) -> list[str]:
++          fetch_runners: Optional[FetchRunners] = None, fetch_run: Optional[Callable] = None) -> list[str]:
+     """Re-read CI-waiting cards' runs and wake the cards whose run is not starting: each card at most once per
+-    ``RECHECK_SECONDS``, at most ``MAX_CARDS_PER_SWEEP`` per sweep (least recently checked first), and no ``gh``
++    ``RECHECK_SECONDS`` (its declared ``watch.every``, and never before its record's ``next_due_at``), at most ``MAX_CARDS_PER_SWEEP`` per sweep (least recently checked first), and no ``gh``
+     call started after ``SWEEP_BUDGET_SECONDS`` (a run cut off before its runner list goes first next sweep).
+     Network: run it off the dispatcher thread (``submit_sweep``). Never raises."""
+     from hermes_cli import kanban_db_connect as kbc
+@@ -687,19 +735,24 @@ def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None,
+         waits = _ci_waits(conn)
+         live = {(db, task_id) for task_id, _ref, _hint in waits}
+         now = time.monotonic()
++        wall = _wall_now()
+         with _LOCK:
+             for key in [k for k in _LAST_CHECK if k[0] == db and k not in live]:
+                 del _LAST_CHECK[key]  # re-parked on something else, woken or gone
+-            due = sorted((_LAST_CHECK.get((db, task_id), float("-inf")), task_id, ref, hint)
+-                         for task_id, ref, hint in waits
+-                         if now - _LAST_CHECK.get((db, task_id), float("-inf")) >= RECHECK_SECONDS)
++            last_at = {task_id: _LAST_CHECK.get((db, task_id), float("-inf")) for task_id, _r, _h in waits}
++        due = sorted((last_at[task_id], task_id, ref, hint) for task_id, ref, hint in waits
++                     if now - last_at[task_id] >= _declared_every(conn, task_id) and _due_wall(conn, task_id, wall))
+         for checked, (_last, task_id, ref, hint) in enumerate(due):
+             if checked >= MAX_CARDS_PER_SWEEP or time.monotonic() >= deadline:
+                 break  # the rest are the least recently checked ones next sweep
+             with _LOCK:
+                 _LAST_CHECK[(db, task_id)] = time.monotonic()
+-            p = progress(ref, hint=hint, parked_at=_parked_at(conn, task_id), fetch=fetch,
+-                         fetch_runners=fetch_runners, deadline=deadline)
++            from hermes_cli.kanban_external_adapters import github as external_github
++            watched = external_github.poll(ref, hint, parked_at=_parked_at(conn, task_id), now=wall, fetch=fetch,
++                                           fetch_runners=fetch_runners, fetch_run=fetch_run, deadline=deadline)
++            p = watched.progress if watched is not None else progress(
++                ref, hint=hint, parked_at=_parked_at(conn, task_id), fetch=fetch, fetch_runners=fetch_runners,
++                deadline=deadline)
+             if p.deferred:
+                 with _LOCK:
+                     _LAST_CHECK.pop((db, task_id), None)  # least recently checked: first next sweep
+@@ -710,6 +763,9 @@ def sweep(conn: sqlite3.Connection, *, fetch: Optional[Fetch] = None,
+                 logger.warning("ci run progress for %s (%s) unreadable: %s", task_id, ref, p.detail)
+             if p.state == NOT_STARTING and apply(conn, task_id, ref, p):
+                 woken.append(task_id)
++                continue
++            if watched is not None and watched.poll is not None and _record_watch(conn, task_id, watched, wall):
++                woken.append(task_id)
+     except Exception:
+         logger.warning("kanban ci run progress sweep failed", exc_info=True)
+     return woken
+diff --git a/hermes_cli/kanban_external_activity.py b/hermes_cli/kanban_external_activity.py
+new file mode 100644
+index 0000000000..e916979b16
+--- /dev/null
++++ b/hermes_cli/kanban_external_activity.py
+@@ -0,0 +1,132 @@
++"""External-run cards on the read side: wait info and the session-row counts/cards. [daveey]
++
++``overlay_waits`` adds ``wait_state`` (external_running / external_unknown / external_down) and the ``external``
++dict to a parked card's wait info (interface.md); ``session_external`` stamps the three counts and the capped
++``kanban_external_cards`` list on session rows (interface-hover.md). Counts are subsets of ``kanban_parked`` and
++are never added to ``kanban_blocked``. Local boards only: a card replicated from another gateway keeps today's
++grey wait info.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++import threading
++import time
++from typing import Any, Iterable, Optional
++
++logger = logging.getLogger(__name__)
++
++CARDS_CAP = 10
++_TTL_S = 5.0
++_lock = threading.Lock()
++_memo: dict[str, tuple[float, dict]] = {}
++
++
++def overlay_waits(conn: sqlite3.Connection, info: dict[str, dict[str, Any]], now: Optional[float] = None) -> None:
++    """Add the external state to ``info`` (``{task_id: wait info}``) in place. Never raises."""
++    if not info:
++        return
++    try:
++        from hermes_cli import kanban_external_watch as kew
++        for tid, derived in kew.card_states(conn, list(info), now=now).items():
++            info[tid]["wait_state"] = derived["state"]
++            info[tid]["external"] = derived["external"]
++    except (sqlite3.Error, ImportError, KeyError, TypeError, ValueError):
++        return
++
++
++def session_external(conn: sqlite3.Connection, pairs: Iterable[tuple[str, str]], key: str = "",
++                     now: Optional[float] = None) -> dict[str, dict[str, Any]]:
++    """``{session id: {"counts": (external, unknown, down), "cards": [{task_id, title, external, state}]}}`` for
++    the parked (session, task) ``pairs`` of one board, memoised ``_TTL_S`` per ``key``. Cards newest-park first."""
++    wall = time.time() if now is None else now
++    with _lock:
++        hit = _memo.get(key)
++        if key and hit and wall - hit[0] < _TTL_S:
++            return hit[1]
++    pairs = list(pairs)
++    out: dict[str, dict[str, Any]] = {}
++    try:
++        from hermes_cli import kanban_external_watch as kew
++        states = kew.card_states(conn, {t for _s, t in pairs}, now=wall)
++        titles = {}
++        ids = list(states)
++        for i in range(0, len(ids), 500):
++            chunk = ids[i:i + 500]
++            titles.update((str(t), str(n or "")) for t, n in conn.execute(
++                f"SELECT id, title FROM tasks WHERE id IN ({','.join('?' for _ in chunk)})", chunk))
++        for sid, tid in sorted(pairs):
++            derived = states.get(tid)
++            if derived is None:
++                continue
++            slot = out.setdefault(sid, {"counts": [0, 0, 0], "cards": []})
++            if derived["state"] == "external_down":
++                slot["counts"][2] += 1
++            else:
++                slot["counts"][0] += 1
++                slot["counts"][1] += derived["state"] == "external_unknown"
++            ext = dict(derived["external"], state=derived["state"])
++            slot["cards"].append({"task_id": tid, "title": titles.get(tid, ""), "external": ext})
++        for slot in out.values():
++            slot["cards"].sort(key=lambda c: (c["external"].get("observed_at") or 0, c["task_id"]), reverse=True)
++    except (sqlite3.Error, ImportError, KeyError, TypeError, ValueError):
++        out = {}
++    with _lock:
++        if key:
++            _memo[key] = (wall, out)
++    return out
++
++
++def stamp_rows(rows: list[dict[str, Any]], by_session: dict[str, dict[str, Any]], ids_of) -> None:
++    """Stamp ``kanban_external``, ``kanban_external_unknown``, ``kanban_external_down`` and
++    ``kanban_external_cards`` (cap ``CARDS_CAP``) on each row from the per-session map; absent when zero."""
++    for row in rows:
++        counts, cards, seen = [0, 0, 0], [], set()
++        for sid in ids_of(row):
++            slot = by_session.get(sid)
++            if not slot:
++                continue
++            counts = [a + b for a, b in zip(counts, slot["counts"])]
++            cards += [c for c in slot["cards"] if c["task_id"] not in seen and not seen.add(c["task_id"])]
++        for field, n in (("kanban_external", counts[0]), ("kanban_external_unknown", counts[1]),
++                         ("kanban_external_down", counts[2])):
++            if n:
++                row[field] = n
++            else:
++                row.pop(field, None)
++        if cards:
++            cards.sort(key=lambda c: (c["external"].get("observed_at") or 0, c["task_id"]), reverse=True)
++            row["kanban_external_cards"] = cards[:CARDS_CAP]
++        else:
++            row.pop("kanban_external_cards", None)
++
++
++def stamp_boards(rows: list[dict[str, Any]], board_paths, open_ro, parked_pairs, row_ids) -> list[dict[str, Any]]:
++    """Read every local board's parked (session, task) pairs and stamp ``rows``; returns ``rows``. Never raises:
++    the session list must render without the external fields."""
++    by_session: dict[str, dict[str, Any]] = {}
++    try:
++        for path in board_paths():
++            try:
++                conn = open_ro(path)
++            except sqlite3.Error:
++                continue
++            try:
++                pairs = parked_pairs(conn)
++                for sid, slot in (session_external(conn, pairs, key=str(path)) if pairs else {}).items():
++                    mine = by_session.setdefault(sid, {"counts": [0, 0, 0], "cards": []})
++                    mine["counts"] = [a + b for a, b in zip(mine["counts"], slot["counts"])]
++                    mine["cards"] += slot["cards"]
++            except sqlite3.Error:
++                logger.debug("kanban external read failed for %s", path, exc_info=True)
++            finally:
++                conn.close()
++        stamp_rows(rows, by_session, row_ids)
++    except (sqlite3.Error, OSError, ImportError, KeyError, TypeError, ValueError, AttributeError):
++        logger.debug("kanban external stamping failed", exc_info=True)
++    return rows
++
++
++def reset_for_tests() -> None:
++    with _lock:
++        _memo.clear()
+diff --git a/hermes_cli/kanban_external_adapters/__init__.py b/hermes_cli/kanban_external_adapters/__init__.py
+new file mode 100644
+index 0000000000..6d7f9b288a
+--- /dev/null
++++ b/hermes_cli/kanban_external_adapters/__init__.py
+@@ -0,0 +1,6 @@
++"""Watch adapters: one poll of an external system -> ``{job, service, detail, url, retry_after}``. [daveey]
++
++``github`` reads a GitHub Actions run or a PR's checks (wrapping ``kanban_ci_progress``); ``shell`` maps a legacy
++wake-check probe's exit code and optional ``HERMES_WATCH {json}`` line. The state machine that turns polls into a
++card state is ``hermes_cli.kanban_external_state``; the database side is ``hermes_cli.kanban_external_watch``.
++"""
+diff --git a/hermes_cli/kanban_external_adapters/github.py b/hermes_cli/kanban_external_adapters/github.py
+new file mode 100644
+index 0000000000..e24a269f61
+--- /dev/null
++++ b/hermes_cli/kanban_external_adapters/github.py
+@@ -0,0 +1,196 @@
++"""GitHub Actions run / PR checks -> watch poll. [daveey]
++
++Wraps :func:`hermes_cli.kanban_ci_progress.ci_run_progress` and :func:`pr_progress` (keeping their ``fetch=``
++injection) and adds what a card needs to show light blue or red: the JOB's state (queued / running / succeeded /
++failed / cancelled) separately from the SERVICE's health (ok / degraded / down / unreachable / auth_failed /
++rate_limited). A GitHub error is no longer logged and forgotten: it becomes a health record.
++
++Cost: a run poll is one jobs read (shared with ``ci_run_progress``) plus one run read, only when every listed job is
++complete (to confirm the run's own conclusion: later jobs may not exist yet). A PR poll reads the PR and its head's
++runs again on top of ``pr_progress``'s own reads: three or four calls per PR poll.
++"""
++from __future__ import annotations
++
++import re
++import subprocess
++from dataclasses import dataclass
++from typing import Callable, Optional
++
++from hermes_cli import kanban_ci_progress as kcp
++
++SERVICE_NAME = "GitHub Actions"
++DEFAULT_RETRY_AFTER = 300
++DETAIL_MAX = 300
++_RETRY_AFTER = re.compile(r"retry[- _]after\D{0,3}(\d+)", re.IGNORECASE)
++_RATE = re.compile(r"http 429|rate limit|secondary rate|abuse detection", re.IGNORECASE)
++_AUTH = re.compile(r"http 401|bad credentials|authentication required|gh auth login", re.IGNORECASE)
++_UNREACHABLE = re.compile(r"timed out|timeout|no such host|could not resolve|temporary failure|connection (?:refused|reset)"
++                          r"|network is unreachable|dial tcp|\beof\b", re.IGNORECASE)
++_FAILED = ("failure", "timed_out", "startup_failure", "action_required")
++_PENDING = ("queued", "waiting", "requested", "pending")
++
++
++@dataclass
++class Watched:
++    """One adapter poll: ``poll`` is None when the sweep budget cut the read off (nothing to record yet)."""
++
++    poll: Optional[dict]
++    progress: kcp.Progress
++    adapter: str
++    scope: str
++    service_name: str = SERVICE_NAME
++
++
++def adapter_for(ref: str, hint: str = "") -> Optional[str]:
++    if kcp.run_target(ref, hint) is not None:
++        return "github_run"
++    if kcp.pr_target(ref, hint) is not None:
++        return "github_pr_checks"
++    return None
++
++
++def classify(detail: str, *, no_credential: bool = False, gh_missing: bool = False) -> tuple[str, Optional[int]]:
++    """``(health, retry_after)`` for a GitHub read that failed with ``detail``."""
++    text = detail or ""
++    if no_credential or _AUTH.search(text):
++        return "auth_failed", None
++    if gh_missing:
++        return "probe_broken", None
++    if _RATE.search(text):
++        m = _RETRY_AFTER.search(text)
++        return "rate_limited", int(m.group(1)) if m else DEFAULT_RETRY_AFTER
++    if _UNREACHABLE.search(text):
++        return "unreachable", None
++    return "down", None
++
++
++def _failed(p: kcp.Progress, adapter: str, scope: str, detail: Optional[str] = None) -> Watched:
++    health, retry = classify(detail if detail is not None else p.detail, no_credential=p.no_credential,
++                             gh_missing=p.gh_missing)
++    text = (detail if detail is not None else p.detail) or health
++    return Watched({"job": "unknown", "service": health, "detail": text[-DETAIL_MAX:], "url": None,
++                    "retry_after": retry}, p, adapter, scope)
++
++
++def _conclusion_job(conclusion: Optional[str]) -> str:
++    if conclusion in _FAILED:
++        return "failed"
++    if conclusion == "cancelled":
++        return "cancelled"
++    if conclusion in ("success", "neutral", "skipped"):
++        return "succeeded"
++    return "unknown"
++
++
++def _run_job(jobs: list, repo: str, run_id: str, fetch_run: Optional[Callable]) -> tuple[str, str]:
++    """``(job state, detail)`` of a run from its listed jobs; the run's own read confirms a finished one."""
++    running = [j for j in jobs if isinstance(j, dict) and j.get("status") == "in_progress"]
++    if running:
++        return "running", f"job '{running[0].get('name') or 'job'}' running"
++    unfinished = [j for j in jobs if isinstance(j, dict) and j.get("status") != "completed"]
++    if not jobs:
++        return "queued", "no jobs created yet"
++    if unfinished:
++        started = len(jobs) > len(unfinished)
++        return ("running", "waiting on later jobs") if started else ("queued", "queued, no runner yet")
++    run = (fetch_run or (lambda r, i: kcp._gh_api(f"repos/{r}/actions/runs/{i}")))(repo, run_id) or {}
++    if run.get("status") != "completed":
++        return "running", "finishing up"
++    job = _conclusion_job(run.get("conclusion"))
++    return job, f"run {run.get('conclusion') or 'finished'}"
++
++
++def poll(ref: str, hint: str = "", *, parked_at: Optional[float] = None, now: Optional[float] = None,
++         fetch: Optional[kcp.Fetch] = None, fetch_runners: Optional[kcp.FetchRunners] = None,
++         fetch_run: Optional[Callable[[str, str], dict]] = None,
++         deadline: Optional[float] = None) -> Optional[Watched]:
++    """Poll the GitHub run or PR ``ref`` names; None when it names neither. Never raises."""
++    adapter = adapter_for(ref, hint)
++    if adapter is None:
++        return None
++    try:
++        if adapter == "github_run":
++            return _poll_run(ref, hint, now, fetch, fetch_runners, fetch_run, deadline)
++        return _poll_pr(ref, hint, parked_at, now, fetch, fetch_runners, deadline)
++    except kcp.GhMissing as exc:
++        return _failed(kcp.Progress("unknown", gh_missing=True, detail=str(exc)), adapter, "")
++    except kcp.NoCredential as exc:
++        return _failed(kcp.Progress("unknown", no_credential=True, detail=str(exc)), adapter, "")
++    except (OSError, RuntimeError, ValueError, AttributeError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
++        return _failed(kcp.Progress("unknown", detail=str(exc)), adapter, "")
++
++
++def _poll_run(ref, hint, now, fetch, fetch_runners, fetch_run, deadline) -> Watched:
++    seen: dict = {}
++
++    def jobs_fetch(repo: str, run_id: str) -> dict:
++        data = (fetch or kcp._fetch_jobs)(repo, run_id)
++        seen["jobs"] = data
++        return data
++
++    p = kcp.ci_run_progress(ref, hint=hint, fetch=jobs_fetch, fetch_runners=fetch_runners, now=now,
++                            deadline=deadline)
++    scope = p.repo
++    if p.state == "unknown":
++        return Watched(None, p, "github_run", scope) if p.deferred else _failed(p, "github_run", scope)
++    url = f"https://github.com/{p.repo}/actions/runs/{p.run_id}"
++    if p.state in (kcp.NOT_STARTING, kcp.BUSY):
++        detail = kcp.describe(p) if p.state == kcp.NOT_STARTING else p.detail
++        return Watched({"job": "queued", "service": "degraded", "detail": detail[:DETAIL_MAX], "url": url,
++                        "retry_after": None}, p, "github_run", scope)
++    try:
++        job, detail = _run_job((seen.get("jobs") or {}).get("jobs") or [], p.repo, p.run_id, fetch_run)
++    except kcp.NoCredential as exc:
++        return _failed(kcp.Progress("unknown", p.repo, p.run_id, detail=str(exc), no_credential=True),
++                       "github_run", scope)
++    except kcp.GhMissing as exc:
++        return _failed(kcp.Progress("unknown", p.repo, p.run_id, detail=str(exc), gh_missing=True),
++                       "github_run", scope)
++    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
++        return _failed(kcp.Progress("unknown", p.repo, p.run_id, detail=str(exc)), "github_run", scope)
++    return Watched({"job": job, "service": "ok", "detail": detail, "url": url, "retry_after": None}, p,
++                   "github_run", scope)
++
++
++def _poll_pr(ref, hint, parked_at, now, fetch, fetch_runners, deadline) -> Watched:
++    repo, number, sha = kcp.pr_target(ref, hint)  # type: ignore[misc]  # adapter_for proved it is a PR ref
++    url = f"https://github.com/{repo}/pull/{number}"
++    p = kcp.pr_progress(repo, number, sha, parked_at, fetch=fetch, fetch_runners=fetch_runners, now=now,
++                        deadline=deadline)
++    if p.state == "unknown" and not p.settling:
++        return Watched(None, p, "github_pr_checks", repo) if p.deferred else _failed(p, "github_pr_checks", repo)
++    if p.state == kcp.NOT_STARTING:
++        detail = p.detail if p.per_pr else kcp.describe(p)
++        return Watched({"job": "queued", "service": "degraded", "detail": detail[:DETAIL_MAX], "url": url,
++                        "retry_after": None}, p, "github_pr_checks", repo)
++    api = kcp._gh_api
++    try:
++        pr = api(f"repos/{repo}/pulls/{number}") or {}
++        if pr.get("state") != "open" or pr.get("merged"):
++            # The existing sweep contract (a finished or moved PR never wakes the park) is kept: the job is unknown.
++            return Watched({"job": "unknown", "service": "ok", "detail": "PR merged" if pr.get("merged") else "PR closed",
++                            "url": url, "retry_after": None}, p, "github_pr_checks", repo)
++        head = str((pr.get("head") or {}).get("sha") or "").lower()
++        if sha and not head.startswith(sha.lower()):
++            return Watched({"job": "unknown", "service": "ok", "detail": f"head moved off {sha[:10]}", "url": url,
++                            "retry_after": None}, p, "github_pr_checks", repo)
++        runs = [r for r in (api(f"repos/{repo}/actions/runs?head_sha={head}&per_page=100") or {}).get(
++            "workflow_runs") or [] if isinstance(r, dict)]
++    except kcp.NoCredential as exc:
++        return _failed(kcp.Progress("unknown", repo, no_credential=True, detail=str(exc)), "github_pr_checks", repo)
++    except kcp.GhMissing as exc:
++        return _failed(kcp.Progress("unknown", repo, gh_missing=True, detail=str(exc)), "github_pr_checks", repo)
++    except (OSError, RuntimeError, ValueError, AttributeError, subprocess.TimeoutExpired) as exc:
++        return _failed(kcp.Progress("unknown", repo, detail=str(exc)), "github_pr_checks", repo)
++    if not runs or any(r.get("status") in _PENDING for r in runs) and not any(
++            r.get("status") == "in_progress" for r in runs):
++        job, detail = "queued", "checks queued" if runs else "no checks started yet"
++    elif any(r.get("status") != "completed" for r in runs):
++        job, detail = "running", "checks running"
++    else:
++        concl = [r.get("conclusion") for r in runs]
++        job = ("failed" if any(c in _FAILED for c in concl) else "cancelled" if "cancelled" in concl
++               else "succeeded")
++        detail = f"checks {job}"
++    return Watched({"job": job, "service": "ok", "detail": detail, "url": url, "retry_after": None}, p,
++                   "github_pr_checks", repo)
+diff --git a/hermes_cli/kanban_external_adapters/shell.py b/hermes_cli/kanban_external_adapters/shell.py
+new file mode 100644
+index 0000000000..23a68ff256
+--- /dev/null
++++ b/hermes_cli/kanban_external_adapters/shell.py
+@@ -0,0 +1,78 @@
++"""Legacy shell probe -> watch poll. [daveey]
++
++A park's ``wake_check`` is a shell probe: exit 0 = condition holds, 1 = not yet, 3 = unknown, anything else = the
++probe is broken. That cannot say whether a CI run passed or failed, or whether GitHub is down. A probe may print
++ONE line ``HERMES_WATCH {json}`` to give the full record (``job``, ``service``, ``detail``, ``url``,
++``retry_after``, ``service_name``): the cheap upgrade path for any script. Unknown or malformed fields are
++ignored, never trusted.
++"""
++from __future__ import annotations
++
++import json
++import re
++from typing import Any, Optional
++
++from hermes_cli.kanban_external_state import HEALTHS, JOBS, TERMINAL_JOBS
++
++_LINE = re.compile(r"^\s*HERMES_WATCH\s+(\{.*\})\s*$")
++DETAIL_MAX = 300
++
++
++def parse_watch(out: str) -> Optional[dict]:
++    """The last ``HERMES_WATCH {json}`` line of ``out`` that holds a JSON object, else None."""
++    found = None
++    for line in (out or "").splitlines():
++        m = _LINE.match(line)
++        if not m:
++            continue
++        try:
++            value = json.loads(m.group(1))
++        except ValueError:
++            continue
++        if isinstance(value, dict):
++            found = value
++    return found
++
++
++def _clean(watch: dict) -> dict:
++    out: dict[str, Any] = {}
++    if watch.get("job") in JOBS:
++        out["job"] = watch["job"]
++    if watch.get("service") in HEALTHS:
++        out["service"] = watch["service"]
++    for key, limit in (("detail", DETAIL_MAX), ("service_name", 60)):
++        if isinstance(watch.get(key), str) and watch[key].strip():
++            out[key] = watch[key].strip()[:limit]
++    url = watch.get("url")
++    if isinstance(url, str) and url.startswith(("http://", "https://")):
++        out["url"] = url[:500]
++    ra = watch.get("retry_after")
++    if isinstance(ra, int) and not isinstance(ra, bool) and ra >= 0:
++        out["retry_after"] = ra
++    return out
++
++
++def poll(rc: Any, out: str) -> dict:
++    """One probe result as a watch poll. ``terminal`` is set when the probe says the job finished (exit 0, or a
++    ``HERMES_WATCH`` line with a terminal job); ``outcome`` is then the job result or ``done_unknown``."""
++    from hermes_cli.kanban_wake_check import output_error
++
++    crashed = rc not in (0, 1, 3) or (rc == 1 and bool(output_error(out)))
++    if crashed:
++        why = output_error(out) or f"exit {rc}"
++        return {"job": "unknown", "service": "probe_broken", "detail": f"probe failed: {why}"[:DETAIL_MAX],
++                "url": None, "retry_after": None, "terminal": False, "outcome": None}
++    base = {"job": "unknown", "service": "ok", "detail": "", "url": None, "retry_after": None, "terminal": False,
++            "outcome": None}
++    if rc == 1:
++        base["job"] = "running"
++    if rc == 3:
++        base["detail"] = "probe could not tell (exit 3)"
++    watch = _clean(parse_watch(out) or {})
++    base.update({k: v for k, v in watch.items() if k != "service_name"})
++    if "service_name" in watch:
++        base["service_name"] = watch["service_name"]
++    base["terminal"] = rc == 0 or base["job"] in TERMINAL_JOBS
++    if base["terminal"]:
++        base["outcome"] = base["job"] if base["job"] in TERMINAL_JOBS else "done_unknown"
++    return base
+diff --git a/hermes_cli/kanban_external_state.py b/hermes_cli/kanban_external_state.py
+new file mode 100644
+index 0000000000..b3b3cb08e9
+--- /dev/null
++++ b/hermes_cli/kanban_external_state.py
+@@ -0,0 +1,148 @@
++"""Card-level state of work that runs on another system: light blue (running externally) or red (service broke). [daveey]
++
++Pure and clock-injected: no database, no network, no ``time`` calls. A watch poll yields one record
++
++    {job: queued|running|succeeded|failed|cancelled|unknown,
++     service: ok|degraded|down|unreachable|auth_failed|rate_limited|probe_broken,   # the *health* of the service
++     detail, url, observed_at, retry_after}
++
++:func:`next_record` folds a poll into the card's stored record (failure streak, next due time with jitter and
++``retry_after``); :func:`derive` turns the stored record and the reader's own clock into the card state:
++
++* ``external_running``: last job queued/running, service ok/degraded, record fresh.
++* ``external_unknown``: one failed/missed poll, a rate limit, a job nobody could read, or a record older than one
++  interval. Light blue with a hollow glyph.
++* ``external_down`` (red): two consecutive down/unreachable polls, ``auth_failed`` at once (it never self-heals),
++  a probe that broke twice, a host silent for more than two intervals (only a host that advertises
++  ``external-watch-v1``: an older host's silence stays grey, ``derive`` returns None), or a ci/deploy/external park
++  with nothing watching it (``watch_missing``).
++* a terminal job (succeeded/failed/cancelled) sets ``wake``: the card is woken with ``external_result`` and the job
++  failing is NOT ``external_down``: that is the woken worker's business, not an outage.
++
++A 429 / rate limit never counts toward red (the GitHub quota livelock of t_eeeeee0000000011 must not repeat) and
++the next poll is never earlier than its ``retry_after``.
++"""
++from __future__ import annotations
++
++from typing import Any, Optional
++
++SCHEMA = 1
++CAPABILITY = "external-watch-v1"
++EXTERNAL_KINDS = ("ci", "deploy", "external")
++
++RUNNING = "external_running"
++UNKNOWN = "external_unknown"
++DOWN = "external_down"
++
++JOBS = ("queued", "running", "succeeded", "failed", "cancelled", "unknown")
++TERMINAL_JOBS = ("succeeded", "failed", "cancelled")
++HEALTHS = ("ok", "degraded", "down", "unreachable", "auth_failed", "rate_limited", "probe_broken")
++FAILING = ("down", "unreachable", "probe_broken")
++
++MIN_EVERY = 120
++MAX_EVERY = 6 * 3600
++DEFAULT_CI_EVERY = 300
++JITTER = 0.10
++DOWN_AFTER = 2  # consecutive failed polls before a down/unreachable service is red
++
++SERVICE_NAMES = {"github_run": "GitHub Actions", "github_pr_checks": "GitHub Actions", "shell": "external probe"}
++
++
++def clamp_every(value: Any, default: int = DEFAULT_CI_EVERY) -> int:
++    """A poll interval in seconds: ``default`` when absent or not a number, else within [MIN_EVERY, MAX_EVERY]."""
++    try:
++        every = int(value)
++    except (TypeError, ValueError):
++        every = int(default)
++    return max(MIN_EVERY, min(MAX_EVERY, every))
++
++
++def next_record(prev: Optional[dict], poll: dict, *, now: float, every: Any, adapter: str, scope: str = "",
++                rand: float = 0.5, host: Optional[str] = None) -> dict:
++    """Fold one poll into the card's record. ``rand`` in [0, 1] places the next poll within ±``JITTER`` of
++    ``every`` (never under ``MIN_EVERY``, never before the poll's ``retry_after``)."""
++    interval = clamp_every(every)
++    health = poll.get("service") if poll.get("service") in HEALTHS else "ok"
++    job = poll.get("job") if poll.get("job") in JOBS else "unknown"
++    streak = int((prev or {}).get("consecutive_failures") or 0)
++    if health in FAILING:
++        streak += 1
++    elif health != "rate_limited":
++        streak = 0
++    retry_after = poll.get("retry_after")
++    try:
++        retry_after = max(0, int(retry_after)) if retry_after is not None else None
++    except (TypeError, ValueError):
++        retry_after = None
++    factor = 1 + (min(1.0, max(0.0, float(rand))) - 0.5) * 2 * JITTER
++    wait = max(interval * factor, MIN_EVERY, retry_after or 0)
++    return {"schema": SCHEMA, "adapter": adapter, "scope": scope, "host": host, "job": job, "service": health,
++            "detail": str(poll.get("detail") or "")[:300], "url": poll.get("url") or None,
++            "observed_at": float(now), "next_due_at": float(now) + wait, "retry_after": retry_after,
++            "consecutive_failures": streak, "every": interval}
++
++
++def _external(rec: Optional[dict], *, health: str, job: str, reason: str, adapter: str, service_name: str) -> dict:
++    return {"service": service_name, "adapter": adapter, "job": job, "health": health, "reason": reason,
++            "url": (rec or {}).get("url") or None,
++            "observed_at": (rec or {}).get("observed_at"), "next_due_at": (rec or {}).get("next_due_at")}
++
++
++def _out(state: str, health: str, job: str, reason: str, rec: Optional[dict], adapter: str, service_name: str,
++         wake: bool = False) -> dict:
++    return {"state": state, "health": health, "job": job, "reason": reason, "wake": wake,
++            "external": _external(rec, health=health, job=job, reason=reason, adapter=adapter,
++                                  service_name=service_name)}
++
++
++def derive(rec: Optional[dict], *, now: float, every: Any, since: Optional[float] = None, advertises: bool = True,
++           watch_missing: bool = False, adapter: Optional[str] = None,
++           service_name: Optional[str] = None) -> Optional[dict]:
++    """The card's external state at ``now`` by the reader's own clock, or None (grey: nothing to say).
++
++    ``rec`` is the stored record (None before the first poll), ``since`` when the park began, ``advertises`` whether
++    the probe host writes records at all (False: silence proves nothing, so None)."""
++    interval = clamp_every(every)
++    adapter = adapter or (rec or {}).get("adapter") or "shell"
++    name = service_name or SERVICE_NAMES.get(adapter, "external service")
++    if watch_missing:
++        return _out(DOWN, "watch_missing", "unknown", "nothing is watching this wait: no adapter and no probe", rec,
++                    adapter, name)
++    if rec is None:
++        if not advertises:
++            return None
++        age = now - (since if since is not None else now)
++        if age > 2 * interval:
++            return _out(DOWN, "host_silent", "unknown", f"no check recorded {int(age // 60)} min after the park", rec,
++                        adapter, name)
++        if age > interval * (1 + JITTER):
++            return _out(UNKNOWN, "host_silent", "unknown", f"no check recorded {int(age // 60)} min after the park",
++                        rec, adapter, name)
++        return _out(UNKNOWN, "ok", "unknown", "not checked yet", rec, adapter, name)
++    job = rec.get("job") if rec.get("job") in JOBS else "unknown"
++    health = rec.get("service") if rec.get("service") in HEALTHS else "ok"
++    detail = str(rec.get("detail") or "")
++    fails = int(rec.get("consecutive_failures") or 0)
++    if job in TERMINAL_JOBS:
++        return _out(RUNNING, "ok" if health in ("ok", "degraded") else health, job, detail or f"job {job}", rec,
++                    adapter, name, wake=True)
++    if health == "auth_failed":
++        return _out(DOWN, health, job, detail or "authentication failed", rec, adapter, name)
++    if health in FAILING:
++        word = "probe failed" if health == "probe_broken" else f"{health}"
++        reason = f"{fails} failed check{'s' if fails != 1 else ''} ({word}){': ' + detail if detail else ''}"
++        return _out(DOWN if fails >= DOWN_AFTER else UNKNOWN, health, job, reason, rec, adapter, name)
++    limited = health == "rate_limited"
++    slack = float(rec.get("retry_after") or 0) if limited else 0.0
++    age = now - float(rec.get("observed_at") or now)
++    if age > 2 * interval + slack:
++        if not advertises:
++            return None
++        return _out(DOWN, "host_silent", job, f"no check for {int(age // 60)} min (host silent)", rec, adapter, name)
++    if limited:
++        return _out(UNKNOWN, health, job, detail or "rate limited", rec, adapter, name)
++    if age > interval * (1 + JITTER) + slack:
++        return _out(UNKNOWN, "host_silent", job, f"last check {int(age // 60)} min ago", rec, adapter, name)
++    if job == "unknown":
++        return _out(UNKNOWN, health, job, detail or "job status unknown", rec, adapter, name)
++    return _out(RUNNING, health, job, detail or f"job {job}", rec, adapter, name)
+diff --git a/hermes_cli/kanban_external_watch.py b/hermes_cli/kanban_external_watch.py
+new file mode 100644
+index 0000000000..145e4b8574
+--- /dev/null
++++ b/hermes_cli/kanban_external_watch.py
+@@ -0,0 +1,351 @@
++"""External-run cards, database side: record polls, derive card state, wake, shared service-down blocker. [daveey]
++
++A card parked with ``awaiting.kind`` in ci/deploy/external waits on work that runs on another system. A watch poll
++(``kanban_external_adapters``) is recorded as an ``external_watch`` event on the card; ``derive_card`` turns the
++newest record into the state in ``kanban_external_state`` by the READER's own clock, so a dead probe host turns the
++card light-blue-unknown after one interval and red after two even though it wrote nothing.
++
++Why events: the Board sync carries ``task_events`` but no new table (``kanban_board_row_fields.json`` is the synced
++row contract), and ``task_wake_checks`` is machine-local, so a worker's poll would be invisible on the hub. One
++event per poll (state change or the heartbeat that keeps the record fresh) is the cost; the writer is
++:func:`write_record`, the one place to swap for a synced table.
++
++Mixed versions: a probe host that never wrote an ``external_watch`` event is an older host. Its silence stays grey
++(``advertises`` False); only a host seen writing records, or this one, can turn a card red by being silent.
++
++Service outage (not a failed job): the first card whose service goes red for a scope is woken as that scope's
++probe with the shared blocker ``service-down.<adapter>.<scope>`` (``kanban_shared_blockers``, as
++``runners-offline.*``); the other cards stay parked and red with the blocker named. The first ok poll of any card
++on that scope clears the blocker and writes one ``external_recovered`` event on each card that was red.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import random
++import sqlite3
++import time
++from typing import Any, Iterable, Optional
++
++from hermes_cli import kanban_external_state as ks
++
++logger = logging.getLogger(__name__)
++
++WATCH_EVENT = "external_watch"
++RECOVERED_EVENT = "external_recovered"
++SERVICE_DOWN = "external_service_down"
++BLOCKER_PREFIX = "service-down"
++AUTHOR = "kanban-dispatcher"
++ADVERTISED_SCAN = 2000  # newest watch events read to learn which hosts write records
++SHELL_DEFAULT_EVERY = 900
++
++
++def _json(raw: Any) -> dict:
++    try:
++        value = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
++    except ValueError:
++        return {}
++    return value if isinstance(value, dict) else {}
++
++
++def park_context(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
++    """The card's latest park: ``{event_id, since, payload, awaiting}`` or None."""
++    row = conn.execute("SELECT id, payload, created_at FROM task_events WHERE task_id = ? AND kind IN "
++                       "('scheduled', 'continued') ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++    if row is None:
++        return None
++    payload = _json(row[1])
++    awaiting = payload.get("awaiting") if isinstance(payload.get("awaiting"), dict) else None
++    return {"event_id": int(row[0]), "since": float(row[2]) if row[2] is not None else None, "payload": payload,
++            "awaiting": awaiting}
++
++
++def latest_record(conn: sqlite3.Connection, task_id: str, after_event: int = 0) -> Optional[dict]:
++    """The newest ``external_watch`` payload written after the card's latest park, else None."""
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ? AND id > ? "
++                       "ORDER BY id DESC LIMIT 1", (task_id, WATCH_EVENT, after_event)).fetchone()
++    return _json(row[0]) if row else None
++
++
++def advertising_hosts(conn: sqlite3.Connection) -> set[str]:
++    """Hosts seen writing watch records on this board (``external-watch-v1``)."""
++    try:
++        rows = conn.execute("SELECT payload FROM task_events WHERE kind = ? ORDER BY id DESC LIMIT ?",
++                            (WATCH_EVENT, ADVERTISED_SCAN)).fetchall()
++    except sqlite3.Error:
++        return set()
++    return {str(h) for h in (_json(r[0]).get("host") for r in rows) if h}
++
++
++def own_host(conn: Optional[sqlite3.Connection]) -> str:
++    from hermes_cli.kanban_wake_check import own_gateway
++    return own_gateway(conn) or "local"
++
++
++def plan(conn: sqlite3.Connection, task_id: str, ctx: dict) -> Optional[dict]:
++    """How the card is watched: ``{adapter, ref, every, hint}`` or None when nothing watches it. A declared
++    ``watch`` on the park wins, then a GitHub run/PR ref of a ``ci`` park, then the park's shell probe."""
++    from hermes_cli.kanban_external_adapters import github
++    payload, awaiting = ctx["payload"], ctx["awaiting"] or {}
++    watch = payload.get("watch") if isinstance(payload.get("watch"), dict) else {}
++    row = None
++    try:
++        row = conn.execute("SELECT cmd, every FROM task_wake_checks WHERE task_id = ?", (task_id,)).fetchone()
++    except sqlite3.Error:
++        pass
++    cmd = (row[0] if row else None) or payload.get("wake_check") or ""
++    hint = " ".join(x for x in (cmd, str(payload.get("reason") or "")) if x)
++    ref = str(watch.get("ref") or awaiting.get("ref") or "")
++    adapter = str(watch.get("adapter") or "") or None
++    if adapter not in ("github_run", "github_pr_checks", "shell"):
++        adapter = github.adapter_for(ref, hint) if awaiting.get("kind") == "ci" else None
++    if adapter is None and cmd:
++        adapter = "shell"
++    if adapter is None:
++        return None
++    default = ks.DEFAULT_CI_EVERY if adapter != "shell" else (
++        int(row[1]) if row and row[1] else int(payload.get("check_every") or SHELL_DEFAULT_EVERY))
++    return {"adapter": adapter, "ref": ref, "hint": hint, "every": ks.clamp_every(watch.get("every"), default)}
++
++
++def _shell_seen(conn: sqlite3.Connection, task_id: str, rec: dict, every: Any, local: bool) -> tuple[dict, Any]:
++    """A shell record is written on change only, so its freshness is the newest sign the probe still runs: the
++    check's own ``last_at`` on this host, the ``wake_check_alive`` a worker node sends every ``ALIVE_EVERY``. A
++    probe relayed from another host is judged against that slower heartbeat plus its interval, as the lost-probe
++    guard does, or a healthy remote probe would read as silent."""
++    from hermes_cli import kanban_wake_check as kwc
++    seen = float(rec.get("observed_at") or 0)
++    try:
++        row = conn.execute("SELECT last_at FROM task_wake_checks WHERE task_id = ?", (task_id,)).fetchone()
++        seen = max(seen, float(row[0] or 0) if row else 0.0)
++        alive = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ? AND kind = ?",
++                             (task_id, kwc.ALIVE_EVENT)).fetchone()
++        seen = max(seen, float(alive[0] or 0) if alive else 0.0)
++    except sqlite3.Error:
++        pass
++    every = ks.clamp_every(every, SHELL_DEFAULT_EVERY)
++    if not local:
++        every = every + kwc.ALIVE_EVERY // 2
++    return dict(rec, observed_at=seen, next_due_at=seen + ks.clamp_every(rec.get("every"), SHELL_DEFAULT_EVERY)), every
++
++
++def card_state(conn: sqlite3.Connection, task_id: str, *, now: Optional[float] = None,
++               hosts: Optional[set[str]] = None, status: Optional[str] = None) -> Optional[dict]:
++    """The derived external state of one card (see ``kanban_external_state.derive``), or None: not a scheduled
++    ci/deploy/external park, an old host's silence, or a deadline-only wait. Adds ``blocker_id`` / ``triage_card``
++    to ``external`` while a service-down blocker holds the card."""
++    now = time.time() if now is None else float(now)
++    if status is None:
++        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        status = row[0] if row else None
++    if status != "scheduled":
++        return None
++    ctx = park_context(conn, task_id)
++    if ctx is None or (ctx["awaiting"] or {}).get("kind") not in ks.EXTERNAL_KINDS:
++        return None
++    watch = plan(conn, task_id, ctx)
++    rec = latest_record(conn, task_id, ctx["event_id"])
++    probe_host = ctx["payload"].get("probe_host")
++    local = not probe_host or probe_host == own_host(conn) or probe_host == "local"
++    advertises = rec is not None or local or probe_host in (advertising_hosts(conn) if hosts is None else hosts)
++    if rec is None and watch is None:
++        derived = ks.derive(None, now=now, every=ks.DEFAULT_CI_EVERY, since=ctx["since"], watch_missing=local,
++                            advertises=advertises)
++    else:
++        every = (rec or {}).get("every") or (watch or {}).get("every")
++        if rec is not None and rec.get("adapter") == "shell":
++            rec, every = _shell_seen(conn, task_id, rec, every, local)
++        derived = ks.derive(rec, now=now, every=every, since=ctx["since"], advertises=advertises,
++                            adapter=(rec or {}).get("adapter") or (watch or {}).get("adapter"),
++                            service_name=(rec or {}).get("service_name"))
++    if derived is not None:
++        derived["adapter"] = derived["external"]["adapter"]
++        _name_blocker(conn, derived, rec)
++    return derived
++
++
++def _name_blocker(conn: sqlite3.Connection, derived: dict, rec: Optional[dict]) -> None:
++    if derived["state"] != ks.DOWN or not rec or not rec.get("adapter") or not rec.get("scope"):
++        return
++    if derived["health"] not in ("down", "unreachable", "auth_failed"):
++        return
++    bid = blocker_id(rec["adapter"], rec["scope"])
++    try:
++        from hermes_cli import kanban_shared_blockers as ksb
++        st = ksb.blocker_states(conn).get(bid)
++    except (sqlite3.Error, ValueError):
++        return
++    if st is not None and st.is_open:
++        derived["external"]["blocker_id"] = bid
++        derived["external"]["triage_card"] = next(iter(sorted(st.behind)), None)
++
++
++def card_states(conn: sqlite3.Connection, task_ids: Iterable[str], *, now: Optional[float] = None) -> dict[str, dict]:
++    """``{task id: derived state}`` for the scheduled external cards among ``task_ids``. Never raises."""
++    out: dict[str, dict] = {}
++    try:
++        hosts = advertising_hosts(conn)
++        for tid in dict.fromkeys(str(t) for t in task_ids):
++            derived = card_state(conn, tid, now=now, hosts=hosts)
++            if derived is not None:
++                out[tid] = derived
++    except sqlite3.Error:
++        logger.debug("external card states unavailable", exc_info=True)
++    return out
++
++
++def blocker_id(adapter: str, scope: str) -> str:
++    from hermes_cli.kanban_shared_blockers import normalize_blocker_id
++    return normalize_blocker_id(f"{BLOCKER_PREFIX}.{adapter}.{scope}") or f"{BLOCKER_PREFIX}.{adapter}"
++
++
++# --- writing -------------------------------------------------------------------------------------------------
++
++def write_record(conn: sqlite3.Connection, task_id: str, rec: dict, derived: dict) -> None:
++    """Append one watch event. In the caller's write txn. The single place to swap for a synced table."""
++    from hermes_cli import kanban_db as kb
++    kb._append_event(conn, task_id, WATCH_EVENT, {**rec, "state": derived["state"], "health": derived["health"],
++                                                  "service_name": derived["external"]["service"]})
++
++
++def record_poll(conn: sqlite3.Connection, task_id: str, poll: dict, *, now: float, adapter: str, scope: str = "",
++                every: Any = None, service_name: Optional[str] = None,
++                rand: Optional[float] = None) -> Optional[dict]:
++    """Fold ``poll`` into the card's record and write it when the state changed or the heartbeat is due. In the
++    caller's write txn. Returns ``{derived, prev_state, rec}``, or None when the park is gone or is not external."""
++    from hermes_cli import kanban_db as kb
++    ctx = park_context(conn, task_id)
++    if ctx is None or (ctx["awaiting"] or {}).get("kind") not in ks.EXTERNAL_KINDS:
++        return None
++    prev = latest_record(conn, task_id, ctx["event_id"])
++    watch = plan(conn, task_id, ctx) or {}
++    every = ks.clamp_every(every if every is not None else (prev or {}).get("every") or watch.get("every"))
++    rec = ks.next_record(prev, poll, now=now, every=every, adapter=adapter, scope=scope,
++                         rand=random.random() if rand is None else rand, host=own_host(conn))
++    name = service_name or poll.get("service_name") or ks.SERVICE_NAMES.get(adapter, "external service")
++    derived = ks.derive(rec, now=now, every=every, adapter=adapter, service_name=name) or {}
++    prev_written = (prev or {}).get("state")
++    changed = (prev is None or prev_written != derived["state"] or prev.get("job") != rec["job"]
++               or prev.get("service") != rec["service"])
++    due = prev is None or (adapter != "shell" and now - float(prev.get("observed_at") or 0) >= 0.9 * every)
++    # A shell probe's heartbeat is not an event per check (test_clean_checks_do_not_append_one_event_each): the
++    # check's own ``task_wake_checks.last_at`` (this host) and ``wake_check_alive`` (a worker node, every
++    # ALIVE_EVERY) carry it; ``_shell_seen`` reads them.
++    if changed or due:
++        write_record(conn, task_id, rec, derived)
++    was_down = prev_written == ks.DOWN
++    if was_down and derived["state"] != ks.DOWN:
++        kb._append_event(conn, task_id, RECOVERED_EVENT, {"adapter": adapter, "scope": scope, "job": rec["job"],
++                                                          "health": derived["health"]})
++    return {"derived": derived, "prev_state": prev_written, "rec": rec, "was_down": was_down}
++
++
++def _result(rec: dict, derived: dict) -> dict:
++    return {"job": rec["job"], "outcome": derived["job"] if derived["job"] in ks.TERMINAL_JOBS else "done_unknown",
++            "detail": rec.get("detail") or "", "url": rec.get("url"), "adapter": rec.get("adapter"),
++            "service": derived["external"]["service"], "observed_at": rec.get("observed_at")}
++
++
++def apply_poll(conn: sqlite3.Connection, task_id: str, poll: dict, *, now: float, adapter: str, scope: str = "",
++               every: Any = None, service_name: Optional[str] = None, rand: Optional[float] = None,
++               cmd: str = "", terminal: Optional[bool] = None) -> Optional[str]:
++    """Record one poll for a scheduled card and act on it: a finished job wakes the card with ``external_result``
++    (``condition_met``; a FAILED job wakes too and is not an outage); a service gone red asserts the shared
++    blocker; an ok poll clears it. Returns the event kind that woke the card, else None. Opens its own write txn."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_wake_check as kwc
++    with kb.write_txn(conn):
++        status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        if status is None or status[0] != "scheduled":
++            return None
++        got = record_poll(conn, task_id, poll, now=now, adapter=adapter, scope=scope, every=every,
++                          service_name=service_name, rand=rand)
++        if got is None:
++            return None
++        derived, rec = got["derived"], got["rec"]
++        finished = poll.get("terminal") if terminal is None else terminal
++        if finished or derived.get("wake"):
++            kwc.episode.reset(conn, task_id)
++            woke = kwc._wake(conn, task_id, kwc.CONDITION_MET_EVENT, {
++                "wake_check": cmd or None, "output": rec.get("detail") or "",
++                "external_result": _result(rec, derived)})
++            if woke:
++                kb.add_comment(conn, task_id, AUTHOR, _finished_note(rec, derived))
++            return woke
++        if derived["state"] == ks.DOWN and derived["health"] in ("down", "unreachable") and scope:
++            return _assert_blocker(conn, task_id, rec, derived)
++        if derived["health"] in ("ok", "degraded") and scope:
++            _clear_blocker(conn, rec)
++        return None
++
++
++def _finished_note(rec: dict, derived: dict) -> str:
++    res = _result(rec, derived)
++    where = f" ({res['url']})" if res.get("url") else ""
++    return (f"Woken: the job on {res['service']} finished: {res['outcome']}{where}. "
++            + ("A failed job is a result for this card, not an outage." if res["outcome"] == "failed" else ""))
++
++
++def _assert_blocker(conn: sqlite3.Connection, task_id: str, rec: dict, derived: dict) -> Optional[str]:
++    """The service is down. The first card for this scope is woken as its probe and the shared blocker is
++    asserted on it; a later card stays parked (red, blocker named)."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_shared_blockers as ksb
++    from hermes_cli.kanban_wake_check import _wake
++    bid = blocker_id(rec["adapter"], rec["scope"])
++    st = ksb.blocker_states(conn).get(bid)
++    if st is not None and st.is_open:
++        return None
++    note = (f"Woken: {derived['external']['service']} is {derived['health']} for {rec['scope']} "
++            f"({derived['reason']}). This card is the probe for shared blocker {bid}: triage the service (credential, "
++            "runner fleet, probe) and re-park; other cards on this scope stay parked and red behind it, and every "
++            "one clears on the first ok poll.")
++    woke = _wake(conn, task_id, SERVICE_DOWN, {"adapter": rec["adapter"], "scope": rec["scope"],
++                                               "health": derived["health"], "blocker_id": bid, "note": note})
++    if not woke:
++        return None
++    kb.add_comment(conn, task_id, AUTHOR, note)
++    run_id = kb._synthesize_ended_run(conn, task_id, outcome=SERVICE_DOWN, summary=derived["reason"][:300],
++                                      metadata={"blocker_id": bid, "adapter": rec["adapter"], "scope": rec["scope"]})
++    kb._append_event(conn, task_id, ksb.PROBE_RELEASED_EVENT, {"blocker_id": bid, "via": SERVICE_DOWN,
++                                                               "after_run": run_id})
++    return woke
++
++
++def _clear_blocker(conn: sqlite3.Connection, rec: dict) -> None:
++    """The first ok poll after an outage: clear the scope's blocker on every card behind it."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_shared_blockers as ksb
++    bid = blocker_id(rec["adapter"], rec["scope"])
++    st = ksb.blocker_states(conn).get(bid)
++    if st is None or not st.is_open:
++        return
++    for tid in sorted(st.behind):
++        kb._synthesize_ended_run(conn, tid, outcome="external_recovered", summary=f"{bid} cleared",
++                                 metadata={ksb.CLEAR_FLAG: True})
++
++
++def note_probe_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out: str, now: float,
++                      every: Any) -> Optional[dict]:
++    """A legacy wake-check probe's result as a watch record (``kanban_external_adapters.shell``), for a scheduled
++    ci/deploy/external park. In the caller's write txn; never raises. Returns the ``external_result`` to carry on
++    a wake (exit 0 or a ``HERMES_WATCH`` line with a terminal job), else None. A GitHub run/PR park is also
++    recorded by the CI sweep (the richer adapter); the later record wins."""
++    from hermes_cli.kanban_external_adapters import shell
++    try:
++        ctx = park_context(conn, task_id)
++        if ctx is None or (ctx["awaiting"] or {}).get("kind") not in ks.EXTERNAL_KINDS:
++            return None
++        if (plan(conn, task_id, ctx) or {}).get("adapter") != "shell":
++            return None  # a GitHub run/PR park is recorded by the CI sweep's richer adapter
++        poll = shell.poll(rc, out)
++        got = record_poll(conn, task_id, poll, now=now, adapter="shell", scope="", every=every,
++                          service_name=poll.get("service_name"))
++    except (sqlite3.Error, ValueError, KeyError, TypeError):
++        logger.warning("kanban external watch: could not record the probe result of %s", task_id, exc_info=True)
++        return None
++    if got is None or not poll.get("terminal"):
++        return None
++    result = _result(got["rec"], got["derived"])
++    result["outcome"] = poll.get("outcome") or result["outcome"]
++    return result
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 5e2e342474..80a89ccd04 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -45,7 +45,7 @@ from hermes_cli.kanban_session_activity_attention import run_checks as _run_done
+ from hermes_cli.kanban_session_activity_card_details import _add_card_details
+ from hermes_cli.kanban_watch import not_watch_sql as _not_watch
+ from hermes_cli.kanban_links_refresh import ScopeRefresher
+-from hermes_cli import kanban_links_narrow as _links_narrow
++from hermes_cli import kanban_links_narrow as _links_narrow, kanban_external_activity as _external_activity
+ from hermes_cli.kanban_session_wait_rows import _describe_waits, _local_wait_info, _local_wait_rows
+ from hermes_cli.kanban_open_asks import card_is_open_human_ask, stamp_needs_you
+ import contextlib
+@@ -1955,7 +1955,7 @@ def annotate_kanban_activity(rows: list[dict[str, Any]], *, display: bool = Fals
+         from hermes_cli.kanban_execution_observations import count_snapshot
+         count_snapshot(row, [key for sid in ids for key in remote_keys.get(sid, ())],
+                        evidence={key: value for sid in ids for key, value in execution.get(sid, {}).items()})
+-    return rows
++    return _external_activity.stamp_boards(rows, _board_db_paths, _open_ro, _parked_pairs, _identity.row_ids)
+ 
+ 
+ def _reset_cache_for_tests(keep_remote: bool = False) -> None:
+diff --git a/hermes_cli/kanban_session_wait_rows.py b/hermes_cli/kanban_session_wait_rows.py
+index 4a26178168..79db6b45f6 100644
+--- a/hermes_cli/kanban_session_wait_rows.py
++++ b/hermes_cli/kanban_session_wait_rows.py
+@@ -30,7 +30,13 @@ def _local_wait_info(conn: sqlite3.Connection, task_ids: Iterable[str], now: flo
+     """[daveey] ``{task_id: wait info}`` (``kanban_wait_info.describe``) for the parked cards among ``task_ids``: what
+     each waits on, since when, and whether only an agent can end it. One query for the cards, one for their newest
+     park events. Missing columns/tables degrade to status-only info."""
+-    return _describe_waits(*_local_wait_rows(conn, task_ids), now=now)
++    return _external_overlay(conn, _describe_waits(*_local_wait_rows(conn, task_ids), now=now), now)
++
++
++def _external_overlay(conn, info, now):
++    from hermes_cli import kanban_external_activity as kea
++    kea.overlay_waits(conn, info, now)
++    return info
+ 
+ 
+ def _local_wait_rows(conn: sqlite3.Connection, task_ids: Iterable[str]) -> tuple[dict[str, tuple], dict[str, tuple]]:
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index f2408aa667..10cee7e70a 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -894,9 +894,12 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+             episode.reset(conn, task_id)
+             if rc != 0:
+                 kb._append_event(conn, task_id, "wake_episode_reset")
+-        if rc == 0:
++        from hermes_cli import kanban_external_watch as kew  # [daveey] external-run card record + HERMES_WATCH
++        ext_result = kew.note_probe_result(conn, task_id, cmd, rc, out, float(now), state["every"])
++        if rc == 0 or (ext_result and ext_result.get("outcome") in ("succeeded", "failed", "cancelled")):
+             return _wake(conn, task_id, CONDITION_MET_EVENT, {
+-                "wake_check": cmd, "output": tail, **({"diagnostics": diagnostics} if diagnostics else {})})
++                "wake_check": cmd, "output": tail, **({"diagnostics": diagnostics} if diagnostics else {}),
++                **({"external_result": ext_result} if ext_result else {})})
+         if rc == 1 and not output_error(out) and answered:
+             from hermes_cli.kanban_comment_origin import WAKE_PROBE_STALE_EVENT, stale_note
+             note = stale_note(answered, cmd)
+diff --git a/tests/hermes_cli/test_kanban_external_activity.py b/tests/hermes_cli/test_kanban_external_activity.py
+new file mode 100644
+index 0000000000..697528d1f4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_external_activity.py
+@@ -0,0 +1,98 @@
++"""Session-row counts and cards for external-run cards (interface.md + interface-hover.md). [daveey]"""
++from __future__ import annotations
++
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_ci_progress as kcp
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_external_activity as kea
++from hermes_cli import kanban_session_activity as ksa
++from tests.hermes_cli import test_kanban_external_watch as helpers
++
++kanban_home, gh, clock = helpers.kanban_home, helpers.gh, helpers.clock
++park, tick = helpers.park, helpers.tick
++
++
++@pytest.fixture(autouse=True)
++def _fresh():
++    kea.reset_for_tests()
++    yield
++    kea.reset_for_tests()
++
++
++def _rows_for(conn, monkeypatch, pairs, rows):
++    monkeypatch.setattr(ksa, "_board_db_paths", lambda: [Path(str(kbc._main_db_file(conn)))])
++    monkeypatch.setattr(ksa, "_parked_pairs", lambda c: set(pairs))
++    kea.stamp_boards(rows, ksa._board_db_paths, ksa._open_ro, ksa._parked_pairs, ksa._identity.row_ids)
++    return rows
++
++
++def test_counts_are_subsets_and_cards_carry_service_status_and_check_times(kanban_home, gh, clock, monkeypatch):
++    with kbc.connect_closing() as conn:
++        a, b, c = park(conn, 5001), park(conn, 5002), park(conn, 5003)
++        gh.run_modes = {"5002": "5xx", "5003": "401"}  # b: one failed poll (unknown); c: auth failure (red)
++        tick(conn, gh, clock, 0)
++        rows = _rows_for(conn, monkeypatch, [("s1", a), ("s1", b), ("s1", c), ("s2", a)],
++                         [{"id": "s1", "kanban_parked": 3}, {"id": "s3", "kanban_parked": 1}])
++        row = rows[0]
++        assert (row["kanban_external"], row["kanban_external_unknown"], row["kanban_external_down"]) == (2, 1, 1)
++        assert "kanban_blocked" not in row
++        cards = row["kanban_external_cards"]
++        assert {card["task_id"] for card in cards} == {a, b, c}
++        for card in cards:
++            ext = card["external"]
++            assert card["title"].startswith("card ")
++            for key in ("service", "job", "health", "reason", "observed_at", "next_due_at"):
++                assert ext[key] not in (None, ""), (card["task_id"], key)
++            assert ext["service"] == "GitHub Actions"
++        # a session with no external card gets no field at all (absent = today's behaviour)
++        assert not any(k.startswith("kanban_external") for k in rows[1])
++
++
++def test_cards_are_capped_at_ten_newest_first(kanban_home, gh, clock, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tids = [park(conn, 6000 + i) for i in range(12)]
++        tick(conn, gh, clock, 0)
++        kcp.sweep(conn, fetch=gh.fetch, fetch_run=gh.fetch_run, fetch_runners=lambda repo: [])  # the other six
++        rows = _rows_for(conn, monkeypatch, [("s1", t) for t in tids], [{"id": "s1", "kanban_parked": 12}])
++        row = rows[0]
++        assert row["kanban_external"] == 12
++        cards = row["kanban_external_cards"]
++        assert len(cards) == kea.CARDS_CAP == 10
++        seen = [c["external"]["observed_at"] for c in cards]
++        assert seen == sorted(seen, reverse=True)
++
++
++def test_every_external_cards_wait_info_carries_service_status_and_check_times(kanban_home, gh, clock):
++    from hermes_cli.kanban_session_wait_rows import _local_wait_info
++    with kbc.connect_closing() as conn:
++        tids = [park(conn, 7000 + i) for i in range(3)]
++        tick(conn, gh, clock, 0)
++        info = _local_wait_info(conn, tids, now=clock.now + 1)
++        assert set(info) == set(tids)
++        for tid in tids:
++            ext = info[tid]["external"]
++            assert info[tid]["wait_state"] == "external_running"
++            assert ext["service"] and ext["health"] and ext["job"]
++            assert ext["observed_at"] and ext["next_due_at"] and ext["next_due_at"] > ext["observed_at"]
++
++
++def test_a_card_before_its_first_poll_has_service_and_status_but_null_check_times(kanban_home, clock):
++    from hermes_cli.kanban_session_wait_rows import _local_wait_info
++    with kbc.connect_closing() as conn:
++        tid = park(conn)
++        ext = _local_wait_info(conn, [tid], now=time.time() + 5)[tid]["external"]
++        assert ext["service"] == "GitHub Actions" and ext["health"] == "ok" and ext["reason"]
++        assert ext["observed_at"] is None and ext["next_due_at"] is None
++
++
++def test_non_external_waits_keep_todays_wait_info(kanban_home):
++    from hermes_cli.kanban_session_wait_rows import _local_wait_info
++    with kbc.connect_closing() as conn:
++        tid = park(conn, kind="clock", ref="soak", wake_check=None, clock_only=True)
++        info = _local_wait_info(conn, [tid])[tid]
++        assert "external" not in info and info["wait_state"] in ("waiting", "stalled")
+diff --git a/tests/hermes_cli/test_kanban_external_adapters.py b/tests/hermes_cli/test_kanban_external_adapters.py
+new file mode 100644
+index 0000000000..6f53542576
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_external_adapters.py
+@@ -0,0 +1,245 @@
++"""Watch adapters: GitHub run, GitHub PR checks and the legacy shell probe -> one watch poll. [daveey]
++
++A fake GitHub serves 200 / 5xx / 429 with retry-after / 401 / timeout through the ``fetch=`` injection that
++``kanban_ci_progress`` already has, so nothing touches the network.
++"""
++from __future__ import annotations
++
++import subprocess
++import time
++
++import pytest
++
++from hermes_cli import kanban_ci_progress as kcp
++from hermes_cli.kanban_external_adapters import github, shell
++
++REPO = "example-org/hermes"
++RUN = "42993449998"
++REF = f"https://github.com/{REPO}/actions/runs/{RUN}"
++NOW = 1_800_000_000.0
++
++
++def _iso(age: int) -> str:
++    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW - age))
++
++
++class FakeGitHub:
++    """Scripted jobs/run endpoints. ``fail`` raises the next call(s) with a scripted error."""
++
++    def __init__(self):
++        self.jobs: list[dict] = []
++        self.run: dict = {"status": "in_progress", "conclusion": None}
++        self.fail: list[BaseException] = []
++        self.calls: list[str] = []
++
++    def fetch(self, repo, run_id):
++        self.calls.append("jobs")
++        if self.fail:
++            raise self.fail.pop(0)
++        return {"jobs": self.jobs}
++
++    def fetch_run(self, repo, run_id):
++        self.calls.append("run")
++        if self.fail:
++            raise self.fail.pop(0)
++        return self.run
++
++    def poll(self, **kw):
++        return github.poll(REF, now=NOW, fetch=self.fetch, fetch_run=self.fetch_run,
++                           fetch_runners=lambda repo: [], **kw)
++
++
++def _job(status, conclusion=None, runner="r1", age=60, name="tests", labels=("self-hosted", "ci-fast")):
++    return {"id": 1, "name": name, "status": status, "conclusion": conclusion,
++            "runner_name": runner if status != "queued" else None, "created_at": _iso(age),
++            "labels": list(labels), "html_url": f"{REF}/job/1"}
++
++
++def test_in_progress_run_is_running_ok():
++    gh = FakeGitHub()
++    gh.jobs = [_job("in_progress"), _job("queued", age=30)]
++    got = gh.poll()
++    assert (got.poll["job"], got.poll["service"]) == ("running", "ok")
++    assert got.poll["url"] == REF
++    assert got.service_name == "GitHub Actions" and got.adapter == "github_run"
++    assert got.scope == REPO
++
++
++def test_freshly_queued_run_is_queued():
++    gh = FakeGitHub()
++    gh.jobs = [_job("queued", age=30)]
++    assert gh.poll().poll["job"] == "queued"
++    gh.jobs = []
++    assert gh.poll().poll["job"] == "queued"  # jobs not created yet
++
++
++@pytest.mark.parametrize("conclusion,job", [("success", "succeeded"), ("failure", "failed"),
++                                            ("timed_out", "failed"), ("cancelled", "cancelled"),
++                                            ("skipped", "succeeded")])
++def test_completed_run_reports_its_conclusion(conclusion, job):
++    gh = FakeGitHub()
++    gh.jobs = [_job("completed", conclusion)]
++    gh.run = {"status": "completed", "conclusion": conclusion}
++    assert gh.poll().poll["job"] == job
++
++
++def test_completed_jobs_of_a_run_still_running_are_not_terminal():
++    gh = FakeGitHub()
++    gh.jobs = [_job("completed", "success")]
++    gh.run = {"status": "in_progress", "conclusion": None}  # a later job has not been created yet
++    assert gh.poll().poll["job"] == "running"
++
++
++def test_stuck_queued_job_is_degraded_and_reported_not_starting():
++    gh = FakeGitHub()
++    gh.jobs = [_job("queued", age=40 * 60)]
++    got = gh.poll()
++    assert got.progress.state == kcp.NOT_STARTING
++    assert (got.poll["job"], got.poll["service"]) == ("queued", "degraded")
++    assert "no runner" in got.poll["detail"]
++
++
++@pytest.mark.parametrize("error,health", [
++    (RuntimeError("gh api exit 1: HTTP 502: Bad Gateway (https://api.github.com/)"), "down"),
++    (RuntimeError("gh api exit 1: HTTP 503: Service Unavailable"), "down"),
++    (subprocess.TimeoutExpired("gh", 20), "unreachable"),
++    (RuntimeError("gh api exit 1: dial tcp: lookup api.github.com: no such host"), "unreachable"),
++    (kcp.NoCredential("gh api exit 1: HTTP 401: Bad credentials"), "auth_failed"),
++    (kcp.NoCredential("gh unavailable: no broker"), "auth_failed"),
++    (RuntimeError("gh api exit 1: HTTP 429: rate limit exceeded"), "rate_limited"),
++    (RuntimeError("gh api exit 1: HTTP 403: You have exceeded a secondary rate limit"), "rate_limited"),
++])
++def test_github_errors_become_health_records_not_silence(error, health):
++    gh = FakeGitHub()
++    gh.fail = [error]
++    got = gh.poll()
++    assert got.poll["service"] == health, got.poll
++    assert got.poll["job"] == "unknown"
++    assert got.poll["detail"]
++
++
++def test_gh_missing_is_a_broken_probe():
++    gh = FakeGitHub()
++    gh.fail = [kcp.GhMissing("gh not installed")]
++    assert gh.poll().poll["service"] == "probe_broken"
++
++
++def test_429_retry_after_is_parsed_and_default_is_set():
++    gh = FakeGitHub()
++    gh.fail = [RuntimeError("gh api exit 1: HTTP 429: rate limit. retry-after: 90")]
++    assert gh.poll().poll["retry_after"] == 90
++    gh.fail = [RuntimeError("gh api exit 1: HTTP 429: slow down")]
++    assert gh.poll().poll["retry_after"] == github.DEFAULT_RETRY_AFTER
++
++
++def test_sweep_budget_cut_defers_instead_of_recording():
++    gh = FakeGitHub()
++    gh.jobs = [_job("queued", age=40 * 60)]
++    got = github.poll(REF, now=NOW, fetch=gh.fetch, fetch_run=gh.fetch_run, deadline=time.monotonic() - 1)
++    assert got.poll is None and got.progress.deferred
++
++
++def test_untracked_ref_has_no_adapter():
++    assert github.poll("a release", now=NOW) is None
++    assert github.adapter_for("a release") is None
++    assert github.adapter_for(REF) == "github_run"
++    assert github.adapter_for(f"{REPO}/pull/12") == "github_pr_checks"
++
++
++# --- PR checks -----------------------------------------------------------------------------------------------
++
++HEAD = "a" * 40
++
++
++def _api(routes: dict):
++    def api(path):
++        for prefix, value in routes.items():
++            if path.startswith(prefix):
++                if isinstance(value, BaseException):
++                    raise value
++                return value
++        raise AssertionError(f"unexpected api path {path}")
++    return api
++
++
++def _pr(**kw):
++    return {"state": "open", "merged": False, "mergeable": True, "mergeable_state": "clean",
++            "head": {"sha": HEAD}, "base": {"ref": "main"}, "updated_at": _iso(10), **kw}
++
++
++def _pr_poll(monkeypatch, routes, sha=HEAD):
++    monkeypatch.setattr(kcp, "_gh_api", _api(routes))
++    return github.poll(f"{REPO}/pull/12@{sha[:12]}", now=NOW)
++
++
++def test_pr_with_running_checks_is_running(monkeypatch):
++    runs = {"workflow_runs": [{"id": 5, "status": "in_progress", "conclusion": None}]}
++    got = _pr_poll(monkeypatch, {f"repos/{REPO}/pulls/12": _pr(), f"repos/{REPO}/actions/runs?head_sha": runs})
++    assert got.adapter == "github_pr_checks"
++    assert (got.poll["job"], got.poll["service"]) == ("running", "ok")
++
++
++@pytest.mark.parametrize("conclusions,job", [(["success", "success"], "succeeded"), (["success", "failure"], "failed"),
++                                             (["cancelled"], "cancelled")])
++def test_pr_with_finished_checks_reports_them(monkeypatch, conclusions, job):
++    runs = {"workflow_runs": [{"id": i, "status": "completed", "conclusion": c} for i, c in enumerate(conclusions)]}
++    got = _pr_poll(monkeypatch, {f"repos/{REPO}/pulls/12": _pr(), f"repos/{REPO}/actions/runs?head_sha": runs})
++    assert got.poll["job"] == job
++
++
++def test_merged_or_moved_pr_does_not_wake(monkeypatch):
++    merged = _pr_poll(monkeypatch, {f"repos/{REPO}/pulls/12": _pr(state="closed", merged=True)})
++    assert merged.poll["job"] == "unknown" and "merged" in merged.poll["detail"]
++    closed = _pr_poll(monkeypatch, {f"repos/{REPO}/pulls/12": _pr(state="closed")})
++    assert closed.poll["job"] == "unknown" and "closed" in closed.poll["detail"]
++    moved = _pr_poll(monkeypatch, {f"repos/{REPO}/pulls/12": _pr()}, sha="b" * 40)
++    assert moved.poll["job"] == "unknown" and "moved" in moved.poll["detail"]
++
++
++def test_conflicting_pr_is_degraded_queued(monkeypatch):
++    got = _pr_poll(monkeypatch, {f"repos/{REPO}/pulls/12": _pr(mergeable=False, mergeable_state="dirty")})
++    assert got.progress.state == kcp.NOT_STARTING
++    assert (got.poll["job"], got.poll["service"]) == ("queued", "degraded")
++
++
++def test_pr_read_5xx_is_down(monkeypatch):
++    got = _pr_poll(monkeypatch, {f"repos/{REPO}/pulls/12": RuntimeError("gh api exit 1: HTTP 502: Bad Gateway")})
++    assert got.poll["service"] == "down"
++
++
++# --- legacy shell probes ---------------------------------------------------------------------------------------
++
++def test_shell_return_codes_map_to_polls():
++    assert shell.poll(1, "")["job"] == "running"
++    assert shell.poll(1, "")["service"] == "ok"
++    done = shell.poll(0, "")
++    assert (done["job"], done["terminal"]) == ("unknown", True)
++    assert done["outcome"] == "done_unknown"
++    unk = shell.poll(3, "stale_age=60s gateway=w1")
++    assert (unk["job"], unk["service"]) == ("unknown", "ok")
++    for rc in (2, 127, None):
++        assert shell.poll(rc, "boom")["service"] == "probe_broken"
++    crashed = shell.poll(1, "Traceback (most recent call last):\n  boom")
++    assert crashed["service"] == "probe_broken"
++
++
++def test_hermes_watch_line_overrides_the_return_code_meaning():
++    out = 'noise\nHERMES_WATCH {"job": "failed", "service": "ok", "detail": "tests red", "url": "https://x/1"}\n'
++    got = shell.poll(0, out)
++    assert (got["job"], got["terminal"], got["url"], got["detail"]) == ("failed", True, "https://x/1", "tests red")
++    down = shell.poll(1, 'HERMES_WATCH {"job": "unknown", "service": "down", "detail": "502"}')
++    assert (down["service"], down["terminal"]) == ("down", False)
++    limited = shell.poll(1, 'HERMES_WATCH {"job": "running", "service": "rate_limited", "retry_after": 120}')
++    assert (limited["service"], limited["retry_after"]) == ("rate_limited", 120)
++    named = shell.poll(1, 'HERMES_WATCH {"job": "running", "service": "ok", "service_name": "Slurm"}')
++    assert named["service_name"] == "Slurm"
++
++
++def test_malformed_or_hostile_watch_lines_are_ignored():
++    assert shell.poll(1, "HERMES_WATCH {not json}")["job"] == "running"
++    assert shell.poll(1, 'HERMES_WATCH {"job": "exploded", "service": "fine"}')["job"] == "running"
++    assert shell.parse_watch("HERMES_WATCH []") is None
++    # the last valid line wins
++    out = 'HERMES_WATCH {"job": "running"}\nHERMES_WATCH {"job": "succeeded"}'
++    assert shell.parse_watch(out)["job"] == "succeeded"
++    assert len(shell.poll(1, 'HERMES_WATCH {"job":"running","detail":"' + "x" * 5000 + '"}')["detail"]) <= 300
+diff --git a/tests/hermes_cli/test_kanban_external_state.py b/tests/hermes_cli/test_kanban_external_state.py
+new file mode 100644
+index 0000000000..9fbf5741f5
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_external_state.py
+@@ -0,0 +1,143 @@
++"""Pure state machine of external-run cards (light blue / red). [daveey]
++
++Plan cases 1, 3, 4, 5, 7, 8, 9 and 11 at the rule level: a fake clock and plain records, no database.
++"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_external_state as ks
++
++EVERY = 300
++T0 = 1_000_000.0
++
++
++def _poll(job="running", service="ok", **kw):
++    return {"job": job, "service": service, "detail": kw.pop("detail", ""), "url": kw.pop("url", None),
++            "retry_after": kw.pop("retry_after", None), **kw}
++
++
++def _rec(prev, poll, now):
++    return ks.next_record(prev, poll, now=now, every=EVERY, adapter="github_run", scope="o/r", rand=0.5)
++
++
++def _derive(rec, now, **kw):
++    kw.setdefault("every", EVERY)
++    return ks.derive(rec, now=now, **kw)
++
++
++def test_running_job_with_a_fresh_poll_is_external_running():
++    rec = _rec(None, _poll("queued"), T0)
++    got = _derive(rec, T0 + 10)
++    assert (got["state"], got["health"], got["job"], got["wake"]) == ("external_running", "ok", "queued", False)
++    assert _derive(_rec(None, _poll("running"), T0), T0 + 10)["state"] == "external_running"
++
++
++@pytest.mark.parametrize("job", ["succeeded", "failed", "cancelled"])
++def test_terminal_job_wakes_and_is_never_down(job):
++    got = _derive(_rec(None, _poll(job), T0), T0 + 1)
++    assert got["wake"] is True
++    assert got["state"] != "external_down"
++    assert got["job"] == job
++
++
++def test_one_5xx_is_unknown_then_recovers_without_wake():
++    bad = _rec(None, _poll("unknown", "down", detail="HTTP 502"), T0)
++    assert bad["consecutive_failures"] == 1
++    got = _derive(bad, T0 + 5)
++    assert (got["state"], got["health"]) == ("external_unknown", "down")
++    ok = _rec(bad, _poll("running"), T0 + EVERY)
++    assert ok["consecutive_failures"] == 0
++    got = _derive(ok, T0 + EVERY + 1)
++    assert (got["state"], got["wake"]) == ("external_running", False)
++
++
++def test_two_consecutive_down_polls_are_red_within_two_intervals():
++    one = _rec(None, _poll("unknown", "down"), T0)
++    two = _rec(one, _poll("unknown", "unreachable"), T0 + EVERY)
++    assert two["consecutive_failures"] == 2
++    got = _derive(two, T0 + EVERY + 1)
++    assert got["state"] == "external_down"
++    assert got["health"] == "unreachable"
++    assert T0 + EVERY + 1 - T0 <= 2 * EVERY + 1
++
++
++def test_rate_limit_is_unknown_never_red_and_honours_retry_after():
++    prev = None
++    for i in range(5):
++        prev = _rec(prev, _poll("unknown", "rate_limited", retry_after=700), T0 + i * 700)
++        got = _derive(prev, T0 + i * 700 + 1)
++        assert got["state"] == "external_unknown" and got["health"] == "rate_limited"
++    assert prev["consecutive_failures"] == 0
++    assert prev["next_due_at"] >= prev["observed_at"] + 700  # never earlier than retry_after
++
++
++def test_rate_limited_polls_do_not_reset_an_existing_failure_streak_but_never_add():
++    one = _rec(None, _poll("unknown", "down"), T0)
++    limited = _rec(one, _poll("unknown", "rate_limited", retry_after=60), T0 + EVERY)
++    assert limited["consecutive_failures"] == 1
++
++
++def test_auth_failed_is_red_at_once():
++    got = _derive(_rec(None, _poll("unknown", "auth_failed", detail="no broker credential"), T0), T0 + 1)
++    assert (got["state"], got["health"]) == ("external_down", "auth_failed")
++    assert "no broker credential" in got["reason"]
++
++
++def test_silent_host_unknown_after_one_interval_red_after_two():
++    rec = _rec(None, _poll("running"), T0)
++    assert _derive(rec, T0 + EVERY * 0.9)["state"] == "external_running"
++    got = _derive(rec, T0 + EVERY * 1.5)
++    assert (got["state"], got["health"]) == ("external_unknown", "host_silent")
++    got = _derive(rec, T0 + EVERY * 2.5)
++    assert (got["state"], got["health"]) == ("external_down", "host_silent")
++
++
++def test_silence_stays_grey_for_hosts_that_do_not_advertise():
++    rec = _rec(None, _poll("running"), T0)
++    assert _derive(rec, T0 + EVERY * 5, advertises=False) is None
++    assert _derive(None, T0 + EVERY * 5, since=T0, advertises=False) is None
++
++
++def test_no_poll_yet_is_unknown_then_silent_red():
++    assert _derive(None, T0 + 30, since=T0)["state"] == "external_unknown"
++    assert _derive(None, T0 + EVERY * 2.5, since=T0)["health"] == "host_silent"
++
++
++def test_watch_missing_is_red():
++    got = _derive(None, T0, watch_missing=True)
++    assert (got["state"], got["health"]) == ("external_down", "watch_missing")
++
++
++def test_probe_broken_is_red_after_two_failures():
++    one = _rec(None, _poll("unknown", "probe_broken"), T0)
++    assert _derive(one, T0 + 1)["state"] == "external_unknown"
++    two = _rec(one, _poll("unknown", "probe_broken"), T0 + EVERY)
++    got = _derive(two, T0 + EVERY + 1)
++    assert (got["state"], got["health"]) == ("external_down", "probe_broken")
++
++
++def test_cadence_jitter_floor_and_retry_after():
++    lo = ks.next_record(None, _poll(), now=T0, every=EVERY, adapter="a", scope="s", rand=0.0)
++    hi = ks.next_record(None, _poll(), now=T0, every=EVERY, adapter="a", scope="s", rand=1.0)
++    assert lo["next_due_at"] - T0 == pytest.approx(EVERY * 0.9)
++    assert hi["next_due_at"] - T0 == pytest.approx(EVERY * 1.1)
++    floor = ks.next_record(None, _poll(), now=T0, every=10, adapter="a", scope="s", rand=0.0)
++    assert floor["next_due_at"] - T0 >= ks.MIN_EVERY
++    assert ks.clamp_every(5) == ks.MIN_EVERY and ks.clamp_every(None) == ks.DEFAULT_CI_EVERY
++    assert ks.clamp_every("x") == ks.DEFAULT_CI_EVERY
++
++
++def test_interface_fields_are_always_filled():
++    got = _derive(_rec(None, _poll("running", url="https://x/y", detail="job tests"), T0), T0 + 5,
++                  service_name="GitHub Actions")
++    ext = got["external"]
++    assert ext["service"] == "GitHub Actions"
++    assert ext["job"] == "running" and ext["health"] == "ok"
++    assert ext["reason"] and ext["url"] == "https://x/y"
++    assert ext["observed_at"] == T0 and ext["next_due_at"] == pytest.approx(T0 + EVERY)
++    for key in ("service", "adapter", "job", "health", "reason", "url", "observed_at", "next_due_at"):
++        assert key in ext
++    before_poll = _derive(None, T0 + 5, since=T0, service_name="GitHub Actions", adapter="github_run")["external"]
++    assert before_poll["service"] == "GitHub Actions" and before_poll["observed_at"] is None
++    assert before_poll["job"] == "unknown" and before_poll["health"] == "ok" and before_poll["reason"]
+diff --git a/tests/hermes_cli/test_kanban_external_watch.py b/tests/hermes_cli/test_kanban_external_watch.py
+new file mode 100644
+index 0000000000..11943dba79
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_external_watch.py
+@@ -0,0 +1,401 @@
++"""External-run cards through the board: sweep -> records -> card state, wakes, the shared blocker. [daveey]
++
++A fake GitHub (200 / 5xx / 429 retry-after / 401 / timeout) is injected through the sweep's ``fetch=`` seam and a
++fake wall clock through ``kanban_ci_progress._wall_now``; the plan's cases 1-14 are numbered in the test names.
++"""
++from __future__ import annotations
++
++import json
++import subprocess
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_ci_progress as kcp
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_external_watch as kew
++from hermes_cli import kanban_shared_blockers as ksb
++from hermes_cli import kanban_wait_info as kwi
++from hermes_cli import kanban_wake_check as kwc
++from hermes_cli.kanban_session_wait_rows import _local_wait_info
++
++REPO = "example-org/hermes"
++EVERY = 300
++T0 = time.time()
++
++
++def url(run: int = 1001) -> str:
++    return f"https://github.com/{REPO}/actions/runs/{run}"
++
++
++@pytest.fixture
++def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    monkeypatch.setenv("ASK_GATE_LEDGER", str(home / "state" / "ask-ledger.sqlite"))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    yield home
++    kwc._shutdown_for_tests()
++    for state in (kcp._LAST_CHECK, kcp._LAST_SWEEP, kcp._SWEEPS, kcp._POOL_SCANS, kcp._WARNED_AT):
++        state.clear()
++
++
++class FakeGitHub:
++    """Serves jobs/run reads. ``mode`` picks the failure: None (200), 5xx, 429, 401, timeout."""
++
++    def __init__(self):
++        self.mode = None
++        self.run_modes: dict[str, str] = {}
++        self.job = "in_progress"      # in_progress | queued | completed
++        self.conclusion = None
++        self.calls = 0
++
++    def fetch(self, repo, run_id):
++        self.calls += 1
++        mode = self.run_modes.get(str(run_id), self.mode)
++        if mode == "5xx":
++            raise RuntimeError("gh api exit 1: HTTP 502: Bad Gateway (https://api.github.com/)")
++        if mode == "429":
++            raise RuntimeError("gh api exit 1: HTTP 429: rate limit exceeded retry-after: 700")
++        if mode == "401":
++            raise kcp.NoCredential("gh api exit 1: HTTP 401: Bad credentials")
++        if mode == "timeout":
++            raise subprocess.TimeoutExpired("gh", 20)
++        created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 30))
++        return {"jobs": [{"id": 1, "name": "tests", "status": self.job, "conclusion": self.conclusion,
++                          "created_at": created, "labels": ["self-hosted", "ci-fast"],
++                          "runner_name": None if self.job == "queued" else "r1"}]}
++
++    def fetch_run(self, repo, run_id):
++        return {"status": "completed" if self.job == "completed" else "in_progress", "conclusion": self.conclusion}
++
++
++@pytest.fixture
++def gh():
++    return FakeGitHub()
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    class Clock:
++        now = T0
++
++        def set(self, t):
++            self.now = t
++            monkeypatch.setattr(kcp, "_wall_now", lambda: self.now)
++    c = Clock()
++    c.set(T0)
++    return c
++
++
++def tick(conn, gh, clock, dt=EVERY):
++    """One dispatcher sweep ``dt`` s after the last one."""
++    clock.set(clock.now + dt)
++    kcp._LAST_CHECK.clear()  # the sweep's monotonic spacing is real time; the fake clock drives everything else
++    return kcp.sweep(conn, fetch=gh.fetch, fetch_run=gh.fetch_run, fetch_runners=lambda repo: [])
++
++
++def park(conn, run: int = 1001, *, kind="ci", ref=None, wake_check="false", reason="waiting", **kw) -> str:
++    tid = kb.create_task(conn, title=f"card {run}", assignee="worker")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    assert kb.claim_task(conn, tid, claimer="worker") is not None
++    awaiting = {"kind": kind, "ref": ref if ref is not None else url(run), "why": "test"}
++    assert kb.schedule_task(conn, tid, reason=reason, wake_check=wake_check, check_every=900, awaiting=awaiting,
++                            **kw)
++    return tid
++
++
++def status(conn, tid):
++    return conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()[0]
++
++
++def state(conn, tid, at=None):
++    got = kew.card_state(conn, tid, now=clock_now(at))
++    return got
++
++
++def clock_now(at):
++    return at if at is not None else time.time()
++
++
++def derived(conn, tid, clock):
++    return kew.card_state(conn, tid, now=clock.now + 1)
++
++
++def events(conn, tid, kind):
++    return [json.loads(r[0]) for r in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id", (tid, kind))]
++
++
++# 1 ---------------------------------------------------------------------------------------------------------
++def test_case1_running_run_is_blue_with_every_hover_field(kanban_home, gh, clock):
++    with kbc.connect_closing() as conn:
++        tid = park(conn)
++        assert tick(conn, gh, clock, 0) == []
++        got = derived(conn, tid, clock)
++        assert (got["state"], got["external"]["job"], got["external"]["health"]) == ("external_running", "running", "ok")
++        ext = got["external"]
++        assert ext["service"] == "GitHub Actions" and ext["adapter"] == "github_run"
++        assert ext["reason"] and ext["url"] == url()
++        assert ext["observed_at"] == clock.now and ext["next_due_at"] > ext["observed_at"]
++        info = _local_wait_info(conn, [tid], now=clock.now + 1)[tid]
++        assert info["wait_state"] == "external_running" and info["external"]["service"] == "GitHub Actions"
++        # hover obligation: every field the tooltip reads is present, with check times
++        for key in ("service", "job", "health", "reason", "observed_at", "next_due_at"):
++            assert ext[key] not in (None, ""), key
++
++
++# 2 + 3 -----------------------------------------------------------------------------------------------------
++@pytest.mark.parametrize("conclusion,outcome", [("success", "succeeded"), ("failure", "failed")])
++def test_case2_3_finished_run_wakes_within_one_tick_and_a_failure_is_never_red(kanban_home, gh, clock, conclusion,
++                                                                               outcome):
++    with kbc.connect_closing() as conn:
++        tid = park(conn)
++        tick(conn, gh, clock, 0)
++        gh.job, gh.conclusion = "completed", conclusion
++        assert tick(conn, gh, clock) == [tid]
++        assert status(conn, tid) == "ready"
++        met = events(conn, tid, "condition_met")[-1]
++        assert met["external_result"]["outcome"] == outcome
++        assert met["external_result"]["service"] == "GitHub Actions" and met["external_result"]["url"] == url()
++        assert not events(conn, tid, kew.SERVICE_DOWN) and not events(conn, tid, kew.RECOVERED_EVENT)
++        assert all(r["state"] != "external_down" for r in events(conn, tid, kew.WATCH_EVENT))
++
++
++# 4 ---------------------------------------------------------------------------------------------------------
++def test_case4_one_5xx_is_unknown_then_recovers(kanban_home, gh, clock):
++    with kbc.connect_closing() as conn:
++        tid = park(conn)
++        tick(conn, gh, clock, 0)
++        gh.mode = "5xx"
++        assert tick(conn, gh, clock) == []
++        got = derived(conn, tid, clock)
++        assert (got["state"], got["health"]) == ("external_unknown", "down")
++        assert got["external"]["service"] == "GitHub Actions" and got["external"]["reason"]
++        gh.mode = None
++        tick(conn, gh, clock)
++        assert derived(conn, tid, clock)["state"] == "external_running"
++        assert status(conn, tid) == "scheduled"
++
++
++# 5 + 6 -----------------------------------------------------------------------------------------------------
++def test_case5_6_two_5xx_are_red_with_one_blocker_for_five_cards_and_recovery_clears_it(kanban_home, gh, clock):
++    with kbc.connect_closing() as conn:
++        tids = [park(conn, 2000 + i) for i in range(5)]
++        tick(conn, gh, clock, 0)
++        gh.mode = "5xx"
++        tick(conn, gh, clock)
++        assert {derived(conn, t, clock)["state"] for t in tids} == {"external_unknown"}
++        woken = tick(conn, gh, clock)
++        bid = kew.blocker_id("github_run", REPO)
++        states = {k: v for k, v in ksb.blocker_states(conn).items() if k.startswith("service-down")}
++        assert list(states) == [bid], states  # ONE blocker for five cards
++        assert len(woken) == 1 and status(conn, woken[0]) == "ready"  # one probe card woken
++        probe = woken[0]
++        waiting = [t for t in tids if t != probe]
++        assert len(waiting) == 4
++        for t in waiting:
++            got = derived(conn, t, clock)
++            assert got["state"] == "external_down" and got["health"] == "down"
++            assert got["external"]["blocker_id"] == bid and got["external"]["triage_card"] == probe
++            assert status(conn, t) == "scheduled"
++        assert states[bid].is_open
++        # recovery: first ok poll clears the blocker and writes external_recovered on each red card
++        gh.mode = None
++        tick(conn, gh, clock)
++        assert not ksb.blocker_states(conn).get(bid) or not ksb.blocker_states(conn)[bid].is_open
++        for t in waiting:
++            assert derived(conn, t, clock)["state"] == "external_running"
++            assert len(events(conn, t, kew.RECOVERED_EVENT)) == 1
++
++
++# 7 ---------------------------------------------------------------------------------------------------------
++def test_case7_429_never_counts_toward_red_and_honours_retry_after(kanban_home, gh, clock):
++    with kbc.connect_closing() as conn:
++        tid = park(conn)
++        tick(conn, gh, clock, 0)
++        gh.mode = "429"
++        tick(conn, gh, clock)
++        calls = gh.calls
++        for _ in range(2):  # 300 s later each: still inside retry-after 700 s, so GitHub is not asked again
++            tick(conn, gh, clock)
++        assert gh.calls == calls
++        got = derived(conn, tid, clock)
++        assert (got["state"], got["health"]) == ("external_unknown", "rate_limited")
++        for _ in range(6):
++            tick(conn, gh, clock, 800)
++            assert derived(conn, tid, clock)["state"] != "external_down"
++        assert status(conn, tid) == "scheduled" and not events(conn, tid, kew.SERVICE_DOWN)
++
++
++# 8 ---------------------------------------------------------------------------------------------------------
++def test_case8_401_is_red_at_once_without_waking(kanban_home, gh, clock):
++    with kbc.connect_closing() as conn:
++        tid = park(conn)
++        gh.mode = "401"
++        tick(conn, gh, clock, 0)
++        got = derived(conn, tid, clock)
++        assert (got["state"], got["health"]) == ("external_down", "auth_failed")
++        assert status(conn, tid) == "scheduled"
++
++
++# 9 ---------------------------------------------------------------------------------------------------------
++def test_case9_silent_host_is_unknown_after_one_interval_and_red_after_two(kanban_home, gh, clock):
++    with kbc.connect_closing() as conn:
++        tid = park(conn)
++        tick(conn, gh, clock, 0)  # the last record the host ever writes
++        t = clock.now
++        assert kew.card_state(conn, tid, now=t + 100)["state"] == "external_running"
++        assert kew.card_state(conn, tid, now=t + 1.5 * EVERY)["state"] == "external_unknown"
++        assert kew.card_state(conn, tid, now=t + 2.5 * EVERY)["state"] == "external_down"
++        assert kew.card_state(conn, tid, now=t + 2.5 * EVERY)["health"] == "host_silent"
++
++
++# 10 --------------------------------------------------------------------------------------------------------
++def _shell_apply(conn, tid, rc, out):
++    st = kwc.get_state(conn, tid)
++    return kwc.apply_result(conn, tid, st["cmd"], rc, out, generation=st["generation"])
++
++
++def test_case10_legacy_return_codes_and_hermes_watch_lines(kanban_home):
++    with kbc.connect_closing() as conn:
++        a = park(conn, kind="external", ref="a slurm job", wake_check="probe.sh")
++        assert _shell_apply(conn, a, 1, "") is None
++        got = kew.card_state(conn, a)
++        assert (got["state"], got["external"]["adapter"], got["external"]["job"]) == ("external_running", "shell", "running")
++        b = park(conn, 1, kind="external", ref="a slurm job", wake_check="probe.sh")
++        _shell_apply(conn, b, 1, 'HERMES_WATCH {"job": "running", "service": "down", "detail": "502"}')
++        assert kew.card_state(conn, b)["state"] == "external_unknown"
++        _shell_apply(conn, b, 1, 'HERMES_WATCH {"job": "running", "service": "down", "detail": "502"}')
++        assert kew.card_state(conn, b)["state"] == "external_down"
++        c = park(conn, 2, kind="external", ref="a slurm job", wake_check="probe.sh")
++        assert _shell_apply(conn, c, 1, 'HERMES_WATCH {"job": "failed", "detail": "oom"}') == "condition_met"
++        assert events(conn, c, "condition_met")[-1]["external_result"]["outcome"] == "failed"
++        d = park(conn, 3, kind="external", ref="a slurm job", wake_check="probe.sh")
++        assert _shell_apply(conn, d, 0, "") == "condition_met"  # legacy exit 0 still wakes, result unknown
++        assert events(conn, d, "condition_met")[-1]["external_result"]["outcome"] == "done_unknown"
++        e = park(conn, 4, kind="external", ref="a slurm job", wake_check="probe.sh")
++        _shell_apply(conn, e, 3, "stale")
++        assert kew.card_state(conn, e)["state"] == "external_unknown"
++
++
++# 11 --------------------------------------------------------------------------------------------------------
++def test_case11_cadence_budget_and_stop_after_leaving_scheduled(kanban_home, gh, clock):
++    with kbc.connect_closing() as conn:
++        tids = [park(conn, 3000 + i) for i in range(8)]
++        tick(conn, gh, clock, 0)
++        assert gh.calls <= kcp.MAX_CARDS_PER_SWEEP * 2  # the per-sweep card budget still bounds the reads
++        first = gh.calls
++        # one interval later the same cards are read again, never sooner
++        kcp._LAST_CHECK.clear()
++        kcp.sweep(conn, fetch=gh.fetch, fetch_run=gh.fetch_run, fetch_runners=lambda repo: [])
++        gh.job, gh.conclusion = "completed", "success"
++        woken = tick(conn, gh, clock)
++        assert woken and all(status(conn, t) == "ready" for t in woken)
++        calls = gh.calls
++        tick(conn, gh, clock)
++        tick(conn, gh, clock)
++        left = [t for t in tids if status(conn, t) == "scheduled"]
++        assert gh.calls - calls <= 2 * 2 * max(1, len(left)) + 2  # woken cards are never polled again
++        assert first > 0
++
++
++def test_case11_declared_every_has_a_floor(kanban_home, gh, clock):
++    with kbc.connect_closing() as conn:
++        tid = park(conn)
++        with kb.write_txn(conn):
++            row = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind='scheduled'",
++                               (tid,)).fetchone()
++            payload = json.loads(row[1] or "{}")
++            payload["watch"] = {"every": 5}
++            conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row[0]))
++        assert kcp._declared_every(conn, tid) == 120
++
++
++# 12 --------------------------------------------------------------------------------------------------------
++def test_case12_ci_park_nothing_watches_is_red(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = park(conn)  # a legacy park: its ref names no run and nothing probes it
++        with kb.write_txn(conn):
++            row = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind='scheduled'",
++                               (tid,)).fetchone()
++            payload = json.loads(row[1] or "{}")
++            payload["awaiting"]["ref"] = "a release train"
++            payload.pop("wake_check", None)
++            conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row[0]))
++            conn.execute("DELETE FROM task_wake_checks WHERE task_id=?", (tid,))
++        got = kew.card_state(conn, tid)
++        assert (got["state"], got["health"]) == ("external_down", "watch_missing")
++        assert got["external"]["service"] and got["external"]["reason"]
++        assert _local_wait_info(conn, [tid])[tid]["wait_state"] == "external_down"
++
++
++# 13 --------------------------------------------------------------------------------------------------------
++def test_case13_a_deadline_park_still_wakes_and_is_not_external(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = park(conn, kind="clock", ref="soak", wake_check=None, clock_only=True)
++        assert kew.card_state(conn, tid) is None
++        from hermes_cli.kanban_continuation import wake_due_continuations
++        assert tid in wake_due_continuations(conn, now=int(time.time()) + 10 * 24 * 3600)
++
++
++# 14 --------------------------------------------------------------------------------------------------------
++def test_case14_old_host_silence_stays_grey_and_an_advertising_host_goes_red(kanban_home, gh, clock):
++    with kbc.connect_closing() as conn:
++        old, new = park(conn, 4001), park(conn, 4002)
++        with kb.write_txn(conn):
++            for tid, host in ((old, "old-host"), (new, "new-host")):
++                row = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind='scheduled'",
++                                   (tid,)).fetchone()
++                payload = json.loads(row[1] or "{}")
++                payload["probe_host"] = host
++                conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row[0]))
++            # new-host wrote one watch record at T0 (as a synced event would arrive); old-host never has
++            kb._append_event(conn, new, kew.WATCH_EVENT, {"adapter": "github_run", "scope": REPO, "host": "new-host",
++                                                          "job": "running", "service": "ok", "observed_at": T0,
++                                                          "next_due_at": T0 + EVERY, "every": EVERY,
++                                                          "consecutive_failures": 0})
++        late = T0 + 5 * EVERY
++        assert kew.card_state(conn, old, now=late) is None  # grey: that host never advertised watching
++        got = kew.card_state(conn, new, now=late)
++        assert (got["state"], got["health"]) == ("external_down", "host_silent")
++
++
++# E2E -------------------------------------------------------------------------------------------------------
++def test_e2e_timeline_queued_running_outage_recover_failed(kanban_home, gh, clock):
++    with kbc.connect_closing() as conn:
++        tid = park(conn)
++        bid = kew.blocker_id("github_run", REPO)
++        gh.job = "queued"
++        tick(conn, gh, clock, 0)
++        assert (derived(conn, tid, clock)["state"], derived(conn, tid, clock)["external"]["job"]) == (
++            "external_running", "queued")
++        gh.job = "in_progress"
++        tick(conn, gh, clock)
++        assert derived(conn, tid, clock)["external"]["job"] == "running"
++        gh.mode = "5xx"
++        tick(conn, gh, clock)
++        assert derived(conn, tid, clock)["state"] == "external_unknown"
++        assert status(conn, tid) == "scheduled"
++        assert tick(conn, gh, clock) == [tid]  # second consecutive failure: red, woken as the service probe
++        assert status(conn, tid) == "ready"
++        assert events(conn, tid, kew.WATCH_EVENT)[-1]["state"] == "external_down"
++        assert ksb.blocker_states(conn)[bid].is_open
++        # the woken probe triages, GitHub is back, it re-parks on the same run
++        gh.mode = None
++        assert kb.claim_task(conn, tid, claimer="worker") is not None
++        assert kb.schedule_task(conn, tid, reason="back", wake_check="false", check_every=900,
++                                awaiting={"kind": "ci", "ref": url(), "why": "test"})
++        tick(conn, gh, clock)
++        assert derived(conn, tid, clock)["state"] == "external_running"
++        assert not ksb.blocker_states(conn).get(bid) or not ksb.blocker_states(conn)[bid].is_open
++        gh.job, gh.conclusion = "completed", "failure"
++        assert tick(conn, gh, clock) == [tid]
++        assert events(conn, tid, "condition_met")[-1]["external_result"]["outcome"] == "failed"
++        assert status(conn, tid) == "ready"
+-- 
+2.43.0
+

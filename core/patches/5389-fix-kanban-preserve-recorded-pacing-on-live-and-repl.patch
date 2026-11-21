@@ -1,0 +1,168 @@
+From 6996224ef18d4cdb0a36a071fb81646e705df169 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 04:23:15 +0000
+Subject: [PATCH] fix(kanban): preserve recorded pacing on live and replica
+ card reads [daveey]
+
+The panel's REST detail and headless courier must retain the provider/reset queue
+verdict without evaluating a replica against the reader host's capacity.
+Keep scheduling position unchanged and overlay the recorded pacing only on card
+reads, preserving leftover-claim and quarantine precedence. Reuse the existing
+queue import instead of growing the module-boundary baseline.
+
+Proof: live/replica REST pacing fixtures and next-tick profile/queue fixtures pass.
+The broad 151-file consumer run passed 3404 tests with one import-count ratchet
+failure, corrected by consolidating the existing queue import; no gate weakened.
+---
+ hermes_cli/kanban_queue_position.py        | 26 +++++++++++++----
+ plugins/kanban/dashboard/plugin_api.py     | 13 ++-------
+ tests/plugins/test_kanban_pacing_detail.py | 34 ++++++++++++++++++++++
+ 3 files changed, 58 insertions(+), 15 deletions(-)
+ create mode 100644 tests/plugins/test_kanban_pacing_detail.py
+
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 01bd4bbca4..84a7588d3d 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -205,6 +205,23 @@ def reroute_prefix(place: Optional[dict[str, Any]]) -> str:
+     return f"{rerouted}; " if str(rerouted).startswith(NOTE_PREFIX) else f"next run rerouted: {rerouted}; "
+ 
+ 
++def recorded_pacing(conn: sqlite3.Connection, task) -> Optional[dict[str, Any]]:
++    """Recorded-only queue projection, safe on replicas: never probe local placement or live pools."""
++    from hermes_cli import kanban_dispatch_skip as skips
++    if task is None or task.status != "ready" or getattr(task, "claim_lock", None):
++        return None
++    skip = skips.latest(conn, task.id)
++    return {"lane": "llm_pacing", "skip": skip} if skip and skip.get("reason") in (skips.LLM_PACED, "llm_pacing") else None
++
++
++def ready_since(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
++    """The Board's synced ready timestamp (ms), absent on older schemas."""
++    if "ready_since" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++        return None
++    row = conn.execute("SELECT ready_since FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    return row[0] if row else None
++
++
+ def _position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Optional[dict[str, Any]]:
+     if task is None or task.status != "ready":
+         return None
+@@ -216,10 +233,6 @@ def _position(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Op
+     from hermes_cli.kanban_sync_quarantine import refusal as quarantine_refusal
+     if held := quarantine_refusal(conn, task.id):  # the dispatcher drops it (drop_held): say why and how [daveey]
+         return {"lane": "sync_quarantine", "reason": held}
+-    from hermes_cli import kanban_dispatch_skip as skips
+-    skip = skips.latest(conn, task.id)
+-    if skip and skip.get("reason") in (skips.LLM_PACED, "llm_pacing"):
+-        return {"lane": "llm_pacing", "skip": skip}
+     guard = recorded_guard(conn, task.id)
+     if guard:
+         return {"lane": "respawn_guard", "reason": guard}
+@@ -454,7 +467,10 @@ def pool_words(place: dict[str, Any], *, advice: bool = True) -> str:
+ def read(conn: sqlite3.Connection, task, board: Optional[str] = None) -> Optional[dict[str, Any]]:
+     """:func:`position` for card reads (``kanban_show``, ``hermes kanban show``): advisory, never fails the read."""
+     try:
+-        return position(conn, task, board)
++        place = position(conn, task, board)
++        if place and place.get("lane") in ("leftover_claim", "sync_quarantine"):
++            return place
++        return recorded_pacing(conn, task) or place
+     except Exception:  # health: allow BLE001 -- an advisory queue place must never fail the read
+         _log.debug("kanban queue position: unavailable for %s", getattr(task, "id", None), exc_info=True)
+         return None
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 1e081c7316..6982e5b42b 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
+ 
+ from hermes_cli import kanban_db
+ from hermes_cli import kanban_review_contract as _review_contract  # a dashboard "done" is never a worker run
++from hermes_cli import kanban_queue_position as kqp
+ from hermes_cli import kanban_workflow
+ from hermes_cli import loop_accounting as _la  # [daveey] per-route pass accounting
+ from hermes_cli.web_read_coalescing import coalesced_read
+@@ -394,7 +395,6 @@ def get_task(
+         task = kanban_db.get_task(conn, task_id)
+         if task is not None:
+             out = _task_detail(conn, task, run_state_type, run_state_name)
+-            from hermes_cli import kanban_queue_position as kqp
+             out.update(kqp.detail_fields(conn, task, board))
+             return {**out, "source": "live", "wait_observation": owner_proof(conn, task)}
+         live_file = kbc._main_db_file(conn)
+@@ -409,14 +409,6 @@ def get_task(
+     raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+ 
+ 
+-def _ready_since(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+-    """When the card last became ready (ms, the Board's synced column); None on a board without it."""
+-    if "ready_since" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
+-        return None
+-    row = conn.execute("SELECT ready_since FROM tasks WHERE id = ?", (task_id,)).fetchone()
+-    return row[0] if row else None
+-
+-
+ def _task_detail(conn: sqlite3.Connection, task: kanban_db.Task, run_state_type: Optional[str],
+                  run_state_name: Optional[str]) -> dict[str, Any]:
+     """The GET /tasks/:id payload for ``task`` read from ``conn`` (the live file or the board replica)."""
+@@ -425,7 +417,7 @@ def _task_detail(conn: sqlite3.Connection, task: kanban_db.Task, run_state_type:
+     task_d = _task_dict(
+         task, latest_summary=kanban_db.latest_summary(conn, task_id),
+         current_run_started_at=kanban_db.current_run_started_ats(conn, [task_id]).get(task_id))
+-    task_d["ready_since"] = _ready_since(conn, task_id)
++    task_d["ready_since"] = kqp.ready_since(conn, task_id)
+     links = _links_for(conn, task_id)
+     child_summaries = kanban_db.latest_summaries(conn, links["children"])
+     children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
+@@ -435,6 +427,7 @@ def _task_detail(conn: sqlite3.Connection, task: kanban_db.Task, run_state_type:
+     from hermes_cli.kanban_artifact_receipt import latest_receipt
+     return {
+         "task": task_d,
++        **kqp.fields(kqp.recorded_pacing(conn, task)),
+         **latest_receipt(kanban_db.list_events(conn, task_id)),
+         "comments": [asdict(c) for c in kanban_db.list_comments(conn, task_id)],
+         "events": [asdict(e) for e in kanban_db.list_events(conn, task_id)],
+diff --git a/tests/plugins/test_kanban_pacing_detail.py b/tests/plugins/test_kanban_pacing_detail.py
+new file mode 100644
+index 0000000000..78684592dc
+--- /dev/null
++++ b/tests/plugins/test_kanban_pacing_detail.py
+@@ -0,0 +1,34 @@
++"""Live and replica card detail preserve recorded pacing without local capacity claims. [daveey]"""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_queue_position as queue
++from tests.plugins.test_kanban_foreign_card_api import (
++    make_replica_card, enable_sync, _live_card,
++)
++from tests.plugins.test_kanban_foreign_card_api import api as api, kanban_home as kanban_home  # noqa: PLC0414 -- fixtures
++
++
++@pytest.mark.parametrize('replica', [False, True])
++def test_card_detail_names_pacing_provider_and_reset(kanban_home, api, monkeypatch, replica):
++    tid = make_replica_card(kanban_home) if replica else _live_card()
++    if replica:
++        enable_sync(monkeypatch)
++        monkeypatch.setattr(queue, '_position', lambda *_a, **_kw: pytest.fail('replica evaluated reader placement'))
++    path = kanban_home / 'kanban' / sync.SHADOW_DIR / 'default.db' if replica else None
++    with kbc.connect(path) as conn:
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'dispatch_skipped', {
++                'reason': 'llm_paced', 'detail': 'xai-oauth held', 'until': 1795474351.914,
++                'providers': [{'provider': 'xai-oauth', 'state': 'held', 'limit': 0}]})
++    result = api.get(f'/api/plugins/kanban/tasks/{tid}')
++    assert result.status_code == 200, result.text
++    body = result.json()
++    assert body['source'] == ('replica' if replica else 'live')
++    assert body['queue']['lane'] == 'llm_pacing'
++    assert 'LLM quota pacing (xai-oauth held pool) until 2026-11-23 22:52Z' in body['queue_note']
++    assert 'worker' not in body['queue_note'] and 'slot' not in body['queue_note']
++    if replica:
++        assert 'capacity_note' not in body and 'wait_observation' not in body
+-- 
+2.43.0
+

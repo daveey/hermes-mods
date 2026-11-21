@@ -1,0 +1,810 @@
+From 2a6fb39cb9c62d90d9c538a2471dfff1e8b6db71 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:16:20 +0000
+Subject: [PATCH] fix(kanban): close fairness capture review lifecycle gaps
+ [daveey]
+
+Resolve the five findings left open in #3687. Scoped serving and dispatcher
+startup acquire close ownership only for newly created epochs. Await boot
+and close through cancellation so late thread results are cleaned up and
+the singleton lease releases even when close fails. Validate Unix runtime
+prerequisites before capture IO; disabled capture remains inert. Restore or
+remove the plan when connection or journal admission refuses, while keeping
+budget-first admission and retaining the plan after successful arming.
+
+Root cause: shared epoch lookup was mistaken for lifetime ownership;
+async cancellation was mistaken for worker termination; optional runtime
+IO assumed Unix; plan publication preceded journal admission without undo.
+
+Proof: focused ownership/platform/cancellation/arm tests fail on original
+53480c6dc085b55617a75ea6ac975ceda015e38f source and pass with fixes.
+Writer final producer and reader custody, armed export refusal, and budget
+mismatch tests each kill their targeted mutants. Full consumer selection:
+78 files / 1155 tests pass; scripts/check all 21 checks pass. Also cover real
+gateway slash dispatch, reversed serving/tenure ownership, connection
+refusal and drain failure after arm. No live activation or default change.
+
+Task: t_eeeeee000000001a
+---
+ gateway/kanban_watchers.py                    |  36 ++-
+ hermes_cli/kanban_fairness_activation.py      |  27 +-
+ scripts/kanban_fairness.py                    |  21 +-
+ .../test_kanban_dispatcher_capture_cancel.py  | 271 ++++++++++++++++++
+ ...st_kanban_fairness_activation_ownership.py |  90 ++++++
+ ...est_kanban_fairness_activation_platform.py |  33 +++
+ .../test_kanban_fairness_arm_rollback.py      |  91 ++++++
+ .../test_kanban_fairness_review_clauses.py    |  84 ++++++
+ 8 files changed, 642 insertions(+), 11 deletions(-)
+ create mode 100644 tests/gateway/test_kanban_dispatcher_capture_cancel.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_activation_ownership.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_activation_platform.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_arm_rollback.py
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_review_clauses.py
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index 826310c23b..2cf8c03df5 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -41,6 +41,28 @@ _GC_INTERVAL_SECONDS = 3600.0
+ _HEALTH_WINDOW = 6
+ 
+ 
++async def _await_process_service(func, /, *args, into=None):
++    """Offload process-service work; cancellation still observes the worker.
++
++    ``asyncio.to_thread`` does not stop the thread. A cancelled waiter waits for
++    it so a late return value can be closed. Nested cancels are absorbed until
++    the worker finishes. Process-service context is unchanged.
++    """
++    worker = asyncio.ensure_future(_to_thread_process_service(func, *args))
++    try:
++        result = await asyncio.shield(worker)
++        if into is not None:
++            into.append(result)
++        return result
++    except asyncio.CancelledError:
++        while not worker.done():
++            with contextlib.suppress(asyncio.CancelledError):
++                await asyncio.wait({worker})
++        if into is not None and not worker.cancelled() and worker.exception() is None:
++            into.append(worker.result())
++        raise
++
++
+ class GatewayKanbanWatchersMixin:
+     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
+ 
+@@ -366,9 +388,10 @@ class GatewayKanbanWatchersMixin:
+         from gateway.kanban_dispatcher_health import DispatcherHealth
+         health = DispatcherHealth(getattr(self, "_kanban_dispatcher_lock_handle", None), interval=interval)
+         self._kanban_dispatcher_health = health
+-        from hermes_cli.kanban_fairness_activation import boot
+-        capture = await _to_thread_process_service(boot)
++        from hermes_cli.kanban_fairness_activation import boot_owned as boot
++        held: list = []
+         try:
++            await _await_process_service(boot, into=held)
+             # Initial delay so adapters are wired before workers spawn (matches the notifier).
+             await asyncio.sleep(5)
+ 
+@@ -472,9 +495,12 @@ class GatewayKanbanWatchersMixin:
+                 await self._sleep_until_tick_or_sync_wake(interval)
+ 
+         finally:
+-            if capture is not None:
+-                await _to_thread_process_service(capture.close)
+-            self._release_kanban_dispatcher_lock()
++            capture = held[-1] if held else None
++            try:
++                if capture is not None:
++                    await _await_process_service(capture.close)
++            finally:
++                self._release_kanban_dispatcher_lock()
+ 
+     async def _kanban_sync_watcher(self) -> None:
+         """Central Kanban sync (``kanban.sync.enabled``): pull the Board service's feed and push the outbox every
+diff --git a/hermes_cli/kanban_fairness_activation.py b/hermes_cli/kanban_fairness_activation.py
+index 08aaa4e8f8..b345e2cab6 100644
+--- a/hermes_cli/kanban_fairness_activation.py
++++ b/hermes_cli/kanban_fairness_activation.py
+@@ -5,6 +5,7 @@ monitor observes disarm outside scheduling locks; existing processes close withi
+ one poll plus the shared runtime shutdown allowance. No journal is auto-armed.
+ """
+ from contextlib import contextmanager
++from contextvars import ContextVar
+ import json
+ import logging
+ import os
+@@ -23,6 +24,8 @@ DISARMED = "runtime-disarmed.json"
+ MAX_DESCRIPTOR = 8192
+ _LOCK = threading.Lock()
+ _LOG = logging.getLogger(__name__)
++# Scoped acquisition mode keeps boot's public/mocked call signature unchanged.
++_OWNED_ONLY = ContextVar("fairness_activation_owned_only", default=False)
+ 
+ 
+ def _validate(value, settings, home):
+@@ -135,6 +138,17 @@ def start(config, *, home):
+     settings = resolve(config, home=home)
+     if settings is None:
+         return None
++    # Validate the complete runtime IO contract before reading an arm or creating
++    # an epoch. In particular O_DIRECTORY is first used by the background writer.
++    required = ("O_NONBLOCK", "O_NOFOLLOW", "O_DIRECTORY")
++    if any(not hasattr(os, name) for name in required):
++        raise ValueError("runtime capture requires nonblocking, nofollow and directory IO")
++    try:
++        import fcntl
++    except ImportError as exc:
++        raise ValueError("runtime capture requires advisory file locking") from exc
++    if any(not hasattr(fcntl, name) for name in ("flock", "LOCK_EX", "LOCK_UN")):
++        raise ValueError("runtime capture requires advisory file locking")
+     with _LOCK:
+         try:
+             raw = _read(settings.directory / NAME)
+@@ -146,7 +160,7 @@ def start(config, *, home):
+             raise ValueError("runtime arm budget mismatch")
+         key = runtime._key(value["board"], home)
+         if key in runtime._SESSIONS:
+-            return runtime._SESSIONS[key]
++            return None if _OWNED_ONLY.get() else runtime._SESSIONS[key]
+         session = runtime.activate(config, home=home, board=value["board"],
+                                    source_gateway=value["source_gateway"], board_uid=value["board_uid"],
+                                    clock_error_ns=value["clock_error_ns"])
+@@ -201,9 +215,18 @@ def boot(config=None, *, home=None):
+         return None
+ 
+ 
++def boot_owned(config=None, *, home=None):
++    """Return only an epoch this caller created and therefore may close."""
++    token = _OWNED_ONLY.set(True)
++    try:
++        return boot(config, home=home)
++    finally:
++        _OWNED_ONLY.reset(token)
++
++
+ @contextmanager
+ def serving(config=None, *, home=None):
+-    session = boot(config, home=home)
++    session = boot_owned(config, home=home)
+     try:
+         yield session
+     finally:
+diff --git a/scripts/kanban_fairness.py b/scripts/kanban_fairness.py
+index 4fdd147cef..fa85489b2f 100644
+--- a/scripts/kanban_fairness.py
++++ b/scripts/kanban_fairness.py
+@@ -93,13 +93,26 @@ def _arm(args) -> int:
+     resolve(config)  # Validate the configured ceiling even when runtime capture is off.
+     maximum = config.get("kanban", {}).get("fairness_capture", {}).get("max_bytes", DEFAULTS["max_bytes"])
+     budget.initialize(out, maximum)
++    plan_path = out / PLAN
++    previous = plan_path.read_bytes() if plan_path.exists() else None
+     plan = {"capture_id": args.capture_id, "db": db, "board": args.board, "replica": bool(args.replica),
+             "assumptions": {"clock_error_s": args.clock_error_s, "apply_lag_s": args.apply_lag_s,
+                             "unclaimed_exit": args.unclaimed_exit}}
+-    budget.write(out / PLAN, json.dumps(plan, indent=1, sort_keys=True).encode("utf-8"))
+-    with _connect(db) as conn:
+-        state = journal.arm(conn, args.capture_id, replace=args.replace)
+-        store.drain(conn, out)
++    budget.write(plan_path, json.dumps(plan, indent=1, sort_keys=True).encode("utf-8"))
++    armed = False
++    try:
++        with _connect(db) as conn:
++            state = journal.arm(conn, args.capture_id, replace=args.replace)
++            armed = True
++            store.drain(conn, out)
++    except BaseException:
++        # Budget admission comes first; only roll back before the journal is armed.
++        if not armed:
++            if previous is None:
++                plan_path.unlink(missing_ok=True)
++            else:
++                budget.write(plan_path, previous)
++        raise
+     _emit({"armed": state, "plan": plan, "acceptance_ready": False})
+     return 0
+ 
+diff --git a/tests/gateway/test_kanban_dispatcher_capture_cancel.py b/tests/gateway/test_kanban_dispatcher_capture_cancel.py
+new file mode 100644
+index 0000000000..f708774fa2
+--- /dev/null
++++ b/tests/gateway/test_kanban_dispatcher_capture_cancel.py
+@@ -0,0 +1,271 @@
++"""Dispatcher tenure must close a late capture session and drop the lease.
++
++``asyncio.to_thread`` keeps boot/close running after the waiter is cancelled, so
++moving boot into ``try`` is not enough: the late return value still has to close,
++and ``lease.release`` must run even when close raises or is cancelled.
++"""
++from __future__ import annotations
++
++import asyncio
++from contextvars import ContextVar
++from types import SimpleNamespace
++import threading
++
++import pytest
++
++from gateway import kanban_watchers as watchers
++
++_MARKER = ContextVar("kanban_capture_process_service", default=None)
++
++
++class FakeSession:
++    def __init__(self):
++        self.open = True
++        self.close_calls = 0
++        self.close_contexts = []
++        self.close_threads = []
++
++    def close(self):
++        self.close_calls += 1
++        self.close_contexts.append(_MARKER.get())
++        self.close_threads.append(threading.current_thread().ident)
++        self.open = False
++
++
++class RaisingCloseSession(FakeSession):
++    def close(self):
++        super().close()
++        raise RuntimeError("close failed")
++
++
++class DummyHealth:
++    def __init__(self, *args, **kwargs):
++        pass
++
++    def close(self):
++        pass
++
++    def invalidate(self):
++        pass
++
++    def publish(self, *args, **kwargs):
++        pass
++
++
++class FakeDispatcher:
++    successful_scopes = ()
++
++    def __init__(self, kb, settings):
++        self.runner = None
++
++    def tick_once(self, *, suppress_spawn=False):
++        return []
++
++    def ready_nonempty(self):
++        return False
++
++    def auto_decompose_tick(self, per_tick):
++        return 0
++
++
++def _lease():
++    released = []
++    handle = object()
++    lease = SimpleNamespace(
++        should_yield=lambda: False,
++        handle=handle,
++        release=lambda: released.append(True),
++    )
++    return lease, released
++
++
++def _runner(lease):
++    runner = watchers.GatewayKanbanWatchersMixin()
++    runner._running = True
++    runner._kanban_dispatcher_lease = lease
++    runner._kanban_dispatcher_lock_handle = lease.handle
++    return runner
++
++
++def _patch_loop(monkeypatch, runner, boot=None, dispatcher=None):
++    monkeypatch.setattr("gateway.kanban_dispatcher_health.DispatcherHealth", DummyHealth)
++    if boot is not None:
++        monkeypatch.setattr("hermes_cli.kanban_fairness_activation.boot", boot)
++    monkeypatch.setattr(watchers, "_KanbanDispatcher", dispatcher or FakeDispatcher)
++
++    original_sleep = asyncio.sleep
++
++    async def skip_startup_delay(delay, result=None):
++        if delay == 5:
++            return result
++        return await original_sleep(delay, result)
++
++    monkeypatch.setattr(watchers.asyncio, "sleep", skip_startup_delay)
++
++    async def stop_after_tick(_interval):
++        runner._running = False
++
++    monkeypatch.setattr(runner, "_sleep_until_tick_or_sync_wake", stop_after_tick)
++    monkeypatch.setattr("hermes_cli.kanban_db_dispatch.reap_worker_zombies", list)
++    monkeypatch.setattr("hermes_cli.kanban_hub_cpu_alert.check", lambda: None)
++    monkeypatch.setattr("hermes_cli.kanban_sync_outbox_age.check", lambda: None)
++    monkeypatch.setattr("agent.estop.check_paused", lambda *a, **k: False)
++    monkeypatch.setattr("agent.core_update_drain.check_drain_hold", lambda *a, **k: False)
++
++
++def _held(runner, lease):
++    return runner._kanban_dispatch_while_held(
++        SimpleNamespace(interval=1.0), lambda: {"kanban": {"auto_decompose": False}}, None, lease)
++
++
++async def _expect_cancelled(task):
++    with pytest.raises(asyncio.CancelledError):
++        await task
++
++
++@pytest.mark.platforms("posix")
++def test_serving_then_dispatcher_tenure_does_not_close_borrowed_epoch(tmp_path, monkeypatch):
++    from hermes_cli import kanban_fairness_activation as activation
++    from hermes_cli import kanban_fairness_runtime as runtime
++    from hermes_cli.kanban_fairness_store import load
++    from hermes_cli.kanban_turn_urgency import read_owners
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    config = {"kanban": {"fairness_capture": {
++        "enabled": True, "capture_id": "fixture", "directory": str(tmp_path / "capture"),
++    }}}
++    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
++    activation.arm(config, home=tmp_path, board="default", source_gateway="gw", board_uid="board")
++    lease, released = _lease()
++    runner = _runner(lease)
++    _patch_loop(monkeypatch, runner)
++    close_calls = []
++
++    with activation.serving(config, home=tmp_path) as session:
++        assert session is not None
++        original_close = session.close
++
++        def close():
++            close_calls.append(True)
++            original_close()
++
++        monkeypatch.setattr(session, "close", close)
++        asyncio.run(_held(runner, lease))
++        assert released == [True]
++        assert runner._kanban_dispatcher_lock_handle is None
++        assert close_calls == [], "dispatcher closed an epoch owned by serving"
++        assert not session.stopping.is_set()
++        assert activation.start(config, home=tmp_path) is session
++        assert runtime.enabled(board="default")
++        assert read_owners(board="default", now_s=150, path=tmp_path / "missing") == set()
++    # The serving creator, not the borrowing tenure, owns shutdown.
++    session.activation_monitor.join(3)
++    assert close_calls == [True]
++    assert session.stopping.is_set()
++    assert not runtime.enabled(board="default")
++    records = load(session.out)["records"]
++    assert any(row["kind"] == "owner_generation" and row["payload"]["outcome"] == "missing"
++               for row in records)
++
++
++def test_cancel_during_background_boot_closes_late_session_and_releases_lease(monkeypatch):
++    entered = threading.Barrier(2)
++    proceed = threading.Barrier(2)
++    session = FakeSession()
++    boot_threads = []
++    boot_contexts = []
++
++    def boot(config=None, *, home=None):
++        boot_threads.append(threading.current_thread().ident)
++        boot_contexts.append(_MARKER.get())
++        entered.wait(timeout=5)
++        proceed.wait(timeout=5)
++        return session
++
++    lease, released = _lease()
++    runner = _runner(lease)
++    _patch_loop(monkeypatch, runner, boot)
++    caller = threading.get_ident()
++
++    async def run():
++        _MARKER.set("caller")
++        task = asyncio.create_task(_held(runner, lease))
++        await asyncio.to_thread(entered.wait, 5)
++        task.cancel()
++        await asyncio.sleep(0)
++        await asyncio.gather(_expect_cancelled(task), asyncio.to_thread(proceed.wait, 5))
++
++    asyncio.run(run())
++    assert boot_threads and boot_threads[0] != caller
++    assert boot_contexts == [None]
++    assert session.close_calls == 1
++    assert session.close_contexts == [None]
++    assert session.close_threads and session.close_threads[0] != caller
++    assert not session.open
++    assert released == [True]
++    assert runner._kanban_dispatcher_lock_handle is None
++
++
++def test_boot_raising_releases_lease(monkeypatch):
++    def boot(config=None, *, home=None):
++        raise RuntimeError("boot failed")
++
++    lease, released = _lease()
++    runner = _runner(lease)
++    _patch_loop(monkeypatch, runner, boot)
++
++    with pytest.raises(RuntimeError, match="boot failed"):
++        asyncio.run(_held(runner, lease))
++
++    assert released == [True]
++    assert runner._kanban_dispatcher_lock_handle is None
++
++
++def test_close_raising_releases_lease_and_session_not_open(monkeypatch):
++    session = RaisingCloseSession()
++
++    def boot(config=None, *, home=None):
++        return session
++
++    lease, released = _lease()
++    runner = _runner(lease)
++    _patch_loop(monkeypatch, runner, boot)
++
++    with pytest.raises(RuntimeError, match="close failed"):
++        asyncio.run(_held(runner, lease))
++    assert session.close_calls == 1
++    assert not session.open
++    assert released == [True]
++    assert runner._kanban_dispatcher_lock_handle is None
++
++
++def test_cancel_during_close_releases_lease_and_session_not_open(monkeypatch):
++    entered = threading.Barrier(2)
++    proceed = threading.Barrier(2)
++    session = FakeSession()
++
++    def boot(config=None, *, home=None):
++        return session
++
++    def close():
++        entered.wait(timeout=5)
++        proceed.wait(timeout=5)
++        FakeSession.close(session)
++
++    session.close = close
++    lease, released = _lease()
++    runner = _runner(lease)
++    _patch_loop(monkeypatch, runner, boot)
++
++    async def run():
++        task = asyncio.create_task(_held(runner, lease))
++        await asyncio.to_thread(entered.wait, 5)
++        task.cancel()
++        await asyncio.sleep(0)
++        await asyncio.gather(_expect_cancelled(task), asyncio.to_thread(proceed.wait, 5))
++
++    asyncio.run(run())
++    assert session.close_calls == 1
++    assert not session.open
++    assert released == [True]
++    assert runner._kanban_dispatcher_lock_handle is None
+diff --git a/tests/hermes_cli/test_kanban_fairness_activation_ownership.py b/tests/hermes_cli/test_kanban_fairness_activation_ownership.py
+new file mode 100644
+index 0000000000..a3ca28a194
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_activation_ownership.py
+@@ -0,0 +1,90 @@
++"""Real activation ownership across gateway/CLI dispatch ingress."""
++import asyncio
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_fairness_activation as activation
++from hermes_cli import kanban_fairness_runtime as runtime
++from hermes_cli.kanban_fairness_store import load
++from hermes_cli.kanban_turn_urgency import read_owners
++
++
++@pytest.fixture
++def armed(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    cfg = {"kanban": {"fairness_capture": {"enabled": True, "capture_id": "fixture",
++                                           "directory": str(tmp_path / "capture")}}}
++    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
++    activation.arm(cfg, home=tmp_path, board="default", source_gateway="gw", board_uid="board")
++    session = activation.boot()
++    assert session is not None
++    try:
++        yield session
++    finally:
++        session.close()
++        session.activation_monitor.join(3)
++
++
++def observe_after_nested_service(session, tmp_path):
++    assert not session.stopping.is_set(), "borrowed service closed the gateway epoch"
++    assert activation.start(_config(tmp_path), home=tmp_path) is session
++    assert runtime.enabled(board="default")
++    assert read_owners(board="default", now_s=150, path=tmp_path / "missing") == set()
++    session.close()
++    records = load(session.out)["records"]
++    assert any(row["kind"] == "owner_generation" and row["payload"]["outcome"] == "missing"
++               for row in records)
++
++
++def _config(tmp_path):
++    return {"kanban": {"fairness_capture": {"enabled": True, "capture_id": "fixture",
++                                           "directory": str(tmp_path / "capture")}}}
++
++
++def test_boot_then_nested_serving_preserves_outer_epoch(armed, tmp_path):
++    with activation.serving():
++        with activation.serving():
++            assert runtime.enabled(board="default")
++    observe_after_nested_service(armed, tmp_path)
++
++
++def test_gateway_slash_dispatch_preserves_outer_epoch(armed, tmp_path, monkeypatch):
++    from gateway.slash_commands import GatewaySlashCommandsMixin
++    from hermes_cli import kanban_db_dispatch as dispatch
++
++    seen = []
++
++    def dispatch_work(conn, **kwargs):
++        seen.append(runtime.enabled(board="default"))
++        return dispatch.DispatchResult()
++
++    monkeypatch.setattr(dispatch, "dispatch_once", dispatch_work)
++    event = SimpleNamespace(text="/kanban dispatch --dry-run --json", source=None)
++    output = asyncio.run(GatewaySlashCommandsMixin._handle_kanban_command(object(), event))
++    assert seen == [True], output
++    assert '"spawned"' in output, output
++    observe_after_nested_service(armed, tmp_path)
++
++
++def test_serving_owns_new_epoch_and_closes_it(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    cfg = _config(tmp_path)
++    activation.arm(cfg, home=tmp_path, board="default", source_gateway="gw", board_uid="board")
++    with activation.serving(cfg, home=tmp_path) as session:
++        assert session is not None
++        assert runtime.enabled(board="default")
++        with activation.serving(cfg, home=tmp_path):
++            pass
++        assert runtime.enabled(board="default")
++    assert session.stopping.is_set()
++    session.activation_monitor.join(3)
++
++
++def test_serving_retains_mocked_boot_signature(monkeypatch):
++    closed = []
++    session = SimpleNamespace(close=lambda: closed.append(True))
++    monkeypatch.setattr(activation, "boot", lambda config=None, *, home=None: session)
++    with activation.serving() as result:
++        assert result is session
++    assert closed == [True]
+diff --git a/tests/hermes_cli/test_kanban_fairness_activation_platform.py b/tests/hermes_cli/test_kanban_fairness_activation_platform.py
+new file mode 100644
+index 0000000000..8e5c99c11f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_activation_platform.py
+@@ -0,0 +1,33 @@
++"""Unsupported capture prerequisites must not interrupt normal startup."""
++import logging
++import os
++import sys
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_fairness_activation as activation
++from hermes_cli import kanban_fairness_runtime as runtime
++
++
++@pytest.mark.parametrize("missing", ["O_NONBLOCK", "O_NOFOLLOW", "O_DIRECTORY", "fcntl"])
++@pytest.mark.parametrize("enabled", [True, False])
++def test_boot_checks_platform_before_capture_io(tmp_path, monkeypatch, caplog, missing, enabled):
++    cfg = {"kanban": {"fairness_capture": {"enabled": enabled, "capture_id": "fixture",
++                                           "directory": str(tmp_path / "capture")}}}
++    if missing == "fcntl":
++        monkeypatch.setitem(sys.modules, "fcntl", None)
++    else:
++        # Do not remove flags from the global os module used by pytest/pathlib.
++        proxy = SimpleNamespace(**{key: value for key, value in vars(os).items() if key != missing})
++        monkeypatch.setattr(activation, "os", proxy)
++    monkeypatch.setattr(activation, "_read", lambda *a: pytest.fail("capture IO before prerequisites"))
++    monkeypatch.setattr(runtime, "activate", lambda *a, **kw: pytest.fail("unsupported session created"))
++    with caplog.at_level(logging.WARNING, logger=activation.__name__):
++        assert activation.boot(cfg, home=tmp_path) is None
++    assert not (tmp_path / "capture").exists()
++    messages = [record.message for record in caplog.records if record.name == activation.__name__]
++    if enabled:
++        assert any("fairness runtime startup incomplete" in message for message in messages)
++    else:
++        assert messages == []
+diff --git a/tests/hermes_cli/test_kanban_fairness_arm_rollback.py b/tests/hermes_cli/test_kanban_fairness_arm_rollback.py
+new file mode 100644
+index 0000000000..f4b72c2ed7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_arm_rollback.py
+@@ -0,0 +1,91 @@
++"""A refused `capture arm` must not leave its plan.json behind (or clobber the previous one)."""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_fairness_budget as budget
++from hermes_cli import kanban_fairness_journal as journal
++from scripts import kanban_fairness as cli
++from scripts.kanban_fairness import PLAN, main
++
++
++@pytest.fixture
++def db(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    return str(kb.kanban_db_path())
++
++
++def _arm(db, out, capture_id, *extra):
++    return main(["capture", "arm", "--out", str(out), "--capture-id", capture_id, "--db", db, *extra])
++
++
++def _journal_state(db):
++    with kbc.connect_closing(Path(db)) as conn:
++        return journal.status(conn)
++
++
++def test_refused_arm_removes_the_new_plan_and_keeps_existing_journal(db, tmp_path, capsys):
++    first = tmp_path / "first"
++    assert _arm(db, first, "one") == 0
++    before = _journal_state(db)
++    second = tmp_path / "second"
++    # Budget initialization intentionally precedes journal admission.
++    budget.initialize(second)
++    contents = _directory_bytes(second)
++    assert _arm(db, second, "two") == 3
++    assert "JournalError" in capsys.readouterr().err
++    assert not (second / PLAN).exists()
++    assert _directory_bytes(second) == contents
++    assert _journal_state(db) == before
++    assert json.loads((first / PLAN).read_text())["capture_id"] == "one"
++
++
++def _directory_bytes(out):
++    return {path.relative_to(out): path.read_bytes() for path in out.rglob("*") if path.is_file()}
++
++
++def test_connect_failure_removes_plan_and_keeps_journal(db, tmp_path, monkeypatch):
++    out = tmp_path / "out"
++    before = _journal_state(db)
++    budget.initialize(out)
++    contents = _directory_bytes(out)
++
++    def fail_connect(db):
++        raise OSError("connection failed")
++
++    monkeypatch.setattr(cli, "_connect", fail_connect)
++    assert _arm(db, out, "one") == 3
++    assert not (out / PLAN).exists()
++    assert _directory_bytes(out) == contents
++    assert _journal_state(db) == before
++
++
++def test_drain_failure_preserves_successfully_armed_plan(db, tmp_path, monkeypatch):
++    out = tmp_path / "out"
++
++    def fail_drain(conn, out):
++        raise OSError("drain failed")
++
++    monkeypatch.setattr(cli.store, "drain", fail_drain)
++    assert _arm(db, out, "one") == 3
++    assert json.loads((out / PLAN).read_text())["capture_id"] == "one"
++    assert _journal_state(db)["capture_id"] == "one"
++
++
++def test_refused_replacement_restores_the_prior_plan(db, tmp_path):
++    out = tmp_path / "out"
++    assert _arm(db, out, "one") == 0
++    prior = (out / PLAN).read_bytes()
++    before = _journal_state(db)
++    assert _arm(db, out, "bad id!", "--replace") == 3
++    assert (out / PLAN).read_bytes() == prior
++    assert _journal_state(db) == before
+diff --git a/tests/hermes_cli/test_kanban_fairness_review_clauses.py b/tests/hermes_cli/test_kanban_fairness_review_clauses.py
+new file mode 100644
+index 0000000000..adbe0adf19
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_review_clauses.py
+@@ -0,0 +1,84 @@
++"""Mutation-killing clauses: writer-final custody, export-vs-arm, arm budget binding."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_fairness_activation as activation
++from hermes_cli import kanban_fairness_budget as budget
++from hermes_cli import kanban_fairness_root as assembly
++from hermes_cli import kanban_fairness_runtime as runtime
++
++
++def cfg(tmp_path):
++    return {"kanban": {"fairness_capture": {"enabled": True, "capture_id": "fixture",
++                                           "directory": str(tmp_path / "capture")}}}
++
++
++def _stop_writer_without_begin_close(session, **custody):
++    """Stop the writer directly so only its own final check can observe custody."""
++    if "producers" in custody:
++        session.producers[object()] = True
++    if "readers" in custody:
++        session.readers = 1
++    session.stopping.set()
++    session.wake.set()
++    session.thread.join(5)
++    assert not session.thread.is_alive()
++
++
++@pytest.mark.parametrize("custody", ["producers", "readers"])
++def test_writer_final_abandons_when_custody_remains(tmp_path, monkeypatch, custody):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    session = runtime.activate(cfg(tmp_path), home=tmp_path, board="default",
++                               source_gateway="gw", board_uid="board", clock_error_ns=0)
++    assert session is not None
++    try:
++        _stop_writer_without_begin_close(session, **{custody: True})
++        assert session.abandoned.is_set()
++    finally:
++        session.producers.clear()
++        session.readers = 0
++        session.close()
++
++
++def test_writer_final_without_custody_is_not_abandoned(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    session = runtime.activate(cfg(tmp_path), home=tmp_path, board="default",
++                               source_gateway="gw", board_uid="board", clock_error_ns=0)
++    assert session is not None
++    try:
++        _stop_writer_without_begin_close(session)
++        assert not session.abandoned.is_set()
++    finally:
++        session.close()
++
++
++def test_export_refused_while_runtime_arm_exists(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    session = runtime.activate(cfg(tmp_path), home=tmp_path, board="default",
++                               source_gateway="gw", board_uid="board", clock_error_ns=0)
++    assert session.enqueue("loss", session.loss_payload("redaction", 1))
++    assert session.close()
++    root = session.out.parent.parent
++    target = tmp_path / "out.tar.gz"
++    (root / "runtime-arm.json").write_text("{}")
++    with pytest.raises(ValueError, match="disarm runtime capture before export"):
++        assembly.export(root, target)
++    assert not target.exists()
++    assert not list(tmp_path.glob("out.tar.gz.*.tmp"))
++    (root / "runtime-arm.json").unlink()
++    assembly.export(root, target)
++    assert target.exists()
++
++
++def test_start_rejects_budget_limit_mismatch(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    config = cfg(tmp_path)
++    activation.arm(config, home=tmp_path, board="default", source_gateway="gw", board_uid="board")
++    directory = tmp_path / "capture"
++    meta = directory / budget.NAME
++    meta.write_text(json.dumps({"version": 1, "max_bytes": budget._limit(directory) - 1}))
++    monkeypatch.setattr(runtime, "activate", lambda *a, **kw: pytest.fail("must not activate"))
++    with pytest.raises(ValueError, match="runtime arm budget mismatch"):
++        activation.start(config, home=tmp_path)
++    assert not (directory / "runtime").exists()
+-- 
+2.43.0
+

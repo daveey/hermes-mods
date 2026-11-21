@@ -1,0 +1,132 @@
+From feefa59f16a43ffb7e148a3b9e51957e4043f26f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 04:03:32 +0000
+Subject: [PATCH] fix(kanban): pin home overdue membership outside checkpoint
+ prose [daveey]
+
+Address independent review of PR #3719: a listing-shaped checkpoint or
+newline in a title defeated the listing parser and minted another incident.
+New incidents use a detector-owned first-line JSON membership marker;
+legacy incidents retain the anchored listing fallback.
+
+RED: both checkpoint/title regressions fail on 73c4f9bb91de.
+GREEN: full home observer suite passes, including second closed cycle,
+exact cooldown expiry, malformed markers and legacy membership parsing.
+Archive-without-completed_at intentionally covers the same set indefinitely.
+---
+ hermes_cli/kanban_pickup_stall_home.py        | 16 +++++--
+ .../test_kanban_pickup_stall_home.py          | 44 +++++++++++++++++++
+ 2 files changed, 57 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_pickup_stall_home.py b/hermes_cli/kanban_pickup_stall_home.py
+index 8d23b601f3..d48ea71ee4 100644
+--- a/hermes_cli/kanban_pickup_stall_home.py
++++ b/hermes_cli/kanban_pickup_stall_home.py
+@@ -6,6 +6,7 @@ Only the hub files: alarm provenance names the observer, not the stopped home.
+ """
+ from __future__ import annotations
+ 
++import json
+ import re
+ import sqlite3
+ import time
+@@ -147,15 +148,23 @@ def _fresh(replica, now: float) -> bool:
+ # Pick: a closed incident keeps covering the same home and same overdue membership for 12 h (the repair
+ # completes after a no-op inspect, so the 1 h REPLACE_AFTER_SECONDS floor still minted ~24 cards/day for a
+ # silent example host; 12 h gives <= 2/day). A changed membership files a fresh incident at once.
+-# Open incidents always win over a closed sibling. Membership is the listing line we write
+-# (`- <id> (<title>), <status>, N minutes overdue`), not every `- token (` in checkpoint prose.
+-# archive_task leaves completed_at NULL; do not start the 12 h clock at created_at.
++# Open incidents always win over a closed sibling. New bodies carry membership on their first
++# line, before all title/checkpoint prose. The listing parser is only for legacy incidents.
++# archive_task leaves completed_at NULL; such incidents cover indefinitely until membership changes.
+ HOME_REPLACE_AFTER_SECONDS = 12 * 3600
++_MEMBERS = "Home-overdue membership v1: "
+ _LISTED = re.compile(
+     r"^- (\S+) \(.*\), (?:scheduled|todo), \d+ minutes overdue", re.MULTILINE)
+ 
+ 
+ def _listed_ids(body: str) -> set[str]:
++    first = (body or "").partition("\n")[0]
++    if first.startswith(_MEMBERS):
++        try:
++            members = json.loads(first[len(_MEMBERS):])
++        except ValueError:
++            return set()
++        return set(members) if isinstance(members, list) and all(isinstance(x, str) for x in members) else set()
+     return set(_LISTED.findall(body or ""))
+ 
+ 
+@@ -195,6 +204,7 @@ def sweep(conn, replica, own: str, *, now_ms: int) -> list[str]:
+                 f"greater than 30 minutes. {cards[0]['home_evidence']}. A todo clock starts when the "
+                 "last parent completed; a scheduled clock uses its current wake/backstop.\n\n" + listed
+                 + "\n\n" + HOWTO)
++        body = _MEMBERS + json.dumps(sorted(c["id"] for c in cards)) + "\n\n" + body
+         key = f"{kps.KEY_PREFIX}{own}:home-overdue-{home}:"
+         if not kps._covering_repair(conn, key, now_ms):
+             recent = _recently_closed(conn, key, [c["id"] for c in cards], now_ms)
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_home.py b/tests/hermes_cli/test_kanban_pickup_stall_home.py
+index f41c14e226..71aa156b22 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_home.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_home.py
+@@ -218,6 +218,34 @@ def test_closed_incident_does_not_respawn_every_tick(replica, local):
+     assert local.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+ 
+ 
++def test_second_closed_incident_covers_next_cycle(replica, local):
++    card(replica, "one")
++    [first] = subject.sweep(local, replica, "hub", now_ms=NOW * 1000)
++    _close(local, first, NOW)
++    at = NOW + subject.HOME_REPLACE_AFTER_SECONDS
++    _fresh_at(replica, at - 1)
++    assert subject.sweep(local, replica, "hub", now_ms=(at - 1) * 1000) == [first]
++    _fresh_at(replica, at)
++    [second] = subject.sweep(local, replica, "hub", now_ms=at * 1000)
++    assert second != first
++    _close(local, second, at)
++    _fresh_at(replica, at + 60)
++    assert subject.sweep(local, replica, "hub", now_ms=(at + 60) * 1000) == [second]
++    assert local.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
++
++
++@pytest.mark.parametrize("payload", ['["one"]', 'not-json', '{}', '[[]]', '[1]'])
++def test_membership_marker_is_validated(payload):
++    body = "Home-overdue membership v1: " + payload + "\n- ghost (title), todo, 45 minutes overdue"
++    assert subject._listed_ids(body) == ({"one"} if payload == '["one"]' else set())
++
++
++def test_legacy_membership_listing_remains_readable():
++    assert subject._listed_ids(
++        "Home-owned transitions overdue\n- one (title), todo, 45 minutes overdue\n- tests (12 passed)"
++    ) == {"one"}
++
++
+ def test_closed_incident_is_replaced_when_membership_changes(replica, local):
+     card(replica, "one")
+     [first] = subject.sweep(local, replica, "hub", now_ms=NOW * 1000)
+@@ -244,6 +272,22 @@ def test_closed_incident_membership_ignores_checkpoint_bullets(replica, local):
+     assert local.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+ 
+ 
++@pytest.mark.parametrize("shape", ["checkpoint", "title"])
++def test_closed_membership_is_not_derived_from_prose(replica, local, shape):
++    card(replica, "one")
++    if shape == "checkpoint":
++        replica.execute(
++            "INSERT INTO task_runs VALUES (1, 'one', 'continued', ?, ?)",
++            ("quoted incident:\n- ghost (ghost title), todo, 45 minutes overdue (since x)", NOW),
++        )
++    else:
++        replica.execute("UPDATE tasks SET title=? WHERE id='one'", ("multiline\ntitle",))
++    [first] = subject.sweep(local, replica, "hub", now_ms=NOW * 1000)
++    _close(local, first, NOW)
++    assert subject.sweep(local, replica, "hub", now_ms=(NOW + 60) * 1000) == [first]
++    assert local.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
++
++
+ def test_open_incident_observed_even_when_closed_sibling_matches(replica, local):
+     card(replica, "one")
+     [open_id] = subject.sweep(local, replica, "hub", now_ms=NOW * 1000)
+-- 
+2.43.0
+

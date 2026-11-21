@@ -1,0 +1,78 @@
+From e6f512f8968dcde6e708e21cd7b624fc3abb9119 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 02:56:17 +0000
+Subject: [PATCH] fix(update): the clone snapshot never checkpoints state.db on
+ close [daveey]
+
+As the last connection to state.db, the clone path's lock connection would
+checkpoint the whole WAL into state.db when it closed: a write the snapshot
+must not make. SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE (Python 3.12+) turns it off;
+a test proves state.db's bytes are unchanged. Also marks the -wal clone for
+the sidecar check (SQLite never locks the -wal) and a ruff nit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/backup_sqlite.py                   |  5 +++++
+ .../test_backup_preflight_progress.py         | 22 ++++++++++++++++++-
+ 2 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/backup_sqlite.py b/hermes_cli/backup_sqlite.py
+index e5f20af0ec..6d556d75a1 100644
+--- a/hermes_cli/backup_sqlite.py
++++ b/hermes_cli/backup_sqlite.py
+@@ -386,10 +386,15 @@ def _clone_snapshot(source: Path, staged: Path) -> dict:
+             source_fd = os.open(source, os.O_RDONLY)  # sqlite-sidecar-open: ok — opened before and closed after the lock connection
+         lock = sqlite3.connect(str(source), timeout=_CLONE_LOCK_WAIT_SECONDS, isolation_level=None,
+                                check_same_thread=False)
++        # As the last connection to close, SQLite would checkpoint the whole WAL into state.db: a
++        # write the snapshot has no business making (Python 3.12+ can turn it off).
++        if hasattr(lock, "setconfig") and hasattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE"):
++            lock.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
+         lock.execute("BEGIN IMMEDIATE")
+         locked_at = time.monotonic()
+         _clone_file(source, staged, source_fd)
+         if wal_mode and Path(f"{source}-wal").exists():
++            # sqlite-sidecar-open: ok — SQLite never locks the -wal itself (WAL locks live in -shm and state.db)
+             _clone_file(Path(f"{source}-wal"), Path(f"{staged}-wal"))
+         lock_ms = (time.monotonic() - locked_at) * 1000
+     finally:
+diff --git a/tests/hermes_cli/test_backup_preflight_progress.py b/tests/hermes_cli/test_backup_preflight_progress.py
+index 4064c0ed4f..fef5daa514 100644
+--- a/tests/hermes_cli/test_backup_preflight_progress.py
++++ b/tests/hermes_cli/test_backup_preflight_progress.py
+@@ -108,7 +108,7 @@ def test_reporter_throttles_to_two_lines_a_second_and_always_writes_the_final_li
+     now = [100.0]
+     out = io.StringIO()
+     reporter = _ProgressReporter(out, clock=lambda: now[0])
+-    for done in range(0, 100):
++    for done in range(100):
+         reporter.progress(done, 1000, method="copy")
+         now[0] += 0.004  # 100 updates in 0.4 s
+     assert len(out.getvalue().splitlines()) == 1
+@@ -316,3 +316,23 @@ def test_the_clone_path_can_be_turned_off(tmp_path, monkeypatch):
+     monkeypatch.setattr(backup_sqlite, "_clone_file", must_not_clone)
+     monkeypatch.setenv("HERMES_PREFLIGHT_CLONE", "0")
+     assert backup_sqlite.preflight_state_db(home, clone=True)["method"] == "copy"
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.skipif(not hasattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE"), reason="needs Python 3.12+")
++def test_the_clone_never_writes_the_source_database(clone_base):
++    """The lock connection may be the last one on state.db; closing it must not fold the WAL in."""
++    home = _home(clone_base, 20)
++    db = home / "state.db"
++    writer = _wal_writer(db)
++    writer.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
++    writer.execute("INSERT INTO messages VALUES ('only in the WAL')")
++    writer.close()
++    assert Path(f"{db}-wal").stat().st_size > 0
++    before = db.read_bytes()
++
++    result, _events_seen, _elapsed = _run(home)
++
++    assert result["method"] == "clone"
++    assert db.read_bytes() == before
++    assert _snapshot_rows(result["path"])[-1] == ("only in the WAL",)
+-- 
+2.43.0
+

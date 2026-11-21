@@ -1,0 +1,121 @@
+From 32eeb4cdf6a88cf254b94c0bb29ef2192d9e88e9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 14:24:38 +0000
+Subject: [PATCH] fix(kanban): a finished Actions run with no jobs reports its
+ own result [daveey]
+
+Review 5994010599 of PR #3745 at cecfdccd: `_run_job` returned "queued / no jobs created yet" for an empty
+jobs list before reading the run. A run that finishes without creating a job (real example: cancelled run
+44729813864 lists zero jobs) therefore stayed "queued" for ever: its card was never woken and the sweep never
+read the run.
+
+Why: the empty-list case was treated as proof the run had not started, but only the run's own status says so.
+`_run_job` now reads the run when the jobs list is empty as well as when every job is complete. A completed
+run returns its terminal result (cancelled, failed, succeeded; an unrecognised conclusion stays unknown and
+does not wake). Only a run that is not completed stays "queued / no jobs created yet". Cost: one extra run
+read per poll for a run that has no jobs yet.
+
+Proof: tests/hermes_cli/test_kanban_external_review4.py, 8 cases through the public `kcp.sweep` wake path,
+started from the reviewer's repro. On cecfdccd 4 fail (cancelled, failure, success and unknown-conclusion
+with jobs=[]) and the 4 queued controls pass; all 8 pass here. A mutant that reports an unfinished empty run
+as "running" fails the 4 controls. All 255 test files referencing the external/ci_progress/wake_check/
+wait_info/session_activity modules: 4970 passed, 1 skipped.
+---
+ hermes_cli/kanban_external_adapters/github.py |  7 +--
+ .../test_kanban_external_review4.py           | 57 +++++++++++++++++++
+ 2 files changed, 60 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_external_review4.py
+
+diff --git a/hermes_cli/kanban_external_adapters/github.py b/hermes_cli/kanban_external_adapters/github.py
+index a44ecb4186..16518644d4 100644
+--- a/hermes_cli/kanban_external_adapters/github.py
++++ b/hermes_cli/kanban_external_adapters/github.py
+@@ -95,19 +95,18 @@ def _conclusion_job(conclusion: Optional[str]) -> str:
+ 
+ 
+ def _run_job(jobs: list, repo: str, run_id: str, fetch_run: Optional[Callable]) -> tuple[str, str]:
+-    """``(job state, detail)`` of a run from its listed jobs; the run's own read confirms a finished one."""
++    """``(job state, detail)`` of a run from its listed jobs; the run's own read decides a finished or empty one."""
+     running = [j for j in jobs if isinstance(j, dict) and j.get("status") == "in_progress"]
+     if running:
+         return "running", f"job '{running[0].get('name') or 'job'}' running"
+     unfinished = [j for j in jobs if isinstance(j, dict) and j.get("status") != "completed"]
+-    if not jobs:
+-        return "queued", "no jobs created yet"
+     if unfinished:
+         started = len(jobs) > len(unfinished)
+         return ("running", "waiting on later jobs") if started else ("queued", "queued, no runner yet")
+     run = (fetch_run or (lambda r, i: kcp._gh_api(f"repos/{r}/actions/runs/{i}")))(repo, run_id) or {}
+     if run.get("status") != "completed":
+-        return "running", "finishing up"
++        # A run cancelled before any job was created lists none and is still finished: only its own read tells.
++        return ("running", "finishing up") if jobs else ("queued", "no jobs created yet")
+     job = _conclusion_job(run.get("conclusion"))
+     return job, f"run {run.get('conclusion') or 'finished'}"
+ 
+diff --git a/tests/hermes_cli/test_kanban_external_review4.py b/tests/hermes_cli/test_kanban_external_review4.py
+new file mode 100644
+index 0000000000..2662667b05
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_external_review4.py
+@@ -0,0 +1,57 @@
++"""A finished Actions run may list no jobs (cancelled before any was created): its own result wakes the card."""
++import pytest
++
++from hermes_cli import kanban_ci_progress as kcp
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_external_watch as kew
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli import test_kanban_external_watch as h
++
++kanban_home, clock = h.kanban_home, h.clock
++
++
++def _no_jobs(repo, run_id):
++    return {"total_count": 0, "jobs": []}
++
++
++@pytest.mark.parametrize("conclusion,outcome", [
++    ("cancelled", "cancelled"), ("failure", "failed"), ("success", "succeeded"),
++])
++def test_completed_run_without_jobs_wakes_with_its_result(kanban_home, clock, conclusion, outcome):
++    reads = []
++
++    def fetch_run(repo, run_id):
++        reads.append(run_id)
++        return {"status": "completed", "conclusion": conclusion}
++
++    with kbc.connect_closing() as conn:
++        tid = h.park(conn, 9101)
++        woke = kcp.sweep(conn, fetch=_no_jobs, fetch_run=fetch_run, fetch_runners=lambda repo: [])
++        assert reads == ["9101"]
++        assert woke == [tid]
++        assert h.status(conn, tid) == "ready"
++        assert h.events(conn, tid, kew.WATCH_EVENT)[-1]["job"] == outcome
++        assert h.events(conn, tid, kwc.CONDITION_MET_EVENT)[-1]["external_result"]["outcome"] == outcome
++
++
++@pytest.mark.parametrize("run_status", ["queued", "in_progress", "pending", None])
++def test_unfinished_run_without_jobs_stays_queued(kanban_home, clock, run_status):
++    with kbc.connect_closing() as conn:
++        tid = h.park(conn, 9102)
++        woke = kcp.sweep(conn, fetch=_no_jobs, fetch_runners=lambda repo: [],
++                         fetch_run=lambda repo, run_id: {"status": run_status, "conclusion": None})
++        assert woke == []
++        assert h.status(conn, tid) == "scheduled"
++        rec = h.events(conn, tid, kew.WATCH_EVENT)[-1]
++        assert (rec["job"], rec["detail"]) == ("queued", "no jobs created yet")
++        assert not h.events(conn, tid, kwc.CONDITION_MET_EVENT)
++
++
++def test_completed_run_without_jobs_and_no_known_result_stays_parked(kanban_home, clock):
++    with kbc.connect_closing() as conn:
++        tid = h.park(conn, 9103)
++        woke = kcp.sweep(conn, fetch=_no_jobs, fetch_runners=lambda repo: [],
++                         fetch_run=lambda repo, run_id: {"status": "completed", "conclusion": None})
++        assert woke == []
++        assert h.status(conn, tid) == "scheduled"
++        assert h.events(conn, tid, kew.WATCH_EVENT)[-1]["job"] == "unknown"
+-- 
+2.43.0
+

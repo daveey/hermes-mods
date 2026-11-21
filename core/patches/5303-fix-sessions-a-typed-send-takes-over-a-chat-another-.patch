@@ -1,0 +1,671 @@
+From db539bce7aa294585540f0c46d017cd118164302 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 21:34:35 +0000
+Subject: [PATCH] fix(sessions): a typed send takes over a chat another window
+ holds only for a background turn [daveey]
+
+An idle second Desktop (the always-on Mac mini) keeps chats loaded on its hub backend. After every
+hub core update the MacBook backend restarts and drops its lease; the next Kanban notice, finished
+background process or post-update continuation then runs in the mini backend, which takes the chat.
+The user typing on the MacBook got "This chat is open somewhere else" several times a day.
+
+prompt.submit now flags such a SESSION_NOT_OWNED refusal auto_take_over (with holder_turn_kind) when
+the chat's newest live user row was started by Hermes: the turn-starting notice kinds
+(agent.context_compressor_turns, minus the user's own loop_tick) plus auto_continue, including
+untyped continuation notes recognised by their prefix as history does. The Desktop card then runs
+its existing Take over here flow (session.take_over, transcript refresh, re-send) by itself, once
+per fresh card: a card older than 30 s (a reopened chat) or a chat auto-taken in the last 2 min
+waits for the click, so two windows cannot bounce a chat. A chat whose newest turn someone typed,
+hidden/hosted sends and other refusals keep the card.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../use-prompt-actions/auto-take-over.test.ts |  98 +++++++++
+ .../hooks/use-prompt-actions/submit.ts        |   4 +-
+ .../session/hooks/use-prompt-actions/utils.ts |  23 ++-
+ .../thread/assistant-message.test.tsx         |  63 ++++++
+ .../assistant-ui/thread/assistant-message.tsx |  50 ++++-
+ apps/desktop/src/lib/error-surface.ts         |   6 +
+ .../test_automation_holder_takeover.py        | 187 ++++++++++++++++++
+ tui_gateway/methods_prompt.py                 |   8 +-
+ tui_gateway/session_lifecycle.py              |  49 +++++
+ 9 files changed, 481 insertions(+), 7 deletions(-)
+ create mode 100644 apps/desktop/src/app/session/hooks/use-prompt-actions/auto-take-over.test.ts
+ create mode 100644 tests/tui_gateway/test_automation_holder_takeover.py
+
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/auto-take-over.test.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/auto-take-over.test.ts
+new file mode 100644
+index 0000000000..a1066cea5b
+--- /dev/null
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/auto-take-over.test.ts
+@@ -0,0 +1,98 @@
++import { JsonRpcGatewayError } from '@hermes/shared'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import {
++  AUTO_TAKE_OVER_COOLDOWN_MS,
++  AUTO_TAKE_OVER_FRESH_MS,
++  resetAutoTakeOverForTests,
++  shouldAutoTakeOver
++} from '@/components/assistant-ui/thread/assistant-message'
++import type { ErrorSurface } from '@/lib/error-surface'
++
++import { autoTakeOverFields, ownershipErrorSurface, sessionNotOwnedErrorSurface } from './utils'
++
++// [daveey] A typed send refused because another backend holds the chat only for a turn Hermes started
++// itself (auto_take_over) takes the chat over on its own, once per fresh card.
++
++const refused = (data: Record<string, unknown>) =>
++  new JsonRpcGatewayError('This chat is active in another Hermes window/terminal.', { code: 4090, data })
++
++const surface = (refusedAt: number): ErrorSurface => ({
++  layer: 'gateway',
++  code: 'SESSION_NOT_OWNED',
++  retryable: false,
++  autoTakeOver: true,
++  refusedAt
++})
++
++afterEach(() => {
++  resetAutoTakeOverForTests()
++  vi.useRealTimers()
++})
++
++describe('autoTakeOverFields', () => {
++  it('stamps a flagged refusal with when it happened', () => {
++    vi.useFakeTimers()
++    vi.setSystemTime(1_000_000)
++    expect(autoTakeOverFields(refused({ reason: 'SESSION_NOT_OWNED', auto_take_over: true }))).toEqual({
++      autoTakeOver: true,
++      refusedAt: 1_000_000
++    })
++    expect(ownershipErrorSurface(refused({ reason: 'SESSION_NOT_OWNED', auto_take_over: true })).errorSurface).toEqual(
++      { layer: 'gateway', code: 'SESSION_NOT_OWNED', retryable: false, autoTakeOver: true, refusedAt: 1_000_000 }
++    )
++  })
++
++  it('stamps the surface submit puts on the card (owner from the Details line, plus the flag)', () => {
++    vi.useFakeTimers()
++    vi.setSystemTime(2_000_000)
++
++    const err = new JsonRpcGatewayError(
++      'This chat is active in another Hermes window/terminal.\nDetails: session s1 opened by desktop on demo-b-mini 4m ago.',
++      { code: 4090, data: { reason: 'SESSION_NOT_OWNED', auto_take_over: true, holder_turn_kind: 'kanban_notice' } }
++    )
++
++    expect(sessionNotOwnedErrorSurface(err, 'fallback')).toEqual({
++      layer: 'gateway',
++      code: 'SESSION_NOT_OWNED',
++      retryable: false,
++      owner: { surface: 'desktop', host: 'demo-b-mini', age: '4m' },
++      autoTakeOver: true,
++      refusedAt: 2_000_000
++    })
++    expect(
++      sessionNotOwnedErrorSurface(refused({ reason: 'SESSION_NOT_OWNED' }), 'fallback').autoTakeOver
++    ).toBeUndefined()
++  })
++
++  it('leaves an unflagged or foreign error alone', () => {
++    expect(autoTakeOverFields(refused({ reason: 'SESSION_NOT_OWNED' }))).toEqual({})
++    expect(autoTakeOverFields(refused({ reason: 'SESSION_NOT_OWNED', auto_take_over: 'yes' }))).toEqual({})
++    expect(autoTakeOverFields(new Error('auto_take_over'))).toEqual({})
++  })
++})
++
++describe('shouldAutoTakeOver', () => {
++  it('acts once on a fresh flagged card', () => {
++    expect(shouldAutoTakeOver(surface(1000), 'rt-1', 1000 + 500)).toBe(true)
++  })
++
++  it('never acts on an unflagged card, a missing session or an unstamped card', () => {
++    expect(shouldAutoTakeOver({ ...surface(1000), autoTakeOver: false }, 'rt-1', 1000)).toBe(false)
++    expect(shouldAutoTakeOver(surface(1000), null, 1000)).toBe(false)
++    expect(shouldAutoTakeOver({ ...surface(1000), refusedAt: undefined }, 'rt-1', 1000)).toBe(false)
++    expect(shouldAutoTakeOver(undefined, 'rt-1', 1000)).toBe(false)
++  })
++
++  it('leaves a stale card (a reopened transcript) to the button', () => {
++    expect(shouldAutoTakeOver(surface(1000), 'rt-1', 1000 + AUTO_TAKE_OVER_FRESH_MS + 1)).toBe(false)
++  })
++
++  it('does not bounce a chat the holder grabbed back within the cooldown', () => {
++    expect(shouldAutoTakeOver(surface(1000), 'rt-1', 1000)).toBe(true)
++    expect(shouldAutoTakeOver(surface(5000), 'rt-1', 5000)).toBe(false)
++    expect(shouldAutoTakeOver(surface(5000), 'rt-2', 5000)).toBe(true)
++    const later = 1000 + AUTO_TAKE_OVER_COOLDOWN_MS + 1
++    expect(shouldAutoTakeOver(surface(later), 'rt-1', later)).toBe(true)
++  })
++})
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+index a71866f09d..2afe9f45ee 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/submit.ts
+@@ -6,7 +6,6 @@ import { translateNow, type Translations } from '@/i18n'
+ import { type ChatMessage, finalizeInterruptedMessages, textPart } from '@/lib/chat-messages'
+ import { optimisticAttachmentRef } from '@/lib/chat-runtime'
+ import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
+-import { sessionNotOwnedSurface } from '@/lib/error-surface'
+ import { setMutableRef } from '@/lib/mutable-ref'
+ import { credentialFailureMetadata } from '@/lib/provider-setup-errors'
+ import {
+@@ -83,6 +82,7 @@ import {
+   ownershipErrorSurface,
+   refusalDroppedImages,
+   releaseSubmitInFlight,
++  sessionNotOwnedErrorSurface,
+   SessionRecoveryAborted,
+   type SubmitTextOptions,
+   withSessionBusyRetry,
+@@ -1532,7 +1532,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
+                 // Another surface owns the session: carry its parsed owner [daveey]
+                 // onto the SESSION_NOT_OWNED card (Take over here names it).
+                 ...(isSessionNotOwnedError(err)
+-                  ? { errorSurface: sessionNotOwnedSurface(err instanceof Error ? err.message : message) }
++                  ? { errorSurface: sessionNotOwnedErrorSurface(err, message) }
+                   : ownershipErrorSurface(err)),
+                 branchGroupId: state.pendingBranchGroup ?? undefined,
+                 completedAt: occurredAt,
+diff --git a/apps/desktop/src/app/session/hooks/use-prompt-actions/utils.ts b/apps/desktop/src/app/session/hooks/use-prompt-actions/utils.ts
+index 4eb6f6e533..b4ec9fb0f9 100644
+--- a/apps/desktop/src/app/session/hooks/use-prompt-actions/utils.ts
++++ b/apps/desktop/src/app/session/hooks/use-prompt-actions/utils.ts
+@@ -5,7 +5,7 @@ import { translateNow, type Translations } from '@/i18n'
+ import type { ChatMessage } from '@/lib/chat-messages'
+ import { isReadFileErrorResult } from '@/lib/desktop-fs'
+ import { type CommandsCatalogLike, filterDesktopCommandsCatalog } from '@/lib/desktop-slash-commands'
+-import type { ErrorSurface } from '@/lib/error-surface'
++import { type ErrorSurface, sessionNotOwnedSurface } from '@/lib/error-surface'
+ import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
+ import type { ComposerAttachment } from '@/store/composer'
+ 
+@@ -339,6 +339,23 @@ export function refusalDroppedImages(error: unknown): boolean {
+   )
+ }
+ 
++/** SESSION_NOT_OWNED fields for a refusal the backend flagged `auto_take_over` (the holder is only
++ *  running a turn Hermes started itself): the card takes the chat over on its own. [daveey] */
++export function autoTakeOverFields(error: unknown): { autoTakeOver?: true; refusedAt?: number } {
++  const data = error instanceof JsonRpcGatewayError ? (error.data as { auto_take_over?: unknown } | undefined) : null
++
++  return data?.auto_take_over === true ? { autoTakeOver: true, refusedAt: Date.now() } : {}
++}
++
++/** The card surface submit stamps on a SESSION_NOT_OWNED refusal: the owner its text names, plus the
++ *  auto-take-over stamp when the backend flagged it. [daveey] */
++export function sessionNotOwnedErrorSurface(error: unknown, fallbackText: string): ErrorSurface {
++  return {
++    ...sessionNotOwnedSurface(error instanceof Error ? error.message : fallbackText),
++    ...autoTakeOverFields(error)
++  }
++}
++
+ export function gatewayReason(error: unknown): unknown {
+   return error instanceof JsonRpcGatewayError ? (error.data as { reason?: unknown } | undefined)?.reason : undefined
+ }
+@@ -349,7 +366,9 @@ export function gatewayReason(error: unknown): unknown {
+ // nothing can continue (deterministic). Empty for any other error.
+ export function ownershipErrorSurface(error: unknown): { errorSurface?: ErrorSurface } {
+   if (isSessionNotOwnedError(error)) {
+-    return { errorSurface: { layer: 'gateway', code: 'SESSION_NOT_OWNED', retryable: false } }
++    return {
++      errorSurface: { layer: 'gateway', code: 'SESSION_NOT_OWNED', retryable: false, ...autoTakeOverFields(error) }
++    }
+   }
+ 
+   if (gatewayReason(error) === 'session_read_only') {
+diff --git a/apps/desktop/src/components/assistant-ui/thread/assistant-message.test.tsx b/apps/desktop/src/components/assistant-ui/thread/assistant-message.test.tsx
+index 5f5a9974d4..953fc6a9d4 100644
+--- a/apps/desktop/src/components/assistant-ui/thread/assistant-message.test.tsx
++++ b/apps/desktop/src/components/assistant-ui/thread/assistant-message.test.tsx
+@@ -19,6 +19,7 @@ import { type SessionTileDelegate, setSessionTileDelegate } from '@/store/sessio
+ 
+ import { stubThreadEnvironment } from '../test-utils'
+ 
++import { AUTO_TAKE_OVER_FRESH_MS, resetAutoTakeOverForTests } from './assistant-message'
+ import { formatTimelineRange, formatTimelineTimestamp } from './timestamp'
+ 
+ import { Thread } from '.'
+@@ -462,6 +463,68 @@ describe('Take over here (SESSION_NOT_OWNED)', () => {
+     expect(onReload).not.toHaveBeenCalled()
+   })
+ 
++  // [daveey] A refusal the backend flagged auto_take_over (the other window only runs a turn Hermes
++  // started itself) takes over and re-sends without a click, once, and only while the card is fresh.
++  function flaggedRefusal(refusedAt: number): ThreadMessage {
++    const message = ownershipRefusalMessage()
++
++    return {
++      ...message,
++      metadata: {
++        ...message.metadata,
++        custom: {
++          errorSurface: {
++            layer: 'gateway',
++            code: 'SESSION_NOT_OWNED',
++            retryable: false,
++            autoTakeOver: true,
++            refusedAt
++          }
++        }
++      }
++    } as unknown as ThreadMessage
++  }
++
++  it('takes a flagged chat over and re-sends on its own, exactly once', async () => {
++    resetAutoTakeOverForTests()
++    $activeSessionId.set('runtime-1')
++    $selectedStoredSessionId.set('stored-auto-1')
++    const { resumeTile, takeOverSession } = installDelegate({ acknowledged: true })
++    const onReload = vi.fn(async () => {})
++    const { rerender } = render(<Harness assistant={flaggedRefusal(Date.now())} onReload={onReload} />)
++
++    await waitFor(() => expect(onReload).toHaveBeenCalledTimes(1))
++    expect(takeOverSession).toHaveBeenCalledWith('runtime-1')
++    expect(resumeTile).toHaveBeenCalledWith('stored-auto-1', { refreshTranscript: true })
++
++    // The re-sent prompt refused again (the holder grabbed it back): a new fresh card waits for the click.
++    rerender(<Harness assistant={flaggedRefusal(Date.now())} onReload={onReload} />)
++    await screen.findByRole('button', { name: en.assistant.thread.errorTakeOver })
++    expect(takeOverSession).toHaveBeenCalledTimes(1)
++    expect(onReload).toHaveBeenCalledTimes(1)
++  })
++
++  it('leaves a stale flagged card (a reopened chat) to the button', async () => {
++    resetAutoTakeOverForTests()
++    $activeSessionId.set('runtime-1')
++    $selectedStoredSessionId.set('stored-auto-2')
++    const { takeOverSession } = installDelegate({ acknowledged: true })
++    render(<Harness assistant={flaggedRefusal(Date.now() - AUTO_TAKE_OVER_FRESH_MS - 1)} />)
++
++    await screen.findByRole('button', { name: en.assistant.thread.errorTakeOver })
++    expect(takeOverSession).not.toHaveBeenCalled()
++  })
++
++  it('never takes over an unflagged card on its own', async () => {
++    resetAutoTakeOverForTests()
++    $activeSessionId.set('runtime-1')
++    const { takeOverSession } = installDelegate({ acknowledged: true })
++    render(<Harness assistant={ownershipRefusalMessage()} />)
++
++    await screen.findByRole('button', { name: en.assistant.thread.errorTakeOver })
++    expect(takeOverSession).not.toHaveBeenCalled()
++  })
++
+   it('is not offered for other failures', async () => {
+     render(<Harness assistant={oauthExpiredMessage()} />)
+     await screen.findByText(/HTTP 401/)
+diff --git a/apps/desktop/src/components/assistant-ui/thread/assistant-message.tsx b/apps/desktop/src/components/assistant-ui/thread/assistant-message.tsx
+index 843aee8fc3..3c6256b5c0 100644
+--- a/apps/desktop/src/components/assistant-ui/thread/assistant-message.tsx
++++ b/apps/desktop/src/components/assistant-ui/thread/assistant-message.tsx
+@@ -729,7 +729,43 @@ const CompressConversationAction: FC<{ className: string; label: string }> = ({
+ // active-session lease to this window (`session.take_over` — the old owner stops its turn and
+ // acknowledges), refreshes the transcript from the store (the other window may have written turns),
+ // then re-runs the refused prompt through `message().reload()` — the exact call behind Retry.
+-const TakeOverAction: FC<{ className: string; label: string }> = ({ className, label }) => {
++// A flagged refusal (`surface.autoTakeOver`: the other backend only runs a turn Hermes started) takes
++// over without a click, once per fresh card: a card older than AUTO_TAKE_OVER_FRESH_MS (a reopened
++// transcript) or a chat this window auto-took within AUTO_TAKE_OVER_COOLDOWN_MS (the holder grabbed it
++// back) waits for the button, so two windows can never bounce a chat between them. [daveey]
++export const AUTO_TAKE_OVER_FRESH_MS = 30_000
++export const AUTO_TAKE_OVER_COOLDOWN_MS = 120_000
++const autoTakeOverAt = new Map<string, number>()
++
++export function shouldAutoTakeOver(surface: ErrorSurface | undefined, chatId: string | null, now: number): boolean {
++  if (!surface?.autoTakeOver || !chatId || surface.refusedAt === undefined) {
++    return false
++  }
++
++  if (now - surface.refusedAt > AUTO_TAKE_OVER_FRESH_MS) {
++    return false
++  }
++
++  const last = autoTakeOverAt.get(chatId)
++
++  if (last !== undefined && now - last < AUTO_TAKE_OVER_COOLDOWN_MS) {
++    return false
++  }
++
++  autoTakeOverAt.set(chatId, now)
++
++  return true
++}
++
++export function resetAutoTakeOverForTests() {
++  autoTakeOverAt.clear()
++}
++
++const TakeOverAction: FC<{ className: string; label: string; surface?: ErrorSurface }> = ({
++  className,
++  label,
++  surface
++}) => {
+   const { t } = useI18n()
+   const copy = t.assistant.thread
+   const aui = useAui()
+@@ -770,6 +806,14 @@ const TakeOverAction: FC<{ className: string; label: string }> = ({ className, l
+     }
+   }, [aui, copy.errorTakeOverFailed, copy.errorTakeOverUnconfirmed, sessionId, storedSessionId])
+ 
++  // shouldAutoTakeOver records the attempt per chat (the stored id survives a reconnect's new runtime
++  // id), so a re-render, remount or second card never fires it twice.
++  useEffect(() => {
++    if (sessionId && shouldAutoTakeOver(surface, storedSessionId || sessionId, Date.now())) {
++      void takeOver()
++    }
++  }, [sessionId, storedSessionId, surface, takeOver])
++
+   return (
+     <button className={className} disabled={pending} onClick={() => void takeOver()} type="button">
+       {label}
+@@ -1187,7 +1231,9 @@ const ERROR_ACTION_RENDERERS: Record<ErrorActionId, (ctx: ErrorActionContext) =>
+     return suggestion ? <SwitchToModelAction className={className} suggestion={suggestion} /> : null
+   },
+   use_credits: ({ className }) => <UseCreditsAction className={className} />,
+-  take_over: ({ className, copy }) => <TakeOverAction className={className} label={copy.errorTakeOver} />,
++  take_over: ({ className, copy, surface }) => (
++    <TakeOverAction className={className} label={copy.errorTakeOver} surface={surface} />
++  ),
+   open_billing: ({ className, copy, surface }) => (
+     <OpenBillingAction className={className} label={copy.errorOpenBillingSettings} surface={surface} />
+   ),
+diff --git a/apps/desktop/src/lib/error-surface.ts b/apps/desktop/src/lib/error-surface.ts
+index e60d4d59f5..36681ba2a1 100644
+--- a/apps/desktop/src/lib/error-surface.ts
++++ b/apps/desktop/src/lib/error-surface.ts
+@@ -126,6 +126,12 @@ export interface ErrorSurface {
+   /** SESSION_NOT_OWNED only: where the chat is open, parsed from the backend's
+    *  `Details: session … opened by <surface> on <host> <age> ago.` line. */
+   owner?: SessionOwner
++  /** SESSION_NOT_OWNED only: the other backend holds the chat just for a turn Hermes started itself
++   *  (a Kanban notice, a finished process, a post-update continuation), so this window takes it over
++   *  and re-sends without waiting for a click. [daveey] */
++  autoTakeOver?: boolean
++  /** With `autoTakeOver`: when this window was refused (ms). Only a fresh card acts on its own. */
++  refusedAt?: number
+   /** usage_window only: the plan's recommended models that still work past the
+    *  limit (best first) and the credits option — the card's one-click buttons
+    *  (agent/plan_limits.py). Absent on older backends. */
+diff --git a/tests/tui_gateway/test_automation_holder_takeover.py b/tests/tui_gateway/test_automation_holder_takeover.py
+new file mode 100644
+index 0000000000..f34e423b26
+--- /dev/null
++++ b/tests/tui_gateway/test_automation_holder_takeover.py
+@@ -0,0 +1,187 @@
++"""A typed send refused because another window's backend holds the chat for a turn Hermes started
++itself (Kanban notice, finished process, post-update continuation) is flagged ``auto_take_over``: the
++Desktop then takes the chat over and re-sends instead of showing the "open somewhere else" card.
++A chat whose newest turn someone typed keeps the card. [daveey]
++"""
++
++from __future__ import annotations
++
++import contextlib
++import sqlite3
++
++import pytest
++
++from hermes_cli.active_sessions import SESSION_NOT_OWNED, ActiveSessionRefusal
++from tui_gateway import server
++from tui_gateway.session_lifecycle import AUTOMATED_TURN_KINDS, latest_user_turn_kind
++
++KEY = "20260104_000000_abc126"
++
++
++def _conn(rows) -> sqlite3.Connection:
++    conn = sqlite3.connect(":memory:")
++    conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, "
++                 "display_kind TEXT, active INTEGER, content TEXT)")
++    conn.executemany("INSERT INTO messages (session_id, role, display_kind, active) VALUES (?,?,?,?)", rows)
++    return conn
++
++
++def test_latest_user_turn_kind_reads_the_newest_live_user_row():
++    conn = _conn([
++        (KEY, "user", None, 1),
++        (KEY, "assistant", None, 1),
++        (KEY, "user", "kanban_notice", 1),
++        (KEY, "assistant", None, 1),
++        (KEY, "user", None, 0),  # rewound away: not live
++        ("other", "user", None, 1),  # another chat
++    ])
++    assert latest_user_turn_kind(conn, KEY) == "kanban_notice"
++
++
++def test_latest_user_turn_kind_typed_row_and_empty_chat():
++    assert latest_user_turn_kind(_conn([(KEY, "user", "kanban_notice", 1), (KEY, "user", None, 1)]), KEY) is None
++    assert latest_user_turn_kind(_conn([]), KEY) is None
++
++
++class _DB:
++    def __init__(self, conn):
++        self._conn = conn
++
++    @contextlib.contextmanager
++    def _read_ctx(self):
++        yield self._conn
++
++
++def _wire_db(monkeypatch, conn):
++    @contextlib.contextmanager
++    def session_db(session):
++        yield _DB(conn)
++
++    monkeypatch.setattr(server, "_session_db", session_db)
++
++
++@pytest.mark.parametrize("kind", sorted(AUTOMATED_TURN_KINDS))
++def test_automation_holder_kind_names_automated_turns(monkeypatch, kind):
++    _wire_db(monkeypatch, _conn([(KEY, "user", None, 1), (KEY, "user", kind, 1)]))
++    assert server._automation_holder_kind({"session_key": KEY}) == kind
++
++
++@pytest.mark.parametrize("kind", [None, "hidden"])
++def test_automation_holder_kind_ignores_typed_and_hidden_turns(monkeypatch, kind):
++    _wire_db(monkeypatch, _conn([(KEY, "user", "kanban_notice", 1), (KEY, "user", kind, 1)]))
++    assert server._automation_holder_kind({"session_key": KEY}) is None
++
++
++def test_automation_holder_kind_fails_closed_on_store_errors(monkeypatch):
++    @contextlib.contextmanager
++    def broken(session):
++        raise sqlite3.OperationalError("database is locked")
++        yield  # pragma: no cover
++
++    monkeypatch.setattr(server, "_session_db", broken)
++    assert server._automation_holder_kind({"session_key": KEY}) is None
++    assert server._automation_holder_kind({"session_key": ""}) is None
++
++
++def _refusal(reason=SESSION_NOT_OWNED):
++    return ActiveSessionRefusal(
++        "This chat is active in another Hermes window/terminal. Use Take over here (session.take_over), "
++        "or wait for that turn to finish.\nDetails: session x opened by desktop. Writer: pid=1:pidns=2:"
++        "turn=x:platform=desktop", reason)
++
++
++def _data(resp):
++    assert resp["error"]["code"] == 4090
++    return resp["error"]["data"]
++
++
++def test_slot_refusal_flags_a_chat_held_for_an_automated_turn(monkeypatch):
++    monkeypatch.setattr(server, "_automation_holder_kind", lambda session: "kanban_notice")
++    data = _data(server._slot_refusal("r", "s", {"session_key": KEY}, "hi", {}, _refusal(), False))
++    assert data == {"reason": SESSION_NOT_OWNED, "auto_take_over": True, "holder_turn_kind": "kanban_notice"}
++
++
++def test_slot_refusal_keeps_the_card_when_someone_typed_there(monkeypatch):
++    monkeypatch.setattr(server, "_automation_holder_kind", lambda session: None)
++    data = _data(server._slot_refusal("r", "s", {"session_key": KEY}, "hi", {}, _refusal(), False))
++    assert data == {"reason": SESSION_NOT_OWNED}
++
++
++def test_slot_refusal_never_flags_hidden_hosted_or_other_refusals(monkeypatch):
++    seen = []
++    monkeypatch.setattr(server, "_automation_holder_kind", lambda session: seen.append(1) or "kanban_notice")
++    session = {"session_key": KEY}
++    hidden = _data(server._slot_refusal("r", "s", session, "hi", {"display_kind": "hidden"}, _refusal(), False))
++    hosted = _data(server._slot_refusal("r", "s", session, "hi", {}, _refusal(), True))
++    capped = _data(server._slot_refusal("r", "s", session, "hi", {}, _refusal("MAX_CONCURRENT_SESSIONS"), False))
++    assert "auto_take_over" not in hidden and "auto_take_over" not in hosted and "auto_take_over" not in capped
++    assert seen == []  # no store read for a send that can never be flagged
++
++
++def test_untyped_continuation_notes_count_as_automated():
++    """Older auto-continue notes and pause replays were stored untyped; history sniffs their prefix."""
++    from tui_gateway.session_history import _AUTO_CONTINUE_NOTE_PREFIX
++    from tui_gateway.update_pause import PAUSE_REPLAY_NOTE_PREFIX
++    for note in (_AUTO_CONTINUE_NOTE_PREFIX + " by a Hermes update.", PAUSE_REPLAY_NOTE_PREFIX + " carry on"):
++        conn = _conn([])
++        conn.execute("INSERT INTO messages (session_id, role, display_kind, active, content) VALUES (?,?,?,?,?)",
++                     (KEY, "user", None, 1, note))
++        assert latest_user_turn_kind(conn, KEY) == "auto_continue"
++
++
++def test_loop_ticks_are_the_users_own_work():
++    assert "loop_tick" not in AUTOMATED_TURN_KINDS
++    assert {"internal_notification", "kanban_notice", "process_complete", "auto_continue"} <= AUTOMATED_TURN_KINDS
++
++
++def _submit_refused(monkeypatch, holder_kind, params=None):
++    """A real ``prompt.submit`` request for a live runtime whose slot claim is refused SESSION_NOT_OWNED."""
++    import threading
++    sid = "rt-auto-takeover"
++    monkeypatch.setitem(server._sessions, sid, {
++        "session_key": KEY, "history": [], "history_lock": threading.RLock(), "running": False,
++        "attached_images": [], "profile_home": None, "transport": None})
++    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *a, **k: _refusal())
++    monkeypatch.setattr(server, "_automation_holder_kind", lambda session: holder_kind)
++    return server.handle_request({"id": "r1", "method": "prompt.submit",
++                                  "params": {"session_id": sid, "text": "typed here", **(params or {})}})
++
++
++def test_prompt_submit_flags_a_refusal_held_for_an_automated_turn(monkeypatch):
++    resp = _submit_refused(monkeypatch, "process_complete")
++    assert resp["error"]["code"] == 4090
++    assert resp["error"]["data"] == {"reason": SESSION_NOT_OWNED, "auto_take_over": True,
++                                     "holder_turn_kind": "process_complete"}
++
++
++def test_prompt_submit_keeps_the_plain_refusal_for_a_typed_holder(monkeypatch):
++    resp = _submit_refused(monkeypatch, None)
++    assert resp["error"]["code"] == 4090 and resp["error"]["data"] == {"reason": SESSION_NOT_OWNED}
++
++
++def test_turn_claim_refusal_is_flagged_the_same_way(monkeypatch):
++    """``_claim_submit_turn`` (the idle reaper released the lease after the precheck) answers through
++    the same ``_slot_refusal``."""
++    monkeypatch.setattr(server, "_automation_holder_kind", lambda session: "kanban_notice")
++    monkeypatch.setattr(server, "_lock_in_submit_turn", lambda *a, **k: (_refusal(), {}))
++    resp, fields = server._claim_submit_turn("r", "s", {"session_key": KEY}, "hi", {}, False, None, None, None, False)
++    assert fields == {} and resp["error"]["data"]["auto_take_over"] is True
++
++
++def test_automation_holder_kind_reads_a_real_session_db(monkeypatch, tmp_path):
++    """The store read against the real schema: a notice row after a typed row flags; a typed row after it does not."""
++    from hermes_state import SessionDB
++    db = SessionDB(db_path=tmp_path / "state.db")
++    db.create_session(KEY, source="desktop")
++    db.append_message(KEY, "user", "please check the card")
++    db.append_message(KEY, "assistant", "on it")
++    db.append_message(KEY, "user", "✔ Kanban t_1 done", display_kind="kanban_notice")
++
++    @contextlib.contextmanager
++    def session_db(session):
++        yield db
++
++    monkeypatch.setattr(server, "_session_db", session_db)
++    assert server._automation_holder_kind({"session_key": KEY}) == "kanban_notice"
++    db.append_message(KEY, "user", "typed in the other window")
++    assert server._automation_holder_kind({"session_key": KEY}) is None
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index ebb3fa073a..c3fffb2001 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -778,7 +778,13 @@ def _slot_refusal(rid, sid, session, text, params, refusal, internal_hosted_subm
+     if getattr(refusal, "ledger_status", None) is not None and not internal_hosted_submit:
+         return _submit_to_ledger_owner(rid, sid, session, text, params, refusal)
+     reason = getattr(refusal, "reason", None)
+-    return _err(rid, 4090, str(refusal), {"reason": reason} if reason else None)
++    data = {"reason": reason} if reason else None
++    if reason == "SESSION_NOT_OWNED" and not internal_hosted_submit and params.get("display_kind") is None:
++        # [daveey] Another window's backend holds this chat only for a turn Hermes started itself: the
++        # Desktop takes it over and re-sends at once (its "Take over here" flow) instead of a card.
++        if (kind := _automation_holder_kind(session)) is not None:
++            data.update(auto_take_over=True, holder_turn_kind=kind)
++    return _err(rid, 4090, str(refusal), data)
+ 
+ 
+ def _submit_to_ledger_owner(rid, sid, session, text, params, refusal) -> dict:
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index caa4b18afc..723b5b865e 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -9,6 +9,8 @@ import logging
+ 
+ import contextlib
+ 
++from agent.context_compressor_turns import TURN_STARTING_NOTICE_KINDS
++
+ from .method_ctx import bind_module
+ 
+ 
+@@ -136,6 +138,53 @@ def _durable_owner_refusal(session: dict):
+         f"Writer: {holder}", SESSION_NOT_OWNED)
+ 
+ 
++#: Display kinds of turns Hermes starts on its own (no human typed them): the turn-starting notices
++#: (a Kanban/internal notice, a finished background process or delegation) and a paused turn
++#: continuing after a core update. Not ``loop_tick``: a /loop the user started is their own work. [daveey]
++AUTOMATED_TURN_KINDS = frozenset((TURN_STARTING_NOTICE_KINDS - {"loop_tick"}) | {"auto_continue"})
++
++# Content is read only as far as the legacy prefix sniff needs.
++_LATEST_USER_KIND_SQL = """SELECT display_kind, substr(content, 1, 200) FROM messages WHERE session_id=?
++    AND role='user' AND COALESCE(active, 1)=1 ORDER BY id DESC LIMIT 1"""
++
++
++def latest_user_turn_kind(conn, session_key: str) -> str | None:
++    """``display_kind`` of the newest live user row of ``session_key`` (None: a typed row, or no row).
++    An untyped continuation note (older rows, pause replays) is recognised by its prefix, as history does."""
++    row = conn.execute(_LATEST_USER_KIND_SQL, (session_key,)).fetchone()
++    if row is None:
++        return None
++    if row[0]:
++        return row[0]
++    # Imported functions are not rebound onto server.py (method_ctx.bind_module): import here.
++    from tui_gateway.session_history import _legacy_display_kind
++    return _legacy_display_kind("user", row[1] or "") if isinstance(row[1], str) else None
++
++
++def _automation_holder_kind(session: dict) -> str | None:
++    """The automated kind of the chat's newest turn when Hermes, not a person, started it; else None.
++
++    A chat refused SESSION_NOT_OWNED because another window's backend took it for a background wake
++    (Kanban notice, finished process, post-update continuation) has no person typing there: the newest
++    user row is that wake's. Desktop takes such a chat over on the user's typed send instead of showing
++    the card. A typed newest row (someone is chatting in the other window), an unreadable store or a
++    missing key keep the card. [daveey]"""
++    key = str(session.get("session_key") or "")
++    if not key:
++        return None
++    try:
++        with _session_db(session) as db:
++            read_ctx = getattr(db, "_read_ctx", None)
++            if read_ctx is None:
++                return None
++            with read_ctx() as conn:
++                kind = latest_user_turn_kind(conn, key)
++    except Exception:
++        logger.warning("Could not read the newest turn kind for %s", key, exc_info=True)
++        return None
++    return kind if kind in AUTOMATED_TURN_KINDS else None
++
++
+ def _session_moved_refusal(session: dict):
+     """``SESSION_MOVED`` when the Board's owner record for this chat's lineage names another gateway (it was handed
+     over with ``hermes sessions move``), else None. No record, sync off or an unreachable Board without a cached
+-- 
+2.43.0
+

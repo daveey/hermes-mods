@@ -1,0 +1,265 @@
+From 9dc9e9f509af28082cd31313bc4af5c3546400a4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 11:08:23 +0000
+Subject: [PATCH] fix(tui_gateway): fence replay timer generations and exact
+ live profiles [daveey]
+
+Proof: stale cancelled timer test fails before generation fence; both exact-profile wake cases select foreign live runtime before fix. Canonical replay/profile/handoff suites: 58 passed, file retries disabled. Full scripts/check: 21 checks OK before final compression-store test. Dispatch identity acceptance remains open; do not land this incomplete PR.
+---
+ tests/tui_gateway/test_automation_replay.py   | 15 +++++
+ .../test_automation_replay_handoff.py         |  2 +-
+ .../tui_gateway/test_replay_wake_profiles.py  | 66 +++++++++++++++++++
+ tui_gateway/automation_replay.py              | 42 +++++++-----
+ tui_gateway/session_notifications.py          | 10 ++-
+ tui_gateway/wake_profiles.py                  | 36 ++++++++++
+ 6 files changed, 148 insertions(+), 23 deletions(-)
+ create mode 100644 tests/tui_gateway/test_replay_wake_profiles.py
+ create mode 100644 tui_gateway/wake_profiles.py
+
+diff --git a/tests/tui_gateway/test_automation_replay.py b/tests/tui_gateway/test_automation_replay.py
+index 2196a6d121..e15ea3fca9 100644
+--- a/tests/tui_gateway/test_automation_replay.py
++++ b/tests/tui_gateway/test_automation_replay.py
+@@ -66,6 +66,21 @@ def test_one_timer_per_chat_and_a_later_reset_rearms(timers):
+     assert len(timers) == 2 and timers[0][2].cancelled and timers[1][0] == 7200
+ 
+ 
++def test_cancelled_timer_cannot_consume_replacement(timers, monkeypatch):
++    from tui_gateway import server
++    wakes = []
++    monkeypatch.setattr(server, "_wake_session_turn", lambda *a, **kw: wakes.append(a) or "started")
++    ar.schedule("k", text="old", display_kind="kanban_notice", display_metadata={}, due=NOW + 60,
++                cause="c", persisted=True, now=NOW)
++    old_fire = timers[-1][1]
++    ar.schedule("k", text="later reset", display_kind="kanban_notice", display_metadata={}, due=NOW + 7200,
++                cause="q", persisted=True, now=NOW)
++    old_fire()  # Timer.cancel cannot stop a callback already waiting for the lock.
++    assert wakes == [] and ar.pending("k")
++    timers[-1][1]()
++    assert len(wakes) == 1 and not ar.pending("k")
++
++
+ def test_cancel_carried_keeps_an_unpersisted_delivery(timers):
+     ar.schedule("k", text="a", display_kind="kanban_notice", display_metadata={}, due=NOW, cause="c", persisted=True,
+                 now=NOW)
+diff --git a/tests/tui_gateway/test_automation_replay_handoff.py b/tests/tui_gateway/test_automation_replay_handoff.py
+index ce1e4ee942..3f5e78a2d6 100644
+--- a/tests/tui_gateway/test_automation_replay_handoff.py
++++ b/tests/tui_gateway/test_automation_replay_handoff.py
+@@ -375,7 +375,7 @@ def test_seam_run_pass_consumes_handoffs(monkeypatch):
+ def test_seam_wake_resumes_only_in_the_given_profile(monkeypatch):
+     from tui_gateway import server
+     resumed = []
+-    monkeypatch.setattr(server, "_find_live_session_by_key", lambda key: None)
++    monkeypatch.setattr(server, "_find_live_session_by_key", lambda key, **kw: None)
+     monkeypatch.setattr(server, "_readopt_wake_profiles", lambda: [None, "a", "b"])
+     monkeypatch.setattr("tui_gateway.update_pause.left_to_successor", lambda *a, **k: False)
+     monkeypatch.setattr(ar, "retiring_backend_refuses", lambda *a, **k: False)
+diff --git a/tests/tui_gateway/test_replay_wake_profiles.py b/tests/tui_gateway/test_replay_wake_profiles.py
+new file mode 100644
+index 0000000000..79bf8ddfe9
+--- /dev/null
++++ b/tests/tui_gateway/test_replay_wake_profiles.py
+@@ -0,0 +1,66 @@
++"""Exact-profile live lookup at the real automation wake boundary."""
++import threading
++
++import pytest
++
++from tui_gateway import automation_replay as ar, server
++
++
++@pytest.mark.parametrize("profile", [None, "work"])
++def test_wake_does_not_use_foreign_live_same_key(monkeypatch, tmp_path, profile):
++    from hermes_constants import get_process_hermes_home, get_default_hermes_root
++    home = get_process_hermes_home() if profile is None else get_default_hermes_root() / "profiles" / profile
++    foreign = {"session_key": "same-key", "profile_home": str(tmp_path / "foreign"),
++               "agent": object(), "history_lock": threading.Lock()}
++    monkeypatch.setitem(server._sessions, "foreign-ui", foreign)
++    monkeypatch.setattr(ar, "retiring_backend_refuses", lambda *a: False)
++    monkeypatch.setattr("tui_gateway.update_pause.left_to_successor", lambda *a: False)
++    resumed = []
++    monkeypatch.setitem(server._methods, "session.resume", lambda rid, params:
++                        resumed.append(params) or {"error": {"code": 4007}})
++    # If the foreign live record is selected, fail before any runtime construction.
++    monkeypatch.setattr(server, "_start_agent_build", lambda *a: pytest.fail("foreign runtime selected"))
++    try:
++        assert server._wake_session_turn("same-key", "notice", profiles=[profile]) == "missing"
++        assert resumed == [{"session_id": "same-key", "omit_messages": True,
++                            **({"profile": profile} if profile else {})}]
++        assert str(home) != foreign["profile_home"]
++    finally:
++        server._sessions.pop("foreign-ui", None)
++
++
++def test_named_launch_matches_none_and_explicit_records(monkeypatch, tmp_path):
++    from tui_gateway.wake_profiles import live_for_profiles
++    home = tmp_path / "profiles" / "work"
++    monkeypatch.setattr("hermes_constants.get_process_hermes_home", lambda: home)
++    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: tmp_path)
++    for recorded in (None, str(home)):
++        session = {"session_key": "named-key", "profile_home": recorded}
++        monkeypatch.setitem(server._sessions, "named-ui", session)
++        assert live_for_profiles("named-key", [None]) == ("named-ui", session)
++        assert live_for_profiles("named-key", ["work"]) == ("named-ui", session)
++        assert live_for_profiles("named-key", ["other"]) is None
++
++
++def test_tip_lookup_uses_exact_store_and_does_not_create_missing(monkeypatch, tmp_path):
++    from hermes_state import SessionDB
++    from tui_gateway.wake_profiles import compression_live
++    home = tmp_path / "profiles" / "work"
++    home.mkdir(parents=True)
++    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: tmp_path)
++    with SessionDB(home / "state.db") as db:
++        db.create_session("root", "desktop")
++    selected = []
++    original = SessionDB.get_compression_tip
++
++    def tip(db, key):
++        selected.append(db.db_path)
++        assert original(db, key) == "root"
++        return "tip"
++
++    monkeypatch.setattr(SessionDB, "get_compression_tip", tip)
++    session = {"session_key": "tip", "profile_home": str(home)}
++    monkeypatch.setitem(server._sessions, "tip-ui", session)
++    assert compression_live("root", ["absent", "work"]) == ("tip-ui", session)
++    assert selected == [home / "state.db"]
++    assert not (tmp_path / "profiles" / "absent").exists()
+diff --git a/tui_gateway/automation_replay.py b/tui_gateway/automation_replay.py
+index dc74f272a9..a9fcff07ac 100644
+--- a/tui_gateway/automation_replay.py
++++ b/tui_gateway/automation_replay.py
+@@ -328,7 +328,16 @@ def plan_turn_failure(display_kind: Any, display_metadata: Any, text: Any, resul
+ 
+ 
+ def _arm(key: str, entry: _Entry, delay: float, fire: Callable[[str], None]) -> None:
+-    timer = threading.Timer(max(delay, 0.0), lambda: fire(key))
++    def guarded_fire():
++        if fire is _fire:
++            _fire(key, expected_timer=timer)
++        else:
++            with _lock:
++                current = _entries.get(key) is entry and entry.timer is timer
++            if current:
++                fire(key)
++
++    timer = threading.Timer(max(delay, 0.0), guarded_fire)
+     timer.daemon = True
+     entry.timer = timer
+     timer.start()
+@@ -506,22 +515,23 @@ def schedule_for_turn(session: dict, st: Any) -> None:
+              profile_home=session.get("profile_home"))
+ 
+ 
+-def _fire(key: str) -> None:
+-    if stale_code_reason():
+-        # [daveey] A retiring backend starts no wake (``retiring_backend_refuses``): that is not a busy chat, so it
+-        # must neither spend the busy budget nor drop the delivery. Hand it to the successor, or keep it.
+-        with _lock:
+-            entry = _entries.get(key)
+-            custody = entry is not None and bool(entry.home) and bool(entry.items)
+-        if custody:
+-            if not handoff(key):
+-                with _lock:
+-                    kept = _entries.get(key)
+-                    if kept is not None:
+-                        _arm(key, kept, BUSY_RECHECK_S, _fire)
+-            return
++def _fire(key: str, *, expected_timer=None) -> None:
++    retired = stale_code_reason()
+     with _lock:
+-        entry = _entries.pop(key, None)
++        entry = _entries.get(key)
++        if entry is None or (expected_timer is not None and entry.timer is not expected_timer):
++            return
++        custody = retired and bool(entry.home) and bool(entry.items)
++        if not custody:
++            _entries.pop(key)
++    if custody:
++        # Retirement is a transfer, not a busy attempt. Keep the due/reset unchanged.
++        if not handoff(key):
++            with _lock:
++                kept = _entries.get(key)
++                if kept is not None:
++                    _arm(key, kept, BUSY_RECHECK_S, _fire)
++        return
+     if entry is None or not entry.items:
+         return  # cancelled by a later successful turn
+     text, kind, meta = replay_payload(entry.items)
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 2ab287cd6f..534f749a67 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -1702,7 +1702,8 @@ def _wake_session_turn(session_key: str, text: str, *, display_kind: str | None
+     if retiring_backend_refuses(label, key):
+         return "busy"
+     try:
+-        live = _find_live_session_by_key(key)
++        from tui_gateway.wake_profiles import live_for_profiles, compression_live
++        live = live_for_profiles(key, profiles)
+         if live is None:
+             # [daveey] A paused turn is its restarting backend's: here its viewers are not attached (update_pause).
+             from tui_gateway.update_pause import left_to_successor
+@@ -1726,13 +1727,10 @@ def _wake_session_turn(session_key: str, text: str, *, display_kind: str | None
+                     return "refused"
+             if not resumed:
+                 return "missing"
+-            live = _find_live_session_by_key(key)
++            live = live_for_profiles(key, profiles)
+             if live is None:
+-                tip = None
+                 with contextlib.suppress(Exception):
+-                    from hermes_state import SessionDB
+-                    tip = SessionDB().get_compression_tip(key)
+-                live = _find_live_session_by_key(tip) if tip else None
++                    live = compression_live(key, profiles)
+             if live is None:
+                 logger.warning("%s: %s resumed but no live session holds it", label, key)
+                 return "error"
+diff --git a/tui_gateway/wake_profiles.py b/tui_gateway/wake_profiles.py
+new file mode 100644
+index 0000000000..c47dc20bfe
+--- /dev/null
++++ b/tui_gateway/wake_profiles.py
+@@ -0,0 +1,36 @@
++"""Profile-fenced lookup and compression-tip recovery for explicit wake selectors."""
++from pathlib import Path
++
++
++def live_for_profiles(key, profiles):
++    from tui_gateway import server
++    if profiles is None:
++        return server._find_live_session_by_key(key)
++    from hermes_constants import get_default_hermes_root, get_process_hermes_home
++    launch = Path(get_process_hermes_home()).resolve()
++    for profile in profiles:
++        home = launch if profile is None else Path(get_default_hermes_root()) / "profiles" / profile
++        # The launch profile's runtime record may use None even when launch is named.
++        selectors = [str(home)] + ([None] if home.resolve() == launch else [])
++        for selector in selectors:
++            live = server._find_live_session_by_key(key, profile_home=selector)
++            if live is not None:
++                return live
++    return None
++
++
++def compression_live(key, profiles):
++    from hermes_state import SessionDB
++    from hermes_constants import get_default_hermes_root, get_process_hermes_home
++    selectors = profiles if profiles is not None else [None]
++    for profile in selectors:
++        home = get_process_hermes_home() if profile is None else Path(get_default_hermes_root()) / "profiles" / profile
++        path = Path(home) / "state.db"
++        if not path.is_file():
++            continue
++        with SessionDB(db_path=path, read_only=True) as db:
++            tip = db.get_compression_tip(key)
++        live = live_for_profiles(tip, [profile] if profiles is not None else None) if tip else None
++        if live is not None:
++            return live
++    return None
+-- 
+2.43.0
+

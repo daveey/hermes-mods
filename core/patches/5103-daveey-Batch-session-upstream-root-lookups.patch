@@ -1,0 +1,106 @@
+From 045dfd70b6759853761bcf4c7c375dbf8d118370 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 09:28:33 +0000
+Subject: [PATCH] [daveey] Batch session upstream root lookups
+
+The local-edge precedence fix added one membership query per listed card. Batch root membership and links while preserving local empty edge sets and replica-only foreign roots; deeper ancestry remains cycle/depth bounded.
+
+Proof: reproduced CI test_task_queries_remain_constant_for_many_rows (81 rows: 106 vs 26 statements). Cover legacy missing-links and present-links schemas; disabling the batched walk kills both parameter cases. Five Python files: 136 passed. Full scripts/check passed.
+---
+ .../kanban_session_activity_card_details.py   | 34 +++++++++++++++++--
+ .../test_kanban_execution_observations.py     |  6 +++-
+ 2 files changed, 36 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_session_activity_card_details.py b/hermes_cli/kanban_session_activity_card_details.py
+index c600de931f..c5c5369342 100644
+--- a/hermes_cli/kanban_session_activity_card_details.py
++++ b/hermes_cli/kanban_session_activity_card_details.py
+@@ -123,6 +123,24 @@ def _parent_ids(conn: sqlite3.Connection, replica: sqlite3.Connection | None, ch
+         (child,), required=src is conn)]
+ 
+ 
++def _root_parents(conn: sqlite3.Connection, replica: sqlite3.Connection | None,
++                  ids: list[str]) -> dict[str, list[str]]:
++    """Batch the first graph layer; local empty edge sets must beat stale shadow links."""
++    ph = ",".join("?" for _ in ids)
++    local = {row[0] for row in _query(conn, f"SELECT id FROM tasks WHERE id IN ({ph})", tuple(ids), required=True)}
++    out: dict[str, list[str]] = {task_id: [] for task_id in ids}
++    local_children = local if replica is not None else set(ids)
++    for src, children in ((conn, local_children), (replica, set(ids) - local)):
++        if src is None or not children:
++            continue
++        args = tuple(sorted(children))
++        marks = ",".join("?" for _ in args)
++        for row in _query(src, f"SELECT child_id, parent_id FROM task_links WHERE child_id IN ({marks}) "
++                          "ORDER BY parent_id", args, required=src is conn):
++            out[row[0]].append(row[1])
++    return out
++
++
+ def _authority(conn: sqlite3.Connection, replica: sqlite3.Connection | None,
+                task_id: str, episode: str) -> dict[str, str]:
+     auth_id = ""
+@@ -159,14 +177,17 @@ def _blocked_payload(conn: sqlite3.Connection, replica: sqlite3.Connection | Non
+ 
+ 
+ def _walk(conn: sqlite3.Connection, task_id: str,
+-          replica: sqlite3.Connection | None) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
++          replica: sqlite3.Connection | None, *,
++          root_parents: dict[str, list[str]] | None = None) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
+     seen = {task_id}
+     frontier = {task_id}
+     nearest_open: dict[str, str] | None = None
+     for _ in range(20):
+         parents: dict[str, dict[str, Any]] = {}
+         for child in sorted(frontier):
+-            for parent in _parent_ids(conn, replica, child):
++            parent_ids = (root_parents[child] if root_parents is not None and child in root_parents
++                          else _parent_ids(conn, replica, child))
++            for parent in parent_ids:
+                 if parent in seen or parent in parents:
+                     continue
+                 info = _task_info(conn, replica, parent)
+@@ -187,15 +208,22 @@ def _walk(conn: sqlite3.Connection, task_id: str,
+ 
+ def _add_blocked_upstream(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]) -> None:
+     """Optional presentation evidence; old schemas remain readable. Replica fills foreign parents."""
++    if not found:
++        return
+     replica = _replica_for(conn)
+     try:
++        try:
++            root_parents = _root_parents(conn, replica, list(found))
++        except sqlite3.Error:
++            logging.getLogger(__name__).debug("Could not read blocked upstream roots", exc_info=True)
++            root_parents = {task_id: [] for task_id in found}
+         for task_id, card in found.items():
+             card.pop("blocked_upstream", None)
+             card.pop("upstream", None)
+             if card.get("status") in {"done", "archived", "blocked", "triage"}:
+                 continue
+             try:
+-                blocked, upstream = _walk(conn, task_id, replica)
++                blocked, upstream = _walk(conn, task_id, replica, root_parents=root_parents)
+             except sqlite3.Error:
+                 logging.getLogger(__name__).debug("Could not read blocked upstream for %s", task_id, exc_info=True)
+                 continue
+diff --git a/tests/hermes_cli/test_kanban_execution_observations.py b/tests/hermes_cli/test_kanban_execution_observations.py
+index a127db955f..d290e409d4 100644
+--- a/tests/hermes_cli/test_kanban_execution_observations.py
++++ b/tests/hermes_cli/test_kanban_execution_observations.py
+@@ -96,7 +96,11 @@ def test_invalid_or_future_source_clocks_remain_unknown(clock):
+     assert observations.card(row, gateway="g", profile="p", now=920)["state"] == "unknown"
+ 
+ 
+-def test_task_queries_remain_constant_for_many_rows(board, monkeypatch):
++@pytest.mark.parametrize("with_links", [False, True])
++def test_task_queries_remain_constant_for_many_rows(board, monkeypatch, with_links):
++    if with_links:
++        with sqlite3.connect(board) as conn:
++            conn.execute("CREATE TABLE task_links (parent_id TEXT, child_id TEXT)")
+     original = activity.cached_ro
+     statements = []
+ 
+-- 
+2.43.0
+

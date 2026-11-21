@@ -1,0 +1,252 @@
+From 09f9d33ff1b327c872481cf4c8e2c8b307b69ad3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 20:46:13 +0000
+Subject: [PATCH] fix(agent): refuse switches under any admitted turn and
+ preserve queued intent [daveey]
+
+Review rework: the active holder must be checked regardless of whether admission preceded the snapshot. Guard unmanaged in-place swaps too. Low-level refusal promises no replay; the gateway queues with original pin_session_override, persist_override and count_switch flags and replays them unchanged. Rebased onto the corrected custody change from PR #3814, preserving route resets.
+
+Proof: removing the managed and unmanaged active-holder guards makes both pre-snapshot regression cases fail (2/2). Event-ordered post-snapshot test exercises the next real provider dispatch with network I/O stubbed. All 129 direct switch/deferred consumers: 2420 passed, 1 skipped. scripts/check --base origin/main: all 21 checks pass.
+
+Hermes-Card: t_eeeeee0000000032
+---
+ agent/agent_runtime_switch.py                 | 11 ++++---
+ agent/turn_facade_lease.py                    |  5 ++-
+ .../agent/test_managed_switch_active_turn.py  | 33 +++++++++++++++++++
+ .../agent/test_managed_switch_turn_custody.py | 13 ++++++++
+ tests/agent/test_switch_model_pool_reload.py  |  1 +
+ .../test_model_switch_lost_turn_race.py       | 21 ++++++++++++
+ tui_gateway/methods_config_set.py             | 12 ++++---
+ tui_gateway/model_switch.py                   |  4 ++-
+ tui_gateway/session_compression.py            |  5 ++-
+ 9 files changed, 91 insertions(+), 14 deletions(-)
+ create mode 100644 tests/agent/test_managed_switch_active_turn.py
+
+diff --git a/agent/agent_runtime_switch.py b/agent/agent_runtime_switch.py
+index aa425980f4..fae124f801 100644
+--- a/agent/agent_runtime_switch.py
++++ b/agent/agent_runtime_switch.py
+@@ -22,8 +22,7 @@ class _DeferredSessionWrites:
+ 
+ 
+ class TurnAdmittedDuringSwitch(RuntimeError):
+-    """A turn was admitted on the agent after the switch's snapshot; nothing was published.
+-    Callers stash the pick for the next turn start (``_stash_pending_model_switch``)."""
++    """A turn holds the runtime; nothing was published. Callers may queue the request."""
+ 
+ 
+ def _stage_compressor(compressor):
+@@ -76,9 +75,10 @@ def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabili
+     temporary = isinstance(getattr(agent, '_one_turn_runtime', None), dict)
+     admission = turn_admission_lock(agent)
+     if config is None and not temporary:
+-        with admission:  # swaps the live agent in place: no turn may be admitted meanwhile
++        with admission:  # swaps the live agent in place: check and mutation exclude admission
++            if getattr(agent, '_active_session_turn_lease_holder', None) is not None:
++                raise TurnAdmittedDuringSwitch('a turn is active; model switch not applied')
+             return _switch_model_runtime(agent, model, provider, api_key, base_url, api_mode, capabilities)
+-    base_holder = getattr(agent, '_active_session_turn_lease_holder', None)
+     staged = copy(agent)
+     # Switch helpers mutate these containers in place. Never expose partial work
+     # or clear live provenance while constructing a replacement.
+@@ -109,7 +109,8 @@ def switch_runtime(agent, model, provider, api_key, base_url, api_mode, capabili
+         staged.context_compressor._session_db = backend.backend
+     with turn_admission_lock(agent):
+         holder = getattr(agent, '_active_session_turn_lease_holder', None)
+-        if holder is not None and holder != base_holder:
++        if holder is not None:
++            # A turn can win before OR after the snapshot. Neither may see a swapped runtime.
+             raise TurnAdmittedDuringSwitch('a turn is active; model switch not applied')
+         vars(agent).update(_without_turn_custody(vars(staged)))
+     persist_class_metadata(agent)
+diff --git a/agent/turn_facade_lease.py b/agent/turn_facade_lease.py
+index a5a544c7ec..0dacf0009a 100644
+--- a/agent/turn_facade_lease.py
++++ b/agent/turn_facade_lease.py
+@@ -71,9 +71,8 @@ def _retry_lease_release(db, session_id: str, holder: str, give_up_at: float) ->
+ 
+ 
+ def turn_admission_lock(agent):
+-    """The lock around publishing a turn's admission on the agent. A runtime switch holds it to check
+-    that no turn was admitted since its snapshot and to publish, so a turn is admitted either before
+-    that check (the switch refuses) or after the publish (it starts on the new runtime)."""
++    """Serialize turn admission with runtime publication. A switch refuses any active holder under
++    this lock, so admission is either before the check (no swap) or after the publish (new runtime)."""
+     return agent.__dict__.setdefault("_turn_admission_lock", threading.RLock())
+ 
+ 
+diff --git a/tests/agent/test_managed_switch_active_turn.py b/tests/agent/test_managed_switch_active_turn.py
+new file mode 100644
+index 0000000000..6bb6901ea6
+--- /dev/null
++++ b/tests/agent/test_managed_switch_active_turn.py
+@@ -0,0 +1,33 @@
++"""Switches must refuse a turn that won before the switch snapshot too."""
++from unittest.mock import patch
++
++import pytest
++
++from agent import model_routing_managed
++from agent.agent_runtime_switch import TurnAdmittedDuringSwitch
++from tests.agent import test_managed_switch_turn_custody as custody
++
++managed = custody.managed
++routing_home = custody.routing_home
++streaming_route = custody.streaming_route
++destinations = custody.destinations
++live = custody.live
++
++
++@pytest.mark.parametrize('managed_route', [True, False])
++def test_switch_refuses_already_admitted_turn(live, managed_route):
++    agent, _db = live
++    before = custody.runtime_of(agent)
++    lease = custody.admit(agent)
++    try:
++        with patch('agent.model_routing_managed.managed_config',
++                   wraps=model_routing_managed.managed_config) as config:
++            if not managed_route:
++                config.side_effect = lambda: None
++            with pytest.raises(TurnAdmittedDuringSwitch, match='not applied'):
++                agent.switch_model(custody.TARGET if managed_route else 'claude-sonnet-4-5',
++                                   'anthropic', api_key='fixture-key',
++                                   base_url='https://api.anthropic.com')
++        assert custody.runtime_of(agent) == before
++    finally:
++        lease.release()
+diff --git a/tests/agent/test_managed_switch_turn_custody.py b/tests/agent/test_managed_switch_turn_custody.py
+index 96d75ff24a..61e5a5c623 100644
+--- a/tests/agent/test_managed_switch_turn_custody.py
++++ b/tests/agent/test_managed_switch_turn_custody.py
+@@ -177,6 +177,19 @@ def test_turn_admitted_during_switch_keeps_its_runtime(live):
+     try:
+         # The turn already runs on `before`; its next API call must not find another model/client.
+         assert runtime_of(agent) == before, f'swapped under the turn: {runtime_of(agent)[:3]}'
++        # Exercise the real provider dispatch for the next request, with only network I/O stubbed.
++        from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
++        calls = []
++
++        def make_client(_reason, **_kwargs):
++            calls.append(runtime_of(agent))
++            return agent._anthropic_client
++
++        with patch.object(agent, '_anthropic_messages_create', return_value='fixture response') as create:
++            response = _dispatch_nonstreaming_api_request(agent, {'model': agent.model}, make_client=make_client)
++        assert response == 'fixture response'
++        assert calls == [before]
++        assert create.call_args.args[0]['model'] == before[0]
+     finally:
+         lease.release()
+ 
+diff --git a/tests/agent/test_switch_model_pool_reload.py b/tests/agent/test_switch_model_pool_reload.py
+index e1ef7d651c..95fb19ec4f 100644
+--- a/tests/agent/test_switch_model_pool_reload.py
++++ b/tests/agent/test_switch_model_pool_reload.py
+@@ -61,6 +61,7 @@ def _make_agent(current_provider, current_model, current_pool):
+     agent._fallback_chain = []
+     agent._fallback_model = None
+     agent._credential_pool = current_pool
++    agent._active_session_turn_lease_holder = None  # idle; MagicMock otherwise invents a live holder
+     # Real-ish instance methods that switch_model calls
+     agent._anthropic_prompt_cache_policy = MagicMock(return_value=(False, False))
+     agent._ensure_lmstudio_runtime_loaded = MagicMock()
+diff --git a/tests/tui_gateway/test_model_switch_lost_turn_race.py b/tests/tui_gateway/test_model_switch_lost_turn_race.py
+index 9db85c390b..8412353839 100644
+--- a/tests/tui_gateway/test_model_switch_lost_turn_race.py
++++ b/tests/tui_gateway/test_model_switch_lost_turn_race.py
+@@ -57,3 +57,24 @@ def test_slash_mirror_queues_the_pick(idle_session):
+     assert "next turn" in note
+     assert idle_session["pending_model_switch"]["raw"] == TARGET
+     assert "model_override" not in idle_session
++
++
++@pytest.mark.parametrize('options', [
++    {'pin_session_override': False, 'persist_override': False, 'count_switch': False},
++    {'pin_session_override': True, 'persist_override': None, 'count_switch': True},
++])
++def test_refused_switch_replays_original_intent(idle_session, monkeypatch, options):
++    result = server._apply_model_switch('sid', idle_session, TARGET, confirm_expensive_model=True, **options)
++    assert result['deferred'] is True
++    pending = idle_session['pending_model_switch']
++    assert {key: pending[key] for key in options} == options
++    calls = []
++
++    def applied(sid, session, raw, **kwargs):
++        calls.append((sid, session, raw, kwargs))
++        return {'confirm_required': False}
++
++    monkeypatch.setattr(server, '_apply_model_switch', applied)
++    server._apply_pending_model_switch('sid', idle_session)
++    assert calls == [('sid', idle_session, TARGET, {'confirm_expensive_model': True, **options})]
++    assert 'pending_model_switch' not in idle_session
+diff --git a/tui_gateway/methods_config_set.py b/tui_gateway/methods_config_set.py
+index 757542bf86..f813704a6d 100644
+--- a/tui_gateway/methods_config_set.py
++++ b/tui_gateway/methods_config_set.py
+@@ -117,7 +117,8 @@ def _cfgset_model_ok(rid, key, value, warning="", confirm_message="", scope="ses
+                confirm_message=confirm_message, scope=scope, **extra)
+ 
+ 
+-def _stash_pending_model_switch(rid, key, value, session, confirmed, parsed):
++def _stash_pending_model_switch(rid, key, value, session, confirmed, parsed, *,
++                                pin_session_override=True, persist_override=None, count_switch=True):
+     """No live swap while a turn streams (agent.switch_model() mutates fields the worker thread
+     reads every iteration): stash the pick for the NEXT turn start. Selection guards run HERE (the
+     only moment a confirm round-trip is possible; an unconfirmed stashed pick is dropped at turn
+@@ -127,8 +128,9 @@ def _stash_pending_model_switch(rid, key, value, session, confirmed, parsed):
+     # resolve_persist_behavior, not --global alone: persist_switch_by_default counts. Only the keys it
+     # always writes: a conditional clear depends on the route resolved at turn start, where
+     # _apply_model_switch checks the exact plan before anything is switched or saved.
+-    if not getattr(parsed, "is_reset", False) and resolve_persist_behavior(
+-            parsed.is_global, parsed.is_session, is_once=parsed.is_once, explicit_provider=parsed.explicit_provider):
++    persists = persist_override if persist_override is not None else resolve_persist_behavior(
++        parsed.is_global, parsed.is_session, is_once=parsed.is_once, explicit_provider=parsed.explicit_provider)
++    if not getattr(parsed, "is_reset", False) and persists:
+         _refuse_managed_model_pick(getattr(parsed, "reasoning_effort", ""))
+     try:
+         pending_model = parsed.model_input
+@@ -150,7 +152,9 @@ def _stash_pending_model_switch(rid, key, value, session, confirmed, parsed):
+     # display_*: _session_info shows the user's pick while pending, not the live old model.
+     session["pending_model_switch"] = {
+         "raw": value, "confirm_expensive_model": confirmed,
+-        "display_model": pending_model, "display_provider": pending_provider}
++        "display_model": pending_model, "display_provider": pending_provider,
++        "pin_session_override": pin_session_override, "persist_override": persist_override,
++        "count_switch": count_switch}
+     return _cfgset_model_ok(rid, key, pending_model, deferred=True)
+ 
+ 
+diff --git a/tui_gateway/model_switch.py b/tui_gateway/model_switch.py
+index f7aa13fca9..7cc298b294 100644
+--- a/tui_gateway/model_switch.py
++++ b/tui_gateway/model_switch.py
+@@ -437,7 +437,9 @@ def _apply_model_switch(
+     except TurnAdmittedDuringSwitch as exc:
+         # The caller's unlocked running check lost to a turn admission: nothing was published and no
+         # session state changed, so queue the pick for the next turn start like a busy-time pick.
+-        _stash_pending_model_switch(None, "model", raw_input, session, confirm_expensive_model, parsed_flags)
++        _stash_pending_model_switch(
++            None, "model", raw_input, session, confirm_expensive_model, parsed_flags,
++            pin_session_override=pin_session_override, persist_override=persist_override, count_switch=count_switch)
+         if not session.get("pending_model_switch"):
+             raise ValueError(f"{exc}; pick {result.new_model} again once the turn ends.") from exc
+         return {"value": result.new_model, "warning": "", "confirm_required": False, "deferred": True,
+diff --git a/tui_gateway/session_compression.py b/tui_gateway/session_compression.py
+index 3339ef7384..cc1fa94835 100644
+--- a/tui_gateway/session_compression.py
++++ b/tui_gateway/session_compression.py
+@@ -215,7 +215,10 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
+         return
+     model = pending.get("display_model") or pending["raw"]
+     try:
+-        result = _apply_model_switch(sid, session, pending["raw"], confirm_expensive_model=bool(pending.get("confirm_expensive_model")))
++        result = _apply_model_switch(
++            sid, session, pending["raw"], confirm_expensive_model=bool(pending.get("confirm_expensive_model")),
++            pin_session_override=pending.get("pin_session_override", True),
++            persist_override=pending.get("persist_override"), count_switch=pending.get("count_switch", True))
+         # Honour the expensive-model confirm: drop the switch rather than spend on a model the user
+         # never confirmed.
+         if not result.get("confirm_required"):
+-- 
+2.43.0
+

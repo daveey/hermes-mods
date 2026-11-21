@@ -1,0 +1,396 @@
+From e907e2023cac2065738c773d44d6a1b0652974d1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 18:49:11 -0800
+Subject: [PATCH] fix(pool): an Anthropic credits_required 429 benches the
+ model until the weekly reset [daveey]
+
+Fable has its own allowance per Claude Max account. When it is spent, Anthropic
+answers 429 'Usage credits are required for this model' with
+details.error_code=credits_required and no usable reset, so the pool's one-hour
+default bench applied. In an example incident the available accounts were out of Fable; a pinned
+chat said 'out until the displayed reset' and the pool kept retrying an account that had no
+Fable until its weekly window reopened.
+
+extract_api_error_context now keeps details.error_code, and a credits_required
+model cooldown lasts until the account's weekly reset from the usage cache,
+never shorter than the error's own reset. No snapshot: unchanged behaviour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/agent_runtime_helpers.py                |  42 +----
+ agent/agent_runtime_helpers_error_context.py  |  61 +++++++
+ agent/credential_pool_model_cooldowns.py      |  30 ++++
+ .../test_anthropic_credits_required_bench.py  | 165 ++++++++++++++++++
+ 4 files changed, 258 insertions(+), 40 deletions(-)
+ create mode 100644 agent/agent_runtime_helpers_error_context.py
+ create mode 100644 tests/agent/test_anthropic_credits_required_bench.py
+
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index ac38957b13..871ab380c2 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -36,6 +36,7 @@ from agent.retry_utils import LIVE_RETRY_WAIT_CAP_S, parse_retry_after_seconds,
+ from agent.message_metadata import MERGED_TURN_PREFIX
+ from agent.turn_context import drop_stale_api_content
+ from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER
++from agent.agent_runtime_helpers_error_context import _set_reset_from_vendor_headers, set_error_code
+ from agent.agent_runtime_helpers_user_rows import _count_unnamed_row, _remember_own_row, keep_one_notice_row
+ from agent.primary_runtime_snapshot import _build_primary_runtime_snapshot
+ from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
+@@ -3529,46 +3530,6 @@ def _set_reset_from_retry_after(context: dict[str, Any], retry_after: Any) -> No
+         context["reset_at"] = time.time() + seconds
+ 
+ 
+-# OpenAI-style relative windows: "6m0s", "1.5s", "20ms", "1h2m3s" (also a bare number of seconds).
+-_DURATION_COMPONENT_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|h|m|s)")
+-_DURATION_UNIT_SECONDS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
+-# Lowest-priority reset sources, after Retry-After and x-ratelimit-reset: OpenAI's per-bucket
+-# durations and Anthropic's per-bucket ISO-8601 timestamps. Plain OpenAI/Anthropic 429s often
+-# carry only these, and without them the retry status never names the reset window.
+-_VENDOR_RESET_HEADERS = (
+-    "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens",
+-    "anthropic-ratelimit-requests-reset", "anthropic-ratelimit-tokens-reset",
+-)
+-
+-
+-def _duration_string_seconds(text: str) -> Optional[float]:
+-    raw = text.strip().lower()
+-    if not raw:
+-        return None
+-    try:
+-        return float(raw)
+-    except ValueError:
+-        pass
+-    parts = _DURATION_COMPONENT_RE.findall(raw)
+-    if not parts or "".join(n + u for n, u in parts) != raw:
+-        return None
+-    return sum(float(n) * _DURATION_UNIT_SECONDS[u] for n, u in parts)
+-
+-
+-def _set_reset_from_vendor_headers(context: dict[str, Any], headers: Any) -> None:
+-    for name in _VENDOR_RESET_HEADERS:
+-        value = headers.get(name)
+-        if not isinstance(value, str) or not value.strip():
+-            continue
+-        seconds = _duration_string_seconds(value)
+-        if seconds is None:
+-            absolute = _parse_absolute_timestamp(value)
+-            seconds = None if absolute is None else absolute - time.time()
+-        if seconds is not None and seconds > 0:
+-            context["reset_at"] = time.time() + seconds
+-            return
+-
+-
+ def extract_api_error_context(error: Exception) -> dict[str, Any]:
+     """Extract structured rate-limit details from provider errors."""
+     from agent.request_bucket_context import request_bucket_context
+@@ -3584,6 +3545,7 @@ def extract_api_error_context(error: Exception) -> dict[str, Any]:
+             message = payload.get("error")
+         if isinstance(message, str) and message.strip():
+             context["message"] = message.strip()
++        set_error_code(context, payload)
+         reset = next((payload.get(k) for k in ("resets_at", "reset_at") if payload.get(k) not in {None, ""}), None)
+         if reset is not None:
+             context["reset_at"] = reset
+diff --git a/agent/agent_runtime_helpers_error_context.py b/agent/agent_runtime_helpers_error_context.py
+new file mode 100644
+index 0000000000..0a89c1635a
+--- /dev/null
++++ b/agent/agent_runtime_helpers_error_context.py
+@@ -0,0 +1,61 @@
++"""Provider error-body and header fields for ``extract_api_error_context``.
++
++Split out of ``agent/agent_runtime_helpers.py`` (code-health size ratchet).
++"""
++from __future__ import annotations
++
++import re
++import time
++from typing import Any, Optional
++
++from agent.credential_pool import _parse_absolute_timestamp
++
++
++def set_error_code(context: dict[str, Any], payload: dict[str, Any]) -> None:
++    """Keep Anthropic's ``details.error_code``: why a subscription request was refused
++    (``credits_required``: the model's included allowance is spent). The pool sizes that bench
++    from it (``agent.credential_pool_model_cooldowns.CREDITS_REQUIRED``). [daveey]"""
++    details = payload.get("details")
++    error_code = details.get("error_code") if isinstance(details, dict) else None
++    if isinstance(error_code, str) and error_code.strip():
++        context["error_code"] = error_code.strip()
++
++
++# OpenAI-style relative windows: "6m0s", "1.5s", "20ms", "1h2m3s" (also a bare number of seconds).
++_DURATION_COMPONENT_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|h|m|s)")
++_DURATION_UNIT_SECONDS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
++# Lowest-priority reset sources, after Retry-After and x-ratelimit-reset: OpenAI's per-bucket
++# durations and Anthropic's per-bucket ISO-8601 timestamps. Plain OpenAI/Anthropic 429s often
++# carry only these, and without them the retry status never names the reset window.
++_VENDOR_RESET_HEADERS = (
++    "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens",
++    "anthropic-ratelimit-requests-reset", "anthropic-ratelimit-tokens-reset",
++)
++
++
++def _duration_string_seconds(text: str) -> Optional[float]:
++    raw = text.strip().lower()
++    if not raw:
++        return None
++    try:
++        return float(raw)
++    except ValueError:
++        pass
++    parts = _DURATION_COMPONENT_RE.findall(raw)
++    if not parts or "".join(n + u for n, u in parts) != raw:
++        return None
++    return sum(float(n) * _DURATION_UNIT_SECONDS[u] for n, u in parts)
++
++
++def _set_reset_from_vendor_headers(context: dict[str, Any], headers: Any) -> None:
++    for name in _VENDOR_RESET_HEADERS:
++        value = headers.get(name)
++        if not isinstance(value, str) or not value.strip():
++            continue
++        seconds = _duration_string_seconds(value)
++        if seconds is None:
++            absolute = _parse_absolute_timestamp(value)
++            seconds = None if absolute is None else absolute - time.time()
++        if seconds is not None and seconds > 0:
++            context["reset_at"] = time.time() + seconds
++            return
+diff --git a/agent/credential_pool_model_cooldowns.py b/agent/credential_pool_model_cooldowns.py
+index 6585d28ee6..f3cf3f1b4f 100644
+--- a/agent/credential_pool_model_cooldowns.py
++++ b/agent/credential_pool_model_cooldowns.py
+@@ -8,12 +8,15 @@ auth, billing and payment failures keep benching the whole credential with.
+ """
+ from __future__ import annotations
+ 
++import logging
+ import time
+ from typing import Any, Dict, Iterable, Optional, TYPE_CHECKING
+ 
+ if TYPE_CHECKING:
+     from agent.credential_pool import PooledCredential
+ 
++logger = logging.getLogger(__name__)
++
+ # A Codex ChatGPT-account model entitlement 400 is a plan property, not a window: bench the
+ # (credential, model) pair until an explicit ``hermes auth reset`` clears model_cooldowns (#71970).
+ MODEL_ENTITLEMENT_BENCH_SECONDS = 365 * 24 * 60 * 60
+@@ -22,6 +25,31 @@ MODEL_ENTITLEMENT_BENCH_SECONDS = 365 * 24 * 60 * 60
+ FAILURE_REASON_USAGE_WINDOW = "usage_window"
+ 
+ 
++# Anthropic 429 ``details.error_code`` when a model's included subscription allowance is spent (Fable).
++# The body carries no reset, and the allowance does not come back with the 5-hour window, so the model
++# is benched until the account's weekly window reopens. [daveey] Example incident: a one-hour default
++# bench made a Fable-pinned chat report "out until the displayed reset" and retry an account with no Fable left.
++CREDITS_REQUIRED = "credits_required"
++
++
++def _weekly_reset(provider: str, entry: PooledCredential) -> Optional[float]:
++    """Epoch of *entry*'s account-wide weekly window reset from the in-process usage cache, or None.
++
++    A stale snapshot still counts: the weekly reset is a fixed point that only moves when the window
++    rolls over, and a reset already past loses to the error's own reset in the caller's ``max``.
++    Model-scoped windows (Opus/Sonnet week) are not the account's week and are skipped."""
++    try:
++        from agent.account_usage_cache import _identity_id_for, cached_account_usage
++        snapshot = cached_account_usage(provider, identity_id=_identity_id_for(provider, entry))
++    except Exception:  # an unreadable cache proves nothing: the error's own bench stands
++        logger.debug("weekly reset unavailable for %s", provider, exc_info=True)
++        return None
++    for window in (snapshot.windows if snapshot else ()):
++        if window.scope == "account" and "week" in str(window.label or "").lower() and window.reset_at:
++            return window.reset_at.timestamp()
++    return None
++
++
+ def pool_failure_reason(reason: Any, error_context: Optional[dict[str, Any]], billing_unverified: bool) -> str:
+     """The pool's failure reason for a rotation (*reason* is a ``FailoverReason``). A usage-window 402
+     benches only the refused model; an ambiguous billing body is sized as transient, not a 1-hour bench."""
+@@ -122,6 +150,8 @@ class CredentialPoolModelCooldownMixin:
+             until = _normalize_error_context(error_context).get("reset_at") or (
+                 time.time() + _exhausted_ttl(429, sole_credential=self._is_sole_credential())
+             )
++            if (error_context or {}).get("error_code") == CREDITS_REQUIRED and self.provider == "anthropic":
++                until = max(until, _weekly_reset(self.provider, entry) or 0.0)
+         failed_key = entry.runtime_api_key
+         for scoped in list(self._entries):
+             if scoped.id != entry.id and not (failed_key and scoped.runtime_api_key == failed_key):
+diff --git a/tests/agent/test_anthropic_credits_required_bench.py b/tests/agent/test_anthropic_credits_required_bench.py
+new file mode 100644
+index 0000000000..7013f3f1ca
+--- /dev/null
++++ b/tests/agent/test_anthropic_credits_required_bench.py
+@@ -0,0 +1,165 @@
++"""An Anthropic ``credits_required`` 429 benches the model until the account's weekly reset. [daveey]
++
++Example Desktop incident: the available Claude Max accounts had spent their Fable allowance. One account
++(example account) answered ``claude-fable-5-2`` with 429 ``Usage credits are required for this model``
++(``details.error_code = credits_required``) and no reset the pool could use, so the default one-hour
++bench applied. The pinned chat then read "quota is out until the displayed reset" and the pool kept retrying an
++account that could not serve Fable before its weekly window reopened.
++
++Real ``agent.credential_pool`` against a real temp auth store and the real in-process usage cache.
++"""
++import json
++import time
++from datetime import datetime, timedelta, timezone, UTC
++
++import pytest
++
++KEY = "sk-ant-oat01-synthetic-test-token-0000"
++FABLE = "claude-fable-5-2"
++OPUS = "claude-opus-5-5"
++CREDITS_BODY = {"type": "error", "error": {
++    "type": "rate_limit_error", "message": "Usage credits are required for this model.",
++    "details": {"error_code": "credits_required", "model": FABLE, "exhausted_included_allowance": False}}}
++
++
++@pytest.fixture
++def pool(tmp_path, monkeypatch):
++    root = tmp_path / "hermes-root"
++    root.mkdir()
++    (tmp_path / "fakehome").mkdir()
++    monkeypatch.setenv("HOME", str(tmp_path / "fakehome"))
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "fakehome"))
++    for var in ("ANTHROPIC_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setenv("HERMES_HOME", str(root))
++    import hermes_constants
++    hermes_constants._default_hermes_root_memo = None  # type: ignore[attr-defined]
++    (root / "auth.json").write_text(json.dumps({"credential_pool": {"anthropic": [
++        {"id": "seat", "label": "seat", "auth_type": "api_key", "priority": 0, "source": "manual", "access_token": KEY},
++        {"id": "other", "label": "other", "auth_type": "api_key", "priority": 1, "source": "manual",
++         "access_token": KEY + "-other"},
++    ]}}))
++    from agent import account_usage_cache
++    monkeypatch.setattr(account_usage_cache, "_snapshots", {})
++    monkeypatch.setattr(account_usage_cache, "_started", {})
++    from agent.credential_pool import load_pool
++    return load_pool("anthropic")
++
++
++def _remember_weekly(pool, entry_id, weekly_reset, session_reset=None, model_week=None):
++    """The windows ``_fetch_anthropic_account_usage`` produces: session, account week, model weeks."""
++    from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
++    from agent.account_usage_cache import _identity_id_for, remember_account_usage
++    entry = next(e for e in pool.entries() if e.id == entry_id)
++    windows = [AccountUsageWindow("Current week", 60.0, weekly_reset)]
++    if model_week is not None:  # an Opus week is the model's, never the account's
++        windows.insert(0, AccountUsageWindow("Opus week", 90.0, model_week, scope="model"))
++    if session_reset is not None:
++        windows.insert(0, AccountUsageWindow("Current session (5h)", 10.0, session_reset))
++    snapshot = AccountUsageSnapshot("anthropic", "test", datetime.now(UTC), windows=tuple(windows))
++    remember_account_usage("anthropic", snapshot, identity_id=_identity_id_for("anthropic", entry))
++
++
++def _error(body):
++    class _Err(Exception):
++        pass
++    err = _Err("Error code: 429")
++    err.body = body
++    err.response = None
++    return err
++
++
++def test_error_context_keeps_the_anthropic_error_code():
++    from agent.agent_runtime_helpers import extract_api_error_context
++    ctx = extract_api_error_context(_error(CREDITS_BODY))
++    assert ctx["error_code"] == "credits_required"
++    assert ctx["message"] == "Usage credits are required for this model."
++
++
++def test_credits_required_benches_the_model_until_the_weekly_reset(pool):
++    weekly = datetime.now(UTC) + timedelta(days=3)
++    _remember_weekly(pool, "seat", weekly, session_reset=datetime.now(UTC) + timedelta(hours=2))
++    from agent.agent_runtime_helpers import extract_api_error_context
++    ctx = {**extract_api_error_context(_error(CREDITS_BODY)), "reset_at": time.time() + 3600}
++
++    nxt = pool.mark_exhausted_and_rotate(status_code=429, error_context=ctx, credential_id="seat",
++                                         failure_reason="rate_limit", model=FABLE)
++
++    seat = next(e for e in pool.entries() if e.id == "seat")
++    assert seat.model_cooldowns[FABLE] == pytest.approx(weekly.timestamp(), abs=2)
++    assert OPUS not in (seat.model_cooldowns or {})  # the credential stays good for other models
++    assert seat.last_status is None
++    assert nxt is not None and nxt.id == "other"  # rotation still moves to the next account
++
++
++def test_credits_required_never_shortens_a_later_reset(pool):
++    weekly = datetime.now(UTC) + timedelta(hours=3)
++    _remember_weekly(pool, "seat", weekly)
++    later = time.time() + 5 * 86400
++    from agent.agent_runtime_helpers import extract_api_error_context
++    ctx = {**extract_api_error_context(_error(CREDITS_BODY)), "reset_at": later}
++    pool.mark_exhausted_and_rotate(status_code=429, error_context=ctx, credential_id="seat",
++                                   failure_reason="rate_limit", model=FABLE)
++    seat = next(e for e in pool.entries() if e.id == "seat")
++    assert seat.model_cooldowns[FABLE] == pytest.approx(later, abs=2)
++
++
++def test_without_a_usage_snapshot_the_existing_bench_stands(pool):
++    from agent.agent_runtime_helpers import extract_api_error_context
++    reset = time.time() + 3600
++    ctx = {**extract_api_error_context(_error(CREDITS_BODY)), "reset_at": reset}
++    pool.mark_exhausted_and_rotate(status_code=429, error_context=ctx, credential_id="seat",
++                                   failure_reason="rate_limit", model=FABLE)
++    seat = next(e for e in pool.entries() if e.id == "seat")
++    assert seat.model_cooldowns[FABLE] == pytest.approx(reset, abs=2)
++
++
++def test_a_plain_rate_limit_429_keeps_its_own_reset(pool):
++    _remember_weekly(pool, "seat", datetime.now(UTC) + timedelta(days=3))
++    reset = time.time() + 600
++    ctx = {"message": "This request would exceed your account's rate limit. Please try again later.",
++           "reason": "rate_limit_error", "reset_at": reset}
++    pool.mark_exhausted_and_rotate(status_code=429, error_context=ctx, credential_id="seat",
++                                   failure_reason="rate_limit", model=FABLE)
++    seat = next(e for e in pool.entries() if e.id == "seat")
++    assert seat.model_cooldowns[FABLE] == pytest.approx(reset, abs=2)
++
++
++def _real_credits_error():
++    import anthropic
++    import httpx
++    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
++    response = httpx.Response(429, json=CREDITS_BODY, request=request)
++    return anthropic.RateLimitError("Error code: 429", response=response, body=CREDITS_BODY)
++
++
++def test_the_real_429_classifies_rotates_and_benches_fable_until_the_account_week(pool):
++    """The SDK error as it arrives: no reset in body or headers, a nearer model-scoped week beside it."""
++    from agent.agent_runtime_helpers import extract_api_error_context
++    from agent.credential_pool_model_cooldowns import pool_failure_reason
++    from agent.error_classifier import classify_api_error
++    weekly = datetime.now(UTC) + timedelta(days=4)
++    _remember_weekly(pool, "seat", weekly, model_week=datetime.now(UTC) + timedelta(days=1))
++    err = _real_credits_error()
++    ctx = extract_api_error_context(err)
++    assert "reset_at" not in ctx and ctx["error_code"] == "credits_required"
++    classified = classify_api_error(err, provider="anthropic", model=FABLE)
++    reason = pool_failure_reason(classified.reason, ctx, False)
++
++    nxt = pool.mark_exhausted_and_rotate(status_code=429, error_context=ctx, credential_id="seat",
++                                         failure_reason=reason, model=FABLE)
++
++    seat = next(e for e in pool.entries() if e.id == "seat")
++    assert seat.model_cooldowns[FABLE] == pytest.approx(weekly.timestamp(), abs=2)
++    assert seat.last_status is None and pool.select(model=OPUS) is not None
++    assert nxt is not None and nxt.id == "other"
++
++
++def test_without_a_snapshot_the_real_429_keeps_the_default_bench(pool):
++    from agent.agent_runtime_helpers import extract_api_error_context
++    from agent.credential_pool import EXHAUSTED_TTL_429_SECONDS
++    before = time.time()
++    pool.mark_exhausted_and_rotate(status_code=429, error_context=extract_api_error_context(_real_credits_error()),
++                                   credential_id="seat", failure_reason="rate_limit", model=FABLE)
++    seat = next(e for e in pool.entries() if e.id == "seat")
++    assert before + EXHAUSTED_TTL_429_SECONDS - 2 <= seat.model_cooldowns[FABLE] <= time.time() + EXHAUSTED_TTL_429_SECONDS + 2
+-- 
+2.43.0
+

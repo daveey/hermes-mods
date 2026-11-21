@@ -1,0 +1,392 @@
+From ad7fca5b63d37aad091256f735a8eeaf19414e47 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:54:45 +0000
+Subject: [PATCH] fix(kanban): count shadow history before capping and disable
+ remote card mutations [daveey]
+
+Address independent review of PR #3774: filter live collisions before the final done window and count all matching replica done rows; retain batched home metadata with materialized rows; don't invalidate on shm read marks. Keep live board/show readable if replica queries fail. Apply explicit CLI sorting across the combined row list without writing either DB. Disable drag, bulk selection, file drops and card context mutations for read-only replicas.
+
+Proof: 35 focused CLI/API tests pass, including capped history, off-payload collision, unknown owner, unreadable replica, all nine canonical sorts, unchanged replica bytes, and dispatcher non-claim. Source-only revert to reviewed head produces 10 failing tests. Desktop remote-card/API tests: 22 passed; source-only revert fails. Desktop tsc passes with 3GB heap. Full scripts/check: 21 checks pass.
+---
+ apps/desktop/src/plugins/kanban/board.tsx     | 21 +++++--
+ .../src/plugins/kanban/card-remote.test.tsx   | 20 ++++++-
+ hermes_cli/kanban.py                          | 11 ++--
+ hermes_cli/kanban_shadow_view.py              | 32 +++++++++-
+ plugins/kanban/dashboard/board_shadow.py      | 19 ++++--
+ tests/hermes_cli/test_kanban_shadow_view.py   | 47 +++++++++++++++
+ tests/plugins/test_kanban_board_shadow.py     | 59 +++++++++++++++++++
+ 7 files changed, 187 insertions(+), 22 deletions(-)
+
+diff --git a/apps/desktop/src/plugins/kanban/board.tsx b/apps/desktop/src/plugins/kanban/board.tsx
+index 6810e1c4df..653b232420 100644
+--- a/apps/desktop/src/plugins/kanban/board.tsx
++++ b/apps/desktop/src/plugins/kanban/board.tsx
+@@ -324,7 +324,7 @@ function Card({
+     onSuccess: n => host.notify({ kind: 'success', message: k.attachedFiles(n, task.title || task.id) })
+   })
+ 
+-  const drop = useFileDrop(files => attach.mutate(files), !attach.isPending)
++  const drop = useFileDrop(files => attach.mutate(files), !attach.isPending && !task.read_only)
+   const fileOver = drop.over || attach.isPending
+ 
+   return (
+@@ -341,10 +341,19 @@ function Card({
+             fileOver && 'border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]'
+           )}
+           data-file-over={drop.over || undefined}
+-          draggable
+-          onClick={event => (event.metaKey || event.ctrlKey ? onToggleSelect(task.id) : onOpen(task.id))}
++          data-slot="kanban-card"
++          draggable={!task.read_only}
++          onClick={event =>
++            !task.read_only && (event.metaKey || event.ctrlKey) ? onToggleSelect(task.id) : onOpen(task.id)
++          }
+           onDragEnd={() => setDragging(false)}
+           onDragStart={event => {
++            if (task.read_only) {
++              event.preventDefault()
++
++              return
++            }
++
+             event.dataTransfer.setData('text/plain', task.id)
+             event.dataTransfer.effectAllowed = 'move'
+             // Snapshot the drag image before dimming the source, so the ghost
+@@ -386,7 +395,7 @@ function Card({
+           <Codicon name="link-external" size="0.85rem" />
+           {k.open}
+         </ContextMenuItem>
+-        <ContextMenuItem onSelect={() => onToggleSelect(task.id)}>
++        <ContextMenuItem disabled={task.read_only} onSelect={() => onToggleSelect(task.id)}>
+           <Codicon name={selected ? 'close' : 'check-all'} size="0.85rem" />
+           {selected ? k.deselect : k.select(formatModifierToken('mod'))}
+         </ContextMenuItem>
+@@ -394,13 +403,13 @@ function Card({
+         {columns
+           .filter(name => name !== task.status && !isLockedTarget(name))
+           .map(name => (
+-            <ContextMenuItem key={name} onSelect={() => onMove(task.id, name)}>
++            <ContextMenuItem disabled={task.read_only} key={name} onSelect={() => onMove(task.id, name)}>
+               <span className="size-2 rounded-full" style={{ backgroundColor: columnMeta(name).tone }} />
+               {k.moveTo(columnLabel(k, name))}
+             </ContextMenuItem>
+           ))}
+         <ContextMenuSeparator />
+-        <ContextMenuItem onSelect={() => onDelete(task.id)} variant="destructive">
++        <ContextMenuItem disabled={task.read_only} onSelect={() => onDelete(task.id)} variant="destructive">
+           <Codicon name="trash" size="0.85rem" />
+           {k.delete}
+         </ContextMenuItem>
+diff --git a/apps/desktop/src/plugins/kanban/card-remote.test.tsx b/apps/desktop/src/plugins/kanban/card-remote.test.tsx
+index 7ed7fd4b3c..b2ddf7717a 100644
+--- a/apps/desktop/src/plugins/kanban/card-remote.test.tsx
++++ b/apps/desktop/src/plugins/kanban/card-remote.test.tsx
+@@ -3,7 +3,7 @@
+  * the board marks it with its home gateway and leaves ordinary cards unmarked.
+  */
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+-import { cleanup, render, screen, within } from '@testing-library/react'
++import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+ import { afterEach, describe, expect, it, vi } from 'vitest'
+ 
+ // eslint-disable-next-line no-restricted-imports
+@@ -24,7 +24,14 @@ vi.mock('./api', async importOriginal => ({
+         name: 'ready',
+         tasks: [
+           { id: 't_1a2b3c', status: 'ready', title: 'Hub card' },
+-          { home_gateway: 'mini', id: 't_4d5e6f', read_only: true, remote: true, status: 'ready', title: 'APP-12 feature' }
++          {
++            home_gateway: 'mini',
++            id: 't_4d5e6f',
++            read_only: true,
++            remote: true,
++            status: 'ready',
++            title: 'APP-12 feature'
++          }
+         ]
+       }
+     ],
+@@ -41,7 +48,7 @@ afterEach(() => {
+   $boardSlug.set('')
+ })
+ 
+-const tileOf = (title: string) => screen.getByText(title).closest<HTMLElement>('[draggable="true"]')!
++const tileOf = (title: string) => screen.getByText(title).closest<HTMLElement>('[data-slot="kanban-card"]')!
+ 
+ describe('kanban board: remote shadow-replica cards', () => {
+   it('marks a remote card with its home gateway and leaves local cards unmarked', async () => {
+@@ -54,8 +61,15 @@ describe('kanban board: remote shadow-replica cards', () => {
+     )
+     await screen.findByText('APP-12 feature')
+ 
++    expect(tileOf('APP-12 feature').getAttribute('draggable')).toBe('false')
++    expect(tileOf('Hub card').getAttribute('draggable')).toBe('true')
+     expect(within(tileOf('APP-12 feature')).getByText('remote · mini')).toBeTruthy()
+     expect(tileOf('Hub card').querySelector('[data-slot="kanban-card-remote"]')).toBeNull()
++    const transfer = { setData: vi.fn() }
++    fireEvent.dragStart(tileOf('APP-12 feature'), { dataTransfer: transfer })
++    expect(transfer.setData).not.toHaveBeenCalled()
++    fireEvent.contextMenu(tileOf('APP-12 feature'))
++    expect((await screen.findByRole('menuitem', { name: 'Delete' })).getAttribute('aria-disabled')).toBe('true')
+     dispose()
+   })
+ })
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 085910cc34..bd67b33519 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -622,8 +622,8 @@ def _cmd_list(args: argparse.Namespace) -> int:
+         )
+         tasks = kb.list_tasks(conn, **filters)
+         remote = _shadow_view.remote_tasks(conn, **filters)  # [daveey] a shadow board's other gateways' cards, read-only
+-    if _json_out(args, [_task_to_dict(t) for t in tasks]
+-                 + [_shadow_view.mark(_task_to_dict(t), home) for t, home in remote]):
++    combined = _shadow_view.ordered([(t, None) for t in tasks] + remote, getattr(args, "sort", None))
++    if _json_out(args, [_shadow_view.mark(_task_to_dict(t), home) for t, home in combined]):
+         return 0
+     # Passive discoverability: only multi-board users see which board this is.
+     try:
+@@ -637,10 +637,9 @@ def _cmd_list(args: argparse.Namespace) -> int:
+     if not tasks and not remote:
+         print("(no matching tasks)")
+         return 0
+-    for t in tasks:
+-        print(_fmt_task_line(t))
+-    for t, home in remote:
+-        print(f"{_fmt_task_line(t)}  [remote:{home}, read-only]")
++    for t, home in combined:
++        suffix = f"  [remote:{home}, read-only]" if home is not None else ""
++        print(f"{_fmt_task_line(t)}{suffix}")
+     return 0
+ 
+ 
+diff --git a/hermes_cli/kanban_shadow_view.py b/hermes_cli/kanban_shadow_view.py
+index 97573df29e..86a4331de5 100644
+--- a/hermes_cli/kanban_shadow_view.py
++++ b/hermes_cli/kanban_shadow_view.py
+@@ -62,6 +62,17 @@ def home_of(replica: sqlite3.Connection, task_id: str) -> str:
+     return UNKNOWN_HOME if owner is foreign._UNSET or owner is None else str(owner)
+ 
+ 
++def homes_of(replica: sqlite3.Connection, ids: list[str]) -> dict[str, str]:
++    """Batch owner metadata, retained with the board rows rather than queried per refresh."""
++    homes = dict.fromkeys(ids, UNKNOWN_HOME)
++    for i in range(0, len(ids), 500):
++        chunk = ids[i:i + 500]
++        marks = ",".join("?" * len(chunk))
++        for tid, owner in replica.execute(f"SELECT id, created_on FROM tasks WHERE id IN ({marks})", chunk):
++            homes[tid] = UNKNOWN_HOME if owner is None else str(owner)
++    return homes
++
++
+ def open_card(live: sqlite3.Connection, scope: Any, task_id: str) -> tuple[Any, sqlite3.Connection, Optional[str]]:
+     """``(task, connection, remote home)`` for ``hermes kanban show``: the live row, else a shadow board's replica
+     row read through a read-only connection kept open in the ``ExitStack`` ``scope`` (home None for a live row).
+@@ -71,7 +82,11 @@ def open_card(live: sqlite3.Connection, scope: Any, task_id: str) -> tuple[Any,
+     if task:
+         return task, live, None
+     replica = scope.enter_context(open_shadow_replica(live))
+-    task = kb.get_task(replica, task_id) if replica is not None else None
++    try:
++        task = kb.get_task(replica, task_id) if replica is not None else None
++    except sqlite3.Error as exc:
++        _log.info("kanban: shadow replica card read failed (%s)", exc)
++        return None, live, None
+     if not task:
+         return None, live, None
+     return task, replica, home_of(replica, task_id) or UNKNOWN_HOME
+@@ -102,6 +117,21 @@ def remote_tasks(conn: sqlite3.Connection, **filters: Any) -> list[tuple[Any, st
+             return []
+ 
+ 
++def ordered(tasks: list[tuple[Any, Optional[str]]], order_by: Optional[str]) -> list[tuple[Any, Optional[str]]]:
++    """Apply the CLI's canonical SQL sort to the combined rows, without touching either board."""
++    if not order_by or not tasks:
++        return tasks
++    from hermes_cli import kanban_db as kb
++    expression = kb.VALID_SORT_ORDERS[order_by.strip().lower()]
++    with sqlite3.connect(":memory:") as order:
++        order.execute("CREATE TABLE cards (position INTEGER, id TEXT, created_at INTEGER, priority INTEGER, "
++                      "status TEXT, assignee TEXT, title TEXT, started_at INTEGER, completed_at INTEGER)")
++        order.executemany("INSERT INTO cards VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [
++            (i, t.id, t.created_at, t.priority, t.status, t.assignee, t.title, t.started_at, t.completed_at)
++            for i, (t, _home) in enumerate(tasks)])
++        return [tasks[r[0]] for r in order.execute(f"SELECT position FROM cards ORDER BY {expression}")]
++
++
+ def mark(d: dict[str, Any], home: Optional[str]) -> dict[str, Any]:
+     """``d`` (a task dict) stamped as a remote, read-only row owned by ``home`` (``unknown`` when the replica row
+     records no owner). ``home`` None is a live row (``show``): ``d`` comes back unchanged."""
+diff --git a/plugins/kanban/dashboard/board_shadow.py b/plugins/kanban/dashboard/board_shadow.py
+index ad6e85bf4f..f475746a92 100644
+--- a/plugins/kanban/dashboard/board_shadow.py
++++ b/plugins/kanban/dashboard/board_shadow.py
+@@ -22,9 +22,9 @@ _MEMO_MAX = 16
+ 
+ 
+ def _signature(path: str) -> tuple:
+-    """Stat of the replica's main, WAL and shm files: any commit the sync pull makes moves one of them."""
++    """Data files change on commits; shm read marks also change on reads, so exclude them."""
+     sig = []
+-    for suffix in ("", "-wal", "-shm"):
++    for suffix in ("", "-wal"):
+         try:
+             st = os.stat(path + suffix)
+             sig.append((st.st_mtime_ns, st.st_size))
+@@ -74,13 +74,20 @@ def merge(payload: dict, live, tenant, include_archived, workflow_template_id, c
+         replica_file = shadow_view.db_file(replica)
+         key = (live_file, tenant, bool(include_archived), workflow_template_id, current_step_key, int(done_limit or 0))
+         try:
+-            rows = _remote_rows(key, replica_file, lambda: board_read.materialize(
+-                replica, tenant, include_archived, workflow_template_id, current_step_key, done_limit,
+-                diagnostic_inputs=diagnostic_inputs))
++            def build():
++                # Filter collisions before the final cap: otherwise a live archived/done row
++                # can consume a replica slot and hide the next remote card in the window.
++                result = board_read.materialize(
++                    replica, tenant, include_archived, workflow_template_id, current_step_key, 0,
++                    diagnostic_inputs=diagnostic_inputs)
++                result["homes"] = shadow_view.homes_of(replica, [t.id for t, _f, _x in result["cards"]])
++                return result
++
++            rows = _remote_rows(key, replica_file, build)
+         except Exception:  # health: allow BLE001 -- an unreadable replica must not take the live board down with it
+             shadow_view._log.warning("kanban: shadow replica board read failed", exc_info=True)
+             return payload
+-        homes = {t.id: shadow_view.home_of(replica, t.id) for t, _f, _x in rows["cards"]}
++        homes = rows["homes"]
+     live_ids = {t["id"] for col in payload["columns"] for t in col["tasks"]}
+     live_ids |= shadow_view._live_ids(live, [i for i in homes if i not in live_ids])
+     remote_ids = set(homes) - live_ids
+diff --git a/tests/hermes_cli/test_kanban_shadow_view.py b/tests/hermes_cli/test_kanban_shadow_view.py
+index 8f46208907..a7499b1de7 100644
+--- a/tests/hermes_cli/test_kanban_shadow_view.py
++++ b/tests/hermes_cli/test_kanban_shadow_view.py
+@@ -140,3 +140,50 @@ def test_dispatcher_never_claims_a_shadow_row(board):
+         row = replica.execute("SELECT status, claim_lock FROM tasks WHERE id = ?", (board["ready_id"],)).fetchone()
+     assert (row[0], row[1]) == ("ready", None)
+     assert shadow.read_bytes() == before
++
++
++def test_unknown_home_is_marked_in_list_and_show(board):
++    with closing(kbc.connect(board["shadow"])) as replica, replica:
++        replica.execute("UPDATE tasks SET created_on=NULL WHERE id=?", (board["ready_id"],))
++    rows = {r["id"]: r for r in _list_json()}
++    assert rows[board["ready_id"]]["home_gateway"] == "unknown"
++    shown = json.loads(kanban_cli.run_slash(f"show {board['ready_id']} --json"))
++    assert shown["task"]["home_gateway"] == "unknown"
++
++
++def test_unreadable_replica_list_and_show_keep_live_rows(board, monkeypatch):
++    import sqlite3
++    original_list, original_get = kb.list_tasks, kb.get_task
++    def listing(conn, **filters):
++        if shadow_view.db_file(conn) == str(board["shadow"]):
++            raise sqlite3.OperationalError("replica unavailable")
++        return original_list(conn, **filters)
++    def getting(conn, tid):
++        if shadow_view.db_file(conn) == str(board["shadow"]):
++            raise sqlite3.OperationalError("replica unavailable")
++        return original_get(conn, tid)
++    monkeypatch.setattr(kb, "list_tasks", listing)
++    monkeypatch.setattr(kb, "get_task", getting)
++    assert [r["id"] for r in _list_json()] == [board["live_id"]]
++    assert "no such task" in kanban_cli.run_slash(f"show {board['ready_id']}")
++
++
++@pytest.mark.parametrize("sort", list(kb.VALID_SORT_ORDERS))
++def test_sort_applies_to_combined_rows(board, sort):
++    with closing(kbc.connect()) as live, live:
++        live.execute("UPDATE tasks SET created_at=30 WHERE id=?", (board["live_id"],))
++    with closing(kbc.connect(board["shadow"])) as replica, replica:
++        replica.execute("UPDATE tasks SET created_at=10 WHERE id=?", (board["ready_id"],))
++        replica.execute("UPDATE tasks SET created_at=20 WHERE id=?", (board["done_id"],))
++    with closing(kbc.connect(board["home"] / "oracle.db")) as oracle, oracle:
++        with closing(kbc.connect()) as live:
++            tasks = [(t, None) for t in kb.list_tasks(live)] + shadow_view.remote_tasks(live)
++        for task, _home in tasks:
++            oracle.execute("INSERT INTO tasks (id,title,status,assignee,priority,created_at,started_at,completed_at) "
++                           "VALUES (?,?,?,?,?,?,?,?)", (task.id, task.title, task.status, task.assignee,
++                                                      task.priority, task.created_at, task.started_at, task.completed_at))
++        expected = [t.id for t in kb.list_tasks(oracle, order_by=sort)]
++    actual = [r["id"] for r in _list_json(f"--sort {sort}")]
++    assert actual == expected
++    text = kanban_cli.run_slash(f"list --sort {sort}")
++    assert sorted(expected, key=text.index) == expected
+diff --git a/tests/plugins/test_kanban_board_shadow.py b/tests/plugins/test_kanban_board_shadow.py
+index ab80ab77a6..8726c17367 100644
+--- a/tests/plugins/test_kanban_board_shadow.py
++++ b/tests/plugins/test_kanban_board_shadow.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ from contextlib import closing
+ import importlib.util
+ import sys
++import sqlite3
+ from pathlib import Path
+ 
+ import pytest
+@@ -127,3 +128,61 @@ def test_http_board_route_and_writes_on_remote_card_refused(shadow_board):
+     assert patch.status_code == 409 and "foreign_card" in patch.text
+     shown = client.get(f"/api/plugins/kanban/tasks/{shadow_board['ready']}")
+     assert shown.status_code == 200 and shown.json()["source"] == "replica"
++
++
++def test_done_history_is_counted_before_cap_and_collisions(shadow_board):
++    with closing(kbc.connect(shadow_board["shadow"])) as replica, replica:
++        for i in range(6):
++            tid = kb.create_task(replica, title=f"History {i}", assignee="default")
++            replica.execute("UPDATE tasks SET status='done', completed_at=?, created_on='mini' WHERE id=?", (i, tid))
++    with closing(kbc.connect()) as live, live:
++        live.execute("UPDATE tasks SET status='done', completed_at=99 WHERE id=?", (shadow_board["live_id"],))
++    for cap in (1, 3, 80, 0):
++        col = _column(_read(shadow_board, done_limit=cap), "done")
++        assert col["total"] == 8
++        assert len(col["tasks"]) == (min(cap, 8) if cap else 8)
++        assert col["omitted"] == 8 - len(col["tasks"])
++        assert col["tasks"][0]["id"] == shadow_board["live_id"]
++
++
++def test_live_row_outside_payload_wins_and_does_not_consume_cap(shadow_board):
++    with closing(kbc.connect()) as live, live:
++        live.execute("UPDATE tasks SET status='archived' WHERE id=?", (shadow_board["live_id"],))
++    with closing(kbc.connect(shadow_board["shadow"])) as replica, replica:
++        replica.execute("UPDATE tasks SET status='done', completed_at=99 WHERE id=?", (shadow_board["live_id"],))
++    body = _read(shadow_board, done_limit=1)
++    assert shadow_board["live_id"] not in _cards(body)
++    col = _column(body, "done")
++    assert col["total"] == 1 and col["omitted"] == 0
++    assert [t["id"] for t in col["tasks"]] == [shadow_board["done"]]
++
++
++def test_board_unknown_home_and_owner_cache(shadow_board, monkeypatch):
++    from hermes_cli import kanban_shadow_view
++    with closing(kbc.connect(shadow_board["shadow"])) as replica, replica:
++        replica.execute("UPDATE tasks SET created_on=NULL WHERE id=?", (shadow_board["ready"],))
++    assert _cards(_read(shadow_board))[shadow_board["ready"]]["home_gateway"] == "unknown"
++    def no_query(*args):
++        pytest.fail("cached board must retain home metadata")
++    monkeypatch.setattr(kanban_shadow_view, "homes_of", no_query)
++    assert _cards(_read(shadow_board))[shadow_board["ready"]]["home_gateway"] == "unknown"
++
++
++def test_unreadable_replica_keeps_live_board(shadow_board, monkeypatch):
++    from plugins.kanban.dashboard import board_read
++    original = board_read.materialize
++    def unreadable(conn, *args, **kwargs):
++        from hermes_cli.kanban_shadow_view import db_file
++        if db_file(conn) == str(shadow_board["shadow"]):
++            raise RuntimeError("replica rebuilding")
++        return original(conn, *args, **kwargs)
++    monkeypatch.setattr(board_read, "materialize", unreadable)
++    assert set(_cards(_read(shadow_board))) == {shadow_board["live_id"]}
++
++
++def test_for_board_live_connect_failure_preserves_payload():
++    from plugins.kanban.dashboard import board_shadow
++    payload = {"sentinel": True}
++    def broken():
++        raise sqlite3.OperationalError("live unavailable")
++    assert board_shadow.for_board(payload, broken, (None, False, None, None, 80), None, None) is payload
+-- 
+2.43.0
+

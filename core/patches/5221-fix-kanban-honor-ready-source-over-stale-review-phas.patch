@@ -1,0 +1,90 @@
+From d62aa7d338970739f5440606c9d3edf5da212021 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 14:47:59 +0000
+Subject: [PATCH] fix(kanban): honor ready source over stale review phase
+ [daveey]
+
+Current ready status is authoritative when parking: sweep and reopen
+return implementation custody regardless of older review lifecycle events.
+Keep history-based phase recovery for parked/triage/parent-gated sources
+and run-lane recovery for running cards.
+
+Proof: six real sweep / approve-reopen paths with timer and early-unblock
+wake fail on 9e681ab7 and pass with the fix. Expanded custody, continuation,
+workflow matrix, triage park, timed park and sweep reentry: 103 tests pass.
+Full scripts/check passes. Addresses review 5994316267 on PR3790.
+---
+ hermes_cli/kanban_db_schedule.py              |  5 ++-
+ .../test_kanban_review_retry_custody.py       | 40 +++++++++++++++++++
+ 2 files changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_db_schedule.py b/hermes_cli/kanban_db_schedule.py
+index 8245a2b55f..1ec413390b 100644
+--- a/hermes_cli/kanban_db_schedule.py
++++ b/hermes_cli/kanban_db_schedule.py
+@@ -59,7 +59,10 @@ def schedule_task(
+         reason, check_every = kaw.resource_apply(record, reason, check_every)
+         payload["reason"] = reason
+         task = _kb.get_task(conn, task_id)
+-        source_status = (_kb._retry_status_for_run(conn, task_id) if task and task.status == 'running'
++        # Current ready is authoritative: a reopened/swept card is new implementation,
++        # even if an older park or failure still records a review phase.
++        source_status = ('ready' if task and task.status == 'ready' else
++                         _kb._retry_status_for_run(conn, task_id) if task and task.status == 'running'
+                          else _kb._resume_status_from_events(conn, task_id))
+         if source_status == 'review':
+             payload['resume_status'] = source_status
+diff --git a/tests/hermes_cli/test_kanban_review_retry_custody.py b/tests/hermes_cli/test_kanban_review_retry_custody.py
+index 7f6d47ec35..6147363349 100644
+--- a/tests/hermes_cli/test_kanban_review_retry_custody.py
++++ b/tests/hermes_cli/test_kanban_review_retry_custody.py
+@@ -200,6 +200,46 @@ def test_review_continuation_uses_its_own_park_phase(board, wake):
+     assert kb.get_task(conn, tid).status == 'review'
+ 
+ 
++@pytest.mark.parametrize('wake', ['unblock', 'timer'])
++@pytest.mark.parametrize('exit_path', ['sweep', 'reopen_continuation', 'reopen_refusal'])
++def test_ready_park_does_not_reuse_old_review_phase(board, monkeypatch, exit_path, wake):
++    from hermes_cli.kanban_db_dispatch import dispatch_once, sweep_stale_triage
++    from hermes_cli.kanban_db_operator import reopen_done_task
++    from hermes_cli.kanban_continuation import continue_task, wake_due_continuations
++    monkeypatch.setenv('HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS', '0')
++    conn, _ = board
++    tid = managed._hand_off_for_review(conn, {'review_model': managed.FABLE})
++    if exit_path == 'reopen_continuation':
++        assert kb.claim_review_task(conn, tid, claimer=kb._claimer_id())
++        result = continue_task(conn, tid, checkpoint='Review remains', resume_after_seconds=60,
++                               clock_only=True, awaiting={'kind': 'clock', 'why': 'cooldown'})
++        assert result['ok']
++        assert wake_due_continuations(conn, now=result['wake_at']) == [tid]
++    else:
++        managed._receipts(conn, tid, route=('class:deep', None))
++        for _ in range(3):
++            dispatch_once(conn, spawn_fn=lambda *a: pytest.fail('unavailable reviewer spawned'), max_spawn=1)
++        assert kb.get_task(conn, tid).status == 'triage'
++        if exit_path == 'sweep':
++            latest = max(event.created_at for event in kb.list_events(conn, tid))
++            assert tid in sweep_stale_triage(conn, now=latest + 3601)
++        else:
++            assert kb.unblock_task(conn, tid)
++    if exit_path != 'sweep':
++        assert kb.get_task(conn, tid).status == 'review'
++        assert kb.claim_review_task(conn, tid, claimer=kb._claimer_id())
++        assert kb.complete_task(conn, tid, summary='Approved')
++        assert reopen_done_task(conn, tid, reason='Additional implementation', actor='operator') == 'ready'
++    assert kb.get_task(conn, tid).status == 'ready'
++    assert kb.schedule_task(conn, tid, clock_only=True, awaiting={'kind': 'clock', 'why': 'cooldown'})
++    if wake == 'unblock':
++        assert kb.unblock_task(conn, tid)
++    else:
++        payload = [event.payload for event in kb.list_events(conn, tid) if event.kind == 'scheduled'][-1]
++        assert wake_due_continuations(conn, now=payload['wake_at']) == [tid]
++    assert kb.get_task(conn, tid).status == 'ready'
++
++
+ @pytest.mark.parametrize('meta,error,expected', [
+     ({'retry_status': 'review', 'trigger_outcome': 'spawn_failed'}, 'Review model resolution failed: no peer', True),
+     ({'retry_status': 'ready', 'trigger_outcome': 'spawn_failed'}, 'Review model resolution failed: no peer', False),
+-- 
+2.43.0
+

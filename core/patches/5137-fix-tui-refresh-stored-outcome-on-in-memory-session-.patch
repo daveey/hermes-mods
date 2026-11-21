@@ -1,0 +1,202 @@
+From d1881f0195f89caf48c75adaf6a551d953a15dae Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 09:19:48 +0000
+Subject: [PATCH] fix(tui): refresh stored outcome on in-memory session reap
+ [daveey]
+
+Hub chats 20000101_000000_000001 / 000002 / 000003 kept unresolved{turn_failed}
+after a later complete reply because ws_orphan_reap tears down the live
+session without the DB orphan sweep's outcome refresh. Manual
+`hermes sessions outcome --refresh` re-derived waiting/done.
+
+Refresh on automatic in-memory ends (ws_orphan_reap, disconnect, idle, lru).
+Discount the still-held active lease at turn_end when _last is not yet copied.
+Tests: failed_turn then a later good reply must not stay turn_failed.
+---
+ tests/hermes_state/test_session_outcome.py    | 14 ++++
+ .../tui_gateway/test_turn_outcome_refresh.py  | 71 ++++++++++++++++++-
+ tui_gateway/session_lifecycle.py              |  6 ++
+ tui_gateway/turn_outcome.py                   | 25 ++++++-
+ 4 files changed, 114 insertions(+), 2 deletions(-)
+
+diff --git a/tests/hermes_state/test_session_outcome.py b/tests/hermes_state/test_session_outcome.py
+index 2c53833090..98f22fa165 100644
+--- a/tests/hermes_state/test_session_outcome.py
++++ b/tests/hermes_state/test_session_outcome.py
+@@ -526,6 +526,20 @@ def test_a_real_reply_after_the_failure_clears_it(db, board):
+     assert so.derive_outcome("chat", db=db)["kind"] == "waiting"
+ 
+ 
++def test_turn_end_clears_stored_turn_failed_after_a_later_good_reply(db, board):
++    """Stored ``turn_failed`` (the auditor's row) must not survive a later good assistant
++    reply once turn_end refresh runs — no manual ``--refresh``."""
++    add_card(board, "t_run", "chat", "scheduled")
++    say(db, "user", "archive my receipts")
++    failed_turn(db)
++    assert so.refresh_outcome("chat", "turn_end", db=db)["reason"] == "turn_failed"
++    assert so.get_outcome("chat", db=db)["reason"] == "turn_failed"
++    say(db, "assistant", SUMMARY)
++    out = so.refresh_outcome("chat", "turn_end", db=db)
++    assert out["kind"] == "waiting"
++    assert so.get_outcome("chat", db=db)["kind"] == "waiting"
++
++
+ def test_interrupted_automation_delivery_does_not_paint_a_waiting_chat(db, board):
+     from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
+     add_card(board, "t_run", "chat", "scheduled")
+diff --git a/tests/tui_gateway/test_turn_outcome_refresh.py b/tests/tui_gateway/test_turn_outcome_refresh.py
+index 2761dc94dd..e08f70b995 100644
+--- a/tests/tui_gateway/test_turn_outcome_refresh.py
++++ b/tests/tui_gateway/test_turn_outcome_refresh.py
+@@ -82,7 +82,7 @@ def turn_env(monkeypatch, tmp_path, db):
+         monkeypatch.setattr(server, name, stub)
+     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+     yield monkeypatch
+-    for sid in [s for s in server._sessions if s.startswith("ui-outcome-")]:
++    for sid in [s for s in server._sessions if s.startswith(("ui-outcome-", "ui-retry"))]:
+         server._sessions.pop(sid, None)
+ 
+ 
+@@ -102,6 +102,75 @@ def test_every_turn_conclusion_refreshes_the_stored_outcome(turn_env, db, reply,
+     assert (stored["kind"], stored.get("reason")) == (kind, reason)
+ 
+ 
++def test_a_later_good_reply_clears_stored_turn_failed_without_manual_refresh(turn_env, db):
++    """Hub chats 20000101_000000_000001 / 000002 / 000003: a failed-turn row then a later
++    successful TUI reply must not leave ``unresolved{turn_failed}`` until ``hermes sessions
++    outcome --refresh``. The second ``_run_prompt_submit`` finally is the turn_end refresh."""
++    from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE
++
++    db.create_session("row-retry", source="desktop")
++    db.append_message("row-retry", role="user", content="archive my receipts")
++    db.append_message(
++        "row-retry", role="assistant", content=FAILED_TURN_NOTICE, display_kind=FAILED_TURN_DISPLAY_KIND,
++    )
++    # The fixture's ImmediateThread cannot run ``Thread(target=fn, args=...)`` workers the
++    # kanban-card reader starts; an unread board must not decide this test.
++    turn_env.setattr(so, "_live_work", lambda db, sid, ids: ([], [], False))
++    assert so.refresh_outcome("row-retry", "turn_end", db=db)["reason"] == "turn_failed"
++    assert so.get_outcome("row-retry", db=db)["reason"] == "turn_failed"
++
++    agent = _Agent("row-retry", db, SUMMARY)
++    session = server._sessions["ui-retry"] = _session(agent)
++    assert server._run_prompt_submit("rid", "ui-retry", session, "try again") is True
++
++    stored = so.get_outcome("row-retry", db=db)
++    assert stored is not None, "the successful turn end must store an outcome"
++    assert stored["kind"] == "done", stored
++
++
++def test_closed_session_refresh_clears_stored_turn_failed_after_a_later_good_reply(monkeypatch, db):
++    """Hub 3ea0c6: later complete turn, then ws_orphan_reap, stored still turn_failed until
++    ``hermes sessions outcome --refresh``. In-memory reap must refresh without that CLI."""
++    from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE
++    from tui_gateway.turn_outcome import concluding_turn_identity, refresh_closed_session_outcome
++
++    monkeypatch.setattr(server, "_get_db", lambda: db)
++    monkeypatch.setattr(so, "_live_work", lambda db, sid, ids: ([], [], False))
++    db.create_session("reaped-retry", source="desktop")
++    db.append_message("reaped-retry", role="user", content="archive my receipts")
++    db.append_message(
++        "reaped-retry", role="assistant", content=FAILED_TURN_NOTICE, display_kind=FAILED_TURN_DISPLAY_KIND,
++    )
++    assert so.refresh_outcome("reaped-retry", "turn_end", db=db)["reason"] == "turn_failed"
++    db.append_message("reaped-retry", role="assistant", content=SUMMARY)
++    assert so.get_outcome("reaped-retry", db=db)["reason"] == "turn_failed"
++
++    only_active = type("A", (), {"_active_session_turn_lease_holder": "lease-1"})()
++    assert "lease:lease-1" in concluding_turn_identity(only_active)
++
++    refresh_closed_session_outcome({"session_key": "reaped-retry"})
++    stored = so.get_outcome("reaped-retry", db=db)
++    assert stored is not None and stored["kind"] == "done", stored
++
++
++def test_ws_orphan_teardown_refreshes_closed_session_outcome(monkeypatch):
++    from tui_gateway import turn_outcome as to
++
++    seen: list[str] = []
++    monkeypatch.setattr(to, "refresh_closed_session_outcome", lambda s: seen.append(s.get("session_key") or ""))
++    monkeypatch.setattr(server, "_teardown_session", lambda *a, **k: None)
++    monkeypatch.setattr("tui_gateway.detached_turn_cleanup.cancel", lambda s: None)
++    monkeypatch.setattr("tui_gateway.event_replay.forget_session", lambda s: None)
++    session = {"session_key": "reaped-retry", "history_lock": threading.Lock(), "_sid": "ui-reap"}
++    assert server._teardown_popped_session(session, end_reason="ws_orphan_reap") is True
++    assert seen == ["reaped-retry"]
++    seen.clear()
++    assert server._teardown_popped_session(session, end_reason="tui_close") is True
++    assert seen == []
++    assert server._teardown_popped_session(session, end_reason="tui_shutdown") is True
++    assert seen == []
++
++
+ def test_refresh_uses_server_bound_session_db(monkeypatch, db, caplog):
+     """Only ``server._get_db`` is stubbed, as in production: session_workdir's raw module copy has no ``_get_db``
+     (it is rebound onto server globals), so the refresh must reach ``_session_db`` through ``server``."""
+diff --git a/tui_gateway/session_lifecycle.py b/tui_gateway/session_lifecycle.py
+index a498b61d19..2e400161a4 100644
+--- a/tui_gateway/session_lifecycle.py
++++ b/tui_gateway/session_lifecycle.py
+@@ -45,6 +45,9 @@ def _notify_session_boundary(event_type: str, session_id: str | None, platform:
+ 
+ _SESSION_OWNERSHIP_UNAVAILABLE = "Hermes could not safely reserve this session. Try again."
+ _AUTOMATIC_SESSION_END_REASONS = frozenset({"ws_orphan_reap", "ws_disconnect", "idle_timeout", "lru_evict", "tui_shutdown"})
++# In-memory automatic ends skip the DB orphan sweep (that sweep refreshes). tui_shutdown is too
++# many rows for a blocking judge; tui_close already ran turn_end on the last prompt.
++_OUTCOME_REFRESH_END_REASONS = frozenset({"ws_orphan_reap", "ws_disconnect", "idle_timeout", "lru_evict"})
+ 
+ 
+ def _lease_metadata(live_session_id: str) -> dict:
+@@ -801,6 +804,9 @@ def _teardown_popped_session(session: dict | None, *, end_reason: str = "tui_clo
+         # finally: a raising finalize (callers log and move on) must still free the ring.
+         from tui_gateway.event_replay import forget_session
+         forget_session(session.get("_sid") or "")
++        if end_reason in _OUTCOME_REFRESH_END_REASONS:
++            from tui_gateway.turn_outcome import refresh_closed_session_outcome
++            refresh_closed_session_outcome(session)
+     return True
+ 
+ 
+diff --git a/tui_gateway/turn_outcome.py b/tui_gateway/turn_outcome.py
+index 39b8f69c56..3cebfcc2aa 100644
+--- a/tui_gateway/turn_outcome.py
++++ b/tui_gateway/turn_outcome.py
+@@ -39,7 +39,9 @@ def concluding_turn_identity(agent=None, marker: Optional[dict] = None) -> froze
+     try:
+         from hermes_state_outcome import turn_identity
+ 
+-        holder = getattr(agent, "_last_session_turn_lease_holder", None)
++        # ``_last`` is kept after release; ``_active`` is the holder if refresh runs before the attr is copied.
++        holder = (getattr(agent, "_last_session_turn_lease_holder", None)
++                  or getattr(agent, "_active_session_turn_lease_holder", None))
+         return turn_identity(marker=marker if isinstance(marker, dict) else None,
+                              lease_holder=holder if isinstance(holder, str) else None)
+     except Exception:  # health: allow BLE001 -- best-effort; nothing named discounts nothing
+@@ -66,3 +68,24 @@ def refresh_turn_outcome(session: dict, agent=None, concluding_turn: Optional[fr
+                 refresh_outcome(sid, "turn_end", db=db, concluding_turn=concluding_turn or frozenset())
+     except Exception:  # health: allow BLE001 -- the turn already concluded; a failed refresh is logged
+         logger.warning("turn-end outcome refresh failed for %s", sid, exc_info=True)
++
++
++def refresh_closed_session_outcome(session: dict) -> None:
++    """In-memory close/reap has no DB orphan sweep. Refresh so a later good reply is stored.
++
++    Hub chats 20000101_000000_000001 / 000002 / 000003: ``ws_orphan_reap`` tore down the live
++    session after a later complete turn; without this, stored ``unresolved{turn_failed}`` from
++    the earlier failed_turn row survived until a manual ``hermes sessions outcome --refresh``.
++    """
++    sid = turn_sid(session, session.get("agent"))
++    if not sid:
++        return
++    try:
++        from hermes_state_outcome import refresh_outcomes_quietly
++        from tui_gateway import server  # split helpers only work rebound onto server globals (bind_module)
++
++        with server._session_profile_runtime_scope(session), server._session_db(session) as db:
++            if db is not None:
++                refresh_outcomes_quietly([sid], "reap", db=db)
++    except Exception:  # health: allow BLE001 -- the session is already closed; a failed refresh is logged
++        logger.warning("closed-session outcome refresh failed for %s", sid, exc_info=True)
+-- 
+2.43.0
+

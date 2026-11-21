@@ -1,0 +1,438 @@
+From 2a89928fea690c1e2bcff1db89de7aab54985879 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:02:19 -0800
+Subject: [PATCH] fix(tui): a pinned route's quota wall hit at agent build
+ shows its reset and Choose a model [daveey]
+
+A chat pinned to a quota-walled subscription route (anthropic/claude-fable-5-2, example Desktop incident) failed
+at agent BUILD time with SubscriptionQuotaUnavailable. The user got a toast with the raw epoch reset and
+`hermes setup` advice, an agent_init_failed "Couldn't start this chat ... Retry" card, and a "Send it again"
+boundary. The pre-build refusal of the same pin (#2516) already reads as a route_refused card with the reset
+in PT and /model; the build-time path now matches it.
+
+- agent/model_routing_walls.py: walled_pin_reply(provider, model, resets_at) factored out of held_reply
+  (text unchanged).
+- agent/model_routing_unavailable.py: quota_refusal_wall(exc) -> (provider, model, resets_at) when the
+  terminal quota refusal names its route and carries a finite absolute reset.
+- tui_gateway/user_messages.py: agent_init_failed_message returns walled_pin_reply for such a build failure;
+  route_refused gets its own turn-error title/hint (not the gateway layer's "internal error ... /retry").
+- tui_gateway/session_registry.py: the build-failure handler records agent_failure.failure_route
+  {provider, model, resets_at}; credential_failure.client_failure_fields drops it like failure_resets_at,
+  so no client frame or RPC error data carries it.
+- tui_gateway/methods_prompt.py: _run_after_agent_ready closes a turn whose build hit that wall with
+  {layer: gateway, code: route_refused, retryable: false, message: <walled reply>} and the
+  ROUTE_REFUSED_TURN_NOTICE boundary; every other build failure keeps agent_init_failed / FAILED_TURN_NOTICE.
+  session_failure_payload still folds reset_at into that route_refused frame.
+
+Tests (RED on the source-only revert, GREEN after): tests/tui_gateway/test_agent_init_quota_wall_card.py
+(message, fallback chain, controls; failure_route recorded and absent from the strict-contract error event
+and _wait_agent data; turn frame surface + boundary row; agent_init_failed control). Desktop:
+route-refused-completion.test.tsx gains the agent_init-path frame (contract check; Desktop code unchanged).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/model_routing_unavailable.py            |  18 +++
+ agent/model_routing_walls.py                  |  12 +-
+ .../route-refused-completion.test.tsx         |  20 +++
+ .../test_agent_init_quota_wall_card.py        | 153 ++++++++++++++++++
+ tui_gateway/credential_failure.py             |  15 +-
+ tui_gateway/methods_prompt.py                 |  34 +++-
+ tui_gateway/session_registry.py               |   6 +
+ tui_gateway/user_messages.py                  |   9 ++
+ 8 files changed, 256 insertions(+), 11 deletions(-)
+ create mode 100644 tests/tui_gateway/test_agent_init_quota_wall_card.py
+
+diff --git a/agent/model_routing_unavailable.py b/agent/model_routing_unavailable.py
+index 5806e17295..c5763f5070 100644
+--- a/agent/model_routing_unavailable.py
++++ b/agent/model_routing_unavailable.py
+@@ -241,6 +241,24 @@ def quota_refusal_route(exc):
+     return provider.strip().lower(), model.strip()
+ 
+ 
++def quota_refusal_wall(exc):
++    """``(provider, model, resets_at)`` when *exc*'s cause chain ends in a quota refusal that names its
++    route (``quota_refusal_route``) and carries a finite absolute ``resets_at``, else None.
++
++    For a fallback chain the reset is the terminal (last-tried) route's own. A ``retry_after`` hint is
++    not an absolute reset and gives None. Typed only, like ``quota_refusal_route``."""
++    from hermes_cli.fallback_errors import ProviderFallbackError
++
++    route = quota_refusal_route(exc)
++    if route is None:
++        return None
++    error = _terminal_refusal(exc)
++    if isinstance(error, ProviderFallbackError):
++        error = _terminal_refusal(error.failures[-1][2])
++    reset = _finite_positive(getattr(error, "resets_at", None))
++    return None if reset is None else (*route, reset)
++
++
+ def is_quota_failure(exc):
+     """True when *exc*'s cause chain ends in a quota refusal (every fallback route one, too),
+     whether or not it carries a usable deadline."""
+diff --git a/agent/model_routing_walls.py b/agent/model_routing_walls.py
+index 2d9e69e460..ec70d01355 100644
+--- a/agent/model_routing_walls.py
++++ b/agent/model_routing_walls.py
+@@ -109,10 +109,18 @@ def reroute_notice(wall, to_model=None):
+     return f"{_label(wall.model)} quota is out until {reset_pt(wall.resets_at)}; continuing on {target}."
+ 
+ 
++def walled_pin_reply(provider, model, resets_at):
++    """The sentence for a chat pinned to *provider*/*model* whose subscription quota is out until *resets_at*.
++
++    One wording for the pre-build refusal (``held_reply``) and a build that hit the wall itself
++    (``tui_gateway.user_messages.agent_init_failed_message``)."""
++    return (f"⚠️ {provider}/{model} subscription quota is out until {reset_pt(resets_at)}. "
++            f"This chat is pinned to it; use /model to switch, or resend after the reset.")
++
++
+ def held_reply(wall):
+     """The reply for a walled pin that holds (explicit, or a wall under the reroute threshold)."""
+-    return (f"⚠️ {wall.provider}/{wall.model} subscription quota is out until {reset_pt(wall.resets_at)}. "
+-            f"This chat is pinned to it; use /model to switch, or resend after the reset.")
++    return walled_pin_reply(wall.provider, wall.model, wall.resets_at)
+ 
+ 
+ def log_reroute(wall, metadata):
+diff --git a/apps/desktop/src/app/session/hooks/use-message-stream/route-refused-completion.test.tsx b/apps/desktop/src/app/session/hooks/use-message-stream/route-refused-completion.test.tsx
+index d49a0bf763..761887cc39 100644
+--- a/apps/desktop/src/app/session/hooks/use-message-stream/route-refused-completion.test.tsx
++++ b/apps/desktop/src/app/session/hooks/use-message-stream/route-refused-completion.test.tsx
+@@ -64,6 +64,26 @@ describe('a pinned route refused before the turn (route_refused)', () => {
+     expect(errorCardActions(bubble?.errorSurface)).toEqual({ primary: 'choose_model' })
+   })
+ 
++  it('shows the same card when the agent build itself hit the wall (tui_gateway agent_init path)', async () => {
++    // tui_gateway/methods_prompt.py `_agent_init_failure_surface`: no failure_reason, the turn text is
++    // turn_error_text(), and the descriptor carries the held sentence as `message`.
++    const bubble = await failTurn({
++      failure_reason: undefined,
++      error: HELD,
++      reset_at: 1794981540,
++      text:
++        "This chat's model is unavailable. Your message was not answered.\n" +
++        `Details: ${HELD}\nUse /model to switch, or resend after the reset.`,
++      error_surface: { layer: 'gateway', code: 'route_refused', retryable: false, message: HELD }
++    })
++
++    const card = errorCardText(thread, bubble?.errorSurface)
++    expect(card.title).toBe(thread.errorCodes.route_refused.title)
++    expect(card.body).toBe(HELD)
++    expect(card.body).not.toContain(thread.errorCodes.agent_init_failed.title)
++    expect(errorCardActions(bubble?.errorSurface)).toEqual({ primary: 'choose_model' })
++  })
++
+   it('control: a genuine runtime failure keeps the generic gateway card', async () => {
+     const bubble = await failTurn({
+       text: 'some reply text',
+diff --git a/tests/tui_gateway/test_agent_init_quota_wall_card.py b/tests/tui_gateway/test_agent_init_quota_wall_card.py
+new file mode 100644
+index 0000000000..2f0d7671cb
+--- /dev/null
++++ b/tests/tui_gateway/test_agent_init_quota_wall_card.py
+@@ -0,0 +1,153 @@
++"""A chat pinned to a quota-walled subscription route whose agent BUILD hit the wall reads like the pre-build refusal.
++
++Example incident (Desktop, anthropic/claude-fable-5-2): the build raised ``SubscriptionQuotaUnavailable`` and the user got a
++toast with the raw epoch reset and `hermes setup` advice, a "Couldn't start this chat ... Retry" card and a "Send it
++again" boundary. The pre-build refusal of the same pin (``agent.model_routing_walls.held_reply``) already says the reset
++in PT and /model; the build-time path now says the same, as a non-retryable ``route_refused`` card."""
++import json
++
++import pytest
++
++from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++from tui_gateway import server
++
++RESET = 1795216785.57385  # Fri 11-20 15:19 PT
++HELD = ("⚠️ anthropic/claude-fable-5-2 subscription quota is out until Fri 11-20 15:19 PT. "
++        "This chat is pinned to it; use /model to switch, or resend after the reset.")
++
++
++@pytest.fixture(autouse=True)
++def isolate_recovery(monkeypatch):
++    # This worktree's gitdir belongs to the live installation; imports must not probe it.
++    monkeypatch.setattr("hermes_cli._early_recovery.restore_interrupted_pull", lambda *a, **kw: False)
++
++
++def _wall():
++    return SubscriptionQuotaUnavailable("anthropic", "claude-fable-5-2", RESET)
++
++
++# --- (a) one sentence for the pre-build and build-time refusal --------------------------------------------------
++
++def test_held_reply_is_the_walled_pin_reply():
++    from agent.model_routing_walls import held_reply, walled_pin_reply
++    assert walled_pin_reply("anthropic", "claude-fable-5-2", RESET) == HELD
++    assert held_reply(_wall()) == HELD
++
++
++# --- (b) the build-failure toast ---------------------------------------------------------------------------------
++
++def test_walled_build_message_names_the_reset_in_pt_and_model_not_an_epoch_or_setup():
++    from tui_gateway.user_messages import agent_init_failed_message
++    message = agent_init_failed_message(_wall())
++    assert message == HELD
++    assert "1795216785" not in message and "hermes setup" not in message
++
++
++def test_walled_build_behind_a_fallback_chain_names_the_terminal_route():
++    from hermes_cli.fallback_errors import ProviderFallbackError
++    from tui_gateway.user_messages import agent_init_failed_message
++    chain = ProviderFallbackError([("anthropic", "claude-fable-5-2", _wall())])
++    assert agent_init_failed_message(chain) == HELD
++
++
++@pytest.mark.parametrize("exc", [
++    RuntimeError("the session database is locked"),
++    SubscriptionQuotaUnavailable("anthropic", "claude-fable-5-2", float("nan")),  # no usable reset
++], ids=["unrelated", "quota-without-reset"])
++def test_other_build_failures_keep_the_generic_message(exc):
++    from tui_gateway.user_messages import agent_init_failed_message
++    message = agent_init_failed_message(exc)
++    assert message.startswith("Hermes could not start the assistant for this session. Details: ")
++    assert "hermes setup" in message
++
++
++# --- (c) the route is recorded server-side and never reaches a client ---------------------------------------------
++
++def test_walled_build_records_its_route_and_never_sends_it(tmp_path, monkeypatch):
++    from tests.tui_gateway.test_credential_failure import _strict_build
++    from tui_gateway.contracts import registry
++    assert registry.STRICT  # ErrorPayload forbids unknown keys: a leaked failure_route raises here
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    session, payloads, crashes = _strict_build(monkeypatch, _wall())
++    assert crashes == []
++    assert session["agent_failure"]["failure_route"] == {
++        "provider": "anthropic", "model": "claude-fable-5-2", "resets_at": RESET}
++    (payload,) = payloads
++    assert payload["message"] == HELD
++    assert "failure_route" not in payload and "failure_resets_at" not in payload
++    assert payload["reset_at"] == RESET
++    data = server._wait_agent(session, "r")["error"]["data"] or {}
++    assert "failure_route" not in data and "failure_resets_at" not in data
++
++
++def test_unrelated_build_failure_records_no_route(tmp_path, monkeypatch):
++    from tests.tui_gateway.test_credential_failure import _strict_build
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    session, _payloads, crashes = _strict_build(monkeypatch, RuntimeError("the session database is locked"))
++    assert crashes == []
++    assert "failure_route" not in (session.get("agent_failure") or {})
++
++
++# --- (d) the turn waiting on the build closes as a route refusal -------------------------------------------------
++
++def _turn_on_failed_build(monkeypatch, tmp_path, agent_failure, error_message):
++    """Submit a turn whose deferred build failed; return the client frames and the durable transcript rows."""
++    from tests.tui_gateway.test_submit_time_user_row import _desktop_session
++    from hermes_state import SessionDB
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    db = SessionDB(db_path=tmp_path / "state.db")
++    sid, key = _desktop_session(monkeypatch, db)
++    session = server._sessions[sid]
++    frames = []
++    monkeypatch.setattr(server, "write_json", lambda frame: frames.append(frame) or True)
++    monkeypatch.setattr(server, "_wait_agent_for_prompt",
++                        lambda _session, _rid, _sid: {"error": {"message": error_message}})
++    try:
++        session["agent_failure"] = agent_failure
++        with session["history_lock"]:
++            session["running"] = True
++            server._start_inflight_turn(session, "whats left")
++        assert server._persist_session_row_for_submit("rid", session, "whats left", None) is None
++        server._run_after_agent_ready("rid", sid, session, "whats left", None, None, None)
++        rows = db.get_messages_as_conversation(key, include_inactive=True)
++    finally:
++        server._sessions.pop(sid, None)
++        db.close()
++    complete = [f["params"]["payload"] for f in frames
++                if f.get("params", {}).get("type") == "message.complete"]
++    return complete, rows
++
++
++def _metadata(row):
++    meta = row.get("display_metadata")
++    return json.loads(meta) if isinstance(meta, str) else (meta or {})
++
++
++def test_walled_build_turn_closes_with_the_route_refused_card_and_no_send_it_again(monkeypatch, tmp_path):
++    from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, ROUTE_REFUSED_TURN_NOTICE
++    failure = {"failure_resets_at": RESET,
++               "failure_route": {"provider": "anthropic", "model": "claude-fable-5-2", "resets_at": RESET}}
++    complete, rows = _turn_on_failed_build(monkeypatch, tmp_path, failure, str(_wall()))
++    expected = {"layer": "gateway", "code": "route_refused", "retryable": False, "message": HELD}
++
++    (payload,) = complete
++    assert payload["status"] == "error"
++    assert payload["error_surface"] == expected
++    assert payload["error"] == HELD
++    assert "1795216785" not in payload["text"] and "/model" in payload["text"]
++    assert "failure_route" not in payload and "failure_resets_at" not in payload
++    assert payload["reset_at"] == RESET
++
++    assert [(r["role"], r["content"]) for r in rows] == [("user", "whats left"), ("assistant", ROUTE_REFUSED_TURN_NOTICE)]
++    boundary = rows[-1]
++    assert boundary["display_kind"] == FAILED_TURN_DISPLAY_KIND
++    assert "Send it again" not in boundary["content"]
++    assert _metadata(boundary)["error_surface"] == expected
++
++
++def test_control_other_build_failure_keeps_agent_init_failed(monkeypatch, tmp_path):
++    from agent.turn_failure_copy import FAILED_TURN_NOTICE
++    complete, rows = _turn_on_failed_build(monkeypatch, tmp_path, {}, "the session database is locked")
++    (payload,) = complete
++    assert payload["error_surface"] == {"layer": "runtime", "code": "agent_init_failed", "retryable": True}
++    assert [(r["role"], r["content"]) for r in rows] == [("user", "whats left"), ("assistant", FAILED_TURN_NOTICE)]
+diff --git a/tui_gateway/credential_failure.py b/tui_gateway/credential_failure.py
+index 387c1390fe..34983de2e5 100644
+--- a/tui_gateway/credential_failure.py
++++ b/tui_gateway/credential_failure.py
+@@ -32,13 +32,18 @@ def credential_failure_fields(provider: str, *, pool=None) -> dict:
+     return {**fields, "failure_kind": "exhausted", "reset_at": min(resets) if resets else None}
+ 
+ 
++# [daveey] ``agent_failure`` keys no wire contract declares: ``failure_resets_at`` (the automation replay's clock)
++# and ``failure_route`` (the quota-walled pin the waiting turn's route-refused card names).
++_SERVER_ONLY_FAILURE_FIELDS = frozenset({"failure_resets_at", "failure_route"})
++
++
+ def client_failure_fields(failure) -> dict:
+     """[daveey] ``agent_failure`` as a client may see it. ``failure_resets_at`` is the automation replay's own
+     clock (``automation_replay.replay_failed_wake``): the wire contracts declare ``reset_at`` instead, so it
+-    fills ``reset_at`` when that is unset and never travels under its own name."""
++    fills ``reset_at`` when that is unset and never travels under its own name. ``failure_route`` never travels."""
+     if not isinstance(failure, dict):
+         return failure
+-    fields = {k: v for k, v in failure.items() if k != "failure_resets_at"}
++    fields = {k: v for k, v in failure.items() if k not in _SERVER_ONLY_FAILURE_FIELDS}
+     if fields.get("reset_at") is None and failure.get("failure_resets_at") is not None:
+         fields["reset_at"] = failure["failure_resets_at"]
+     return fields
+@@ -91,8 +96,10 @@ def session_failure_payload(event: str, payload: dict, session: dict) -> dict:
+         return payload
+     surface = payload.get("error_surface") or {}
+     code = surface.get("code")
+-    if code == "agent_init_failed" and session.get("agent_failure"):
+-        return {**payload, **client_failure_fields(session["agent_failure"])}
++    failure = session.get("agent_failure")
++    if failure and (code == "agent_init_failed"
++                    or (code == "route_refused" and isinstance(failure, dict) and failure.get("failure_route"))):
++        return {**payload, **client_failure_fields(failure)}
+     if surface.get("layer") != "auth" and code not in {"rate_limit", "billing", "quota_exceeded"}:
+         return payload
+     from tui_gateway.server import _session_profile_runtime_scope
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index c3fffb2001..8a1823baff 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -671,14 +671,38 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
+     return error
+ 
+ 
+-def _close_agent_init_failed_turn(session: dict, message: str, error_surface: dict) -> None:
++def _agent_init_failure_surface(session: dict, message: str) -> tuple[str, dict, str | None]:
++    """[daveey] ``(message, error_surface, boundary notice)`` for a turn whose agent build failed.
++
++    A build refused by the pinned route's subscription quota wall (``agent_failure.failure_route``, recorded by
++    the build-failure handler) closes like the pre-build refusal of that pin (``gateway/run_turn_runner.py``
++    ``_resolution_failure_result``): a non-retryable ``route_refused`` card whose body names the reset in PT and
++    /model, and the boundary copy without "Send it again". Everything else stays ``agent_init_failed``."""
++    failure = session.get("agent_failure")
++    route = failure.get("failure_route") if isinstance(failure, dict) else None
++    if isinstance(route, dict):
++        try:
++            from agent.model_routing_walls import walled_pin_reply
++            reply = walled_pin_reply(route["provider"], route["model"], route["resets_at"])
++        except Exception:  # health: allow BLE001 -- a malformed record keeps the generic card
++            logger.warning("prompt.submit: unusable failure_route %r", route, exc_info=True)
++        else:
++            from agent.turn_failure_copy import ROUTE_REFUSED_TURN_NOTICE
++            return reply, {"layer": "gateway", "code": "route_refused", "retryable": False,
++                           "message": reply}, ROUTE_REFUSED_TURN_NOTICE
++    return message, {"layer": "runtime", "code": "agent_init_failed", "retryable": True}, None
++
++
++def _close_agent_init_failed_turn(
++        session: dict, message: str, error_surface: dict, notice: str | None = None) -> None:
+     """[daveey] Close the accepted user row of a turn whose agent build failed with the failed-turn boundary.
+ 
+     No agent ran, so neither ``agent/conversation_loop.py::_close_durable_failed_turn`` nor the gateway's
+     ``_hmwa_close_failed_turn`` exists on this path: without this row the chat's durable tail stays the
+     user row and its outcome reads ``unresolved{interrupted}`` forever instead of ``turn_failed``.
+     Idempotent on the DURABLE tail (``OPEN_TURN_TAIL_ROLES``), like the other two closers: a redelivery
+-    or a tail another writer already closed is a no-op. No tool ran, so the copy is ``FAILED_TURN_NOTICE``.
++    or a tail another writer already closed is a no-op. No tool ran, so the copy is ``FAILED_TURN_NOTICE``
++    unless *notice* replaces it (a route refusal's ``ROUTE_REFUSED_TURN_NOTICE``).
+     Best-effort: the client frame still goes out when the store cannot be written."""
+     sid = str(session.get("session_key") or "")
+     if not sid:
+@@ -692,7 +716,7 @@ def _close_agent_init_failed_turn(session: dict, message: str, error_surface: di
+             if db is None or db.latest_conversation_role(sid) not in OPEN_TURN_TAIL_ROLES:
+                 return
+             error = redact_sensitive_text(str(message or "").strip()[:2000], force=True)
+-            row = {"role": "assistant", "content": FAILED_TURN_NOTICE, "display_kind": FAILED_TURN_DISPLAY_KIND,
++            row = {"role": "assistant", "content": notice or FAILED_TURN_NOTICE, "display_kind": FAILED_TURN_DISPLAY_KIND,
+                    "display_metadata": {k: v for k, v in (("error", error), ("error_surface", error_surface)) if v}}
+             try:
+                 db.append_message(sid, **row)
+@@ -726,8 +750,8 @@ def _run_after_agent_ready(
+         # without this the accepted message reads in agent.log as one that silently never ran. [daveey]
+         logger.warning("prompt.submit: turn for session %s (%s) failed before the agent was ready: %s",
+                        sid, session.get("session_key") or "", str(message)[:300])
+-        surface = {"layer": "runtime", "code": "agent_init_failed", "retryable": True}
+-        _close_agent_init_failed_turn(session, message, surface)
++        message, surface, notice = _agent_init_failure_surface(session, message)
++        _close_agent_init_failed_turn(session, message, surface, notice)
+         # Terminal frame + retained snapshot (not a bare "error" event): the snapshot is
+         # the only way resume shows this to a disconnected client.
+         _emit_terminal_turn_error(sid, session, message, error_surface=surface)
+diff --git a/tui_gateway/session_registry.py b/tui_gateway/session_registry.py
+index a7951664d3..552e0ff9da 100644
+--- a/tui_gateway/session_registry.py
++++ b/tui_gateway/session_registry.py
+@@ -306,6 +306,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
+             if (isinstance(resets_at, (int, float)) and not isinstance(resets_at, bool)
+                     and "failure_resets_at" not in current["agent_failure"]):
+                 current["agent_failure"]["failure_resets_at"] = float(resets_at)
++            # [daveey] The pinned route whose quota wall refused the build, with that wall's reset: the turn waiting
++            # on it closes as a route refusal (``methods_prompt._run_after_agent_ready``). Server-side only, like
++            # failure_resets_at (``credential_failure.client_failure_fields`` drops it).
++            from agent.model_routing_unavailable import quota_refusal_wall
++            if (wall := quota_refusal_wall(e)) is not None:
++                current["agent_failure"]["failure_route"] = dict(zip(("provider", "model", "resets_at"), wall))
+             current["agent_error"] = str(e)
+             # Logged: a failed build otherwise leaves no trace, so a prompt waiting on it reads in agent.log as
+             # a message that "never ran" (the client only got an event, which a disconnect can lose). [daveey]
+diff --git a/tui_gateway/user_messages.py b/tui_gateway/user_messages.py
+index 855500545d..cadcb5c6b3 100644
+--- a/tui_gateway/user_messages.py
++++ b/tui_gateway/user_messages.py
+@@ -45,6 +45,9 @@ _TURN_ERROR_CODE_COPY: dict[str, tuple[str, str]] = {
+                           "Use it there, or start a new chat with /new."),
+     "SESSION_COORDINATION_UNAVAILABLE": ("Hermes could not check whether this chat is open somewhere else",
+                                          "Send /retry; type /logs for the trace."),
++    # [daveey] The chat's pinned route refused before any model ran (a subscription quota wall): /retry
++    # repeats the refusal until the reset, so the way out is another model.
++    "route_refused": ("This chat's model is unavailable", "Use /model to switch, or resend after the reset."),
+ }
+ 
+ _TURN_ERROR_LAYER_COPY: dict[str, tuple[str, str]] = {
+@@ -130,6 +133,12 @@ _AUTH_LOCK_TIMEOUT_PREFIXES = (
+ 
+ 
+ def agent_init_failed_message(exc: Any) -> str:
++    # [daveey] A build refused by the pinned route's subscription quota wall: the reset in PT and /model, the
++    # same sentence as the pre-build refusal (``held_reply``), not a raw epoch and `hermes setup` advice.
++    from agent.model_routing_unavailable import quota_refusal_wall
++    if (wall := quota_refusal_wall(exc)) is not None:
++        from agent.model_routing_walls import walled_pin_reply
++        return walled_pin_reply(*wall)
+     detail = str(exc).rstrip(". ")  # resolver messages end in a sentence; no ".." before the hint
+     if any(prefix in detail for prefix in _AUTH_LOCK_TIMEOUT_PREFIXES):
+         return (f"Hermes could not start the assistant for this session. Details: {detail}. "
+-- 
+2.43.0
+

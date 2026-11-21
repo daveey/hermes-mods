@@ -1,0 +1,145 @@
+From 3b4713bde16d29752945d599a0020a17c1c3c407 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:10:29 +0000
+Subject: [PATCH] fix(kanban): preserve remote chat ownership of contained
+ strands [daveey]
+
+The strand sweep used local-chat discovery as absence-of-owner evidence. Read owning links on all gateways and owning hub subscriptions too; retain explicit releases, machine/notice exclusions and fail-closed read errors. Proof: new probes fail on the reviewed head; 14 consumer files pass after the fix.
+---
+ hermes_cli/kanban_triage_sweep.py             | 42 +++++++++++++-
+ .../test_kanban_contained_remote_owner.py     | 56 +++++++++++++++++++
+ 2 files changed, 95 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_contained_remote_owner.py
+
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index b1ab8e5e04..f40a5cf0c9 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -119,6 +119,44 @@ def stranded_contained(conn: sqlite3.Connection, *, now: Optional[float] = None)
+     return out
+ 
+ 
++def _contained_chat_owners(conn: sqlite3.Connection, ids: list[str]) -> set[str]:
++    """Owning chats on any gateway, including subscriptions not projected into links yet.
++
++    A stored release wins over a lingering subscription. Notice-only subscriptions and
++    machine/placeholder sessions are not owners. Read failures propagate to the sweep's
++    fail-closed boundary rather than becoming evidence of absent ownership. [daveey]
++    """
++    from hermes_cli.kanban_chat_links import _local_links
++    from hermes_cli.kanban_db_notify import _owning_sub_clause, is_machine_session
++    from hermes_cli.kanban_origin import OriginError, gateway_name, parse_origin
++    from hermes_cli.kanban_placement import is_placeholder_session
++
++    gateway = gateway_name()
++    owned = {r["task_id"] for r in _local_links(conn, gateway).values() if not r.get("released")}
++    has_links = conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone()
++    for tid in ids:
++        rows = [dict(r) for r in conn.execute("SELECT * FROM task_chat_links WHERE task_id=?", (tid,))] if has_links else []
++        known = {(r["chat_gateway"], r["chat_profile"] or "default", r["chat_session"]) for r in rows}
++        candidates = [r for r in rows if not r["released"] and r["kind"] in ("created", "shepherd")]
++        for sub in conn.execute(
++                "SELECT s.chat_id FROM kanban_notify_subs s LEFT JOIN tasks p ON p.id=s.task_id "
++                f"WHERE s.task_id=? AND s.platform='hub' AND {_owning_sub_clause()}", (tid,)):
++            try:
++                origin = parse_origin(sub[0])
++            except OriginError:
++                continue
++            key = (origin.gateway, origin.profile or "default", origin.session)
++            if key not in known:
++                candidates.append({"chat_gateway": origin.gateway, "chat_profile": origin.profile,
++                                   "chat_session": origin.session})
++                known.add(key)
++        for row in candidates:
++            if not is_placeholder_session(row["chat_session"]) and not is_machine_session(
++                    row["chat_gateway"], row["chat_session"], local_gateway=gateway, profile=row["chat_profile"]):
++                owned.add(tid)
++    return owned
++
++
+ def escalate_stranded_contained(conn: sqlite3.Connection, *, now: Optional[float] = None,
+                                 skip: Optional[set] = None) -> list[str]:
+     """A stranded contained card with a chat is woken by the owner wake (``wait.agent_owned``); one with NO chat has
+@@ -128,8 +166,6 @@ def escalate_stranded_contained(conn: sqlite3.Connection, *, now: Optional[float
+ 
+     Retained copies of another gateway's card are skipped. Those copies have no triage authority, and a worker
+     must not create a supervisor card for one. [daveey]"""
+-    from hermes_cli.kanban_chat_links import _local_links
+-    from hermes_cli.kanban_origin import gateway_name
+     from hermes_cli.kanban_wake_check import foreign_ids
+ 
+     skipped = foreign_ids(conn) if skip is None else skip
+@@ -140,7 +176,7 @@ def escalate_stranded_contained(conn: sqlite3.Connection, *, now: Optional[float
+     if not stranded:
+         return []
+     try:
+-        linked = {link["task_id"] for link in _local_links(conn, gateway_name()).values() if not link.get("released")}
++        linked = _contained_chat_owners(conn, [card["id"] for card in stranded])
+     except Exception:
+         logger.warning("kanban: containment strand check could not read chat links", exc_info=True)
+         return []
+diff --git a/tests/hermes_cli/test_kanban_contained_remote_owner.py b/tests/hermes_cli/test_kanban_contained_remote_owner.py
+new file mode 100644
+index 0000000000..21fb618f5b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_contained_remote_owner.py
+@@ -0,0 +1,56 @@
++"""Contained-strand escalation must not replace remote owning chats. [daveey]"""
++import json
++import sqlite3
++
++import pytest
++
++from tests.hermes_cli import test_kanban_contained_strand as h
++
++@pytest.fixture
++def board(request):
++    conn = request.getfixturevalue("base_board")
++    conn.execute("CREATE TABLE task_chat_links(uid TEXT,task_id TEXT,chat_gateway TEXT,chat_profile TEXT,"
++                 "chat_session TEXT,kind TEXT,released INTEGER,created_at REAL)")
++    return conn
++
++
++base_board = h.board
++
++
++@pytest.mark.parametrize("source", ["link", "subscription"])
++@pytest.mark.parametrize("owner", ["chat", "released", "machine", "notice"])
++def test_remote_ownership_controls_escalation(board, source, owner):
++    relay, authority, _ = h._contained(board)
++    h._finish(board, authority)
++    session = "cron_fixture" if owner == "machine" else "20261120_000000_abcdef"
++    if source == "link" or owner == "released":
++        board.execute(
++            "INSERT INTO task_chat_links(uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) "
++            "VALUES (?,?, 'remote-chat-host','default',?,'created',?,?)",
++            ("remote-owner", relay, session, int(owner == "released"), h.NOW - 3600))
++    if source == "subscription":
++        board.execute(
++            "INSERT INTO kanban_notify_subs(task_id,platform,chat_id,created_at,delivery_metadata) "
++            "VALUES (?,'hub',?,?,?)", (relay, f"remote-chat-host/default/{session}", h.NOW - 3600,
++                                      json.dumps({"reason": "touch" if owner == "notice" else "create"})))
++    # Notice-only is meaningful for subscriptions, not an explicit owning link.
++    expected = 0 if owner == "chat" or (source == "link" and owner == "notice") else 1
++    made = h.sweep.escalate_stranded_contained(board, now=h.NOW)
++    assert len(made) == expected
++    assert board.execute(f"SELECT COUNT(*) FROM tasks WHERE {h.KEY}").fetchone()[0] == expected
++    assert h.sweep.escalate_stranded_contained(board, now=h.NOW + 3600) == []
++
++
++def test_unreadable_remote_ownership_does_not_escalate(board, monkeypatch):
++    from hermes_cli import kanban_db_notify
++    _relay, authority, _ = h._contained(board)
++    h._finish(board, authority)
++
++    def unavailable(*args, **kwargs):
++        raise sqlite3.OperationalError("ownership unavailable")
++
++    board.execute("INSERT INTO task_chat_links VALUES ('owner',?,'remote-chat-host','default',"
++                  "'20261120_000000_abcdef','created',0,?)", (_relay, h.NOW))
++    monkeypatch.setattr(kanban_db_notify, "is_machine_session", unavailable)
++    assert h.sweep.escalate_stranded_contained(board, now=h.NOW) == []
++    assert board.execute(f"SELECT COUNT(*) FROM tasks WHERE {h.KEY}").fetchone()[0] == 0
+-- 
+2.43.0
+

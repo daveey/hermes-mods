@@ -1,0 +1,133 @@
+From 741585ba0230335d93eee29a89afb74eff49e1f1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 16:10:18 +0000
+Subject: [PATCH] [daveey] automation replay: fence late-published rewall by
+ the time its replay row was written
+
+---
+ .../tui_gateway/test_automation_replay_handoff.py  | 12 ++++++++++--
+ tui_gateway/automation_replay.py                   | 14 +++++++++-----
+ tui_gateway/automation_replay_handoff.py           | 10 +++++-----
+ 3 files changed, 24 insertions(+), 12 deletions(-)
+
+diff --git a/tests/tui_gateway/test_automation_replay_handoff.py b/tests/tui_gateway/test_automation_replay_handoff.py
+index 50e989c23f..224458a87a 100644
+--- a/tests/tui_gateway/test_automation_replay_handoff.py
++++ b/tests/tui_gateway/test_automation_replay_handoff.py
+@@ -474,7 +474,7 @@ def test_named_launch_profile_is_consumed(monkeypatch, tmp_path):
+ 
+ def test_rewalled_replay_is_not_fenced_by_an_earlier_success_but_is_by_stop(wired):
+     ar.cancel_durable(wired.path.parent, (KEY,), 60.0)  # earlier turn succeeded after the first failure (created=50)
+-    rewalled = dict(item("rewall", created=50), source_batch="parent-batch", attempt=1)
++    rewalled = dict(item("rewall", created=50), source_batch="parent-batch", attempt=1, row_at=70)
+     wired.publish(KEY, [rewalled])
+     got = wired.claim(KEY, 200, "h", lambda _: False)
+     assert got and [r["id"] for r in json.loads(got["payload"])] == ["rewall"]
+@@ -485,9 +485,17 @@ def test_rewalled_replay_is_not_fenced_by_an_earlier_success_but_is_by_stop(wire
+ 
+ def test_locally_rewalled_replay_without_batch_is_not_fenced_by_an_earlier_success(wired):
+     ar.cancel_durable(wired.path.parent, (KEY,), 60.0)  # earlier turn succeeded after the first failure (created=50)
+-    wired.publish(KEY, [dict(item("local-rewall", created=50), attempt=1)])  # timer-run replay: no source_batch
++    wired.publish(KEY, [dict(item("local-rewall", created=50), attempt=1, row_at=70)])  # timer-run replay: no source_batch
+     wired.publish(KEY, [item("fresh-old", created=50)])  # a never-replayed delivery older than the success stays fenced
+     got = wired.claim(KEY, 200, "h", lambda _: False)
+     assert got and [r["id"] for r in json.loads(got["payload"])] == ["local-rewall"]
+     again = wired.claim(KEY, 300, "h2", lambda _: False)  # the unsettled batch only, never the fenced item
+     assert [r["id"] for r in json.loads(again["payload"])] == ["local-rewall"]
++
++
++def test_rewalled_replay_published_late_is_fenced_by_a_success_that_started_after_its_row(wired):
++    ar.cancel_durable(wired.path.parent, (KEY,), 60.0)
++    ar.cancel_durable(wired.path.parent, (KEY,), 300.0)  # a later turn started after the replay row (row_at=200)
++    wired.publish(KEY, [dict(item("late-rewall", created=50), attempt=1, row_at=200), dict(
++        item("late-batch-rewall", created=50), source_batch="parent-batch", attempt=1, row_at=200)])
++    assert wired.claim(KEY, 400, "h", lambda _: False) is None
+diff --git a/tui_gateway/automation_replay.py b/tui_gateway/automation_replay.py
+index 5c66320162..432d234297 100644
+--- a/tui_gateway/automation_replay.py
++++ b/tui_gateway/automation_replay.py
+@@ -83,6 +83,7 @@ class _Item:
+     attempt: int = 0  # replays this delivery already had (a wall-refused replay re-armed: ``rewall_due``)
+     id: str = field(default_factory=lambda: uuid.uuid4().hex)  # stable identity across a retirement handoff
+     source_batch: str | None = None  # only a rewall of this exact durable wake transfers custody
++    row_at: float = 0.0  # when this delivery's latest replay row entered the transcript (0: its failure row, failed_at)
+ 
+ 
+ @dataclass
+@@ -359,7 +360,7 @@ def _cancel_timer(entry: _Entry) -> None:
+ def schedule(session_key: str, *, text: str, display_kind: str, display_metadata: dict | None, due: float,
+              cause: str, persisted: bool, now: float | None = None,
+              fire: Callable[[str], None] | None = None, attempt: int = 0, failed_at: float | None = None,
+-             profile_home: Any = None, source_batch: str | None = None) -> bool:
++             profile_home: Any = None, source_batch: str | None = None, row_at: float = 0.0) -> bool:
+     """Arm (or join) this chat's one pending replay. True when it is pending after the call. ``attempt`` is the
+     replays the delivery already had (a wall-refused replay re-armed), ``failed_at`` its first failure."""
+     key = str(session_key or "")
+@@ -369,6 +370,7 @@ def schedule(session_key: str, *, text: str, display_kind: str, display_metadata
+     item = _Item(text, display_kind, dict(display_metadata or {}), persisted, cause,
+                  now if failed_at is None else failed_at, attempt)
+     item.source_batch = source_batch
++    item.row_at = row_at
+     fire = fire or _fire
+     home = _home_of(profile_home)
+     slot = (home, key)
+@@ -516,14 +518,15 @@ def schedule_for_turn(session: dict, st: Any) -> None:
+         logger.warning("automation-replay: %s in %s", plan.line, key)
+         return
+     text, meta = getattr(st, "automation_text", ""), getattr(st, "display_metadata", None)
+-    attempt, failed_at, source_batch = 0, None, None
++    attempt, failed_at, source_batch, row_at = 0, None, None, 0.0
+     if is_replay(meta):  # a wall refused the replay (``rewall_due``): re-arm the deliveries it wrapped
+         marker = meta.get(REPLAY_METADATA_KEY) if isinstance(meta, dict) else None
+         source_batch = marker.get("batch_id") if isinstance(marker, dict) else None
+         text, meta, failed_at, attempt = _unwrap_replay(text, meta, time.time())
++        row_at = time.time()  # the replay row that just failed is in the transcript now
+     schedule(key, text=text, display_kind=st.display_kind, display_metadata=meta, due=plan.due, cause=plan.cause,
+              persisted=True, attempt=attempt, failed_at=failed_at,
+-             profile_home=session.get("profile_home"), source_batch=source_batch)
++             profile_home=session.get("profile_home"), source_batch=source_batch, row_at=row_at)
+ 
+ 
+ def _fire(key: str, *, profile_home: Any = None, expected_timer=None) -> None:
+@@ -585,13 +588,14 @@ def _item_dict(item: _Item, due: float) -> dict:
+     return {"id": item.id, "text": item.text, "display_kind": item.display_kind,
+             "display_metadata": item.display_metadata, "persisted": item.persisted, "cause": item.cause,
+             "failed_at": item.failed_at, "attempt": item.attempt, "due": due, "created_at": item.failed_at,
+-            "source_batch": item.source_batch}
++            "source_batch": item.source_batch, "row_at": item.row_at}
+ 
+ 
+ def _item_from(data: dict) -> _Item:
+     return _Item(data["text"], data["display_kind"], dict(data.get("display_metadata") or {}),
+                  bool(data["persisted"]), data.get("cause") or "", float(data["failed_at"]),
+-                 int(data.get("attempt") or 0), str(data["id"]), data.get("source_batch"))
++                 int(data.get("attempt") or 0), str(data["id"]), data.get("source_batch"),
++                 float(data.get("row_at") or 0.0))
+ 
+ 
+ def handoff(key: str, *, profile_home: Any = None) -> bool:
+diff --git a/tui_gateway/automation_replay_handoff.py b/tui_gateway/automation_replay_handoff.py
+index e504445b5e..15c4574107 100644
+--- a/tui_gateway/automation_replay_handoff.py
++++ b/tui_gateway/automation_replay_handoff.py
+@@ -63,12 +63,12 @@ class Journal:
+             fence = conn.execute("SELECT * FROM automation_replay_fences WHERE owner=?", (owner,)).fetchone()
+             for item in items:
+                 created = item["created_at"]
+-                # A re-walled replay (source_batch) keeps the first failure's created_at, so a success that landed
+-                # between that failure and the replay says nothing about this attempt: only Stop fences it.
++                # A persisted item is carried by a success whose context started after its latest row entered the
++                # transcript: the failure row, or for a re-walled replay the replay row (row_at), never the first
++                # failure's created_at (a success between the two says nothing about the replay).
++                row_at = float(item.get("row_at") or 0.0) or created
+                 covered = fence and (created <= fence["stopped_at"] or
+-                                     (item["persisted"] and not item.get("source_batch")
+-                                      and not int(item.get("attempt") or 0)
+-                                      and created <= fence["carried_through"]))
++                                     (item["persisted"] and row_at <= fence["carried_through"]))
+                 payload = json.dumps(item, separators=(",", ":"))
+                 terminal = conn.execute("SELECT owner,payload_sha256 FROM automation_replay_tombstones WHERE id=?",
+                                         (item["id"],)).fetchone()
+-- 
+2.43.0
+

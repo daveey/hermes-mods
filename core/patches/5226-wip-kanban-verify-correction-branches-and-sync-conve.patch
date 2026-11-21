@@ -1,0 +1,138 @@
+From d74042108dfec3120c3216269fc835e12e221fd2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:54:03 +0000
+Subject: [PATCH] wip(kanban): verify correction branches and sync convergence
+ [daveey]
+
+---
+ ...t_kanban_diagnostic_correction_controls.py | 43 ++++++++++++++++
+ .../test_kanban_diagnostic_correction_sync.py | 49 +++++++++++++++++++
+ 2 files changed, 92 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_diagnostic_correction_sync.py
+
+diff --git a/tests/hermes_cli/test_kanban_diagnostic_correction_controls.py b/tests/hermes_cli/test_kanban_diagnostic_correction_controls.py
+index 078aa2bf01..7cc6865d83 100644
+--- a/tests/hermes_cli/test_kanban_diagnostic_correction_controls.py
++++ b/tests/hermes_cli/test_kanban_diagnostic_correction_controls.py
+@@ -74,6 +74,18 @@ def test_wrong_identity_preserves_every_row(correction_case, identity):
+     assert list(conn.iterdump()) == before
+ 
+ 
++def test_missing_task_with_orphan_comment_refused(correction_case):
++    conn, _tid, request = correction_case
++    # Imported corruption: membership matches, but its task row is absent.
++    conn.execute("PRAGMA foreign_keys = OFF")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE task_comments SET task_id = 'missing-task' WHERE uid = ?", (request["comment_uid"],))
++    before = list(conn.iterdump())
++    with pytest.raises(ValueError, match="identity mismatch"):
++        correct_diagnostics(conn, "missing-task", **request)
++    assert list(conn.iterdump()) == before
++
++
+ @pytest.mark.parametrize("status", ["running", "review", "done", "archived"])
+ def test_active_or_closed_task_refused(correction_case, status):
+     conn, tid, request = correction_case
+@@ -85,6 +97,34 @@ def test_active_or_closed_task_refused(correction_case, status):
+     assert list(conn.iterdump()) == before
+ 
+ 
++@pytest.mark.parametrize("status", ["todo", "ready", "blocked", "scheduled", "triage"])
++def test_inactive_open_status_supported(correction_case, status):
++    conn, tid, request = correction_case
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
++    result = correct_diagnostics(conn, tid, **request)
++    assert result["after"]["body"] == 'Diagnostic "error"'
++    assert conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == status
++
++
++def test_current_run_alone_refuses(correction_case):
++    conn, tid, request = correction_case
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET current_run_id = 71 WHERE id = ?", (tid,))
++    before = list(conn.iterdump())
++    with pytest.raises(ValueError, match="inactive open task"):
++        correct_diagnostics(conn, tid, **request)
++    assert list(conn.iterdump()) == before
++
++
++def test_matching_primary_supported(correction_case, monkeypatch):
++    conn, tid, request = correction_case
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET created_on = ? WHERE id = ?", ("owner", tid))
++    monkeypatch.setattr(sync, "sync_state", lambda _conn: {"mode": "primary", "gateway_id": "owner"})
++    assert correct_diagnostics(conn, tid, **request)["process_context"]["gateway"] == "owner"
++
++
+ @pytest.mark.parametrize("state", [
+     {"mode": "shadow", "gateway_id": "owner"},
+     {"mode": "primary", "gateway_id": ""},
+@@ -94,6 +134,9 @@ def test_primary_owner_required(correction_case, monkeypatch, state):
+     conn, tid, request = correction_case
+     with kb.write_txn(conn):
+         conn.execute("UPDATE tasks SET created_on = ? WHERE id = ?", ("owner", tid))
++    if not state["gateway_id"]:
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET created_on = '' WHERE id = ?", (tid,))
+     monkeypatch.setattr(sync, "sync_state", lambda _conn: state)
+     before = list(conn.iterdump())
+     with pytest.raises(PermissionError, match="owning primary gateway"):
+diff --git a/tests/hermes_cli/test_kanban_diagnostic_correction_sync.py b/tests/hermes_cli/test_kanban_diagnostic_correction_sync.py
+new file mode 100644
+index 0000000000..914b940430
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_diagnostic_correction_sync.py
+@@ -0,0 +1,49 @@
++"""Real capture/translate/replica with isolated Python Board stand-in."""
++from __future__ import annotations
++
++import json
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli.kanban_diagnostic_correction import correct_diagnostics
++from tests.hermes_cli import test_kanban_sync_terminal_regress as fixtures
++
++kanban_home = fixtures.kanban_home
++svc = fixtures.svc
++live = fixtures.live
++
++
++def test_correction_converges_body_comment_and_audit(live, kanban_home, svc):
++    body = "Diagnostic error. Acceptance: preserve all requirements."
++    comment = "Observed error."
++    tid = kb.create_task(live, title="Diagnostic transport", body=body)
++    kb.add_comment(live, tid, "original-author", comment)
++    original = dict(live.execute("SELECT * FROM task_comments WHERE task_id = ?", (tid,)).fetchone())
++    uid = original["uid"]
++    assert uid
++    fixtures._round(kanban_home, svc)
++    request = dict(comment_uid=uid, expected_body=body, expected_comment=comment,
++                   body_diagnostic="error", comment_diagnostic="error",
++                   reason="Diagnosed prose, not a destination", request_id="transport-correction")
++    result = correct_diagnostics(live, tid, **request)
++    fixtures._round(kanban_home, svc)
++    rows = svc.board(fixtures.BOARD)["rows"]
++    assert rows["tasks"][tid]["body"] == result["after"]["body"]
++    assert rows["task_comments"][uid]["body"] == result["after"]["comment"]
++    assert rows["task_comments"][uid]["author"] == original["author"]
++    with kbc.connect_closing(ksc.shadow_path(fixtures.BOARD)) as replica:
++        assert replica.execute("SELECT body FROM tasks WHERE id = ?", (tid,)).fetchone()[0] == result["after"]["body"]
++        copied = dict(replica.execute("SELECT * FROM task_comments WHERE uid = ?", (uid,)).fetchone())
++        for key in ("uid", "task_id", "author", "created_at"):
++            assert copied[key] == original[key]
++        assert copied["body"] == result["after"]["comment"]
++        audit = replica.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
++                                (tid, "diagnostic_corrected")).fetchall()
++        assert len(audit) == 1
++        assert json.loads(audit[0][0]) == result
++    before = list(live.iterdump())
++    assert correct_diagnostics(live, tid, **request) == result
++    assert list(live.iterdump()) == before
++    assert result["before"] == {"body": body, "comment": comment}
++    assert result["after"]["body"].split("Acceptance:")[1] == body.split("Acceptance:")[1]
+-- 
+2.43.0
+

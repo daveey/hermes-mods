@@ -1,0 +1,340 @@
+From 1353d7ce5d225abd98ced56fc91d3b5d494dfc23 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 04:38:47 +0000
+Subject: [PATCH] [daveey] kanban: an expedite that commits while a wake probe
+ is running survives that probe's older result
+
+Found by review t_eeeeee000000001e of PR #3729 (https://github.com/example-org/hermes/pull/3729#pullrequestreview-5987361418).
+
+Five whys:
+1. Why did a wait-comment answer still wait 900 s after #3729's expedite? The probe that was already running
+   returned "not yet" from a snapshot taken before the comment, and apply_result wrote next_at = now + every,
+   overwriting the expedite (next_at = now). Window = the probe's whole run (3.7-3.8 s measured on a pool host).
+2. Why did apply_result overwrite it? All four non-waking branches (not yet, offline gateway, scope unknown,
+   broken-once) set next_at unconditionally; the claim had set it to ts + every and nothing recorded that a
+   later writer moved it earlier.
+3. Why was that invisible? Expedites (comment, awaited-card status, replica pull) only ever lower next_at;
+   no test committed one between the probe result and apply_result. The same overwrite exists on baseline and
+   hits status expedites too.
+4. Why not simply min(next_at, now + every)? That shortens the ordinary cadence of every unexpedited probe to
+   the claim slot; the cadence must stay exactly now + every.
+5. Root: the claim's slot was not carried to the apply. Fix: run_due_wake_checks passes the slot it claimed
+   (ts + every) as claimed_next_at; apply_result keeps a next_at that is earlier than that slot (an expedite
+   landed mid-probe), else the ordinary now + every. The next tick re-probes, so a real answer wakes the card
+   and a rejected comment costs one probe, then the cadence. No polling added; a result for a re-parked
+   probe (cmd/generation mismatch) is still dropped before this point.
+
+Cross-card wait-comment (a park on another card's comments) is left on its cadence on purpose, pinned by a test:
+matching it needs a scan of every park's cmd per comment commit, and the chat-wait builder waits on its own card.
+
+Tests (tests/hermes_cli/test_kanban_wake_inflight_expedite.py, a second connection commits after the probe
+result and before apply_result; RED 6/9 on main, GREEN 9/9):
+- comment mid-probe: next tick wakes the card with the answer (condition_met carries it);
+- rejected (system) comment mid-probe: one extra probe, then now + every again;
+- awaited-card status change mid-probe; not-yet, offline-gateway and broken-once results;
+- no expedite: cadence unchanged; re-park mid-probe: old result dropped, new park untouched;
+- cross-card wait-comment keeps its cadence.
+Neighbouring suites: 85 files importing kanban_wake_check / apply_result / run_due_wake_checks, 1917 passed.
+---
+ hermes_cli/kanban_local_status_wake.py        |   5 +
+ hermes_cli/kanban_wake_check.py               |  31 ++-
+ .../test_kanban_wake_inflight_expedite.py     | 179 ++++++++++++++++++
+ 3 files changed, 207 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_wake_inflight_expedite.py
+
+diff --git a/hermes_cli/kanban_local_status_wake.py b/hermes_cli/kanban_local_status_wake.py
+index ae6d033771..9c22683481 100644
+--- a/hermes_cli/kanban_local_status_wake.py
++++ b/hermes_cli/kanban_local_status_wake.py
+@@ -18,6 +18,11 @@ the write that made them (a rolled-back transition never expedites). ``arm`` cle
+ commit hands over only its own changes. Before calling ``expedite`` (which reads every scheduled park's latest park
+ event), one indexed query asks whether any scheduled park mentions a changed card at all; the common commit costs
+ that one read. Every failure is swallowed: the park keeps its ``check_every`` cadence and the transition stands.
++
++Scope, deferred on purpose: only ``wait-comment <the parked card itself>`` is expedited by a comment. A park waiting
++on ANOTHER card's comments keeps its cadence: matching it costs a scan of every park's cmd on every comment commit
++(the self-card match is one indexed read), and the chat-wait builder always waits on its own card. A change that
++commits while a probe is already running is kept by ``kanban_wake_check.apply_result`` (``claimed_next_at``).
+ """
+ from __future__ import annotations
+ 
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index f9923358dd..d2e3b31c17 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -807,8 +807,20 @@ def producer_note(hit: dict) -> str:
+             "`--from <that status>`. Those statuses count as met, so without it the probe passes at once.")
+ 
+ 
++def _after_probe(state: dict, claimed_next_at: Optional[int], now: int) -> int:
++    """next_at after a probe that did not wake the card. [daveey] The claim parked next_at at its slot
++    (``claimed_next_at``). A wait-comment or status expedite that committed while the probe ran moved it earlier
++    (due now): that earlier slot is kept, so the next tick re-probes and sees the change instead of this older
++    snapshot's result pushing the park a whole ``check_every`` out. Not expedited: the ordinary cadence."""
++    held = state.get("next_at")
++    if claimed_next_at is not None and held is not None and int(held) < int(claimed_next_at):
++        return int(held)
++    return now + int(state["every"])
++
++
+ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict, now: Optional[int], generation: str,
+-                     purpose: str = "wake", stale_interval: Optional[float] = None, passive_policy=None) -> Any:
++                     purpose: str = "wake", stale_interval: Optional[float] = None, passive_policy=None,
++                     claimed_next_at: Optional[int] = None) -> Any:
+     key = (db_path, task_id)
+     try:
+         rc, out = _run_probe(key, cmd, cwd, env)
+@@ -843,7 +855,8 @@ def _probe_and_apply(db_path: str, task_id: str, cmd: str, cwd: str, env: dict,
+                 dead_ancestry = detect(cmd, cwd)
+             apply_result(conn, task_id, cmd, rc, out, now=now, generation=generation, diagnostics=diag,
+                          answered=answered, producer=producer, dead_ancestry=dead_ancestry,
+-                         stale_interval=stale_interval, passive_policy=passive_policy)
++                         stale_interval=stale_interval, passive_policy=passive_policy,
++                         claimed_next_at=claimed_next_at)
+             if rc == 1 and not output_error(out):
+                 from hermes_cli import kanban_decision_ask  # [daveey] a chat wait unanswered for 2 h goes to David
+                 kanban_decision_ask.escalate_if_overdue(conn, task_id, now=now)
+@@ -859,7 +872,8 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+                  *, generation: str, now: Optional[int] = None,
+                  diagnostics: Optional[dict] = None, answered: Optional[dict] = None,
+                  producer: Optional[dict] = None, dead_ancestry: Optional[list[dict]] = None,
+-                 stale_interval: Optional[float] = None, passive_policy=None) -> Optional[str]:
++                 stale_interval: Optional[float] = None, passive_policy=None,
++                 claimed_next_at: Optional[int] = None) -> Optional[str]:
+     """Record one probe result; wake the card on success or a broken probe. Returns the event
+     kind appended (``condition_met`` / ``wake_check_broken``) or None. A result for a probe
+     that is no longer the card's (re-parked, unblocked) is dropped."""
+@@ -919,7 +933,7 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+                 return woke
+             conn.execute(
+                 "UPDATE task_wake_checks SET last_at = ?, last_rc = 1, last_out = ?, fails = 0, "
+-                "next_at = ? WHERE task_id = ?", (now, tail, now + int(state["every"]), task_id))
++                "next_at = ? WHERE task_id = ?", (now, tail, _after_probe(state, claimed_next_at, now), task_id))
+             _note_alive(conn, task_id, cmd, now)
+             return None
+         age = stale_age(rc, out)
+@@ -939,7 +953,7 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+             # Not broken: the gateway is just offline. Keep any real-failure streak from before as it was.
+             conn.execute(
+                 "UPDATE task_wake_checks SET last_at = ?, last_rc = ?, last_out = ?, "
+-                "next_at = ? WHERE task_id = ?", (now, rc, tail, now + int(state["every"]), task_id))
++                "next_at = ? WHERE task_id = ?", (now, rc, tail, _after_probe(state, claimed_next_at, now), task_id))
+             _note_alive(conn, task_id, cmd, now)
+             return None
+         gw = source_unknown(rc, out)
+@@ -959,7 +973,7 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+             # Same unchanged source state, already escalated: keep any real-failure streak as it was.
+             conn.execute(
+                 "UPDATE task_wake_checks SET last_at = ?, last_rc = ?, last_out = ?, "
+-                "next_at = ? WHERE task_id = ?", (now, rc, tail, now + int(state["every"]), task_id))
++                "next_at = ? WHERE task_id = ?", (now, rc, tail, _after_probe(state, claimed_next_at, now), task_id))
+             _note_alive(conn, task_id, cmd, now)
+             return None
+         fails = int(state["fails"] or 0) + 1
+@@ -971,7 +985,8 @@ def apply_result(conn: sqlite3.Connection, task_id: str, cmd: str, rc: Any, out:
+                 "note": "The wake_check failed (not exit 0/1) repeatedly. Fix the probe, then park again."})
+         conn.execute(
+             "UPDATE task_wake_checks SET last_at = ?, last_rc = ?, last_out = ?, fails = ?, "
+-            "next_at = ? WHERE task_id = ?", (now, rc_col, tail, fails, now + int(state["every"]), task_id))
++            "next_at = ? WHERE task_id = ?",
++            (now, rc_col, tail, fails, _after_probe(state, claimed_next_at, now), task_id))
+         _note_alive(conn, task_id, cmd, now)
+         return None
+ 
+@@ -1075,7 +1090,7 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+                     continue
+             cwd = probe_cwd(task.workspace_path)
+             fut = _pool().submit(_probe_and_apply, db_path, task_id, cmd, cwd, _probe_env(task, db_path), now, claim,
+-                                 purpose, stale_interval, passive_policy)
++                                 purpose, stale_interval, passive_policy, ts + int(every))
+             with _LOCK:
+                 _IN_FLIGHT[key] = fut
+             submitted.append(task_id)
+diff --git a/tests/hermes_cli/test_kanban_wake_inflight_expedite.py b/tests/hermes_cli/test_kanban_wake_inflight_expedite.py
+new file mode 100644
+index 0000000000..ca56187808
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wake_inflight_expedite.py
+@@ -0,0 +1,179 @@
++"""An expedite that commits while a probe is in flight survives that probe's older "not yet" result. [daveey]
++
++Review t_eeeeee000000001e of PR #3729: ``run_due_wake_checks`` claims a probe with next_at = ts + every. A comment (or
++awaited-card status change) arriving while the probe runs expedites next_at to now; the probe's result, read before
++that change, then ``apply_result`` unconditionally wrote next_at = now + every, so the answer waited a full
++``check_every`` (900 s) again. The window is the probe's whole run (3.7-3.8 s measured on a pool host).
++
++Each test commits the change from a second connection (the real writer boundary) after the probe has produced its
++result and before ``apply_result`` records it: a deterministic stand-in for the race.
++"""
++from __future__ import annotations
++
++import os
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli.test_kanban_comment_wake import EVERY, _next_at, _park, _status
++from tests.hermes_cli.test_kanban_comment_wake import live, probes  # fixtures, requested below by name
++
++
++@pytest.fixture
++def board(request):
++    return request.getfixturevalue("live")
++
++
++@pytest.fixture
++def wake_probes(request):
++    return request.getfixturevalue("probes")
++
++
++def _inflight(monkeypatch, db_path, change, result=None):
++    """After the probe computed its result, ``change`` commits on another connection; the old result is returned."""
++    inner = kwc._run_probe
++
++    def run(key, cmd, cwd, env):
++        rc, out = inner(key, cmd, cwd, env) if result is None else result
++        other = kbc.connect(Path(str(db_path)))
++        try:
++            change(other)
++        finally:
++            other.close()
++        return rc, out
++
++    monkeypatch.setattr(kwc, "_run_probe", run)
++    return inner
++
++
++def _tick(board, now):
++    kwc.run_due_wake_checks(board, now=now, wait=True)
++
++
++def test_a_comment_during_the_probe_is_not_lost_to_its_older_result(board, wake_probes, monkeypatch):
++    tid, t0 = _park(board, wake_probes)
++    db = kbc._main_db_file(board)
++    # The park's probe is due; its claim sets next_at = t0 + 600 + EVERY, then the answer lands mid-probe.
++    with kb.write_txn(board):
++        board.execute("UPDATE task_wake_checks SET next_at = ? WHERE task_id = ?", (t0, tid))
++    inner = _inflight(monkeypatch, db, lambda c: kb.add_comment(c, tid, "default", "Decision: rotate daily; proceed."))
++    wall = int(time.time())
++    _tick(board, t0 + 600)
++    assert _status(board, tid) == "scheduled"  # the in-flight result was the older, not-yet one
++    assert _next_at(board, tid) <= wall + 5  # RED on main: t0 + 600 + EVERY
++    monkeypatch.setattr(kwc, "_run_probe", inner)
++
++    _tick(board, t0 + 601)
++    assert _status(board, tid) == "ready"
++    met = [e for e in kb.list_events(board, tid) if e.kind == "condition_met"]
++    assert met and "Decision: rotate daily" in (met[-1].payload or {})["output"]
++
++
++def test_a_rejected_comment_during_the_probe_costs_one_probe_then_the_cadence(board, wake_probes, monkeypatch):
++    tid, t0 = _park(board, wake_probes)
++    db = kbc._main_db_file(board)
++    with kb.write_txn(board):
++        board.execute("UPDATE task_wake_checks SET next_at = ? WHERE task_id = ?", (t0, tid))
++    inner = _inflight(monkeypatch, db, lambda c: kb.add_comment(c, tid, "kanban-dispatcher", "note", system=True))
++    wall = int(time.time())
++    _tick(board, t0 + 600)
++    assert _next_at(board, tid) <= wall + 5
++    monkeypatch.setattr(kwc, "_run_probe", inner)
++
++    runs = wake_probes[tid]
++    _tick(board, t0 + 601)  # the real probe skips the system comment: not yet
++    assert wake_probes[tid] == runs + 1 and _status(board, tid) == "scheduled"
++    assert _next_at(board, tid) == t0 + 601 + EVERY  # ordinary cadence again, no further expedite
++
++
++def test_a_status_change_during_the_probe_is_not_lost_either(board, monkeypatch):
++    review = kb.create_task(board, title="review", assignee="worker")
++    owner = kb.create_task(board, title="owner", assignee="worker")
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status = 'running' WHERE id IN (?, ?)", (review, owner))
++    flag = os.path.join(os.path.dirname(str(kbc._main_db_file(board))), "never-written")
++    assert kb.schedule_task(board, owner, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting",
++                            wake_check=f"test -f {flag}", check_every=EVERY,
++                            awaiting={"kind": "card", "ref": review, "why": "review"})
++    t0 = int(time.time())
++    with kb.write_txn(board):
++        board.execute("UPDATE task_wake_checks SET next_at = ? WHERE task_id = ?", (t0, owner))
++
++    def finish(c):
++        with kb.write_txn(c):
++            c.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review,))
++
++    _inflight(monkeypatch, kbc._main_db_file(board), finish, result=(1, ""))
++    _tick(board, t0)
++    assert _status(board, owner) == "scheduled"
++    assert _next_at(board, owner) <= int(time.time()) + 5  # RED on main: t0 + EVERY
++
++
++@pytest.mark.parametrize("result", [
++    pytest.param((1, "not yet"), id="not-yet"),
++    pytest.param((2, "boom"), id="broken-once"),
++    pytest.param((3, "stale_age=60s gateway=g1"), id="offline-gateway"),
++])
++def test_every_non_waking_result_branch_keeps_the_expedite(board, wake_probes, monkeypatch, result):
++    tid, t0 = _park(board, wake_probes)
++    with kb.write_txn(board):
++        board.execute("UPDATE task_wake_checks SET next_at = ? WHERE task_id = ?", (t0, tid))
++    _inflight(monkeypatch, kbc._main_db_file(board), lambda c: kb.add_comment(c, tid, "default", "answer"),
++              result=result)
++    wall = int(time.time())
++    _tick(board, t0 + 600)
++    assert _status(board, tid) == "scheduled"
++    assert _next_at(board, tid) <= wall + 5
++
++
++def test_no_expedite_keeps_the_ordinary_cadence_on_every_branch(board, wake_probes, monkeypatch):
++    tid, t0 = _park(board, wake_probes)
++    with kb.write_txn(board):
++        board.execute("UPDATE task_wake_checks SET next_at = ? WHERE task_id = ?", (t0, tid))
++    monkeypatch.setattr(kwc, "_run_probe", lambda key, cmd, cwd, env: (1, "not yet"))
++    _tick(board, t0 + 600)
++    assert _next_at(board, tid) == t0 + 600 + EVERY
++
++
++def test_a_repark_during_the_probe_drops_the_old_result_and_keeps_the_new_park(board, wake_probes, monkeypatch):
++    tid, t0 = _park(board, wake_probes)
++    with kb.write_txn(board):
++        board.execute("UPDATE task_wake_checks SET next_at = ? WHERE task_id = ?", (t0, tid))
++    later = {}
++
++    def repark(c):
++        task = kb.get_task(c, tid)
++        assert task is not None
++        newer = kb.add_comment(c, tid, "default", "second question")
++        later["cmd"] = f"hermes kanban wait-comment {tid} --after-id {newer} --skip-system"
++        with kb.write_txn(c):
++            c.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
++        assert kb.schedule_task(c, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting again",
++                                wake_check=later["cmd"], check_every=EVERY)
++
++    _inflight(monkeypatch, kbc._main_db_file(board), repark, result=(1, "not yet"))
++    _tick(board, t0 + 600)
++    state = kwc.get_state(board, tid)
++    assert state is not None and state["cmd"] == later["cmd"]
++    assert state["last_rc"] is None and state["fails"] == 0  # the old probe's result recorded nothing
++    assert state["next_at"] != t0 + 600 + EVERY  # nothing from the old probe's apply: its slot was dropped
++
++
++def test_a_cross_card_wait_comment_keeps_its_cadence(board, wake_probes):
++    """Deferred scope, pinned: only ``wait-comment <the parked card itself>`` is expedited. Matching a park on
++    ANOTHER card's comments needs a scan of every park's cmd per comment commit (the self-card case is one indexed
++    read), and the standard chat-wait builder always waits on its own card."""
++    source = kb.create_task(board, title="source", assignee="worker")
++    owner = kb.create_task(board, title="owner", assignee="worker")
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (owner,))
++    assert kb.schedule_task(board, owner, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z waiting on another card",
++                            wake_check=f"hermes kanban wait-comment {source} --after-id 0 --skip-system",
++                            check_every=EVERY)
++    before = _next_at(board, owner)
++    kb.add_comment(board, source, "default", "answer on the other card")
++    assert _next_at(board, owner) == before
+-- 
+2.43.0
+

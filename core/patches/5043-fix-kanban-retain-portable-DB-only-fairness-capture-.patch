@@ -1,0 +1,168 @@
+From f20002ce0f6527bdb9c87298013785da81868b05 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 22:20:39 +0000
+Subject: [PATCH] fix(kanban): retain portable DB-only fairness capture
+ [daveey]
+
+The runtime capture budget added by #3687 made the existing DB-only CLI
+require Unix fcntl and O_DIRECTORY. Keep runtime capture fail-closed on
+unsupported platforms, but use Windows msvcrt byte-range advisory locking
+for DB capture budget writes. Preserve file fsync and atomic replacement;
+only directory fsync is unavailable on Windows.
+
+Exercise arm/status/drain/seal/clear through the real DB CLI with isolated
+Windows-style budget primitives, plus budget overflow and release. RED on
+prior budget source (ValueError), GREEN after the portable path. All five
+budget importing test files included in combined fairness gate, which passes
+twice. This is simulated platform proof, not a native Windows execution.
+
+Also prove recovery after the real post-commit OSError/KeyboardInterrupt:
+status works with the retained plan and explicit --replace arms again.
+Fifty fresh-process repetitions of the reported seal-timeout test pass;
+no captured failure to justify changing that pre-existing test.
+---
+ hermes_cli/kanban_fairness_budget.py          | 21 +++++--
+ .../test_kanban_fairness_arm_rollback.py      |  7 +++
+ .../test_kanban_fairness_budget_portable.py   | 60 +++++++++++++++++++
+ 3 files changed, 84 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_fairness_budget_portable.py
+
+diff --git a/hermes_cli/kanban_fairness_budget.py b/hermes_cli/kanban_fairness_budget.py
+index 70b5b28344..bec0c94077 100644
+--- a/hermes_cli/kanban_fairness_budget.py
++++ b/hermes_cli/kanban_fairness_budget.py
+@@ -24,16 +24,26 @@ class BudgetExceeded(ValueError):
+ def _locked(root):
+     try:
+         import fcntl
+-    except ImportError as exc:
+-        raise ValueError("capture budget requires advisory file locking") from exc
++        def lock(stream, acquire):
++            fcntl.flock(stream.fileno(), fcntl.LOCK_EX if acquire else fcntl.LOCK_UN)
++    except ImportError:
++        try:
++            import msvcrt
++        except ImportError as exc:
++            raise ValueError("capture budget requires advisory file locking") from exc
++        def lock(stream, acquire):
++            # Windows locks a byte range from the current position; seeking is
++            # required on both acquisition and release, including an empty file.
++            stream.seek(0)
++            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK if acquire else msvcrt.LK_UNLCK, 1)
+     if (root / ".capture-budget.lock").is_symlink():
+         raise ValueError("budget lock must not be a symlink")
+     with (root / ".capture-budget.lock").open("a+b") as stream:
+-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
++        lock(stream, True)
+         try:
+             yield
+         finally:
+-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
++            lock(stream, False)
+ 
+ 
+ def _used(root):
+@@ -101,6 +111,9 @@ def _write(path, data):
+         stream.flush()
+         os.fsync(stream.fileno())
+     os.replace(tmp, path)
++    if not hasattr(os, "O_DIRECTORY"):
++        # Windows supports file fsync + atomic replacement, not directory fsync.
++        return
+     directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+     try:
+         os.fsync(directory)
+diff --git a/tests/hermes_cli/test_kanban_fairness_arm_rollback.py b/tests/hermes_cli/test_kanban_fairness_arm_rollback.py
+index a89d1a8143..968efbcc8b 100644
+--- a/tests/hermes_cli/test_kanban_fairness_arm_rollback.py
++++ b/tests/hermes_cli/test_kanban_fairness_arm_rollback.py
+@@ -93,6 +93,7 @@ def test_post_commit_failure_keeps_committed_plan(db, tmp_path, monkeypatch, err
+     def fail_status(conn):
+         raise error("after commit")
+ 
++    original_status = journal._open_status
+     monkeypatch.setattr(journal, "_open_status", fail_status)
+     args = ("--replace", "--clock-error-s", "7") if replace else ()
+     if error is KeyboardInterrupt:
+@@ -104,6 +105,12 @@ def test_post_commit_failure_keeps_committed_plan(db, tmp_path, monkeypatch, err
+     assert plan["capture_id"] == _journal_state(db)["capture_id"] == "one"
+     if replace:
+         assert plan["assumptions"]["clock_error_s"] == 7
++    monkeypatch.setattr(journal, "_open_status", original_status)
++    assert main(["capture", "status", "--out", str(out)]) == 0
++    # A committed capture still requires explicit replacement; recovery works
++    # using its retained plan rather than silently overwriting an active journal.
++    assert _arm(db, out, "recovered", "--replace") == 0
++    assert _journal_state(db)["capture_id"] == "recovered"
+ 
+ 
+ @pytest.mark.parametrize("error", [OSError, KeyboardInterrupt])
+diff --git a/tests/hermes_cli/test_kanban_fairness_budget_portable.py b/tests/hermes_cli/test_kanban_fairness_budget_portable.py
+new file mode 100644
+index 0000000000..25942401f9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_fairness_budget_portable.py
+@@ -0,0 +1,60 @@
++"""DB-only capture remains usable with Windows-style lock/fsync primitives."""
++import builtins
++import json
++import os
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_fairness_budget as budget
++from scripts.kanban_fairness import main
++
++
++def test_db_capture_without_unix_primitives(tmp_path, monkeypatch):
++    import fcntl
++
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    db = str(kb.kanban_db_path())
++    calls = []
++
++    def locking(fd, mode, count):
++        assert count == 1
++        assert os.lseek(fd, 0, os.SEEK_CUR) == 0
++        calls.append(mode)
++        fcntl.flock(fd, fcntl.LOCK_EX if mode == 1 else fcntl.LOCK_UN)
++
++    real_import = builtins.__import__
++    windows_lock = SimpleNamespace(locking=locking, LK_LOCK=1, LK_UNLCK=2)
++
++    def platform_import(name, globals=None, locals=None, fromlist=(), level=0):
++        # Simulate the budget module's platform without changing unrelated Linux
++        # SQLite lifecycle locks or pytest's own process bookkeeping.
++        if globals and globals.get("__name__") == budget.__name__:
++            if name == "fcntl":
++                raise ImportError("Windows has no fcntl")
++            if name == "msvcrt":
++                return windows_lock
++        return real_import(name, globals, locals, fromlist, level)
++
++    monkeypatch.setattr(builtins, "__import__", platform_import)
++    proxy = SimpleNamespace(**{key: value for key, value in vars(os).items()
++                               if key not in ("O_DIRECTORY", "O_NONBLOCK", "O_NOFOLLOW")})
++    monkeypatch.setattr(budget, "os", proxy)
++    out = tmp_path / "capture"
++    assert main(["capture", "arm", "--db", db, "--out", str(out), "--capture-id", "portable"]) == 0
++    assert json.loads((out / "plan.json").read_text())["capture_id"] == "portable"
++    for action in ("status", "drain", "seal", "clear"):
++        assert main(["capture", action, "--out", str(out)]) == 0
++    bounded = tmp_path / "bounded"
++    budget.initialize(bounded, 128)
++    with pytest.raises(budget.BudgetExceeded):
++        budget.write(bounded / "too-large", b"x" * 128)
++    assert not (bounded / "too-large").exists()
++    assert calls and calls == [1, 2] * (len(calls) // 2)
++    assert budget._used(out) <= budget._limit(out)
+-- 
+2.43.0
+

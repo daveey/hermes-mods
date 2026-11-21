@@ -1,0 +1,469 @@
+From 76b1c6a3a7dccca6ab78b807973ff8a1a8a14045 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 19:13:14 -0800
+Subject: [PATCH] feat(sessions): per-source retention
+ (sessions.source_retention_days) [daveey]
+
+Automation transcripts dominate state.db: on tester's MacBook 576k of 985k
+messages (and most of the 23 GB file) were Kanban card runs, kept forever
+because auto_prune is off to keep chat history.
+
+sessions.source_retention_days ({source: days}) prunes one automation
+source's ended sessions past its own window, independent of auto_prune.
+Only unattended sources are eligible (SOURCE_RETENTION_SOURCES: cron, kanban,
+subagent, tool, recovered); cli/acp/api_server also carry interactive chats
+and are refused like desktop/tui. A non-integer or <1 value is skipped with a
+warning, so a typo never deletes conversations. Same guards as auto-prune
+(pinned and mid-turn rows spared, archived rows included, stale open rows
+closed first), its own throttle key, no VACUUM (freed pages are reused, so
+the file stops growing).
+
+The CLI start and the gateway housekeeping tick now share
+run_sessions_retention(), which reads min_interval_hours only when a feature
+that uses it is on (as before) and drops 9 lines from gateway/run.py.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ gateway/run.py                                |  13 +-
+ hermes_cli/cli_auto_maintenance.py            |  35 ++--
+ hermes_cli/config_defaults.py                 |   8 +-
+ hermes_state_maintenance.py                   |  70 ++++++++
+ .../test_housekeeping_profile_scope.py        |  35 ++++
+ tests/hermes_state/test_source_retention.py   | 156 ++++++++++++++++++
+ website/docs/user-guide/sessions.md           |  21 +++
+ 7 files changed, 307 insertions(+), 31 deletions(-)
+ create mode 100644 tests/hermes_state/test_source_retention.py
+
+diff --git a/gateway/run.py b/gateway/run.py
+index 1ce5624e75..7bb6e99a16 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4248,23 +4248,14 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
+     or vacuumed by anyone — the dashboard/serve trigger defers to the gateway for every profile a
+     gateway owns (``web_server_sessions``). *launch* carries the launch home's configured transcript
+     dir (:func:`_launch_sessions_dir`) so its override still governs its own profile."""
++    from hermes_cli.cli_auto_maintenance import run_sessions_retention
+     from hermes_cli.config import load_config as _load_full_config
+     from hermes_state_registry import acquire, release_or_close
+     _sess_cfg = (_load_full_config().get("sessions") or {})
+     _adb = acquire()
+     try:
+         _adb.maybe_archive_empty_drafts()  # [daveey] ungated: empty drafts > 24 h are never a chat to resolve
+-        if _sess_cfg.get("auto_archive", False):
+-            _adb.maybe_auto_archive(
+-                idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
+-                min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)))
+-        if _sess_cfg.get("auto_prune", False):
+-            _adb.maybe_auto_prune_and_vacuum(
+-                retention_days=int(_sess_cfg.get("retention_days", 90)),
+-                min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+-                min_vacuum_interval_days=int(_sess_cfg.get("min_vacuum_interval_days", 30)),
+-                vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
+-                sessions_dir=_profile_sessions_dir(launch))
++        run_sessions_retention(_adb, _sess_cfg, _profile_sessions_dir(launch))
+     finally:
+         release_or_close(_adb)
+ 
+diff --git a/hermes_cli/cli_auto_maintenance.py b/hermes_cli/cli_auto_maintenance.py
+index 9076089e1c..0c93122257 100644
+--- a/hermes_cli/cli_auto_maintenance.py
++++ b/hermes_cli/cli_auto_maintenance.py
+@@ -52,26 +52,29 @@ def _run_state_db_auto_maintenance(session_db) -> None:
+                 logger.info(done_msg, count)
+ 
+         session_db.maybe_archive_empty_drafts()  # [daveey] not gated by sessions.auto_archive
+-        cfg = (_load_full_config().get("sessions") or {})
++        run_sessions_retention(session_db, _load_full_config().get("sessions") or {},
++                               _hermes_home_maint / "sessions")
++    except Exception as exc:
++        logger.debug("state.db auto-maintenance skipped: %s", exc, exc_info=True)
+ 
+-        # Auto-archive is independent of auto_prune: run it before prune's early return.
+-        if cfg.get("auto_archive", False):
+-            session_db.maybe_auto_archive(
+-                idle_days=float(cfg.get("auto_archive_days", 3)),
+-                min_interval_hours=int(cfg.get("min_interval_hours", 24)),
+-            )
+ 
+-        if not cfg.get("auto_prune", False):
+-            return
++def run_sessions_retention(session_db, cfg: dict, sessions_dir) -> None:
++    """The ``sessions:`` retention settings on one store, shared by the CLI start and the gateway's
++    housekeeping: auto-archive, per-source retention (each independent of ``auto_prune``), then the
++    global auto-prune/VACUUM."""
++    def interval() -> int:  # read only by an enabled feature, as before this helper existed
++        return int(cfg.get("min_interval_hours", 24))
++    if cfg.get("auto_archive", False):
++        session_db.maybe_auto_archive(idle_days=float(cfg.get("auto_archive_days", 3)),
++                                      min_interval_hours=interval())
++    if cfg.get("source_retention_days"):
++        session_db.maybe_prune_source_retention(cfg["source_retention_days"], min_interval_hours=interval(),
++                                                sessions_dir=sessions_dir)
++    if cfg.get("auto_prune", False):
+         session_db.maybe_auto_prune_and_vacuum(
+-            retention_days=int(cfg.get("retention_days", 90)),
+-            min_interval_hours=int(cfg.get("min_interval_hours", 24)),
++            retention_days=int(cfg.get("retention_days", 90)), min_interval_hours=interval(),
+             min_vacuum_interval_days=int(cfg.get("min_vacuum_interval_days", 30)),
+-            vacuum=bool(cfg.get("vacuum_after_prune", True)),
+-            sessions_dir=_hermes_home_maint / "sessions",
+-        )
+-    except Exception as exc:
+-        logger.debug("state.db auto-maintenance skipped: %s", exc)
++            vacuum=bool(cfg.get("vacuum_after_prune", True)), sessions_dir=sessions_dir)
+ 
+ 
+ def _run_checkpoint_auto_maintenance() -> None:
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 154f173cce..bdcc09cc46 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -2336,13 +2336,13 @@ DEFAULT_CONFIG = {
+         # auto_prune key, every surface asks once the disk holding state.db runs low
+         # (hermes_cli/prune_advisor.py); either answer writes the key and ends the question.
+         "auto_prune": False,
+-        # Inactive days of ended-session history to keep (= `hermes sessions prune`).
+-        "retention_days": 90,
++        "retention_days": 90,  # inactive days of ended-session history to keep (= `hermes sessions prune`)
++        # {source: days} for automation sources only, applied even with auto_prune off (docs: sessions.md)
++        "source_retention_days": {},
+         # Auto-archive (soft-hide, never delete) sessions with no activity for auto_archive_days,
+         # once per min_interval_hours. Pinned sessions are exempt.
+         "auto_archive": False,
+-        # Idle days before auto-archive hides a session (only when auto_archive is true).
+-        "auto_archive_days": 3,
++        "auto_archive_days": 3,  # idle days before auto-archive hides a session (only when auto_archive is true)
+         # List delegate_task subagent runs in session lists (desktop sidebar, dashboard, session.list),
+         # nested under their parent. Off by default: they are machinery, not conversations.
+         "show_subagents": False,
+diff --git a/hermes_state_maintenance.py b/hermes_state_maintenance.py
+index 9e6422c17e..1ab05a80b6 100644
+--- a/hermes_state_maintenance.py
++++ b/hermes_state_maintenance.py
+@@ -35,6 +35,11 @@ def _one(clause: str, conv=None):
+     return lambda v: ([clause], [conv(v) if conv else v])
+ 
+ 
++# Unattended producers only. Not cli/acp/api_server: they also carry interactive conversations
++# (the classic CLI, editors, API clients), and this window deletes without the chat-wide opt-in.
++SOURCE_RETENTION_SOURCES: tuple[str, ...] = ("cron", "kanban", "subagent", "tool", "recovered")
++
++
+ def _seconds_since(now: float, raw) -> Optional[float]:
+     """Age of a state_meta timestamp; None when unset or corrupt (= no prior run)."""
+     try:
+@@ -614,6 +619,71 @@ class SessionMaintenanceMixin:
+             self._record_db_file_identity()
+         return optimized
+ 
++    def maybe_prune_source_retention(
++        self, source_days: Optional[dict], min_interval_hours: int = 24, sessions_dir: Optional[Path] = None,
++    ) -> dict[str, Any]:
++        """Per-source retention (``sessions.source_retention_days``), independent of ``auto_prune``: each
++        ``{source: days}`` entry prunes that source's ENDED sessions inactive for ``days`` and closes its
++        stale open rows (they then get a full window), at most once per ``min_interval_hours`` (own
++        throttle key). Only the unattended automation sources in :data:`SOURCE_RETENTION_SOURCES` are
++        eligible: a chat source (desktop, tui, cli, acp, api_server, slack...) or a days value that is not a whole number >= 1
++        is skipped with a warning, so a typo never deletes conversations. Pinned and mid-turn rows are
++        spared as in :meth:`maybe_auto_prune_and_vacuum`. No VACUUM: freed pages are reused by later
++        writes, which keeps the file bounded without a full rewrite. Never raises; returns
++        ``{"skipped", "pruned": {source: n}, "closed": {source: n}}`` plus ``"error"`` on failure."""
++        from hermes_state_repair import _release_auto_maintenance_lock, _try_acquire_auto_maintenance_lock
++        result: dict[str, Any] = {"skipped": False, "pruned": {}, "closed": {}}
++        plan = self._source_retention_plan(source_days)
++        if not plan:
++            result["skipped"] = True
++            return result
++        maintenance_lock = _try_acquire_auto_maintenance_lock(self.db_path)
++        if maintenance_lock is None:
++            result["skipped"] = True
++            return result
++        try:
++            now = time.time()
++            since = _seconds_since(now, self.get_meta("last_source_retention_prune"))
++            if since is not None and since < min_interval_hours * 3600:
++                result["skipped"] = True
++                return result
++            for source, days in plan:
++                report_startup_progress(900.0, phase="state_db_source_retention")
++                result["pruned"][source] = self.prune_sessions(
++                    older_than_days=days, source=source, sessions_dir=sessions_dir,
++                    exclude_active_write_guards=True)
++                result["closed"][source] = len(self.sweep_orphaned_sessions(
++                    max_idle_seconds=float(days) * 86400.0, sources=(source,), exclude_pinned=True,
++                    respect_gateway_heartbeats=False))
++            self.set_meta("last_source_retention_prune", str(now))
++            if any(result["pruned"].values()) or any(result["closed"].values()):
++                logger.info("state.db source retention: pruned %s, closed %s", result["pruned"], result["closed"])
++        except Exception as exc:
++            logger.warning("state.db source retention failed: %s", exc, exc_info=True)
++            result["error"] = str(exc)
++        finally:
++            _release_auto_maintenance_lock(maintenance_lock)
++        return result
++
++    def _source_retention_plan(self, source_days: Optional[dict]) -> list[tuple[str, int]]:
++        """Valid ``(source, days)`` pairs of ``sessions.source_retention_days``, warning once per bad entry."""
++        if not isinstance(source_days, dict):
++            if source_days:
++                logger.warning("sessions.source_retention_days must be a mapping of source: days, got %r",
++                               source_days)
++            return []
++        plan = []
++        for source, days in source_days.items():
++            if source not in SOURCE_RETENTION_SOURCES:
++                logger.warning("sessions.source_retention_days: %r skipped; only automation sources (%s) "
++                               "can have their own retention", source, ", ".join(SOURCE_RETENTION_SOURCES))
++            elif isinstance(days, bool) or not isinstance(days, int) or days < 1:
++                logger.warning("sessions.source_retention_days.%s: %r skipped; use a whole number of days >= 1",
++                               source, days)
++            else:
++                plan.append((source, days))
++        return plan
++
+     def maybe_auto_prune_and_vacuum(
+         self, retention_days: int = 90, min_interval_hours: int = 24, vacuum: bool = True,
+         sessions_dir: Optional[Path] = None, min_vacuum_interval_days: int = 30,
+diff --git a/tests/gateway/test_housekeeping_profile_scope.py b/tests/gateway/test_housekeeping_profile_scope.py
+index 195b068402..ff671c7d4a 100644
+--- a/tests/gateway/test_housekeeping_profile_scope.py
++++ b/tests/gateway/test_housekeeping_profile_scope.py
+@@ -240,6 +240,41 @@ def test_profile_scope_setup_failure_restores_the_callers_home(two_homes, monkey
+     assert current_secret_scope() == scope_before
+ 
+ 
++def test_maintenance_tick_applies_source_retention_with_auto_prune_off(two_homes):
++    """``sessions.source_retention_days`` reaches the gateway's housekeeping path with ``auto_prune``
++    off: the old Kanban transcript goes, the equally old chat stays. Real store, real config."""
++    import time
++
++    from hermes_state import SessionDB
++
++    a, _ = two_homes
++    (a / "config.yaml").write_text(
++        "model:\n  provider: nous\n"
++        "sessions:\n"
++        "  auto_prune: false\n"
++        "  min_interval_hours: 0\n"
++        "  source_retention_days:\n"
++        "    kanban: 14\n",
++        encoding="utf-8")
++    old = time.time() - 400 * 86400
++    db = SessionDB(db_path=a / "state.db")
++    for sid, source in (("old-kanban", "kanban"), ("old-chat", "desktop")):
++        db.create_session(sid, source)
++        db.end_session(sid, "done")
++        db._conn.execute("UPDATE sessions SET started_at=?, last_activity_at=? WHERE id=?", (old, old, sid))
++    db._conn.commit()
++    db.close()
++
++    _run_60_ticks(SimpleNamespace(config=SimpleNamespace(multiplex_profiles=False)))
++
++    db = SessionDB(db_path=a / "state.db")
++    try:
++        assert db.get_session("old-kanban") is None
++        assert db.get_session("old-chat") is not None
++    finally:
++        db.close()
++
++
+ def test_prune_unlinks_transcripts_under_the_configured_sessions_dir(two_homes, tmp_path):
+     """``gateway.sessions_dir`` governs the LAUNCH profile's transcripts; others use their own home.
+ 
+diff --git a/tests/hermes_state/test_source_retention.py b/tests/hermes_state/test_source_retention.py
+new file mode 100644
+index 0000000000..99470a1b5d
+--- /dev/null
++++ b/tests/hermes_state/test_source_retention.py
+@@ -0,0 +1,156 @@
++"""``sessions.source_retention_days``: an automation source's own retention window, applied even
++while ``sessions.auto_prune`` is off, so Kanban/cron transcripts stop growing ``state.db`` without
++deleting any chat history."""
++
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_state import SessionDB
++
++DAY = 86400.0
++
++
++@pytest.fixture
++def db(tmp_path):
++    store = SessionDB(db_path=tmp_path / "state.db")
++    yield store
++    store.close()
++
++
++def _session(db: SessionDB, sid: str, source: str, *, idle_days: float, ended: bool = True) -> None:
++    db.create_session(sid, source=source)
++    db.append_message(sid, role="user", content="hello")
++    if ended:
++        db.end_session(sid, "done")
++    ts = time.time() - idle_days * DAY
++    db._conn.execute("UPDATE sessions SET started_at=?, last_activity_at=? WHERE id=?", (ts, ts, sid))
++    db._conn.execute("UPDATE messages SET timestamp=? WHERE session_id=?", (ts, sid))
++    db._conn.commit()
++
++
++def test_prunes_only_the_listed_source_past_its_window(db):
++    _session(db, "old-kanban", "kanban", idle_days=20)
++    _session(db, "new-kanban", "kanban", idle_days=3)
++    _session(db, "old-desktop", "desktop", idle_days=200)
++    _session(db, "old-cron", "cron", idle_days=200)
++    _session(db, "pinned-kanban", "kanban", idle_days=20)
++    db.set_session_pinned("pinned-kanban", True)
++    _session(db, "archived-kanban", "kanban", idle_days=20)  # archive hides a row, it is not a keep flag
++    db.set_session_archived("archived-kanban", True, notify=False)
++
++    result = db.maybe_prune_source_retention({"kanban": 14}, min_interval_hours=0)
++
++    assert result["pruned"] == {"kanban": 2}
++    assert db.get_session("old-kanban") is None
++    assert db.get_session("archived-kanban") is None
++    for kept in ("new-kanban", "old-desktop", "old-cron", "pinned-kanban"):
++        assert db.get_session(kept) is not None, kept
++
++
++def test_stale_open_row_is_closed_first_and_kept_for_a_full_window(db):
++    _session(db, "dead-worker", "kanban", idle_days=20, ended=False)
++
++    first = db.maybe_prune_source_retention({"kanban": 14}, min_interval_hours=0)
++
++    assert first["closed"] == {"kanban": 1}
++    row = db.get_session("dead-worker")
++    assert row is not None and row["end_reason"] == "startup_orphan_reap"
++    assert db.maybe_prune_source_retention({"kanban": 14}, min_interval_hours=0)["pruned"] == {"kanban": 0}
++
++
++@pytest.mark.parametrize("entries", [
++    {"desktop": 14},  # a chat source never gets its own window
++    {"cli": 14},  # the classic CLI's chats share this source with one-shot runs
++    {"kanban": 0},
++    {"kanban": -5},
++    {"kanban": "14"},
++    {"kanban": True},
++    {"kanban": 1.5},
++    ["kanban"],
++])
++def test_invalid_entries_delete_nothing(db, entries, caplog):
++    _session(db, "old-kanban", "kanban", idle_days=400)
++    _session(db, "old-desktop", "desktop", idle_days=400)
++
++    result = db.maybe_prune_source_retention(entries, min_interval_hours=0)
++
++    assert result["skipped"] is True
++    assert db.get_session("old-kanban") is not None
++    assert db.get_session("old-desktop") is not None
++    assert "source_retention_days" in caplog.text
++
++
++def test_runs_at_most_once_per_interval(db):
++    assert db.maybe_prune_source_retention({"kanban": 14}, min_interval_hours=24)["skipped"] is False
++    _session(db, "old-kanban", "kanban", idle_days=20)
++
++    assert db.maybe_prune_source_retention({"kanban": 14}, min_interval_hours=24)["skipped"] is True
++    assert db.get_session("old-kanban") is not None
++
++
++def _write_config(home: Path, body: str) -> None:
++    home.mkdir(parents=True, exist_ok=True)
++    (home / "config.yaml").write_text(body, encoding="utf-8")
++
++
++_CONFIG = ("sessions:\n"
++           "  auto_prune: false\n"
++           "  min_interval_hours: 0\n"
++           "  source_retention_days:\n"
++           "    kanban: 14\n")
++
++
++def test_cli_startup_applies_source_retention_with_auto_prune_off(tmp_path, monkeypatch):
++    """E2E through the CLI start path and the real config loader."""
++    import cli
++
++    home = tmp_path / "hermes"
++    _write_config(home, _CONFIG)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    store = SessionDB(db_path=home / "state.db")
++    try:
++        _session(store, "old-kanban", "kanban", idle_days=20)
++        _session(store, "old-desktop", "desktop", idle_days=400)
++
++        cli._run_state_db_auto_maintenance(store)
++
++        assert store.get_session("old-kanban") is None
++        assert store.get_session("old-desktop") is not None
++    finally:
++        store.close()
++
++
++def test_cli_startup_runs_both_windows_when_auto_prune_is_on(tmp_path, monkeypatch):
++    """The per-source pass and the chat-wide auto-prune share the maintenance lock in one call."""
++    import cli
++
++    home = tmp_path / "hermes"
++    _write_config(home, _CONFIG.replace("auto_prune: false", "auto_prune: true\n  retention_days: 90\n"
++                                        "  vacuum_after_prune: false"))
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    store = SessionDB(db_path=home / "state.db")
++    try:
++        _session(store, "old-kanban", "kanban", idle_days=20)
++        _session(store, "old-desktop", "desktop", idle_days=400)
++        _session(store, "new-desktop", "desktop", idle_days=20)
++
++        cli._run_state_db_auto_maintenance(store)
++
++        assert store.get_session("old-kanban") is None
++        assert store.get_session("old-desktop") is None
++        assert store.get_session("new-desktop") is not None
++    finally:
++        store.close()
++
++
++def test_bad_interval_is_not_read_while_every_feature_is_off(tmp_path, monkeypatch):
++    from hermes_cli.cli_auto_maintenance import run_sessions_retention
++    from unittest.mock import MagicMock
++
++    store = MagicMock()
++    run_sessions_retention(store, {"min_interval_hours": "daily"}, tmp_path)
++
++    store.maybe_prune_source_retention.assert_not_called()
++    store.maybe_auto_prune_and_vacuum.assert_not_called()
+diff --git a/website/docs/user-guide/sessions.md b/website/docs/user-guide/sessions.md
+index 6832359a32..6e382bbadc 100644
+--- a/website/docs/user-guide/sessions.md
++++ b/website/docs/user-guide/sessions.md
+@@ -1258,6 +1258,27 @@ sessions:
+ Installs that set any of these keys explicitly keep their values; only unset
+ keys follow the defaults.
+ 
++**Per-source retention.** Automation transcripts usually dominate `state.db` (a Kanban
++worker writes a full transcript for every card run) while your chats are what you want to keep.
++`sessions.source_retention_days` gives an automation source its own window, and it applies even
++while `auto_prune` is off:
++
++```yaml
++sessions:
++  auto_prune: false         # chats are kept
++  source_retention_days:
++    kanban: 14              # ended Kanban card transcripts go after 14 idle days
++    cron: 30
++```
++
++Only unattended automation sources are accepted (`cron`, `kanban`, `subagent`, `tool`,
++`recovered`); `cli`, `acp` and `api_server` are refused because they also hold interactive
++conversations. Any other source, or a value that is not a whole number of days `>= 1`, is
++skipped with a warning. It shares `min_interval_hours` and the auto-prune guards
++(pinned and mid-turn sessions are kept; a stale open row is closed first and gets a full
++window), and it never runs `VACUUM`: SQLite reuses the freed pages, so the file stops growing.
++Run `hermes sessions optimize` once to give space already used back to the disk.
++
+ Only **ended** sessions are ever deleted. Active sessions are never auto-pruned,
+ regardless of age. Ended sessions are aged from their last activity — the
+ freshest of live activity, latest message, or session start — so a long-lived
+-- 
+2.43.0
+

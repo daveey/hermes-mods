@@ -1,0 +1,268 @@
+From 1f703b2321f86c64edcba684002a33b6b9b3304c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 04:46:03 +0000
+Subject: [PATCH] fix: clear carried needs_you with kanban evidence; no
+ invariant reports for non-live rows [daveey]
+
+Review 5987589833 on #3735:
+- withKanbanEvidence (retained-row refresh and the per-gateway carry) copied and cleared only kanban_* keys, so a
+  stale `needs_you` survived a fresh snapshot that omitted it (empty) and kept the row red after its card
+  unblocked/archived. needs_you is now part of the kanban evidence set; sameCronSignature compares it too.
+- stripeInvariantViolation fired for archived/offline rows whose stripe is null because they are not live; the
+  invariant governs live rows only (recordStripeTransition takes `live`).
+- card_is_open_human_ask reuses the status-independent leaf _stored_needs_human that _board_rows uses; the
+  narrowed needs_you shape (card entries, empty question) is documented.
+---
+ .../app/chat/sidebar/session-row-stripe.tsx   |  4 ++--
+ .../hooks/refresh-retained-kanban.test.ts     | 15 ++++++++++++-
+ .../session/hooks/refresh-retained-kanban.ts  |  9 ++++++--
+ .../src/lib/session-signatures.test.ts        |  1 +
+ apps/desktop/src/lib/session-signatures.ts    |  6 ++++--
+ .../src/store/session-dot-state.test.ts       | 19 +++++++++++++++++
+ apps/desktop/src/store/session-dot-state.ts   | 19 ++++++++++++-----
+ hermes_cli/kanban_open_asks.py                | 21 ++++++++++---------
+ 8 files changed, 72 insertions(+), 22 deletions(-)
+
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx b/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
+index d828cb8e04..37ac747cc2 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row-stripe.tsx
+@@ -85,8 +85,8 @@ export function useSessionRowStripe(
+   const promptInputsKey = useStore(dotState === 'needs-input' ? $stuckPromptInputsKey : NO_PROMPT_INPUTS)
+ 
+   useEffect(() => {
+-    recordStripeTransition(session, statusStripe, dotState)
+-  }, [session, statusStripe, dotState, promptInputsKey])
++    recordStripeTransition(session, statusStripe, dotState, Date.now(), live)
++  }, [session, statusStripe, dotState, promptInputsKey, live])
+ 
+   // Only explain the stripe with the outcome when it actually painted it: open asks and unfinished work override it.
+   const outcomePainted =
+diff --git a/apps/desktop/src/app/session/hooks/refresh-retained-kanban.test.ts b/apps/desktop/src/app/session/hooks/refresh-retained-kanban.test.ts
+index 7be54fadc8..6609aaa6fb 100644
+--- a/apps/desktop/src/app/session/hooks/refresh-retained-kanban.test.ts
++++ b/apps/desktop/src/app/session/hooks/refresh-retained-kanban.test.ts
+@@ -1,8 +1,9 @@
+ import { describe, expect, it } from 'vitest'
+ 
++import { kanbanStripeCounts } from '@/store/session-dot-state'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+-import { refreshRetainedKanban } from './refresh-retained-kanban'
++import { refreshRetainedKanban, withKanbanEvidence } from './refresh-retained-kanban'
+ 
+ const row = (extra = {}) => ({ id: 'old', profile: 'default', title: 'Keep me', ...extra }) as SessionInfo
+ 
+@@ -37,4 +38,16 @@ describe('retained older sidebar task evidence', () => {
+     expect(result.kanban_unknown).toBe(true)
+     expect(result.kanban_active).toBeUndefined()
+   })
++
++  // [daveey] needs_you is authoritative for the red stripe and omitted when empty: a fresh snapshot without it must
++  // clear the old copy, or the row stays 'stuck' after its card unblocked or was archived.
++  it('clears a stale needs_you when the fresh snapshot omits it', async () => {
++    const ask = { kind: 'card', question: '', ref: 'default/t_a' }
++    const old = row({ kanban_blocked: 1, kanban_observed_at: 1, needs_you: [ask] })
++    const [result] = await refreshRetainedKanban([old], async () => row({ kanban_observed_at: 2 }))
++    expect(result.needs_you).toBeUndefined()
++    expect(result.kanban_blocked).toBeUndefined()
++    expect(kanbanStripeCounts(result).blocked).toBe(0)
++    expect(withKanbanEvidence(row(), row({ kanban_observed_at: 3, needs_you: [ask] })).needs_you).toEqual([ask])
++  })
+ })
+diff --git a/apps/desktop/src/app/session/hooks/refresh-retained-kanban.ts b/apps/desktop/src/app/session/hooks/refresh-retained-kanban.ts
+index 65f3661a3f..4341c200ec 100644
+--- a/apps/desktop/src/app/session/hooks/refresh-retained-kanban.ts
++++ b/apps/desktop/src/app/session/hooks/refresh-retained-kanban.ts
+@@ -1,14 +1,19 @@
+ import type { SessionInfo } from '@/types/hermes'
+ 
++/** [daveey] The task-evidence fields one snapshot stamps together. `needs_you` is built from the same snapshot as
++ *  `kanban_blocked` and is omitted when empty, so it is replaced (or cleared) with the counts: a carried stale copy is
++ *  authoritative for the stripe and would keep the row red after its card unblocked or was archived. */
++export const isKanbanEvidenceKey = (key: string): boolean => key.startsWith('kanban_') || key === 'needs_you'
++
+ export function withKanbanEvidence(row: SessionInfo, fresh: SessionInfo): SessionInfo {
+   const next = { ...row }
+ 
+   for (const key of Object.keys(next)) {
+-    if (key.startsWith('kanban_')) { delete (next as unknown as Record<string, unknown>)[key] }
++    if (isKanbanEvidenceKey(key)) { delete (next as unknown as Record<string, unknown>)[key] }
+   }
+ 
+   for (const [key, value] of Object.entries(fresh)) {
+-    if (key.startsWith('kanban_')) { (next as unknown as Record<string, unknown>)[key] = value }
++    if (isKanbanEvidenceKey(key)) { (next as unknown as Record<string, unknown>)[key] = value }
+   }
+ 
+   return next
+diff --git a/apps/desktop/src/lib/session-signatures.test.ts b/apps/desktop/src/lib/session-signatures.test.ts
+index 11825d6ca0..3fcde93ebd 100644
+--- a/apps/desktop/src/lib/session-signatures.test.ts
++++ b/apps/desktop/src/lib/session-signatures.test.ts
+@@ -57,6 +57,7 @@ describe('sameCronSignature', () => {
+     ['kanban_active', 2, 1],
+     ['kanban_blocked', 1, undefined],
+     ['kanban_blocked_on', ['remote/default/t_one'], ['remote/default/t_two']],
++    ['needs_you', [{ kind: 'card', question: '', ref: 'default/t_one' }], undefined],
+     ['kanban_unseen', 1, undefined],
+     ['goal_active', true, undefined],
+     ['cron_active', true, undefined],
+diff --git a/apps/desktop/src/lib/session-signatures.ts b/apps/desktop/src/lib/session-signatures.ts
+index c53a962ee9..45005eb66c 100644
+--- a/apps/desktop/src/lib/session-signatures.ts
++++ b/apps/desktop/src/lib/session-signatures.ts
+@@ -59,8 +59,10 @@ export function sameCronSignature(a: SessionInfo[], b: SessionInfo[]): boolean {
+       // or a background job exiting moves only these, and they drive the
+       // sidebar badge and the done/working stripe. [daveey]
+       session.kanban_active === other.kanban_active &&
+-      JSON.stringify([session.kanban_blocked, session.kanban_blocked_on]) ===
+-        JSON.stringify([other.kanban_blocked, other.kanban_blocked_on]) &&
++      // `needs_you` drives the red stripe on its own (authoritative when stamped), so its arrival or removal
++      // must publish even when the counts did not move.
++      JSON.stringify([session.kanban_blocked, session.kanban_blocked_on, session.needs_you]) ===
++        JSON.stringify([other.kanban_blocked, other.kanban_blocked_on, other.needs_you]) &&
+       session.kanban_unseen === other.kanban_unseen &&
+       session.kanban_attention === other.kanban_attention &&
+       // Evidence can become unknown, stale, or fresh without a count change.
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index 68698b4510..da30fa27f7 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -38,6 +38,7 @@ import {
+   setStripeReasonReporter,
+   showsRunningArc,
+   STRIPE_TRANSITION_LOG_CAP_PER_MIN,
++  type StripeTraceRow,
+   stuckReasons,
+   takeSessionListRefreshReason,
+   unreadSessionCount,
+@@ -1285,4 +1286,22 @@ describe('open human ask invariant (blocked > 0 && !parked => stuck)', () => {
+     expect(report.mock.calls[1][3]).not.toContain('needs_you:2')
+     setStripeReasonReporter(null)
+   })
++
++  // [daveey] Archived and offline-cached rows draw no stripe (null because not live): not a violation.
++  const nonLiveRows: [string, StripeTraceRow, boolean][] = [
++    ['not live', { id: 'arch-a', kanban_blocked: 1 }, false],
++    ['archived', { archived: true, id: 'arch-b', kanban_blocked: 1 }, true],
++    ['offline cached', { id: 'arch-c', kanban_blocked: 1, offline_cached: true }, true]
++  ]
++
++  it.each(nonLiveRows)('reports no invariant violation for a %s row', (_name, row, live) => {
++    const report = vi.fn()
++    setStripeReasonReporter(report)
++    resetStripeTransitionLog()
++
++    recordStripeTransition(row, null, 'idle', 1_000, live)
++    recordStripeTransition(row, 'done', 'idle', 2_000, live)
++    expect(report.mock.calls.flatMap((call: unknown[]) => call[3] as string[])).not.toContain('needs_you:1')
++    setStripeReasonReporter(null)
++  })
+ })
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 59e4c3d652..4fa04aa15f 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -889,6 +889,7 @@ export type StripeTraceRow = Pick<SessionInfo, 'id'> &
+   Partial<
+     Pick<
+       SessionInfo,
++      | 'archived'
+       | 'background_active'
+       | 'connection_id'
+       | 'cron_active'
+@@ -903,6 +904,7 @@ export type StripeTraceRow = Pick<SessionInfo, 'id'> &
+       | 'kanban_stalled'
+       | 'kanban_waiting_on'
+       | 'muted'
++      | 'needs_you'
+       | 'offline_cached'
+       | 'outcome'
+       | 'offline_synced_at'
+@@ -1033,9 +1035,15 @@ export const setStripeReasonReporter = (reporter: null | StripeReasonReporter):
+ 
+ /** [daveey] The reason string a non-red stripe reports while the row has an open human ask and is not ⌘B-parked (the
+  *  backend logs `stripe-invariant-violation <sid>` for it). `stripe` is already the result of `sessionStatusStripe`,
+- *  so this fires only when some caller bypassed the invariant. */
+-function stripeInvariantViolation(row: StripeTraceRow, stripe: null | SessionStatusStripe, nowSeconds: number): null | string {
+-  if (stripe === 'stuck' || stripe === 'blocked') {
++ *  so this fires only when some caller bypassed the invariant. The invariant governs live rows only: an archived or
++ *  offline-cached row has no stripe at all (null), which is not a violation. */
++function stripeInvariantViolation(
++  row: StripeTraceRow,
++  stripe: null | SessionStatusStripe,
++  nowSeconds: number,
++  live: boolean
++): null | string {
++  if (!live || row.archived || row.offline_cached || stripe === 'stuck' || stripe === 'blocked') {
+     return null
+   }
+ 
+@@ -1112,14 +1120,15 @@ export function recordStripeTransition(
+   row: StripeTraceRow,
+   stripe: null | SessionStatusStripe,
+   dotState: SessionDotState,
+-  now: number = Date.now()
++  now: number = Date.now(),
++  live = true
+ ): void {
+   try {
+     const key = `${row.connection_id ?? ''}\u0000${row.profile ?? ''}\u0000${row.id}`
+     const entry = stripeTrace.get(key)
+     const reasons = stripe === 'stuck' ? stuckReasons(row, dotState, now / 1000) : []
+     const reasonsKey = reasons.join('|')
+-    const violation = stripeInvariantViolation(row, stripe, now / 1000)
++    const violation = stripeInvariantViolation(row, stripe, now / 1000, live)
+ 
+     if (!entry) {
+       stripeTrace.set(key, { emitted: [], reasonsKey, stripe, suppressed: 0 })
+diff --git a/hermes_cli/kanban_open_asks.py b/hermes_cli/kanban_open_asks.py
+index db0b297190..65704830bc 100644
+--- a/hermes_cli/kanban_open_asks.py
++++ b/hermes_cli/kanban_open_asks.py
+@@ -9,8 +9,7 @@ paints red whenever it is non-empty (``sessionStatusStripe``).
+ 
+ from __future__ import annotations
+ 
+-import json
+-from typing import Any, Iterable, Optional
++from typing import Any, Iterable
+ 
+ BLOCKED_STATUSES = ("blocked", "triage")
+ 
+@@ -20,21 +19,23 @@ def card_is_open_human_ask(status: Any, block_kind: Any, human_request: Any) ->
+     dict or its stored JSON text; anything undecodable is not an ask."""
+     if status not in BLOCKED_STATUSES:
+         return False
+-    from hermes_cli.kanban_human_request import needs_human
++    # The status-independent leaf is shared with the annotation cache's board rows (``_board_rows`` stores this
++    # verdict beside the status and gates on status where it reads it), so there is one decode/validate path.
++    from hermes_cli.kanban_session_wait_rows import _stored_needs_human
+ 
+-    if isinstance(human_request, str):
+-        try:
+-            human_request = json.loads(human_request)
+-        except ValueError:
+-            return False
+-    return needs_human(human_request, kind=block_kind)
++    return bool(_stored_needs_human(human_request, block_kind))
+ 
+ 
+ def open_human_asks(card_refs: Iterable[str], count: int) -> list[dict[str, str]]:
+     """``needs_you`` entries for one row: one ``card`` entry per open ask. ``card_refs`` are the owner-qualified
+     keys (``<board>/<id>``) of the blocked cards of the row's lineage, from the snapshot that supplies ``count``
+     (``kanban_blocked``). When the snapshot knows fewer keys than it counted (an older replica row without a key), the
+-    entries are padded with a ref-less one, so ``len(needs_you)`` never undercounts the badge."""
++    entries are padded with a ref-less one, so ``len(needs_you)`` never undercounts the badge.
++
++    Shape (deliberately narrowed): entries are ``kind == "card"`` only and ``question`` is empty. The count snapshot
++    carries card keys, not the ``human_request`` text, and reading it would add a board scan per list. In-chat
++    prompts/approvals and a stuck review reach the same red invariant on the Desktop from the row's execution
++    observations and ``review_wait`` (``kanbanStripeCounts`` / ``hasOpenHumanAsk``), not from this list."""
+     refs = sorted({str(r) for r in card_refs if r})
+     out = [{"kind": "card", "ref": ref, "question": ""} for ref in refs]
+     out += [{"kind": "card", "ref": "", "question": ""} for _ in range(max(0, int(count) - len(refs)))]
+-- 
+2.43.0
+

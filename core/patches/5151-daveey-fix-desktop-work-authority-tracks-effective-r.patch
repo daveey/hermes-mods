@@ -1,0 +1,600 @@
+From f18ac68936723d3660ac1ac46cfe2e32c1fa7e1b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:59:11 +0000
+Subject: [PATCH] [daveey] fix(desktop): work authority tracks effective
+ runtime roles and same-ID routes, indexes drafts once
+
+Review of d11f25f519 (REQUEST_CHANGES) found three defects in the work-source
+authority observer:
+
+1. P1 runtime-role ABA: the runtime index tracked the union of mirror/tile/main
+   runtime IDs, so rebinding a tile or the main pane between runtimes that
+   already had mirrors changed nothing; a cached all-five proof stayed valid and
+   the idle stripe stayed done. The index now records each runtime's effective
+   roles (mirror, tile, main) per qualified scope; any role change (including
+   rt-a -> rt-b -> rt-a) bumps only the runtime epoch, revoking cached and
+   in-flight runtime proof while durable proof is untouched.
+2. P2 same-ID routes: the candidate index kept only the first row per bare ID, so
+   a row for the same stored ID on another connection/profile starved the second
+   legitimate owner of authority. The index keeps every row per alias in list
+   order and each tracked scope resolves the candidate that names its own
+   connection/profile, falling back to the first candidate (existing precedence,
+   fail-closed). Exact-id rows still outrank lineage aliases.
+3. P2 draft index cost: ownerLookupSessionRows() built a fresh recents+unshadowed
+   draft array on every call, defeating the identity-keyed index (1000 rows /
+   1000 mirrors: structural median ~180-220 ms with one draft vs ~4-7 ms
+   without). withUnlistedOwnerStubs now memoizes on (rows, stubs) identity.
+
+Proof: the three review repro tests are RED on d11f25f519 and GREEN here, with new
+ABA / in-flight / unaffected-durable / main-pane tests, a three-route identical-ID
+real HermesGateway registry test (both list orders, close + real reconnect +
+fresh-read recovery), and an index-build counter test (kills the memo: 40600 vs
+40400 rebuild count). Draft benchmark structural median 3.8 ms with and without
+a draft; stream updates stay neutral.
+---
+ .../session-control-authority-routing.test.ts |  77 ++++++++++-
+ apps/desktop/src/store/session.ts             |  15 ++-
+ .../src/store/work-source-owner.test.ts       |  92 ++++++++++++-
+ apps/desktop/src/store/work-source-owner.ts   | 125 +++++++++++++++---
+ .../work-source-secondary-authority.test.ts   |  60 +++++++++
+ 5 files changed, 346 insertions(+), 23 deletions(-)
+
+diff --git a/apps/desktop/src/store/session-control-authority-routing.test.ts b/apps/desktop/src/store/session-control-authority-routing.test.ts
+index 5651b99dc4..257f5b7896 100644
+--- a/apps/desktop/src/store/session-control-authority-routing.test.ts
++++ b/apps/desktop/src/store/session-control-authority-routing.test.ts
+@@ -7,7 +7,7 @@ import { sessionsHost } from '@/sdk/sessions'
+ import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import { $gateway, setPrimaryGateway, setPrimaryGatewayConnection } from '@/store/gateway'
+ import { $profiles } from '@/store/profile'
+-import { _resetSessionOwnerHintsForTests, setSessions } from '@/store/session'
++import { $activeSessionId, _resetSessionOwnerHintsForTests, setSessions } from '@/store/session'
+ import { $sessionControlBySession, clearAllSessionControl, refreshSessionControl } from '@/store/session-control'
+ import { sessionStatusStripe } from '@/store/session-dot-state'
+ import { $sessionTiles, clearAllSessionStates, publishSessionState } from '@/store/session-states'
+@@ -145,6 +145,7 @@ describe('control authority at the real idle row hook', () => {
+     for (const read of reads) {
+       sessionsHost.reportWorkSourceRead({ ...read, available: true })
+     }
++
+     const { result, unmount } = renderHook(() => useWorkSourceUnavailable(row))
+ 
+     try {
+@@ -200,6 +201,7 @@ describe('control authority at the real idle row hook', () => {
+     for (const read of reads) {
+       sessionsHost.reportWorkSourceRead({ ...read, available: true })
+     }
++
+     const { result, unmount } = renderHook(() => useWorkSourceUnavailable(row))
+ 
+     try {
+@@ -222,6 +224,79 @@ describe('control authority at the real idle row hook', () => {
+     }
+   })
+ 
++  it('review: a tile rebind between existing mirrors vetoes cached complete proof', () => {
++    const row = makeSessionInfo({ id: 'stored-chat', profile: 'default', connection_id: 'local', outcome: DONE })
++    setSessions([row])
++    publishSessionState('rt-next', createClientSessionState(row.id))
++    $sessionTiles.set([{ storedSessionId: row.id, runtimeId: 'rt-main', ownerRoute: { connectionId: 'local', profile: 'default' } }])
++    const reads = (['lineage', 'tasks', 'process', 'subagent', 'control'] as const).map(source => sessionsHost.beginWorkSourceRead({connectionId: 'local', profile: 'default', storedSessionId: row.id, source}))
++
++    for (const read of reads) {sessionsHost.reportWorkSourceRead({...read, available: true})}
++    const { result, unmount } = renderHook(() => useWorkSourceUnavailable(row))
++
++    try {
++      expect(stripe(result.current)).toBe('done')
++      act(() => { $sessionTiles.set([{ storedSessionId: row.id, runtimeId: 'rt-next', ownerRoute: { connectionId: 'local', profile: 'default' } }]) })
++      expect(stripe(result.current)).not.toBe('done')
++    } finally { unmount() }
++  })
++
++  it('a rebind between mirrored runtimes revokes cached and in-flight proof, ABA included, but not an unrelated row', () => {
++    const row = makeSessionInfo({ id: 'stored-chat', profile: 'default', connection_id: 'local', outcome: DONE })
++    const other = makeSessionInfo({ id: 'other-chat', profile: 'default', connection_id: 'local', outcome: DONE })
++    setSessions([row, other])
++    publishSessionState('rt-b', createClientSessionState(row.id))
++    const route = { connectionId: 'local', profile: 'default' }
++    const bind = (runtimeId: string) => $sessionTiles.set([{ storedSessionId: row.id, runtimeId, ownerRoute: route }])
++
++    const capture = (id: string) =>
++      (['lineage', 'tasks', 'process', 'subagent', 'control'] as const).map(source =>
++        sessionsHost.beginWorkSourceRead({ connectionId: 'local', profile: 'default', storedSessionId: id, source })
++      )
++
++    const succeed = (reads: ReturnType<typeof capture>) => {
++      for (const read of reads) {
++        sessionsHost.reportWorkSourceRead({ ...read, available: true })
++      }
++    }
++
++    bind('rt-main')
++    const inFlight = capture(row.id)
++    const stableReads = capture(other.id)
++    succeed(stableReads)
++    const mounted = renderHook(() => [useWorkSourceUnavailable(row), useWorkSourceUnavailable(other)])
++
++    try {
++      // Nothing completed for `row` yet: an in-flight read is not proof.
++      expect(mounted.result.current).toEqual([true, false])
++      act(() => bind('rt-b'))
++      act(() => succeed(inFlight)) // captured before the rebind: must be rejected
++      expect(mounted.result.current).toEqual([true, false])
++      act(() => succeed(capture(row.id)))
++      expect(mounted.result.current).toEqual([false, false])
++
++      // ABA: rt-b → rt-main → rt-b between polls. The proof of the first rt-b is gone.
++      act(() => bind('rt-main'))
++      expect(mounted.result.current).toEqual([true, false])
++      act(() => bind('rt-b'))
++      expect(mounted.result.current).toEqual([true, false])
++      act(() => succeed(capture(row.id)))
++      expect(mounted.result.current).toEqual([false, false])
++
++      // Rebinding the MAIN pane between two mirrored runtimes is a role change too.
++      publishSessionState('rt-main', createClientSessionState(row.id))
++      act(() => $activeSessionId.set('rt-main'))
++      expect(mounted.result.current).toEqual([true, false])
++      act(() => succeed(capture(row.id)))
++      expect(mounted.result.current).toEqual([false, false])
++      act(() => $activeSessionId.set('rt-b'))
++      expect(mounted.result.current).toEqual([true, false])
++    } finally {
++      $activeSessionId.set(null)
++      mounted.unmount()
++    }
++  })
++
+   it('unread required sources cannot certify stored done before the first poll', () => {
+     const row = makeSessionInfo({ id: 'stored-chat', profile: 'default', connection_id: 'local', outcome: DONE })
+     setSessions([row])
+diff --git a/apps/desktop/src/store/session.ts b/apps/desktop/src/store/session.ts
+index 8d95894703..449a299c89 100644
+--- a/apps/desktop/src/store/session.ts
++++ b/apps/desktop/src/store/session.ts
+@@ -1002,6 +1002,14 @@ function withUnlistedOwnerStubs(rows: SessionInfo[], stubs: readonly SessionInfo
+     return rows
+   }
+ 
++  // Same (rows, stubs) inputs → same array: an unlisted draft must not hand
++  // every identity-keyed consumer (work-source owner index) a fresh copy.
++  const memo = stubShadowMemo
++
++  if (memo && memo.rows === rows && memo.stubs === stubs) {
++    return memo.result
++  }
++
+   const listed = new Set<string>()
+ 
+   for (const row of rows) {
+@@ -1010,9 +1018,14 @@ function withUnlistedOwnerStubs(rows: SessionInfo[], stubs: readonly SessionInfo
+ 
+   const visible = stubs.filter(stub => !listed.has(stub.id))
+ 
+-  return visible.length ? [...rows, ...visible] : rows
++  const result = visible.length ? [...rows, ...visible] : rows
++  stubShadowMemo = { result, rows, stubs }
++
++  return result
+ }
+ 
++let stubShadowMemo: { result: SessionInfo[]; rows: SessionInfo[]; stubs: readonly SessionInfo[] } | null = null
++
+ /**
+  * Every session row the renderer knows, for OWNER lookups. The sidebar splits
+  * its fetch into three source-scoped slices ($sessions / $cronSessions /
+diff --git a/apps/desktop/src/store/work-source-owner.test.ts b/apps/desktop/src/store/work-source-owner.test.ts
+index e680d04e2f..bc9c3fa422 100644
+--- a/apps/desktop/src/store/work-source-owner.test.ts
++++ b/apps/desktop/src/store/work-source-owner.test.ts
+@@ -26,6 +26,7 @@ import { makeSessionInfo } from '@/test/session-info'
+ 
+ import {
+   $workSourceAuthorityRevision,
++  _ownerIndexBuildsForTests,
+   _resetWorkSourceOwnerForTests,
+   qualifiedWorkSourceOwner,
+   workSourceAuthorityForSession
+@@ -92,6 +93,7 @@ describe('work-source owner authority context', () => {
+     $sessionTiles.set([])
+     setSessions([])
+     $projectTree.set([])
++    $unlistedSessionOwnerRows.set([])
+     $activeSessionId.set(null)
+     $selectedStoredSessionId.set(null)
+     $profiles.set([])
+@@ -167,6 +169,16 @@ describe('work-source owner authority context', () => {
+     })
+   })
+ 
++  it('review: tile rebind revokes authority when both mirrors already exist', () => {
++    setSessions([makeSessionInfo({ id: 'stored-chat', profile: 'default', connection_id: 'local' })])
++    publishSessionState('rt-a', createClientSessionState('stored-chat'))
++    publishSessionState('rt-b', createClientSessionState('stored-chat'))
++    $sessionTiles.set([{ storedSessionId: 'stored-chat', runtimeId: 'rt-a', ownerRoute: { connectionId: 'local', profile: 'default' } }])
++    const first = workSourceAuthorityForSession('local', 'default', 'stored-chat')
++    $sessionTiles.set([{ storedSessionId: 'stored-chat', runtimeId: 'rt-b', ownerRoute: { connectionId: 'local', profile: 'default' } }])
++    expect(workSourceAuthorityForSession('local', 'default', 'stored-chat').runtime).not.toBe(first.runtime)
++  })
++
+   it('invalidates runtime on tile rebind and both epochs on semantic owner change, not on the same owner', () => {
+     setSessions([makeSessionInfo({ id: 'stored-chat', profile: 'default', connection_id: 'local' })])
+     $sessionTiles.set([
+@@ -400,6 +412,7 @@ describe('work-source owner authority context', () => {
+       profile: 'default',
+       connection_id: 'local'
+     })
++
+     const collision = makeSessionInfo({ id: 'root', profile: 'default', connection_id: 'homelab' })
+     setSessions([first, collision])
+     const root = workSourceAuthorityForSession('local', 'default', 'root')
+@@ -415,7 +428,84 @@ describe('work-source owner authority context', () => {
+     expect(workSourceAuthorityForSession('local', 'default', 'middle').durable).not.toBe(middle.durable)
+   })
+ 
+-  it('keeps realistic streaming observation neutral and reports structural observer cost', () => {
++  it('keeps same-ID rows on different routes independent while exact ids still outrank lineage aliases', () => {
++    const local = makeSessionInfo({ id: 'twin', profile: 'default', connection_id: 'local' })
++    const away = makeSessionInfo({ id: 'twin', profile: 'default', connection_id: 'homelab' })
++    setSessions([away, local])
++    const a = workSourceAuthorityForSession('local', 'default', 'twin')
++    const b = workSourceAuthorityForSession('homelab', 'default', 'twin')
++    expect(positive(a.durable)).toBe(true)
++    expect(positive(b.durable)).toBe(false) // homelab has no live socket here; local must not be blocked by it
++    setSessions([local, away])
++    expect(workSourceAuthorityForSession('local', 'default', 'twin')).toEqual(a)
++    // A third route never named by any row is still refused.
++    expect(workSourceAuthorityForSession('elsewhere', 'default', 'twin')).toEqual({ durable: null, runtime: null })
++    // An exact-id row of another route still outranks a same-scope lineage alias (list precedence kept).
++    const alias = makeSessionInfo({ id: 'tip', _lineage_root_id: 'twin', profile: 'default', connection_id: 'local' })
++    setSessions([away, alias])
++    expect(workSourceAuthorityForSession('local', 'default', 'twin')).toEqual({ durable: null, runtime: null })
++  })
++
++  it('revokes only the runtime epoch when a tile or the main pane moves between mirrored runtimes, ABA included', () => {
++    setSessions([makeSessionInfo({ id: 'stored-chat', profile: 'default', connection_id: 'local' })])
++    publishSessionState('rt-a', createClientSessionState('stored-chat'))
++    publishSessionState('rt-b', createClientSessionState('stored-chat'))
++    const route = { connectionId: 'local', profile: 'default' }
++    const tile = (runtimeId: string) => $sessionTiles.set([{ storedSessionId: 'stored-chat', runtimeId, ownerRoute: route }])
++    tile('rt-a')
++    const first = workSourceAuthorityForSession('local', 'default', 'stored-chat')
++    tile('rt-b')
++    const second = workSourceAuthorityForSession('local', 'default', 'stored-chat')
++    tile('rt-a')
++    const third = workSourceAuthorityForSession('local', 'default', 'stored-chat')
++    expect(new Set([first.runtime, second.runtime, third.runtime]).size).toBe(3)
++    expect([second.durable, third.durable]).toEqual([first.durable, first.durable])
++    $sessionTiles.set([])
++    const noTile = workSourceAuthorityForSession('local', 'default', 'stored-chat')
++    $activeSessionId.set('rt-a')
++    const mainA = workSourceAuthorityForSession('local', 'default', 'stored-chat')
++    $activeSessionId.set('rt-b')
++    const mainB = workSourceAuthorityForSession('local', 'default', 'stored-chat')
++    $activeSessionId.set('rt-a')
++    const mainA2 = workSourceAuthorityForSession('local', 'default', 'stored-chat')
++    expect(new Set([third.runtime, noTile.runtime, mainA.runtime, mainB.runtime, mainA2.runtime]).size).toBe(5)
++    expect(mainA2.durable).toBe(first.durable)
++    // Re-asserting the same effective roles is neutral.
++    $activeSessionId.set('rt-a')
++    expect(workSourceAuthorityForSession('local', 'default', 'stored-chat')).toEqual(mainA2)
++  })
++
++  it('builds the owner candidate index once per row-list change, even with an unlisted draft', () => {
++    const rows = Array.from({ length: 200 }, (_, i) => makeSessionInfo({ id: `idx-${i}`, profile: 'default', connection_id: 'local' }))
++    $unlistedSessionOwnerRows.set([makeSessionInfo({ id: 'draft', profile: 'default', connection_id: 'local' })])
++    setSessions(rows)
++
++    for (const row of rows) {
++      publishSessionState(`rt-${row.id}`, createClientSessionState(row.id))
++      workSourceAuthorityForSession('local', 'default', row.id)
++    }
++
++    const base = _ownerIndexBuildsForTests()
++
++    // Repeated lookups and a stream publish with the same row list: no rebuild.
++    for (const row of rows) {
++      workSourceAuthorityForSession('local', 'default', row.id)
++    }
++
++    publishSessionState('rt-idx-0', { ...createClientSessionState('idx-0'), streaming: true } as never)
++    expect(_ownerIndexBuildsForTests()).toBe(base)
++    // One structural change rebuilds once, not once per tracked entry or runtime.
++    setSessions(rows.map(row => ({ ...row, title: 'renamed' })))
++    expect(_ownerIndexBuildsForTests()).toBeLessThanOrEqual(base + 1)
++    expect(_ownerIndexBuildsForTests()).toBeGreaterThan(base)
++    const after = _ownerIndexBuildsForTests()
++    $unlistedSessionOwnerRows.set([makeSessionInfo({ id: 'draft-2', profile: 'default', connection_id: 'local' })])
++    expect(_ownerIndexBuildsForTests()).toBeLessThanOrEqual(after + 1)
++  })
++
++  it.each([false, true])('review: realistic structural cost with unlisted stub %s', withStub => {
++    if (withStub) {$unlistedSessionOwnerRows.set([makeSessionInfo({ id: 'unlisted-draft', profile: 'default', connection_id: 'local' })])}
++
+     const rows = Array.from({ length: 1000 }, (_, i) =>
+       makeSessionInfo({ id: `perf-${i}`, profile: 'default', connection_id: 'local' })
+     )
+diff --git a/apps/desktop/src/store/work-source-owner.ts b/apps/desktop/src/store/work-source-owner.ts
+index c94d678d60..5c71253beb 100644
+--- a/apps/desktop/src/store/work-source-owner.ts
++++ b/apps/desktop/src/store/work-source-owner.ts
+@@ -49,13 +49,19 @@ interface Tracked {
+   offState?: () => void
+ }
+ 
++interface Candidate {
++  exact: boolean
++  row: SessionInfo
++}
++
+ const tracked = new Map<string, Tracked>()
+ const unsubscribers: Array<() => void> = []
+ const TRACKED_LIMIT = 4096
+ let epoch = 0
+ let runtimeIndex = new Map<string, string>()
+ let ownerRows: readonly SessionInfo[] | undefined
+-let ownerRowIndex = new Map<string, SessionInfo[]>()
++let ownerRowIndex = new Map<string, Candidate[]>()
++let ownerIndexBuilds = 0
+ let mirrorBindings = ''
+ export const $workSourceAuthorityRevision = atom(1)
+ 
+@@ -136,30 +142,81 @@ function bindSocket(entry: Tracked, socket: Socket | null): void {
+   })
+ }
+ 
+-/** Preserve the resolver's first matching row, including lineage aliases and list precedence. */
+-function indexedOwnerForSession(id: string): SessionOwnerScope {
++/** Every row naming an id (own id or lineage alias), in resolver list order. Built once per row-list identity. */
++function candidateIndex(): Map<string, Candidate[]> {
+   const rows = ownerLookupSessionRows()
+ 
+   if (rows !== ownerRows) {
+     ownerRows = rows
+     ownerRowIndex = new Map()
++    ownerIndexBuilds++
+ 
+     for (const row of rows) {
++      const seen = new Set<string>()
++
+       for (const alias of [row.id, row._lineage_root_id, ...(row._lineage_ids ?? [])]) {
+-        if (alias && !ownerRowIndex.has(alias)) {
+-          ownerRowIndex.set(alias, [row])
++        if (!alias || seen.has(alias)) {
++          continue
++        }
++
++        seen.add(alias)
++        const list = ownerRowIndex.get(alias)
++        const candidate = { exact: alias === row.id, row }
++
++        if (list) {
++          list.push(candidate)
++        } else {
++          ownerRowIndex.set(alias, [candidate])
+         }
+       }
+     }
+   }
+ 
++  return ownerRowIndex
++}
++
++/** Rows competing for an id: those of the first match's kind (own id vs lineage alias), preserving list precedence. */
++function competingRows(stored: string): SessionInfo[] {
++  const list = candidateIndex().get(stored)
++
++  if (!list?.length) {
++    return []
++  }
++
++  const exact = list[0].exact
++
++  return list.filter(candidate => candidate.exact === exact).map(candidate => candidate.row)
++}
++
++/**
++ * Owners the resolver can name for `id`. One row (or none) keeps the resolver's
++ * first-match behavior; several same-ID rows on different routes each resolve on
++ * their own, so a foreign route's row never shadows another healthy route.
++ */
++function candidateOwners(id: string): Array<QualifiedWorkSourceOwner | undefined> {
+   const stored = storedSessionIdForRuntimeId(id) ?? id
++  const rows = competingRows(stored)
++
++  if (rows.length <= 1) {
++    return [qualifiedWorkSourceOwner(knownOwnerForSession(id, rows))]
++  }
+ 
+-  return knownOwnerForSession(id, ownerRowIndex.get(stored) ?? [])
++  return rows.map(row => qualifiedWorkSourceOwner(knownOwnerForSession(id, [row])))
++}
++
++/** The candidate for exactly this entry's scope, else the first candidate (which then fails the scope match). */
++function ownerForEntry(entry: Tracked): QualifiedWorkSourceOwner | undefined {
++  const owners = candidateOwners(entry.storedSessionId)
++
++  return (
++    owners.find(
++      owner => owner?.connectionId === entry.owner.connectionId && owner?.profile === entry.owner.profile
++    ) ?? owners[0]
++  )
+ }
+ 
+ function syncEntry(entry: Tracked): void {
+-  const resolved = qualifiedWorkSourceOwner(indexedOwnerForSession(entry.storedSessionId))
++  const resolved = ownerForEntry(entry)
+   const semantic = semanticOf(resolved)
+   const runtimes = runtimeIndex.get(scopeKey(entry.owner, entry.storedSessionId)) ?? ''
+ 
+@@ -176,39 +233,60 @@ function syncEntry(entry: Tracked): void {
+   bindSocket(entry, matches ? gatewayRouteState(resolved.connectionId, resolved.profile).gateway : null)
+ }
+ 
+-/** Resolve each runtime once per binding update, not once per observed scope. */
++/**
++ * Resolve each runtime once per binding update, not once per observed scope.
++ * The index value is the runtime's effective ROLES (mirror / tile / main), not
++ * mere membership: rebinding a tile or the main pane between runtimes that
++ * already have mirrors must still change what a cached proof was read against.
++ */
+ function rebuildRuntimeIndex(): void {
+-  const ids = new Set(Object.keys($sessionStates.get()))
++  const roles = new Map<string, string>()
++  const addRole = (id: string, role: string) => roles.set(id, (roles.get(id) ?? '') + role)
++
++  for (const id of Object.keys($sessionStates.get())) {
++    addRole(id, 'm')
++  }
+ 
+   for (const tile of $sessionTiles.get()) {
+     if (tile.runtimeId) {
+-      ids.add(tile.runtimeId)
++      addRole(tile.runtimeId, 't')
+     }
+   }
+ 
+   const active = $activeSessionId.get()
+ 
+   if (active) {
+-    ids.add(active)
++    addRole(active, 'a')
+   }
+ 
+-  const index = new Map<string, string[]>()
++  const index = new Map<string, Array<[string, string]>>()
+ 
+-  for (const id of ids) {
++  for (const [id, role] of roles) {
+     const stored = storedSessionIdForRuntimeId(id)
+-    const owner = qualifiedWorkSourceOwner(indexedOwnerForSession(id))
+ 
+-    if (!stored || !owner) {
++    if (!stored) {
+       continue
+     }
+ 
+-    const key = scopeKey(owner, stored)
+-    const values = index.get(key) ?? []
+-    values.push(id)
+-    index.set(key, values)
++    // A runtime of an ambiguous same-ID row set may serve any of those routes:
++    // attribute it to each so a rebinding can only over-revoke, never miss.
++    for (const owner of candidateOwners(id)) {
++      if (!owner) {
++        continue
++      }
++
++      const key = scopeKey(owner, stored)
++      const values = index.get(key) ?? []
++
++      if (!values.some(([existing]) => existing === id)) {
++        values.push([id, role])
++      }
++
++      index.set(key, values)
++    }
+   }
+ 
+-  runtimeIndex = new Map([...index].map(([key, values]) => [key, JSON.stringify(values.sort())]))
++  runtimeIndex = new Map([...index].map(([key, values]) => [key, JSON.stringify(values.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))]))
+ }
+ 
+ function syncTracked(): void {
+@@ -330,8 +408,15 @@ export function peekWorkSourceAuthorityForSession(
+   return { durable: entry.durable, runtime: entry.runtime }
+ }
+ 
++/** Test-only: how many times the owner-row candidate index was rebuilt. */
++export function _ownerIndexBuildsForTests(): number {
++  return ownerIndexBuilds
++}
++
+ /** Test-only: drop listeners but never recycle request authority. */
+ export function _resetWorkSourceOwnerForTests(): void {
++  ownerIndexBuilds = 0
++
+   for (const entry of tracked.values()) {
+     entry.offState?.()
+   }
+diff --git a/apps/desktop/src/store/work-source-secondary-authority.test.ts b/apps/desktop/src/store/work-source-secondary-authority.test.ts
+index 075067c5ab..09e1b36a8b 100644
+--- a/apps/desktop/src/store/work-source-secondary-authority.test.ts
++++ b/apps/desktop/src/store/work-source-secondary-authority.test.ts
+@@ -190,6 +190,7 @@ it('isolates three live connection/profile routes and keeps unaffected complete
+   expect([...localReads, ...workerReads, ...otherReads].every(read => read.authorityEpoch !== undefined)).toBe(true)
+   succeed(localReads)
+   succeed(workerReads)
++
+   const mounted = renderHook(() => [
+     useWorkSourceUnavailable(local),
+     useWorkSourceUnavailable(row),
+@@ -218,6 +219,65 @@ it('isolates three live connection/profile routes and keeps unaffected complete
+   }
+ })
+ 
++it('review: same-id rows on two live routes both retain usable authority', () => {
++  const local = makeSessionInfo({ id: row.id, profile: 'default', connection_id: 'local' })
++  setSessions([local, row])
++  const reads = capture()
++  expect(reads.every(read => read.authorityEpoch !== undefined)).toBe(true)
++})
++
++it.each([
++  ['local, remote-default, worker', 0],
++  ['worker, remote-default, local', 1]
++])('identical stored ids on three live routes each reach green and recover independently (%s)', async (_label, flip) => {
++  const opening = ensureGatewayForAgent('remote', 'default')
++  await vi.advanceTimersByTimeAsync(10)
++  expect(await opening).toBe(true)
++  const remoteDefaultSocket = AuthoritySocket.instances.at(-1)!
++  const local = makeSessionInfo({ id: row.id, profile: 'default', connection_id: 'local' })
++  const remoteDefault = makeSessionInfo({ id: row.id, profile: 'default', connection_id: 'remote' })
++  const routes = [local, remoteDefault, row]
++  setSessions(flip ? [...routes].reverse() : routes)
++
++  const readFor = (session: typeof row) =>
++    (['lineage', 'tasks', 'process', 'subagent', 'control'] as const).map(source =>
++      sessionsHost.beginWorkSourceRead({
++        connectionId: session.connection_id!,
++        profile: session.profile!,
++        storedSessionId: session.id,
++        source
++      })
++    )
++
++  const reads = routes.map(readFor)
++  expect(reads.flat().every(read => read.authorityEpoch !== undefined)).toBe(true)
++  succeed(reads[0])
++  succeed(reads[2])
++
++  const mounted = renderHook(() => routes.map(route => useWorkSourceUnavailable(route)))
++
++  try {
++    // Only routes with their own five proofs are green; a sibling's proof never certifies the third.
++    expect(mounted.result.current).toEqual([false, true, false])
++    act(() => succeed(reads[1]))
++    expect(mounted.result.current).toEqual([false, false, false])
++    // Closing one live socket vetoes that route only.
++    act(() => remoteDefaultSocket.close())
++    expect(mounted.result.current).toEqual([false, true, false])
++    // Replies captured before the close stay rejected after the real reconnect...
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(5000)
++    })
++    act(() => succeed(reads[1]))
++    expect(mounted.result.current).toEqual([false, true, false])
++    // ...and only a fresh complete read set on the healthy route recovers green.
++    act(() => succeed(readFor(remoteDefault)))
++    expect(mounted.result.current).toEqual([false, false, false])
++  } finally {
++    mounted.unmount()
++  }
++})
++
+ it('revokes a mounted secondary owner on close and rejects old replies after real reconnect', async () => {
+   const reads = capture()
+   expect(reads.every(read => read.authorityEpoch !== undefined)).toBe(true)
+-- 
+2.43.0
+

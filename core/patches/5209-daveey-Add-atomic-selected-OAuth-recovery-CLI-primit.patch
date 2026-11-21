@@ -1,0 +1,650 @@
+From 3552ad4f0bfeffc18b1a9809ab4d79f03050256b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 12:02:40 +0000
+Subject: [PATCH] [daveey] Add atomic selected OAuth recovery CLI primitives
+
+---
+ agent/anthropic_credentials.py                |  10 +-
+ hermes_cli/auth_commands.py                   |   3 +-
+ hermes_cli/auth_reauth_command.py             |  56 ++++++
+ hermes_cli/auth_reauth_target.py              | 126 +++++++++++++
+ hermes_cli/subcommands/auth.py                |   3 +
+ tests/hermes_cli/test_auth_reauth_command.py  | 154 ++++++++++++++++
+ tests/hermes_cli/test_auth_reauth_target.py   | 168 ++++++++++++++++++
+ .../user-guide/selected-account-recovery.md   |  11 ++
+ 8 files changed, 525 insertions(+), 6 deletions(-)
+ create mode 100644 hermes_cli/auth_reauth_command.py
+ create mode 100644 hermes_cli/auth_reauth_target.py
+ create mode 100644 tests/hermes_cli/test_auth_reauth_command.py
+ create mode 100644 tests/hermes_cli/test_auth_reauth_target.py
+ create mode 100644 website/docs/user-guide/selected-account-recovery.md
+
+diff --git a/agent/anthropic_credentials.py b/agent/anthropic_credentials.py
+index bf8929f273..aaad86be1e 100644
+--- a/agent/anthropic_credentials.py
++++ b/agent/anthropic_credentials.py
+@@ -437,12 +437,12 @@ def _post_oauth_token(
+                 return json.loads(resp.read().decode())
+         except urllib.error.HTTPError as exc:
+             last_error = _oauth_http_error(exc, what=what)
+-            logger.debug("Anthropic token %s failed at %s: %s", what, endpoint, last_error)
++            logger.debug("Anthropic token %s failed at %s: HTTP %s", what, endpoint, last_error.status)
+             if last_error.relogin_required:
+                 break  # a dead grant is dead at every endpoint; do not replay it
+         except Exception as exc:
+             last_error = exc
+-            logger.debug("Anthropic token %s failed at %s: %s", what, endpoint, exc)
++            logger.debug("Anthropic token %s failed at %s: %s", what, endpoint, type(exc).__name__)
+     raise last_error or ValueError(f"Anthropic token {what} failed")
+ 
+ 
+@@ -771,7 +771,7 @@ def _generate_pkce() -> tuple:
+     return verifier, challenge
+ 
+ 
+-def run_hermes_oauth_login_pure() -> Optional[dict[str, Any]]:
++def run_hermes_oauth_login_pure(*, code_reader=None) -> Optional[dict[str, Any]]:
+     """Run Hermes-native OAuth PKCE flow and return credential state."""
+     from urllib.parse import urlencode
+     verifier, challenge = _generate_pkce()
+@@ -800,7 +800,7 @@ def run_hermes_oauth_login_pure() -> Optional[dict[str, Any]]:
+             print("  (Browser opened automatically)")
+     print("\nAfter authorizing, you'll see a code. Paste it below.\n")
+     try:
+-        auth_code = input("Authorization code: ").strip()
++        auth_code = (code_reader or input)("Authorization code: ").strip()
+     except (KeyboardInterrupt, EOFError):
+         return None
+     if not auth_code:
+@@ -818,7 +818,7 @@ def run_hermes_oauth_login_pure() -> Optional[dict[str, Any]]:
+         }).encode()
+         result = _post_oauth_token(exchange_data, content_type="application/json", timeout=15, what="exchange")
+     except Exception as e:
+-        print(f"Token exchange failed: {e}")
++        print("Token exchange failed." if code_reader is not None else f"Token exchange failed: {e}")
+         return None
+     if not result.get("access_token"):
+         print("No access token in response.")
+diff --git a/hermes_cli/auth_commands.py b/hermes_cli/auth_commands.py
+index 10c8260443..abac61e3b1 100644
+--- a/hermes_cli/auth_commands.py
++++ b/hermes_cli/auth_commands.py
+@@ -25,6 +25,7 @@ from hermes_cli.auth_plugin_providers import (
+     canonical_registry_rows, dispatch_plugin_auth, is_refreshable_oauth_provider, plugin_missing_auth_handler_error)
+ from hermes_constants import OPENROUTER_BASE_URL
+ from hermes_cli.secret_prompt import masked_secret_prompt
++from hermes_cli.auth_reauth_command import auth_reauth_command
+ 
+ 
+ # Providers that support OAuth login in addition to API keys.
+@@ -955,7 +956,7 @@ def auth_upgrade_command(args) -> None:
+ 
+ 
+ _AUTH_ACTIONS = {
+-    "add": auth_add_command, "list": auth_list_command, "remove": auth_remove_command,
++    "add": auth_add_command, "reauth": auth_reauth_command, "list": auth_list_command, "remove": auth_remove_command,
+     "reset": auth_reset_command, "priority": auth_priority_command, "refresh": auth_refresh_command, "status": auth_status_command,
+     "disable": auth_disable_command, "enable": auth_enable_command,
+     "logout": auth_logout_command, "upgrade": auth_upgrade_command}
+diff --git a/hermes_cli/auth_reauth_command.py b/hermes_cli/auth_reauth_command.py
+new file mode 100644
+index 0000000000..f519449dfe
+--- /dev/null
++++ b/hermes_cli/auth_reauth_command.py
+@@ -0,0 +1,56 @@
++"""Interactive selected-account recovery, without append or singleton writes."""
++import getpass
++import sys
++import warnings
++
++from hermes_cli.auth_reauth_target import ReauthConflict, commit_reauth, prepare_reauth
++
++
++def _secret_code(prompt: str) -> str:
++    # getpass otherwise falls back to echoing stdin when the terminal has no
++    # controllable echo. A recovery terminal must fail closed in that case.
++    with warnings.catch_warnings():
++        warnings.simplefilter('error', getpass.GetPassWarning)
++        return getpass.getpass(prompt)
++
++
++def auth_reauth_command(args) -> None:
++    """Reauthenticate an exact owned pool ID; never resolve a display label."""
++    from hermes_cli import auth
++    from hermes_cli.auth_commands import _OAUTH_ADD_SPECS
++    if not sys.stdin.isatty() or not sys.stdout.isatty():
++        raise SystemExit('Account recovery requires an interactive private terminal.')
++    committing = False
++    try:
++        target = prepare_reauth(args.provider, args.credential_id)
++        unverified = target.provider == 'anthropic'
++        if unverified:
++            print('The stored grant has no verifiable account identity. This replaces the selected credential; '
++                  'it cannot prove the new sign-in is the same account.')
++            if input('Replace this selected credential? Type replace to continue: ').strip() != 'replace':
++                print('Sign-in cancelled; no credential was changed.')
++                return
++            from agent.anthropic_credentials import run_hermes_oauth_login_pure
++            credentials = run_hermes_oauth_login_pure(code_reader=_secret_code)
++        else:
++            credentials = _OAUTH_ADD_SPECS[target.provider].login(args)
++        if not credentials:
++            print('Sign-in cancelled or unsuccessful; no credential was changed.')
++            return
++        spec = _OAUTH_ADD_SPECS[target.provider]
++        grant = {'access_token': spec.token(credentials), **spec.fields(credentials, target.provider)}
++        committing = True
++        result = commit_reauth(target, grant, allow_unverified_identity=unverified)
++    except (KeyboardInterrupt, EOFError):
++        print('Recovery interrupted during save; credential state is unverified. Refresh accounts before retrying.'
++              if committing else 'Sign-in cancelled; no credential was changed.')
++        return
++    except getpass.GetPassWarning as exc:
++        raise SystemExit('Secure input is unavailable; no credential was changed.') from exc
++    except (ReauthConflict, auth.AuthError) as exc:
++        # Provider error bodies can carry secrets. Only our fixed conflict text is
++        # safe to display; provider failures retain a generic user-facing outcome.
++        message = str(exc) if isinstance(exc, ReauthConflict) else 'Provider sign-in failed; retry recovery.'
++        raise SystemExit(message) from None
++    identity = 'Identity matched.' if result.identity_verified else 'Account identity remains unverified.'
++    print(f'Selected credential saved. {identity} Account health still requires refresh and verification.')
+diff --git a/hermes_cli/auth_reauth_target.py b/hermes_cli/auth_reauth_target.py
+new file mode 100644
+index 0000000000..89d70480fe
+--- /dev/null
++++ b/hermes_cli/auth_reauth_target.py
+@@ -0,0 +1,126 @@
++"""Atomic selected-row reauthentication primitives for owned OAuth grants.
++
++Targets are backend-only, short-lived values. They are not serialized or accepted
++from a renderer. Login runs between prepare and commit, outside the store lock.
++Only tokens returned by the provider login exchange may reach commit_reauth.
++"""
++from dataclasses import dataclass, field
++import hashlib
++import json
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any
++
++
++class ReauthConflict(ValueError):
++    """Recovery cannot safely replace the selected stored credential."""
++
++
++@dataclass(frozen=True)
++class ReauthTarget:
++    provider: str
++    credential_id: str
++    store_path: Path = field(repr=False)
++    generation: str = field(repr=False)
++    principal: tuple[str, str] | None = field(repr=False)
++
++
++@dataclass(frozen=True)
++class ReauthResult:
++    credential_id: str
++    identity_verified: bool
++
++
++_OWNED_SOURCES = {
++    'anthropic': {'manual:hermes_pkce'},
++    'openai-codex': {'manual:device_code', 'manual:loopback_pkce'},
++}
++_TOKEN_FIELDS = ('access_token', 'refresh_token', 'expires_at', 'expires_at_ms', 'last_refresh')
++
++
++def _generation(row: dict[str, Any]) -> str:
++    # Include source and policy metadata, not just the pair. Any target edit wins
++    # over an outstanding login. Unrelated rows may still change concurrently.
++    return hashlib.sha256(json.dumps(row, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
++
++
++def _selected(store: dict[str, Any], provider: str, credential_id: str) -> dict[str, Any]:
++    pool = store.get('credential_pool')
++    rows = pool.get(provider) if isinstance(pool, dict) else None
++    hits = [row for row in rows if isinstance(row, dict) and row.get('id') == credential_id] if isinstance(rows, list) else []
++    if len(hits) != 1:
++        raise ReauthConflict('Selected credential is missing or ambiguous; refresh the account list.')
++    row = hits[0]
++    if row.get('auth_type') != 'oauth' or row.get('source') not in _OWNED_SOURCES.get(provider, set()):
++        raise ReauthConflict('This credential must be recovered at its original credential source.')
++    from agent.credential_pool_disabled import is_credential_disabled
++    if is_credential_disabled(provider, SimpleNamespace(**row)):
++        raise ReauthConflict('Selected credential is disabled; recovery did not change it.')
++    return row
++
++
++def _principal(provider: str, token: Any) -> tuple[str, str] | None:
++    if provider != 'openai-codex':
++        return None
++    from agent.credential_pool import _codex_principal_identity
++    return _codex_principal_identity(token)
++
++
++def prepare_reauth(provider: str, credential_id: str) -> ReauthTarget:
++    """Bind an exact locally-owned persisted row; never seed or borrow a pool."""
++    from hermes_cli import auth
++    if provider not in _OWNED_SOURCES or not isinstance(credential_id, str) or not credential_id:
++        raise ReauthConflict('Unsupported recovery target.')
++    path = auth._auth_file_path().resolve()
++    with auth._auth_store_lock(target_path=path):
++        row = _selected(auth._load_auth_store(path), provider, credential_id)
++        return ReauthTarget(provider, credential_id, path, _generation(row),
++                            _principal(provider, row.get('access_token')))
++
++
++def _validate_grant(target: ReauthTarget, grant: dict[str, Any], allow_unverified: bool) -> bool:
++    if any(not isinstance(grant.get(key), str) or not grant[key].strip()
++           for key in ('access_token', 'refresh_token')):
++        raise ReauthConflict('Provider did not return a complete OAuth grant.')
++    principal = _principal(target.provider, grant['access_token'])
++    if target.provider == 'openai-codex':
++        if target.principal is None or principal != target.principal:
++            raise ReauthConflict('Sign-in does not match the selected account and workspace.')
++        return True
++    if not allow_unverified:
++        raise ReauthConflict('Account identity is unavailable; explicit replacement confirmation is required.')
++    return False
++
++
++def commit_reauth(target: ReauthTarget, grant: dict[str, Any], *,
++                  allow_unverified_identity: bool = False) -> ReauthResult:
++    """CAS a provider-exchanged grant into its selected row, preserving metadata.
++
++    Unknown Anthropic identity is *never* reported verified. The caller must obtain
++    explicit replacement consent before opting into that case. This result proves
++    persistence only, not account health; callers must perform health readback.
++    """
++    from hermes_cli import auth
++    if auth._auth_file_path().resolve() != target.store_path:
++        raise ReauthConflict('Credential profile changed during sign-in.')
++    verified = _validate_grant(target, grant, allow_unverified_identity)
++    with auth._auth_store_lock(target_path=target.store_path):
++        store = auth._load_auth_store(target.store_path)
++        row = _selected(store, target.provider, target.credential_id)
++        if _generation(row) != target.generation:
++            raise ReauthConflict('Selected credential changed during sign-in; no credentials were saved.')
++        for key in _TOKEN_FIELDS:
++            row.pop(key, None)
++            if key in grant:
++                row[key] = grant[key]
++        # A new grant replaces terminal authentication failure, not quota evidence.
++        if row.get('last_status') == 'dead':
++            for key in ('last_status', 'last_error', 'failure_reason', 'last_error_code',
++                        'last_error_reason', 'last_error_message', 'last_error_reset_at'):
++                row.pop(key, None)
++        _selected(store, target.provider, target.credential_id)  # validate incoming disable policy BEFORE save
++        auth._save_auth_store(store, target_path=target.store_path)
++        saved = _selected(auth._load_auth_store(target.store_path), target.provider, target.credential_id)
++        if _generation(saved) != _generation(row):
++            raise ReauthConflict('Credential save could not be verified.')
++    return ReauthResult(target.credential_id, verified)
+diff --git a/hermes_cli/subcommands/auth.py b/hermes_cli/subcommands/auth.py
+index 74835b231e..b27fd1b3a0 100644
+--- a/hermes_cli/subcommands/auth.py
++++ b/hermes_cli/subcommands/auth.py
+@@ -36,6 +36,9 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
+     auth_add.add_argument(
+         "--insecure", action="store_true", help="Disable TLS verification for OAuth login")
+     auth_add.add_argument("--ca-bundle", help="Custom CA bundle for OAuth login")
++    auth_reauth = auth_subparsers.add_parser('reauth', help='Sign in again for an exact owned OAuth credential')
++    auth_reauth.add_argument('provider', choices=['anthropic', 'openai-codex'])
++    auth_reauth.add_argument('credential_id', help='Exact credential pool ID (not a label or row index)')
+     auth_list = auth_subparsers.add_parser("list", help="List pooled credentials")
+     auth_list.add_argument("provider", nargs="?", help="Optional provider filter")
+     auth_remove = auth_subparsers.add_parser(
+diff --git a/tests/hermes_cli/test_auth_reauth_command.py b/tests/hermes_cli/test_auth_reauth_command.py
+new file mode 100644
+index 0000000000..509f7cdfd5
+--- /dev/null
++++ b/tests/hermes_cli/test_auth_reauth_command.py
+@@ -0,0 +1,154 @@
++"""Real CLI dispatch and persistence with fixture-only provider exchange."""
++import argparse
++import json
++import sys
++
++import pytest
++
++from hermes_cli import auth
++from hermes_cli.auth_commands import auth_command
++from hermes_cli.subcommands.auth import build_auth_parser
++
++
++@pytest.fixture
++def recovery(tmp_path, monkeypatch):
++    path = tmp_path / 'auth.json'
++    monkeypatch.setattr(auth, '_auth_file_path', lambda: path)
++    path.write_text(json.dumps({'providers': {}, 'credential_pool': {'anthropic': [dict(
++        id='selected', source='manual:hermes_pkce', auth_type='oauth', label='Example',
++        priority=2, access_token='fixture-old', refresh_token='fixture-old-refresh', last_status='dead')]}}))
++    parser = argparse.ArgumentParser()
++    build_auth_parser(parser.add_subparsers(), cmd_auth=auth_command)
++    args = parser.parse_args(['auth', 'reauth', 'anthropic', 'selected'])
++    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
++    monkeypatch.setattr(sys.stdout, 'isatty', lambda: True)
++    return path, args
++
++
++def test_cli_dispatch_replaces_selected_grant_without_singleton(recovery, monkeypatch, capsys):
++    from agent import anthropic_credentials as anthropic
++    from hermes_cli import auth_reauth_command as command
++    path, args = recovery
++    monkeypatch.setattr(sys.stdout, 'isatty', lambda: True)
++    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
++    monkeypatch.setattr('builtins.input', lambda prompt: 'replace')
++    monkeypatch.setattr(command.getpass, 'getpass', lambda prompt: 'fixture-code#fixture-state')
++    monkeypatch.setattr(anthropic.secrets, 'token_urlsafe', lambda n: 'fixture-state')
++    monkeypatch.setattr(auth, '_can_open_graphical_browser', lambda: False)
++    calls = []
++
++    def exchange(data, **kwargs):
++        calls.append(json.loads(data))
++        return {'access_token': 'fixture-new', 'refresh_token': 'fixture-new-refresh', 'expires_in': 3600}
++
++    monkeypatch.setattr(anthropic, '_post_oauth_token', exchange)
++    args.func(args)
++    saved = json.loads(path.read_text())
++    assert len(saved['credential_pool']['anthropic']) == 1
++    assert saved['credential_pool']['anthropic'][0]['access_token'] == 'fixture-new'
++    assert saved['credential_pool']['anthropic'][0]['id'] == 'selected'
++    assert saved['providers'] == {}
++    assert calls[0]['code'] == 'fixture-code'
++    output = capsys.readouterr().out
++    assert 'identity remains unverified' in output
++    assert 'fixture-code' not in output
++    assert 'fixture-new' not in output
++    assert 'Reconnected' not in output
++
++
++@pytest.mark.parametrize('mode', ['cancel', 'no_tty', 'peer_delete'])
++def test_cli_refusal_does_not_save(recovery, monkeypatch, mode):
++    from agent import anthropic_credentials as anthropic
++    path, args = recovery
++    monkeypatch.setattr('builtins.input', lambda prompt: 'cancel' if mode == 'cancel' else 'replace')
++    calls = []
++
++    def login(**kwargs):
++        calls.append(True)
++        data = json.loads(path.read_text())
++        data['credential_pool']['anthropic'] = []
++        path.write_text(json.dumps(data))
++        return {'access_token': 'fixture-new', 'refresh_token': 'fixture-new-refresh'}
++
++    monkeypatch.setattr(anthropic, 'run_hermes_oauth_login_pure', login)
++    if mode == 'no_tty':
++        monkeypatch.setattr(sys.stdin, 'isatty', lambda: False)
++    before = path.read_bytes()
++    if mode == 'cancel':
++        args.func(args)
++    else:
++        with pytest.raises(SystemExit):
++            args.func(args)
++    if mode != 'peer_delete':
++        assert path.read_bytes() == before and calls == []
++    else:
++        assert json.loads(path.read_text())['credential_pool']['anthropic'] == []
++
++
++@pytest.mark.parametrize('saved_first', [True, False])
++def test_interrupt_during_commit_never_claims_unchanged(recovery, monkeypatch, capsys, saved_first):
++    from agent import anthropic_credentials as anthropic
++    path, args = recovery
++    monkeypatch.setattr(sys.stdout, 'isatty', lambda: True)
++    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
++    monkeypatch.setattr('builtins.input', lambda prompt: 'replace')
++    monkeypatch.setattr(anthropic, 'run_hermes_oauth_login_pure',
++                        lambda **kwargs: {'access_token': 'fixture-new', 'refresh_token': 'fixture-new-refresh'})
++    save = auth._save_auth_store
++
++    def interrupted(*args, **kwargs):
++        if saved_first:
++            save(*args, **kwargs)
++        raise KeyboardInterrupt
++
++    monkeypatch.setattr(auth, '_save_auth_store', interrupted)
++    args.func(args)
++    output = capsys.readouterr().out
++    assert 'state is unverified' in output
++    assert 'no credential was changed' not in output
++    expected = 'fixture-new' if saved_first else 'fixture-old'
++    assert json.loads(path.read_text())['credential_pool']['anthropic'][0]['access_token'] == expected
++
++
++@pytest.mark.parametrize('http_error', [True, False])
++def test_secure_exchange_error_does_not_leak_to_output_or_debug(recovery, monkeypatch, capsys, caplog, http_error):
++    import io
++    import logging
++    import urllib.error
++    import urllib.request
++    from agent import anthropic_credentials as anthropic
++    from hermes_cli import auth_reauth_command as command
++    path, args = recovery
++    monkeypatch.setattr(sys.stdout, 'isatty', lambda: True)
++    monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
++    monkeypatch.setattr('builtins.input', lambda prompt: 'replace')
++    monkeypatch.setattr(command.getpass, 'getpass', lambda prompt: 'fixture-code#fixture-state')
++    monkeypatch.setattr(anthropic.secrets, 'token_urlsafe', lambda n: 'fixture-state')
++    monkeypatch.setattr(auth, '_can_open_graphical_browser', lambda: False)
++    caplog.set_level(logging.DEBUG, logger=anthropic.logger.name)
++    sentinel = 'fixture-sensitive-response'
++
++    def fail(*args, **kwargs):
++        if http_error:
++            body = json.dumps({'error': 'invalid_grant', 'error_description': sentinel}).encode()
++            raise urllib.error.HTTPError('https://example.com', 400, sentinel, {}, io.BytesIO(body))
++        raise OSError(sentinel)
++
++    monkeypatch.setattr(urllib.request, 'urlopen', fail)
++    before = path.read_bytes()
++    args.func(args)
++    assert path.read_bytes() == before
++    assert sentinel not in caplog.text + capsys.readouterr().out
++
++
++def test_no_echo_fallback_is_refused(monkeypatch):
++    import warnings
++    from hermes_cli import auth_reauth_command as command
++
++    def unavailable(prompt):
++        warnings.warn('echo unavailable', command.getpass.GetPassWarning)
++        pytest.fail('warning must raise before reading an unmasked secret')
++
++    monkeypatch.setattr(command.getpass, 'getpass', unavailable)
++    with pytest.raises(command.getpass.GetPassWarning):
++        command._secret_code('Code: ')
+diff --git a/tests/hermes_cli/test_auth_reauth_target.py b/tests/hermes_cli/test_auth_reauth_target.py
+new file mode 100644
+index 0000000000..58796c4f5b
+--- /dev/null
++++ b/tests/hermes_cli/test_auth_reauth_target.py
+@@ -0,0 +1,168 @@
++"""Selected recovery replaces one owned row, never adds or guesses an identity."""
++import base64
++import json
++
++import pytest
++
++from hermes_cli import auth
++
++
++@pytest.fixture
++def store(tmp_path, monkeypatch):
++    path = tmp_path / 'auth.json'
++    monkeypatch.setattr(auth, '_auth_file_path', lambda: path)
++    row = dict(id='selected', source='manual:hermes_pkce', auth_type='oauth',
++               label='Example', priority=3, access_token='fixture-old',
++               refresh_token='fixture-refresh', last_status='dead',
++               last_error_code=401, last_error_reason='auth', last_error_message='expired', last_error_reset_at=123)
++    payload = dict(providers={}, credential_pool={'anthropic': [row]})
++    path.write_text(json.dumps(payload))
++    return path
++
++
++def test_replacement_preserves_selected_row_without_duplicate(store):
++    from hermes_cli.auth_reauth_target import commit_reauth, prepare_reauth
++    target = prepare_reauth('anthropic', 'selected')
++    result = commit_reauth(target, {'access_token': 'fixture-new', 'refresh_token': 'fixture-new-refresh'},
++                           allow_unverified_identity=True)
++    rows = json.loads(store.read_text())['credential_pool']['anthropic']
++    assert len(rows) == 1
++    assert rows[0]['id'] == 'selected'
++    assert rows[0]['label'] == 'Example'
++    assert rows[0]['priority'] == 3
++    assert rows[0]['access_token'] == 'fixture-new'
++    assert rows[0].get('last_status') is None
++    assert not any(key.startswith('last_error') for key in rows[0])
++    assert result.identity_verified is False
++    assert result.credential_id == 'selected'
++
++
++@pytest.mark.parametrize('change', ['delete', 'rotate', 'disable', 'source', 'other_home'])
++def test_changed_target_refuses_without_write(store, monkeypatch, change):
++    from hermes_cli.auth_reauth_target import ReauthConflict, commit_reauth, prepare_reauth
++    from agent import credential_pool_disabled as disabled
++    target = prepare_reauth('anthropic', 'selected')
++    data = json.loads(store.read_text())
++    row = data['credential_pool']['anthropic'][0]
++    mutations = {
++        'delete': lambda: data['credential_pool'].update(anthropic=[]),
++        'rotate': lambda: row.update(access_token='fixture-peer'),
++        'source': lambda: row.update(source='claude_code'),
++        'disable': lambda: monkeypatch.setattr(disabled, 'is_credential_disabled', lambda *args: True),
++        'other_home': lambda: monkeypatch.setattr(auth, '_auth_file_path', lambda: store.parent / 'other.json'),
++    }
++    mutations[change]()
++    store.write_text(json.dumps(data))
++    before = store.read_bytes()
++    with pytest.raises(ReauthConflict):
++        commit_reauth(target, {'access_token': 'fixture-new', 'refresh_token': 'fixture-new-refresh'},
++                      allow_unverified_identity=True)
++    assert store.read_bytes() == before
++
++
++@pytest.mark.parametrize('source', ['claude_code', 'env:EXAMPLE_TOKEN', 'device_code', 'manual:unknown'])
++def test_unowned_or_unknown_sources_are_not_copied(store, source):
++    from hermes_cli.auth_reauth_target import ReauthConflict, prepare_reauth
++    data = json.loads(store.read_text())
++    data['credential_pool']['anthropic'][0]['source'] = source
++    store.write_text(json.dumps(data))
++    before = store.read_bytes()
++    with pytest.raises(ReauthConflict):
++        prepare_reauth('anthropic', 'selected')
++    assert store.read_bytes() == before
++
++
++def test_unknown_identity_requires_explicit_replacement(store):
++    from hermes_cli.auth_reauth_target import ReauthConflict, commit_reauth, prepare_reauth
++    target = prepare_reauth('anthropic', 'selected')
++    before = store.read_bytes()
++    with pytest.raises(ReauthConflict):
++        commit_reauth(target, {'access_token': 'fixture-new', 'refresh_token': 'fixture-new-refresh'})
++    assert store.read_bytes() == before
++
++
++def test_other_rows_and_metadata_survive(store):
++    from hermes_cli.auth_reauth_target import commit_reauth, prepare_reauth
++    target = prepare_reauth('anthropic', 'selected')
++    data = json.loads(store.read_text())
++    other = dict(id='other', source='manual:hermes_pkce', access_token='fixture-peer')
++    data['credential_pool']['anthropic'].append(other)
++    data['unrelated'] = {'keep': True}
++    store.write_text(json.dumps(data))
++    commit_reauth(target, {'access_token': 'fixture-new', 'refresh_token': 'fixture-new-refresh'},
++                  allow_unverified_identity=True)
++    saved = json.loads(store.read_text())
++    assert saved['credential_pool']['anthropic'][1] == other
++    assert saved['unrelated'] == {'keep': True}
++
++
++def test_target_repr_does_not_disclose_credentials(store):
++    from hermes_cli.auth_reauth_target import prepare_reauth
++    target = prepare_reauth('anthropic', 'selected')
++    assert 'fixture-old' not in repr(target)
++    assert 'fixture-refresh' not in repr(target)
++
++
++def _jwt(account, subject, nonce):
++    claims = {'https://api.openai.com/auth': {'chatgpt_account_id': account}, 'sub': subject, 'nonce': nonce}
++    return 'fixture.' + base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip('=') + '.fixture'
++
++
++@pytest.mark.parametrize('account,subject,accepted', [
++    ('workspace-a', 'subject-a', True), ('workspace-b', 'subject-a', False),
++    ('workspace-a', 'subject-b', False), ('', 'subject-a', False)])
++def test_codex_principal_and_workspace_must_both_match(store, account, subject, accepted):
++    from hermes_cli.auth_reauth_target import ReauthConflict, commit_reauth, prepare_reauth
++    row = json.loads(store.read_text())['credential_pool']['anthropic'][0]
++    row.update(source='manual:device_code', access_token=_jwt('workspace-a', 'subject-a', 'old'))
++    store.write_text(json.dumps({'providers': {}, 'credential_pool': {'openai-codex': [row]}}))
++    target = prepare_reauth('openai-codex', 'selected')
++    grant = {'access_token': _jwt(account, subject, 'new'), 'refresh_token': 'fixture-new-refresh'}
++    before = store.read_bytes()
++    if accepted:
++        assert commit_reauth(target, grant).identity_verified is True
++        saved = json.loads(store.read_text())['credential_pool']['openai-codex']
++        assert len(saved) == 1 and saved[0]['id'] == 'selected'
++    else:
++        with pytest.raises(ReauthConflict):
++            commit_reauth(target, grant, allow_unverified_identity=True)
++        assert store.read_bytes() == before
++
++
++@pytest.mark.parametrize('grant', [{}, {'access_token': 'fixture-new'},
++                                  {'access_token': '', 'refresh_token': 'fixture-refresh'}])
++def test_incomplete_grant_does_not_write(store, grant):
++    from hermes_cli.auth_reauth_target import ReauthConflict, commit_reauth, prepare_reauth
++    target = prepare_reauth('anthropic', 'selected')
++    before = store.read_bytes()
++    with pytest.raises(ReauthConflict):
++        commit_reauth(target, grant, allow_unverified_identity=True)
++    assert store.read_bytes() == before
++
++
++def test_incoming_disabled_grant_is_refused_before_save(store, monkeypatch):
++    from hermes_cli.auth_reauth_target import ReauthConflict, commit_reauth, prepare_reauth
++    from agent import credential_pool_disabled as disabled
++    target = prepare_reauth('anthropic', 'selected')
++    monkeypatch.setattr(disabled, 'is_credential_disabled',
++                        lambda provider, row: row.access_token == 'fixture-disabled')
++    before = store.read_bytes()
++    with pytest.raises(ReauthConflict):
++        commit_reauth(target, {'access_token': 'fixture-disabled', 'refresh_token': 'fixture-new-refresh'},
++                      allow_unverified_identity=True)
++    assert store.read_bytes() == before
++
++
++def test_committed_target_is_single_use_and_grant_cannot_edit_metadata(store):
++    from hermes_cli.auth_reauth_target import ReauthConflict, commit_reauth, prepare_reauth
++    target = prepare_reauth('anthropic', 'selected')
++    grant = dict(access_token='fixture-new', refresh_token='fixture-refresh-new',
++                 id='injected', label='injected', source='env:INJECTED', priority=0)
++    commit_reauth(target, grant, allow_unverified_identity=True)
++    before = store.read_bytes()
++    with pytest.raises(ReauthConflict):
++        commit_reauth(target, grant, allow_unverified_identity=True)
++    assert store.read_bytes() == before
++    row = json.loads(before)['credential_pool']['anthropic'][0]
++    assert (row['id'], row['label'], row['source'], row['priority']) == (
++        'selected', 'Example', 'manual:hermes_pkce', 3)
+diff --git a/website/docs/user-guide/selected-account-recovery.md b/website/docs/user-guide/selected-account-recovery.md
+new file mode 100644
+index 0000000000..0a47e6c878
+--- /dev/null
++++ b/website/docs/user-guide/selected-account-recovery.md
+@@ -0,0 +1,11 @@
++# Selected OAuth credential recovery
++
++`hermes auth reauth PROVIDER CREDENTIAL_ID` is an interactive recovery command for an exact locally owned credential-pool ID. Unlike `auth add`, it replaces that row instead of appending a second account. It accepts `anthropic` and `openai-codex`; labels and list indexes are not accepted as identifiers.
++
++This initial command supports Anthropic `manual:hermes_pkce` and Codex `manual:device_code` / `manual:loopback_pkce` sources only. Borrowed credentials, environment tokens, singleton `device_code` rows and external credential stores are refused rather than copied into the current profile. It does not implement Desktop recovery launch or gateway routing.
++
++The selected row must still exist, be enabled, and be unchanged when login finishes. Its ID, label, priority and unrelated metadata are preserved. Login runs without holding the auth-store lock; a concurrent deletion or edit prevents replacement. A Codex login must match both the stored account/workspace and subject. Legacy Anthropic grants lack a verifiable principal, so the terminal requires explicit replacement confirmation and reports identity as unverified, never as a confirmed same-account reconnect.
++
++Anthropic authorization-code input is masked; if terminal echo cannot be disabled, recovery stops rather than reading an unmasked code. Do not run this in an agent-readable or recorded terminal. A future Desktop recovery surface must provide a private terminal and bind the owning gateway and profile explicitly; this command alone does not provide that transport.
++
++The completion message confirms credential persistence, not provider health. Refresh and verify account health separately. If interrupted during persistence, the command reports an unverified outcome rather than claiming no change occurred.
+-- 
+2.43.0
+

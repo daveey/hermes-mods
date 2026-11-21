@@ -1,0 +1,409 @@
+From 9f85b5268c570ba56a85999e6bfe8761d0d19b9d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 03:10:20 +0000
+Subject: [PATCH] [daveey] Recover update-held prompts after refused retries
+ and live-writer handoff
+
+The queue retry chain depended on drain scheduling its own successor. A transient retirement refusal or another false drain result stranded the prompt while startup recovery deferred to its still-live writer. Keep idle retries alive, sweep own queues before code-skew deferral, and release orphaned or permanently retired queue custody with marker identity fencing. Exclude queued markers from running outcomes; suppress superseded replay and warn on a queue stuck after hold lift.
+
+Proof: new regression file failed 4 cases before the fix. 12 regression tests now pass; 148 existing focused and consumer tests pass. scripts/check --base origin/main: all 21 checks pass.
+---
+ hermes_cli/backend_retirement.py              |   5 +
+ hermes_state_outcome.py                       |   4 +-
+ .../tui_gateway/test_update_queue_recovery.py | 150 ++++++++++++++++++
+ tui_gateway/admission_retry.py                |  88 +++++++++-
+ tui_gateway/session_auto_continue.py          |   7 +
+ tui_gateway/startup_resume.py                 |   5 +
+ tui_gateway/turn_marker.py                    |  18 +++
+ 7 files changed, 268 insertions(+), 9 deletions(-)
+ create mode 100644 tests/tui_gateway/test_update_queue_recovery.py
+
+diff --git a/hermes_cli/backend_retirement.py b/hermes_cli/backend_retirement.py
+index 0832ec1c97..88ec61ebb0 100644
+--- a/hermes_cli/backend_retirement.py
++++ b/hermes_cli/backend_retirement.py
+@@ -237,6 +237,11 @@ class RetirementFence:
+         with self._lock:
+             return self._active
+ 
++    def retired(self):
++        """Committed retirement is permanent; prepare alone is reversible."""
++        with self._lock:
++            return self._committed
++
+     def retiring(self):
+         """A retirement is preparing or holds a live/committed permit: admission is closed or closing."""
+         with self._lock:
+diff --git a/hermes_state_outcome.py b/hermes_state_outcome.py
+index 40ce37b3ff..dc4b385961 100644
+--- a/hermes_state_outcome.py
++++ b/hermes_state_outcome.py
+@@ -253,11 +253,11 @@ def _live_turn(db: Any, sid: str, concluding: frozenset[str] = frozenset()) -> b
+ 
+ def _live_turn_tokens(db: Any, sid: str) -> Iterator[str]:
+     """Identity token of each live-turn evidence, lazily (``_live_turn`` stops at the first foreign one)."""
+-    from tui_gateway.turn_marker import marker_writer_state, read_turn_marker
++    from tui_gateway.turn_marker import UPDATE_HOLD_QUEUE_REASON, marker_writer_state, read_turn_marker
+ 
+     home = Path(db.db_path).parent
+     marker = read_turn_marker(home, sid)
+-    if marker and marker_writer_state(marker) == "alive":
++    if marker and marker.get("reason") != UPDATE_HOLD_QUEUE_REASON and marker_writer_state(marker) == "alive":
+         yield marker_identity(marker)
+     owner = _guarded("durable turn", sid, lambda: _durable_turn_owner(db, sid), None)
+     if owner is not None:
+diff --git a/tests/tui_gateway/test_update_queue_recovery.py b/tests/tui_gateway/test_update_queue_recovery.py
+new file mode 100644
+index 0000000000..04cae02bd6
+--- /dev/null
++++ b/tests/tui_gateway/test_update_queue_recovery.py
+@@ -0,0 +1,150 @@
++"""Recovery of idle update queues is independent of their original retry chain."""
++import os
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import admission_fence as af, backend_retirement
++from tui_gateway import admission_retry, server, startup_resume, turn_marker
++
++
++@pytest.mark.parametrize("refusal", ["retirement", "other"])
++def test_retry_survives_one_refused_attempt(tmp_path, monkeypatch, refusal):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    fence = backend_retirement.RetirementFence()
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    timers = []
++
++    class Timer:
++        def __init__(self, delay, target):
++            self.target = target
++        def start(self):
++            timers.append(self)
++
++    monkeypatch.setattr(admission_retry.threading, "Timer", Timer)
++    queued = {"text": "kept", "queued_reason": "core_update"}
++    session = {"profile_home": str(tmp_path), "history_lock": threading.RLock(),
++               "running": False, "queued_prompt": queued}
++    dispatched = []
++
++    def dispatch(rid, sid, record, envelope, generation):
++        dispatched.append(envelope)
++        record["running"] = False
++        server._clear_inflight_turn(record)
++        return True
++
++    monkeypatch.setattr(server, "_dispatch_claimed_queue", dispatch)
++    af.set_hold(tmp_path)
++    assert server._drain_queued_prompt("r", "s", session)
++    if refusal == "retirement":
++        with monkeypatch.context() as patch:
++            patch.setattr(fence, "acquire", lambda: False)
++            timers.pop(0).target()
++    else:
++        with monkeypatch.context() as patch:
++            patch.setattr(server, "_drain_queued_prompt", lambda *args: False)
++            timers.pop(0).target()
++    af.clear_hold(tmp_path)
++    assert len(timers) == 1, "one refusal must not terminate the retry chain"
++    timers.pop(0).target()
++    assert dispatched == [queued]
++    assert not timers
++    assert not session.get("queued_prompt")
++
++
++def test_update_queue_is_not_a_live_turn(tmp_path, monkeypatch):
++    import hermes_state_outcome as outcome
++    db = SimpleNamespace(db_path=tmp_path / "state.db")
++    monkeypatch.setattr(outcome, "_durable_turn_owner", lambda *args: None)
++    monkeypatch.setattr(outcome, "_gateway_turn_tokens", lambda *args: iter(()))
++    assert turn_marker.record_turn_start(tmp_path, "chat", "pending", reason="update_hold_queue")
++    assert list(outcome._live_turn_tokens(db, "chat")) == []
++    assert turn_marker.record_turn_start(tmp_path, "chat", "started")
++    assert len(list(outcome._live_turn_tokens(db, "chat"))) == 1
++
++
++def test_orphan_queue_handoff_with_live_writer(tmp_path, monkeypatch):
++    assert turn_marker.record_turn_start(tmp_path, "chat", "pending", reason="update_hold_queue")
++    monkeypatch.setattr(server, "_sessions", {})
++    admission_retry.redrive_update_queues(tmp_path)
++    marker = turn_marker.read_turn_marker(tmp_path, "chat")
++    assert marker["writer_pid"] == os.getpid()
++    assert turn_marker.marker_writer_state(marker) == "dead"
++    pending = startup_resume.pending_resumes(tmp_path, {}, log_skips=False)
++    assert [row["session_key"] for row in pending] == ["chat"]
++
++
++@pytest.mark.parametrize("running", [False, True])
++def test_sweep_rearms_only_idle_owned_queue(tmp_path, monkeypatch, running):
++    assert turn_marker.record_turn_start(tmp_path, "chat", "pending", reason="update_hold_queue")
++    session = {"session_key": "chat", "profile_home": str(tmp_path),
++               "history_lock": threading.RLock(), "running": running,
++               "queued_prompt": {"text": "pending", "queued_reason": "core_update"}}
++    monkeypatch.setattr(server, "_sessions", {"s": session})
++    called = []
++    monkeypatch.setattr(admission_retry, "retry_queued_prompt", lambda *a: called.append(a))
++    admission_retry.redrive_update_queues(tmp_path)
++    assert len(called) == (0 if running else 1)
++    assert turn_marker.marker_writer_state(turn_marker.read_turn_marker(tmp_path, "chat")) == "alive"
++
++
++def test_committed_retirement_hands_queue_to_startup(tmp_path, monkeypatch):
++    fence = backend_retirement.RetirementFence()
++    from hermes_cli import web_server_idle_proof
++    monkeypatch.setattr(web_server_idle_proof, "idle_proof", lambda: {"idle": True})
++    monkeypatch.setattr(backend_retirement, "retirement", fence)
++    assert turn_marker.record_turn_start(tmp_path, "chat", "pending", reason="update_hold_queue")
++    session = {"session_key": "chat", "profile_home": str(tmp_path),
++               "history_lock": threading.RLock(), "queued_prompt": {"text": "pending", "queued_reason": "core_update"}}
++    token = fence.prepare()["token"]
++    assert not fence.retired()
++    assert fence.commit(token)["ok"]
++    assert fence.retired()
++    assert admission_retry.retry_queued_prompt("r", "s", session) is False
++    assert not session.get("_admission_retry")
++    assert startup_resume.pending_resumes(tmp_path, {}, log_skips=False)[0]["session_key"] == "chat"
++
++
++@pytest.mark.parametrize("reason,pid,stale", [(None, None, False), ("update_hold_queue", -1, False),
++                                               ("update_hold_queue", None, True)])
++def test_release_fences_marker_identity(tmp_path, reason, pid, stale):
++    assert turn_marker.record_turn_start(tmp_path, "chat", "pending", reason=reason)
++    marker = turn_marker.read_turn_marker(tmp_path, "chat")
++    if pid is not None:
++        turn_marker._update(tmp_path, "chat", lambda entries: {"chat": {**entries["chat"], "writer_pid": pid}}, "fixture")
++    if stale:
++        marker["started_at"] -= 1
++    assert not turn_marker.release_update_queue(tmp_path, "chat", marker)
++    assert not turn_marker.read_turn_marker(tmp_path, "chat").get("queue_released")
++
++
++def test_newer_user_activity_suppresses_replay(tmp_path, monkeypatch):
++    from tui_gateway import update_pause
++    assert turn_marker.record_turn_start(tmp_path, "chat", "pending", reason="update_hold_queue")
++    session = {"session_key": "chat", "profile_home": str(tmp_path), "history_lock": threading.RLock()}
++    monkeypatch.setattr(update_pause, "later_turns_since", lambda *a: 1)
++    assert server._maybe_schedule_auto_continue("s", session, "chat") is None
++    assert turn_marker.read_turn_marker(tmp_path, "chat") is None
++
++
++def test_stranded_warning_is_once_per_hold_lift(monkeypatch, caplog):
++    session = {"queued_prompt": {"queued_reason": "core_update"}}
++    clock = [10.0]
++    held = [None]
++    monkeypatch.setattr(admission_retry.time, "monotonic", lambda: clock[0])
++    monkeypatch.setattr(backend_retirement, "update_hold_started_at", lambda *a: held[0])
++    admission_retry._warn_stranded_queue("s", session)
++    clock[0] += 59
++    admission_retry._warn_stranded_queue("s", session)
++    assert not caplog.records
++    clock[0] += 1
++    admission_retry._warn_stranded_queue("s", session)
++    admission_retry._warn_stranded_queue("s", session)
++    assert len(caplog.records) == 1
++    assert "60s after hold lift" in caplog.text
++    held[0] = 100.0
++    admission_retry._warn_stranded_queue("s", session)
++    assert "_queue_unheld" not in session
++
++
+diff --git a/tui_gateway/admission_retry.py b/tui_gateway/admission_retry.py
+index f4805a4ddc..f8002005a5 100644
+--- a/tui_gateway/admission_retry.py
++++ b/tui_gateway/admission_retry.py
+@@ -1,5 +1,26 @@
+ """Retry durable queued prompts after an update hold or transient contention."""
++import logging
+ import threading
++import time
++
++
++def _warn_stranded_queue(sid, session):
++    from hermes_cli.backend_retirement import last_refusal, update_hold_started_at
++    head = session.get("queued_prompt") or {}
++    if head.get("queued_reason") != "core_update":
++        return
++    if update_hold_started_at(session.get("profile_home") or None) is not None:
++        session.pop("_queue_unheld", None)
++        return
++    now = time.monotonic()
++    observed = session.get("_queue_unheld")
++    if observed is None or observed[0] is not head:
++        observed = session["_queue_unheld"] = [head, now, False]
++    if not observed[2] and now - observed[1] >= 60:
++        observed[2] = True
++        logging.getLogger(__name__).warning(
++            "update-hold queue for session %s remains unadmitted 60s after hold lift (refusal=%s)",
++            sid, last_refusal())
+ 
+ 
+ def retry_queued_prompt(rid, sid, session):
+@@ -9,13 +30,20 @@ def retry_queued_prompt(rid, sid, session):
+     Backend shutdown/Stop may discard the queue; the callback checks it afresh.
+     """
+     from hermes_cli.backend_retirement import retirement
+-    # Retirement refusal keeps its original semantics: the client is replacing
+-    # this process, not waiting for an update hold/short filesystem contention.
+-    if not retirement.acquire():
+-        return False
+-    retirement.release()
+     if session.get("_closing") or session.get("_finalized") or not session.get("queued_prompt"):
+         return False
++    from tui_gateway import server
++    _warn_stranded_queue(sid, session)
++    if retirement.acquire():
++        retirement.release()
++    elif not server._update_held_queue(session):
++        return False  # non-update queues retain the retirement refusal contract
++    if retirement.retired():
++        from tui_gateway.turn_marker import read_turn_marker, release_update_queue
++        home, key = server._session_home(session), session.get("session_key")
++        if key and (marker := read_turn_marker(home, key)):
++            release_update_queue(home, key, marker)
++        return False
+     if session.get("_admission_retry") is not None:
+         return True
+ 
+@@ -23,9 +51,18 @@ def retry_queued_prompt(rid, sid, session):
+         from tui_gateway import server
+         with session["history_lock"]:
+             session.pop("_admission_retry", None)
+-            if session.get("_closing") or session.get("_finalized") or not session.get("queued_prompt"):
++            if (session.get("_closing") or session.get("_finalized") or session.get("running")
++                    or not session.get("queued_prompt")):
+                 return
+-        server._drain_queued_prompt(rid, sid, session)
++        try:
++            server._drain_queued_prompt(rid, sid, session)
++        finally:
++            # Admission can refuse without scheduling another attempt (retirement,
++            # a racing running turn, or another caller's guard). Queue custody,
++            # not the refusal reason, owns this retry chain.
++            with session["history_lock"]:
++                if not session.get("running"):
++                    retry_queued_prompt(rid, sid, session)
+ 
+     timer = threading.Timer(0.25, retry)
+     timer.daemon = True
+@@ -36,3 +73,40 @@ def retry_queued_prompt(rid, sid, session):
+         session.pop("_admission_retry", None)
+         raise
+     return True
++
++
++def redrive_update_queues(home):
++    """Restart lost timers and release orphaned custody, even on an old backend.
++
++    Resume serialization prevents adoption between the inventory and release.
++    A live PID without a live queue must not indefinitely block startup replay.
++    """
++    import os
++    from pathlib import Path
++    from tui_gateway import server
++    from tui_gateway.turn_marker import (
++        UPDATE_HOLD_QUEUE_REASON, _load, _marker_path, release_update_queue,
++    )
++
++    home = Path(home)
++    with server._session_resume_lock:
++        with server._sessions_lock:
++            sessions = list(server._sessions.items())
++        for key, marker in _load(_marker_path(home)).items():
++            if (marker.get("reason") != UPDATE_HOLD_QUEUE_REASON
++                    or marker.get("writer_pid") != os.getpid() or marker.get("queue_released")):
++                continue
++            owned = [(sid, session) for sid, session in sessions
++                     if session.get("session_key") == key and Path(server._session_home(session)) == home]
++            if not owned:
++                release_update_queue(home, key, marker)
++                continue
++            for sid, session in owned:
++                with session["history_lock"]:
++                    if session.get("running"):
++                        continue  # head already claimed, marker not yet restamped
++                    if session.get("queued_prompt") and not (session.get("_closing") or session.get("_finalized")):
++                        retry_queued_prompt("__update_queue__", sid, session)
++                    else:
++                        release_update_queue(home, key, marker)
++
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index 7078dc900b..cf1d00c301 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -241,6 +241,13 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) ->
+     if not enabled or age > max_age or marker["attempts"] >= max_attempts:
+         clear_turn_marker(home, session_key)  # stale/disabled/crash-looping: a manual message continues
+         return None
++    if marker.get("reason") == UPDATE_HOLD_QUEUE_REASON:
++        from tui_gateway.update_pause import later_turns_since
++        if (later_turns_since(session, session_key, marker.get("started_at"), marker.get("prompt")) or 0) > 0:
++            from hermes_state_outcome import turn_identity
++            clear_turn_marker(home, session_key, concluding_turn=turn_identity(marker=marker))
++            logger.info("update-hold queue for %s superseded by newer user activity; not replayed", session_key)
++            return None
+     with session["history_lock"]:
+         if (session.get("_auto_continue_scheduled")
+                 or (marker.get("reason") == "core_update_pause" and session.get("running"))
+diff --git a/tui_gateway/startup_resume.py b/tui_gateway/startup_resume.py
+index dee54b38cb..f05503829b 100644
+--- a/tui_gateway/startup_resume.py
++++ b/tui_gateway/startup_resume.py
+@@ -193,6 +193,11 @@ def _observe_pauses(handler: Callable, home: Path, cfg: dict, stopped: threading
+             from hermes_cli.config import load_config
+ 
+             cfg = load_config()
++            # Old writers still own their in-memory queues after a checkout swap.
++            # Repair them before the code-skew guard defers marker adoption.
++            from tui_gateway.admission_retry import redrive_update_queues
++            for _, profile_home in _homes(home):
++                redrive_update_queues(profile_home)
+             if not _settings(cfg)[0] or detect_code_skew() is not None:
+                 retry_delay = 30.0
+                 continue
+diff --git a/tui_gateway/turn_marker.py b/tui_gateway/turn_marker.py
+index 2c7d8b576b..c2333d3e2b 100644
+--- a/tui_gateway/turn_marker.py
++++ b/tui_gateway/turn_marker.py
+@@ -123,6 +123,8 @@ def marker_writer_state(entry: dict) -> str:
+     """
+     if not isinstance(entry, dict):
+         return "unknown"
++    if entry.get("reason") == UPDATE_HOLD_QUEUE_REASON and entry.get("queue_released") is True:
++        return "dead"  # explicit queue-custody handoff, not process death
+     pid = entry.get("writer_pid")
+     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+         return "unknown"
+@@ -174,6 +176,21 @@ def _update(home: Path | str, session_key: str, mutate, what: str) -> bool:
+     return False
+ 
+ 
++def release_update_queue(home: Path | str, session_key: str, marker: dict) -> bool:
++    """Release only this process's unchanged idle queue marker for another backend."""
++    def mutate(entries):
++        entry = entries.get(session_key)
++        if (not isinstance(entry, dict) or entry.get("reason") != UPDATE_HOLD_QUEUE_REASON
++                or entry.get("writer_pid") != os.getpid()
++                or entry.get("started_at") != marker.get("started_at")
++                or entry.get("queue_released")):
++            return None
++        entry["queue_released"] = True
++        return entries
++
++    return _update(home, session_key, mutate, "release queued prompt")
++
++
+ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attempts: int = 0,
+                       auto_continue: bool = True, notification_category: str | None = None,
+                       pauses: int = 0, killed_jobs: list | None = None, until_tool: bool = False,
+@@ -439,6 +456,7 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
+                 "pauses": max(0, int(entry.get("pauses") or 0)),
+                 # Writer identity when present: extra keys only, so a marker written by an older build still reads.
+                 **{k: entry[k] for k in ("writer_pid", "writer_start_time") if entry.get(k) is not None},
++                **({"queue_released": True} if entry.get("queue_released") is True else {}),
+                 **({"reason": str(entry["reason"])} if entry.get("reason") else {}),
+                 **({"parked_at": float(entry["parked_at"])} if entry.get("parked_at") else {}),
+                 **({"paused_at": float(entry["paused_at"])} if entry.get("paused_at") else {}),
+-- 
+2.43.0
+

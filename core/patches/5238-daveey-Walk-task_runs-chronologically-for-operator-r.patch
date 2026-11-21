@@ -1,0 +1,104 @@
+From 10f92fef0ed97b9b3e486237e3841bb73844aee6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:37:30 +0000
+Subject: [PATCH] [daveey] Walk task_runs chronologically for operator-resume
+ receipts
+
+Why: on a worker replica local task_runs ids are not chronological (the checkpoint
+run was id 654 while older runs held 655..668). `_still_current`, `_latest_run` and
+`latest_run_skipping_requeues` walked `ORDER BY id DESC`, so an older real run with a
+higher id spent a valid receipt; the hub accepted it but every worker dispatch kept
+the active_pr guard.
+
+Fix: order by `COALESCE(started_at, 0) DESC, id DESC` in all three. Run-uid identity
+match, the active_pr guard, operator-only lineage and one_continuation scope are
+unchanged; legacy boards (ids chronological) behave as before.
+
+Proof: new regression (older real run with a higher id + core-update requeue) is red
+without the change and green with it; a genuinely newer run still spends the receipt.
+18 consumer test files, 315 tests pass.
+---
+ hermes_cli/kanban_core_update_requeue.py      |  4 ++-
+ hermes_cli/kanban_operator_resume.py          |  8 +++---
+ .../test_kanban_operator_resume_requeue.py    | 27 +++++++++++++++++++
+ 3 files changed, 35 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_core_update_requeue.py b/hermes_cli/kanban_core_update_requeue.py
+index 7cd538295b..a9830061b8 100644
+--- a/hermes_cli/kanban_core_update_requeue.py
++++ b/hermes_cli/kanban_core_update_requeue.py
+@@ -120,7 +120,9 @@ def latest_run_skipping_requeues(conn: sqlite3.Connection, task_id: str):
+     """Latest run, passing over core-update requeues and attested unused grants.
+ 
+     Any run that started, failed or lacks the unused-grant receipt still counts."""
+-    rows = conn.execute("SELECT * FROM task_runs WHERE task_id = ? ORDER BY id DESC", (task_id,))
++    # Chronological, not by local id: replica run ids are not time-ordered.
++    rows = conn.execute("SELECT * FROM task_runs WHERE task_id = ? ORDER BY COALESCE(started_at, 0) DESC, id DESC",
++                        (task_id,))
+     return next((run for run in rows if not _skipped(conn, run)), None)
+ 
+ 
+diff --git a/hermes_cli/kanban_operator_resume.py b/hermes_cli/kanban_operator_resume.py
+index 89d3fb40dd..965ddde4ac 100644
+--- a/hermes_cli/kanban_operator_resume.py
++++ b/hermes_cli/kanban_operator_resume.py
+@@ -33,8 +33,9 @@ def worker_lineage() -> str | None:
+ 
+ 
+ def _latest_run(conn, task_id):
+-    return conn.execute("SELECT * FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+-                        (task_id,)).fetchone()
++    # Chronological, not by local id: replica run ids are not time-ordered.
++    return conn.execute("SELECT * FROM task_runs WHERE task_id = ? "
++                        "ORDER BY COALESCE(started_at, 0) DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+ 
+ 
+ def _identity(run):
+@@ -95,7 +96,8 @@ def _still_current(conn, task_id, after) -> bool:
+     from hermes_cli.kanban_core_update_requeue import _skipped
+     from hermes_cli.kanban_dependency_review import _checkpoint_matches_run
+ 
+-    for run in conn.execute("SELECT * FROM task_runs WHERE task_id = ? ORDER BY id DESC", (task_id,)):
++    for run in conn.execute("SELECT * FROM task_runs WHERE task_id = ? "
++                            "ORDER BY COALESCE(started_at, 0) DESC, id DESC", (task_id,)):
+         if isinstance(after, dict) and _checkpoint_matches_run(after, run):
+             return True
+         if not _skipped(conn, run):
+diff --git a/tests/hermes_cli/test_kanban_operator_resume_requeue.py b/tests/hermes_cli/test_kanban_operator_resume_requeue.py
+index c12a2c4762..0901f8d8f4 100644
+--- a/tests/hermes_cli/test_kanban_operator_resume_requeue.py
++++ b/tests/hermes_cli/test_kanban_operator_resume_requeue.py
+@@ -80,3 +80,30 @@ def test_crash_or_other_reclaim_spends_the_receipt(kanban_home, clock, reason, c
+     tid = _resumed(clock)
+     _run(clock, tid, reason, crashed=crashed)
+     assert _guard(tid) == "active_pr"
++
++
++def _older_run_with_higher_id(tid, outcome="blocked"):
++    """A replica row: id above the checkpoint run's, but started before it."""
++    with kbc.connect_closing() as conn:
++        first = conn.execute("SELECT * FROM task_runs WHERE task_id=? ORDER BY id LIMIT 1", (tid,)).fetchone()
++        cols = [c for c in first.keys() if c != "id"]
++        row = {c: first[c] for c in cols}
++        row.update(started_at=first["started_at"] - 100, ended_at=first["started_at"] - 50, outcome=outcome)
++        if "uid" in row:
++            row["uid"] = "01a1f925-0000-7000-8000-000000000001"
++        with kb.write_txn(conn):
++            conn.execute(f"INSERT INTO task_runs ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
++                         [row[c] for c in cols])
++
++
++def test_receipt_survives_replica_run_ids_that_are_not_chronological(kanban_home, clock):
++    tid = _resumed(clock)
++    _run(clock, tid, CORE_UPDATE_REQUEUE_REASON)  # a pause after the checkpoint run
++    _older_run_with_higher_id(tid)  # replica: older real run, highest id
++    with kbc.connect_closing() as conn:
++        by_id = conn.execute("SELECT outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
++                             (tid,)).fetchone()
++        assert by_id["outcome"] == "blocked"  # the pre-fix walk would stop here
++    assert _guard(tid) is None
++    _run(clock, tid, "worker crashed")  # a genuinely newer run still spends it
++    assert _guard(tid) == "active_pr"
+-- 
+2.43.0
+

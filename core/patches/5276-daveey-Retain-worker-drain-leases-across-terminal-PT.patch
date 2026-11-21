@@ -1,0 +1,976 @@
+From ffacf479bb0cca13202f9549c59480203c33c91a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 19:36:51 +0000
+Subject: [PATCH] [daveey] Retain worker drain leases across terminal, PTY and
+ reservation lifetimes; refuse incomplete census zeros
+
+---
+ cron/scheduler_tick.py                        |   7 +-
+ hermes_cli/admission_fence.py                 |  13 ++
+ hermes_cli/backend_retirement.py              |   3 +
+ hermes_cli/process_identity.py                |   7 +-
+ hermes_cli/pty_bridge.py                      |  21 ++-
+ hermes_cli/worker_drain_census.py             |  77 +++++-----
+ hermes_cli/worker_drain_fence.py              |  87 +++++++++--
+ tests/hermes_cli/test_worker_drain_census.py  |  68 ++++++---
+ tests/hermes_cli/test_worker_drain_fence.py   |  12 ++
+ .../test_worker_drain_launch_lifetime.py      | 137 ++++++++++++++++++
+ tests/tools/test_worker_drain_reservations.py |  90 ++++++++++++
+ tools/environments/base_output.py             |   3 +-
+ tools/environments/local.py                   |   3 +-
+ tools/process_registry_ownership.py           |   3 +-
+ tui_gateway/turn_admission.py                 |  37 ++++-
+ 15 files changed, 470 insertions(+), 98 deletions(-)
+ create mode 100644 tests/tools/test_worker_drain_launch_lifetime.py
+ create mode 100644 tests/tools/test_worker_drain_reservations.py
+
+diff --git a/cron/scheduler_tick.py b/cron/scheduler_tick.py
+index 9e6efec892..712e65fb24 100644
+--- a/cron/scheduler_tick.py
++++ b/cron/scheduler_tick.py
+@@ -129,6 +129,7 @@ def update_admission():
+         from hermes_cli import admission_fence
+         from hermes_cli.admission_fence import AdmissionBusy, SUPPORTED
+         from hermes_cli.backend_retirement import BUSY_WAIT_S
++        from hermes_cli.worker_drain_fence import DrainRefused, lease_scope
+     except ImportError:
+         yield True
+         return
+@@ -145,6 +146,9 @@ def update_admission():
+         pending = admission_fence.reserve(root, timeout=BUSY_WAIT_S)
+         if pending is not None:
+             getattr(pending, "describe", lambda *_: None)("cron_tick")
++    except DrainRefused:
++        yield False  # leave due-time untouched; never inherit updater fail-open
++        return
+     except AdmissionBusy:  # before OSError: AdmissionBusy is a TimeoutError, i.e. an OSError
+         logger.info("cron dispatch deferred: core update admission lock still busy after %.1fs under %s; "
+                     "due jobs fire on a later tick", BUSY_WAIT_S, root)
+@@ -166,7 +170,8 @@ def update_admission():
+         _update_hold_logged.discard(key)
+         logger.info("cron dispatch resumed: core update admission hold released under %s", root)
+     try:
+-        yield True
++        with lease_scope(getattr(pending, '_worker_drain_lease', None)):
++            yield True
+     finally:
+         pending.close()
+ 
+diff --git a/hermes_cli/admission_fence.py b/hermes_cli/admission_fence.py
+index 6c32580a05..6749b3a1fb 100644
+--- a/hermes_cli/admission_fence.py
++++ b/hermes_cli/admission_fence.py
+@@ -114,6 +114,9 @@ class Reservation:
+                 finally:
+                     os.close(self.fd)
+                     self.fd = None
++                    lease = getattr(self, '_worker_drain_lease', None)
++                    if lease is not None:
++                        lease.close()
+ 
+ 
+ @contextmanager
+@@ -168,6 +171,11 @@ def turns_waiting(root):
+ 
+ 
+ def reserve(home, *, timeout=0.05):
++    from hermes_cli.worker_drain_fence import admitted_reservation
++    return admitted_reservation(_reserve_update, home, timeout=timeout)
++
++
++def _reserve_update(home, *, timeout=0.05):
+     import fcntl
+ 
+     # Some callers hold the backend session-map lock. Absorb ordinary short
+@@ -191,6 +199,11 @@ def reserve(home, *, timeout=0.05):
+ 
+ 
+ def extend(home, *, timeout=0.05):
++    from hermes_cli.worker_drain_fence import admitted_reservation
++    return admitted_reservation(_extend_update, home, timeout=timeout)
++
++
++def _extend_update(home, *, timeout=0.05):
+     """A reservation taken WITHOUT the hold check, for work already admitted under a live reservation
+     the caller still holds (a cron run registered inside its tick's reservation). The updater reads
+     reservations after setting the hold, so it sees the caller's or this one: never neither. [daveey]
+diff --git a/hermes_cli/backend_retirement.py b/hermes_cli/backend_retirement.py
+index 88ec61ebb0..abbd703031 100644
+--- a/hermes_cli/backend_retirement.py
++++ b/hermes_cli/backend_retirement.py
+@@ -107,6 +107,7 @@ def _reserve(root, busy_wait_s, what):
+     Each try keeps reserve's own 50 ms lock cap, so a caller never blocks longer than busy_wait_s + 50 ms.
+     A hold returns (None, "held") at once; any other fence error fails closed with its traceback."""
+     from hermes_cli import admission_fence
++    from hermes_cli.worker_drain_fence import DrainRefused
+ 
+     started = time.monotonic()
+     tries = 0
+@@ -115,6 +116,8 @@ def _reserve(root, busy_wait_s, what):
+             tries += 1
+             try:
+                 pending = admission_fence.reserve(root)
++            except DrainRefused as exc:
++                return None, exc.reason
+             except admission_fence.AdmissionBusy:
+                 waited = time.monotonic() - started
+                 if waited >= busy_wait_s:
+diff --git a/hermes_cli/process_identity.py b/hermes_cli/process_identity.py
+index b6c750ac27..0608e736da 100644
+--- a/hermes_cli/process_identity.py
++++ b/hermes_cli/process_identity.py
+@@ -31,7 +31,7 @@ from pathlib import Path
+ from typing import Iterator, Optional, Sequence
+ 
+ from utils import atomic_json_write
+-from hermes_cli.worker_drain_fence import fenced as drain_fenced
++
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -1216,7 +1216,6 @@ def stop_owned_group_survivors(pgid: int, *, proc=None, grace: float = 3.0) -> b
+     return release_process_group_once_empty(pgid, proc=proc, timeout=0)
+ 
+ 
+-@drain_fenced("process_identity.spawn_owned")
+ def spawn_owned(argv, *, purpose: str, **popen_kwargs) -> subprocess.Popen:
+     """Start a long-lived child that dies with this process: the one way to own a child.
+ 
+@@ -1228,7 +1227,9 @@ def spawn_owned(argv, *, purpose: str, **popen_kwargs) -> subprocess.Popen:
+     """
+     if os.name != "posix":
+         return subprocess.Popen(argv, **popen_kwargs)
+-    proc = subprocess.Popen(argv, start_new_session=True, **popen_kwargs)
++    from hermes_cli.worker_drain_fence import popen_worker
++    proc = popen_worker(subprocess.Popen, argv, drain_purpose='process_identity.spawn_owned',
++                        start_new_session=True, **popen_kwargs)
+     own_process_groups([proc.pid])
+     register_child(proc.pid, purpose)
+     return proc
+diff --git a/hermes_cli/pty_bridge.py b/hermes_cli/pty_bridge.py
+index 8221afa3d7..4728e3ecd2 100644
+--- a/hermes_cli/pty_bridge.py
++++ b/hermes_cli/pty_bridge.py
+@@ -158,7 +158,26 @@ class PtyBridge:
+         # (xterm.js never drops frames, so under the dashboard that repaint was a visible flash on
+         # every OS app-switch).
+         spawn_env[PTY_HOST_ENV] = PTY_HOST_DASHBOARD
+-        proc = ptyprocess.PtyProcess.spawn(list(argv), cwd=cwd, env=spawn_env, dimensions=(rows, cols))  # type: ignore[union-attr]
++        from hermes_cli.worker_drain_fence import admit
++        lease = admit('pty.spawn')
++        try:
++            extra = {}
++            if lease is not None:
++                fds = lease.pass_fds()
++
++                def inherit_lease_fds():
++                    # ptyprocess preserves pass_fds but does not clear CLOEXEC.
++                    # Change flags only in its fork child, never in this threaded host.
++                    for fd in fds:
++                        os.set_inheritable(fd, True)
++
++                extra = {'pass_fds': fds, 'preexec_fn': inherit_lease_fds}
++            child_env = spawn_env if lease is None else lease.child_env(spawn_env)
++            proc = ptyprocess.PtyProcess.spawn(list(argv), cwd=cwd, env=child_env,
++                                               dimensions=(rows, cols), **extra)  # type: ignore[union-attr]
++        finally:
++            if lease is not None:
++                lease.close()
+         try:
+             return cls(proc)
+         except OSError:  # no safe readiness wait for the master (fd_wait): don't leak the child
+diff --git a/hermes_cli/worker_drain_census.py b/hermes_cli/worker_drain_census.py
+index ec447c5712..d132a9f310 100644
+--- a/hermes_cli/worker_drain_census.py
++++ b/hermes_cli/worker_drain_census.py
+@@ -1,11 +1,10 @@
+-"""Complete-or-UNKNOWN process census for worker drain.
++"""Positive lower-bound worker census; incomplete observations never emit zero.
+ 
+-Counts every process that could be card work: anything owned by the worker
+-user, plus anything in the user manager's app.slice / hermes.slice, minus an
+-explicit baseline allowlist of resident infrastructure units and this process.
+-Unscoped historical work (e.g. an ssh session scope, a detached job outside any
+-service) is counted, not ignored. If /proc cannot be read completely the answer
+-is ``None`` (UNKNOWN), never zero. processes.json is never consulted.
++A unit name exempts neither a daemon nor any descendants. A complete idle proof
++needs host cgroup/namespace traversal and exact manifest/live adapter identities;
++that part is not implemented yet. Until then this producer returns positive work
++or UNKNOWN. It cannot enable scale-in even when drain activation is present.
++processes.json is not an authority.
+ """
+ from __future__ import annotations
+ 
+@@ -13,26 +12,23 @@ import os
+ import re
+ import sys
+ 
+-# Resident infrastructure: cgroup unit leaf names that are not card work.
+-BASELINE_UNITS = (
+-    "init.scope", "gpg-agent.service", "dbus.service", "hermes-gateway.service",
+-    "hermes-gh-conntrace.service", "pipewire.service", "pulseaudio.service",
+-)
+-_SCOPED = re.compile(r"/(app|hermes)\.slice(/|$)")
++_SCOPED = re.compile(r'/(app|hermes)\.slice(/|$)')
++_PF_KTHREAD = 0x200000
+ 
+ 
+ def _read(path: str) -> str:
+-    with open(path, "rb") as fh:
+-        return fh.read().decode("utf-8", "replace")
++    with open(path, 'rb') as fh:
++        return fh.read().decode('utf-8', 'replace')
+ 
+ 
+-def _is_baseline(cgroup: str) -> bool:
+-    return cgroup.rstrip("/").rsplit("/", 1)[-1] in BASELINE_UNITS
++def census(proc_root: str = '/proc', uid: int | None = None) -> int | None:
++    """Count observed worker userspace processes, never assert complete idle.
+ 
+-
+-def census(proc_root: str = "/proc", uid: int | None = None) -> int | None:
+-    """Return the count of non-baseline worker processes, or None if UNKNOWN."""
+-    if not sys.platform.startswith("linux"):
++    Foreign-UID/root and unstable/missing observations do not prove absence of
++    work. A positive number remains a conservative lower bound if the inventory
++    is incomplete. No guessed infrastructure exemptions or implicit zero.
++    """
++    if not sys.platform.startswith('linux'):
+         return None
+     uid = os.getuid() if uid is None else uid  # windows-footgun: ok
+     me = str(os.getpid())
+@@ -40,42 +36,37 @@ def census(proc_root: str = "/proc", uid: int | None = None) -> int | None:
+         entries = [e for e in os.listdir(proc_root) if e.isdigit()]
+     except OSError:
+         return None
+-    if not entries:
+-        return None
+     count = 0
+     for pid in entries:
+         if pid == me:
+             continue
+         try:
+-            if os.stat(f"{proc_root}/{pid}").st_uid != uid:
+-                cg = _read_cgroup(proc_root, pid)
+-                if not _SCOPED.search(cg):
+-                    continue
+-            else:
+-                cg = _read_cgroup(proc_root, pid)
+-            if _is_kernel_thread(proc_root, pid):
+-                continue
+-        except FileNotFoundError:
+-            continue  # exited during the scan: not work
+-        except OSError:
+-            return None  # cannot see it: UNKNOWN, not zero
+-        if not _is_baseline(cg):
+-            count += 1
+-    return count
++            cg = _read_cgroup(proc_root, pid)
++            if not cg:
++                continue  # unsupported membership: not an absence proof
++            if os.stat(f'{proc_root}/{pid}').st_uid == uid or _SCOPED.search(cg):
++                if not _is_kernel_thread(proc_root, pid):
++                    count += 1
++        except (OSError, ValueError, IndexError):
++            continue  # incomplete entry: positive lower bound or UNKNOWN below
++    return count or None
+ 
+ 
+ def _read_cgroup(root: str, pid: str) -> str:
+-    for line in _read(f"{root}/{pid}/cgroup").splitlines():
+-        if line.startswith("0::"):
++    for line in _read(f'{root}/{pid}/cgroup').splitlines():
++        if line.startswith('0::'):
+             return line[3:]
+-    return ""
++    return ''
+ 
+ 
+ def _is_kernel_thread(root: str, pid: str) -> bool:
+-    return _read(f"{root}/{pid}/cmdline") == "" and "Z (zombie)" not in _read(f"{root}/{pid}/status")
++    # Empty cmdline alone also describes exec races and ordinary userspace that
++    # changed argv. PF_KTHREAD is field 9; comm may contain spaces/parentheses.
++    fields = _read(f'{root}/{pid}/stat').rsplit(')', 1)[1].split()
++    return bool(int(fields[6]) & _PF_KTHREAD) and _read(f'{root}/{pid}/cmdline') == ''
+ 
+ 
+ def complete_count() -> int | None:
+-    """Census gated by the unsent-results check (single exit for zero)."""
++    """Positive/UNKNOWN observation through the unsent-results gate."""
+     from hermes_cli import machine_persistent_jobs as jobs
+     return jobs.census_count(census())
+diff --git a/hermes_cli/worker_drain_fence.py b/hermes_cli/worker_drain_fence.py
+index 594bfa2d1d..028fb78e10 100644
+--- a/hermes_cli/worker_drain_fence.py
++++ b/hermes_cli/worker_drain_fence.py
+@@ -27,6 +27,7 @@ import re
+ import time
+ import uuid
+ from contextlib import contextmanager
++from contextvars import ContextVar
+ from dataclasses import dataclass
+ from pathlib import Path
+ 
+@@ -173,7 +174,7 @@ def read_latch(root: Path, ident: Identity) -> dict:
+         raise DrainRefused('identity-mismatch', 'install binding')
+     if latch.get('iid') != ident.iid or latch.get('node_epoch') != ident.node_epoch:
+         raise DrainRefused('identity-mismatch', 'latch binding')
+-    if latch.get('boot') != ident.boot and latch.get('phase') != 'open':
++    if latch.get('boot') != ident.boot:
+         raise DrainRefused('unknown-state', 'latch bound to another boot')
+     if latch.get('phase') not in PHASES or not isinstance(latch.get('generation'), int):
+         raise DrainRefused('unknown-state', 'latch malformed')
+@@ -213,6 +214,8 @@ def apply_request(root: Path, ident: Identity, req: dict, *, now_ms: int | None
+             new, gen, att = 'draining', req['generation'], req['attempt']
+         if new is None:
+             raise DrainRefused('identity-mismatch', f'illegal {req["op"]} from {phase}')
++        if new == 'sealed' and busy_leases(root):
++            raise DrainRefused('draining', 'live work leases prevent seal')
+         receipt = {'phase': new, 'generation': gen, 'attempt': att, 'request_id': req['request_id'], 'hash': digest}
+         _write_atomic(d / LATCH_FILE, _latch_doc(ident, new, gen, att,
+                                                  {'request_id': req['request_id'], 'hash': digest, 'receipt': receipt}))
+@@ -234,12 +237,13 @@ class WorkLease:
+         """fds for subprocess pass_fds: the child keeps the same open file description (and flock),
+         plus the held parent so deeper hermes descendants stay admitted while draining."""
+         fds = [f for f in (self.fd, self.parent.fd if self.parent else None) if f is not None]
+-        for f in fds:
+-            os.set_inheritable(f, True)
+         return tuple(fds)
+ 
+     def child_env(self, env: dict | None = None) -> dict:
+-        out = dict(os.environ if env is None else env)
++        if env is None:
++            from tools.environments.local import build_subprocess_env
++            env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
++        out = dict(env)
+         anchor = self.parent if self.parent is not None and self.parent.fd is not None else self
+         if anchor.fd is not None:
+             out[LEASE_FD_ENV] = str(anchor.fd)
+@@ -278,7 +282,8 @@ def acquire_lease(root: Path, ident: Identity, purpose: str, *, parent: WorkLeas
+         phase = read_latch(root, ident)['phase']
+         if phase == 'sealed':
+             raise DrainRefused('sealed')
+-        if phase == 'draining' and parent is None:
++        if phase == 'draining' and (parent is None or parent.fd is None
++                or _parent_from_fd(root, parent.fd, boot=ident.boot) is None):
+             raise DrainRefused('draining')
+         ld = d / LEASE_DIR
+         name = uuid.uuid4().hex + '.lease'
+@@ -302,6 +307,7 @@ def seal_precheck(root: Path, ident: Identity) -> bool:
+ LEASE_FD_ENV = 'HERMES_WORKER_DRAIN_LEASE_FD'
+ _IMDS = 'http://169.254.169.254'
+ _iid_cache: dict = {}
++_authority: ContextVar = ContextVar('worker_drain_authority', default=None)
+ 
+ 
+ def read_imds_iid(timeout: float = 1.5) -> str:
+@@ -339,28 +345,57 @@ def _state_base() -> Path:
+ 
+ 
+ def _inherited_parent(root: Path):
++    local = _authority.get()
++    if local is not None and local.fd is not None:
++        parent = _parent_from_fd(root, local.fd)
++        if parent is not None:
++            return parent
+     raw = os.environ.get(LEASE_FD_ENV)
+     if not raw or not raw.isdigit():
+         return None
+-    fd = int(raw)
++    return _parent_from_fd(root, int(raw))
++
++
++def _parent_from_fd(root: Path, fd: int, *, boot=None):
+     try:
+         real = Path(os.readlink(f'/proc/self/fd/{fd}'))
+         same = os.path.samestat(os.fstat(fd), os.stat(real))
+-    except OSError:
++        info = Path(f'/proc/self/fdinfo/{fd}').read_text(encoding='ascii')
++        locked = any(re.search(r'\bFLOCK\s+ADVISORY\s+WRITE\b', line) for line in info.splitlines()
++                     if line.startswith('lock:'))
++        metadata = json.loads(os.pread(fd, 4096, 0))
++        same_boot = metadata.get('boot') == (read_boot_id() if boot is None else boot)
++    except (OSError, ValueError, AttributeError):
+         return None
+-    if real.parent != _state_root(root) / LEASE_DIR or not same:
++    if real.parent != _state_root(root) / LEASE_DIR or not same or not locked or not same_boot:
+         return None
+     return WorkLease(fd, real, owned=False)
+ 
+ 
+-def popen_worker(popen, cmd, *, env, **kwargs):
++@contextmanager
++def lease_scope(lease):
++    """Carry a retained, live lease through synchronous/context-copied work.
++
++    The owner must hold it until the callback finishes. A copied context is not
++    authority after close: admit revalidates the live descriptor/kernel lock.
++    """
++    token = _authority.set(lease)
++    try:
++        yield
++    finally:
++        _authority.reset(token)
++
++
++def popen_worker(popen, cmd, *, env=None, drain_purpose='kanban.worker', **kwargs):
+     """Start a detached worker under an admission lease it keeps for life (inherited fd), so its own
+     hermes descendants stay admitted while draining. Plain call when not activated."""
+-    lease = admit('kanban.worker')
++    lease = admit(drain_purpose)
+     if lease is None:
+         return popen(cmd, env=env, **kwargs)
+     try:
+-        return popen(cmd, env=lease.child_env(env), pass_fds=lease.pass_fds(), **kwargs)
++        kwargs['pass_fds'] = tuple(dict.fromkeys((*kwargs.get('pass_fds', ()), *lease.pass_fds())))
++        kwargs['close_fds'] = True
++        return popen(cmd, env=lease.child_env(env), **kwargs)
+     finally:
+         lease.close()
+ 
+@@ -375,7 +410,8 @@ def fenced(purpose: str):
+         def wrapper(*args, **kwargs):
+             lease = admit(purpose)
+             try:
+-                return fn(*args, **kwargs)
++                with lease_scope(lease):
++                    return fn(*args, **kwargs)
+             finally:
+                 if lease is not None:
+                     lease.close()
+@@ -384,6 +420,24 @@ def fenced(purpose: str):
+     return deco
+ 
+ 
++def admitted_reservation(reserve, *args, **kwargs):
++    """Attach a close-only drain lease to an updater reservation.
++
++    Acquire before the updater account lock, never recursively inside it. The
++    caller owns both lifetimes. Failure/update hold releases the drain lease.
++    """
++    lease = admit('admission.reservation')
++    try:
++        pending = reserve(*args, **kwargs)
++        if pending is not None:
++            pending._worker_drain_lease = lease
++            lease = None
++        return pending
++    finally:
++        if lease is not None:
++            lease.close()
++
++
+ def admit(purpose: str, *, activation_path: Path | None = None, imds=None):
+     """Gate one admission/spawn. None when enforcement is not activated (full no-op).
+ 
+@@ -394,7 +448,10 @@ def admit(purpose: str, *, activation_path: Path | None = None, imds=None):
+     act = load_activation(ACTIVATION_PATH if activation_path is None else activation_path)
+     if act is None:
+         return None
+-    root = _state_base()
+-    ident = current_identity(act, imds=imds)
+-    return acquire_lease(root, ident, purpose, parent=_inherited_parent(root))
++    try:
++        root = _state_base()
++        ident = current_identity(act, imds=imds)
++        return acquire_lease(root, ident, purpose, parent=_inherited_parent(root))
++    except OSError as exc:
++        raise DrainRefused('unknown-state', f'admission unavailable: {type(exc).__name__}') from exc
+ 
+diff --git a/tests/hermes_cli/test_worker_drain_census.py b/tests/hermes_cli/test_worker_drain_census.py
+index e52be4f822..277535dcab 100644
+--- a/tests/hermes_cli/test_worker_drain_census.py
++++ b/tests/hermes_cli/test_worker_drain_census.py
+@@ -1,4 +1,4 @@
+-"""Census: complete or UNKNOWN, over a fake /proc."""
++"""Conservative census: no guessed baseline or empty-cmdline zero."""
+ from __future__ import annotations
+ 
+ import os
+@@ -6,45 +6,65 @@ import os
+ from hermes_cli import worker_drain_census as census
+ 
+ 
+-def _proc(root, pid, cgroup, cmdline="x\0", uid=None):
++def _proc(root, pid, cgroup, cmdline='x\0', flags=0):
+     d = root / str(pid)
+     d.mkdir()
+-    (d / "cgroup").write_text(f"0::{cgroup}\n")
+-    (d / "cmdline").write_bytes(cmdline.encode())
+-    (d / "status").write_text("State:\tS (sleeping)\n")
++    (d / 'cgroup').write_text(f'0::{cgroup}\n')
++    (d / 'cmdline').write_bytes(cmdline.encode())
++    # stat fields 3 through 22: state, ppid, pgrp, session, tty, tpgid, flags, ... starttime
++    fields = ['S', '1', '1', '1', '0', '-1', str(flags)] + ['0'] * 12 + ['100']
++    (d / 'stat').write_text(f'{pid} (fixture process) ' + ' '.join(fields))
+     return d
+ 
+ 
+-U = "/user.slice/user-1000.slice/user@1000.service"
++U = '/user.slice/user-1000.slice/user@1000.service'
+ 
+ 
+-def test_baseline_only_is_zero(tmp_path):
+-    _proc(tmp_path, 10, U + "/init.scope")
+-    _proc(tmp_path, 11, U + "/app.slice/gpg-agent.service")
+-    assert census.census(str(tmp_path), uid=os.stat(str(tmp_path)).st_uid) == 0
++def test_baseline_cgroup_never_exempts_arbitrary_children(tmp_path):
++    _proc(tmp_path, 10, U + '/init.scope')
++    _proc(tmp_path, 11, U + '/app.slice/gpg-agent.service')
++    _proc(tmp_path, 12, U + '/app.slice/hermes-gateway.service')
++    assert census.census(str(tmp_path), uid=os.stat(tmp_path).st_uid) == 3
+ 
+ 
+ def test_unscoped_and_app_slice_work_counts(tmp_path):
+-    _proc(tmp_path, 10, U + "/init.scope")
+-    _proc(tmp_path, 11, U + "/app.slice/hermes-core-update.service")
+-    _proc(tmp_path, 12, "/user.slice/user-1000.slice/session-3.scope")
+-    _proc(tmp_path, 13, U + "/hermes.slice/hermes-kanban.slice/x.service")
+-    assert census.census(str(tmp_path), uid=os.stat(str(tmp_path)).st_uid) == 3
++    _proc(tmp_path, 10, U + '/init.scope')
++    _proc(tmp_path, 11, U + '/app.slice/hermes-core-update.service')
++    _proc(tmp_path, 12, '/user.slice/user-1000.slice/session-3.scope')
++    _proc(tmp_path, 13, U + '/hermes.slice/hermes-kanban.slice/x.service')
++    assert census.census(str(tmp_path), uid=os.stat(tmp_path).st_uid) == 4
+ 
+ 
+-def test_kernel_thread_ignored(tmp_path):
+-    _proc(tmp_path, 10, "/", cmdline="")
+-    assert census.census(str(tmp_path), uid=os.stat(str(tmp_path)).st_uid) == 0
++def test_empty_cmdline_is_not_kernel_identity(tmp_path):
++    _proc(tmp_path, 10, '/', cmdline='')
++    assert census.census(str(tmp_path), uid=os.stat(tmp_path).st_uid) == 1
++
++
++def test_kernel_flag_does_not_authorize_complete_zero(tmp_path):
++    _proc(tmp_path, 10, '/', cmdline='', flags=0x200000)
++    # Full host cgroup/namespace/manifest proof is not built yet.
++    assert census.census(str(tmp_path), uid=os.stat(tmp_path).st_uid) is None
+ 
+ 
+ def test_unreadable_entry_is_unknown(tmp_path):
+-    d = tmp_path / "10"
+-    d.mkdir()  # no cgroup file readable -> exited => skipped
+-    assert census.census(str(tmp_path), uid=os.stat(str(tmp_path)).st_uid) == 0
+-    (d / "cgroup").mkdir()  # IsADirectoryError is an OSError we cannot classify
+-    assert census.census(str(tmp_path), uid=os.stat(str(tmp_path)).st_uid) is None
++    d = tmp_path / '10'
++    d.mkdir()
++    assert census.census(str(tmp_path), uid=os.stat(tmp_path).st_uid) is None
++    (d / 'cgroup').mkdir()
++    assert census.census(str(tmp_path), uid=os.stat(tmp_path).st_uid) is None
+ 
+ 
+ def test_missing_proc_is_unknown(tmp_path):
+-    assert census.census(str(tmp_path / "nope")) is None
++    assert census.census(str(tmp_path / 'nope')) is None
+     assert census.census(str(tmp_path)) is None
++
++
++def test_foreign_uid_unscoped_work_does_not_become_zero(tmp_path):
++    _proc(tmp_path, 10, '/system.slice/amazon-ssm-agent.service')
++    assert census.census(str(tmp_path), uid=os.stat(tmp_path).st_uid + 1) is None
++
++
++def test_non_v2_membership_holds(tmp_path):
++    d = _proc(tmp_path, 10, '/')
++    (d / 'cgroup').write_text('1:cpu:/legacy\n')
++    assert census.census(str(tmp_path), uid=os.stat(tmp_path).st_uid) is None
+diff --git a/tests/hermes_cli/test_worker_drain_fence.py b/tests/hermes_cli/test_worker_drain_fence.py
+index 0b68d78a90..d615662c4a 100644
+--- a/tests/hermes_cli/test_worker_drain_fence.py
++++ b/tests/hermes_cli/test_worker_drain_fence.py
+@@ -70,6 +70,18 @@ def test_generation_rules_and_cancel(root):
+     refuses('identity-mismatch', f.apply_request, root, IDENT, req('cancel', 3, 'a3'))  # no cancel after seal
+ 
+ 
++def test_closed_parent_cannot_admit_descendant(root):
++    parent = f.acquire_lease(root, IDENT, 'parent')
++    parent.close()
++    f.apply_request(root, IDENT, req('establish', 1))
++    refuses('draining', f.acquire_lease, root, IDENT, 'late', parent=parent)
++
++
++def test_open_latch_from_previous_boot_is_unknown(root):
++    other = f.Identity(IDENT.iid, 'boot-2', IDENT.node_epoch)
++    refuses('unknown-state', f.acquire_lease, root, other, 'late')
++
++
+ def test_bad_request_shapes(root):
+     refuses('unknown-state', f.apply_request, root, IDENT, req('establish', 1, extra=1))
+     refuses('identity-mismatch', f.apply_request, root, IDENT, req('establish', 1, ident=f.Identity(IDENT.iid, 'boot-2', 'epoch-1')))
+diff --git a/tests/tools/test_worker_drain_launch_lifetime.py b/tests/tools/test_worker_drain_launch_lifetime.py
+new file mode 100644
+index 0000000000..07b2c20e69
+--- /dev/null
++++ b/tests/tools/test_worker_drain_launch_lifetime.py
+@@ -0,0 +1,137 @@
++"""Real child lifetime and terminal seam tests; no node or AWS writes."""
++import os
++import subprocess
++import sys
++
++import pytest
++
++from hermes_cli import worker_drain_fence as f
++from tests.tools import test_worker_drain_spawn as fixtures
++
++node = fixtures.node
++latch = fixtures.latch
++
++
++@pytest.mark.parametrize('seam', ['generic', 'owned', 'bash'])
++def test_child_holds_lease_after_spawn_returns(node, seam):
++    root, ident = node
++    argv = [sys.executable, '-c', 'import time; time.sleep(30)']
++    if seam == 'generic':
++        proc = f.popen_worker(subprocess.Popen, argv, env=None)
++    elif seam == 'owned':
++        from hermes_cli.process_identity import spawn_owned
++        proc = spawn_owned(argv, purpose='drain-lifetime-fixture')
++    else:
++        from tools.environments.base_output import _popen_bash
++        proc = _popen_bash(argv)
++    try:
++        assert f.busy_leases(root) == 1
++        latch(root, ident)
++        assert not f.seal_precheck(root, ident)
++    finally:
++        proc.kill()
++        proc.wait(timeout=10)
++    assert f.seal_precheck(root, ident)
++
++
++def test_generic_preserves_explicit_pass_fds_and_cloexec(node):
++    root, _ident = node
++    read_fd, write_fd = os.pipe()
++    try:
++        proc = f.popen_worker(subprocess.Popen,
++            [sys.executable, '-c', f'import os; os.write({write_fd}, b"ok")'],
++            env=None, pass_fds=(write_fd,))
++        assert os.read(read_fd, 2) == b'ok'
++        assert proc.wait(timeout=10) == 0
++        assert not os.get_inheritable(write_fd)
++        assert f.busy_leases(root) == 0
++    finally:
++        os.close(read_fd)
++        os.close(write_fd)
++
++
++def test_spawn_failure_releases_lease(node):
++    root, _ident = node
++    with pytest.raises(FileNotFoundError):
++        f.popen_worker(subprocess.Popen, ['/nonexistent-drain-fixture-command'], env=None)
++    assert f.busy_leases(root) == 0
++
++
++def test_pty_child_holds_lease_and_late_pty_refuses(node):
++    from hermes_cli.pty_bridge import PtyBridge
++    if not PtyBridge.is_available():
++        pytest.skip('ptyprocess unavailable')
++    root, ident = node
++    bridge = PtyBridge.spawn([sys.executable, '-c', 'import time; time.sleep(30)'])
++    try:
++        assert f.busy_leases(root) == 1
++        latch(root, ident)
++        assert not f.seal_precheck(root, ident)
++        with pytest.raises(f.DrainRefused):
++            PtyBridge.spawn([sys.executable, '-c', 'pass'])
++    finally:
++        bridge.close()
++
++
++def test_reopened_unlocked_fd_cannot_mint_parent_authority(node, monkeypatch):
++    root, ident = node
++    parent = f.admit('fixture-parent')
++    path = parent.path
++    parent.close()
++    fd = os.open(path, os.O_RDWR)
++    try:
++        monkeypatch.setenv(f.LEASE_FD_ENV, str(fd))
++        latch(root, ident)
++        with pytest.raises(f.DrainRefused):
++            f.admit('forged-parent')
++    finally:
++        os.close(fd)
++
++
++def test_nested_fenced_work_can_finish_after_latch(node):
++    root, ident = node
++
++    @f.fenced('already-admitted')
++    def existing_work():
++        latch(root, ident)
++        proc = f.popen_worker(subprocess.Popen, [sys.executable, '-c', 'pass'])
++        assert proc.wait(timeout=10) == 0
++    existing_work()
++    assert f.busy_leases(root) == 0
++
++
++def test_seal_mutation_itself_checks_live_leases(node):
++    root, ident = node
++    parent = f.admit('fixture-parent')
++    try:
++        latch(root, ident)
++        with pytest.raises(f.DrainRefused):
++            latch(root, ident, op='seal')
++        assert f.read_latch(root, ident)['phase'] == 'draining'
++    finally:
++        parent.close()
++    assert latch(root, ident, op='seal')['phase'] == 'sealed'
++
++
++@pytest.mark.parametrize('seam', ['generic', 'owned', 'bash', 'local'])
++def test_late_terminal_seams_cannot_execute(node, tmp_path, seam):
++    root, ident = node
++    latch(root, ident)
++    output = tmp_path / 'should-not-exist'
++    argv = [sys.executable, '-c', f'open({str(output)!r}, "w").write("lost")']
++    with pytest.raises(f.DrainRefused):
++        if seam == 'generic':
++            f.popen_worker(subprocess.Popen, argv, env=None)
++        elif seam == 'owned':
++            from hermes_cli.process_identity import spawn_owned
++            spawn_owned(argv, purpose='drain-late-fixture')
++        elif seam == 'bash':
++            from tools.environments.base_output import _popen_bash
++            _popen_bash(argv)
++        else:
++            from tools.environments.local import LocalEnvironment
++            # Bypass unrelated startup shells; exercise the real local spawn boundary.
++            local = LocalEnvironment.__new__(LocalEnvironment)
++            local.env, local.cwd = {}, str(tmp_path)
++            local._run_bash('touch ' + str(output))
++    assert not output.exists()
+diff --git a/tests/tools/test_worker_drain_reservations.py b/tests/tools/test_worker_drain_reservations.py
+new file mode 100644
+index 0000000000..bf3756fd5e
+--- /dev/null
++++ b/tests/tools/test_worker_drain_reservations.py
+@@ -0,0 +1,90 @@
++"""Update/turn reservation drain coverage, with actual isolated flock state."""
++import pytest
++
++from hermes_cli import admission_fence as admission
++from hermes_cli import worker_drain_fence as f
++from tests.tools import test_worker_drain_spawn as fixtures
++
++node = fixtures.node
++latch = fixtures.latch
++
++
++@pytest.mark.parametrize('method', [admission.reserve, admission.extend])
++def test_reservation_holds_drain_lease_until_close(node, method):
++    root, ident = node
++    reservation = method(root)
++    assert reservation is not None
++    try:
++        assert f.busy_leases(root) == 1
++        latch(root, ident)
++        assert not f.seal_precheck(root, ident)
++    finally:
++        reservation.close()
++    reservation.close()
++    assert f.seal_precheck(root, ident)
++
++
++@pytest.mark.parametrize('method', [admission.reserve, admission.extend])
++def test_reservation_after_latch_refuses(node, method):
++    root, ident = node
++    latch(root, ident)
++    with pytest.raises(f.DrainRefused):
++        method(root)
++    assert f.busy_leases(root) == 0
++
++
++def test_turn_callback_retains_authority_across_thread_handoff(node, monkeypatch):
++    import subprocess
++    import sys
++    import threading
++    import hermes_constants
++    from tui_gateway import turn_admission as turns
++    root, ident = node
++    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda **kw: root)
++    token = turns.acquire(root)
++    assert token is not None
++    session = {'history_lock': threading.RLock(), '_turn_admission': token}
++    outputs = []
++
++    def target():
++        proc = f.popen_worker(subprocess.Popen,
++            [sys.executable, '-c', 'print("finished")'], stdout=subprocess.PIPE)
++        output, _ = proc.communicate(timeout=10)
++        outputs.append(output)
++    callback, _cancel = turns.retained_callback(session, target)
++    token.release()  # only the callback reference remains
++    latch(root, ident)
++    thread = threading.Thread(target=callback)
++    thread.start()
++    thread.join(timeout=10)
++    assert not thread.is_alive()
++    assert outputs == [b'finished\n']
++    assert f.busy_leases(root) == 0
++    assert turns.acquire(root) is None
++
++
++def test_cron_tick_refuses_late_and_retains_extension(node, monkeypatch):
++    import hermes_constants
++    from cron import scheduler, scheduler_tick
++    root, ident = node
++    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda **kw: root)
++    monkeypatch.setattr(scheduler, '_get_hermes_home', lambda: root)
++    with scheduler_tick.update_admission() as admitted:
++        assert admitted
++        latch(root, ident)
++        extension = admission.extend(root)
++        assert f.busy_leases(root) == 2
++    assert f.busy_leases(root) == 1
++    extension.close()
++    with scheduler_tick.update_admission() as admitted:
++        assert not admitted
++    assert f.busy_leases(root) == 0
++
++
++def test_backend_refuses_without_update_failopen(node):
++    from hermes_cli.backend_retirement import _reserve
++    root, ident = node
++    latch(root, ident)
++    reservation, reason = _reserve(root, 0, 'fixture')
++    assert reservation is None
++    assert reason == 'draining'
+diff --git a/tools/environments/base_output.py b/tools/environments/base_output.py
+index 454cfe86b3..461cf9e820 100644
+--- a/tools/environments/base_output.py
++++ b/tools/environments/base_output.py
+@@ -256,7 +256,8 @@ def _popen_bash(cmd: list[str], stdin_data: str | None = None, **kwargs) -> subp
+     asynchronously via :func:`_pipe_stdin`. Backends with special Popen needs (e.g. local's
+     ``preexec_fn``) can bypass this and call :func:`_pipe_stdin` directly."""
+     kwargs.setdefault("creationflags", windows_hide_flags())
+-    proc = subprocess.Popen(
++    from hermes_cli.worker_drain_fence import popen_worker
++    proc = popen_worker(subprocess.Popen,
+         cmd,
+         stdout=subprocess.PIPE,
+         stderr=subprocess.STDOUT,
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+index f33497ea02..9c89ad3976 100644
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -1266,7 +1266,8 @@ class LocalEnvironment(BaseEnvironment):
+         with endpoint as offered:
+             if offered is not None:
+                 run_env[ENV_KEY] = offered[1]
+-            proc = subprocess.Popen(
++            from hermes_cli.worker_drain_fence import popen_worker
++            proc = popen_worker(subprocess.Popen,
+                 args, text=True, env=run_env, encoding="utf-8", errors="replace",
+                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                 stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+diff --git a/tools/process_registry_ownership.py b/tools/process_registry_ownership.py
+index 4f4ad2bb61..a43b80f1ea 100644
+--- a/tools/process_registry_ownership.py
++++ b/tools/process_registry_ownership.py
+@@ -164,7 +164,8 @@ class ProcessOwnershipMixin:
+             session._owned_pgid = proc.pid
+             return proc
+         # noqa: subprocess-stdin — a forwarder: spawn_local passes stdin=DEVNULL in popen_kwargs
+-        return subprocess.Popen(argv, start_new_session=True, **popen_kwargs)  # detached-spawn: ok — see _owns_job
++        from hermes_cli.worker_drain_fence import popen_worker
++        return popen_worker(subprocess.Popen, argv, start_new_session=True, **popen_kwargs)  # detached-spawn: ok — see _owns_job
+ 
+     def _own_pty_job(self, session: Any, pty_proc: Any) -> None:
+         """The PTY child leads its own session and group (pty.fork). Its hangup reaches only jobs that
+diff --git a/tui_gateway/turn_admission.py b/tui_gateway/turn_admission.py
+index c39ee4936e..b4fe0c15fa 100644
+--- a/tui_gateway/turn_admission.py
++++ b/tui_gateway/turn_admission.py
+@@ -6,14 +6,16 @@ another. Clearing the UI's in-flight state must not make unwinding work idle.
+ from contextlib import contextmanager, nullcontext
+ from contextvars import ContextVar
+ import threading
++from hermes_cli.worker_drain_fence import admit, DrainRefused, lease_scope
+ 
+ _current: ContextVar[tuple | None] = ContextVar("turn_admission_owner", default=None)
+ _KEY = "_turn_admission"
+ 
+ 
+ class TurnAdmission:
+-    def __init__(self, reservation):
++    def __init__(self, reservation, drain_lease=None):
+         self.reservation = reservation
++        self.drain_lease = drain_lease
+         self.lock = threading.RLock()
+         self.refs = 1
+         self.workers = 0
+@@ -29,7 +31,11 @@ class TurnAdmission:
+         with self.lock:
+             self.refs -= 1
+             if self.refs == 0:
+-                self.reservation.__exit__(None, None, None)
++                try:
++                    self.reservation.__exit__(None, None, None)
++                finally:
++                    if self.drain_lease is not None:
++                        self.drain_lease.close()
+ 
+ 
+ def acquire(home=None, *, busy_wait_s=None):
+@@ -37,10 +43,22 @@ def acquire(home=None, *, busy_wait_s=None):
+     # busy_wait_s=None keeps the fence's default busy-lock retry; 0 is one short try (resume-lock callers).
+     reservation = (retirement.reservation(home) if busy_wait_s is None
+                    else retirement.reservation(home, busy_wait_s=busy_wait_s))
+-    if not reservation.__enter__():
+-        reservation.__exit__(None, None, None)
++    try:
++        drain_lease = admit('turn.admission')
++    except DrainRefused:
+         return None
+-    return TurnAdmission(reservation)
++    try:
++        with lease_scope(drain_lease):
++            if not reservation.__enter__():
++                reservation.__exit__(None, None, None)
++                if drain_lease is not None:
++                    drain_lease.close()
++                return None
++        return TurnAdmission(reservation, drain_lease)
++    except BaseException:
++        if drain_lease is not None:
++            drain_lease.close()
++        raise
+ 
+ 
+ def owns(session):
+@@ -109,7 +127,8 @@ def stage(session, *, inherit=False):
+             token.retain()
+     context = _current.set((session, token))
+     try:
+-        yield
++        with lease_scope(token.drain_lease if token is not None else None):
++            yield
+     except BaseException:
+         with session["history_lock"]:
+             if owns(session):
+@@ -145,7 +164,8 @@ def retained_callback(session, target, *, settle_on_error=False):
+     def run(*args, **kwargs):
+         context = _current.set((session, token))
+         try:
+-            return target(*args, **kwargs)
++            with lease_scope(token.drain_lease if token is not None else None):
++                return target(*args, **kwargs)
+         except BaseException:
+             if settle_on_error:
+                 with session["history_lock"]:
+@@ -294,7 +314,8 @@ class PreparedWork:
+     def _run(self):
+         context = _current.set((self._session, self._token))
+         try:
+-            self._target()
++            with lease_scope(self._token.drain_lease):
++                self._target()
+         finally:
+             try:
+                 self._finish()
+-- 
+2.43.0
+

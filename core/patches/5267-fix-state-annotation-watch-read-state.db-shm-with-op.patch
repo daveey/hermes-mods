@@ -1,0 +1,336 @@
+From 561230bc2cb183b4c2beca58b3597971e53d28a4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 11:21:58 -0800
+Subject: [PATCH] fix(state): annotation watch read state.db/-shm with
+ open()/close(), cancelling SQLite's locks
+
+Root cause of an example gateway's repeated state.db index corruption.
+
+kanban_annotation_watch._head() read the
+database header and the WAL-index header of every watched state.db with
+`with open(path, "rb")` every ~2 s in the Desktop backend (the kanban-annotation
+lease holder). POSIX cancels every lock a process holds on a file when it closes ANY
+descriptor for it, so the backend's SQLite connections ran without their WAL writer
+lock and read marks (in an example reproduction: /proc/locks showed no POSIX lock for the
+backend on state.db-shm while it held -shm open; an audit hook traced the opens to
+_head). The backend and the gateway then wrote the same WAL at once: index entries
+of recent rows were lost on every messages/sessions index, and the
+gateway later hit SQLITE_CORRUPT and quarantined itself.
+
+- _head reads through sqlite_safe_read.pread_lock_safe (cached descriptor, never
+  closed); a missing file is still None and any other failure still raises.
+- backup_sqlite._uses_wal read the header with open() while _safe_copy_db already
+  held a connection to it (inside the gateway/CLI): same fix, stdlib fallback marked.
+- scripts/check_sqlite_sidecar_opens.py missed both because the path reached open()
+  as a parameter: a same-file function that passes a parameter to a file call
+  (directly or through another such function, self./cls. methods included) is now a
+  file call, flagged at the call site; marked calls do not propagate.
+
+Tests: a foreign writer must stay locked out of a write transaction open in this
+process across signature() (fails on the old code: the foreign writer acquires);
+_uses_wal never calls the builtin open(); checker cases for helpers and wrappers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/backup_sqlite.py                   | 13 +++-
+ hermes_cli/kanban_annotation_watch.py         | 17 ++++--
+ scripts/check_sqlite_sidecar_opens.py         | 61 ++++++++++++++++++-
+ tests/hermes_cli/test_backup_preflight.py     | 27 ++++++++
+ .../test_kanban_annotation_watch.py           | 51 ++++++++++++++++
+ .../test_check_sqlite_sidecar_opens.py        | 35 +++++++++++
+ 6 files changed, 194 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/backup_sqlite.py b/hermes_cli/backup_sqlite.py
+index c899235841..5adc89cf49 100644
+--- a/hermes_cli/backup_sqlite.py
++++ b/hermes_cli/backup_sqlite.py
+@@ -65,9 +65,16 @@ _ROLLBACK_LOCK_HOLD_SECONDS = 0.25
+ 
+ 
+ def _uses_wal(src: Path) -> bool:
+-    # Header byte 18 (file format write version) is 2 for WAL; reading it takes no lock.
+-    with open(src, "rb") as handle:
+-        header = handle.read(19)
++    # Header byte 18 (file format write version) is 2 for WAL. Read through the lock-safe cached descriptor:
++    # _safe_copy_db already holds a connection to src here (and runs inside the gateway/CLI next to live
++    # ones), and a plain open()/close() would cancel this process's SQLite locks on the file.
++    try:
++        from hermes_cli.sqlite_safe_read import read_header_lock_safe
++    except ImportError:  # the standalone pre-stop script: stdlib only, and no other connection in that process
++        with open(src, "rb") as handle:  # sqlite-sidecar-open: ok — stdlib-only pre-stop process
++            header = handle.read(19)
++    else:
++        header = read_header_lock_safe(src, 19) or b""
+     return len(header) == 19 and header[18] == 2
+ 
+ 
+diff --git a/hermes_cli/kanban_annotation_watch.py b/hermes_cli/kanban_annotation_watch.py
+index 2a6cc1b66c..dc8cdfe8f7 100644
+--- a/hermes_cli/kanban_annotation_watch.py
++++ b/hermes_cli/kanban_annotation_watch.py
+@@ -20,6 +20,8 @@ import hashlib
+ import json
+ import os
+ 
++from hermes_cli.sqlite_safe_read import pread_lock_safe
++
+ 
+ def _stat(path: str) -> list:
+     try:
+@@ -30,12 +32,17 @@ def _stat(path: str) -> list:
+ 
+ 
+ def _head(path: str, start: int, end: int) -> str | None:
+-    try:
+-        with open(path, "rb") as f:
+-            f.seek(start)
+-            return f.read(end - start).hex()
+-    except FileNotFoundError:
++    """Bytes ``start:end`` of *path* as hex; None when it does not exist. Read through the lock-safe cached
++    descriptor: this runs in the Desktop backend, which holds live connections to these files, and a plain
++    ``open()``/``close()`` there cancels every SQLite POSIX lock the process holds on the file (its WAL writer
++    lock and read marks included). Every 2 s that let the backend write state.db's WAL alongside the gateway
++    and corrupted its indexes (example repeated-corruption incident)."""
++    data = pread_lock_safe(path, start, end - start)
++    if data is not None:
++        return data.hex()
++    if not os.path.exists(path):
+         return None
++    raise OSError(f"cannot read {path}")  # callers treat any error but a missing file as "moved"
+ 
+ 
+ def signature(scope: tuple[str, ...], dbs: list[str], files: list[str]) -> str:
+diff --git a/scripts/check_sqlite_sidecar_opens.py b/scripts/check_sqlite_sidecar_opens.py
+index 78e8972522..fe8de53136 100644
+--- a/scripts/check_sqlite_sidecar_opens.py
++++ b/scripts/check_sqlite_sidecar_opens.py
+@@ -37,8 +37,13 @@ Names are tracked without flow, and err toward flagging (rename the variable or
+                  method, or ``SUFFIX = "-wal"`` in a class body, marks every ``<x>.shm`` /
+                  ``<x>.SUFFIX``.
+ 
++A function of the same file that passes a parameter to such a call (``def _head(path): open(path)``),
++directly or through another such function, is a file call too: ``_head(db + "-shm", 0, 48)`` is flagged
++at the call site (example incident: exactly that, in the annotation holder's watch signature, cancelled the
++Desktop backend's locks every 2 s and two writers corrupted state.db's indexes).
++
+ Not caught: a sidecar path built in another file, by a helper defined elsewhere, or passed in
+-as a parameter; one stored under a subscript (``d["wal"] = ...; open(d["wal"])``); an aliased
++as a parameter of a function that is called from another file; one stored under a subscript (``d["wal"] = ...; open(d["wal"])``); an aliased
+ import (``from os import open as os_open``); a database path with no identifying literal;
+ ``open`` under another name (``op = open``); a global one function writes
+ and another opens; a copy made by a child process; and descriptors opened from C extensions. The runtime side of this rule is ``hermes_state``'s WAL
+@@ -168,6 +173,55 @@ def _tainted_names(nodes: list[ast.AST], inherited: frozenset[str]) -> frozenset
+     return frozenset(tainted)
+ 
+ 
++Openers = dict[str, tuple[frozenset[int], frozenset[str]]]  # function name -> (path positions, path keywords)
++
++
++def _opener_call_paths(node: ast.Call, openers: Openers) -> list[ast.AST]:
++    """Path arguments of a call to a same-file function that opens one of its parameters."""
++    func = node.func
++    if isinstance(func, ast.Name):
++        name = func.id
++    elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id in {"self", "cls"}:
++        name = func.attr
++    else:
++        return []
++    if name not in openers:
++        return []
++    positions, keywords = openers[name]
++    return [*(arg for i, arg in enumerate(node.args) if i in positions),
++            *(kw.value for kw in node.keywords if kw.arg in keywords)]
++
++
++def _openers(tree: ast.AST, src_lines: list[str] | None = None) -> Openers:
++    """Functions of this file that pass a parameter to a file call, directly or through another opener
++    (``def _head(path): open(path, "rb")``): calling one on a sidecar is a plain file call on it, so
++    the call site is flagged. Matched by bare name or ``self.``/``cls.`` method name, to a fixed point. A file
++    call carrying the opt-out marker does not make its function an opener."""
++    functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
++    openers: Openers = {}
++    changed = True
++    while changed:
++        changed = False
++        for fn in functions:
++            params = [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]
++            names = {arg.arg for arg in params}
++            opened: set[str] = set()
++            for node in _scope_nodes(fn):
++                if isinstance(node, ast.Call) and not (src_lines and _marked(src_lines, node.lineno)):
++                    for path in [*_file_call_paths(node), *_opener_call_paths(node, openers)]:
++                        opened.update(sub.id for sub in ast.walk(path) if isinstance(sub, ast.Name) and sub.id in names)
++            if not opened:
++                continue
++            positional = [*fn.args.posonlyargs, *fn.args.args]
++            offset = 1 if positional and positional[0].arg in {"self", "cls"} else 0
++            entry = (frozenset(i - offset for i, arg in enumerate(positional) if arg.arg in opened and i >= offset),
++                     frozenset(opened))
++            if openers.get(fn.name) != entry:
++                openers[fn.name] = entry
++                changed = True
++    return openers
++
++
+ def _file_call_paths(node: ast.Call) -> list[ast.AST]:
+     """The path-bearing expressions of ``node`` when it is a file open/read/write/copy call."""
+     func = node.func
+@@ -209,6 +263,7 @@ def sidecar_open_lines(text: str) -> list[int]:
+         if found_attrs == attrs:
+             break
+         attrs = frozenset(found_attrs)
++    openers = _openers(tree, text.splitlines())
+     lines: set[int] = set()
+     scopes: list[tuple[ast.AST, frozenset[str]]] = [(tree, attrs)]
+     while scopes:
+@@ -218,7 +273,9 @@ def sidecar_open_lines(text: str) -> list[int]:
+         for node in nodes:
+             if isinstance(node, _SCOPES):
+                 scopes.append((node, tainted))  # a nested function sees the names of the one around it
+-            elif isinstance(node, ast.Call) and any(_names_sidecar(path, tainted) for path in _file_call_paths(node)):
++            elif isinstance(node, ast.Call) and any(
++                    _names_sidecar(path, tainted)
++                    for path in [*_file_call_paths(node), *_opener_call_paths(node, openers)]):
+                 lines.add(node.lineno)
+     return sorted(lines)
+ 
+diff --git a/tests/hermes_cli/test_backup_preflight.py b/tests/hermes_cli/test_backup_preflight.py
+index 563ff48aed..913f4e886b 100644
+--- a/tests/hermes_cli/test_backup_preflight.py
++++ b/tests/hermes_cli/test_backup_preflight.py
+@@ -137,3 +137,30 @@ def test_rollback_journal_copy_lets_a_live_writer_commit_between_steps(tmp_path,
+             assert copy.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+     else:
+         assert not snapshot.exists()
++
++
++def test_uses_wal_reads_the_header_without_a_plain_open(tmp_path, monkeypatch):
++    """_safe_copy_db already holds a connection to src when it asks; a plain open()/close() of src would cancel
++    this process's SQLite locks on it (the same lock-cancellation class of bug). The header goes through the lock-safe
++    cached descriptor instead."""
++    import builtins
++    import sqlite3
++
++    from hermes_cli import backup_sqlite
++
++    path = tmp_path / "w.db"
++    with sqlite3.connect(path) as conn:
++        conn.execute("PRAGMA journal_mode=WAL")
++        conn.execute("CREATE TABLE t (x)")
++    rollback = tmp_path / "r.db"
++    with sqlite3.connect(rollback) as conn:
++        conn.execute("CREATE TABLE t (x)")
++    real_open = builtins.open
++
++    def guarded_open(file, *args, **kwargs):
++        assert str(file) not in {str(path), str(rollback)}, "plain open() of a live database"
++        return real_open(file, *args, **kwargs)
++
++    monkeypatch.setattr(builtins, "open", guarded_open)
++    assert backup_sqlite._uses_wal(path) is True
++    assert backup_sqlite._uses_wal(rollback) is False
+diff --git a/tests/hermes_cli/test_kanban_annotation_watch.py b/tests/hermes_cli/test_kanban_annotation_watch.py
+index 52aa4d7df6..21d8911beb 100644
+--- a/tests/hermes_cli/test_kanban_annotation_watch.py
++++ b/tests/hermes_cli/test_kanban_annotation_watch.py
+@@ -66,3 +66,54 @@ def test_missing_files_are_part_of_the_signature(tmp_path):
+     before = watch.signature(SCOPE, [path], [])
+     _db(path, wal=False).close()
+     assert watch.signature(SCOPE, [path], []) != before
++
++
++_TRY_WRITE = """
++import sqlite3, sys
++conn = sqlite3.connect(sys.argv[1], timeout=0, isolation_level=None)
++try:
++    conn.execute("BEGIN IMMEDIATE")
++except sqlite3.OperationalError as exc:
++    print("locked" if "locked" in str(exc) else "error: %s" % exc)
++else:
++    conn.execute("ROLLBACK")
++    print("acquired")
++"""
++
++
++def test_signature_keeps_this_process_sqlite_locks(tmp_path):
++    """Example incident: the signature read state.db and its -shm with open()/close() in the Desktop
++    backend, which cancelled every SQLite POSIX lock the process held on them; a second process then took the WAL
++    writer lock while this one was mid-write and the two corrupted state.db's indexes. A write transaction open
++    here must keep refusing a foreign writer across signature()."""
++    import subprocess
++    import sys
++
++    path = str(tmp_path / "live.db")
++    conn = _db(path, wal=True)
++
++    def foreign_writer():
++        return subprocess.run([sys.executable, "-c", _TRY_WRITE, path], capture_output=True, text=True, check=True,
++                              timeout=60).stdout.strip()
++
++    conn.execute("BEGIN IMMEDIATE")
++    conn.execute("UPDATE t SET v = 'mid-write' WHERE id = 1")
++    assert foreign_writer() == "locked"
++    for _ in range(3):
++        watch.signature(SCOPE, [path], [])
++    assert foreign_writer() == "locked"
++    conn.execute("COMMIT")
++    assert foreign_writer() == "acquired"
++    conn.close()
++
++
++def test_head_reports_missing_files_and_raises_on_unreadable(tmp_path, monkeypatch):
++    assert watch._head(str(tmp_path / "absent.db"), 0, 4) is None
++    present = tmp_path / "present.db"
++    present.write_bytes(b"0123456789")
++    assert watch._head(str(present), 2, 6) == b"2345".hex()
++    monkeypatch.setattr(watch, "pread_lock_safe", lambda *_a: None)
++    import pytest
++
++    with pytest.raises(OSError):
++        watch._head(str(present), 0, 4)
+diff --git a/tests/scripts/test_check_sqlite_sidecar_opens.py b/tests/scripts/test_check_sqlite_sidecar_opens.py
+index d940250670..4a679b0750 100644
+--- a/tests/scripts/test_check_sqlite_sidecar_opens.py
++++ b/tests/scripts/test_check_sqlite_sidecar_opens.py
+@@ -173,3 +173,38 @@ def test_the_tree_is_clean_and_the_baseline_is_empty():
+     mod = _load()
+     assert mod._BASELINE == {}
+     assert mod.scan() == {}
++
++
++# Example incident: a same-file helper that opened its parameter hid the sidecar from the scan, and the
++# annotation holder's ``_head(db + "-shm", 0, 48)`` cancelled the Desktop backend's SQLite locks every 2 s.
++@pytest.mark.parametrize(
++    "src, line",
++    [
++        ('def _head(path, a, b):\n    with open(path, "rb") as f:\n        return f.read()\n'
++         '_head(db + "-shm", 0, 48)', 4),
++        ('def _read(p):\n    return Path(p).read_bytes()\n'
++         'def _wrap(x, y):\n    return _read(y)\n'
++         '_wrap(1, f"{db}-wal")', 5),
++        ('class W:\n    def head(self, path):\n        return os.open(path, os.O_RDONLY)\n'
++         '    def sig(self, db):\n        return self.head(db + "-shm")', 5),
++        ('def _head(path=None):\n    return open(path, "rb")\n_head(path="state.db")', 3),
++    ],
++)
++def test_a_same_file_helper_that_opens_its_parameter_is_followed(src, line):
++    assert _load().sidecar_open_lines(src) == [line]
++
++
++@pytest.mark.parametrize(
++    "src",
++    [
++        # the helper opens only its other parameter
++        'def _copy(src, dst):\n    return open(dst, "wb")\n_copy(db + "-wal", out)',
++        # the opening line carries the opt-out marker
++        'def _head(path):\n    return open(path, "rb")  # sqlite-sidecar-open: ok — stdlib-only child\n'
++        '_head(db + "-shm")',
++        # same name, but not a self/cls method call: another object's method
++        'def head(path):\n    return open(path, "rb")\nother.head(db + "-shm")',
++    ],
++)
++def test_helpers_that_do_not_open_the_sidecar_are_not_flagged(src):
++    assert _load().sidecar_open_lines(src) == []
+-- 
+2.43.0
+

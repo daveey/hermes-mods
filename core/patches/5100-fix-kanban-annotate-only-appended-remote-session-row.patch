@@ -1,0 +1,110 @@
+From 8bcc20d517216a3164bcae0cdf6a841351763ac3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 04:47:10 +0000
+Subject: [PATCH] fix(kanban): annotate only appended remote session rows
+ [daveey]
+
+append_remote_listed_cards walked the mixed local+remote list against
+the replica, so a lagging blocked parent overwrote a locally done
+parent. Collect remote rows and pass those. Quote replica file URIs
+with Path.as_uri().
+
+Proof: test_stale_replica_does_not_override_local_parent_status failed
+on the mixed walk then passed; 88 focused tests green; health clean.
+---
+ .../kanban_session_activity_card_details.py   |  4 +--
+ hermes_cli/kanban_session_outcome_tasks.py    |  4 ++-
+ .../test_kanban_blocked_upstream_details.py   | 35 +++++++++++++++++++
+ 3 files changed, 40 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_session_activity_card_details.py b/hermes_cli/kanban_session_activity_card_details.py
+index 6770b5f760..5d25bb92b9 100644
+--- a/hermes_cli/kanban_session_activity_card_details.py
++++ b/hermes_cli/kanban_session_activity_card_details.py
+@@ -83,7 +83,7 @@ def _replica_for(conn: sqlite3.Connection) -> sqlite3.Connection | None:
+         path = shadow_path(board_slug_for_path(key))
+         if not path.is_file() or Path(key).resolve() == path.resolve():
+             return None
+-        replica = connect(f"file:{path}?mode=ro", uri=True, timeout=5)
++        replica = connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+         replica.row_factory = sqlite3.Row
+         return replica
+     except (OSError, TypeError, ValueError, sqlite3.Error):
+@@ -236,7 +236,7 @@ def annotate_remote_upstream(cards: list[dict[str, Any]]) -> None:
+             path = shadow_path(board)
+             if not path.is_file():
+                 continue
+-            replica = connect(f"file:{path}?mode=ro", uri=True, timeout=5)
++            replica = connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+             replica.row_factory = sqlite3.Row
+             _add_blocked_upstream(replica, found)
+         except (OSError, TypeError, ValueError, sqlite3.Error):
+diff --git a/hermes_cli/kanban_session_outcome_tasks.py b/hermes_cli/kanban_session_outcome_tasks.py
+index 0cc4a89371..c746ee69a4 100644
+--- a/hermes_cli/kanban_session_outcome_tasks.py
++++ b/hermes_cli/kanban_session_outcome_tasks.py
+@@ -59,6 +59,7 @@ def append_remote_listed_cards(out: list[dict[str, Any]], ids: list[str], status
+     from hermes_cli.kanban_session_activity_release import PENDING_RELEASE_STATUSES
+ 
+     wanted, seen = set(ids), set()
++    remote: list[dict[str, Any]] = []
+     for card in _remote_cards(ids, statuses, stale_ok):
+         belongs = card["session"] in wanted or card.get("origin_session") in wanted
+         listed = (card.get("status") in statuses
+@@ -70,8 +71,9 @@ def append_remote_listed_cards(out: list[dict[str, Any]], ids: list[str], status
+             if wait is not None:
+                 row["wait"] = wait
+             out.append(row)
++            remote.append(row)
+     from hermes_cli.kanban_session_activity_card_details import annotate_remote_upstream
+-    annotate_remote_upstream(out)
++    annotate_remote_upstream(remote)
+ 
+ 
+ def _read_lean_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -> list[dict[str, Any]]:
+diff --git a/tests/hermes_cli/test_kanban_blocked_upstream_details.py b/tests/hermes_cli/test_kanban_blocked_upstream_details.py
+index 495989c0fc..bdf4c61c10 100644
+--- a/tests/hermes_cli/test_kanban_blocked_upstream_details.py
++++ b/tests/hermes_cli/test_kanban_blocked_upstream_details.py
+@@ -131,3 +131,38 @@ def test_missing_replica_fails_soft(board, caplog, monkeypatch):
+         rows = details(board, [("c", "todo")], [("b", "c")], ["c"])
+     assert "blocked_upstream" not in rows["c"]
+     assert "upstream" not in rows["c"]
++
++
++def test_stale_replica_does_not_override_local_parent_status(tmp_path, monkeypatch):
++    """Local details win: a done local parent is not rewritten from a lagging blocked replica."""
++    from hermes_cli import kanban_db_sync, kanban_session_activity as ksa, kanban_sync_client
++    from hermes_cli.kanban_session_outcome_tasks import append_remote_listed_cards
++
++    local_path = tmp_path / "local.db"
++    replica_path = tmp_path / "replica.db"
++    local = sqlite3.connect(local_path)
++    local.row_factory = sqlite3.Row
++    local.executescript(SCHEMA)
++    local.executemany("INSERT INTO tasks (id, status) VALUES (?, ?)", [("p", "done"), ("lc", "todo")])
++    local.execute("INSERT INTO task_links VALUES (?, ?)", ("p", "lc"))
++    local.commit()
++    with sqlite3.connect(replica_path) as replica:
++        replica.executescript(SCHEMA)
++        replica.executemany("INSERT INTO tasks (id, status) VALUES (?, ?)",
++                            [("p", "blocked"), ("lc", "todo")])
++        replica.execute("INSERT INTO task_links VALUES (?, ?)", ("p", "lc"))
++    monkeypatch.setattr(kanban_sync_client, "shadow_path", lambda board: replica_path)
++    monkeypatch.setattr(kanban_db_sync, "_db_key", lambda conn: str(local_path))
++    monkeypatch.setattr(kanban_db_sync, "board_slug_for_path", lambda key: "default")
++    found = {"lc": {"id": "lc", "status": "todo", "board": "default"}}
++    _add_card_details(local, found)
++    assert "blocked_upstream" not in found["lc"]
++    monkeypatch.setattr(ksa, "_remote_cards", lambda *a, **k: [{
++        "key": "hub/default/default/remote", "id": "remote", "board": "default",
++        "session": "s1", "status": "todo",
++    }])
++    out = [found["lc"]]
++    append_remote_listed_cards(out, ["s1"], ksa.LISTED_STATUSES, False)
++    local_row = next(row for row in out if row["id"] == "lc")
++    assert "blocked_upstream" not in local_row
++    local.close()
+-- 
+2.43.0
+

@@ -1,0 +1,283 @@
+From 950620b8aba38f6d4a3e3bb7051263b7d95d058f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 21:09:48 +0000
+Subject: [PATCH] fix(kanban): retain artifact-keyed author custody across
+ rework runs [daveey]
+
+Tie concrete PR-head authorship to delivered artifact identities, not verdict boundaries. Retain authors through continued/crashed/no-spawn rework and A-to-B-to-A returns. Complete review_commit_range receipts permit release only for disjoint commit sets; missing range receipts conservatively retain earlier heads of the same PR. Open and merged head identities are supported. Artifact-less historical handoffs preserve the legacy fallback; downstream source provenance stays full-history.
+
+Proof: 17 consumer files, 490 tests passed. scripts/check passes. Eight new lifecycle probes are red with artifact custody disabled; disjoint-range regression red before range support. Eight source mutants killed against a green 96-test baseline. Exact-head CI and independent review remain required before canonical ship.
+---
+ hermes_cli/kanban_review_artifacts.py         | 98 +++++++++++++++++++
+ hermes_cli/kanban_review_model.py             | 11 +++
+ .../test_kanban_review_model_artifacts.py     | 52 ++++++++++
+ .../test_kanban_review_model_cycles.py        | 45 +++++++++
+ .../test_kanban_review_retry_custody.py       |  4 +-
+ 5 files changed, 208 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_review_artifacts.py
+ create mode 100644 tests/hermes_cli/test_kanban_review_model_artifacts.py
+
+diff --git a/hermes_cli/kanban_review_artifacts.py b/hermes_cli/kanban_review_artifacts.py
+new file mode 100644
+index 0000000000..e92d2a945f
+--- /dev/null
++++ b/hermes_cli/kanban_review_artifacts.py
+@@ -0,0 +1,98 @@
++"""Artifact-keyed author custody, independent of review verdict/run ordering."""
++from __future__ import annotations
++
++import re
++
++from hermes_cli.kanban_review_retry import _mapping, rehandoff_runs
++
++
++def _identity(metadata):
++    """A delivered PR head, whether open or merged; incomplete evidence is unknown."""
++    pr, head = metadata.get('published_pr'), metadata.get('reviewed_sha')
++    if (not isinstance(pr, str)
++            or not re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+/pull/[1-9][0-9]*', pr)
++            or not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}', head)):
++        return None
++    merge = metadata.get('merge_commit')
++    if not isinstance(merge, str) or not re.fullmatch(r'[0-9a-f]{40}', merge):
++        merge = None
++    return pr, head, merge
++
++
++def _commit_range(metadata, identity):
++    """Complete handoff receipt for ``git rev-list merge-base..head``; invalid is unknown.
++
++    The delivering worker supplies this immutable metadata, like reviewed_sha itself.
++    Missing receipts never imply disjointness. Producers must list the entire range,
++    not only their own commits; the head/base binding prevents stale receipt reuse.
++    """
++    value = metadata.get('review_commit_range')
++    if not isinstance(value, dict) or identity is None:
++        return None
++    base, head, commits = value.get('base'), value.get('head'), value.get('commits')
++    if (head != identity[1] or not isinstance(base, str) or not re.fullmatch(r'[0-9a-f]{40}', base)
++            or not isinstance(commits, list) or not 0 < len(commits) <= 10000
++            or any(not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha) for sha in commits)):
++        return None
++    result = set(commits)
++    if head not in result or base in result or len(result) != len(commits):
++        return None
++    return result
++
++
++def _related(identity, commits, target, target_commits):
++    if identity is None or target is None:
++        return True
++    if (set(identity[1:]) - {None}) & (set(target[1:]) - {None}):
++        return True
++    if commits is not None and target_commits is not None:
++        return bool(commits & target_commits)
++    # No range proof: different heads of a PR can still contain earlier commits.
++    return identity[0] == target[0]
++
++
++def _review_runs(conn, task_id):
++    reviewing = set()
++    for run_id, kind, raw in conn.execute(
++            "SELECT run_id, kind, payload FROM task_events WHERE task_id=? "
++            "AND kind IN ('model_tier', 'run_route', 'claimed')", (task_id,)):
++        payload = _mapping(raw)
++        if payload.get('lane') == 'review' or (kind == 'claimed' and payload.get('source_status') == 'review'):
++            reviewing.add(run_id)
++    return reviewing
++
++
++def artifact_author_runs(conn, task_id):
++    """Author run ids for the latest artifact, or None for legacy artifact-less cards.
++
++    A verdict never removes artifact custody. Attribute non-review runs to their next
++    handoff, retaining checkpoint/crash authors. Identical immutable handoffs retain
++    the original delivery's authors even across other artifacts. Without a Git range
++    receipt, different heads of the same PR may contain the earlier commits, so retain
++    those authors too. This intentionally over-excludes rather than guessing ancestry.
++    Unknown deliveries stay conservative. No network or mutable worktree is consulted.
++    """
++    rows = conn.execute('SELECT id, outcome, metadata FROM task_runs WHERE task_id=? ORDER BY id',
++                        (task_id,)).fetchall()
++    handoffs = [(rid, _identity(_mapping(raw))) for rid, outcome, raw in rows if outcome == 'review_requested']
++    if not any(identity for _, identity in handoffs):
++        return None
++    target = handoffs[-1][1]
++    target_metadata = next(_mapping(raw) for rid, outcome, raw in reversed(rows) if outcome == 'review_requested')
++    target_commits = _commit_range(target_metadata, target)
++    reviewing = _review_runs(conn, task_id)
++    repeats = rehandoff_runs(conn, task_id)
++    pending, authors = set(), set()
++    for rid, outcome, raw in rows:
++        if rid in reviewing:
++            continue
++        if rid not in repeats:
++            pending.add(rid)
++        if outcome != 'review_requested':
++            continue
++        metadata = _mapping(raw)
++        identity = _identity(metadata)
++        if _related(identity, _commit_range(metadata, identity), target, target_commits):
++            authors.update(pending)
++        pending = set()
++    return authors | pending
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index 1f5610cbf2..432407ab4f 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -117,6 +117,17 @@ def implementer_models(conn, task) -> set[str]:
+ 
+ 
+ def _current_authors(conn, task_id, bounded=True):
++    from hermes_cli.kanban_review_artifacts import artifact_author_runs
++    delivered = artifact_author_runs(conn, task_id) if bounded else None
++    if delivered is None:
++        return _legacy_current_authors(conn, task_id, bounded)
++    models = {model for rid in delivered
++              if (model := (_run_model(conn, task_id, rid, "worker_result", "route_model")
++                            or _run_model(conn, task_id, rid, "run_route", "model")))}
++    return models, False
++
++
++def _legacy_current_authors(conn, task_id, bounded=True):
+     """Authors since the review preceding the latest implementation, plus epoch boundary.
+ 
+     Consecutive review retries keep the same author set. A pre-spawn refusal is
+diff --git a/tests/hermes_cli/test_kanban_review_model_artifacts.py b/tests/hermes_cli/test_kanban_review_model_artifacts.py
+new file mode 100644
+index 0000000000..ff39d11e50
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_review_model_artifacts.py
+@@ -0,0 +1,52 @@
++"""Artifact custody drops authors only with positive commit-range disjointness."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_review_model as review
++from tests.hermes_cli import test_kanban_review_implementer_set as authors
++from tests.hermes_cli.test_kanban_review_retry_custody import ARTIFACT, handoff
++
++board = authors.board
++
++
++def receipt(head, commits):
++    return {'base': '0' * 40, 'head': head, 'commits': commits}
++
++
++def test_unhanded_work_after_artifact_stays_excluded(board):
++    with authors.kbc.connect() as conn:
++        tid = authors._card(conn)
++        handoff(conn, tid, authors.ASTRA, ARTIFACT)
++        authors._run(conn, tid, receipt=authors.OPUS)
++        assert review.implementer_models(conn, kb.get_task(conn, tid)) == {authors.ASTRA, authors.OPUS}
++
++
++@pytest.mark.parametrize('overlap', [True, False])
++def test_complete_ranges_control_same_pr_author_custody(board, overlap):
++    with authors.kbc.connect() as conn:
++        tid = authors._card(conn)
++        first = {**ARTIFACT, 'review_commit_range': receipt('b' * 40, ['b' * 40])}
++        handoff(conn, tid, authors.ASTRA, first)
++        rid = authors._run(conn, tid, receipt=authors.GROK, lane='review')
++        conn.execute("UPDATE task_runs SET outcome='changes_requested' WHERE id=?", (rid,))
++        commits = ['d' * 40, 'b' * 40] if overlap else ['d' * 40]
++        second = {**ARTIFACT, 'merge_commit': 'c' * 40, 'reviewed_sha': 'd' * 40,
++                  'review_commit_range': receipt('d' * 40, commits)}
++        handoff(conn, tid, authors.OPUS, second)
++        excluded = review.implementer_models(conn, kb.get_task(conn, tid))
++        assert excluded == ({authors.ASTRA, authors.OPUS} if overlap else {authors.OPUS})
++
++
++@pytest.mark.parametrize('bad', [None, {}, [], {'base': 'bad'},
++    receipt('e' * 40, ['e' * 40]), receipt('d' * 40, []),
++    receipt('d' * 40, ['d' * 40, 'bad']), receipt('d' * 40, ['d' * 40, 'd' * 40]),
++    {**receipt('d' * 40, ['d' * 40]), 'base': 'bad'},
++    receipt('d' * 40, ['d' * 40, '0' * 40]), receipt('d' * 40, ['e' * 40])])
++def test_invalid_range_never_releases_same_pr_author(board, bad):
++    with authors.kbc.connect() as conn:
++        tid = authors._card(conn)
++        handoff(conn, tid, authors.ASTRA, {**ARTIFACT,
++                'review_commit_range': receipt('b' * 40, ['b' * 40])})
++        handoff(conn, tid, authors.OPUS, {**ARTIFACT, 'merge_commit': 'c' * 40,
++                                        'reviewed_sha': 'd' * 40, 'review_commit_range': bad})
++        assert review.implementer_models(conn, kb.get_task(conn, tid)) == {authors.ASTRA, authors.OPUS}
+diff --git a/tests/hermes_cli/test_kanban_review_model_cycles.py b/tests/hermes_cli/test_kanban_review_model_cycles.py
+index 435cdd2963..bc8943186a 100644
+--- a/tests/hermes_cli/test_kanban_review_model_cycles.py
++++ b/tests/hermes_cli/test_kanban_review_model_cycles.py
+@@ -181,6 +181,51 @@ def test_dispatch_fifth_review_after_four_real_verdict_cycles(board, monkeypatch
+         assert events[-1]["implementer_models"] == [MODELS[-1]]
+ 
+ 
++@pytest.mark.parametrize("merged", [True, False])
++@pytest.mark.parametrize("middle", ["continue", "crash", "route_only", "other_artifact"])
++def test_artifact_authors_survive_nonhandoff_rework(board, middle, merged):
++    from hermes_cli.kanban_continuation import continue_task
++    from tests.hermes_cli.test_kanban_review_retry_custody import ARTIFACT
++    artifact = ARTIFACT if merged else {key: value for key, value in ARTIFACT.items()
++                                      if key not in ("pr_state", "merge_commit")}
++    cfg = helpers.config(board, strong=MODELS[0], routes=MODELS)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="artifact custody", assignee="default")
++
++        def deliver(model, artifact):
++            claimed = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++            assert claimed
++            kb._append_event(conn, tid, "run_route", {"model": model, "lane": "ready"},
++                             run_id=claimed.current_run_id)
++            assert kb.request_review(conn, tid, metadata=artifact)
++
++        deliver(MODELS[0], artifact)
++        verdict(conn, tid, MODELS[1])
++        if middle == "other_artifact":
++            deliver(MODELS[2], {**ARTIFACT, "published_pr": "https://github.com/example/project/pull/13",
++                                "merge_commit": "c" * 40, "reviewed_sha": "d" * 40})
++            verdict(conn, tid, MODELS[1])
++        else:
++            claimed = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++            assert claimed
++            kb._append_event(conn, tid, "run_route", {"model": MODELS[2], "lane": "ready"},
++                             run_id=claimed.current_run_id)
++            if middle == "continue":
++                assert continue_task(conn, tid, checkpoint="Rework remains")["ok"]
++            else:
++                if middle == "crash":
++                    kb._append_event(conn, tid, "spawned", {"pid": 123}, run_id=claimed.current_run_id)
++                provenance._end_run(conn, claimed.current_run_id)
++                conn.execute("UPDATE tasks SET status='triage', current_run_id=NULL, claim_lock=NULL WHERE id=?", (tid,))
++                assert kb.promote_task(conn, tid, actor="operator")[0]
++        deliver(MODELS[3], artifact)
++        claimed = kb.claim_review_task(conn, tid, claimer=kb._claimer_id())
++        excluded = review.implementer_models(conn, claimed)
++        assert MODELS[0] in excluded
++        chosen, _, _ = tier.resolve_model_tier(conn, claimed, lane="review", cfg=cfg)
++        assert chosen not in excluded
++
++
+ def test_provider_wall_does_not_become_structural_exhaustion(board, monkeypatch):
+     cfg = helpers.config(board)
+     from hermes_cli import kanban_provider_walls as walls
+diff --git a/tests/hermes_cli/test_kanban_review_retry_custody.py b/tests/hermes_cli/test_kanban_review_retry_custody.py
+index 103157334a..ef96fd73cf 100644
+--- a/tests/hermes_cli/test_kanban_review_retry_custody.py
++++ b/tests/hermes_cli/test_kanban_review_retry_custody.py
+@@ -86,14 +86,14 @@ def test_verdict_between_identical_handoffs_keeps_original_author(identity_board
+         assert review.implementer_models(conn, kb.get_task(conn, tid)) == {authors.ASTRA}
+ 
+ 
+-def test_verdict_then_changed_handoff_still_starts_new_epoch(identity_board):
++def test_changed_merge_does_not_release_same_head_author(identity_board):
+     with authors.kbc.connect() as conn:
+         tid = authors._card(conn)
+         handoff(conn, tid, authors.ASTRA, ARTIFACT)
+         rid = authors._run(conn, tid, receipt=authors.GROK, lane='review')
+         conn.execute("UPDATE task_runs SET outcome='changes_requested' WHERE id=?", (rid,))
+         handoff(conn, tid, authors.OPUS, {**ARTIFACT, 'merge_commit': 'c' * 40})
+-        assert review.implementer_models(conn, kb.get_task(conn, tid)) == {authors.OPUS}
++        assert review.implementer_models(conn, kb.get_task(conn, tid)) == {authors.ASTRA, authors.OPUS}
+ 
+ 
+ def test_three_refusals_park_and_wake_stay_review(board, monkeypatch):
+-- 
+2.43.0
+

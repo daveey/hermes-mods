@@ -1,0 +1,446 @@
+From 59efa8388da31237da58fe88fca9167ae18f9d21 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 11:22:45 +0000
+Subject: [PATCH] fix(tui_gateway): isolate pending replay custody by exact
+ profile [daveey]
+
+Keep profile identity through local coalescing, timer wake, Stop and retirement handoff. Cancel carried local work only through the successful context start watermark. Proof: four regressions failed on base, 58 focused tests pass, four guard mutants killed.
+---
+ tests/tui_gateway/test_automation_replay.py   | 10 +--
+ .../test_automation_replay_handoff.py         |  3 +-
+ .../test_automation_replay_profiles.py        | 90 +++++++++++++++++++
+ tui_gateway/automation_replay.py              | 86 ++++++++++--------
+ tui_gateway/prompt_turn.py                    |  3 +-
+ 5 files changed, 150 insertions(+), 42 deletions(-)
+ create mode 100644 tests/tui_gateway/test_automation_replay_profiles.py
+
+diff --git a/tests/tui_gateway/test_automation_replay.py b/tests/tui_gateway/test_automation_replay.py
+index e15ea3fca9..9fd84af94b 100644
+--- a/tests/tui_gateway/test_automation_replay.py
++++ b/tests/tui_gateway/test_automation_replay.py
+@@ -86,12 +86,12 @@ def test_cancel_carried_keeps_an_unpersisted_delivery(timers):
+                 now=NOW)
+     ar.schedule("k", text="b", display_kind="kanban_notice", display_metadata={}, due=NOW, cause="c", persisted=False,
+                 now=NOW)
+-    assert ar.cancel_carried("k") and ar.pending("k")
+-    assert not ar.cancel_carried("k")  # what is left never reached the transcript
++    assert ar.cancel_carried("k", through=NOW) and ar.pending("k")
++    assert not ar.cancel_carried("k", through=NOW)  # what is left never reached the transcript
+     ar.reset()
+     ar.schedule("k", text="a", display_kind="kanban_notice", display_metadata={}, due=NOW, cause="c", persisted=True,
+                 now=NOW)
+-    assert ar.cancel_carried("k") and not ar.pending("k") and timers[-1][2].cancelled
++    assert ar.cancel_carried("k", through=NOW) and not ar.pending("k") and timers[-1][2].cancelled
+ 
+ 
+ def test_the_replay_payload_coalesces_and_marks_itself():
+@@ -164,7 +164,7 @@ def test_the_rearmed_replay_carries_the_deliveries_not_the_old_note(timers, monk
+                                               now=NOW)
+     ar.schedule_for_turn({"session_key": "k"}, st)
+     assert ar.pending("k")
+-    entry = ar._entries["k"]
++    entry = ar._entries[(ar._home_of(None), "k")]
+     assert [i.text for i in entry.items] == [original] and entry.items[0].attempt == 1
+     text2, _, meta2 = ar.replay_payload(entry.items)
+     assert text2.count("[Hermes: automatic retry") == 1 and text2.endswith(original)
+@@ -179,7 +179,7 @@ def test_a_replay_wake_refused_by_a_wall_that_still_holds_is_rearmed(timers, mon
+                           "This is the only retry. Check the current state before redoing anything.]\n\nbody",
+                           {"agent_error": "quota", "agent_failure": {"failure_resets_at": reset}},
+                           "kanban_notice", _replay_meta(), "notice-closeout")
+-    assert ar.pending("k") and [i.text for i in ar._entries["k"].items] == ["body"]
++    assert ar.pending("k") and [i.text for i in ar._entries[(ar._home_of(None), "k")].items] == ["body"]
+     ar.reset()
+     ar.replay_failed_wake("k", "body", {"agent_error": "quota", "agent_failure": {}}, "kanban_notice",
+                           _replay_meta(), "notice-closeout")
+diff --git a/tests/tui_gateway/test_automation_replay_handoff.py b/tests/tui_gateway/test_automation_replay_handoff.py
+index 3f5e78a2d6..4c257bd65c 100644
+--- a/tests/tui_gateway/test_automation_replay_handoff.py
++++ b/tests/tui_gateway/test_automation_replay_handoff.py
+@@ -212,6 +212,7 @@ KEY = "20261119_232638_a67251"
+ 
+ @pytest.fixture
+ def wired(journal, monkeypatch):
++    monkeypatch.setattr("hermes_constants.get_process_hermes_home", lambda: journal.path.parent)
+     monkeypatch.setattr(ar, "ENABLED", True)
+     monkeypatch.setattr(threading, "Timer", lambda delay, fn: types.SimpleNamespace(
+         start=lambda: None, daemon=False, cancel=lambda: None))
+@@ -277,7 +278,7 @@ def test_storage_failure_keeps_local_custody_without_spending_budget(wired, monk
+     monkeypatch.setattr(ar, "stale_code_reason", lambda: "superseded")
+     monkeypatch.setattr(Journal, "publish", lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("locked")))
+     ar._fire(KEY)
+-    assert ar.pending(KEY) and ar._entries[KEY].busy_rechecks == 0 and len(ar._entries[KEY].items) == 2
++    assert ar.pending(KEY) and ar._entries[(ar._home_of(None), KEY)].busy_rechecks == 0 and len(ar._entries[(ar._home_of(None), KEY)].items) == 2
+ 
+ 
+ def test_schedule_while_already_retired_hands_off_at_once(wired, monkeypatch):
+diff --git a/tests/tui_gateway/test_automation_replay_profiles.py b/tests/tui_gateway/test_automation_replay_profiles.py
+new file mode 100644
+index 0000000000..cf54f15e7b
+--- /dev/null
++++ b/tests/tui_gateway/test_automation_replay_profiles.py
+@@ -0,0 +1,90 @@
++"""Local retirement custody is isolated before either profile hands off."""
++import threading
++
++import pytest
++
++from tui_gateway import automation_replay as ar
++from tui_gateway.automation_replay_handoff import Journal
++
++
++@pytest.fixture
++def homes(tmp_path, monkeypatch):
++    import sqlite3
++    roots = [tmp_path / "profiles" / p for p in ("alpha", "beta")]
++    for home in roots:
++        home.mkdir(parents=True)
++        sqlite3.connect(home / "state.db").close()
++    monkeypatch.setattr(ar, "ENABLED", True)
++    monkeypatch.setattr(ar, "stale_code_reason", lambda: None)
++    monkeypatch.setattr("hermes_constants.get_process_hermes_home", lambda: roots[0])
++    timers = []
++
++    class Timer:
++        def __init__(self, delay, callback):
++            self.callback = callback
++            self.daemon = False
++            timers.append(self)
++
++        def start(self):
++            pass
++
++        def cancel(self):
++            pass
++
++    monkeypatch.setattr(threading, "Timer", Timer)
++    ar.reset()
++    yield roots, timers
++    ar.reset()
++
++
++def schedule(home, text, *, persisted=True, now=100):
++    return ar.schedule("same-key", text=text, display_kind="process_complete", display_metadata={},
++                       due=1000, cause="quota", persisted=persisted, now=now, profile_home=home)
++
++
++def test_same_key_two_profiles_handoff_without_coalescing(homes):
++    (alpha, beta), _ = homes
++    schedule(alpha, "alpha work")
++    schedule(beta, "beta work")
++    assert ar.handoff_all() == 2
++    for home, expected in ((alpha, "alpha work"), (beta, "beta work")):
++        batch = Journal(home).claim("same-key", 2000, "successor", lambda _: False)
++        assert batch is not None
++        import json
++        assert [i["text"] for i in json.loads(batch["payload"])] == [expected]
++
++
++def test_stop_one_profile_does_not_drop_other_profile_work(homes):
++    (alpha, beta), _ = homes
++    schedule(alpha, "alpha work", persisted=False)
++    schedule(beta, "beta work", persisted=False)
++    ar.cancel_durable(alpha, ("same-key",), 200, stop=True)
++    assert ar.handoff_all() == 1
++    assert Journal(alpha).claim("same-key", 2000, "a", lambda _: False) is None
++    assert Journal(beta).claim("same-key", 2000, "b", lambda _: False) is not None
++
++
++def test_timer_replays_only_its_profile(homes, monkeypatch):
++    (alpha, beta), timers = homes
++    schedule(alpha, "alpha work")
++    schedule(beta, "beta work")
++    calls = []
++    monkeypatch.setattr("tui_gateway.server._wake_session_turn", lambda key, text, **kw: calls.append((text, kw)) or "started")
++    timers[0].callback()
++    assert len(calls) == 1 and "alpha work" in calls[0][0] and "beta work" not in calls[0][0]
++    assert calls[0][1]["profiles"] == ["alpha"]
++    assert ar.handoff_all() == 1
++    assert Journal(beta).claim("same-key", 2000, "b", lambda _: False) is not None
++
++
++def test_success_only_cancels_carried_items_at_context_start(homes):
++    (alpha, beta), _ = homes
++    schedule(alpha, "already carried", now=100)
++    schedule(alpha, "joined during turn", now=300)
++    schedule(beta, "foreign profile", now=100)
++    assert ar.cancel_carried("same-key", profile_home=alpha, through=200)
++    assert ar.handoff_all() == 2
++    import json
++    for home, expected in ((alpha, "joined during turn"), (beta, "foreign profile")):
++        batch = Journal(home).claim("same-key", 2000, "successor", lambda _: False)
++        assert [i["text"] for i in json.loads(batch["payload"])] == [expected]
+diff --git a/tui_gateway/automation_replay.py b/tui_gateway/automation_replay.py
+index a9fcff07ac..a526232d35 100644
+--- a/tui_gateway/automation_replay.py
++++ b/tui_gateway/automation_replay.py
+@@ -95,7 +95,7 @@ class _Entry:
+ 
+ 
+ _lock = threading.Lock()
+-_entries: dict[str, _Entry] = {}
++_entries: dict[tuple[str | None, str], _Entry] = {}
+ 
+ 
+ @dataclass(frozen=True)
+@@ -328,12 +328,13 @@ def plan_turn_failure(display_kind: Any, display_metadata: Any, text: Any, resul
+ 
+ 
+ def _arm(key: str, entry: _Entry, delay: float, fire: Callable[[str], None]) -> None:
++    slot = (entry.home, key)
+     def guarded_fire():
+         if fire is _fire:
+-            _fire(key, expected_timer=timer)
++            _fire(key, profile_home=entry.home, expected_timer=timer)
+         else:
+             with _lock:
+-                current = _entries.get(key) is entry and entry.timer is timer
++                current = _entries.get(slot) is entry and entry.timer is timer
+             if current:
+                 fire(key)
+ 
+@@ -368,8 +369,9 @@ def schedule(session_key: str, *, text: str, display_kind: str, display_metadata
+     item.source_batch = source_batch
+     fire = fire or _fire
+     home = _home_of(profile_home)
++    slot = (home, key)
+     with _lock:
+-        entry = _entries.get(key)
++        entry = _entries.get(slot)
+         if entry is not None:
+             entry.home = entry.home or home
+             entry.items.append(item)
+@@ -385,39 +387,43 @@ def schedule(session_key: str, *, text: str, display_kind: str, display_metadata
+         else:
+             joined = False
+             entry = _Entry(items=[item], due=due, home=home)
+-            _entries[key] = entry
++            _entries[slot] = entry
+             _arm(key, entry, max(due - now, REPLAY_MIN_DELAY_S), fire)
+     if not joined:
+         logger.info("automation-replay: %s failed in %s (%s); one replay at %s", subject(
+             display_kind, display_metadata, text), key, cause, format_when(due, now))
+-    _handoff_if_retired(key)
++    _handoff_if_retired(key, home)
+     return True
+ 
+ 
+-def cancel_carried(*session_keys: str) -> bool:
++def cancel_carried(*session_keys: str, profile_home: Any = None, through: float | None = None) -> bool:
+     """A turn in the chat succeeded: drop the pending deliveries its context already carried. True if any went."""
+     dropped = False
++    home = _home_of(profile_home)
++    through = time.time() if through is None else through
+     with _lock:
+         for key in dict.fromkeys(k for k in session_keys if k):
+-            entry = _entries.get(key)
++            slot = (home, key)
++            entry = _entries.get(slot)
+             if entry is None:
+                 continue
+-            kept = [item for item in entry.items if not item.persisted]
++            kept = [item for item in entry.items if not item.persisted or item.failed_at > through]
+             if len(kept) == len(entry.items):
+                 continue
+             dropped = True
+             entry.items = kept
+             if not kept:
+                 _cancel_timer(entry)
+-                del _entries[key]
++                del _entries[slot]
+             logger.info("automation-replay: a later turn in %s succeeded and carries the failed delivery; %s",
+                         key, "replay cancelled" if not kept else f"{len(kept)} unpersisted delivery(ies) still pending")
+     return dropped
+ 
+ 
+-def pending(session_key: str) -> bool:
++def pending(session_key: str, *, profile_home: Any = None) -> bool:
++    slot = (_home_of(profile_home), str(session_key or ""))
+     with _lock:
+-        return str(session_key or "") in _entries
++        return slot in _entries
+ 
+ 
+ def reset() -> None:
+@@ -515,20 +521,21 @@ def schedule_for_turn(session: dict, st: Any) -> None:
+              profile_home=session.get("profile_home"))
+ 
+ 
+-def _fire(key: str, *, expected_timer=None) -> None:
++def _fire(key: str, *, profile_home: Any = None, expected_timer=None) -> None:
+     retired = stale_code_reason()
++    slot = (_home_of(profile_home), key)
+     with _lock:
+-        entry = _entries.get(key)
++        entry = _entries.get(slot)
+         if entry is None or (expected_timer is not None and entry.timer is not expected_timer):
+             return
+         custody = retired and bool(entry.home) and bool(entry.items)
+         if not custody:
+-            _entries.pop(key)
++            _entries.pop(slot)
+     if custody:
+         # Retirement is a transfer, not a busy attempt. Keep the due/reset unchanged.
+-        if not handoff(key):
++        if not handoff(key, profile_home=entry.home):
+             with _lock:
+-                kept = _entries.get(key)
++                kept = _entries.get(slot)
+                 if kept is not None:
+                     _arm(key, kept, BUSY_RECHECK_S, _fire)
+         return
+@@ -539,7 +546,7 @@ def _fire(key: str, *, expected_timer=None) -> None:
+     try:
+         from tui_gateway import server
+         verdict = server._wake_session_turn(key, text, display_kind=kind, display_metadata=meta,
+-                                            label="automation-replay")
++                                            label="automation-replay", profiles=[_profile_of(entry.home)])
+     except Exception:  # health: allow BLE001 -- the replay is best effort; logged as given up below
+         logger.warning("automation-replay: replay of %s raised", key, exc_info=True)
+         verdict = "error"
+@@ -548,12 +555,12 @@ def _fire(key: str, *, expected_timer=None) -> None:
+         return
+     if verdict == "busy" and entry.busy_rechecks < BUSY_RECHECKS_MAX:
+         with _lock:
+-            if key not in _entries:  # a newer failure may have armed its own entry meanwhile: join it
++            if slot not in _entries:  # a newer failure may have armed its own entry meanwhile: join it
+                 entry.busy_rechecks += 1
+-                _entries[key] = entry
++                _entries[slot] = entry
+                 _arm(key, entry, BUSY_RECHECK_S, _fire)
+                 return
+-            current = _entries[key]
++            current = _entries[slot]
+             current.items[:0] = entry.items
+         return
+     logger.warning("automation-replay: gave up on %s in %s after one retry (%s); nothing more is scheduled",
+@@ -567,10 +574,10 @@ def _fire(key: str, *, expected_timer=None) -> None:
+ def _home_of(profile_home: Any) -> str | None:
+     """The chat's exact profile home; ``None`` in a session record means the LAUNCH profile (resolved here)."""
+     if profile_home:
+-        return str(profile_home)
++        return str(Path(profile_home).expanduser().resolve())
+     try:
+         from hermes_constants import get_process_hermes_home
+-        return str(get_process_hermes_home())
++        return str(Path(get_process_hermes_home()).expanduser().resolve())
+     except Exception:  # health: allow BLE001 -- no resolvable home: custody stays local
+         return None
+ 
+@@ -587,13 +594,14 @@ def _item_from(data: dict) -> _Item:
+                  int(data.get("attempt") or 0), str(data["id"]))
+ 
+ 
+-def handoff(key: str) -> bool:
++def handoff(key: str, *, profile_home: Any = None) -> bool:
+     """Publish this chat's pending replay to its profile's journal; the local copy goes only once the journal
+     accepted it. False (custody kept here, nothing lost) when it cannot (no profile home, storage failure)."""
+     from tui_gateway.automation_replay_handoff import Journal
++    slot = (_home_of(profile_home), key)
+     for _ in range(3):  # deliveries that join while the write is in flight are handed over by the next round
+         with _lock:
+-            entry = _entries.get(key)
++            entry = _entries.get(slot)
+             if entry is None or not entry.home or not entry.items:
+                 return entry is None
+             items, due, home = list(entry.items), entry.due, entry.home
+@@ -603,29 +611,31 @@ def handoff(key: str) -> bool:
+             logger.warning("automation-replay: handing %s to the successor failed; kept here", key, exc_info=True)
+             return False
+         with _lock:
+-            current = _entries.get(key)
++            current = _entries.get(slot)
+             if current is entry:
+                 sent = {i.id for i in items}
+                 current.items = [i for i in current.items if i.id not in sent]
+                 if not current.items:
+                     _cancel_timer(current)
+-                    del _entries[key]
++                    del _entries[slot]
+                     logger.info("automation-replay: handed the replay of %s to the successor backend", key)
+                     return True
+     return False
+ 
+ 
+-def _handoff_if_retired(key: str) -> None:
++def _handoff_if_retired(key: str, home: Any) -> None:
+     if stale_code_reason():
+-        handoff(key)
++        handoff(key, profile_home=home)
+ 
+ 
+ def handoff_all() -> int:
+     """Hand every pending replay over (this process was just retired). Never raises."""
+     done = 0
+     try:
+-        for key in list(_entries):
+-            done += bool(handoff(key))
++        with _lock:
++            slots = list(_entries)
++        for home, key in slots:
++            done += bool(handoff(key, profile_home=home))
+     except Exception:  # health: allow BLE001 -- retirement must not fail on custody transfer
+         logger.warning("automation-replay: retirement handoff failed", exc_info=True)
+     return done
+@@ -656,12 +666,13 @@ def cancel_durable(home: Any, keys: Any, through: float, *, stop: bool = False)
+     if stop:
+         with _lock:
+             for key in keys:
+-                entry = _entries.get(key)
++                slot = (home, key)
++                entry = _entries.get(slot)
+                 if entry is not None and entry.home == home:
+                     entry.items = [i for i in entry.items if i.failed_at > through]
+                     if not entry.items:
+                         _cancel_timer(entry)
+-                        del _entries[key]
++                        del _entries[slot]
+     try:
+         from tui_gateway.automation_replay_handoff import Journal
+         journal = Journal(home)
+@@ -671,6 +682,11 @@ def cancel_durable(home: Any, keys: Any, through: float, *, stop: bool = False)
+         logger.warning("automation-replay: durable cancel failed", exc_info=True)
+ 
+ 
++def _profile_of(home: Any) -> str | None:
++    path = Path(str(home))
++    return path.name if path.parent.name == "profiles" else None
++
++
+ def _holder() -> str:
+     from hermes_cli.host_loop_lease import _start_of
+     return f"{os.getpid()}|{_start_of(os.getpid())}"
+@@ -721,7 +737,7 @@ def _consume(homes: list, wake: Callable[..., str] | None, now: float | None) ->
+         except Exception:  # health: allow BLE001 -- one unreadable store must not stop the others
+             logger.warning("automation-replay: journal of %s unreadable", home, exc_info=True)
+             continue
+-        profile = Path(str(home)).name if Path(str(home)).parent.name == "profiles" else None
++        profile = _profile_of(home)
+         for owner in owners:
+             try:
+                 batch = journal.claim(owner, time.time() if now is None else now, _holder(), _own_or_alive)
+@@ -761,7 +777,7 @@ def _run_batch(journal, batch: dict, owner: str, profile: str | None, wake) -> N
+         with _lock:
+             _failures[bid] = _failures.get(bid, 0) + 1
+             tries = _failures[bid]
+-            entry = _entries.get(owner)
++            entry = _entries.get((_home_of(journal.path.parent), owner))
+             local = bool(entry and entry.home == str(journal.path.parent) and
+                          any(i.source_batch == bid for i in entry.items))
+         if not local and tries < HANDOFF_FAILURES_MAX:
+diff --git a/tui_gateway/prompt_turn.py b/tui_gateway/prompt_turn.py
+index 1c1d1f7b31..8077d340d3 100644
+--- a/tui_gateway/prompt_turn.py
++++ b/tui_gateway/prompt_turn.py
+@@ -1482,7 +1482,8 @@ def _run_admitted_prompt(
+                 outcome_sid=turn_sid(session, st.agent))
+             if status == "complete":
+                 # [daveey] This turn's context carried any failed delivery already in the transcript.
+-                automation_replay.cancel_carried(st.marker_key, str(session.get("session_key") or ""))
++                automation_replay.cancel_carried(st.marker_key, str(session.get("session_key") or ""),
++                                                 profile_home=session.get("profile_home"), through=_turn_started_wall)
+                 automation_replay.cancel_durable(session.get("profile_home"),
+                                                  (st.marker_key, str(session.get("session_key") or "")),
+                                                  _turn_started_wall)
+-- 
+2.43.0
+

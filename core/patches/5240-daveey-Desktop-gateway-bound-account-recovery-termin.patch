@@ -1,0 +1,925 @@
+From f951ac7dc4e1a567be372e7f9b40af6b3d34f056 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 14:18:41 +0000
+Subject: [PATCH] [daveey] Desktop: gateway-bound account recovery terminal
+ with a fixed command
+
+A panel that finds a dead Anthropic grant had no supported way to start the
+sign-in for that exact stored row: core forbids a dashboard login for
+Anthropic, and the only hand-off was Settings > Accounts, which shows CLI
+instructions and would add a second row.
+
+Add `window.hermesDesktop.terminal.startRecovery({connectionId, profile,
+provider, credentialId})`. The caller names a gateway, a provider and a pool
+row id and supplies no command text. Main checks each field against a fixed
+pattern and runs only `hermes [--profile NAME] auth reauth PROVIDER ID`:
+through this device's resolved Hermes runtime for the local gateway, or
+through the gateway's recorded launcher over that gateway's SSH connection.
+
+- A request that fails a check, a removed gateway, a gateway with no shell
+  transport, a Windows host and an unknown remote launcher start no process
+  and return `unavailable`; a gateway without a shell is never replaced by
+  this device.
+- The session is not a terminal tab (not listed, saved, restored or readable
+  by agent terminal tools). Only the window that started it can attach, write,
+  resize, read its cwd or dispose it. Ordinary shell tabs keep their existing
+  write path.
+- Only `anthropic` is accepted; Codex keeps the dashboard device sign-in.
+
+Proof: electron/terminal-recovery.test.ts, 12 tests (argument checks, local and
+SSH argv, every refusal, per-window ownership). They cannot run on the base
+commit: the module and the IPC channel do not exist there. Existing terminal
+IPC and external-terminal suites: 32 pass. "Open in terminal" now builds its
+script from the same launcher helper (keeps main.ts within its line cap). tsc (renderer and electron projects) and eslint clean.
+Not proven: a live Desktop run and a live Anthropic sign-in.
+---
+ apps/desktop/electron/external-terminal.ts    |  23 ++
+ apps/desktop/electron/main.ts                 |  20 +-
+ apps/desktop/electron/preload.ts              |   1 +
+ apps/desktop/electron/terminal-ipc.ts         | 223 +++++++++---
+ .../electron/terminal-recovery.test.ts        | 324 ++++++++++++++++++
+ apps/desktop/electron/terminal-recovery.ts    |  75 ++++
+ apps/desktop/src/global.d.ts                  |  14 +
+ .../user-guide/selected-account-recovery.md   |  10 +-
+ 8 files changed, 627 insertions(+), 63 deletions(-)
+ create mode 100644 apps/desktop/electron/terminal-recovery.test.ts
+ create mode 100644 apps/desktop/electron/terminal-recovery.ts
+
+diff --git a/apps/desktop/electron/external-terminal.ts b/apps/desktop/electron/external-terminal.ts
+index fbd87ffe37..efc2b1dbf4 100644
+--- a/apps/desktop/electron/external-terminal.ts
++++ b/apps/desktop/electron/external-terminal.ts
+@@ -75,6 +75,29 @@ export function terminalScriptEnv(
+   return out
+ }
+ 
++export interface TerminalLauncher {
++  args: string[]
++  command: string
++  env: Record<string, string>
++  /** The command is a shell shim, not something to exec directly. */
++  shell: boolean
++}
++
++/** A resolved Hermes backend as a command to launch in a terminal, or null when no runtime is installed. */
++export function terminalLauncher(
++  backend: { args: string[]; command?: null | string; env?: Record<string, string | undefined>; shell?: boolean },
++  hermesHome?: string
++): null | TerminalLauncher {
++  return backend.command
++    ? {
++        args: backend.args,
++        command: backend.command,
++        env: terminalScriptEnv(backend.env, hermesHome),
++        shell: Boolean(backend.shell)
++      }
++    : null
++}
++
+ export interface TerminalScriptSpec {
+   command: string
+   args: string[]
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 77fe940db3..3f3a03e717 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -252,7 +252,7 @@ import { openExternalUrl as externalOpen, type ExternalOpenDeps, reportPreOpenSt
+ import {
+   buildTerminalScript,
+   resolveTerminalLaunch,
+-  terminalScriptEnv,
++  terminalLauncher,
+   terminalScriptExtension,
+   tuiResumeArgs
+ } from './external-terminal'
+@@ -13894,8 +13894,9 @@ ipcMain.handle('hermes:window:openInTerminal', async (_event, sessionId, opts) =
+   try {
+     const profile = typeof opts?.profile === 'string' ? opts.profile.trim() : ''
+     const backend = await resolveHermesBackend(tuiResumeArgs(sessionId.trim(), profile || undefined))
++    const launcher = terminalLauncher(backend, HERMES_HOME)
+ 
+-    if (!backend.command) {
++    if (!launcher) {
+       return { ok: false, error: 'Hermes is not installed yet' }
+     }
+ 
+@@ -13908,16 +13909,7 @@ ipcMain.handle('hermes:window:openInTerminal', async (_event, sessionId, opts) =
+       `hermes-${crypto.randomBytes(6).toString('hex')}${terminalScriptExtension()}`
+     )
+ 
+-    fs.writeFileSync(
+-      scriptPath,
+-      buildTerminalScript({
+-        args: backend.args,
+-        command: backend.command,
+-        cwd,
+-        env: terminalScriptEnv(backend.env, HERMES_HOME)
+-      }),
+-      { mode: 0o700 }
+-    )
++    fs.writeFileSync(scriptPath, buildTerminalScript({ ...launcher, cwd }), { mode: 0o700 })
+ 
+     const launch = resolveTerminalLaunch({ findOnPath, scriptPath })
+ 
+@@ -16803,7 +16795,9 @@ const terminalIpc = registerTerminalIpc({
+   ensureGatewayBackend: owner =>
+     backendDialClaims.run(backendScopeKey(owner.connectionId, owner.profile), () =>
+       ensureRegistryBackend(owner.connectionId, owner.profile, '', { use: true })
+-    )
++    ),
++  // Resolution only, as for "open in terminal": a recovery never starts a first-run install.
++  localHermesCli: async args => terminalLauncher(await resolveHermesBackend(args), HERMES_HOME)
+ })
+ 
+ const disposeTerminalSession = terminalIpc.disposeTerminalSession
+diff --git a/apps/desktop/electron/preload.ts b/apps/desktop/electron/preload.ts
+index 76922809c3..709e95aec4 100644
+--- a/apps/desktop/electron/preload.ts
++++ b/apps/desktop/electron/preload.ts
+@@ -586,6 +586,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
+     dispose: id => ipcRenderer.invoke('hermes:terminal:dispose', id),
+     resize: (id, size) => ipcRenderer.invoke('hermes:terminal:resize', id, size),
+     start: options => ipcRenderer.invoke('hermes:terminal:start', options),
++    startRecovery: options => ipcRenderer.invoke('hermes:terminal:recovery:start', options),
+     write: (id, data) => ipcRenderer.invoke('hermes:terminal:write', id, data),
+     onData: (id, callback) => {
+       const channel = `hermes:terminal:${id}:data`
+diff --git a/apps/desktop/electron/terminal-ipc.ts b/apps/desktop/electron/terminal-ipc.ts
+index e733606279..b680619879 100644
+--- a/apps/desktop/electron/terminal-ipc.ts
++++ b/apps/desktop/electron/terminal-ipc.ts
+@@ -11,6 +11,7 @@ import { app, ipcMain } from 'electron'
+ import nodePty from 'node-pty'
+ 
+ import { resolveTerminalConnection, resolveTerminalConnectionForSender } from './connection-apply'
++import type { TerminalLauncher } from './external-terminal'
+ import { ensureSpawnHelperExecutable } from './spawn-helper-perms'
+ import { buildInteractiveSshArgs } from './ssh-connection'
+ import {
+@@ -20,6 +21,7 @@ import {
+   type TerminalGatewayTarget
+ } from './terminal-gateway-target'
+ import { createTerminalOutputGate } from './terminal-output-gate'
++import { recoveryCliArgs, remoteRecoveryCommand, requestedRecovery } from './terminal-recovery'
+ import { applyWindowsMsysBashEnvDefaults } from './windows-msys-bash-env'
+ import { buildWindowsInteractiveCommand } from './windows-remote-lifecycle'
+ 
+@@ -31,12 +33,23 @@ export interface TerminalIpcDeps {
+   /** The ssh client to spawn for remote terminals (resolveSshBinary). */
+   sshBinary: () => string
+   ensureBackend: (webContentsId: number) => Promise<unknown>
+-  getSshConnectionState: (scope: string) => undefined | { registryConnectionId?: null | string; remotePlatform?: string }
++  getSshConnectionState: (scope: string) =>
++    | undefined
++    | {
++        hermesHome?: null | string
++        hermesPath?: null | string
++        registryConnectionId?: null | string
++        remotePlatform?: string
++      }
+   /** The host of the gateway a tab was opened on. A tab owns its gateway: the
+    *  window-backend route (which a Sessions pick never re-points) only serves
+    *  tabs that recorded none. */
+   gatewayTarget: (owner: TerminalGatewayOwner) => TerminalGatewayTarget
+   ensureGatewayBackend: (owner: TerminalGatewayOwner) => Promise<unknown>
++  /** This device's Hermes launcher for `hermes <args>`, resolved the way the
++   *  app resolves its own backend; null when no runtime is installed. Absent
++   *  on hosts that cannot run an account recovery. */
++  localHermesCli?: (args: string[]) => Promise<null | TerminalLauncher>
+ }
+ 
+ export interface TerminalIpcApi {
+@@ -69,7 +82,8 @@ export function registerTerminalIpc({
+   ensureBackend,
+   getSshConnectionState,
+   gatewayTarget,
+-  ensureGatewayBackend
++  ensureGatewayBackend,
++  localHermesCli
+ }: TerminalIpcDeps): TerminalIpcApi {
+   const terminalSessions = new Map()
+ 
+@@ -342,7 +356,9 @@ export function registerTerminalIpc({
+     webContentsId: number
+   ): Promise<{ sshTarget: null | SshTerminalTarget } | { unavailable: 'missing' | 'no-shell' }> {
+     if (!owner) {
+-      return { sshTarget: await resolveTerminalConnectionForSender(webContentsId, activeSshTerminalTarget, ensureBackend) }
++      return {
++        sshTarget: await resolveTerminalConnectionForSender(webContentsId, activeSshTerminalTarget, ensureBackend)
++      }
+     }
+ 
+     const target = await resolveTerminalConnection(
+@@ -366,6 +382,138 @@ export function registerTerminalIpc({
+     return sshTarget ? getSshConnectionState(sshTarget.scope)?.registryConnectionId || null : 'local'
+   }
+ 
++  // Wire a spawned PTY to the renderer that asked for it and register it.
++  function trackSession(event, id: string, ptyProcess, extra: Record<string, unknown>) {
++    const send = (suffix, payload) => {
++      if (event.sender.isDestroyed()) {
++        return
++      }
++
++      event.sender.send(terminalChannel(id, suffix), payload)
++    }
++
++    const outputGate = createTerminalOutputGate({
++      onExitFlushed: () => disposeTerminalSession(id),
++      sendData: data => send('data', data),
++      sendExit: payload => send('exit', payload)
++    })
++
++    terminalSessions.set(id, { outputGate, pty: ptyProcess, webContentsId: event.sender.id, ...extra })
++
++    ptyProcess.onData(data => outputGate.data(data))
++    ptyProcess.onExit(({ exitCode, signal }) => {
++      outputGate.exit({ code: exitCode, signal: signal == null ? null : String(signal) })
++
++      // The child is gone but node-pty keeps the /dev/ptmx master fd open
++      // until kill() runs; release it here instead of waiting for the tab to
++      // close (or the renderer to attach), or repeated `exit`s exhaust macOS
++      // PTYs (#128942). The map entry stays until the gate flushes the
++      // buffered exit, so a late attach still receives it.
++      try {
++        ptyProcess.kill()
++      } catch {
++        // Already reaped.
++      }
++    })
++    event.sender.once('destroyed', () => disposeTerminalSession(id))
++  }
++
++  // An account-recovery PTY carries a sign-in: only the renderer that started
++  // it may type into it, size it, read its cwd or end it.
++  function sessionFor(event, id) {
++    const sessionInfo = terminalSessions.get(String(id || ''))
++
++    if (!sessionInfo || (sessionInfo.recovery && sessionInfo.webContentsId !== event?.sender?.id)) {
++      return null
++    }
++
++    return sessionInfo
++  }
++
++  const ptyDimension = (value: unknown, fallback: number) =>
++    Math.max(2, Number.parseInt(String(value || fallback), 10) || fallback)
++
++  // The one process a recovery may start on its gateway, or why none can.
++  async function recoveryLaunch(
++    target: Exclude<TerminalGatewayTarget, 'missing' | 'no-shell' | 'pending'>,
++    args: string[]
++  ) {
++    if (target === 'local') {
++      const cli = localHermesCli ? await localHermesCli(args) : null
++
++      // A shell shim would put the arguments on a shell command line; only a direct exec runs here.
++      return cli?.command && !cli.shell
++        ? { args: cli.args, command: cli.command, env: { ...terminalShellEnv(), ...cli.env } }
++        : 'no-runtime'
++    }
++
++    const state = getSshConnectionState(target.scope)
++    const posix = state?.remotePlatform === 'Linux' || state?.remotePlatform === 'Darwin'
++    const remoteCommand = posix ? remoteRecoveryCommand(state, args) : null
++
++    return remoteCommand
++      ? {
++          args: buildInteractiveSshArgs(target.ssh, '', undefined, remoteCommand),
++          command: sshBinary(),
++          env: terminalShellEnv()
++        }
++      : 'unsupported'
++  }
++
++  // Account recovery: run `hermes auth reauth <provider> <row>` on the gateway
++  // that owns the row, and nothing else. The request names a gateway, a
++  // provider and a row id; a request that fails any check starts no process,
++  // and a gateway without a shell transport is reported, never replaced by
++  // this device.
++  ipcMain.handle('hermes:terminal:recovery:start', async (event, payload = {}) => {
++    const refused = (unavailable: string) => ({ id: '', recovery: true, unavailable })
++    const request = requestedRecovery(payload)
++    const owner = requestedTerminalGateway(payload)
++    const args = request && owner ? recoveryCliArgs(request, owner.profile) : null
++
++    if (!request || !owner || !args) {
++      return refused('invalid')
++    }
++
++    if (isWindows) {
++      return refused('unsupported')
++    }
++
++    const target = await resolveTerminalConnection(
++      () => gatewayTarget(owner),
++      () => ensureGatewayBackend(owner)
++    )
++
++    if (target === 'missing' || target === 'no-shell') {
++      return refused(target)
++    }
++
++    const launch = await recoveryLaunch(target, args)
++
++    if (typeof launch === 'string') {
++      return refused(launch)
++    }
++
++    ensureNodePtySpawnHelper()
++
++    const ptyProcess = nodePty.spawn(launch.command, launch.args, {
++      cols: ptyDimension(payload?.cols, 80),
++      cwd: app.getPath('home'),
++      env: launch.env,
++      name: 'xterm-256color',
++      rows: ptyDimension(payload?.rows, 24)
++    })
++
++    const id = crypto.randomUUID()
++
++    trackSession(event, id, ptyProcess, {
++      recovery: true,
++      ...(target === 'local' ? {} : { sshScope: target.scope })
++    })
++
++    return { connectionId: owner.connectionId, id, recovery: true }
++  })
++
+   ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
+     ensureNodePtySpawnHelper()
+ 
+@@ -381,7 +529,13 @@ export function registerTerminalIpc({
+     // Removed gateway, or one with no shell transport: report it instead of
+     // spawning a local shell the tab would label with the remote's name.
+     if ('unavailable' in resolved) {
+-      return { connectionId: owner?.connectionId ?? null, cwd: null, id: '', shell: '', unavailable: resolved.unavailable }
++      return {
++        connectionId: owner?.connectionId ?? null,
++        cwd: null,
++        id: '',
++        shell: '',
++        unavailable: resolved.unavailable
++      }
+     }
+ 
+     const { sshTarget } = resolved
+@@ -401,43 +555,12 @@ export function registerTerminalIpc({
+         )
+       : nodePty.spawn(command, args, { cols, cwd, env: terminalShellEnv(), name: 'xterm-256color', rows })
+ 
+-    const send = (suffix, payload) => {
+-      if (event.sender.isDestroyed()) {
+-        return
+-      }
+-
+-      event.sender.send(terminalChannel(id, suffix), payload)
+-    }
+-
+-    const outputGate = createTerminalOutputGate({
+-      onExitFlushed: () => disposeTerminalSession(id),
+-      sendData: data => send('data', data),
+-      sendExit: payload => send('exit', payload)
+-    })
+-
+-    terminalSessions.set(id, {
+-      outputGate,
+-      pty: ptyProcess,
+-      webContentsId: event.sender.id,
+-      ...(remote ? { sshScope: sshTarget.scope, remoteCwd: String(payload?.cwd || '') } : {})
+-    })
+-
+-    ptyProcess.onData(data => outputGate.data(data))
+-    ptyProcess.onExit(({ exitCode, signal }) => {
+-      outputGate.exit({ code: exitCode, signal: signal == null ? null : String(signal) })
+-
+-      // The child is gone but node-pty keeps the /dev/ptmx master fd open
+-      // until kill() runs; release it here instead of waiting for the tab to
+-      // close (or the renderer to attach), or repeated `exit`s exhaust macOS
+-      // PTYs (#128942). The map entry stays until the gate flushes the
+-      // buffered exit, so a late attach still receives it.
+-      try {
+-        ptyProcess.kill()
+-      } catch {
+-        // Already reaped.
+-      }
+-    })
+-    event.sender.once('destroyed', () => disposeTerminalSession(id))
++    trackSession(
++      event,
++      id,
++      ptyProcess,
++      remote ? { sshScope: sshTarget.scope, remoteCwd: String(payload?.cwd || '') } : {}
++    )
+ 
+     return { connectionId: spawnedOn(owner, sshTarget), cwd: remote ? null : cwd, id, shell: remote ? 'ssh' : name }
+   })
+@@ -454,8 +577,8 @@ export function registerTerminalIpc({
+     return true
+   })
+ 
+-  ipcMain.handle('hermes:terminal:write', (_event, id, data) => {
+-    const sessionInfo = terminalSessions.get(String(id || ''))
++  ipcMain.handle('hermes:terminal:write', (event, id, data) => {
++    const sessionInfo = sessionFor(event, id)
+ 
+     if (!sessionInfo) {
+       return false
+@@ -466,8 +589,8 @@ export function registerTerminalIpc({
+     return true
+   })
+ 
+-  ipcMain.handle('hermes:terminal:resize', (_event, id, size = {}) => {
+-    const sessionInfo = terminalSessions.get(String(id || ''))
++  ipcMain.handle('hermes:terminal:resize', (event, id, size = {}) => {
++    const sessionInfo = sessionFor(event, id)
+ 
+     if (!sessionInfo) {
+       return false
+@@ -480,17 +603,19 @@ export function registerTerminalIpc({
+ 
+     return true
+   })
+-  ipcMain.handle('hermes:terminal:cwd', async (_event, id) => {
+-    const sessionInfo = terminalSessions.get(String(id || ''))
++  ipcMain.handle('hermes:terminal:cwd', async (event, id) => {
++    const sessionInfo = sessionFor(event, id)
+ 
+-    if (!sessionInfo) {
++    if (!sessionInfo || sessionInfo.recovery) {
+       return null
+     }
+ 
+     return sessionInfo.sshScope !== undefined ? null : readProcessCwd(sessionInfo.pty.pid)
+   })
+ 
+-  ipcMain.handle('hermes:terminal:dispose', (_event, id) => disposeTerminalSession(String(id || '')))
++  ipcMain.handle('hermes:terminal:dispose', (event, id) =>
++    sessionFor(event, id) ? disposeTerminalSession(String(id || '')) : false
++  )
+ 
+   return { disposeTerminalSession, disposeTerminalSessionsForSshScope, disposeAllTerminalSessions }
+ }
+diff --git a/apps/desktop/electron/terminal-recovery.test.ts b/apps/desktop/electron/terminal-recovery.test.ts
+new file mode 100644
+index 0000000000..2f14838c68
+--- /dev/null
++++ b/apps/desktop/electron/terminal-recovery.test.ts
+@@ -0,0 +1,324 @@
++import assert from 'node:assert/strict'
++
++import { beforeEach, test, vi } from 'vitest'
++
++// terminal-ipc.ts loads Electron and the native PTY at module scope; both are
++// stubbed. The real ssh argv builder runs, so the remote command line is the
++// one a gateway would receive.
++const handles = vi.hoisted(() => ({ map: new Map<string, (...args: never[]) => unknown>() }))
++const spawnMock = vi.hoisted(() => ({ fn: vi.fn() }))
++
++vi.mock('electron', () => ({
++  app: { getPath: () => '/tmp', getVersion: () => '0.0.0-test' },
++  ipcMain: {
++    handle: (channel: string, listener: (...args: never[]) => unknown) => {
++      handles.map.set(channel, listener)
++    }
++  }
++}))
++vi.mock('node-pty', () => ({ default: { spawn: (...args: unknown[]) => spawnMock.fn(...args) } }))
++
++import type { ConnectionRegistry } from './connection-registry'
++import { terminalGatewayTarget } from './terminal-gateway-target'
++import { registerTerminalIpc } from './terminal-ipc'
++import { recoveryCliArgs, remoteRecoveryCommand, requestedRecovery } from './terminal-recovery'
++
++const registry = {
++  connections: [
++    { id: 'local', kind: 'local', label: 'This device' },
++    { id: 'nas', kind: 'ssh', label: 'NAS' },
++    { id: 'winbox', kind: 'ssh', label: 'Windows box' },
++    { id: 'cloudbox', kind: 'remote', label: 'Cloud box' }
++  ],
++  primary: 'local',
++  version: 2
++} as unknown as ConnectionRegistry
++
++const ssh = { controlPath: '/tmp/ctl', host: 'nas.lan', user: 'hermes' }
++
++const pool = new Map<string, Record<string, unknown>>([
++  [
++    'conn:nas::default',
++    {
++      hermesHome: '/home/hermes/.hermes',
++      hermesPath: '/opt/hermes/bin/hermes',
++      registryConnectionId: 'nas',
++      remotePlatform: 'Linux',
++      ssh
++    }
++  ],
++  [
++    'conn:winbox::default',
++    { hermesPath: 'C:\\hermes\\hermes.exe', registryConnectionId: 'winbox', remotePlatform: 'Windows', ssh }
++  ]
++])
++
++interface Started {
++  connectionId?: string
++  id: string
++  recovery: true
++  unavailable?: string
++}
++
++type Sender = ReturnType<typeof makeSender>
++type Handler = (event: { sender: Sender }, ...args: unknown[]) => unknown
++
++function makeSender(id: number) {
++  return { id, isDestroyed: () => false, once: vi.fn(), send: vi.fn() }
++}
++
++function fakePty() {
++  return { kill: vi.fn(), onData: vi.fn(), onExit: vi.fn(), pid: 4242, resize: vi.fn(), write: vi.fn() }
++}
++
++function register(overrides: Record<string, unknown> = {}) {
++  const localHermesCli = vi.fn(async (args: string[]) => ({
++    args: ['-m', 'hermes_cli.main', ...args],
++    command: '/opt/py/bin/python',
++    env: { HERMES_HOME: '/Users/me/.hermes' },
++    shell: false
++  }))
++
++  registerTerminalIpc({
++    activeSshTerminalTarget: () => ({ scope: 'conn:nas::default', ssh }),
++    ensureBackend: async () => undefined,
++    ensureGatewayBackend: async () => undefined,
++    findOnPath: () => null,
++    gatewayTarget: owner => terminalGatewayTarget(owner, registry, pool),
++    getSshConnectionState: scope => pool.get(scope),
++    isWindows: false,
++    localHermesCli,
++    rememberLog: () => {},
++    sshBinary: () => '/usr/bin/ssh',
++    ...overrides
++  } as Parameters<typeof registerTerminalIpc>[0])
++
++  const call = (channel: string) => handles.map.get(channel) as unknown as Handler
++
++  return {
++    localHermesCli,
++    start: (sender: Sender, payload: unknown) =>
++      call('hermes:terminal:recovery:start')({ sender }, payload) as Promise<Started>,
++    call
++  }
++}
++
++const request = { connectionId: 'local', credentialId: 'a1b2c3', provider: 'anthropic' }
++
++beforeEach(() => {
++  handles.map.clear()
++  spawnMock.fn.mockReset()
++  spawnMock.fn.mockImplementation(() => fakePty())
++})
++
++test('a recovery request names an allowed provider and a plain row id, or nothing', () => {
++  assert.deepEqual(requestedRecovery({ credentialId: 'a1b2c3', provider: 'anthropic' }), {
++    credentialId: 'a1b2c3',
++    provider: 'anthropic'
++  })
++
++  for (const bad of [
++    null,
++    {},
++    { credentialId: 'a1b2c3' },
++    { credentialId: 'a1b2c3', provider: 'openai-codex' },
++    { credentialId: 'a1b2c3', provider: 'anthropic; rm -rf ~' },
++    { credentialId: '', provider: 'anthropic' },
++    { credentialId: '-rf', provider: 'anthropic' },
++    { credentialId: 'a b', provider: 'anthropic' },
++    { credentialId: "a';id;'", provider: 'anthropic' },
++    { credentialId: 'a$(id)', provider: 'anthropic' },
++    { credentialId: 'a\nb', provider: 'anthropic' },
++    { credentialId: 'x'.repeat(129), provider: 'anthropic' },
++    { credentialId: 7, provider: 'anthropic' }
++  ]) {
++    assert.equal(requestedRecovery(bad), null, JSON.stringify(bad))
++  }
++})
++
++test('recovery arguments are the fixed reauth command, with a plain profile only', () => {
++  const recovery = { credentialId: 'a1b2c3', provider: 'anthropic' }
++
++  assert.deepEqual(recoveryCliArgs(recovery), ['auth', 'reauth', 'anthropic', 'a1b2c3'])
++  assert.deepEqual(recoveryCliArgs(recovery, 'work'), ['--profile', 'work', 'auth', 'reauth', 'anthropic', 'a1b2c3'])
++  assert.equal(recoveryCliArgs(recovery, '--help'), null)
++  assert.equal(recoveryCliArgs(recovery, 'a b'), null)
++  assert.equal(recoveryCliArgs(recovery, "w';id;'"), null)
++})
++
++test('the remote command replaces the shell with the quoted launcher and arguments', () => {
++  const args = ['auth', 'reauth', 'anthropic', 'a1b2c3']
++
++  assert.equal(
++    remoteRecoveryCommand({ hermesHome: '/home/h/.hermes', hermesPath: "/opt/it's/hermes" }, args),
++    "HERMES_HOME='/home/h/.hermes' exec '/opt/it'\\''s/hermes' 'auth' 'reauth' 'anthropic' 'a1b2c3'"
++  )
++  assert.equal(
++    remoteRecoveryCommand({ hermesPath: '/opt/hermes' }, args),
++    "exec '/opt/hermes' 'auth' 'reauth' 'anthropic' 'a1b2c3'"
++  )
++  assert.equal(remoteRecoveryCommand({ hermesPath: '' }, args), null)
++  assert.equal(remoteRecoveryCommand({ hermesPath: '/opt/hermes\nid' }, args), null)
++  assert.equal(remoteRecoveryCommand({ hermesHome: '/h\nid', hermesPath: '/opt/hermes' }, args), null)
++})
++
++test('a local recovery runs only the resolved launcher with the reauth arguments', async () => {
++  const { localHermesCli, start } = register()
++  const started = await start(makeSender(1), { ...request, cols: 100, profile: 'work', rows: 30 })
++
++  assert.equal(started.unavailable, undefined)
++  assert.equal(started.recovery, true)
++  assert.equal(started.connectionId, 'local')
++  assert.ok(started.id)
++  assert.deepEqual(localHermesCli.mock.calls, [[['--profile', 'work', 'auth', 'reauth', 'anthropic', 'a1b2c3']]])
++  assert.equal(spawnMock.fn.mock.calls.length, 1)
++
++  const [command, args, options] = spawnMock.fn.mock.calls[0]
++
++  assert.equal(command, '/opt/py/bin/python')
++  assert.deepEqual(args, ['-m', 'hermes_cli.main', '--profile', 'work', 'auth', 'reauth', 'anthropic', 'a1b2c3'])
++  assert.equal(options.cols, 100)
++  assert.equal(options.rows, 30)
++  assert.equal(options.env.HERMES_HOME, '/Users/me/.hermes')
++})
++
++test('an SSH recovery runs the gateway launcher over that gateway tunnel, never a shell', async () => {
++  const { localHermesCli, start } = register()
++  const started = await start(makeSender(1), { ...request, connectionId: 'nas' })
++
++  assert.equal(started.unavailable, undefined)
++  assert.equal(started.connectionId, 'nas')
++  assert.equal(localHermesCli.mock.calls.length, 0)
++
++  const [command, args] = spawnMock.fn.mock.calls[0]
++
++  assert.equal(command, '/usr/bin/ssh')
++  assert.equal(
++    args.at(-1),
++    "HERMES_HOME='/home/hermes/.hermes' exec '/opt/hermes/bin/hermes' 'auth' 'reauth' 'anthropic' 'a1b2c3'"
++  )
++  assert.equal(args.at(-2), 'hermes@nas.lan')
++  assert.ok(!args.some((arg: string) => arg.includes('$SHELL')))
++})
++
++test('a request that fails any check starts no process', async () => {
++  const { localHermesCli, start } = register()
++  const sender = makeSender(1)
++
++  for (const payload of [
++    undefined,
++    { credentialId: 'a1b2c3', provider: 'anthropic' },
++    { ...request, connectionId: '  ' },
++    { ...request, provider: 'openai-codex' },
++    { ...request, credentialId: 'a;id' },
++    { ...request, profile: 'w;id' },
++    { ...request, command: 'id', credentialId: undefined }
++  ]) {
++    assert.deepEqual(await start(sender, payload), { id: '', recovery: true, unavailable: 'invalid' })
++  }
++
++  assert.equal(spawnMock.fn.mock.calls.length, 0)
++  assert.equal(localHermesCli.mock.calls.length, 0)
++})
++
++test('a gateway without a shell, a removed gateway and a Windows gateway are reported, not run here', async () => {
++  const { localHermesCli, start } = register()
++  const sender = makeSender(1)
++
++  assert.equal((await start(sender, { ...request, connectionId: 'cloudbox' })).unavailable, 'no-shell')
++  assert.equal((await start(sender, { ...request, connectionId: 'gone' })).unavailable, 'missing')
++  assert.equal((await start(sender, { ...request, connectionId: 'winbox' })).unavailable, 'unsupported')
++  assert.equal(spawnMock.fn.mock.calls.length, 0)
++  assert.equal(localHermesCli.mock.calls.length, 0)
++})
++
++test('an SSH gateway whose launcher path is unknown is reported', async () => {
++  const bare = new Map([['conn:nas::default', { registryConnectionId: 'nas', remotePlatform: 'Linux', ssh }]])
++
++  const { start } = register({
++    gatewayTarget: (owner: { connectionId: string }) => terminalGatewayTarget(owner, registry, bare),
++    getSshConnectionState: (scope: string) => bare.get(scope)
++  })
++
++  assert.equal((await start(makeSender(1), { ...request, connectionId: 'nas' })).unavailable, 'unsupported')
++  assert.equal(spawnMock.fn.mock.calls.length, 0)
++})
++
++test('no local runtime, a Windows Desktop, or an older host wiring start nothing', async () => {
++  const sender = makeSender(1)
++
++  assert.equal((await register({ localHermesCli: async () => null }).start(sender, request)).unavailable, 'no-runtime')
++  assert.equal((await register({ localHermesCli: undefined }).start(sender, request)).unavailable, 'no-runtime')
++  assert.equal(
++    (
++      await register({
++        localHermesCli: async () => ({ args: [], command: 'hermes.cmd', env: {}, shell: true })
++      }).start(sender, request)
++    ).unavailable,
++    'no-runtime'
++  )
++  assert.equal((await register({ isWindows: true }).start(sender, request)).unavailable, 'unsupported')
++  assert.equal(spawnMock.fn.mock.calls.length, 0)
++})
++
++test('only the window that started a recovery can type into it, size it, read it or end it', async () => {
++  const pty = fakePty()
++
++  spawnMock.fn.mockImplementation(() => pty)
++
++  const { call, start } = register()
++  const owner = makeSender(1)
++  const other = makeSender(2)
++  const { id } = await start(owner, request)
++
++  assert.equal(await call('hermes:terminal:write')({ sender: other }, id, 'x'), false)
++  assert.equal(await call('hermes:terminal:resize')({ sender: other }, id, { cols: 10, rows: 10 }), false)
++  assert.equal(await call('hermes:terminal:attach')({ sender: other }, id), false)
++  assert.equal(await call('hermes:terminal:dispose')({ sender: other }, id), false)
++  assert.equal(pty.write.mock.calls.length, 0)
++  assert.equal(pty.resize.mock.calls.length, 0)
++  assert.equal(pty.kill.mock.calls.length, 0)
++
++  assert.equal(await call('hermes:terminal:attach')({ sender: owner }, id), true)
++  assert.equal(await call('hermes:terminal:write')({ sender: owner }, id, 'replace\r'), true)
++  assert.deepEqual(pty.write.mock.calls, [['replace\r']])
++  assert.equal(await call('hermes:terminal:cwd')({ sender: owner }, id), null)
++  assert.equal(await call('hermes:terminal:dispose')({ sender: owner }, id), true)
++  assert.equal(pty.kill.mock.calls.length, 1)
++  assert.equal(await call('hermes:terminal:write')({ sender: owner }, id, 'x'), false)
++})
++
++test('recovery output reaches only the window that started it', async () => {
++  const pty = fakePty()
++
++  spawnMock.fn.mockImplementation(() => pty)
++
++  const { call, start } = register()
++  const owner = makeSender(1)
++  const { id } = await start(owner, request)
++
++  await call('hermes:terminal:attach')({ sender: owner }, id)
++
++  const onData = pty.onData.mock.calls[0][0] as (data: string) => void
++
++  onData('Open this URL')
++  await new Promise(resolve => setTimeout(resolve, 30))
++
++  const sent = owner.send.mock.calls.filter(([channel]) => channel === `hermes:terminal:${id}:data`)
++
++  assert.ok(sent.length >= 1)
++})
++
++test('an ordinary shell tab keeps its existing write path', async () => {
++  const pty = fakePty()
++
++  spawnMock.fn.mockImplementation(() => pty)
++
++  const { call } = register()
++  const owner = makeSender(1)
++
++  const session = (await call('hermes:terminal:start')({ sender: owner }, { connectionId: 'local' })) as { id: string }
++
++  assert.equal(await call('hermes:terminal:write')({ sender: makeSender(2) }, session.id, 'ls\r'), true)
++  assert.deepEqual(pty.write.mock.calls, [['ls\r']])
++})
+diff --git a/apps/desktop/electron/terminal-recovery.ts b/apps/desktop/electron/terminal-recovery.ts
+new file mode 100644
+index 0000000000..18f08ad5b0
+--- /dev/null
++++ b/apps/desktop/electron/terminal-recovery.ts
+@@ -0,0 +1,75 @@
++// Selected-account recovery: the one command an account-recovery PTY may run.
++//
++// The renderer names a provider and a stored credential row; it never supplies
++// command text. Everything that reaches an argv or a remote command line is
++// checked against the patterns here first, so a request that does not match
++// starts nothing (no shell, no fallback to another host).
++
++/** Providers whose sign-in must run in an interactive CLI on the gateway. */
++const RECOVERY_PROVIDERS = new Set(['anthropic'])
++
++// A pool row id / profile name as Hermes writes them. The leading character
++// rules out an option-looking token (`-x`), and the alphabet rules out quoting,
++// whitespace and shell syntax.
++const CREDENTIAL_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
++const PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
++
++export interface RecoveryRequest {
++  credentialId: string
++  provider: string
++}
++
++/** The recovery a start payload names, or null when any field is absent,
++ *  mistyped or outside the allowed alphabet. */
++export function requestedRecovery(payload: unknown): null | RecoveryRequest {
++  const record = payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {}
++  const { credentialId, provider } = record
++
++  if (typeof provider !== 'string' || !RECOVERY_PROVIDERS.has(provider)) {
++    return null
++  }
++
++  if (typeof credentialId !== 'string' || !CREDENTIAL_ID.test(credentialId)) {
++    return null
++  }
++
++  return { credentialId, provider }
++}
++
++/** `hermes` arguments for the recovery, or null when the profile name is not a
++ *  plain profile name. */
++export function recoveryCliArgs(request: RecoveryRequest, profile?: string): null | string[] {
++  const named = (profile || '').trim()
++
++  if (named && !PROFILE_NAME.test(named)) {
++    return null
++  }
++
++  return [...(named ? ['--profile', named] : []), 'auth', 'reauth', request.provider, request.credentialId]
++}
++
++const shq = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
++
++/** The single remote command an SSH recovery runs: the gateway's own Hermes
++ *  launcher with the checked arguments, replacing the login shell so the PTY
++ *  ends when the sign-in does. Null without a launcher path. */
++export function remoteRecoveryCommand(
++  runtime: { hermesHome?: null | string; hermesPath?: null | string },
++  args: readonly string[]
++): null | string {
++  const hermesPath = String(runtime.hermesPath || '').trim()
++
++  if (!hermesPath || /[\0\r\n]/.test(hermesPath)) {
++    return null
++  }
++
++  const hermesHome = String(runtime.hermesHome || '').trim()
++
++  if (/[\0\r\n]/.test(hermesHome)) {
++    return null
++  }
++
++  const env = hermesHome ? `HERMES_HOME=${shq(hermesHome)} ` : ''
++
++  return `${env}exec ${shq(hermesPath)} ${args.map(shq).join(' ')}`
++}
+diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
+index d50fc96d42..eb4eba92e0 100644
+--- a/apps/desktop/src/global.d.ts
++++ b/apps/desktop/src/global.d.ts
+@@ -703,6 +703,20 @@ declare global {
+           restoreKey?: string
+           resumeOnly?: boolean
+         }) => Promise<HermesTerminalSession>
++        /** Account recovery: main runs `hermes auth reauth <provider> <row>` on
++         *  the named gateway and nothing else; the caller supplies no command.
++         *  Absent on a Desktop without it. `unavailable` names why nothing ran
++         *  (`invalid`, `missing`, `no-shell`, `no-runtime`, `unsupported`); a
++         *  gateway without a shell is never replaced by this device. Output is
++         *  delivered only through `onData` to the window that started it. */
++        startRecovery?: (options: {
++          cols?: number
++          connectionId: string
++          credentialId: string
++          profile?: string
++          provider: string
++          rows?: number
++        }) => Promise<{ connectionId?: string; id: string; recovery: true; unavailable?: string }>
+         write: (id: string, data: string) => Promise<boolean>
+       }
+       reachPreviewUrl?: (url: string) => Promise<string>
+diff --git a/website/docs/user-guide/selected-account-recovery.md b/website/docs/user-guide/selected-account-recovery.md
+index 235c7bd05e..f2dfeb8f57 100644
+--- a/website/docs/user-guide/selected-account-recovery.md
++++ b/website/docs/user-guide/selected-account-recovery.md
+@@ -6,10 +6,18 @@ This initial command supports Anthropic `manual:hermes_pkce` and Codex `manual:d
+ 
+ The selected row must still exist, be enabled, and be unchanged when login finishes. Its ID, label, priority and unrelated metadata are preserved. Login runs without holding the auth-store lock; a concurrent deletion or edit prevents replacement. A Codex login must match both the stored account/workspace and subject. Legacy Anthropic grants lack a verifiable principal, so the terminal requires explicit replacement confirmation and reports identity as unverified, never as a confirmed same-account reconnect.
+ 
+-Anthropic authorization-code input is masked; if terminal echo cannot be disabled, recovery stops rather than reading an unmasked code. Do not run this in an agent-readable or recorded terminal. A future Desktop recovery surface must provide a private terminal and bind the owning gateway and profile explicitly; this command alone does not provide that transport.
++Anthropic authorization-code input is masked; if terminal echo cannot be disabled, recovery stops rather than reading an unmasked code. Do not run this in an agent-readable or recorded terminal. Hermes Desktop provides that private transport (below); the command alone does not.
+ 
+ The completion message confirms credential persistence, not provider health. Refresh and verify account health separately. If interrupted during persistence, the command reports an unverified outcome rather than claiming no change occurred.
+ 
+ ## Dashboard device sign-in for a selected Codex credential
+ 
+ `POST /api/providers/oauth/openai-codex/start` accepts an optional JSON body `{"credential_id": "<pool id>"}`. The session is then bound to that exact owned row before any provider call, and its response carries `target_bound: true`. On approval the grant is committed into the selected row with the same checks as the command above (unchanged row, same account/workspace and subject, enabled), instead of the singleton login that would add a second row. The poll response reports `credential_id` and `identity_verified` on success, or `status: error` with `reason: reauth_conflict` and no write. A malformed id, an unsupported provider or an unreplaceable row is refused (400/409); a named target never degrades to the ordinary untargeted login. Cancelling the session before commit leaves the row untouched. Callers on an older core receive no `target_bound` field and must cancel that session rather than let it complete as an account-add.
++
++## Desktop recovery terminal
++
++Hermes Desktop can run this command for a renderer (for example a plugin panel) through `window.hermesDesktop.terminal.startRecovery({connectionId, profile, provider, credentialId})`. The caller names a gateway, a provider and a pool row id; it never supplies command text. Desktop's main process checks each field against a fixed pattern and runs only `hermes [--profile NAME] auth reauth PROVIDER CREDENTIAL_ID`: with this device's own Hermes runtime for the local gateway, or with the gateway's recorded Hermes launcher over that gateway's SSH connection. Only `anthropic` is accepted; Codex uses the dashboard device sign-in above.
++
++A request that fails a check, a removed gateway, a gateway with no shell transport (URL/token or cloud), a Windows host and a gateway whose launcher path is unknown all start no process and return `unavailable` (`invalid`, `missing`, `no-shell`, `unsupported`, `no-runtime`). A gateway without a shell is never replaced by a shell on this device. Feature-detect the method: an older Desktop does not have it.
++
++The session is not a terminal tab: it is not listed, saved, restored or readable by agent terminal tools, and only the window that started it can attach to it, type into it, resize it or end it. Ending it stops the command. The command's exit says nothing about account health; read the credential back afterwards.
+-- 
+2.43.0
+

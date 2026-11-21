@@ -1,0 +1,769 @@
+From 2f024b5a7e49267d29bf5dcafcb7dcc918a19f08 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 21:09:11 +0000
+Subject: [PATCH] [daveey] Bind worker drain baselines to process and image
+ provenance
+
+Checkpoint strict boot/IID/node epoch and PID/start identities, image-declared unit MainPID capture, atomic root baseline writes and sealed memfd capability primitives. Production startup and installer integration remain pending; no worker activation or delivery is claimed.
+
+Proof: reader regressions failed 4/13 on base then passed 13/13; capture and capability tests written first; 44 focused tests pass with real kernel memfd sealing controls. scripts/check --only health passes.
+---
+ hermes_cli/worker_drain_baseline.py           | 155 ++++++++++++++++++
+ hermes_cli/worker_drain_capability.py         | 119 ++++++++++++++
+ hermes_cli/worker_drain_census.py             |  63 ++++++-
+ .../hermes_cli/test_worker_drain_baseline.py  | 105 ++++++++++++
+ .../test_worker_drain_capability.py           |  75 +++++++++
+ .../test_worker_drain_census_manifest.py      |  26 ++-
+ .../hermes_cli/test_worker_drain_producer.py  |  97 +++++++++++
+ 7 files changed, 622 insertions(+), 18 deletions(-)
+ create mode 100644 hermes_cli/worker_drain_baseline.py
+ create mode 100644 hermes_cli/worker_drain_capability.py
+ create mode 100644 tests/hermes_cli/test_worker_drain_baseline.py
+ create mode 100644 tests/hermes_cli/test_worker_drain_capability.py
+ create mode 100644 tests/hermes_cli/test_worker_drain_producer.py
+
+diff --git a/hermes_cli/worker_drain_baseline.py b/hermes_cli/worker_drain_baseline.py
+new file mode 100644
+index 0000000000..9c670607e1
+--- /dev/null
++++ b/hermes_cli/worker_drain_baseline.py
+@@ -0,0 +1,155 @@
++"""Root-only drain baseline capture from an image-authored service manifest.
++
++No discovery-based allowlist: every userspace PID must be a declared unit's
++MainPID (or the package-pinned PID 1), independently of its executable name.
++Invoke directly as a systemd oneshot, without an SSH/SSM shell on the host.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import re
++import subprocess
++import uuid
++from pathlib import Path
++
++from hermes_cli import worker_drain_census as census
++from hermes_cli import worker_drain_fence as fence
++
++MANIFEST_PATH = Path('/var/lib/hermes-worker/drain-manifest.json')
++UNIT_RE = re.compile(r'[a-zA-Z0-9_.@:-]+\.(?:service|scope)\Z')
++
++
++class CaptureRefused(RuntimeError):
++    """Unknown provenance or live work: do not install a baseline."""
++
++
++def file_digest(path) -> str:
++    with open(path, 'rb') as fh:
++        return hashlib.file_digest(fh, 'sha256').hexdigest()
++
++
++def load_manifest(path) -> dict:
++    try:
++        doc = json.loads(fence._secure_read(Path(path), {0}))
++        if doc.get('version') != 1 or not isinstance(doc['units'], list) or not doc['units']:
++            raise ValueError('manifest shape')
++        names = set()
++        for unit in doc['units']:
++            if (not UNIT_RE.fullmatch(unit['name']) or unit['name'] in names
++                    or unit['kind'] not in ('infrastructure', 'hermes', 'init')
++                    or any(not re.fullmatch('[0-9a-f]{64}', unit[k]) for k in ('fragment_sha256', 'exe_sha256'))):
++                raise ValueError('unit shape')
++            names.add(unit['name'])
++        return doc
++    except (OSError, ValueError, KeyError, TypeError, AttributeError, fence.DrainRefused) as exc:
++        raise CaptureRefused('untrusted service manifest') from exc
++
++
++def unit_state(unit: dict) -> dict:
++    from tools.environments.local import build_subprocess_env
++    cmd = ['systemctl']
++    if 'user' in unit:
++        if not re.fullmatch('[a-z_][a-z0-9_-]*', unit['user']):
++            raise CaptureRefused('invalid user manager')
++        cmd += ['--user', '--machine=' + unit['user'] + '@.host']
++    cmd += ['show', '--', unit['name']]
++    try:
++        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', timeout=5,
++                                check=True, env=build_subprocess_env(scrub_secrets=True))
++    except (OSError, subprocess.SubprocessError) as exc:
++        raise CaptureRefused('unit manager unavailable') from exc
++    fields = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
++    return {k: fields[k] for k in ('MainPID', 'ControlGroup', 'FragmentPath') if k in fields}
++
++
++def _unit_entry(unit, state, proc_root, ident, manifest):
++    try:
++        pid = '1' if unit['kind'] == 'init' and unit['name'] == 'init.scope' else state['MainPID']
++        if not pid.isdigit() or int(pid) <= 0:
++            raise ValueError('no live MainPID')
++        if file_digest(state['FragmentPath']) != unit['fragment_sha256']:
++            raise ValueError('unit package changed')
++        entry = census.process_identity(proc_root, pid)
++        if entry[3] != state['ControlGroup'] or not entry[3]:
++            raise ValueError('unit cgroup mismatch')
++        if file_digest(f'{proc_root}/{pid}/exe') != unit['exe_sha256']:
++            raise ValueError('executable package changed')
++        if unit['kind'] == 'hermes':
++            from hermes_cli.worker_drain_capability import validate_capability
++            validate_capability(int(pid), entry, ident, manifest, proc_root=proc_root)
++        return dict(zip(('pid', 'start_ticks', 'uid', 'cgroup', 'exe'), entry, strict=True))
++    except (OSError, ValueError, KeyError, IndexError) as exc:
++        raise CaptureRefused(f'unit provenance unavailable: {unit["name"]}') from exc
++
++
++def capture(manifest_path, ident, *, proc_root='/proc') -> dict:
++    manifest = load_manifest(manifest_path)
++    if ident is None:
++        act = fence.load_activation()
++        if act is None:
++            raise CaptureRefused('fence not activated')
++        ident = fence.current_identity(act)
++    units = [(unit, unit_state(unit)) for unit in manifest['units']]
++    idle = [_unit_entry(unit, state, proc_root, ident, manifest) for unit, state in units]
++    base = census.Baseline(ident.boot, ident.iid, ident.node_epoch,
++                           frozenset(census._entry_identity(e) for e in idle))
++    observed = census.observe_processes(proc_root, base)
++    if observed.state != census.ZERO:
++        raise CaptureRefused('undeclared or unobservable processes: ' + observed.state)
++    # A service restart or PID reuse while scanning cannot be published as idle.
++    if any(unit_state(unit) != state for unit, state in units):
++        raise CaptureRefused('service changed during capture')
++    for entry in idle:
++        if census.process_identity(proc_root, str(entry['pid'])) != census._entry_identity(entry):
++            raise CaptureRefused('process changed during capture')
++    return {'version': 2, 'boot_id': ident.boot, 'iid': ident.iid, 'node_epoch': ident.node_epoch,
++            'manifest_digest': fence.request_hash(manifest), 'idle': idle}
++
++
++def validate_baseline(base, ident) -> bool:
++    """Re-read provenance AND daemon capability on every census, not only capture."""
++    try:
++        manifest = load_manifest(MANIFEST_PATH)
++        if fence.request_hash(manifest) != base.manifest_digest:
++            return False
++        entries = [_unit_entry(unit, unit_state(unit), '/proc', ident, manifest) for unit in manifest['units']]
++        return frozenset(census._entry_identity(e) for e in entries) == base.idle
++    except (OSError, ValueError, CaptureRefused):
++        return False
++
++
++def write_baseline(path: Path, doc: dict) -> None:
++    if os.geteuid() != 0:  # windows-footgun: ok -- root-only Linux installer
++        raise CaptureRefused('baseline writer requires root')
++    path = Path(path)
++    tmp = path.with_name(f'.{path.name}.{uuid.uuid4().hex}')
++    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
++    try:
++        os.fchown(fd, 0, 0)
++        with os.fdopen(fd, 'wb', closefd=False) as fh:
++            fh.write(fence._canon(doc))
++            fh.flush()
++            os.fchmod(fd, 0o644)
++            os.fsync(fd)
++        os.replace(tmp, path)
++        dfd = os.open(path.parent, os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
++        try:
++            os.fsync(dfd)
++        finally:
++            os.close(dfd)
++    finally:
++        os.close(fd)
++        tmp.unlink(missing_ok=True)
++
++
++def install(manifest_path=MANIFEST_PATH, ident=None, *, path=Path(census.BASELINE_PATH)) -> dict:
++    if os.geteuid() != 0:  # windows-footgun: ok -- root-only Linux installer
++        raise CaptureRefused('baseline installation requires root')
++    # Failed re-capture must invalidate a previous baseline, never retain an old
++    # daemon attestation after an unsuccessful upgrade/activation.
++    Path(path).unlink(missing_ok=True)
++    doc = capture(manifest_path, ident)
++    write_baseline(Path(path), doc)
++    return doc
+diff --git a/hermes_cli/worker_drain_capability.py b/hermes_cli/worker_drain_capability.py
+new file mode 100644
+index 0000000000..e4a3d3e74a
+--- /dev/null
++++ b/hermes_cli/worker_drain_capability.py
+@@ -0,0 +1,119 @@
++"""Startup-only, kernel-sealed proof of a daemon's activated fence runtime.
++
++The image's root-authored contract pins reviewed code and supported homes. This
++module does not infer fence coverage from a running process or package name.
++The descriptor is close-on-exec and lives only as long as the attesting daemon.
++"""
++from __future__ import annotations
++
++import asyncio
++import importlib
++import json
++import os
++import re
++import sys
++import threading
++from pathlib import Path
++
++from hermes_cli import worker_drain_census as census
++from hermes_cli import worker_drain_fence as fence
++from hermes_cli.worker_drain_baseline import CaptureRefused, file_digest
++
++fcntl = importlib.import_module('fcntl') if sys.platform.startswith('linux') else None
++NAME = 'hermes-worker-drain-capability-v1'
++CAPABILITIES = ('turn', 'claim', 'cron', 'plugin')
++# Linux uapi/linux/fcntl.h. Some bundled Python builds omit these constants
++# despite exposing fcntl and memfd_create; the kernel remains the authority.
++_ADD_SEALS, _GET_SEALS, _REQUIRED_SEALS = 1033, 1034, 0x0F
++REQUIRED_FILES = ('hermes_cli/worker_drain_fence.py', 'hermes_cli/worker_drain_capability.py',
++                  'tui_gateway/turn_admission.py', 'cron/scheduler.py', 'tools/registry.py')
++
++
++def verified_contract(manifest: dict) -> dict:
++    try:
++        contract = manifest['runtime']
++        root = Path(contract['core_root'])
++        files = contract['files']
++        if (not root.is_absolute() or not set(REQUIRED_FILES).issubset(files)
++                or set(contract['capabilities']) != set(CAPABILITIES)
++                or any(type(contract[k]) is not int or contract[k] < 0
++                       for k in ('installed_start_ticks', 'activation_start_ticks'))
++                or not contract['homes'] or any(not Path(h).is_absolute() for h in contract['homes'])):
++            raise ValueError('runtime contract shape')
++        for name, digest in files.items():
++            rel = Path(name)
++            if (rel.is_absolute() or '..' in rel.parts or not re.fullmatch('[0-9a-f]{64}', digest)
++                    or file_digest(root / rel) != digest):
++                raise ValueError('installed runtime digest mismatch')
++        digest = fence.request_hash({'files': files, 'core_root': str(root), 'capabilities': contract['capabilities']})
++        return {**contract, 'digest': digest}
++    except (OSError, ValueError, KeyError, TypeError) as exc:
++        raise CaptureRefused('daemon capability runtime contract unavailable') from exc
++
++
++def startup_is_cold() -> bool:
++    if threading.active_count() != 1:
++        return False
++    try:
++        asyncio.get_running_loop()
++    except RuntimeError:
++        return True
++    return False
++
++
++def _payload(ident, entry, contract) -> dict:
++    if (contract['installed_boot_id'] != ident.boot
++            or entry[1] <= max(contract['installed_start_ticks'], contract['activation_start_ticks'])):
++        raise CaptureRefused('daemon capability predates install or activation')
++    return {'version': 1, 'boot_id': ident.boot, 'iid': ident.iid, 'node_epoch': ident.node_epoch,
++            'pid': entry[0], 'start_ticks': entry[1], 'uid': entry[2], 'cgroup': entry[3], 'exe': entry[4],
++            'runtime_digest': contract['digest'], 'homes': contract['homes']}
++
++
++def create_capability(ident, manifest, *, entry=None) -> int:
++    if fcntl is None or not startup_is_cold():
++        raise CaptureRefused('daemon capability requires cold single-threaded startup')
++    entry = census.process_identity('/proc', str(os.getpid())) if entry is None else entry
++    if entry[0] != os.getpid():
++        raise CaptureRefused('cannot attest another process')
++    payload = _payload(ident, entry, verified_contract(manifest))
++    fd = os.memfd_create(NAME, os.MFD_ALLOW_SEALING | os.MFD_CLOEXEC)
++    try:
++        with os.fdopen(fd, 'wb', closefd=False) as fh:
++            fh.write(fence._canon(payload))
++            fh.flush()
++        fcntl.fcntl(fd, _ADD_SEALS, _REQUIRED_SEALS)
++        return fd
++    except (OSError, ValueError):
++        os.close(fd)
++        raise
++
++
++def validate_capability(pid, entry, ident, manifest, *, proc_root='/proc') -> None:
++    if fcntl is None:
++        raise CaptureRefused('daemon capability requires Linux')
++    try:
++        expected = _payload(ident, entry, verified_contract(manifest))
++        directory = Path(proc_root) / str(pid) / 'fd'
++        matches = []
++        for path in directory.iterdir():
++            try:
++                if os.readlink(path) != f'/memfd:{NAME} (deleted)':
++                    continue
++                # /proc/PID/fd is deliberately followed here: the descriptor is
++                # checked through the kernel, not trusted as a regular JSON file.
++                fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
++                try:
++                    if fcntl.fcntl(fd, _GET_SEALS) & _REQUIRED_SEALS != _REQUIRED_SEALS:
++                        continue
++                    if os.fstat(fd).st_uid != entry[2]:
++                        continue
++                    matches.append(json.loads(os.pread(fd, 1 << 20, 0)))
++                finally:
++                    os.close(fd)
++            except FileNotFoundError:
++                continue
++        if matches != [expected]:
++            raise CaptureRefused('daemon capability missing or mismatched')
++    except (OSError, ValueError, KeyError, TypeError) as exc:
++        raise CaptureRefused('daemon capability unreadable') from exc
+diff --git a/hermes_cli/worker_drain_census.py b/hermes_cli/worker_drain_census.py
+index 5f8efa6adf..07fcfc7084 100644
+--- a/hermes_cli/worker_drain_census.py
++++ b/hermes_cli/worker_drain_census.py
+@@ -87,7 +87,47 @@ class Observation:
+     reason: str = ''
+ 
+ 
+-def load_baseline(path: str = BASELINE_PATH) -> frozenset | None:
++@dataclass(frozen=True)
++class Baseline:
++    boot_id: str
++    iid: str
++    node_epoch: str
++    idle: frozenset
++    manifest_digest: str | None = None
++
++
++def baseline_is_live(base: Baseline) -> bool:
++    from hermes_cli import worker_drain_fence as fence
++    try:
++        act = fence.load_activation()
++        if act is None:
++            return False
++        ident = fence.current_identity(act)
++        if (base.boot_id, base.iid, base.node_epoch) != (ident.boot, ident.iid, ident.node_epoch):
++            return False
++        if base.manifest_digest is not None:
++            from hermes_cli.worker_drain_baseline import validate_baseline
++            return validate_baseline(base, ident)
++        return True  # internal capture scan, before a baseline is persisted
++    except (OSError, ValueError, fence.DrainRefused):
++        return False
++
++
++def process_identity(proc_root: str, pid: str) -> tuple:
++    fields = _read(f'{proc_root}/{pid}/stat').rsplit(')', 1)[1].split()
++    return (int(pid), int(fields[19]), os.stat(f'{proc_root}/{pid}').st_uid,
++            _read_cgroup(proc_root, pid), os.readlink(f'{proc_root}/{pid}/exe'))
++
++
++def _entry_identity(e: dict) -> tuple:
++    if (any(type(e[k]) is not int for k in ('pid', 'start_ticks', 'uid'))
++            or e['pid'] <= 0 or e['start_ticks'] <= 0 or e['uid'] < 0
++            or any(not isinstance(e[k], str) or not e[k].startswith('/') for k in ('cgroup', 'exe'))):
++        raise ValueError('invalid process identity')
++    return (e['pid'], e['start_ticks'], e['uid'], e['cgroup'], e['exe'])
++
++
++def load_baseline(path: str = BASELINE_PATH) -> Baseline | None:
+     """Exact idle identities (uid, cgroup, exe) captured at install. None = no usable baseline.
+ 
+     Trusted only when root-owned, a regular non-symlink file and not group/world writable. A unit
+@@ -99,23 +139,29 @@ def load_baseline(path: str = BASELINE_PATH) -> frozenset | None:
+         return None
+     try:
+         st = os.fstat(fd)
+-        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
++        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o644:
+             return None
+         doc = json.loads(os.read(fd, 1 << 20))
+-        if doc.get('version') != 1 or not isinstance(doc.get('idle'), list):
++        if doc.get('version') != 2 or not isinstance(doc.get('idle'), list):
++            return None
++        if not isinstance(doc.get('manifest_digest'), str) or not doc['manifest_digest']:
+             return None
+-        return frozenset((int(e['uid']), str(e['cgroup']), str(e['exe'])) for e in doc['idle'])
+-    except (OSError, ValueError, KeyError, TypeError):
++        base = Baseline(doc['boot_id'], doc['iid'], doc['node_epoch'],
++                        frozenset(_entry_identity(e) for e in doc['idle']), doc['manifest_digest'])
++        return base if baseline_is_live(base) else None
++    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+         return None
+     finally:
+         os.close(fd)
+ 
+ 
+-def observe_processes(proc_root: str = '/proc', baseline: frozenset | None = None) -> Observation:
++def observe_processes(proc_root: str = '/proc', baseline: Baseline | None = None) -> Observation:
+     """Every userspace process is work unless it exactly matches a live baseline identity and so
+     do all of its descendants. Any unreadable entry or missing baseline cannot prove zero."""
+     if not sys.platform.startswith('linux'):
+         return Observation(UNKNOWN, reason='not linux')
++    if baseline is not None and (not isinstance(baseline, Baseline) or not baseline_is_live(baseline)):
++        return Observation(UNKNOWN, reason='baseline binding is not live')
+     try:
+         pids = [e for e in os.listdir(proc_root) if e.isdigit()]
+     except OSError:
+@@ -130,13 +176,12 @@ def observe_processes(proc_root: str = '/proc', baseline: frozenset | None = Non
+             if _is_kernel_thread(proc_root, pid):
+                 continue
+             ppid = _read(f'{proc_root}/{pid}/stat').rsplit(')', 1)[1].split()[1]
+-            ident = (os.stat(f'{proc_root}/{pid}').st_uid, _read_cgroup(proc_root, pid),
+-                     os.readlink(f'{proc_root}/{pid}/exe'))
++            ident = process_identity(proc_root, pid)
+             procs[pid] = (ppid, ident)
+         except (OSError, ValueError, IndexError):
+             if os.path.exists(f'{proc_root}/{pid}'):
+                 unreadable += 1  # alive but unobservable: not an absence proof
+-    work = {pid for pid, (_, ident) in procs.items() if baseline is None or ident not in baseline}
++    work = {pid for pid, (_, ident) in procs.items() if baseline is None or ident not in baseline.idle}
+     grew = True
+     while grew:  # an exempt process with a working descendant is itself working
+         grew = False
+diff --git a/tests/hermes_cli/test_worker_drain_baseline.py b/tests/hermes_cli/test_worker_drain_baseline.py
+new file mode 100644
+index 0000000000..8a63e8fa9f
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_baseline.py
+@@ -0,0 +1,105 @@
++"""Boot/instance and PID-reuse regressions for trusted drain baselines."""
++from __future__ import annotations
++
++import json
++import os
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import worker_drain_census as c
++from hermes_cli import worker_drain_fence as fence
++
++pytestmark = pytest.mark.platforms('linux')
++CG = '/system.slice/idle.service'
++
++
++def process(root, pid=10, start=100, exe='/usr/sbin/idled'):
++    d = root / str(pid)
++    d.mkdir(exist_ok=True)
++    fields = ['S', '1', '1', '1', '0', '-1', '0'] + ['0'] * 12 + [str(start)]
++    (d / 'stat').write_text(f'{pid} (p q) ' + ' '.join(fields), encoding='ascii')
++    (d / 'cgroup').write_text(f'0::{CG}\n', encoding='ascii')
++    (d / 'cmdline').write_bytes(b'idled\0')
++    if not (d / 'exe').is_symlink():
++        (d / 'exe').symlink_to(exe)
++
++
++@pytest.fixture
++def host(monkeypatch, tmp_path):
++    ident = fence.Identity('i-12345678', 'boot-a', 'epoch-a', os.getuid())
++    monkeypatch.setattr(fence, 'load_activation', lambda: {'uid': os.getuid()})
++    monkeypatch.setattr(fence, 'current_identity', lambda act: ident)
++    from hermes_cli import worker_drain_baseline as producer
++    monkeypatch.setattr(producer, 'validate_baseline', lambda base, ident: True)
++    path = tmp_path / 'baseline.json'
++    # Model a root-installed file without requiring privileged pytest. The real
++    # descriptor checks remain exercised in the trust test below.
++    real_fstat = c.os.fstat
++    def root_stat(fd):
++        st = real_fstat(fd)
++        return SimpleNamespace(st_uid=0, st_mode=st.st_mode, st_nlink=st.st_nlink)
++    monkeypatch.setattr(c.os, 'fstat', root_stat)
++    doc = {'version': 2, 'boot_id': ident.boot, 'iid': ident.iid, 'node_epoch': ident.node_epoch,
++           'manifest_digest': 'trusted-test-digest',
++           'idle': [{'pid': 10, 'start_ticks': 100, 'uid': os.getuid(), 'cgroup': CG, 'exe': '/usr/sbin/idled'}]}
++    def load(**changes):
++        path.write_text(json.dumps({**doc, **changes}), encoding='utf-8')
++        path.chmod(0o644)
++        return c.load_baseline(str(path))
++    return tmp_path, path, load
++
++
++def test_fresh_idle_and_same_executable_sibling(host):
++    root, _, load = host
++    process(root)
++    baseline = load()
++    assert baseline is not None
++    assert c.observe_processes(str(root), baseline).state == c.ZERO
++    process(root, pid=11)
++    assert c.observe_processes(str(root), baseline).state == c.POSITIVE
++
++
++def test_pid_reuse_is_not_idle(host):
++    root, _, load = host
++    process(root, start=101)
++    assert c.observe_processes(str(root), load()).state == c.POSITIVE
++
++
++@pytest.mark.parametrize('changes', [{'boot_id': 'old-boot'}, {'iid': 'i-87654321'},
++                                    {'node_epoch': 'old-epoch'}, {'version': 1}])
++def test_stale_or_legacy_baseline_unknown(host, changes):
++    root, _, load = host
++    assert load(**changes) is None
++    assert c.observe_processes(str(root), c.load_baseline(str(root / 'missing'))).state == c.UNKNOWN
++
++
++def test_binding_revalidated_after_load(host, monkeypatch):
++    root, _, load = host
++    process(root)
++    baseline = load()
++    monkeypatch.setattr(fence, 'current_identity', lambda act: fence.Identity('i-12345678', 'boot-b', 'epoch-a'))
++    assert c.observe_processes(str(root), baseline).state == c.UNKNOWN
++
++
++@pytest.mark.parametrize('entry', [{'pid': True}, {'pid': -1}, {'start_ticks': 0}, {'uid': '0'}, {'cgroup': ''}])
++def test_malformed_identity_never_exempts(host, entry):
++    root, _, load = host
++    process(root)
++    idle = {'pid': 10, 'start_ticks': 100, 'uid': os.getuid(), 'cgroup': CG, 'exe': '/usr/sbin/idled'}
++    assert load(idle=[{**idle, **entry}]) is None
++
++
++def test_unsafe_mode_and_links_refused(host):
++    _, path, load = host
++    assert load() is not None
++    path.chmod(0o666)
++    assert c.load_baseline(str(path)) is None
++    path.chmod(0o644)
++    hard = path.with_name('hard')
++    hard.hardlink_to(path)
++    assert c.load_baseline(str(path)) is None
++    hard.unlink()
++    link = path.with_name('link')
++    link.symlink_to(path)
++    assert c.load_baseline(str(link)) is None
+diff --git a/tests/hermes_cli/test_worker_drain_capability.py b/tests/hermes_cli/test_worker_drain_capability.py
+new file mode 100644
+index 0000000000..afd4d3e930
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_capability.py
+@@ -0,0 +1,75 @@
++"""Kernel-sealed daemon capability lifetime and identity controls."""
++from __future__ import annotations
++
++import os
++
++import pytest
++
++from hermes_cli import worker_drain_capability as cap
++from hermes_cli import worker_drain_census as census
++from hermes_cli import worker_drain_fence as fence
++from hermes_cli.worker_drain_baseline import CaptureRefused
++
++pytestmark = pytest.mark.platforms('linux')
++
++
++@pytest.fixture
++def capability(monkeypatch):
++    entry = census.process_identity('/proc', str(os.getpid()))
++    ident = fence.Identity('i-12345678', 'boot-a', 'epoch-a', os.getuid())
++    contract = {'digest': 'core-digest', 'installed_boot_id': 'boot-a', 'installed_start_ticks': entry[1] - 1,
++                'activation_start_ticks': entry[1] - 1, 'homes': ['/home/worker/.hermes']}
++    monkeypatch.setattr(cap, 'verified_contract', lambda manifest: contract)
++    monkeypatch.setattr(cap, 'startup_is_cold', lambda: True)
++    fd = cap.create_capability(ident, {}, entry=entry)
++    try:
++        yield ident, entry, fd, contract
++    finally:
++        os.close(fd)
++
++
++def test_live_kernel_capability_matches_exact_process(capability):
++    ident, entry, _, _ = capability
++    cap.validate_capability(entry[0], entry, ident, {})
++
++
++def test_capability_cannot_be_rewritten_or_inherited_through_exec(capability):
++    _, _, fd, _ = capability
++    assert not os.get_inheritable(fd)
++    with pytest.raises(OSError):
++        os.write(fd, b'forged')
++
++
++@pytest.mark.parametrize('field,value', [('digest', 'new-digest'), ('installed_boot_id', 'old-boot'),
++    ('installed_start_ticks', 10**20), ('activation_start_ticks', 10**20), ('homes', ['/other/home'])])
++def test_changed_runtime_contract_is_unknown(capability, field, value):
++    ident, entry, _, contract = capability
++    contract[field] = value
++    with pytest.raises(CaptureRefused):
++        cap.validate_capability(entry[0], entry, ident, {})
++
++
++@pytest.mark.parametrize('ident', [fence.Identity('i-87654321', 'boot-a', 'epoch-a'),
++    fence.Identity('i-12345678', 'boot-b', 'epoch-a'), fence.Identity('i-12345678', 'boot-a', 'epoch-b')])
++def test_other_boot_instance_or_epoch_has_no_capability(capability, ident):
++    _, entry, _, _ = capability
++    with pytest.raises(CaptureRefused):
++        cap.validate_capability(entry[0], entry, ident, {})
++
++
++def test_capability_disappears_with_descriptor(capability):
++    ident, entry, fd, _ = capability
++    os.close(fd)
++    # Keep the fixture's own descriptor valid for final cleanup, without retaining
++    # the capability inode in this process.
++    replacement = os.open('/dev/null', os.O_RDONLY)
++    assert replacement == fd
++    with pytest.raises(CaptureRefused):
++        cap.validate_capability(entry[0], entry, ident, {})
++
++
++def test_warm_daemon_cannot_gain_capability(capability, monkeypatch):
++    ident, entry, _, _ = capability
++    monkeypatch.setattr(cap, 'startup_is_cold', lambda: False)
++    with pytest.raises(CaptureRefused, match='startup'):
++        cap.create_capability(ident, {}, entry=entry)
+diff --git a/tests/hermes_cli/test_worker_drain_census_manifest.py b/tests/hermes_cli/test_worker_drain_census_manifest.py
+index df7d71ef17..f83428366b 100644
+--- a/tests/hermes_cli/test_worker_drain_census_manifest.py
++++ b/tests/hermes_cli/test_worker_drain_census_manifest.py
+@@ -51,11 +51,19 @@ def _proc(root, pid, ppid=1, cgroup=CG, exe='/usr/sbin/idled', uid_dir=True, lin
+ 
+ 
+ def _ident(root, cgroup=CG, exe='/usr/sbin/idled'):
+-    return (os.stat(root).st_uid, cgroup, exe)
++    return (10, 100, os.stat(root).st_uid, cgroup, exe)
+ 
+ 
+-def test_baseline_exempts_only_exact_identity_with_no_working_descendant(tmp_path):
+-    base = frozenset({_ident(tmp_path)})
++@pytest.fixture
++def live_baseline(monkeypatch):
++    from hermes_cli import worker_drain_fence as fence
++    monkeypatch.setattr(fence, 'load_activation', dict)
++    monkeypatch.setattr(fence, 'current_identity', lambda act: fence.Identity('iid', 'boot', 'epoch'))
++    return lambda entries: c.Baseline('boot', 'iid', 'epoch', frozenset(entries))
++
++
++def test_baseline_exempts_only_exact_identity_with_no_working_descendant(tmp_path, live_baseline):
++    base = live_baseline({_ident(tmp_path)})
+     _proc(tmp_path, 10)
+     assert c.observe_processes(str(tmp_path), base) == c.Observation(c.ZERO)
+     _proc(tmp_path, 11, ppid=10, exe='/usr/bin/python3')  # unlisted descendant of an exempt daemon
+@@ -63,8 +71,8 @@ def test_baseline_exempts_only_exact_identity_with_no_working_descendant(tmp_pat
+     assert seen.state == c.POSITIVE and seen.count == 2  # parent is dragged in: a unit name exempts no descendants
+ 
+ 
+-def test_same_exe_in_other_cgroup_is_work(tmp_path):
+-    base = frozenset({_ident(tmp_path)})
++def test_same_exe_in_other_cgroup_is_work(tmp_path, live_baseline):
++    base = live_baseline({_ident(tmp_path)})
+     _proc(tmp_path, 10, cgroup='/user.slice/job.scope')
+     assert c.observe_processes(str(tmp_path), base).state == c.POSITIVE
+ 
+@@ -74,14 +82,14 @@ def test_unlisted_process_without_baseline_is_work(tmp_path):
+     assert c.observe_processes(str(tmp_path), None).state == c.POSITIVE
+ 
+ 
+-def test_empty_proc_without_baseline_is_unknown(tmp_path):
++def test_empty_proc_without_baseline_is_unknown(tmp_path, live_baseline):
+     assert c.observe_processes(str(tmp_path), None) == c.Observation(c.UNKNOWN, reason='no trusted live baseline')
+-    assert c.observe_processes(str(tmp_path), frozenset()).state == c.ZERO
++    assert c.observe_processes(str(tmp_path), live_baseline(set())).state == c.ZERO
+ 
+ 
+-def test_unreadable_exe_blocks_zero(tmp_path):
++def test_unreadable_exe_blocks_zero(tmp_path, live_baseline):
+     _proc(tmp_path, 10, link=False)  # alive, exe not readable (foreign uid)
+-    seen = c.observe_processes(str(tmp_path), frozenset({_ident(tmp_path)}))
++    seen = c.observe_processes(str(tmp_path), live_baseline({_ident(tmp_path)}))
+     assert seen.state == c.UNKNOWN and 'unobservable' in seen.reason
+ 
+ 
+diff --git a/tests/hermes_cli/test_worker_drain_producer.py b/tests/hermes_cli/test_worker_drain_producer.py
+new file mode 100644
+index 0000000000..5f8aef8111
+--- /dev/null
++++ b/tests/hermes_cli/test_worker_drain_producer.py
+@@ -0,0 +1,97 @@
++"""A producer may not learn exemptions from arbitrary running processes."""
++from __future__ import annotations
++
++import json
++import os
++
++import pytest
++
++from hermes_cli import worker_drain_census as census
++from hermes_cli import worker_drain_fence as fence
++from hermes_cli import worker_drain_baseline as producer
++from tests.hermes_cli.test_worker_drain_baseline import process
++
++pytestmark = pytest.mark.platforms('linux')
++
++
++@pytest.fixture
++def image(tmp_path, monkeypatch):
++    proc = tmp_path / 'proc'
++    proc.mkdir()
++    process(proc)
++    ident = fence.Identity('i-12345678', 'boot-a', 'epoch-a', os.getuid())
++    monkeypatch.setattr(fence, 'load_activation', dict)
++    monkeypatch.setattr(fence, 'current_identity', lambda act: ident)
++    manifest = {'version': 1, 'units': [{'name': 'idle.service', 'kind': 'infrastructure',
++                 'fragment_sha256': 'fragment-hash', 'exe_sha256': 'exe-hash'}]}
++    monkeypatch.setattr(producer, 'load_manifest', lambda path: manifest)
++    monkeypatch.setattr(producer, 'unit_state', lambda unit: {
++        'MainPID': '10', 'ControlGroup': '/system.slice/idle.service', 'FragmentPath': '/unit'})
++    monkeypatch.setattr(producer, 'file_digest', lambda path: 'fragment-hash' if str(path) == '/unit' else 'exe-hash')
++    return proc, ident, manifest
++
++
++def capture(image):
++    proc, ident, _ = image
++    return producer.capture('manifest', ident, proc_root=str(proc))
++
++
++def test_declared_mainpid_produces_strict_idle_identity(image, monkeypatch):
++    proc, _, _ = image
++    doc = capture(image)
++    assert doc['version'] == 2 and doc['boot_id'] == 'boot-a' and doc['iid'] == 'i-12345678'
++    assert doc['idle'][0]['pid'] == 10 and doc['idle'][0]['start_ticks'] == 100
++    monkeypatch.setattr(census, 'baseline_is_live', lambda base: True)
++    base = census.Baseline(doc['boot_id'], doc['iid'], doc['node_epoch'],
++                           frozenset(census._entry_identity(e) for e in doc['idle']))
++    assert census.observe_processes(str(proc), base).state == census.ZERO
++    process(proc, pid=11)
++    assert census.observe_processes(str(proc), base).state == census.POSITIVE
++
++
++def test_undeclared_same_exe_process_refuses_capture(image):
++    process(image[0], pid=11)
++    with pytest.raises(producer.CaptureRefused, match='undeclared'):
++        capture(image)
++
++
++@pytest.mark.parametrize('field,value', [('MainPID', '11'), ('ControlGroup', '/other'), ('FragmentPath', '/different')])
++def test_forged_or_changed_unit_provenance_refuses(image, monkeypatch, field, value):
++    state = {'MainPID': '10', 'ControlGroup': '/system.slice/idle.service', 'FragmentPath': '/unit'}
++    monkeypatch.setattr(producer, 'unit_state', lambda unit: {**state, field: value})
++    with pytest.raises(producer.CaptureRefused):
++        capture(image)
++
++
++def test_hermes_without_live_capability_is_never_exempt(image):
++    image[2]['units'][0]['kind'] = 'hermes'
++    with pytest.raises(producer.CaptureRefused, match='capability'):
++        capture(image)
++
++
++def test_unreadable_process_never_learns_baseline(image):
++    (image[0] / '10' / 'exe').unlink()
++    with pytest.raises(producer.CaptureRefused):
++        capture(image)
++
++
++def test_atomic_writer_owner_mode_and_failed_capture_invalidates(tmp_path, monkeypatch):
++    # Exercise bytes/mode/replace without needing root; privilege refusal has its
++    # own control and the production writer always uses fchown(0, 0).
++    path = tmp_path / 'baseline.json'
++    monkeypatch.setattr(producer.os, 'geteuid', lambda: 0)
++    chowns = []
++    monkeypatch.setattr(producer.os, 'fchown', lambda fd, uid, gid: chowns.append((uid, gid)))
++    producer.write_baseline(path, {'version': 2})
++    assert json.loads(path.read_text()) == {'version': 2}
++    assert path.stat().st_mode & 0o777 == 0o644 and chowns == [(0, 0)]
++    monkeypatch.setattr(producer, 'capture', lambda *a, **k: (_ for _ in ()).throw(producer.CaptureRefused('busy')))
++    with pytest.raises(producer.CaptureRefused):
++        producer.install('manifest', None, path=path)
++    assert not path.exists()
++
++
++def test_writer_refuses_unprivileged(tmp_path, monkeypatch):
++    monkeypatch.setattr(producer.os, 'geteuid', lambda: 1000)
++    with pytest.raises(producer.CaptureRefused, match='root'):
++        producer.write_baseline(tmp_path / 'baseline', {})
+-- 
+2.43.0
+

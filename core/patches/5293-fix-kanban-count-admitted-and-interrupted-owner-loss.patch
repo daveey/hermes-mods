@@ -1,0 +1,250 @@
+From 84c1c99d8c824c0a9da74b71b4d98638269f81cc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 20:42:43 +0000
+Subject: [PATCH] fix(kanban): count admitted and interrupted owner-loss spend
+ [daveey]
+
+Address review 5998995314 on PR #3819. Owner-unavailable is a failure-budget
+booking, not proof no turn ran: it also covers midrun interruptions. A
+submitter's rc 69 can likewise lose an admission answer after a turn ran.
+Exclude only owner_unavailable/owner_down or integer rc-69 crashes with no
+owner_admitted event, no usage receipt, and no host_refusal except preadmission.
+Count startup, midrun, unknown or malformed refusal proofs conservatively.
+
+Five whys: the original failure counter fix changed dispatch, while spend
+reads task_runs separately; the first exclusion reused failure outcomes;
+those outcomes cover both preturn and midturn owner faults; lost receipts
+can hide a real admitted turn; synthetic outcome-only fixtures missed the
+admission and proof-phase boundary. The repair checks those independent
+receipts and exercises the real dead-worker sweep.
+
+RED on d78924ea6f: all 11 new negative cases fail (3 reviewer sweep probes,
+8 evidence cases). GREEN: 9 importing test files, 206 passed; scripts/check
+--base origin/main: 21 checks ok. Existing 8-real + 7-refusal acceptance now
+uses the actual preadmission metadata shapes. Unadmitted refusal streak
+remains excluded; cache-read tokens and reported <= runs remain intact.
+---
+ hermes_cli/kanban_spend_budget.py             | 34 ++++---
+ tests/hermes_cli/test_kanban_spend_budget.py  | 28 +++++-
+ .../test_kanban_spend_budget_refusal.py       | 92 +++++++++++++++++++
+ 3 files changed, 138 insertions(+), 16 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_spend_budget_refusal.py
+
+diff --git a/hermes_cli/kanban_spend_budget.py b/hermes_cli/kanban_spend_budget.py
+index e8258ca4ce..a81bd7c39a 100644
+--- a/hermes_cli/kanban_spend_budget.py
++++ b/hermes_cli/kanban_spend_budget.py
+@@ -15,9 +15,9 @@ the tokens those runs reported. A spending run is a closed run that lasted at le
+ quota walls, released claims and spawn failures end in seconds and spend nothing. Tokens come from the
+ run's own ``worker_result`` receipt (``usage``, written by the managed worker from its agent's session
+ counters on the host that ran it, so a card that ran on several workers is still summed on its home board);
+-a run with no usage receipt counts as a run only. Runs in which the profile owner refused the claim and no
+-turn ran (``owner_unavailable`` / ``owner_down``, or ``crashed`` with the owner-unreachable exit 69 and no usage
+-receipt) are not spending runs; ``Spend.excluded`` counts them.
++a run with no usage receipt counts as a run only. ``Spend.excluded`` counts only ``owner_unavailable`` /
++``owner_down`` runs (or ``crashed`` with integer exit 69) with no owner admission, no usage receipt, and
++no ``host_refusal`` proof except one whose phase is ``preadmission``. Admitted or interrupted turns count.
+ 
+ At ``kanban.spend_budget_runs`` spending runs (default 15) or ``kanban.spend_budget_cache_read_tokens``
+ cache-read tokens (default 30M) -- 0 disables either -- the dispatcher does not spawn the card. Deciding
+@@ -48,9 +48,8 @@ OVERRIDE_EVENT = "spend_budget_set"  # a card's own limits (``set_override``); t
+ AUTHOR = "kanban-spend-budget"
+ # A run that handed work on closes the budget window.
+ RESET_OUTCOMES = ("completed", "review_requested", "changes_requested")
+-# Runs booked while the profile owner refused the claim ran no turn and spent nothing. ``owner_unavailable`` /
+-# ``owner_down`` are booked as such; the fifth consecutive refusal is booked ``crashed`` with the worker's
+-# owner-unreachable exit code (``kanban_owner_unavailable``: 69) and no usage receipt.
++# Exclude these outcomes (or crashed with integer exit 69) only without admission or usage, and with
++# host_refusal absent or explicitly preadmission. Neutral failure-budget bookings can also be mid-turn.
+ REFUSAL_OUTCOMES = ("owner_unavailable", "owner_down")
+ REFUSAL_EXIT_CODE = 69
+ USAGE_KEYS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+@@ -224,18 +223,22 @@ def _run_usage(conn: sqlite3.Connection, task_id: str, run_ids: list[int]) -> di
+     return out
+ 
+ 
+-def _refused(outcome: Any, raw_metadata: Any, has_usage: bool) -> bool:
+-    """True for a run in which the owner refused the claim and no turn ran."""
+-    if outcome in REFUSAL_OUTCOMES:
+-        return True
+-    if outcome != "crashed" or has_usage:
++def _refused(outcome: Any, raw_metadata: Any, has_usage: bool, admitted: bool) -> bool:
++    """Exclude only pre-turn owner refusals, not admitted or interrupted turns."""
++    if has_usage or admitted:
+         return False
+     try:
+         meta = json.loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
+     except ValueError:
+         return False
+-    code = meta.get("exit_code") if isinstance(meta, dict) else None
+-    return code == REFUSAL_EXIT_CODE and not isinstance(code, bool)
++    meta = meta if isinstance(meta, dict) else {}
++    proof = meta.get("host_refusal")
++    if "host_refusal" in meta and (not isinstance(proof, dict) or proof.get("phase") != "preadmission"):
++        return False
++    if outcome in REFUSAL_OUTCOMES:
++        return True
++    code = meta.get("exit_code")
++    return outcome == "crashed" and isinstance(code, int) and not isinstance(code, bool) and code == REFUSAL_EXIT_CODE
+ 
+ 
+ def spend(conn: sqlite3.Connection, task_id: str, *, as_of: Optional[int] = None) -> Spend:
+@@ -246,7 +249,10 @@ def spend(conn: sqlite3.Connection, task_id: str, *, as_of: Optional[int] = None
+         "SELECT id, outcome, metadata FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL AND ended_at < ? "
+         "AND started_at >= ? AND ended_at - started_at >= ?", (task_id, cut, since, MIN_RUN_SECONDS)).fetchall()
+     usage = _run_usage(conn, task_id, [int(r[0]) for r in rows])
+-    run_ids = [int(r[0]) for r in rows if not _refused(r[1], r[2], int(r[0]) in usage)]
++    admitted = {int(r[0]) for r in conn.execute(
++        "SELECT DISTINCT run_id FROM task_events WHERE task_id = ? AND kind = 'owner_admitted' "
++        "AND run_id IS NOT NULL", (task_id,))}
++    run_ids = [int(r[0]) for r in rows if not _refused(r[1], r[2], int(r[0]) in usage, int(r[0]) in admitted)]
+     excluded = len(rows) - len(run_ids)
+     tokens = {key: 0 for key in USAGE_KEYS}
+     cost = 0.0
+diff --git a/tests/hermes_cli/test_kanban_spend_budget.py b/tests/hermes_cli/test_kanban_spend_budget.py
+index 4075b13e9a..729183e673 100644
+--- a/tests/hermes_cli/test_kanban_spend_budget.py
++++ b/tests/hermes_cli/test_kanban_spend_budget.py
+@@ -485,11 +485,13 @@ def test_cli_sets_and_shows_the_card_override(kanban_home):
+ 
+ def _refusals(conn, tid: str) -> None:
+     """The 7 no-turn runs of t_eeeeee0000000023: six ``owner_unavailable`` and one ``crashed`` rc 69."""
++    metadata = {"host_refusal": {"kind": "owner_storage_unavailable", "phase": "preadmission",
++                                 "reason": "storage_unavailable"}}
+     for _ in range(3):
+-        _run(conn, tid, "owner_unavailable")
++        _run(conn, tid, "owner_unavailable", metadata=metadata)
+     _run(conn, tid, "crashed", metadata={"exit_kind": "nonzero_exit", "exit_code": 69})
+     for _ in range(3):
+-        _run(conn, tid, "owner_unavailable")
++        _run(conn, tid, "owner_unavailable", metadata=metadata)
+ 
+ 
+ def test_owner_refusals_do_not_hold_the_t_eeeeee0000000023_window(kanban_home):
+@@ -542,3 +544,25 @@ def test_readback_reports_the_excluded_count(kanban_home):
+     shown = json.loads(kc.run_slash(f"spend-budget {tid} --json"))
+     assert shown["spent"]["runs"] == 8 and shown["spent"]["excluded"] == 7
+     assert "spent: 8 runs (7 owner-refusal runs excluded)" in kc.run_slash(f"spend-budget {tid}")
++
++
++@pytest.mark.parametrize("outcome,metadata,admitted,usage", [
++    ("owner_unavailable", None, True, None),
++    ("owner_down", None, True, None),
++    ("owner_unavailable", {"host_refusal": {"phase": "startup"}}, True, None),
++    ("owner_unavailable", {"host_refusal": {"phase": "startup"}}, False, None),
++    ("owner_unavailable", {"host_refusal": {"phase": "unknown"}}, False, None),
++    ("owner_unavailable", {"host_refusal": None}, False, None),
++    ("owner_down", None, False, {"input_tokens": 5}),
++    ("crashed", {"exit_code": 69.0}, False, None),
++])
++def test_refusal_evidence_must_prove_no_turn(kanban_home, outcome, metadata, admitted, usage):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="uncertain refusal", assignee="default")
++        run_id = _run(conn, tid, outcome, metadata=metadata, usage=usage)
++        if admitted:
++            with kb.write_txn(conn):
++                kb._append_event(conn, tid, "owner_admitted", {}, run_id=run_id)
++        spent = ksb.spend(conn, tid)
++        assert (spent.runs, spent.excluded) == (1, 0)
++        assert spent.reported <= spent.runs
+diff --git a/tests/hermes_cli/test_kanban_spend_budget_refusal.py b/tests/hermes_cli/test_kanban_spend_budget_refusal.py
+new file mode 100644
+index 0000000000..c2f4855928
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_budget_refusal.py
+@@ -0,0 +1,92 @@
++"""Spending follows whether a turn ran, not the sweep's failure-budget outcome."""
++import os
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_owner_unavailable as ou
++from hermes_cli import kanban_spend_budget as ksb
++from tests.hermes_cli import test_kanban_host_refusal as helpers
++
++home = helpers.home
++_TERMINAL = "Worker failed: WorkerPersistenceError: owner_unavailable"
++
++
++def _backdate(conn, tid, seconds=3600):
++    with kb.write_txn(conn):
++        conn.execute("UPDATE task_runs SET started_at = started_at - ? WHERE task_id = ? AND ended_at IS NULL",
++                     (seconds, tid))
++        conn.execute("UPDATE tasks SET started_at = started_at - ? WHERE id = ?", (seconds, tid))
++
++
++def _result(conn, tid, **changes):
++    task = kb.get_task(conn, tid)
++    payload = {"pid": os.getpid(), "claim_lock": task.claim_lock, "exit_code": 1, "last_output": _TERMINAL}
++    payload.update(changes)
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "worker_result", payload, run_id=task.current_run_id)
++
++
++def _last(conn, tid):
++    return conn.execute("SELECT outcome, error, metadata, ended_at - started_at AS secs FROM task_runs "
++                        "WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++
++
++@pytest.mark.parametrize("usage", [None, {"cache_read_tokens": 5_000_000, "input_tokens": 9}])
++def test_midrun_owner_loss_is_a_spending_run(home, usage):
++    with kbc.connect() as conn:
++        tid, _ = helpers._admitted_run(conn)
++        _backdate(conn, tid)
++        if usage is not None:
++            _result(conn, tid, last_output="turn text", usage=usage)
++        _result(conn, tid)
++        kbd.detect_crashed_workers(conn)
++        run = _last(conn, tid)
++        assert run["outcome"] == "owner_unavailable" and "turn interrupted" in run["error"]
++        assert run["secs"] >= 3600
++        spent = ksb.spend(conn, tid)
++        assert (spent.runs, spent.excluded) == (1, 0)
++        assert spent.reported <= spent.runs
++        assert spent.tokens["cache_read_tokens"] == (5_000_000 if usage else 0)
++        assert spent.reported == (1 if usage else 0)
++
++
++def test_admitted_run_lost_with_exit_69_is_a_spending_run(home, monkeypatch):
++    """The owner admitted the run but the submitter never saw the answer."""
++    from hermes_cli.kanban_db_dispatch_exit_code import exit_code_kind
++    monkeypatch.setattr(kbd, "_classify_worker_exit", lambda pid: exit_code_kind(ou.KANBAN_OWNER_UNAVAILABLE_EXIT_CODE))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="goal card", assignee="default")
++        kb.claim_task(conn, tid, claimer=f"{kb._claimer_id().split(':', 1)[0]}:w71001")
++        run_id = kb.get_task(conn, tid).current_run_id
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET worker_pid=71001 WHERE id=?", (tid,))
++            kb._append_event(conn, tid, "owner_admitted", {"db": "/nowhere"}, run_id=run_id)
++        _backdate(conn, tid)
++        kbd.detect_crashed_workers(conn)
++        run = _last(conn, tid)
++        assert run["outcome"] == "crashed" and "the owner had admitted this run" in run["error"]
++        spent = ksb.spend(conn, tid)
++        assert (spent.runs, spent.excluded) == (1, 0)
++
++
++def test_unadmitted_69_streak_is_not_spending(home, monkeypatch):
++    from hermes_cli.kanban_db_dispatch_exit_code import exit_code_kind
++    monkeypatch.setattr(kbd, "_classify_worker_exit", lambda pid: exit_code_kind(ou.KANBAN_OWNER_UNAVAILABLE_EXIT_CODE))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="goal card", assignee="default")
++        outcomes = []
++        for n in range(6):
++            kb.claim_task(conn, tid, claimer=f"{kb._claimer_id().split(':', 1)[0]}:w{71001 + n}")
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (71001 + n, tid))
++            _backdate(conn, tid, 120)
++            kbd.detect_crashed_workers(conn)
++            outcomes.append(_last(conn, tid)["outcome"])
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++        assert outcomes == ["owner_unavailable"] * 5 + ["crashed"]
++        spent = ksb.spend(conn, tid)
++        assert (spent.runs, spent.excluded) == (0, 6)
+-- 
+2.43.0
+

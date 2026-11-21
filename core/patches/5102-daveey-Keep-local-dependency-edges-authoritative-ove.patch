@@ -1,0 +1,125 @@
+From 5247cbb12f00feb8ec010985b8153fa6473eb48c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 09:07:56 +0000
+Subject: [PATCH] [daveey] Keep local dependency edges authoritative over stale
+ replicas
+
+Local task membership owns its complete parent set, including empty after unlink. Foreign ancestor links still resolve through the shadow. Preserve optional upstream owner evidence in ledger projections and remove the unused nearest-blocked wrapper.
+
+Proof: locally removed edge regression RED then GREEN; upstream projection regression RED then GREEN; six targeted suites GREEN and scripts/check --base origin/main passed.
+
+Co-Authored-By: GPT-6.1-sol <noreply@openai.com>
+---
+ hermes_cli/kanban_origin_ledger.py            |  2 +-
+ .../kanban_session_activity_card_details.py   | 24 ++++++-------------
+ .../test_kanban_blocked_upstream_details.py   | 11 +++++++++
+ .../test_kanban_blocked_upstream_remote.py    | 11 +++++----
+ 4 files changed, 25 insertions(+), 23 deletions(-)
+
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 5d4830406a..33a1497f8c 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -658,7 +658,7 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                     'legacy_aliases': aliases_for_projection(alias_receipts.get(structure.digest(raw, binding), []), binding),
+                     # [daveey] Bounded run fields for what the card waits on (kanban_wait_info, display only).
+                     'park': _park_of(task),
+-                    **{k: task[k] for k in ('awaiting', 'wake_check', 'human_request', 'blocked_upstream') if task.get(k)},
++                    **{k: task[k] for k in ('awaiting', 'wake_check', 'human_request', 'blocked_upstream', 'upstream') if task.get(k)},
+                 })
+         return result
+     finally:
+diff --git a/hermes_cli/kanban_session_activity_card_details.py b/hermes_cli/kanban_session_activity_card_details.py
+index 1179efbd05..c600de931f 100644
+--- a/hermes_cli/kanban_session_activity_card_details.py
++++ b/hermes_cli/kanban_session_activity_card_details.py
+@@ -114,16 +114,13 @@ def _task_info(conn: sqlite3.Connection, replica: sqlite3.Connection | None, tas
+ 
+ 
+ def _parent_ids(conn: sqlite3.Connection, replica: sqlite3.Connection | None, child: str) -> list[str]:
+-    seen: set[str] = set()
+-    ids: list[str] = []
+-    for src, required in ((conn, True), (replica, False)):
+-        for row in _query(src, "SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id",
+-                          (child,), required=required):
+-            parent = row[0]
+-            if parent not in seen:
+-                seen.add(parent)
+-                ids.append(parent)
+-    return ids
++    # Local membership owns the whole edge set, including an empty set after unlink.
++    # Only a foreign child's edges come from the shadow; its parents may still be local.
++    local = _query(conn, "SELECT id FROM tasks WHERE id=?", (child,), required=True)
++    src = conn if local or replica is None else replica
++    return [row[0] for row in _query(
++        src, "SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id",
++        (child,), required=src is conn)]
+ 
+ 
+ def _authority(conn: sqlite3.Connection, replica: sqlite3.Connection | None,
+@@ -161,13 +158,6 @@ def _blocked_payload(conn: sqlite3.Connection, replica: sqlite3.Connection | Non
+     return out
+ 
+ 
+-def _nearest_blocked(conn: sqlite3.Connection, task_id: str,
+-                     replica: sqlite3.Connection | None = None) -> dict[str, Any] | None:
+-    """Breadth-first, so the first match is nearest; ties sort by id."""
+-    blocked, _upstream = _walk(conn, task_id, replica)
+-    return blocked
+-
+-
+ def _walk(conn: sqlite3.Connection, task_id: str,
+           replica: sqlite3.Connection | None) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
+     seen = {task_id}
+diff --git a/tests/hermes_cli/test_kanban_blocked_upstream_details.py b/tests/hermes_cli/test_kanban_blocked_upstream_details.py
+index bdf4c61c10..5ca3456c79 100644
+--- a/tests/hermes_cli/test_kanban_blocked_upstream_details.py
++++ b/tests/hermes_cli/test_kanban_blocked_upstream_details.py
+@@ -119,6 +119,17 @@ def test_foreign_parent_resolved_through_replica(board, shadow, monkeypatch):
+     assert_contained(rows["child"])
+ 
+ 
++def test_locally_removed_link_is_not_restored_from_replica(board, shadow, monkeypatch):
++    """A local child's empty parent set is authoritative, even while the shadow lags."""
++    from hermes_cli import kanban_db_sync
++
++    monkeypatch.setattr(kanban_db_sync, "_db_key", lambda conn: str(shadow.parent / "local.db"))
++    monkeypatch.setattr(kanban_db_sync, "board_slug_for_path", lambda key: "default")
++    rows = details(board, [("child", "todo"), ("c", "blocked")], [], ["child"])
++    assert "blocked_upstream" not in rows["child"]
++    assert "upstream" not in rows["child"]
++
++
+ def test_remote_row_annotated_through_replica(shadow):
+     rows = [{"id": "child", "status": "todo", "board": "default"}]
+     card_details.annotate_remote_upstream(rows)
+diff --git a/tests/hermes_cli/test_kanban_blocked_upstream_remote.py b/tests/hermes_cli/test_kanban_blocked_upstream_remote.py
+index 73431f60b1..3e895cc875 100644
+--- a/tests/hermes_cli/test_kanban_blocked_upstream_remote.py
++++ b/tests/hermes_cli/test_kanban_blocked_upstream_remote.py
+@@ -18,16 +18,17 @@ world = origin_fixtures.world
+ 
+ 
+ @pytest.mark.parametrize("present", [True, False])
+-def test_origin_ledger_projection_keeps_optional_ancestor(world, present):
++@pytest.mark.parametrize("field", ["blocked_upstream", "upstream"])
++def test_origin_ledger_projection_keeps_optional_ancestor(world, present, field):
+     path, replica, binding = world
+-    expected = {"id": "parent", "status": "blocked"}
+-    origin_fixtures.publish(replica, binding, **({"blocked_upstream": expected} if present else {}))
++    expected = {"id": "parent", "status": "running" if field == "upstream" else "blocked"}
++    origin_fixtures.publish(replica, binding, **({field: expected} if present else {}))
+     origin_fixtures.accept(world)
+     row = ledger.project(path, replica=replica, gateway="origin", profile="default")[0]
+     if present:
+-        assert row["blocked_upstream"] == expected
++        assert row[field] == expected
+     else:
+-        assert "blocked_upstream" not in row
++        assert field not in row
+ 
+ 
+ @pytest.mark.parametrize("status", ["blocked", "triage", "running"])
+-- 
+2.43.0
+

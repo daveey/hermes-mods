@@ -1,0 +1,682 @@
+From 70b5d9638d7124d52a2f03e125be92f38ed24c93 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 04:51:10 +0000
+Subject: [PATCH] [daveey] Keep authority observation out of render and index
+ owner row candidates
+
+---
+ .../src/app/chat/session-tab-accent.test.tsx  |  97 ++++++++++++++--
+ .../src/lib/use-work-source-unavailable.ts    |  17 ++-
+ .../src/store/work-source-owner.test.ts       | 109 ++++++++++++++++++
+ apps/desktop/src/store/work-source-owner.ts   |  62 +++++++++-
+ .../work-source-secondary-authority.test.ts   | 103 ++++++++++++++++-
+ 5 files changed, 368 insertions(+), 20 deletions(-)
+
+diff --git a/apps/desktop/src/app/chat/session-tab-accent.test.tsx b/apps/desktop/src/app/chat/session-tab-accent.test.tsx
+index d1eff0664d..9a0578f7b7 100644
+--- a/apps/desktop/src/app/chat/session-tab-accent.test.tsx
++++ b/apps/desktop/src/app/chat/session-tab-accent.test.tsx
+@@ -1,14 +1,25 @@
+ import { act, cleanup, render } from '@testing-library/react'
+ import type { WritableAtom } from 'nanostores'
+-import { afterEach, describe, expect, it, vi } from 'vitest'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+ import { PaneTab } from '@/components/ui/pane-tab'
++import { sessionsHost } from '@/sdk/sessions'
++import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import { rowExecution } from '@/store/execution-observation-row'
++import { setPrimaryGateway, setPrimaryGatewayConnection } from '@/store/gateway'
+ import { $kanbanObservationTick } from '@/store/kanban-observation'
+-import { $selectedStoredSessionId, $sessions } from '@/store/session'
++import { $profiles } from '@/store/profile'
++import {
++  $selectedStoredSessionId,
++  $sessions,
++  _resetSessionOwnerHintsForTests,
++  setSessionOwnerHint
++} from '@/store/session'
+ import { $blockedSessionIds } from '@/store/session-blocked'
+ import { $sessionDotStateById, type SessionDotState } from '@/store/session-dot-state'
+ import type * as DotStateModule from '@/store/session-dot-state'
++import { $unavailableWorkSources } from '@/store/session-work-source'
++import { _resetWorkSourceOwnerForTests } from '@/store/work-source-owner'
+ import type { SessionInfo } from '@/types/hermes'
+ 
+ import fixture from '../../../../../schemas/fixtures/execution-observations-v1.json'
+@@ -22,7 +33,38 @@ vi.mock('@/store/session-dot-state', async importOriginal => ({
+ }))
+ 
+ const states = $sessionDotStateById as WritableAtom<Record<string, SessionDotState>>
+-const row = { id: 'session', message_count: 2, kanban_observed_at: Date.now() / 1000 } as SessionInfo
++const row = {
++  id: 'session',
++  profile: 'default',
++  connection_id: 'local',
++  message_count: 2,
++  kanban_observed_at: Date.now() / 1000
++} as SessionInfo
++
++beforeEach(() => {
++  $connectionsRegistry.set({
++    primary: 'local',
++    activeConnectionId: 'local',
++    connections: [{ id: 'local', kind: 'local' }]
++  } as never)
++  $profiles.set([{ name: 'default' }] as never)
++  setPrimaryGateway(
++    { connectionState: 'open', onEvent: () => () => undefined, onState: () => () => undefined } as never,
++    'default'
++  )
++  setPrimaryGatewayConnection({ connectionId: 'local' })
++  setSessionOwnerHint(row.id, { connectionId: 'local', profile: 'default' })
++
++  for (const source of ['lineage', 'tasks', 'process', 'subagent', 'control'] as const) {
++    const read = sessionsHost.beginWorkSourceRead({
++      connectionId: 'local',
++      profile: 'default',
++      storedSessionId: row.id,
++      source
++    })
++    sessionsHost.reportWorkSourceRead({ ...read, available: true })
++  }
++})
+ 
+ function tab(session: SessionInfo | null = row) {
+   return (
+@@ -34,6 +76,13 @@ function tab(session: SessionInfo | null = row) {
+ 
+ afterEach(() => {
+   cleanup()
++  _resetWorkSourceOwnerForTests()
++  _resetSessionOwnerHintsForTests({ storage: true })
++  $unavailableWorkSources.set({})
++  setPrimaryGateway(null)
++  setPrimaryGatewayConnection(null)
++  $connectionsRegistry.set(null)
++  $profiles.set([])
+   vi.useRealTimers()
+   $blockedSessionIds.set([])
+   $selectedStoredSessionId.set(null)
+@@ -49,16 +98,25 @@ describe('session tab underline', () => {
+     const session = {
+       ...row,
+       kanban_observed_at: 1001,
+-      execution_observations: [{
+-        ...fixture.base, state: 'waiting', valid_until: 1010,
+-        wait: {
+-          kind: 'dependency', owner: fixture.base.owner, predicate: 'parent finishes', since: 1000,
+-          target: fixture.base.identity
++      execution_observations: [
++        {
++          ...fixture.base,
++          state: 'waiting',
++          valid_until: 1010,
++          wait: {
++            kind: 'dependency',
++            owner: fixture.base.owner,
++            predicate: 'parent finishes',
++            since: 1000,
++            target: fixture.base.identity
++          }
+         }
+-      }]
++      ]
+     } as SessionInfo
+ 
+-    if (listed) { $sessions.set([session]) }
++    if (listed) {
++      $sessions.set([session])
++    }
+     const { container } = render(tab(session))
+     const stripe = () => container.querySelector('[data-session-tab-accent]')?.getAttribute('data-session-tab-accent')
+ 
+@@ -140,15 +198,30 @@ describe('session tab underline', () => {
+     expect(container.firstElementChild!.className).toContain('dark:[--session-status-color:var(--color-zinc-500)]')
+   })
+ 
+-  it.each([{ kanban_observed_at: undefined }, { kanban_unknown: true }, { kanban_active: 1 }, { kanban_observed_at: 1 }])('does not mark unverified tree-only rows done: %j', evidence => {
++  it.each([
++    { kanban_observed_at: undefined },
++    { kanban_unknown: true },
++    { kanban_active: 1 },
++    { kanban_observed_at: 1 }
++  ])('does not mark unverified tree-only rows done: %j', evidence => {
+     const { container } = render(tab({ ...row, ...evidence }))
+ 
+     expect(container.querySelector('[data-session-tab-accent="done"]')).toBeNull()
+   })
+ 
++  it('unread authority still vetoes a stored-done tab with a known owner', () => {
++    $unavailableWorkSources.set({})
++    const { container } = render(tab({ ...row, outcome: { kind: 'done', source: 'derived', at: 1000 } }))
++    expect(container.querySelector('[data-session-tab-accent="done"]')).toBeNull()
++  })
++
+   it('does not finish an unread stored tab whose row is missing', () => {
+     states.set({ session: 'unread' })
+-    const { container } = render(<SessionTabAccent storedSessionId="session"><span>Missing</span></SessionTabAccent>)
++    const { container } = render(
++      <SessionTabAccent storedSessionId="session">
++        <span>Missing</span>
++      </SessionTabAccent>
++    )
+     expect(container.querySelector('[data-session-tab-accent="done"]')).toBeNull()
+   })
+ 
+diff --git a/apps/desktop/src/lib/use-work-source-unavailable.ts b/apps/desktop/src/lib/use-work-source-unavailable.ts
+index e381593b48..9f714971ca 100644
+--- a/apps/desktop/src/lib/use-work-source-unavailable.ts
++++ b/apps/desktop/src/lib/use-work-source-unavailable.ts
+@@ -1,9 +1,11 @@
+ import { useStore } from '@nanostores/react'
++import { useEffect } from 'react'
+ 
+ import { $sessions, knownSessionOwner, lineageAliases } from '@/store/session'
+ import { $unavailableWorkSources, workSourceAuthorityComplete } from '@/store/session-work-source'
+ import {
+   $workSourceAuthorityRevision,
++  peekWorkSourceAuthorityForSession,
+   qualifiedWorkSourceOwner,
+   workSourceAuthorityForSession
+ } from '@/store/work-source-owner'
+@@ -16,15 +18,26 @@ export function useWorkSourceUnavailable(row: SessionInfo | null | undefined): b
+   const sessions = useStore($sessions)
+   useStore($workSourceAuthorityRevision)
+ 
++  const owner = row ? qualifiedWorkSourceOwner(knownSessionOwner([row], row.id)) : undefined
++  const connectionId = owner?.connectionId
++  const profile = owner?.profile
++  const storedSessionId = row?.id
++
++  useEffect(() => {
++    if (connectionId && profile && storedSessionId) {
++      workSourceAuthorityForSession(connectionId, profile, storedSessionId)
++    }
++  }, [connectionId, profile, storedSessionId])
++
+   if (!row) {
+     return false
+   }
+-  const owner = qualifiedWorkSourceOwner(knownSessionOwner([row], row.id))
+ 
+   if (!owner) {
+     return true
+   }
+-  const authority = workSourceAuthorityForSession(owner.connectionId, owner.profile, row.id)
++
++  const authority = peekWorkSourceAuthorityForSession(owner.connectionId, owner.profile, row.id)
+ 
+   return !workSourceAuthorityComplete(
+     owner.connectionId,
+diff --git a/apps/desktop/src/store/work-source-owner.test.ts b/apps/desktop/src/store/work-source-owner.test.ts
+index 0a654c4ef2..e680d04e2f 100644
+--- a/apps/desktop/src/store/work-source-owner.test.ts
++++ b/apps/desktop/src/store/work-source-owner.test.ts
+@@ -4,6 +4,7 @@ import { createClientSessionState } from '@/lib/chat-runtime'
+ import { $connectionsRegistry } from '@/store/connection-registry-state'
+ import { $gateway, setPrimaryGateway, setPrimaryGatewayConnection } from '@/store/gateway'
+ import { $profiles } from '@/store/profile'
++import { $projectTree } from '@/store/project-tree'
+ import {
+   $activeSessionId,
+   $cronSessions,
+@@ -90,6 +91,7 @@ describe('work-source owner authority context', () => {
+     clearAllSessionStates()
+     $sessionTiles.set([])
+     setSessions([])
++    $projectTree.set([])
+     $activeSessionId.set(null)
+     $selectedStoredSessionId.set(null)
+     $profiles.set([])
+@@ -340,9 +342,116 @@ describe('work-source owner authority context', () => {
+     for (const row of rows.slice(1)) {
+       workSourceAuthorityForSession('local', 'default', row.id)
+     }
++
+     expect(workSourceAuthorityForSession('local', 'default', rows[0].id).durable).not.toBe(first.durable)
+   })
+ 
++  it('revokes same-socket primary route-tag ABA without a read in the intermediate route', () => {
++    setSessions([makeSessionInfo({ id: 'stored-chat', profile: 'default', connection_id: 'local' })])
++    const first = workSourceAuthorityForSession('local', 'default', 'stored-chat')
++    expect(positive(first.durable)).toBe(true)
++    setPrimaryGatewayConnection({ connectionId: 'homelab' })
++    setPrimaryGatewayConnection({ connectionId: 'local' })
++    const after = workSourceAuthorityForSession('local', 'default', 'stored-chat')
++    expect(positive(after.durable)).toBe(true)
++    expect(after.durable).not.toBe(first.durable)
++    expect(after.runtime).not.toBe(first.runtime)
++  })
++
++  it.each(['preview', 'repo'])('observes project-tree-only %s rows and isolates connection/profile scopes', kind => {
++    const row = makeSessionInfo({ id: 'tree-chat', profile: 'default', connection_id: 'local' })
++    const stable = makeSessionInfo({ id: 'stable-chat', profile: 'default', connection_id: 'local' })
++    setSessions([stable])
++
++    const publish = (connectionId: string, profile = 'default') => {
++      const rows = [{ ...row, connection_id: connectionId, profile }]
++      $projectTree.set([
++        {
++          id: 'project',
++          label: 'Project',
++          path: '/project',
++          sessionCount: 1,
++          previewSessions: kind === 'preview' ? rows : [],
++          repos: kind === 'repo' ? [{ groups: [{ sessions: rows }] }] : []
++        }
++      ] as never)
++    }
++
++    publish('local')
++    const first = workSourceAuthorityForSession('local', 'default', row.id)
++    const unchanged = workSourceAuthorityForSession('local', 'default', stable.id)
++    expect(positive(first.durable)).toBe(true)
++    expect(workSourceAuthorityForSession('homelab', 'default', row.id)).toEqual({ durable: null, runtime: null })
++    expect(workSourceAuthorityForSession('local', 'other', row.id)).toEqual({ durable: null, runtime: null })
++    publish('homelab')
++    publish('local', 'other')
++    publish('local')
++    const after = workSourceAuthorityForSession('local', 'default', row.id)
++    expect(positive(after.durable)).toBe(true)
++    expect(after.durable).not.toBe(first.durable)
++    expect(workSourceAuthorityForSession('local', 'default', stable.id)).toEqual(unchanged)
++  })
++
++  it('preserves first-row lineage precedence when indexing owner observations', () => {
++    const first = makeSessionInfo({
++      id: 'tip',
++      _lineage_root_id: 'root',
++      _lineage_ids: ['middle', 'tip'],
++      profile: 'default',
++      connection_id: 'local'
++    })
++    const collision = makeSessionInfo({ id: 'root', profile: 'default', connection_id: 'homelab' })
++    setSessions([first, collision])
++    const root = workSourceAuthorityForSession('local', 'default', 'root')
++    const middle = workSourceAuthorityForSession('local', 'default', 'middle')
++    expect(positive(root.durable)).toBe(true)
++    expect(positive(middle.durable)).toBe(true)
++    setSessions([collision, first])
++    expect(workSourceAuthorityForSession('local', 'default', 'root')).toEqual({ durable: null, runtime: null })
++    expect(workSourceAuthorityForSession('local', 'default', 'middle')).toEqual(middle)
++    setSessions([])
++    expect(workSourceAuthorityForSession('local', 'default', 'middle')).toEqual({ durable: null, runtime: null })
++    setSessions([first])
++    expect(workSourceAuthorityForSession('local', 'default', 'middle').durable).not.toBe(middle.durable)
++  })
++
++  it('keeps realistic streaming observation neutral and reports structural observer cost', () => {
++    const rows = Array.from({ length: 1000 }, (_, i) =>
++      makeSessionInfo({ id: `perf-${i}`, profile: 'default', connection_id: 'local' })
++    )
++
++    setSessions(rows)
++
++    for (const row of rows) {
++      publishSessionState(`rt-${row.id}`, createClientSessionState(row.id))
++    }
++
++    for (const row of rows) {
++      workSourceAuthorityForSession('local', 'default', row.id)
++    }
++
++    const revision = $workSourceAuthorityRevision.get()
++    const stream: number[] = []
++    const structural: number[] = []
++
++    for (let i = 0; i < 100; i++) {
++      const start = performance.now()
++      publishSessionState('rt-perf-0', { ...createClientSessionState('perf-0'), streaming: Boolean(i % 2) } as never)
++      stream.push(performance.now() - start)
++    }
++
++    expect($workSourceAuthorityRevision.get()).toBe(revision)
++
++    for (let i = 0; i < 10; i++) {
++      const start = performance.now()
++      setSessions(rows.map(row => ({ ...row, title: `title-${i}` })))
++      structural.push(performance.now() - start)
++    }
++
++    expect($workSourceAuthorityRevision.get()).toBe(revision)
++    process.stdout.write(`AUTHORITY_OBSERVER_1000 ${JSON.stringify({ stream, structural })}\n`)
++  })
++
+   it('invalidates when the published primary socket identity is replaced', () => {
+     setSessions([makeSessionInfo({ id: 'stored-chat', profile: 'default', connection_id: 'local' })])
+     const first = workSourceAuthorityForSession('local', 'default', 'stored-chat')
+diff --git a/apps/desktop/src/store/work-source-owner.ts b/apps/desktop/src/store/work-source-owner.ts
+index 1d13c22d5b..c94d678d60 100644
+--- a/apps/desktop/src/store/work-source-owner.ts
++++ b/apps/desktop/src/store/work-source-owner.ts
+@@ -12,7 +12,8 @@ import {
+   $selectedStoredSessionId,
+   $sessionOwnerHintsRevision,
+   $sessions,
+-  $unlistedSessionOwnerRows
++  $unlistedSessionOwnerRows,
++  ownerLookupSessionRows
+ } from '@/store/session'
+ import { isSessionOwnerRoute, type SessionOwnerScope } from '@/store/session-request-router'
+ import {
+@@ -23,6 +24,7 @@ import {
+   storedSessionIdForRuntimeId
+ } from '@/store/session-states'
+ import type { WorkSourceAuthority } from '@/store/session-work-source'
++import type { SessionInfo } from '@/types/hermes'
+ 
+ export interface QualifiedWorkSourceOwner {
+   connectionId: string
+@@ -52,6 +54,8 @@ const unsubscribers: Array<() => void> = []
+ const TRACKED_LIMIT = 4096
+ let epoch = 0
+ let runtimeIndex = new Map<string, string>()
++let ownerRows: readonly SessionInfo[] | undefined
++let ownerRowIndex = new Map<string, SessionInfo[]>()
+ let mirrorBindings = ''
+ export const $workSourceAuthorityRevision = atom(1)
+ 
+@@ -91,6 +95,7 @@ export function qualifiedWorkSourceOwner(owner: SessionOwnerScope): QualifiedWor
+   if (typeof owner !== 'string' || !owner.trim()) {
+     return undefined
+   }
++
+   const profile = owner.trim()
+   const { key } = gatewayRouteState(null, profile)
+   const connectionId = pinnedPrimaryGatewayConnectionId()
+@@ -106,6 +111,7 @@ function invalidate(entry: Tracked, durable: boolean): void {
+   if (durable) {
+     entry.durable = nextEpoch()
+   }
++
+   entry.runtime = nextEpoch()
+   bumpRevision()
+ }
+@@ -114,6 +120,7 @@ function bindSocket(entry: Tracked, socket: Socket | null): void {
+   if (entry.socket === socket) {
+     return
+   }
++
+   entry.offState?.()
+   entry.offState = undefined
+   entry.socket = socket
+@@ -123,13 +130,36 @@ function bindSocket(entry: Tracked, socket: Socket | null): void {
+     if (entry.socketState === state) {
+       return
+     }
++
+     entry.socketState = state
+     invalidate(entry, true)
+   })
+ }
+ 
++/** Preserve the resolver's first matching row, including lineage aliases and list precedence. */
++function indexedOwnerForSession(id: string): SessionOwnerScope {
++  const rows = ownerLookupSessionRows()
++
++  if (rows !== ownerRows) {
++    ownerRows = rows
++    ownerRowIndex = new Map()
++
++    for (const row of rows) {
++      for (const alias of [row.id, row._lineage_root_id, ...(row._lineage_ids ?? [])]) {
++        if (alias && !ownerRowIndex.has(alias)) {
++          ownerRowIndex.set(alias, [row])
++        }
++      }
++    }
++  }
++
++  const stored = storedSessionIdForRuntimeId(id) ?? id
++
++  return knownOwnerForSession(id, ownerRowIndex.get(stored) ?? [])
++}
++
+ function syncEntry(entry: Tracked): void {
+-  const resolved = qualifiedWorkSourceOwner(knownOwnerForSession(entry.storedSessionId))
++  const resolved = qualifiedWorkSourceOwner(indexedOwnerForSession(entry.storedSessionId))
+   const semantic = semanticOf(resolved)
+   const runtimes = runtimeIndex.get(scopeKey(entry.owner, entry.storedSessionId)) ?? ''
+ 
+@@ -155,20 +185,23 @@ function rebuildRuntimeIndex(): void {
+       ids.add(tile.runtimeId)
+     }
+   }
++
+   const active = $activeSessionId.get()
+ 
+   if (active) {
+     ids.add(active)
+   }
++
+   const index = new Map<string, string[]>()
+ 
+   for (const id of ids) {
+     const stored = storedSessionIdForRuntimeId(id)
+-    const owner = qualifiedWorkSourceOwner(knownOwnerForSession(id))
++    const owner = qualifiedWorkSourceOwner(indexedOwnerForSession(id))
+ 
+     if (!stored || !owner) {
+       continue
+     }
++
+     const key = scopeKey(owner, stored)
+     const values = index.get(key) ?? []
+     values.push(id)
+@@ -196,6 +229,7 @@ function syncMirrors(): void {
+   if (bindings === mirrorBindings) {
+     return
+   }
++
+   mirrorBindings = bindings
+   syncTracked()
+ }
+@@ -204,6 +238,7 @@ function ensureObservers(): void {
+   if (unsubscribers.length) {
+     return
+   }
++
+   unsubscribers.push(
+     $sessionOwnerHintsRevision.listen(syncTracked),
+     $sessionEventOwnersRevision.listen(syncTracked),
+@@ -236,11 +271,13 @@ export function workSourceAuthorityForSession(
+   if (!storedSessionId?.trim() || !profile?.trim()) {
+     return none
+   }
++
+   const requested = qualifiedWorkSourceOwner(connectionId ? { connectionId, profile } : profile)
+ 
+   if (!requested) {
+     return none
+   }
++
+   ensureObservers()
+   const key = scopeKey(requested, storedSessionId)
+   let entry = tracked.get(key)
+@@ -278,17 +315,36 @@ export function workSourceAuthorityForSession(
+   return { durable: entry.durable, runtime: entry.runtime }
+ }
+ 
++/** Read-only render snapshot. Observation is installed by SDK reads or a mount effect. */
++export function peekWorkSourceAuthorityForSession(
++  connectionId: string,
++  profile: string,
++  storedSessionId: string
++): WorkSourceAuthority {
++  const entry = tracked.get(scopeKey({ connectionId, profile, routeKey: '' }, storedSessionId))
++
++  if (!entry?.semantic || !entry.socket || entry.socketState !== 'open') {
++    return { durable: null, runtime: null }
++  }
++
++  return { durable: entry.durable, runtime: entry.runtime }
++}
++
+ /** Test-only: drop listeners but never recycle request authority. */
+ export function _resetWorkSourceOwnerForTests(): void {
+   for (const entry of tracked.values()) {
+     entry.offState?.()
+   }
++
+   tracked.clear()
+   runtimeIndex.clear()
++  ownerRows = undefined
++  ownerRowIndex.clear()
+   mirrorBindings = ''
+ 
+   while (unsubscribers.length) {
+     unsubscribers.pop()?.()
+   }
++
+   $workSourceAuthorityRevision.set(1)
+ }
+diff --git a/apps/desktop/src/store/work-source-secondary-authority.test.ts b/apps/desktop/src/store/work-source-secondary-authority.test.ts
+index 1072d3c0bc..075067c5ab 100644
+--- a/apps/desktop/src/store/work-source-secondary-authority.test.ts
++++ b/apps/desktop/src/store/work-source-secondary-authority.test.ts
+@@ -1,4 +1,5 @@
+-import { act, renderHook } from '@testing-library/react'
++import { act, render, renderHook } from '@testing-library/react'
++import { createElement } from 'react'
+ import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+ 
+ import { HermesGateway } from '@/api/client'
+@@ -17,7 +18,7 @@ import {
+ import { $profiles } from './profile'
+ import { _resetSessionOwnerHintsForTests, setSessions } from './session'
+ import { $unavailableWorkSources } from './session-work-source'
+-import { _resetWorkSourceOwnerForTests } from './work-source-owner'
++import { $workSourceAuthorityRevision, _resetWorkSourceOwnerForTests } from './work-source-owner'
+ 
+ // The transport and registry are real; only the WebSocket peer is synthetic.
+ class AuthoritySocket extends EventTarget {
+@@ -45,6 +46,7 @@ class AuthoritySocket extends EventTarget {
+     if (this.readyState === AuthoritySocket.CLOSED) {
+       return
+     }
++
+     this.readyState = AuthoritySocket.CLOSED
+     this.dispatchEvent(new CloseEvent('close', { code: 1000 }))
+   }
+@@ -52,6 +54,7 @@ class AuthoritySocket extends EventTarget {
+ 
+ let primary: HermesGateway
+ const row = makeSessionInfo({ id: 'remote-chat', profile: 'worker', connection_id: 'remote' })
++
+ const descriptor = {
+   connectionId: 'remote',
+   mode: 'remote',
+@@ -95,7 +98,7 @@ beforeEach(async () => {
+   setPrimaryGateway(primary, 'default')
+   setPrimaryGatewayConnectionId('local', 'local')
+   window.hermesDesktop = {
+-    getConnectionFor: vi.fn(async () => descriptor),
++    getConnectionFor: vi.fn(async (scope: { profile: string }) => ({ ...descriptor, profile: scope.profile })),
+     getGatewayWsUrlFor: vi.fn(async () => descriptor.wsUrl)
+   } as never
+   const secondary = ensureGatewayForAgent('remote', 'worker')
+@@ -121,6 +124,100 @@ afterEach(() => {
+   vi.unstubAllGlobals()
+ })
+ 
++it('mounting a previously unread secondary row does not update another row during render', () => {
++  const other = makeSessionInfo({ id: 'other-remote-chat', profile: 'worker', connection_id: 'remote' })
++  setSessions([row, other])
++
++  function MountedRow() {
++    return createElement('span', null, String(useWorkSourceUnavailable(row)))
++  }
++
++  let rendering = false
++  const renderPublications: number[] = []
++
++  const off = $workSourceAuthorityRevision.listen(value => {
++    if (rendering) {
++      renderPublications.push(value)
++    }
++  })
++
++  function NewlyMountedRow() {
++    rendering = true
++    const unavailable = useWorkSourceUnavailable(other)
++    rendering = false
++
++    return createElement('span', null, String(unavailable))
++  }
++
++  const first = render(createElement(MountedRow))
++  const errors = vi.spyOn(console, 'error')
++  const second = render(createElement(NewlyMountedRow))
++
++  try {
++    expect(first.container.textContent).toBe('true')
++    expect(second.container.textContent).toBe('true')
++    expect(renderPublications).toEqual([])
++    expect(errors.mock.calls.flat().join(' ')).not.toContain('Cannot update a component')
++  } finally {
++    off()
++    first.unmount()
++    second.unmount()
++    errors.mockRestore()
++  }
++})
++
++it('isolates three live connection/profile routes and keeps unaffected complete rows green', async () => {
++  const opening = ensureGatewayForAgent('remote', 'default')
++  await vi.advanceTimersByTimeAsync(10)
++  expect(await opening).toBe(true)
++  const local = makeSessionInfo({ id: 'local-chat', profile: 'default', connection_id: 'local' })
++  const remoteDefault = makeSessionInfo({ id: 'remote-default-chat', profile: 'default', connection_id: 'remote' })
++  setSessions([local, row, remoteDefault])
++
++  const readFor = (session: typeof row) =>
++    (['lineage', 'tasks', 'process', 'subagent', 'control'] as const).map(source =>
++      sessionsHost.beginWorkSourceRead({
++        connectionId: session.connection_id!,
++        profile: session.profile!,
++        storedSessionId: session.id,
++        source
++      })
++    )
++
++  const localReads = readFor(local)
++  const workerReads = readFor(row)
++  const otherReads = readFor(remoteDefault)
++  expect([...localReads, ...workerReads, ...otherReads].every(read => read.authorityEpoch !== undefined)).toBe(true)
++  succeed(localReads)
++  succeed(workerReads)
++  const mounted = renderHook(() => [
++    useWorkSourceUnavailable(local),
++    useWorkSourceUnavailable(row),
++    useWorkSourceUnavailable(remoteDefault)
++  ])
++
++  try {
++    expect(mounted.result.current).toEqual([false, false, true])
++    act(() => {
++      // Identical source names/read counters from another live scope are not proof here.
++      for (const read of workerReads) {
++        sessionsHost.reportWorkSourceRead({ ...read, storedSessionId: remoteDefault.id, available: true })
++      }
++
++      for (const read of localReads) {
++        sessionsHost.reportWorkSourceRead({ ...read, storedSessionId: remoteDefault.id, available: true })
++      }
++    })
++    expect(mounted.result.current).toEqual([false, false, true])
++    act(() => succeed(otherReads))
++    expect(mounted.result.current).toEqual([false, false, false])
++    act(() => AuthoritySocket.instances.at(-1)!.close())
++    expect(mounted.result.current).toEqual([false, false, true])
++  } finally {
++    mounted.unmount()
++  }
++})
++
+ it('revokes a mounted secondary owner on close and rejects old replies after real reconnect', async () => {
+   const reads = capture()
+   expect(reads.every(read => read.authorityEpoch !== undefined)).toBe(true)
+-- 
+2.43.0
+

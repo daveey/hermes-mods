@@ -1,0 +1,84 @@
+From fcb0b6986c4ed00fa75e16bf54e6d882c7f35fd8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:39:24 +0000
+Subject: [PATCH] fix(kanban): count shepherd hub subs and read strand
+ ownership per card [daveey]
+
+---
+ hermes_cli/kanban_triage_sweep.py             | 19 +++++++++++-----
+ .../test_kanban_contained_remote_owner.py     | 22 +++++++++++++++++++
+ 2 files changed, 36 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index f40a5cf0c9..1360d4b161 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -126,21 +126,30 @@ def _contained_chat_owners(conn: sqlite3.Connection, ids: list[str]) -> set[str]
+     machine/placeholder sessions are not owners. Read failures propagate to the sweep's
+     fail-closed boundary rather than becoming evidence of absent ownership. [daveey]
+     """
+-    from hermes_cli.kanban_chat_links import _local_links
+-    from hermes_cli.kanban_db_notify import _owning_sub_clause, is_machine_session
++    from hermes_cli.kanban_db_notify import is_machine_session
++    from hermes_cli.kanban_session_activity import _counted_sub_clause
+     from hermes_cli.kanban_origin import OriginError, gateway_name, parse_origin
+     from hermes_cli.kanban_placement import is_placeholder_session
+ 
+     gateway = gateway_name()
+-    owned = {r["task_id"] for r in _local_links(conn, gateway).values() if not r.get("released")}
++    owned: set[str] = set()
+     has_links = conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone()
+     for tid in ids:
+         rows = [dict(r) for r in conn.execute("SELECT * FROM task_chat_links WHERE task_id=?", (tid,))] if has_links else []
+         known = {(r["chat_gateway"], r["chat_profile"] or "default", r["chat_session"]) for r in rows}
+         candidates = [r for r in rows if not r["released"] and r["kind"] in ("created", "shepherd")]
++        # Per-card reads only (no board-wide scan on the dispatcher hot path). Subs count the way
++        # _owner_hub_links does: creators, shepherds and origin bindings, not notice-only subs.
++        made_in = conn.execute("SELECT session_id FROM tasks WHERE id=?", (tid,)).fetchone()
++        if made_in and made_in[0]:
++            candidates.append({"chat_gateway": gateway, "chat_profile": None, "chat_session": made_in[0]})
++        for local in conn.execute(
++                "SELECT s.chat_id FROM kanban_notify_subs s JOIN tasks t ON t.id=s.task_id "
++                f"WHERE s.task_id=? AND s.platform='tui' AND s.chat_id != '' AND {_counted_sub_clause(conn)}", (tid,)):
++            candidates.append({"chat_gateway": gateway, "chat_profile": None, "chat_session": local[0]})
+         for sub in conn.execute(
+-                "SELECT s.chat_id FROM kanban_notify_subs s LEFT JOIN tasks p ON p.id=s.task_id "
+-                f"WHERE s.task_id=? AND s.platform='hub' AND {_owning_sub_clause()}", (tid,)):
++                "SELECT s.chat_id FROM kanban_notify_subs s JOIN tasks t ON t.id=s.task_id "
++                f"WHERE s.task_id=? AND s.platform='hub' AND s.chat_id != '' AND {_counted_sub_clause(conn)}", (tid,)):
+             try:
+                 origin = parse_origin(sub[0])
+             except OriginError:
+diff --git a/tests/hermes_cli/test_kanban_contained_remote_owner.py b/tests/hermes_cli/test_kanban_contained_remote_owner.py
+index 21fb618f5b..be74775453 100644
+--- a/tests/hermes_cli/test_kanban_contained_remote_owner.py
++++ b/tests/hermes_cli/test_kanban_contained_remote_owner.py
+@@ -54,3 +54,25 @@ def test_unreadable_remote_ownership_does_not_escalate(board, monkeypatch):
+     monkeypatch.setattr(kanban_db_notify, "is_machine_session", unavailable)
+     assert h.sweep.escalate_stranded_contained(board, now=h.NOW) == []
+     assert board.execute(f"SELECT COUNT(*) FROM tasks WHERE {h.KEY}").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("reason,expected", [("shepherd", 0), ("origin", 0), ("send_refused", 1)])
++def test_hub_subscription_reasons_before_link_row_lands(board, reason, expected):
++    """A remote shepherd's hub sub counts as an owner even before its link row syncs; send_refused does not."""
++    relay, authority, _ = h._contained(board)
++    h._finish(board, authority)
++    board.execute("INSERT INTO kanban_notify_subs(task_id,platform,chat_id,created_at,delivery_metadata) "
++                  "VALUES (?,'hub','remote-chat-host/default/20261120_000000_abcdef',?,?)",
++                  (relay, h.NOW - 3600, json.dumps({"reason": reason})))
++    assert len(h.sweep.escalate_stranded_contained(board, now=h.NOW)) == expected
++
++
++def test_ownership_read_is_per_card_not_board_wide(board, monkeypatch):
++    from hermes_cli import kanban_chat_links
++    relay, authority, _ = h._contained(board)
++    h._finish(board, authority)
++    board.execute("INSERT INTO task_chat_links VALUES ('owner',?,'remote-chat-host','default',"
++                  "'20261120_000000_abcdef','created',0,?)", (relay, h.NOW))
++    monkeypatch.setattr(kanban_chat_links, "_local_links",
++                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("board-wide scan")))
++    assert h.sweep.escalate_stranded_contained(board, now=h.NOW) == []
+-- 
+2.43.0
+

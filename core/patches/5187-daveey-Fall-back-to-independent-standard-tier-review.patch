@@ -1,0 +1,238 @@
+From e429bf40a6ce74b9a84182d0f1d390fbeb65f797 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 11:27:17 +0000
+Subject: [PATCH] [daveey] Fall back to independent standard-tier review routes
+
+When every deep route authored implementation or is unavailable, select the first eligible independent standard route. Preserve mandatory reviewer pins and refused-override deep-only recovery. Record review_tier_fallback through existing dispatch receipts.
+
+Proof: four-author regression first failed with ReviewModelUnavailable. 354 focused tests pass across 12 consumer files; original review-model tests unchanged. All 21 scripts/check gates pass. Mutation baseline 16 tests green; four fallback, pool-wall, refused-override and author-exclusion mutants killed.
+---
+ hermes_cli/kanban_review_model.py             |  18 ++-
+ .../test_kanban_managed_pin_policy.py         |   5 +
+ .../test_kanban_review_tier_fallback.py       | 150 ++++++++++++++++++
+ 3 files changed, 167 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_review_tier_fallback.py
+
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index 8444e516b2..efa45b7ff7 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -290,15 +290,15 @@ def admission_refusal(conn, task_id, exc):
+     return isinstance(exc, (RestartSafeScopeUnavailable, ReviewModelUnavailable, OfferLost)), False, None
+ 
+ 
+-def independent_routes(pin, cfg, assignee):
+-    """Concrete strong tier followed by eligible deep routes, excluding every author model.
++def independent_routes(pin, cfg, assignee, *, level="deep"):
++    """Eligible routes at *level*, with concrete strong first for deep, excluding every author model.
+ 
+     Accept a single model for legacy callers, or the complete implementer set.
+-    Read-only; an unreadable routing policy contributes no deep candidates.
++    Read-only; an unreadable routing policy contributes no policy candidates.
+     """
+     excluded = {pin} if isinstance(pin, str) else set(pin or ())
+     strong = str(cfg.get("strong_model") or "").strip()
+-    if strong and strong not in excluded and not is_class_selector(strong):
++    if level == "deep" and strong and strong not in excluded and not is_class_selector(strong):
+         from hermes_cli.kanban_model_tier import infer_provider
+         yield strong, str(cfg.get("strong_provider") or "").strip() or infer_provider(strong)
+     from agent.model_routing_agent import class_requirements
+@@ -313,7 +313,7 @@ def independent_routes(pin, cfg, assignee):
+     if not policy.get("enabled", False):
+         return
+     providers = config.get("providers") or {}
+-    for route in eligible_routes(policy, "deep", class_requirements(config), eligible=lambda r: is_provider_enabled(
++    for route in eligible_routes(policy, level, class_requirements(config), eligible=lambda r: is_provider_enabled(
+             providers.get(r["provider"], {}))):
+         if route["model"] not in excluded:
+             yield route["model"], route["provider"]
+@@ -384,7 +384,13 @@ def resolve_review_model(conn, task, cfg):
+         reason = (OVERRIDE_REFUSED if refusal else "review_override" if class_override or override_moved
+                   else "review_unpinned")
+         return model, provider, reason
+-    detail = f"No eligible deep review model distinct from {sorted(excluded)!r}"
++    # Refused overrides retain their existing registered-deep-only recovery contract.
++    for model, provider in (() if refusal else independent_routes(excluded, cfg, assignee, level="standard")):
++        if _unavailable(model, provider) or (override and registry_refusal(model, provider, assignee)):
++            continue
++        return model, provider, "review_tier_fallback"
++    levels = "deep" if refusal else "deep or standard"
++    detail = f"No eligible {levels} review model distinct from {sorted(excluded)!r}"
+     if refusal and override:
+         detail = f"review_model {override[0]!r} is refused here ({refusal.code}); {detail}"
+     raise ReviewModelUnavailable(detail)
+diff --git a/tests/hermes_cli/test_kanban_managed_pin_policy.py b/tests/hermes_cli/test_kanban_managed_pin_policy.py
+index 358709dd69..7f5cc5aa64 100644
+--- a/tests/hermes_cli/test_kanban_managed_pin_policy.py
++++ b/tests/hermes_cli/test_kanban_managed_pin_policy.py
+@@ -338,6 +338,11 @@ def test_rerouted_pin_reviewer_is_distinct_from_the_model_that_ran(board, overri
+     _receipts(conn, tid, **({'route': ran} if receipt == 'run_route' else {'ran': ran}))
+     seen = []
+     dispatch_once(conn, spawn_fn=lambda item, *args: seen.append(item.model_override), max_spawn=1)
++    if override is None:
++        assert seen == ['claude-sonnet-5-5']
++        event = [e.payload for e in kb.list_events(conn, tid) if e.kind == 'model_tier'][-1]
++        assert event['reason'] == 'review_tier_fallback'
++        return
+     assert seen == []
+     task = kb.get_task(conn, tid)
+     assert task.status == 'review' and task.consecutive_failures == 0
+diff --git a/tests/hermes_cli/test_kanban_review_tier_fallback.py b/tests/hermes_cli/test_kanban_review_tier_fallback.py
+new file mode 100644
+index 0000000000..27fb6e4806
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_review_tier_fallback.py
+@@ -0,0 +1,150 @@
++"""Independent standard-tier review is preferable to no independent review."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_llm_pacing_dispatch as pacing
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli import kanban_provider_walls as walls
++from hermes_cli import kanban_review_model as review
++from tests.hermes_cli import test_kanban_review_model as helpers
++
++board = helpers.board
++DEEP = ["claude-fable-5-2", "claude-opus-5-5", "gpt-6-astra", "grok-4.7"]
++STANDARD = "gpt-6.1-sol"
++
++
++def fallback_config(board):
++    cfg = helpers.config(board, strong=DEEP[0], routes=DEEP)
++    path = board / "config.yaml"
++    data = json.loads(path.read_text(encoding="utf-8"))
++    template = data["model_routing"]["routes"]["deep"][0]
++    data["model_routing"]["routes"]["standard"] = [
++        {**template, "model": STANDARD, "provider": "openai-codex"}]
++    path.write_text(json.dumps(data), encoding="utf-8")
++    return cfg
++
++
++def author_task(conn):
++    t = helpers.task(conn, DEEP[0])
++    from tests.hermes_cli import test_kanban_review_implementer_set as authors
++    for model in DEEP[1:]:
++        authors._run(conn, t.id, model=model)
++    return kb.get_task(conn, t.id)
++
++
++def test_all_deep_authors_fall_back_to_independent_standard(board):
++    cfg = fallback_config(board)
++    with kbc.connect() as conn:
++        t = author_task(conn)
++        assert review.implementer_models(conn, t) == set(DEEP)
++        assert review.resolve_review_model(conn, t, cfg) == (
++            STANDARD, "openai-codex", "review_tier_fallback")
++
++
++@pytest.mark.parametrize("blocked", ["excluded", "walled", "held", "live_wall"])
++def test_no_independent_available_standard_still_raises(board, monkeypatch, blocked):
++    cfg = fallback_config(board)
++    if blocked == "walled":
++        monkeypatch.setattr(walls, "active_walls", lambda **kw: {"openai-codex": 9999999999})
++    if blocked == "held":
++        monkeypatch.setattr(pacing, "held_pools", lambda *a: {"openai-codex": 9999999999})
++    if blocked == "live_wall":
++        monkeypatch.setattr(walls, "live_quota_wall", lambda p, m: m == STANDARD)
++    with kbc.connect() as conn:
++        t = author_task(conn)
++        if blocked == "excluded":
++            from tests.hermes_cli import test_kanban_review_implementer_set as authors
++            authors._run(conn, t.id, model=STANDARD)
++        with pytest.raises(review.ReviewModelUnavailable):
++            review.resolve_review_model(conn, t, cfg)
++
++
++def test_excluded_mandatory_pin_does_not_fall_back(board):
++    cfg = fallback_config(board)
++    with kbc.connect() as conn:
++        author = author_task(conn)
++        tid = kb.create_task(conn, title="Independent review of fixture", assignee="default",
++                             creator_task_id=author.id, model_override=DEEP[0],
++                             provider_override="anthropic")
++        conn.execute("UPDATE tasks SET model_pin_mandatory=1 WHERE id=?", (tid,))
++        conn.commit()
++        with pytest.raises(review.ReviewModelUnavailable, match="Mandatory reviewer pin"):
++            review.resolve_review_model(conn, kb.get_task(conn, tid), cfg)
++
++
++@pytest.mark.parametrize("blocked", ["excluded", "walled", "held", "live_wall", "ineligible"])
++def test_standard_policy_order_skips_unavailable_routes(board, monkeypatch, blocked):
++    cfg = fallback_config(board)
++    path = board / "config.yaml"
++    data = json.loads(path.read_text(encoding="utf-8"))
++    routes = data["model_routing"]["routes"]["standard"]
++    bad = {**routes[0], "model": "claude-standard", "provider": "anthropic"}
++    if blocked == "ineligible":
++        bad["eligible"] = False
++    routes.insert(0, bad)
++    routes.append({**routes[1], "model": "gpt-later"})
++    path.write_text(json.dumps(data), encoding="utf-8")
++    if blocked == "walled":
++        monkeypatch.setattr(walls, "active_walls", lambda **kw: {"anthropic": 9999999999})
++    if blocked == "held":
++        monkeypatch.setattr(pacing, "held_pools", lambda *a: {"anthropic": 9999999999})
++    if blocked == "live_wall":
++        monkeypatch.setattr(walls, "live_quota_wall", lambda p, m: m == bad["model"])
++    with kbc.connect() as conn:
++        t = author_task(conn)
++        if blocked == "excluded":
++            from tests.hermes_cli import test_kanban_review_implementer_set as authors
++            authors._run(conn, t.id, model=bad["model"])
++        assert review.resolve_review_model(conn, t, cfg) == (
++            STANDARD, "openai-codex", "review_tier_fallback")
++
++
++@pytest.mark.parametrize("blocked", ["none", "walled", "held"])
++def test_deep_preferred_unless_its_pool_unavailable(board, monkeypatch, blocked):
++    cfg = fallback_config(board)
++    if blocked == "walled":
++        monkeypatch.setattr(walls, "active_walls", lambda **kw: {"anthropic": 9999999999})
++    if blocked == "held":
++        monkeypatch.setattr(pacing, "held_pools", lambda *a: {"anthropic": 9999999999})
++    with kbc.connect() as conn:
++        t = helpers.task(conn, DEEP[0])
++        expected = ((DEEP[1], "anthropic", "review_unpinned") if blocked == "none" else
++                    (STANDARD, "openai-codex", "review_tier_fallback"))
++        assert review.resolve_review_model(conn, t, cfg) == expected
++
++
++def test_dispatch_records_fallback_in_both_route_receipts(board):
++    fallback_config(board)
++    seen = []
++    with kbc.connect() as conn:
++        t = author_task(conn)
++        kb.claim_task(conn, t.id)
++        assert kb.request_review(conn, t.id)
++        dispatch.dispatch_once(conn, dry_run=False,
++                               spawn_fn=lambda item, ws: seen.append(item.model_override))
++        stored = kb.get_task(conn, t.id)
++        assert seen == [STANDARD]
++        assert stored.model_override == DEEP[0]
++        assert tier.owner_model_pin(conn, stored) == (STANDARD, "openai-codex")
++        events = {e.kind: e.payload for e in kb.list_events(conn, t.id)
++                  if e.run_id == stored.current_run_id and e.kind in ("model_tier", "run_route")}
++        assert events["model_tier"]["reason"] == "review_tier_fallback"
++        assert events["run_route"]["tier_reason"] == "review_tier_fallback"
++
++
++def test_refused_override_retains_deep_only_recovery(board, monkeypatch):
++    from types import SimpleNamespace
++    cfg = fallback_config(board)
++    refusal = SimpleNamespace(code="model_pin_not_in_registry", allowed=[STANDARD])
++    monkeypatch.setattr(review, "registry_refusal",
++                        lambda m, p, a: None if m == STANDARD else refusal)
++    with kbc.connect() as conn:
++        t = author_task(conn)
++        kb.claim_task(conn, t.id)
++        assert kb.request_review(conn, t.id, metadata={"review_model": "claude-refused"})
++        with pytest.raises(review.ReviewModelUnavailable, match="refused here"):
++            review.resolve_review_model(conn, t, cfg)
+-- 
+2.43.0
+

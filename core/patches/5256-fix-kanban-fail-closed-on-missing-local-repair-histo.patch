@@ -1,0 +1,284 @@
+From fa6bc17f9b6dd922e4dd5a2fc79353ba8654f150 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 11:27:37 +0000
+Subject: [PATCH] fix(kanban): fail closed on missing local repair history and
+ proxy protocol errors [daveey]
+
+A locally present original is not authority to release an assignment repair
+when its blocked history has not arrived. Require a matching blocked event
+with a string reason and preserve the existing authority/profile/model
+checks. Refusal happens within completion's transaction, leaving the repair
+and original unchanged. Ordinary routed local repairs remain supported.
+
+Normalize http.client.HTTPException from urlopen (including HTTPError body
+reads) to URLError so proxy and direct Board transports share the promised
+refusal contract. Preserve the original exception and attempt diagnostics;
+do not retry or widen authority. Extract unchanged peer_closed observation
+to a topical transport sibling to keep the client below its file-size cap.
+
+Why: assignment validation only ran the execution-authority check inside a
+matching-history loop, with no no-match rejection. urllib also leaves HTTP
+protocol/read failures unwrapped, unlike the direct kept-alive path.
+
+Proof: synthetic local RED 5 failures (incorrect completion), GREEN 7 focused
+cases including ordinary completion/policy drift. Real loopback HTTP proxy
+RED 16 failures (raw IncompleteRead/BadStatusLine), GREEN 19 tests including
+GET/POST, both deadline and global openers, truncated success/error bodies,
+and complete 200/409/410 controls. Focused final regression: 8 files,
+226 tests passed. scripts/check --base origin/main: all 21 checks passed.
+No production task execution, unblock, repair mutation or raw BB data.
+---
+ hermes_cli/kanban_assignment_routing.py       |  6 ++
+ hermes_cli/kanban_sync_client.py              | 25 ++---
+ hermes_cli/kanban_sync_hub_transport.py       | 17 ++++
+ .../test_kanban_assignment_routing.py         | 30 ++++++
+ .../test_kanban_sync_hub_proxy_refusal.py     | 94 +++++++++++++++++++
+ 5 files changed, 156 insertions(+), 16 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_hub_transport.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_hub_proxy_refusal.py
+
+diff --git a/hermes_cli/kanban_assignment_routing.py b/hermes_cli/kanban_assignment_routing.py
+index 1d0d287169..cd04febed2 100644
+--- a/hermes_cli/kanban_assignment_routing.py
++++ b/hermes_cli/kanban_assignment_routing.py
+@@ -216,10 +216,16 @@ def validate_repair_completion(conn, task_id, *, observation=None):
+         except ValueError:
+             continue
+         if isinstance(data, dict) and data.get('supervisor_task_id') == task_id:
++            if not isinstance(data.get('reason'), str):
++                raise AssignmentRoutingError('Assignment repair has invalid authority history')
+             needs = execution_authority_need(original.id, data.get('reason'))
+             if needs:
+                 raise _authority_error(original.id, needs, data.get('reason'))
+             break
++    else:
++        # A local row can arrive before its history. Its assignment alone cannot
++        # establish that completing this repair is authorized.
++        raise AssignmentRoutingError('Assignment repair has no matching authority history')
+     validate_assignment(original.assignee, requires=original.requires,
+                         workspace_kind=original.workspace_kind,
+                         workspace_path=original.workspace_path, skills=original.skills)
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index 74e4eba6dd..6f100ad737 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -52,6 +52,7 @@ from hermes_cli import kanban_sync_refusal as refusal  # one board's Containment
+ from hermes_cli.kanban_containment_lifecycle import ContainmentRefused
+ from hermes_cli.kanban_sync_connections import connection, connection_scope, invalidate
+ from hermes_cli.kanban_sync_hub_routes import HubRoutesMixin
++from hermes_cli.kanban_sync_hub_transport import peer_closed as _peer_closed
+ from hermes_cli.kanban_sync_client_attempt import note_attempt, raise_bounded_error, replay_after_timeout
+ from hermes_cli.kanban_sync_bounded_probe import DeadlineRequests as _DeadlineRequests, schedstat, watch_written
+ from hermes_cli.kanban_sync_repair_window import (  # shared per-board repair-window state, re-exported
+@@ -154,22 +155,6 @@ def load_identity(cfg: Optional[dict] = None) -> Identity:
+     return Identity(url=url, key=key, gateway=gateway)
+ 
+ 
+-def _peer_closed(conn) -> bool:
+-    """True when an idle kept-alive socket is readable (the server sent FIN) or already gone."""
+-    import select
+-    sock = getattr(conn, "sock", None)
+-    if sock is None:
+-        return True
+-    try:  # poll, not select: select raises for fds >= 1024, which a busy gateway has
+-        if not hasattr(select, "poll"):  # Windows: select has no fd ceiling there
+-            return bool(select.select([sock], [], [], 0)[0])
+-        poller = select.poll()
+-        poller.register(sock, select.POLLIN | select.POLLPRI)
+-        return bool(poller.poll(0))
+-    except (OSError, ValueError):
+-        return True
+-
+-
+ CPU_REPORT_BUDGET_S = 2.0
+ _CPU_FIELDS = ("cpu_busy_pct", "cpu_busy_window_ms", "cpu_busy_sample_end_ms")
+ 
+@@ -300,6 +285,8 @@ class Hub(HubRoutesMixin):
+         return self._call_kept_alive(parts, method, path, data, timeout, replay_safe=replay_safe)
+ 
+     def _call_urlopen(self, method: str, path: str, data: Optional[bytes], timeout: Optional[float] = None) -> dict:
++        import http.client
++
+         timeout = self._remaining(timeout)
+         req = urllib.request.Request(self.ident.url + path, data=data, method=method, headers=self._headers())
+         # A per-call opener leaves global urllib users alone. Its processor also caps
+@@ -316,6 +303,12 @@ class Hub(HubRoutesMixin):
+                 if exc.code == 410:
+                     raise Resync(text) from exc
+                 raise HubError(exc.code, text) from exc
++        except http.client.HTTPException as exc:
++            # urllib does not wrap malformed status lines or truncated bodies,
++            # including failures while reading an HTTPError's response body.
++            error = urllib.error.URLError(exc)
++            note_attempt(error, self.deadline, started, time.monotonic())
++            raise error from exc
+         except Exception as exc:  # health: allow BLE001 -- stamps diagnostics, then re-raises the same error
+             note_attempt(exc, self.deadline, started, time.monotonic())
+             raise
+diff --git a/hermes_cli/kanban_sync_hub_transport.py b/hermes_cli/kanban_sync_hub_transport.py
+new file mode 100644
+index 0000000000..476759eda5
+--- /dev/null
++++ b/hermes_cli/kanban_sync_hub_transport.py
+@@ -0,0 +1,17 @@
++"""Socket observation for the Board's kept-alive HTTP transport. [daveey]"""
++
++
++def peer_closed(conn) -> bool:
++    """True when an idle kept-alive socket is readable (the server sent FIN) or already gone."""
++    import select
++    sock = getattr(conn, "sock", None)
++    if sock is None:
++        return True
++    try:  # poll, not select: select raises for fds >= 1024, which a busy gateway has
++        if not hasattr(select, "poll"):  # Windows: select has no fd ceiling there
++            return bool(select.select([sock], [], [], 0)[0])
++        poller = select.poll()
++        poller.register(sock, select.POLLIN | select.POLLPRI)
++        return bool(poller.poll(0))
++    except (OSError, ValueError):
++        return True
+diff --git a/tests/hermes_cli/test_kanban_assignment_routing.py b/tests/hermes_cli/test_kanban_assignment_routing.py
+index a33da28844..a8daccaf8d 100644
+--- a/tests/hermes_cli/test_kanban_assignment_routing.py
++++ b/tests/hermes_cli/test_kanban_assignment_routing.py
+@@ -268,6 +268,36 @@ def test_running_original_handoff_waits_then_dispatches_new_profile(board):
+     assert resumed.assignee == 'supervisor'
+ 
+ 
++@pytest.mark.parametrize('history', [
++    'missing', 'other-repair', 'invalid-json', 'non-object', 'missing-reason', 'null-reason', 'non-string-reason',
++])
++def test_local_repair_requires_matching_authority_history(board, history):
++    from hermes_cli.kanban_assignment_routing import AssignmentRoutingError
++
++    conn, _ = board
++    tid = task_with_drift(board)
++    assert kb.block_task(conn, tid, kind='assignment', reason='Wrong worker')
++    repair_id = payload(conn, tid)['supervisor_task_id']
++    if history == 'missing':
++        conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='blocked'", (tid,))
++    else:
++        raw = {
++            'other-repair': json.dumps({'supervisor_task_id': 't_0000000000000000', 'reason': 'Wrong worker'}),
++            'invalid-json': '{',
++            'non-object': '[]',
++            'missing-reason': json.dumps({'supervisor_task_id': repair_id}),
++            'null-reason': json.dumps({'supervisor_task_id': repair_id, 'reason': None}),
++            'non-string-reason': json.dumps({'supervisor_task_id': repair_id, 'reason': []}),
++        }[history]
++        conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='blocked'", (raw, tid))
++    conn.commit()
++    before = conn.execute('SELECT * FROM tasks ORDER BY id').fetchall()
++    with pytest.raises(AssignmentRoutingError, match='authority history'):
++        kb.complete_task(conn, repair_id, result='Verified')
++    assert conn.execute('SELECT * FROM tasks ORDER BY id').fetchall() == before
++    assert not kb._parents_satisfied(conn, tid)
++
++
+ def test_repair_completion_rechecks_policy_drift(board):
+     from hermes_cli.kanban_capabilities import CapabilityMismatchError
+     conn, home = board
+diff --git a/tests/hermes_cli/test_kanban_sync_hub_proxy_refusal.py b/tests/hermes_cli/test_kanban_sync_hub_proxy_refusal.py
+new file mode 100644
+index 0000000000..01aa687236
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_hub_proxy_refusal.py
+@@ -0,0 +1,94 @@
++"""Real proxy wire failures preserve Hub's typed transport-refusal contract."""
++from __future__ import annotations
++
++import http.client
++import http.server
++import threading
++import time
++import urllib.error
++import urllib.request
++
++import pytest
++
++from hermes_cli import kanban_sync_client as ksc
++
++
++@pytest.fixture
++def proxy(monkeypatch):
++    class Handler(http.server.BaseHTTPRequestHandler):
++        def log_message(self, *args):
++            pass
++
++        def respond(self):
++            self.rfile.read(int(self.headers.get('content-length', 0)))
++            self.server.requests.append((self.command, self.path))
++            self.wfile.write(self.server.response)
++            self.close_connection = True
++
++        do_GET = do_POST = respond
++
++    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
++    server.requests = []
++    server.response = b''
++    for name in ('http_proxy', 'HTTP_PROXY', 'https_proxy', 'HTTPS_PROXY',
++                 'all_proxy', 'ALL_PROXY', 'no_proxy', 'NO_PROXY'):
++        monkeypatch.delenv(name, raising=False)
++    monkeypatch.setenv('http_proxy', f'http://127.0.0.1:{server.server_port}')
++    # urlopen caches its opener; don't inherit another test's proxy selection.
++    monkeypatch.setattr(urllib.request, '_opener', None)
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    try:
++        yield server
++    finally:
++        server.shutdown()
++        server.server_close()
++        thread.join(5)
++        assert not thread.is_alive()
++
++
++def hub_for_proxy(monkeypatch, deadline):
++    def forbid_direct(*args, **kwargs):
++        pytest.fail('Proxy request incorrectly used kept-alive direct transport')
++
++    monkeypatch.setattr(ksc.Hub, '_call_kept_alive', forbid_direct)
++    return ksc.Hub(ksc.Identity(url='http://board.invalid', key='synthetic-key', gateway='fixture'),
++                   timeout=3, deadline=time.monotonic() + 3 if deadline else None)
++
++
++@pytest.mark.parametrize('deadline', [False, True], ids=['urlopen', 'deadline-opener'])
++@pytest.mark.parametrize('method', ['GET', 'POST'])
++@pytest.mark.parametrize(('wire', 'cause'), [
++    (b'HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{}', http.client.IncompleteRead),
++    (b'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n{}', http.client.IncompleteRead),
++    (b'garbled status\r\n\r\n', http.client.BadStatusLine),
++    # HTTPError.read() is another transport boundary, not a completed HTTP refusal.
++    (b'HTTP/1.1 409 Conflict\r\nContent-Length: 20\r\n\r\n{}', http.client.IncompleteRead),
++])
++def test_proxy_protocol_failure_is_urlerror(proxy, monkeypatch, deadline, method, wire, cause):
++    proxy.response = wire
++    hub = hub_for_proxy(monkeypatch, deadline)
++    try:
++        with pytest.raises(urllib.error.URLError) as caught:
++            hub._call(method, '/synthetic', {'fixture': True} if method == 'POST' else None)
++        assert isinstance(caught.value.reason, cause)
++        assert caught.value.__cause__ is caught.value.reason
++        assert proxy.requests == [(method, 'http://board.invalid/synthetic')]
++    finally:
++        hub.close()
++
++
++@pytest.mark.parametrize('status', [200, 409, 410])
++def test_proxy_complete_http_responses_keep_their_contract(proxy, monkeypatch, status):
++    proxy.response = f'HTTP/1.1 {status} Fixture\r\nContent-Length: 2\r\n\r\n'.encode() + b'{}'
++    hub = hub_for_proxy(monkeypatch, True)
++    try:
++        if status == 200:
++            assert hub._call('GET', '/synthetic') == {}
++        else:
++            error = ksc.Resync if status == 410 else ksc.HubError
++            with pytest.raises(error):
++                hub._call('GET', '/synthetic')
++        assert proxy.requests == [('GET', 'http://board.invalid/synthetic')]
++    finally:
++        hub.close()
+-- 
+2.43.0
+

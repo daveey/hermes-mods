@@ -1,0 +1,249 @@
+From 272194de1b452f710fb8eb3a75ec50e5306fbe27 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 09:13:50 +0000
+Subject: [PATCH] fix(state): preserve missing-lease fencing and distinguish
+ custody failures [daveey]
+
+Reject the proposed INSERT-on-append recovery. Absence cannot distinguish an
+unexpected loss from release, a successor that released, stale mutation or a
+never-acquired writer. Keep the original fail-closed check and matching-row
+expiry renewal. Report missing lease row versus holder mismatch explicitly;
+user-facing copy no longer asserts a takeover from the generic error bucket.
+
+Problem: session 20000101_000000_00000b failed after an Opus
+response with session_persistence_failed:turn_lease.
+Why 1: transcript guard rejected missing or mismatching custody.
+Why 2: the generic copy incorrectly asserted takeover.
+Root (happened): UNDETERMINED. A later missing row does not prove its state
+at failure; no producer transition receipt establishes who removed it.
+Root (not caught): diagnostics conflated missing custody with takeover;
+original proposed tests replaced an intentional fail-closed contract.
+Countermeasure: precise diagnostic reason without relaxing ownership.
+Proof: independently reproduced 3 failed lifecycle regressions on 8887286
+(release, successor-release, never acquired: all DID NOT RAISE). Revised
+candidate: 68 tests passed across 4 targeted files including an independent
+connection / Event-ordered successor-release late flush. Original Desktop
+chat has later persisted successful final <message-id>; that is immediate recovery,
+not evidence this patch was deployed or of vendor quota bucket sharing.
+---
+ hermes_state_messages.py                      | 40 +++++------
+ tests/hermes_state/test_session_turn_lease.py | 53 ++-------------
+ .../test_turn_lease_revocation.py             | 66 +++++++++++++++++++
+ 3 files changed, 91 insertions(+), 68 deletions(-)
+ create mode 100644 tests/hermes_state/test_turn_lease_revocation.py
+
+diff --git a/hermes_state_messages.py b/hermes_state_messages.py
+index 6eadb3cf95..55ebd3457e 100644
+--- a/hermes_state_messages.py
++++ b/hermes_state_messages.py
+@@ -217,13 +217,24 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin,
+         reject_active_turn_lease: bool = False, reject_active_compression_lock: bool = False,
+         allow_closed_compression_parent: bool = False, reject_parked_turn: bool = False) -> None:
+         """Transcript-write admission checks, run INSIDE the write txn by every writer. Ordinary appends do
+-        NOT check compression_locks (#75316): the lock only stops two COMPRESSIONS colliding and
+-        archive_and_compact() commits against a watermark, so concurrent appends are safe (blocking them
+-        killed turns during slow summaries; #74568, #77386). Destructive user mutations opt in via
+-        ``reject_active_*`` so a compressor that captured its watermark cannot resurrect the removed turn.
+-        ``reject_active_turn_lease`` / ``reject_parked_turn`` refuse a parked update [daveey t_eeeeee000000000f]."""
++        NOT check compression_locks: the lock only stops two COMPRESSIONS colliding and archive_and_compact()
++        commits against a watermark, so concurrent appends are safe (blocking them killed turns during slow
++        summaries). Destructive user mutations opt in via ``reject_active_*`` so a compressor that captured
++        its watermark cannot resurrect the removed turn.
++
++        Shared by every writer (#74478 patience note below). ``reject_active_turn_lease`` also refuses a turn
++        parked for an update (its checkpoint forbids a later row); ``reject_parked_turn`` is that half alone,
++        for the public lease-less appenders: a passive row must not void the proof [daveey t_eeeeee000000000f]."""
+         from hermes_state import SessionCompressionInProgressError
+         from hermes_state_errors import CompressionSessionClosedError, SessionTurnLeaseLostError
++        # NOTE (#75316 redesign): appends do NOT check compression_locks. The lock's job is to stop two
++        # COMPRESSIONS colliding, not to fence ordinary transcript writes. Concurrent appends during a
++        # compression are safe by construction: archive_and_compact() commits against a watermark captured
++        # at compression start and clones every row that arrived after it back into the live transcript, in
++        # the same write transaction. Blocking appends here was the root cause of a whole symptom family —
++        # turns dying as session_persistence_failed while a slow provider summary held the lease (#74568,
++        # #77386), including stale locks from dead PIDs blocking writes for the full TTL. Keep that narrow
++        # fence opt-in so ordinary appends retain the watermark behavior.
+         if reject_active_compression_lock:
+             active_lock = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
+             if active_lock is not None:
+@@ -237,22 +248,13 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin,
+             lease = conn.execute(_TURN_LEASE_ROW_SQL, (conversation_id,)).fetchone()
+             now = time.time()
+             if turn_lease_holder:
+-                if lease is not None and lease["holder"] != turn_lease_holder:
++                if lease is None or lease["holder"] != turn_lease_holder:
++                    reason = "missing lease row" if lease is None else "holder mismatch"
+                     raise SessionTurnLeaseLostError(
+-                        f"Session turn lease lost; refusing transcript write for {session_id!r} "
+-                        f"(held by {lease['holder']!r})")
+-                if lease is None:  # vacant row is not takeover; reclaim like expiry (same txn)
+-                    conn.execute("INSERT OR IGNORE INTO session_turn_leases "
+-                        "(conversation_id, holder, acquired_at, expires_at) VALUES (?, ?, ?, ?)",
+-                        (conversation_id, turn_lease_holder, now,
+-                         now + max(0.1, float(turn_lease_ttl_seconds))))
+-                    lease = conn.execute(_TURN_LEASE_ROW_SQL, (conversation_id,)).fetchone()
+-                    if lease is None or lease["holder"] != turn_lease_holder:
+-                        raise SessionTurnLeaseLostError(
+-                            f"Session turn lease lost; refusing transcript write for {session_id!r}"
+-                            + (f" (held by {lease['holder']!r})" if lease is not None else ""))
++                        f"Session turn lease lost; refusing transcript write for {session_id!r} ({reason})")
+                 if float(lease["expires_at"]) <= now:
+-                    # Expiry is reclaimable, not takeover; BEGIN IMMEDIATE serializes with acquisition.
++                    # Expiry makes the row reclaimable, not taken over; BEGIN IMMEDIATE serializes this
++                    # renewal with acquisition, so a still-matching owner recovers from a starved refresher.
+                     conn.execute("UPDATE session_turn_leases SET expires_at = ? "
+                         "WHERE conversation_id = ? AND holder = ?",
+                         (now + max(0.1, float(turn_lease_ttl_seconds)), conversation_id, turn_lease_holder))
+diff --git a/tests/hermes_state/test_session_turn_lease.py b/tests/hermes_state/test_session_turn_lease.py
+index d046c5fc17..bc01209e5b 100644
+--- a/tests/hermes_state/test_session_turn_lease.py
++++ b/tests/hermes_state/test_session_turn_lease.py
+@@ -557,43 +557,6 @@ def test_turn_lease_fences_stale_transcript_flush_after_reclaim(tmp_path):
+     db.release_session_turn_lease("shared", next_holder)
+ 
+ 
+-def test_turn_lease_reclaims_missing_row_for_matching_holder(tmp_path):
+-    """A still-running writer can persist if the SQLite lease row vanished.
+-
+-    ``_check_transcript_write_guards`` used to treat missing-or-mismatch as one
+-    error; the UI glossed that as takeover even when no other holder existed.
+-    """
+-    db = SessionDB(tmp_path / "state.db")
+-    db.create_session("shared", source="test")
+-    holder = f"pid={os.getpid()}:turn=owner"
+-    other = f"pid={os.getpid()}:turn=other"
+-    assert db.try_acquire_session_turn_lease("shared", holder, ttl_seconds=5)
+-    raw = sqlite3.connect(tmp_path / "state.db")
+-    with raw:
+-        raw.execute("DELETE FROM session_turn_leases WHERE conversation_id = 'shared'")
+-    assert db.append_messages_batch(
+-        "shared",
+-        [{"role": "assistant", "content": "reclaimed"}],
+-        turn_lease_holder=holder,
+-    ) == 1
+-    with db._read_ctx() as conn:
+-        lease = conn.execute(
+-            "SELECT holder FROM session_turn_leases WHERE conversation_id = ?",
+-            ("shared",),
+-        ).fetchone()
+-    assert lease["holder"] == holder
+-    assert [m["content"] for m in db.get_messages("shared")] == ["reclaimed"]
+-    assert db.try_acquire_session_turn_lease("shared", other, ttl_seconds=5) is False
+-    with pytest.raises(SessionTurnLeaseLostError, match="held by"):
+-        db.append_messages_batch(
+-            "shared",
+-            [{"role": "assistant", "content": "late"}],
+-            turn_lease_holder=other,
+-        )
+-    raw.close()
+-    db.release_session_turn_lease("shared", holder)
+-
+-
+ def test_turn_lease_revives_expired_row_still_owned_by_writer(tmp_path, monkeypatch):
+     import hermes_state_compression
+     import hermes_state_messages
+@@ -659,25 +622,17 @@ def test_turn_lease_acquisition_sweeps_long_expired_rows_of_other_conversations(
+ 
+ 
+ def test_turn_lease_fences_flush_when_row_is_absent(tmp_path):
+-    """A vacant conversation is reclaimed by the presented holder, not treated as takeover."""
+     db = SessionDB(tmp_path / "state.db")
+     db.create_session("shared", source="test")
+     holder = f"pid={os.getpid()}:turn=owner"
+-    other = f"pid={os.getpid()}:turn=other"
+ 
+-    assert db.append_messages_batch(
+-        "shared",
+-        [{"role": "assistant", "content": "after release"}],
+-        turn_lease_holder=holder,
+-    ) == 1
+-    assert [m["content"] for m in db.get_messages("shared")] == ["after release"]
+-    with pytest.raises(SessionTurnLeaseLostError, match="held by"):
++    with pytest.raises(SessionTurnLeaseLostError, match="turn lease lost"):
+         db.append_messages_batch(
+             "shared",
+-            [{"role": "assistant", "content": "late"}],
+-            turn_lease_holder=other,
++            [{"role": "assistant", "content": "after release"}],
++            turn_lease_holder=holder,
+         )
+-    db.release_session_turn_lease("shared", holder)
++    assert db.get_messages("shared") == []
+ 
+ 
+ def test_turn_lease_fence_walks_compression_child_to_root(tmp_path):
+diff --git a/tests/hermes_state/test_turn_lease_revocation.py b/tests/hermes_state/test_turn_lease_revocation.py
+new file mode 100644
+index 0000000000..d3643ba616
+--- /dev/null
++++ b/tests/hermes_state/test_turn_lease_revocation.py
+@@ -0,0 +1,66 @@
++"""A missing lease is absence of custody, not permission to resurrect a writer."""
++import os
++from concurrent.futures import ThreadPoolExecutor
++from threading import Event
++
++import pytest
++
++from hermes_state import SessionDB
++from hermes_state_errors import SessionTurnLeaseLostError
++
++
++@pytest.mark.parametrize("boundary", ["release", "takeover_release", "never_acquired"])
++def test_missing_lease_refuses_stale_writer(tmp_path, boundary):
++    db = SessionDB(tmp_path / "state.db")
++    db.create_session("shared", source="test")
++    holder = f"pid={os.getpid()}:turn=old"
++    successor = f"pid={os.getpid()}:turn=new"
++    if boundary != "never_acquired":
++        assert db.try_acquire_session_turn_lease("shared", holder)
++        db.release_session_turn_lease("shared", holder)
++    if boundary == "takeover_release":
++        assert db.try_acquire_session_turn_lease("shared", successor)
++        db.append_messages_batch("shared", [{"role": "assistant", "content": "new"}],
++                                 turn_lease_holder=successor)
++        db.release_session_turn_lease("shared", successor)
++    before = db.get_messages("shared")
++    with pytest.raises(SessionTurnLeaseLostError, match="missing"):
++        db.append_messages_batch("shared", [{"role": "assistant", "content": "stale"}],
++                                 turn_lease_holder=holder)
++    assert db.get_messages("shared") == before
++    assert db.session_turn_lease_owner("shared") is None
++    db.close()
++
++
++def test_late_flush_after_successor_release_on_independent_connection(tmp_path):
++    path = tmp_path / "state.db"
++    writer = SessionDB(path)
++    owner = SessionDB(path)
++    owner.create_session("shared", source="test")
++    holder = f"pid={os.getpid()}:turn=old"
++    successor = f"pid={os.getpid()}:turn=new"
++    assert owner.try_acquire_session_turn_lease("shared", holder)
++    released = Event()
++
++    def late_flush():
++        assert released.wait(10)
++        with pytest.raises(SessionTurnLeaseLostError, match="missing lease row"):
++            writer.append_messages_batch("shared", [{"role": "assistant", "content": "stale"}],
++                                         turn_lease_holder=holder)
++
++    with ThreadPoolExecutor(max_workers=1) as executor:
++        future = executor.submit(late_flush)
++        try:
++            owner.release_session_turn_lease("shared", holder)
++            assert owner.try_acquire_session_turn_lease("shared", successor)
++            with pytest.raises(SessionTurnLeaseLostError, match="holder mismatch"):
++                writer.append_messages_batch("shared", [{"role": "assistant", "content": "stale"}],
++                                             turn_lease_holder=holder)
++            owner.release_session_turn_lease("shared", successor)
++        finally:
++            released.set()
++        future.result(timeout=15)
++    assert owner.get_messages("shared") == []
++    assert owner.session_turn_lease_owner("shared") is None
++    writer.close()
++    owner.close()
+-- 
+2.43.0
+
