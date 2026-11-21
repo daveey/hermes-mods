@@ -6,6 +6,7 @@ exact blocked ask and block generation under the board write transaction.
 """
 
 import hashlib
+import importlib.util
 import inspect
 import itertools
 import json
@@ -228,6 +229,11 @@ class Mirror:
         session_present=None,
     ):
         self.core, self.store, self.backend = core, store, backend
+        path = Path(__file__).with_name('remote_cards.py')
+        spec = importlib.util.spec_from_file_location('_user_steps_remote_cards', path)
+        remote = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(remote)
+        self.remote = remote.Remote(self)
         board_source = core.kanban_boards if boards is None else boards
         self.boards = dict(board_source() if callable(board_source) else board_source)
         self.session_exists = session_exists or self._user_session
@@ -444,8 +450,8 @@ class Mirror:
                 raise self.core.ActionError("Card choices require label and value")
             choices.append(dict(id=f"card-{i}", label=opt["label"], effect="answer"))
         ref = dict(
-            gatewayId=owner["gatewayId"],
-            profile=owner["profile"],
+            gatewayId=snap.get('remote', {}).get('target', {}).get('ownerGateway', owner['gatewayId']),
+            profile=snap.get('remote', {}).get('target', {}).get('ownerProfile', owner['profile']),
             type="kanban",
             board=board,
             id=snap["task"],
@@ -515,8 +521,8 @@ class Mirror:
         details = '\n\n'.join(str(hr[k]) for k in ('action', 'why_human', 'scope', 'evidence') if hr.get(k))
         return dict(request, presentation=dict(kind='kanban-question', question=question,
                     details=details, recommendedChoiceId=recommended, other=True,
-                    sourceRef=dict(gatewayId=request['owner']['gatewayId'],
-                                   profile=request['owner']['profile'], type='kanban',
+                    sourceRef=dict(gatewayId=snap.get('remote', {}).get('target', {}).get('ownerGateway', request['owner']['gatewayId']),
+                                   profile=snap.get('remote', {}).get('target', {}).get('ownerProfile', request['owner']['profile']), type='kanban',
                                    board=binding['board'], id=binding['task'])))
 
     def decide_other(self, owner, decision):
@@ -602,6 +608,10 @@ class Mirror:
 
     def reconcile(self, owner):
         self.core.validate_owner(owner)
+        try:
+            self.remote.reconcile(owner)
+        except (OSError, sqlite3.Error, ImportError) as exc:
+            logging.getLogger('user-steps').warning('Remote card reconciliation unavailable: %s', exc)
         with _accounted_pass("user_steps.mirror_reconcile") as acct:
             fenced = self._fenced_core()
             key = self._key(owner, fenced)
@@ -789,6 +799,8 @@ class Mirror:
         return clean
 
     def _reconcile_binding(self, owner, binding):
+        if json.loads(binding['snapshot']).get('remote'):
+            return  # remote owner, not a same-named local board/card
         if binding["board"] not in self.boards:
             return  # temporarily absent board is not departure evidence
         current = self._read_snapshot(
@@ -1030,6 +1042,8 @@ class Mirror:
 
     def deliver(self, op):
         binding = self._bound(op)
+        if json.loads(binding['snapshot']).get('remote'):
+            return self.remote.deliver(op, binding)
         api = self._api()
         c = api.connect(self._path(binding["board"]))
         try:
@@ -1112,6 +1126,8 @@ class Mirror:
 
     def readback(self, op, receipt):
         binding = self._bound(op)
+        if json.loads(binding['snapshot']).get('remote'):
+            return self.remote.deliver(op, binding) == receipt
         c = self.core._ro_connect(self._path(binding["board"]))
         try:
             return self._receipt(c, binding, op) == receipt

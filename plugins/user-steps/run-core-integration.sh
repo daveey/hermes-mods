@@ -14,14 +14,17 @@ for home in "$HOME/.hermes" "${HERMES_HOME:-}"; do
   fi
 done
 plugins="$(cd "$(dirname "$0")/.." && pwd)"
-fixtures="$(mktemp -d "$core/.user-steps-integration.XXXXXX")"
+fixtures="$(mktemp -d "$core/tests/hermes_cli/.user-steps-integration.XXXXXX")"
 trap 'rm -rf -- "$fixtures"' EXIT
+if [[ -n "${HERMES_HUB_CLIENT_REAL:-}" ]]; then
+  cp "$HERMES_HUB_CLIENT_REAL" "$fixtures/courier.py"
+fi
 # Preserve the repository layout for cross-producer and Desktop contract tests.
 mkdir -p "$fixtures/plugins/coach" "$fixtures/desktop-plugins"
-for plugin in user-steps ask-gate session-outcome open-asks; do
+for plugin in user-steps ask-gate session-outcome open-asks hub-sync; do
   cp -R "$plugins/$plugin" "$fixtures/plugins/$plugin"
 done
 cp "$plugins/coach/placement_evidence.py" "$fixtures/plugins/coach/placement_evidence.py"
 cp -R "$plugins/../desktop-plugins/user-steps" "$fixtures/desktop-plugins/user-steps"
 cd "$core"
-scripts/run_tests.sh "$fixtures/plugins/user-steps/tests" -p tests.conftest --file-retries 0 --tb=short "$@"
+scripts/run_tests.sh "$fixtures/plugins/user-steps/tests" --file-retries 0 --tb=short "$@"
