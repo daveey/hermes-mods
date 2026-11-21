@@ -160,6 +160,11 @@ promoting owner rather than adding overlapping allowances or overwriting a compe
    chain for a `machine:<w>` in `runs_on` against the worker registry (skill `hermes-workers`); a worker that is
    gone means `hermes kanban move <id> --pool`. Two cards waiting on each other can both sit in triage: promote
    the producer first, then park the consumer (`schedule --awaiting card:<producer>` refuses a triage producer).
+   Before replacing disposition wakes with a terminal-only wait, inspect containment authority: a consumer
+   that owns the producer's next containment release cannot wait only for that producer to finish. Settle
+   the exact episode through a live scoped authority decision, preserving independent spend admission,
+   then wait on the actual next producer event. A prohibition on release plus a terminal-only wake needs
+   an explicit superseding authority decision, not polling or an ordinary unblock.
 7. **Retire superseded tracking.** When bounded successors have taken over every remaining acceptance criterion, reconcile the original spend-held umbrella in the same handoff. Verify the successor's current state and unchanged acceptance, record the transfer on the original, then archive the obsolete tracker and read back its authoritative status. Do not mark unmet acceptance done, reset its spend allowance, or leave instructions to preserve triage indefinitely. Keep the genuine final acceptance owner open; archiving duplicate tracking must not waive its gates.
 
 8. **Tell the thread once.** One comment: who you are, on whose instruction, what it supersedes, the files
