@@ -113,6 +113,12 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
   not, run the ones that need no root yourself, or send it back. Fixture tests pass on a root-owned file or empty
   table the live host doesn't have. After a refusal, read live state back, comment "latch spent, nothing changed,
   approval not consumed" plus the cause, and require a new runner with a new latch and staging directory.
+- Owner-route runs to a pool worker: workers get rebuilt, and a rebuild loses the workspace and changes the host key.
+  Before launching, re-stage the inputs from the durable hub package and re-hash them on the worker.
+  If the Mac refuses with a host-key mismatch, read the worker's `/etc/ssh/ssh_host_ed25519_key.pub` over
+  `hub-worker-exec` (SSM, a separate trusted path). Then, in the same window, run
+  `ssh-keygen -R <host>`, append that key to `~/.ssh/known_hosts`, and use `ssh -o StrictHostKeyChecking=yes`.
+  Never pass `StrictHostKeyChecking=no` or `accept-new`: that blindly trusts whatever host answers.
 - A "worker exited unexpectedly" notice on a card with an owner-terminal step is often a finished handoff whose
   block was refused: read the card's newest comments and the newest evidence `HANDOFF.md` before treating it as a
   crash. A runner that is ready, reviewed and unlaunched is yours to launch that turn.
