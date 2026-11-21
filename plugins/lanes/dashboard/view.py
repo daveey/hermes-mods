@@ -13,6 +13,22 @@ REASONS = {
     'limit:cards_per_day': ('over cards/day', '#e08bd0'), 'limit:usd_per_day': ('over $/day', '#e08bd0')}
 
 
+# The strip's all-lanes counts: one bucket per open card, in urgency order. Colours are owned by Desktop.
+STATUS = ('you', 'ext', 'worker', 'run', 'dep', 'triage', 'other')
+_STATUS_OF = {'you': 'you', 'time': 'ext', 'review': 'ext', 'gate': 'worker', 'slot': 'worker', 'quota': 'worker',
+              'run': 'run', 'dep': 'dep', 'triage': 'triage'}
+
+
+def status_of(reason):
+    reason = str(reason or '')
+    return 'worker' if reason.startswith('limit:') else _STATUS_OF.get(reason, 'other')
+
+
+def status_counts(cards):
+    tally = Counter(status_of(c.get('reason')) for c in cards)
+    return {key: tally.get(key, 0) for key in STATUS}
+
+
 def reason_info(reason):
     return REASONS.get(reason, ('over limit', '#e08bd0') if str(reason).startswith('limit:') else (reason or 'unknown', '#9aa3b2'))
 
@@ -75,6 +91,13 @@ def project(snap, raw, expanded):
                         if gap > 0 else 'under: nothing ready' if row['ready'] == 0 else 'under: waiting for slots')
     view['totals'] = {key: sum(r[key] for r in view['lanes'].values()) for key in
                       ('running', 'not_ready', 'blocked_on_you', 'open', 'ready', 'held', 'done')}
+    if raw and raw.get('configured') is not False and 'cards' in raw:
+        view['status'] = status_counts(raw['cards'])
+        # Per-lane strip counts from the same card reasons, so a lane's red always adds up to the total's red.
+        for name, row in view['lanes'].items():
+            lane = Counter(status_of(c.get('reason')) for c in raw['cards'] if c.get('lane') == name)
+            row['strip'] = {'blocked': lane['you'], 'running': lane['run'],
+                            'other': sum(lane.values()) - lane['you'] - lane['run']}
     if not expanded:
         return view
     view['flow_error'] = raw.get('reason', '') if raw.get('configured') is False else ''

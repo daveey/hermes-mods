@@ -41,6 +41,34 @@ def test_lane_view_counts_and_conservation(monkeypatch):
     assert 'floor' not in api.lane_view(6, '6h', False)
 
 
+def test_collapsed_view_carries_all_lanes_status_counts(monkeypatch):
+    api = load()
+    monkeypatch.setattr(api, 'core', lambda: None)
+    reasons = ['run', 'you', 'time', 'review', 'gate', 'slot', 'quota', 'limit:usd_per_day', 'dep', 'dep',
+               'triage', 'mystery']
+    cards = [dict(id=f't_{i}', lane='a' if i % 2 else 'b', step='waiting', reason=r, age_h=1)
+             for i, r in enumerate(reasons)]
+    monkeypatch.setattr(api, 'read', lambda hours: {'configured': True, 'lanes': {
+        'a': {'running': 1, 'blocked_on_you': 1, 'open': 6}, 'b': {'open': 6}}})
+    monkeypatch.setattr(api, 'flow', lambda window: {'configured': True, 'cards': cards, 'lanes': {}})
+    for expanded in (False, True):
+        view = api.lane_view(6, '6h', expanded)
+        assert view['status'] == {'you': 1, 'ext': 2, 'worker': 4, 'run': 1, 'dep': 2, 'triage': 1, 'other': 1}
+        assert sum(view['status'].values()) == len(cards)
+        strips = {n: view['lanes'][n]['strip'] for n in ('a', 'b')}
+        assert sum(s['blocked'] for s in strips.values()) == view['status']['you']
+        assert sum(s['running'] for s in strips.values()) == view['status']['run']
+        assert sum(sum(s.values()) for s in strips.values()) == len(cards)
+    collapsed = api.lane_view(6, '6h', False)
+    assert 'cards' not in collapsed and 'floor' not in collapsed
+    # Unavailable flow: no status rather than zeros that look real (a fresh module: views are cached).
+    api = load()
+    monkeypatch.setattr(api, 'core', lambda: None)
+    monkeypatch.setattr(api, 'read', lambda hours: {'configured': True, 'lanes': {'a': {'open': 6}}})
+    monkeypatch.setattr(api, 'flow', lambda window: {'configured': False, 'reason': 'x'})
+    assert 'status' not in api.lane_view(6, '6h', False)
+
+
 def test_get_flow_returns_the_same_expanded_view(monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient

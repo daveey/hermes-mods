@@ -28,6 +28,15 @@ export const OPEN_KEY = 'hermes-lanes-open'
 export const KANBAN_CHIP_EVENT = 'hermes-kanban-chip'
 const COLORS = ['#f0a43a', '#8fb0ff', '#5fd4e6', '#d982f0', '#b4bac6', '#3ddc97', '#ef7b7b', '#c9d36a']
 export const METER_COLORS = { running: '#388bfd', notReady: '#d4a72c', blocked: '#d64545' }
+// Card-state colours shared with the sidebar's card squares (Tailwind red-500, pink-500, emerald-500, sky-500, zinc-500).
+export const CARD_COLORS = { you: '#ef4444', ext: '#ec4899', worker: '#10b981', run: '#0ea5e9', dep: '#71717a' }
+export const LANE_COUNT_COLORS = { blocked: CARD_COLORS.you, running: CARD_COLORS.run, other: '#a1a1aa' }
+/** All-lanes strip counts: hub `status` key, words, colour (null = outlined, no fill). */
+export const STATUS = [
+  ['you', 'blocked on you', CARD_COLORS.you], ['ext', 'waiting on external (CI, review, timer)', CARD_COLORS.ext],
+  ['worker', 'waiting for a worker', CARD_COLORS.worker], ['run', 'running', CARD_COLORS.run],
+  ['dep', 'waiting on other cards', CARD_COLORS.dep], ['triage', 'in triage', null], ['other', 'other', null]
+]
 
 // ── which gateway to talk to ──────────────────────────────────────────────
 // Lanes are configured on one gateway (the one that holds the board and runs the dispatcher), which is often
@@ -597,29 +606,46 @@ export function Panel({ snap, flow, flowError, windowHours, onWindow, onApply, s
       h('button', { type: 'button', className: 'is-primary', disabled: !pending.length || saving, onClick: async () => { if (await onApply(pending)) setDraft({}) } }, saving ? 'Applying…' : 'Apply')))
 }
 
-function MiniBar({ row }) {
-  const m = meter(row)
-  const total = m.total || 1
-  const seg = (key, count) => count > 0
-    ? h('span', { key, 'data-segment': key, style: { width: `${(count / total) * 100}%`, background: METER_COLORS[key] } })
-    : null
-  return h('span', {
-    className: 'hermes-lanes-mini-bar', role: 'img',
-    'aria-label': `${m.running} running, ${m.notReady} not ready, ${m.blocked} blocked on you`
-  }, seg('running', m.running), seg('notReady', m.notReady), seg('blocked', m.blocked))
+/** A lane's three strip counts: blocked on you (red), running (blue), everything else (grey). Zeros are left out. */
+export function laneCounts(row) {
+  const m = stripMeter(row)
+  return [['blocked', m.blocked], ['running', m.running], ['other', m.notReady]].filter(([, n]) => n > 0)
+}
+
+/** The hub's per-lane `strip` counts (same card reasons as the totals); older hubs: the lane snapshot's counts. */
+export function stripMeter(row) {
+  const s = row?.strip
+  if (!s) return meter(row)
+  return { blocked: s.blocked || 0, running: s.running || 0, notReady: s.other || 0, total: (s.blocked || 0) + (s.running || 0) + (s.other || 0) }
 }
 
 function MiniPill({ row, onOpen, expanded }) {
+  const m = stripMeter(row)
+  const counts = laneCounts(row)
   return h('button', {
     type: 'button', className: 'hermes-lanes-pill', 'data-lane-pill': row.name,
-    title: `${row.name}: ${row.running} running · ${row.ready} ready · ${Number(row.blocked_on_you) || 0} blocked on you · ${row.open} open`,
+    title: `${row.name}: ${m.blocked} blocked on you · ${m.running} running · ${m.notReady} other · ${m.total} open`,
+    'aria-label': `${row.name}: ${m.blocked} blocked on you, ${m.running} running, ${m.notReady} other`,
     'aria-expanded': expanded,
     onClick: (event) => { event.stopPropagation(); onOpen(row.name) }
   },
-    h('span', { className: 'hermes-lanes-dot', style: { background: row.color }, 'aria-hidden': 'true' }),
     h('span', { className: 'hermes-lanes-pill-name' }, row.name),
-    h(MiniBar, { row }),
-    h('span', { className: 'hermes-lanes-pill-open' }, row.open))
+    counts.length
+      ? counts.map(([key, n]) => h('span', { key, className: 'hermes-lanes-n', 'data-count': key, style: { color: LANE_COUNT_COLORS[key] } }, n))
+      : h('span', { className: 'hermes-lanes-n hermes-lanes-dim', 'data-count': 'none' }, '0'))
+}
+
+/** The all-lanes counts on the right, from the hub's `status` projection (older hubs send none: nothing shows). */
+function StatusTotals({ status }) {
+  if (!status) return null
+  const items = STATUS.filter(([key]) => (status[key] || 0) > 0)
+  return h('span', { className: 'hermes-lanes-status', 'data-slot': 'lanes-status' },
+    items.map(([key, label, color]) => h('span', {
+      key, className: 'hermes-lanes-status-item', 'data-status': key, title: `${status[key]} ${label}`
+    },
+      h('span', { className: color ? 'hermes-lanes-sw' : 'hermes-lanes-sw is-outline', style: color ? { background: color } : undefined, 'aria-hidden': 'true' }),
+      h('span', { className: 'hermes-lanes-n' }, status[key]),
+      h('span', { className: 'hermes-lanes-status-word' }, label))))
 }
 
 export function Lanes({ ctx }) {
@@ -717,7 +743,9 @@ export function Lanes({ ctx }) {
         }
       }
     },
-      list.map((row) => h(MiniPill, { key: row.name, row, onOpen: openLane, expanded: open && focus === row.name })),
+      list.filter((row) => (row.strip ? stripMeter(row).total > 0 : row.open == null || Number(row.open) > 0)) // no open cards: hidden
+        .map((row) => h(MiniPill, { key: row.name, row, onOpen: openLane, expanded: open && focus === row.name })),
+      h(StatusTotals, { status: snap?.status }),
       !live ? h('small', { className: 'hermes-lanes-dim', title: 'Push unavailable; refreshing every 60 seconds' }, 'not live') : null,
       h('button', {
         type: 'button', className: 'hermes-lanes-toggle', 'aria-expanded': open,
@@ -738,9 +766,13 @@ const CSS = `
 .hermes-lanes-mini{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:4px 8px;min-height:28px;cursor:pointer}
 .hermes-lanes-pill{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 8px;border:1px solid var(--ui-stroke-secondary);border-radius:999px;background:transparent;color:inherit;font:inherit;cursor:pointer}
 .hermes-lanes-pill-name{font-weight:600;font-size:12px}
-.hermes-lanes-pill-open{font-variant-numeric:tabular-nums;font-size:11px;color:var(--ui-text-tertiary)}
-.hermes-lanes-mini-bar{display:inline-flex;width:28px;height:6px;border-radius:3px;overflow:hidden;background:var(--ui-stroke-secondary);flex:none}
-.hermes-lanes-mini-bar>span{height:100%;display:block;min-width:0}
+.hermes-lanes-n{font-variant-numeric:tabular-nums;font-size:11.5px;font-weight:600}
+.hermes-lanes-status{margin-left:auto;display:inline-flex;align-items:center;gap:8px;padding-left:10px;border-left:1px solid var(--ui-stroke-secondary);white-space:nowrap}
+.hermes-lanes-status-item{display:inline-flex;align-items:center;gap:4px}
+.hermes-lanes-status-word{display:none;color:var(--ui-text-tertiary);font-size:11px}
+.hermes-lanes-sw{width:8px;height:8px;border-radius:2px;flex:none;box-sizing:border-box}
+.hermes-lanes-sw.is-outline{border:1px solid var(--ui-text-tertiary)}
+.hermes-lanes-status+.hermes-lanes-toggle,.hermes-lanes-status+small+.hermes-lanes-toggle{margin-left:0}
 .hermes-lanes-toggle{margin-left:auto;height:22px;padding:0 8px;border:1px solid var(--ui-stroke-secondary);border-radius:6px;background:transparent;color:inherit;font:inherit;cursor:pointer}
 .hermes-lanes-body{max-height:60vh;overflow:auto}
 .hermes-lanes{display:flex;flex-direction:column;gap:8px;font-size:12px;padding:6px}

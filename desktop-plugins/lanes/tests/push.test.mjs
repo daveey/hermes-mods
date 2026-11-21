@@ -16,7 +16,10 @@ test('pill, footer, Floor and Flow render server counts even with empty card lis
   localStorage.setItem(P.OPEN_KEY,'1')
   const view = await mount(React.createElement(P.Lanes,{ctx:{rest:async()=>fixture}}))
   try {
-    assert.equal(view.container.querySelector('.hermes-lanes-mini-bar').getAttribute('aria-label'),'7 running, 42 not ready, 9 blocked on you')
+    const pill = view.container.querySelector('[data-lane-pill=work]')
+    assert.equal(pill.getAttribute('aria-label'),'work: 9 blocked on you, 7 running, 42 other')
+    assert.deepEqual([...pill.querySelectorAll('[data-count]')].map(n=>[n.dataset.count,n.textContent]),[['blocked','9'],['running','7'],['other','42']])
+    assert.equal(pill.querySelector('.hermes-lanes-dot'),null)
     assert.match(view.container.textContent,/71 running · 93 open/)
     assert.equal(view.container.querySelector('[data-step=waiting]').dataset.count,'66')
     assert.equal(view.container.querySelector('[data-step=waiting]').dataset.piling,'1')
@@ -25,6 +28,32 @@ test('pill, footer, Floor and Flow render server counts even with empty card lis
     assert.equal(view.container.querySelector('[data-flow-node=source]').dataset.count,'83')
     assert.match(view.container.textContent,/server hint/)
   } finally { await view.close() }
+})
+
+test('strip: no colour square, zero lanes hidden, all-lanes status counts on the right', async()=>{
+  const snap={...fixture,lanes:{work:{running:2,not_ready:0,blocked_on_you:0,open:2},
+    hub:{running:9,not_ready:9,blocked_on_you:1,open:19,strip:{blocked:5,running:9,other:5}},idle:{running:0,not_ready:0,blocked_on_you:0,open:0}},
+    status:{you:14,ext:43,worker:23,run:21,dep:37,triage:19,other:0}}
+  const view = await mount(React.createElement(P.Lanes,{ctx:{rest:async()=>snap}}))
+  try {
+    const strip=view.container.querySelector('.hermes-lanes-mini')
+    assert.deepEqual([...strip.querySelectorAll('[data-lane-pill]')].map(p=>p.dataset.lanePill),['work','hub'])
+    assert.deepEqual([...strip.querySelector('[data-lane-pill=hub]').querySelectorAll('[data-count]')].map(n=>[n.dataset.count,n.textContent]),
+      [['blocked','5'],['running','9'],['other','5']], 'hub strip counts win over the snapshot fields')
+    assert.deepEqual([...strip.querySelector('[data-lane-pill=work]').querySelectorAll('[data-count]')].map(n=>n.dataset.count),['running'])
+    const items=[...strip.querySelectorAll('[data-status]')]
+    assert.deepEqual(items.map(i=>[i.dataset.status,i.querySelector('.hermes-lanes-n').textContent]),
+      [['you','14'],['ext','43'],['worker','23'],['run','21'],['dep','37'],['triage','19']])
+    assert.equal(items[0].title,'14 blocked on you')
+    const sw=(k)=>items.find(i=>i.dataset.status===k).querySelector('.hermes-lanes-sw').style.background
+    assert.equal(sw('you'),'rgb(239, 68, 68)'); assert.equal(sw('ext'),'rgb(236, 72, 153)'); assert.equal(sw('worker'),'rgb(16, 185, 129)')
+    assert.ok(items.find(i=>i.dataset.status==='triage').querySelector('.is-outline'))
+  } finally { await view.close() }
+})
+
+test('strip without a hub status projection shows no totals', async()=>{
+  const view = await mount(React.createElement(P.Lanes,{ctx:{rest:async()=>fixture}}))
+  try { assert.equal(view.container.querySelector('[data-slot=lanes-status]'),null) } finally { await view.close() }
 })
 
 test('live subscription has no polling timer; unavailable socket alone polls at 60 seconds', async()=>{

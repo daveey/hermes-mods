@@ -230,7 +230,8 @@ def _lane_view(hours, window, expanded):
     if mods is not None and 'evidence' in inspect.signature(mods[2].snapshot).parameters:
         return _current_view(mods, hours, window, expanded)
     snap = read(hours)
-    return _view_module().project(snap, flow(window) if expanded and snap.get("configured") else None, expanded)
+    # The collapsed strip needs the open cards' reasons too (its all-lanes status counts).
+    return _view_module().project(snap, flow(window) if snap.get("configured") else None, expanded)
 
 
 def _current_view(mods, hours, window, expanded):
@@ -241,7 +242,7 @@ def _current_view(mods, hours, window, expanded):
         with kbc.connect_closing() as conn, read_view(conn) as evidence:
             snap = cli.snapshot(conn, hours=hours, evidence=evidence)
             raw = None
-            if expanded and snap.get('configured'):
+            if snap.get('configured'):  # collapsed too: the strip's all-lanes status counts need card reasons
                 try:
                     flow_mods = flow_core()
                     if flow_mods is None:
