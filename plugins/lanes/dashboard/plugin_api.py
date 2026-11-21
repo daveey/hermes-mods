@@ -160,8 +160,7 @@ def _pr_contexts(db, flow_module, *, evidence=None):
                     if event['kind'] not in ('heartbeat', 'external_watch') or carries_pr:
                         revision = max(revision, event['id'])
                 return revision
-            revision = (evidence.derived(row['id'], 'pr_revision', newest) if hasattr(evidence, 'derived')
-                        else newest(events))
+            revision = newest(events)
             source = evidence.identity(row['id']) if evidence is not None and hasattr(evidence, 'identity') else identity
             groups[url].append((row['id'], row['status'], row['completion_contract'], (source, revision)))
     return {url: (identity, tuple(sorted(cards))) for url, cards in groups.items()}
@@ -193,7 +192,6 @@ def _view_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
 
 
 def _shared_views():
@@ -240,7 +238,6 @@ def _current_view(mods, hours, window, expanded):
     kbc, _, cli = mods
     try:
         with kbc.connect_closing() as conn, read_view(conn) as evidence:
-
             snap = cli.snapshot(conn, hours=hours, evidence=evidence)
             raw = None
             if expanded and snap.get('configured'):
@@ -348,6 +345,7 @@ async def post_admit(card: str, body: Dict[str, Any] = Body(default={})) -> Dict
 
 
 WATCH_S = 0.25  # change-cursor poll; a change is projected on the first tick that sees it
+MIN_PROJECT_GAP_S = 1.0  # idle time between projections under sustained source churn
 HEARTBEAT_S = 30.0
 _seen_cursor = None
 
@@ -425,11 +423,13 @@ async def stream_lanes(ws: WebSocket):
     debug = ws.query_params.get('debug', 'false').lower() == 'true'
     last_hash = None
     version = 0
+    last_project_end = 0.0
     async def send_view(timing=None):
-        nonlocal last_hash, version
+        nonlocal last_hash, version, last_project_end
         started = time.time()
         view = await asyncio.to_thread(lane_view, *params)
         finished = time.time()
+        last_project_end = time.monotonic()
         echo = dict(zip(('hours', 'window', 'expanded'), params))
         digest = hashlib.sha256(json.dumps({'view': view, 'params': echo}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         if digest != last_hash:
@@ -445,13 +445,13 @@ async def stream_lanes(ws: WebSocket):
         _refresh_cursor(cursor)
         await send_view()
         last_heartbeat = time.monotonic()
-        recomputed = False
+        pending_timing = None
         while True:
             # wait_for cancels and joins receive on timeout. No detached poll/receive tasks.
-            # After a recompute, look at the cursor again at once: changes that landed while it ran
-            # coalesce into one follow-up instead of waiting for another tick.
+            # Poll through the short cooldown: retain the first detection, coalesce revisions,
+            # and project the latest cursor when eligible. Quiet changes have no debounce.
             try:
-                message = await asyncio.wait_for(ws.receive(), 0.005 if recomputed else WATCH_S)
+                message = await asyncio.wait_for(ws.receive(), WATCH_S)
                 if message['type'] == 'websocket.disconnect':
                     return
                 if message.get('text'):
@@ -468,13 +468,16 @@ async def stream_lanes(ws: WebSocket):
                 pass
             polled = time.time()
             current = await asyncio.to_thread(change_cursor)
-            recomputed = current != cursor
-            if recomputed:
-                # Leading edge: the first tick that sees a change projects it, with no fixed wait.
-                cursor = current
-                detected = time.time()
-                _refresh_cursor(cursor)
-                await send_view({'cursor_poll': polled, 'detected': detected, 'released': time.time()})
+            if current != cursor:
+                if pending_timing is None:
+                    pending_timing = {'cursor_poll': polled, 'detected': time.time()}
+                if time.monotonic() - last_project_end >= MIN_PROJECT_GAP_S:
+                    cursor = current
+                    _refresh_cursor(cursor)
+                    await send_view({**pending_timing, 'released': time.time()})
+                    pending_timing = None
+            else:
+                pending_timing = None
             if time.monotonic() - last_heartbeat >= HEARTBEAT_S:
                 await ws.send_json({'type': 'heartbeat', 'version': version})
                 last_heartbeat = time.monotonic()

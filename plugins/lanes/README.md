@@ -33,14 +33,17 @@ slider does not invent a client-side forecast.
 
 The stream uses core's canonical WebSocket authorization (ticket/token/internal
 identity), failing closed with 1008. It watches the local and fleet-replica
-`task_events` cursor and policy/planner-note mtimes every 0.25 seconds. The first tick that
-sees a change projects it at once (no trailing debounce); changes that land during a
-projection coalesce into one immediate follow-up. Counts are computed on the hub by core,
-using request-local evidence shared by the strip and expanded flow; no cross-request card
-history memo is retained. Legacy read caches are invalidated once per revision, and a frame is sent only when
-the view/parameter hash differs. `&debug=true` adds a `timing` object to each pushed frame
-(wall-clock epoch seconds: `cursor_poll`, `detected`, `released`, `project_start`,
-`project_end`, `sent`); it is outside the view hash and absent otherwise. An unchanged board produces
+`task_events` cursor and policy/planner-note mtimes every 0.25 seconds. After quiet, the
+first tick that sees a change projects it at once (no trailing debounce). Changes during
+or just after a projection coalesce into one follow-up after a minimum 1 second idle
+gap from the previous projection's end; new changes do not reset that deadline. Counts
+are computed on the hub by core, using request-local evidence shared by the strip and
+expanded flow; no cross-request card history memo is retained. Legacy read caches are
+invalidated once per revision, and a frame is sent only when the view/parameter hash
+differs. `&debug=true` adds a `timing` object to view frames (wall-clock epoch seconds:
+`project_start`, `project_end`, `sent`; change-triggered frames additionally carry
+`cursor_poll`, `detected`, `released`). Timing is outside the view hash and absent
+otherwise. An unchanged board produces
 only `{type: "heartbeat", version}` every 30 seconds. Time-window/age values are
 snapshots at board/config changes, not a separate clock-driven feed.
 

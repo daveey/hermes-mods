@@ -26,7 +26,11 @@ def test_stream_status_change_heartbeat_and_disconnect(monkeypatch):
             assert ws.receive_json()['type'] == 'heartbeat'
             start = time.monotonic()
             state.update(status='running', cursor=1)
-            assert ws.receive_json()['view']['status'] == 'running'
+            frame = ws.receive_json()
+            while frame.get('type') == 'heartbeat':
+                assert time.monotonic() - start < 3
+                frame = ws.receive_json()
+            assert frame['view']['status'] == 'running'
             assert time.monotonic() - start < 3
             ws.send_json({'hours': 24, 'window': '24h', 'expanded': True})
             assert ws.receive_json()['view']['args'] == [24, '24h', True]
