@@ -19,7 +19,10 @@ metadata:
 # Try to unblock it yourself first
 
 A blocked card costs David attention every time a summary renders it. Before one exists, prove that no agent
-can clear it. The bar is **certainty**: if you are not sure David is needed, he is not. Do the work, apply your
+can clear it. When auditing an automated escalation, trace the actual producer: internal database calls do not
+run tool pre-call hooks or load these skills. A timeout, quota failure, offline owner or absent subscriber proves
+a delivery/recovery problem, not human-only authority. Keep agent custody and the original answer probe; never
+copy an internal handoff into a human_request merely because the owning chat did not answer. The bar is **certainty**: if you are not sure David is needed, he is not. Do the work, apply your
 recommendation and say how to reverse it.
 
 Run this every time you are about to:
