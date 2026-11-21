@@ -123,8 +123,12 @@ def _load_feed():
             mod.PROCESS_LOCK = old.PROCESS_LOCK  # one lock for every generation of this process's feed
             mod.PROCESS_FEED = running
             sys.modules[_FEED_KEY] = mod  # swapped under the lock feed() re-checks with
-            if running is not None and not running.stopped.is_set():
-                # Any running feed here is of an older class (a reload always makes a new one): hand it over.
+            if getattr(old, '__name__', '').startswith(_FEED_KEY + '_g'):
+                sys.modules.pop(old.__name__, None)  # the previous generation's own name: nothing refers to it
+            # Any feed found here is of an older class (a reload always makes a new one): hand it over now. A stopped
+            # one with no successor was stopped by this plugin's unload during the same reload (loading plugin_api.py
+            # means the plugin is being loaded, not disabled), so it is resumed too instead of waiting for a request.
+            if running is not None and getattr(running, '_successor', None) is None:
                 running.stopped.set()
                 restart = True
     if restart:  # resume it now, not at the next request: pushes and heartbeats continue

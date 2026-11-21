@@ -153,6 +153,7 @@ def test_a_feed_py_that_fails_to_load_keeps_the_running_feed(monkeypatch, tmp_pa
         bad = tmp_path / 'feed.py'
         bad.write_text('raise RuntimeError("half-written")\n')
         monkeypatch.setattr(api, '_FEED_PATH', bad)
+        monkeypatch.setattr(old_mod, 'SOURCE_STAMP', old_mod.SOURCE_STAMP)  # restored after: the test records a stamp
         gen = api._LOADER.generation
         assert api._load_feed() is old_mod and not running.stopped.is_set()
         assert f'{api._FEED_KEY}_g{gen + 1}' not in sys.modules, 'the failed generation is not left registered'
@@ -162,3 +163,40 @@ def test_a_feed_py_that_fails_to_load_keeps_the_running_feed(monkeypatch, tmp_pa
         assert api._load_feed() is old_mod and caplog.text == '', 'not retried until feed.py changes again'
     finally:
         _restore(api, old_mod)
+
+
+
+def test_a_reload_from_real_older_feed_code_hands_over_with_the_same_epoch(monkeypatch):
+    # The live upgrade: the process holds feed.py as loaded by older code (no stamp, a Feed without resume, a
+    # publish with no stopped-check), and the plugin's unload already stopped it before plugin_api.py is imported.
+    import importlib.util
+    import time
+    api, current = _hot(monkeypatch, 'c')
+    fakes = load('_spf_hot_fakes_c2', HERE.parent / 'test_feed.py')
+    spec = importlib.util.spec_from_file_location(api._FEED_KEY, HERE.parent / 'fixtures' / 'feed_6f569abc.py')
+    older = importlib.util.module_from_spec(spec)
+    sys.modules[api._FEED_KEY] = older
+    try:
+        spec.loader.exec_module(older)
+        assert not hasattr(older.Feed, 'resume')
+        sent = []
+        running = older.Feed(fakes.Readers(), emit=sent.append)
+        first = running.changes(['S1'])
+        older.PROCESS_FEED = running
+        running.stopped.set()  # the old plugin's unload ran first
+        new_mod = api._load_feed()
+        assert new_mod is not older and sys.modules[api._FEED_KEY] is new_mod
+        deadline = time.monotonic() + 5
+        while not isinstance(new_mod.PROCESS_FEED, new_mod.Feed) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        f = new_mod.PROCESS_FEED  # resumed without any request
+        assert isinstance(f, new_mod.Feed) and not f.stopped.is_set()
+        assert f.epoch == first['epoch'] and f.rev == running.rev
+        sent.clear()
+        rev = running.rev
+        older.Feed._publish(running, {'S1': running.compute('S1')})  # the old class's own publish, still in flight
+        out = running.changes(['S2'], since=first['rev'], epoch=first['epoch'])  # a stale reference to it
+        assert sent == [] and running.rev == rev, 'the older object neither pushes nor moves a revision'
+        assert out['epoch'] == f.epoch and 'S2' in f.interest and 'S2' in out['bundles']
+    finally:
+        _restore(api, current)
