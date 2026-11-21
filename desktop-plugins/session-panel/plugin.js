@@ -1502,7 +1502,68 @@ async function readCard(route, id) {
   }
   return null
 }
-const cardSummary = (id, r) => ({ id, title: str(r.detail.task.title), status: str(r.detail.task.status), session: str(r.detail.task.session_id), owner: typeof r.detail.owner === 'string' ? r.detail.owner : '', board: r.board, hop: nextHop(r.detail, Date.now()) })
+export const cardSummary = (id, r) => ({ id, title: str(r.detail.task.title), status: str(r.detail.task.status), session: str(r.detail.task.session_id), owner: typeof r.detail.owner === 'string' ? r.detail.owner : '', board: r.board, hop: nextHop(r.detail, Date.now()),
+  parents: (r.detail.links?.parents || []).map(str),
+  request: validHumanRequest(r.detail.task.human_request, r.detail.task.block_kind) ? r.detail.task.human_request : null
+})
+
+/** Human attention can live on ANY dependency branch, not the first chain's leaf. Read-only presentation:
+ *  never changes membership, requests or stripe semantics. Only fresh validated blocked asks are actionable.
+ *  Old persisted summaries lack parents/request; they are refreshed by the normal card cache. */
+function currentAskInfo(chip, id, now, read, fallback) {
+  const result = cardInfo(chip, id, now, read, fallback)
+  const hit = cards.get(titleKey(refRoute(chip, fallback), id))
+  return hit && Number.isFinite(hit.at) && !hit.pending && !hit.stale && now - hit.at < CARD_FRESH_MS
+    ? result : { state: 'loading', info: null }
+}
+export function inheritedAsks(rows, now = Date.now(), { info = currentAskInfo, fallback } = {}) {
+  const asks = new Map(), seen = new Set(), queue = []
+  let incomplete = false
+  for (const row of rows || []) {
+    const c = row.chip
+    if (row.kind !== 'kanban' || !c?.id || c.stale) continue
+    queue.push({ chip: c, root: row, id: c.id, path: [] })
+  }
+  let reads = 0
+  while (queue.length && reads < 80) {
+    const item = queue.shift(), { chip, root, id, path } = item
+    const key = `${chip.connectionId}:${chip.profile}:${chip.board}:${id}`
+    if (seen.has(key) || path.includes(id)) continue
+    seen.add(key); reads++
+    const r = info(chip, id, now, undefined, fallback)
+    if (r.state !== 'ok' || !r.info || r.info.stale) { incomplete = true; continue }
+    const nd = r.info
+    if (!OPEN(nd.status)) continue
+    if (!Array.isArray(nd.parents)) { incomplete = true; continue }
+    const nextPath = [...path, id]
+    const routeChip = { kind: 'kanban', connectionId: chip.connectionId, profile: chip.profile,
+      board: nd.board || chip.board || 'default', gatewayId: nd.owner || chip.gatewayId || chip.gateway }
+    if (path.length && nd.status === 'blocked' && nd.request) {
+      asks.set(key, { key, request: nd.request, path: nextPath, root: root.label, title: nd.title,
+        chip: { ...routeChip, id, state: nd.status, label: nd.title }, owner: nd.owner })
+    }
+    if (path.length >= MAX_HOPS) { if (nd.parents?.length) incomplete = true; continue }
+    const parents = nd.parents || []
+    // Parks may name a producer without a formal parent edge.
+    const ids = [...new Set([...parents, ...(nd.hop?.ref?.id ? [nd.hop.ref.id] : [])])]
+    for (const parent of ids) queue.push({ chip: routeChip, root, id: parent, path: nextPath })
+  }
+  return { asks: [...asks.values()], incomplete: incomplete || queue.length > 0 }
+}
+
+/** Inherited asks stay read-only: answering in the dependent chat must not imply permission on its owner. */
+export function UpstreamAsk({ ask }) {
+  const st = typeof window !== 'undefined' ? window.__sessionTasks : null
+  const canOpen = ask.chip.connectionId && ask.chip.profile && typeof st?.openTaskChip === 'function'
+  return jsxs('div', { 'data-upstream-ask': ask.key, style: { borderLeft: `3px solid ${C.needsYou}`, padding: '8px 12px', marginBottom: 8, overflowWrap: 'anywhere' }, children: [
+    jsx('div', { style: { color: ALERT_TEXT, fontWeight: 600 }, children: 'Needs you · upstream dependency' }),
+    jsx('div', { 'data-upstream-action': '', children: ask.request.action }),
+    jsx('div', { style: muted, children: `Needed by ${ask.root}: ${ask.path.join(' → ')}` }),
+    jsx('div', { style: muted, children: ask.request.scope }),
+    jsx('div', { style: muted, children: `Owner: ${ask.owner || 'not reported'}; read via ${ask.chip.connectionId} · ${ask.chip.profile} · ${ask.chip.board} · ${ask.chip.id}. Resolve the original ask in its owning card; this wait grants no permissions.` }),
+    canOpen && jsx('button', { type: 'button', 'data-open-upstream-card': ask.chip.id, style: btn, onClick: () => st.openTaskChip(ask.chip), children: 'Open original card' })
+  ] })
+}
 /** One card read fills both caches: the park reader's answer seeds the chain's, and the chain's the park's. */
 function shareCardRead(route, id, r) {
   if (!r?.detail?.task) return
@@ -2431,7 +2492,9 @@ export function Panel() {
   const sorted = classify(chips, { nowMs: now, silence, isAsked, presentationFor, evidence: c => (c.kind === 'kanban' ? chipObservation(c, chipAsOf(c, now) / 1000) : null) })
   const known = new Set(chips.filter(c => c?.kind === 'kanban' && c.id).map(c => str(c.id))) // this chat's cards
   const evidenceUnknown = annotateEvidence(sorted, now)
-  const asks = typeof US?.openAskCount === 'function' ? US.openAskCount() : 0
+  const upstream = inheritedAsks([...sorted.blockedUpstream, ...sorted.waiting, ...sorted.queued], now)
+  const upstreamAsks = upstream.asks.filter(a => !presentationFor(a.chip)?.representedInQueue && !chips.some(c => c.kind === 'kanban' && c.id === a.chip.id && c.connectionId === a.chip.connectionId && c.profile === a.chip.profile && (c.board || 'default') === a.chip.board))
+  const asks = (typeof US?.openAskCount === 'function' ? US.openAskCount() : 0) + upstreamAsks.length
   const finished = doneState.scope === scope ? doneState.rows : cachedDone(scope)
   const n = counts(sorted, { asks, done: finished ? finished.filter(d => !d.archived).length : null })
   const finishedOpen = finishedScopes.has(scope)
@@ -2469,7 +2532,7 @@ export function Panel() {
   }
   // The user-steps bridge qualifies these by owner/request/revision. A count alone cannot distinguish
   // a replacement ask; old bridges without identity must fail open rather than hide an unknown set.
-  const askKeys = typeof US?.openAskKeys === 'function' ? US.openAskKeys() : []
+  const askKeys = [...(typeof US?.openAskKeys === 'function' ? US.openAskKeys() : []), ...upstreamAsks.map(a => `upstream:${a.key}:${a.request.action}`)]
   const attention = attentionKeys(askKeys, sorted)
   // Empty attention only matches an explicitly empty fold. Otherwise every([])
   // would reuse a fold saved for answered asks (including legacy asks:N keys).
@@ -2505,6 +2568,8 @@ export function Panel() {
     (asks > 0 || sorted.unasked.length > 0) && jsx('h3', { 'data-section': 'needs-you', style: heading(C.needsYou), children: `Needs you · ${asks + sorted.unasked.length}` }, 'h-needs-you'),
     US?.ActionQueue && jsx(US.ActionQueue, { embedded: true, audience: 'human' }, 'queue'),
     ...sorted.unasked.map(i => jsx(AskRow, { i, session: route.session }, i.key)),
+    ...upstreamAsks.map(ask => jsx(UpstreamAsk, { ask }, `upstream:${ask.key}`)),
+    upstream.incomplete && jsx('div', { 'data-upstream-incomplete': '', style: muted, children: 'Some upstream actions are still being read or could not be verified. Open the dependency tree for the last-known wait.' }),
     legacy
   ].filter(Boolean)
   const summaryParts = PIP_ORDER.filter(k => n[k]).map(k => ({ k, text: `${n[k]} ${LABEL[k]}` }))
