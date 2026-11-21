@@ -19,4 +19,10 @@ cases = {
     'subagents': f.bundle(subagents=[f.observed({'id': 'child', 'title': 'Research'}, 'subagent')]),
     'all_sections': f.bundle(f.task(human_request=f.human(), wait={'wait_state': 'human'}), f.task('t_stuck', status='scheduled', wait={'wait_state': 'stalled'}), f.task('t_ready', status='ready'), f.task('t_wait', status='blocked'), rentals=[{'id': 'box', 'name': 'Machine'}], done=[f.task('t_done', status='done')], outcome_json={'state': 'needs_user'}),
 }
+approval = f.request()
+approval.update(kind='approval', limits=[{'key': 'Runtime', 'value': 'LIMIT-4-HOURS', 'permissionRequired': True}],
+                exclusions=['EXCLUDED-SPEND'], outcomes={'approve': 'Stage A only', 'decline': 'No execution'})
+approval['scope'] = {**approval['scope'], 'complete': True, 'markdown': 'CANONICAL-PLAN distinct from the card brief'}
+approval['choices'][0].update(effect='approve', explain='Only the bounded stage is authorized')
+cases['approval_boundaries'] = f.bundle(f.task(human_request=f.human(), wait={'wait_state': 'human'}), requests=[approval])
 print(json.dumps({name: {'model': f.model.reduce_panel(b, now=f.NOW, projector=f.project)} for name, b in cases.items()}))

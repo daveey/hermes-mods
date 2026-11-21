@@ -83,7 +83,7 @@ export function ingestBundle(connectionId, profile, b) {
   profile = profile || 'default'
   const scope = routeKey({ connectionId, profile, session: b.session })
   modelCache.delete(scope)
-  if (b.model?.version === 1 && b.model.header && b.model.sections) {
+  if (validModel(b.model)) {
     modelCache.set(scope, b.model)
     if (modelCache.size > 100) modelCache.delete(modelCache.keys().next().value)
   }
@@ -242,10 +242,15 @@ const MODEL_SECTIONS = [
   ['waiting', 'Waiting'], ['ready', 'Ready'], ['done', 'Done']
 ]
 const modelSmall = { fontSize: 12, lineHeight: 1.5, overflowWrap: 'anywhere' }
+// P3b owns the remote courier cutover. Preserve the existing explicit draft (never send) meanwhile.
+const draftOnly = row => row.source === 'card' && !row.request_id
+export const chooseText = (row, option) => `Card ${row.id}: go with ${option.letter ? `option ${option.letter}` : 'this option'} (${option.name}).\n`
+export const validModel = model => model?.version === 1 && !!model.header?.counts && Array.isArray(model.header?.pips) &&
+  MODEL_SECTIONS.every(([section]) => Array.isArray(model.sections?.[section]))
 
 /** Pure model -> React tree. No parsing, classification, I/O, clock or ambient state. */
 export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck } = {}) {
-  if (model?.version !== 1 || !model.header || !model.sections) return null
+  if (!validModel(model)) return null
   const details = row => row.details?.length > 0 && jsxs('details', { 'data-ask-details': '', style: modelSmall, children: [
     jsx('summary', { children: 'Details' }),
     ...row.details.map((text, i) => jsx('div', { style: { whiteSpace: 'pre-wrap', marginTop: 4 }, children: text }, i))
@@ -270,7 +275,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
           section === 'needs_you' && jsxs('div', { style: { display: 'grid', gap: 6 }, children: [
             row.situation && jsx('div', { 'data-ask-situation': '', title: row.situation, style: { ...modelSmall, ...clamp(3) }, children: row.situation }),
             ...row.options.map(option => jsxs('button', { type: 'button', 'data-choice-letter': option.letter,
-              ...(option.recommended ? { 'data-recommended-row': '' } : {}), disabled: !onChoose || !row.request_id || !option.choice_id || !row.actions.some(a => a.kind === 'decide' && a.owner && a.request_id === row.request_id && a.revision === row.request_revision) || !!status?.locked,
+              ...(option.recommended ? { 'data-recommended-row': '' } : {}), disabled: !onChoose || (!draftOnly(row) && (!row.request_id || !option.choice_id || !row.actions.some(a => a.kind === 'decide' && a.owner && a.request_id === row.request_id && a.revision === row.request_revision))) || !!status?.locked,
               'aria-label': `Choose option ${option.letter}: ${option.name}`,
               onClick: () => onChoose?.(row, option),
               style: { textAlign: 'left', font: 'inherit', color: 'inherit', border: '1px solid var(--border)', borderRadius: 6, padding: '8px 10px', background: option.recommended ? 'color-mix(in srgb, var(--foreground) 6%, transparent)' : 'transparent', display: 'grid', gridTemplateColumns: '22px minmax(0,1fr)', gap: 8, cursor: 'pointer' }, children: [
@@ -283,6 +288,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
               ] })
             ] }, option.letter)),
             row.only_you && jsx('div', { 'data-ask-only-you': '', style: modelSmall, children: row.only_you }),
+            draftOnly(row) && jsx('small', { children: 'Choosing drafts your answer; send it in the chat to decide.' }),
             status?.text && jsx('div', { role: 'status', style: modelSmall, children: status.text }),
             status?.locked && onCheck && jsx('button', { type: 'button', onClick: () => onCheck(row), children: 'Check status' })
           ] }),
@@ -319,6 +325,12 @@ async function modelRequestRoute(action, sourceRoute, call) {
 }
 const modelApi = (path, opts) => window.hermesDesktop.api({ path, timeoutMs: 10_000, ...opts })
 export async function chooseModelOption(row, option, sourceRoute, { call = modelApi } = {}) {
+  if (draftOnly(row)) {
+    if (routeKey(panelRoute()) !== routeKey(sourceRoute)) return
+    await host.composer?.setDraft?.(sourceRoute.session, chooseText(row, option))
+    host.composer?.focus?.(sourceRoute.session)
+    return
+  }
   const action = row.actions.find(a => a.kind === 'decide')
   if (!row.request_id || !action?.owner || action.request_id !== row.request_id || action.revision !== row.request_revision || !option.choice_id) throw Error('No canonical decision binding')
   const key = modelDecisionKey(row)
@@ -382,6 +394,7 @@ export function Panel() {
     decisionStatus: modelDecisionStatus, onCheck: row => void checkModelDecision(row),
     onAction: (row, action) => {
       const t = action.target
+      if (!t?.id) return
       const connectionId = t.gateway ? tasksBridge()?.connectionForHubGateway?.(t.gateway) : route.connectionId
       if (!connectionId) { host.notify?.({ kind: 'error', message: 'Card owner connection unavailable.' }); return }
       void tasksBridge()?.openTaskChip?.({ id: t.id, kind: 'kanban', gatewayId: t.gateway, profile: t.profile, board: t.board, connectionId })

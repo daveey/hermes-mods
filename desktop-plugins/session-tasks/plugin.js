@@ -351,10 +351,10 @@ export function humanRequestOf(raw) {
 
 // Display text for a card comes from the hub's PanelModel v1 row (title/detail); nothing here parses a card's scope.
 const MODEL_SECTION_KEYS = ['needs_you', 'stuck', 'running', 'waiting', 'ready', 'done']
-/** The PanelModel row that shows this card chip: same card id, and the same gateway/profile/board where both sides say. */
+/** Display is owner-qualified: missing gateway/profile/board is unknown, never a wildcard. */
 export function modelRowFor(model, chip) {
-  if (!model || model.version !== 1 || !model.sections || chip?.kind !== 'kanban') return null
-  const same = (a, b) => !a || !b || str(a) === str(b)
+  if (!model || model.version !== 1 || !model.sections || chip?.kind !== 'kanban' || !str(chip.id)) return null
+  const same = (a, b) => !!str(a) && !!str(b) && str(a) === str(b)
   for (const name of MODEL_SECTION_KEYS) {
     const row = (Array.isArray(model.sections[name]) ? model.sections[name] : []).find(r => r && r.kind !== 'question' && str(r.id) === chip.id && same(r.gateway, chip.gateway) && same(r.profile, chip.profile) && same(r.board, chip.board))
     if (row) return row
@@ -825,6 +825,10 @@ export function ingestFeed({ connectionId, profile = 'default', session, lineage
   const route = { connectionId, profile }
   const scope = JSON.stringify([connectionId, profile, session])
   const chips = withModelDisplay(sessionTaskChips(tasks, route), model)
+  // Seed the same owner/lineage read cache used by polling and background warming.
+  // A newer bundle without a model deliberately replaces (and clears) old display text.
+  const idsForDisplay = Array.isArray(lineage) && lineage.length ? lineage : [session]
+  if (trusted) taskReadCache.set(taskReadKey(route, idsForDisplay), chips)
   rememberChips(scope, chips, undefined, { feed: !!trusted })
   if (Array.isArray(lineage) && lineage.length) {
     const ids = new Set(lineage.map(String))
@@ -862,6 +866,21 @@ const emit = () => subs.forEach(fn => fn(snapshot))
 // Last good hub answer for the focused lineage (shown stale while the hub is unreachable).
 let hubLinkCache = { session: null, chips: [] }
 const taskReadCache = new Map()
+const taskReadKey = (route, ids) => JSON.stringify([route.connectionId || '', route.profile, [...ids].sort()])
+// Reuse only display attached to the identical projected evidence, never an old status/ask/title.
+// Cache paint tags are not evidence. Removed cards disappear from the authoritative cache,
+// so a later reappearance cannot resurrect their old model text.
+function retainModelDisplay(chips, previous) {
+  const evidence = ({ display, cachedAt, paintedAt, boardStatus, ...chip }) => {
+    const { readAt, ...status } = boardStatus || {}
+    return JSON.stringify({ ...chip, boardStatus: status })
+  }
+  const byKey = new Map((previous || []).map(c => [c.key, c]))
+  return chips.map(chip => {
+    const old = byKey.get(chip.key)
+    return old?.display && evidence(old) === evidence(chip) ? { ...chip, display: old.display } : chip
+  })
+}
 
 // The raw `/api/session-kanban-tasks` rows of the last authoritative answer per (owner route, lineage), from this
 // plugin's own read or a trusted feed bundle. blocked-panel reads the same list for the same chat every 10 s; it
@@ -894,7 +913,7 @@ export const resetRowsForTests = () => rowsCache.clear()
 
 export async function loadKanban(ids, route = focusedRoute()) {
   route = { ...route }
-  const cacheScope = JSON.stringify([route.connectionId || '', route.profile, [...ids].sort()])
+  const cacheScope = taskReadKey(route, ids)
   const read = (path, timeoutMs = 15_000) => api(path, route.connectionId, timeoutMs, route.profile)
   const list = await safe(
     () => read(`/api/session-kanban-tasks?ids=${encodeURIComponent([...ids].join(','))}`),
@@ -903,7 +922,9 @@ export async function loadKanban(ids, route = focusedRoute()) {
   let live = null
   if (list && Array.isArray(list.tasks)) {
     rememberRows(route, ids, list.tasks)
-    live = sessionTaskChips(list.tasks, route)
+    const previous = taskReadCache.has(cacheScope) ? taskReadCache.get(cacheScope)
+      : [...ids].flatMap(id => cachedChips(JSON.stringify([route.connectionId || '', route.profile, id]))?.kanban || [])
+    live = retainModelDisplay(sessionTaskChips(list.tasks, route), previous)
     taskReadCache.set(cacheScope, live)
     // Authoritative projections include remote obligations and releases.
     // Replica inventory must not add back released or unrelated tasks.

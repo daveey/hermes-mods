@@ -79,6 +79,16 @@ for (const [name, fixture] of Object.entries(cases)) {
   assert.equal(JSON.stringify(model), before, 'pure renderer never mutates input')
  })
 }
+test('canonical approval plan, limits, permissions, exclusions and outcomes remain accessible before choosing', async () => {
+ const model = publicCases.approval_boundaries.model
+ await paint(m.renderModel(model, { onChoose: () => {} }))
+ const row = document.querySelector('[data-ask-row]')
+ assert.ok(row.querySelector('button[data-choice-letter]:not(:disabled)'))
+ const details = row.querySelector('details')
+ for (const text of ['CANONICAL-PLAN distinct from the card brief', 'LIMIT-4-HOURS', 'permissionRequired: true', 'EXCLUDED-SPEND', 'Stage A only', 'No execution', 'Only the bounded stage is authorized']) {
+  assert.ok(details.textContent.includes(text), `missing consent boundary: ${text}`)
+ }
+})
 test('header counts/pips remain server values, not recomputed row totals', async () => {
  const model = structuredClone(publicCases.all_sections.model)
  model.header.counts.running = 78; model.header.pips = [{ section: 'running', count: 91, label: 'hub value' }]
@@ -127,20 +137,30 @@ test('Open card resolves the supplied owner target rather than the focused conne
  assert.deepEqual(opened, [{ id: 't_example', kind: 'kanban', gatewayId: 'owner-gateway', profile: 'work', board: 'board-a', connectionId: 'owner-connection' }])
  await paint(null)
 })
-test('unbound options are disabled and rejected, never drafted or posted', async () => {
+test('unmirrored card choices preserve the explicit composer draft until P3b, never POST', async () => {
  const model = structuredClone(publicCases.own_letters.model)
  const row = model.sections.needs_you[0]
  row.request_id = null; row.actions = row.actions.filter(a => a.kind !== 'decide')
  let invoked = 0
+ const before = drafts.length
  await paint(m.renderModel(model, { onChoose: () => invoked++ }))
- for (const option of document.querySelectorAll('[data-choice-letter]')) {
-  assert.equal(option.disabled, true)
-  await React.act(async () => option.click())
- }
+ for (const option of document.querySelectorAll('[data-choice-letter]')) assert.equal(option.disabled, false)
+ assert.ok(document.body.textContent.includes('Choosing drafts your answer'))
+ await m.chooseModelOption(row, row.options[0], current, { call: async () => { invoked++ } })
  assert.equal(invoked, 0)
- await assert.rejects(m.chooseModelOption(row, row.options[0], current, { call: async () => { invoked++ } }), /No canonical decision binding/)
- assert.equal(invoked, 0); assert.equal(drafts.length, 0)
- assert.ok(!document.body.textContent.includes('Choosing drafts'))
+ assert.deepEqual(drafts.slice(before), [[current.session, m.chooseText(row, row.options[0])]])
+ await m.chooseModelOption(row, row.options[0], { ...current, session: 'stale-chat' }, { call: async () => { invoked++ } })
+ assert.equal(drafts.length, before + 1)
+ row.source = 'question'
+ await paint(m.renderModel(model, { onChoose: () => invoked++ }))
+ assert.ok([...document.querySelectorAll('[data-choice-letter]')].every(o => o.disabled))
+ await assert.rejects(m.chooseModelOption(row, row.options[0], current), /No canonical decision binding/)
+})
+test('partial models invalidate cached scope and render nothing instead of crashing', () => {
+ const partial = { version: 1, header: { counts: {} }, sections: { needs_you: [] } }
+ assert.equal(m.renderModel(partial), null)
+ m.ingestBundle(current.connectionId, current.profile, { session: current.session, model: partial })
+ assert.equal(m.cachedModel(current), null)
 })
 test('request choices use choice_id, verified owner route and exact revision with readback', async () => {
  const q = structuredClone(publicCases.own_letters.model.sections.needs_you[0])

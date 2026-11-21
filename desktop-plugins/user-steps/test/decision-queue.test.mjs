@@ -829,14 +829,16 @@ test('validRequest mirrors the server: explain is non-empty text, recommended is
  assert.equal(withChoices([{ ...base[0], recommended: true }, { ...base[1], recommended: true }, base[2]]), false)
 })
 
-test('with the session panel loaded, the For you strip yields to it and its parts are exported for embedding', async () => {
+test('with the session panel loaded, the strip keeps only the compact companion queue (no legacy Strip)', async () => {
  const areas = []
  const dispose = m.default.register({ register: a => areas.push(a) })
  try {
   const strip = areas.find(a => a.id === 'strip')
   assert.notEqual(strip.render(), null, 'draws itself without the panel')
   window.__sessionPanel = { active: true }
-  assert.equal(strip.render(), null, 'the panel draws the asks instead')
+  const drawn = strip.render()
+  assert.equal(drawn.props.children.type, m.ActionQueue, 'the companion queue stays: free text, Retry, plan request, withdraw')
+  assert.equal(drawn.props.children.props.companion, true)
   assert.equal(window.__userSteps.ActionQueue, m.ActionQueue)
   assert.equal(window.__userSteps.Strip, m.Strip)
   assert.equal(typeof window.__userSteps.openAskCount, 'function')

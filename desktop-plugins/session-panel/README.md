@@ -3,7 +3,7 @@
 Desktop renders the hub's **PanelModel v1** unconditionally. The hub owns work
 classification, brief/option parsing, dependency traversal, wait wording and counts.
 Desktop does not read raw cards, person waits or finished-card lists to reconstruct
-a panel. There is no local renderer toggle or composer-draft decision fallback.
+a panel. There is no local renderer toggle.
 
 ## Model presentation and cached switching
 
@@ -22,9 +22,11 @@ that a worker is still running; heartbeats never recompute their work states.
 
 ## Request-backed decisions
 
-Every actionable ask requires a canonical request ID, exact revision, decision
-owner and choice ID. Unbound options are disabled; direct invocation also refuses
-them without writing a draft or posting anything.
+Request-backed asks require a canonical request ID, exact revision, decision
+owner and choice ID. Unbound non-card options are disabled. Until the owner-side
+remote courier cutover, unmirrored card choices preserve the existing explicit
+composer draft: choosing does not send or record the decision, and the hint says
+to send it in the chat. A changed focused route refuses the stale draft.
 
 Choices use the existing user-steps decisions POST. On click, Desktop reads the
 request on a candidate connection and verifies its exact gateway/profile/stored
@@ -33,7 +35,8 @@ The idempotency key and intent persist **before** POST. Delivery is established
 with operation lookup and receipt readback, not the POST response alone.
 An unknown outcome locks all options and offers **Check status**, retaining the
 same key across reloads. Confirmed decisions remain locked against old cached
-models. Choices requiring free text continue through the existing decision queue.
+models. Choices requiring free text, withdrawal and delivery Check status/Retry
+remain available in user-steps' compact companion queue without duplicate tiles.
 Open card uses the existing owner-qualified session-tasks connection mapping.
 
 ## Feed transport
@@ -62,7 +65,7 @@ HERMES_DESKTOP_DIR=/path/to/desktop-deps \
 The dependency directory needs React, React DOM and jsdom (the public Desktop CI
 workflow pins versions). `test/hub-model.test.mjs` invokes the real Python reducer
 through `test/hub-model-fixtures.py` for public structural goldens, then exercises
-DOM presentation, cached/missing scopes, disabled unbound choices, verified
+DOM presentation, cached/missing scopes, scoped draft fallback, disabled unbound questions, verified
 owner/revision routing, canonical POST/readback and unknown-outcome locking.
 `test/feed.test.mjs` covers model caching, raw-field isolation, transport recovery,
 revision ordering, cache bounds and coalesced registrations. Removed local UI and

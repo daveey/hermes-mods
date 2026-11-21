@@ -189,6 +189,24 @@ def ask(row, request=None):
     out['request_id'] = request.get('requestId')
     out['request_revision'] = request.get('revision')
     if request:
+        # The Desktop no longer renders a second full request. Preserve every
+        # consent boundary in the single model, including card-backed requests
+        # whose human_request.scope differs from the canonical plan.
+        full_scope = text(scope.get('markdown'))
+        if full_scope and full_scope not in out['details']:
+            out['details'].append(full_scope)
+        for limit in request.get('limits') or []:
+            limit = obj(limit)
+            out['details'].append('Limit: ' + text(limit.get('key')) + ': ' + str(limit.get('value', '')) +
+                                  ' · permissionRequired: ' + json.dumps(limit.get('permissionRequired'), ensure_ascii=False))
+        for exclusion in request.get('exclusions') or []:
+            out['details'].append('Not included: ' + text(exclusion))
+        for effect, outcome in obj(request.get('outcomes')).items():
+            if text(outcome):
+                out['details'].append(str(effect) + ': ' + text(outcome))
+        for choice in choices:
+            if text(obj(choice).get('explain')):
+                out['details'].append(text(choice.get('label')) + ': ' + text(choice.get('explain')))
         out['gateway'] = obj(request.get('owner')).get('gatewayId') or out['gateway']
         out['actions'].append({'kind': 'decide', 'label': 'Answer', 'request_id': request['requestId'],
                                'revision': request.get('revision'), 'owner': request.get('owner')})
