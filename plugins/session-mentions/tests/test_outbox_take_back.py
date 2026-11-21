@@ -79,6 +79,20 @@ def test_cancel_and_claim_race_exactly_one_wins(tmp_path):
     _race(base, lambda rid: rf.cancel(rid, base))
 
 
+def test_cancel_that_cannot_take_back_says_not_taken_and_logs(tmp_path, monkeypatch, caplog):
+    """An OSError other than not-found (permissions, I/O) is "not taken" (False, logged), never a 500."""
+    base = _base(tmp_path)
+    rf.atomic_write(base / "outbox" / "r1.json", {"id": "r1", "action": "send", "created_at": time.time(), "ttl": 600})
+
+    def denied(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(rf, "take_back", denied)
+    with caplog.at_level("WARNING"):
+        assert rf.cancel("r1", base) is False
+    assert "r1" in caplog.text and "Permission denied" in caplog.text
+
+
 def test_sweep_drops_hidden_leftovers_older_than_an_hour(tmp_path):
     base = _base(tmp_path)
     old = time.time() - rf.STALE_SECONDS - 60

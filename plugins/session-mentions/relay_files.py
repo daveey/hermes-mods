@@ -29,6 +29,7 @@ name>`` and ``reach=<every gateway name it can resolve>``, and is registered und
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -36,6 +37,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 STALE_SECONDS = 3600
 HOME_COURIER_ID = "home-courier"
@@ -686,12 +689,17 @@ def request_status(req_id: Any, base: Path | None = None) -> dict:
 
 
 def cancel(req_id: Any, base: Path | None = None) -> bool:
-    """Withdraw a still-unclaimed request. False once any courier has claimed it."""
+    """Withdraw a still-unclaimed request. False once any courier has claimed it, or when it could not be taken
+    back (an OSError other than not-found, logged): then it may still be delivered, never a 500 for POST /cancel."""
     base = base or root()
     rid = safe_id(req_id)
     if not rid:
         return False
-    return take_back(base / "outbox" / f"{rid}.json")
+    try:
+        return take_back(base / "outbox" / f"{rid}.json")
+    except OSError as exc:
+        log.warning("cancel %s: could not take the request back from the outbox: %s", rid, exc)
+        return False
 
 
 def take_back(path: Path) -> bool:

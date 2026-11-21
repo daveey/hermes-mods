@@ -3286,7 +3286,8 @@ _RELAY_FILES: Any = None
 
 
 def _relay_files() -> Any:
-    """session-mentions' relay_files (the courier's outbox protocol), loaded from the sibling plugin dir."""
+    """session-mentions' relay_files (the courier's outbox protocol), loaded from the sibling plugin dir; None when
+    that plugin is not installed next to user-terminal."""
     global _RELAY_FILES
     if _RELAY_FILES is None:
         import importlib.util
@@ -3299,14 +3300,24 @@ def _relay_files() -> Any:
                 spec.loader.exec_module(mod)  # type: ignore[union-attr]
                 _RELAY_FILES = mod
                 break
-        else:
-            raise RuntimeError("the session-mentions plugin (relay_files.py) is not installed next to user-terminal")
     return _RELAY_FILES
 
 
 def _take_back(path: Path) -> bool:
-    """relay_files.take_back: True only when this call took the request out of the outbox, so no courier did."""
-    return bool(_relay_files().take_back(path))
+    """relay_files.take_back: True only when this call took the request out of the outbox, so no courier did.
+
+    A session-mentions without take_back (an older plugin next to this one) or none at all gets the same
+    os.replace take-back inline: an unlink racing the courier's claim can also succeed on APFS."""
+    shared = getattr(_relay_files(), "take_back", None)
+    if shared is not None:
+        return bool(shared(path))
+    taken = path.with_name(f".{path.stem}.taken")
+    try:
+        os.replace(path, taken)
+    except FileNotFoundError:
+        return False
+    taken.unlink(missing_ok=True)
+    return True
 
 
 def _withdrawn_unclaimed(base: Path, rid: str) -> bool:
@@ -3349,7 +3360,7 @@ def relay_once(base: Path, device: str, args: dict, sender: dict, result_wait: f
                     "error": (f"The Hermes Desktop on `{device}` did not pick up the request (it may "
                               f"be quitting, asleep, or running an older session-mentions plugin). "
                               f"Tell the owner; do not hand them the command.")}
-        if time.time() > pickup and rid_given and _withdrawn_unclaimed(base, rid):
+        if rid_given and _withdrawn_unclaimed(base, rid):  # withdraw_remote took it back: answer at once
             return {"ok": False, "status": "withdrawn", "code": "withdrawn", "request_id": rid,
                     "error": f"withdrawn before `{device}` claimed it (action=withdraw); nothing ran."}
         if _interrupted():

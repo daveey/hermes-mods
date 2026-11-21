@@ -1519,14 +1519,31 @@ def test_relay_once_claimed_at_the_pickup_deadline_waits_for_its_answer(remote, 
     assert not _outbox(base)
 
 
+@pytest.mark.parametrize("loaded", [None, "no take_back"])
+def test_take_back_falls_back_inline_when_session_mentions_lacks_it(monkeypatch, tmp_path, loaded):
+    """Version skew: session-mentions missing, or an older one without take_back. Still an os.replace take-back."""
+    monkeypatch.setattr(ut, "_relay_files", lambda: None if loaded is None else object())
+    path = tmp_path / "r.json"
+    path.write_text("{}")
+    assert ut._take_back(path) is True
+    assert not list(tmp_path.iterdir())  # neither the request nor its taken copy is left
+    assert ut._take_back(path) is False  # gone (claimed or taken): not ours
+
+
+def test_take_back_uses_session_mentions_relay_files():
+    assert ut._relay_files().take_back.__module__ == "_user_terminal_relay_files"
+
+
+@pytest.mark.parametrize("pickup_s", [1.0, 30.0])
 def test_start_withdrawn_while_waiting_for_pickup_answers_withdrawn_and_keeps_the_withdrawal(remote, monkeypatch,
-                                                                                               tmp_path):
+                                                                                               tmp_path, pickup_s):
     """withdraw_remote takes the start back while its own tool call still waits: that call answers withdrawn (not
-    "claimed but sent no answer"), and the ledger keeps the withdrawal, so a repeat withdraw says already."""
+    "claimed but sent no answer") as soon as the ledger says so, well before a 30 s pickup window ends, and the
+    ledger keeps the withdrawal, so a repeat withdraw says already."""
     base, mac = remote
     monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
     monkeypatch.setenv("HERMES_USER_TERMINAL_DEVICE", "macbook")
-    monkeypatch.setattr(ut, "PICKUP_S", 1.0)
+    monkeypatch.setattr(ut, "PICKUP_S", pickup_s)
     monkeypatch.setattr(ut, "START_RESULT_S", 20.0)
     _beat(base, "macbook")
     got = {}
@@ -1542,7 +1559,7 @@ def test_start_withdrawn_while_waiting_for_pickup_answers_withdrawn_and_keeps_th
     t.join(10)
     out = got["out"]
     assert out["ok"] is True and out["status"] == "withdrawn" and out["job_id"] == req.stem, out
-    assert time.time() - t0 < 5  # answered after pickup, not after START_RESULT_S
+    assert time.time() - t0 < 5  # not after the pickup window (30 s) or START_RESULT_S
     led = _ledger(base, req.stem)
     assert led["state"] == "withdrawn" and led["withdraw_confirmed"] and led["withdraw_reason"] == "superseded", led
     again = ut.withdraw_remote(base, req.stem, "x")
