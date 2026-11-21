@@ -152,6 +152,7 @@ def test_sample_local_tokens_replay_budget(tmp_path, monkeypatch):
           f"{steady_rows} rows), full-read mean {mean_full * 1000:.1f} ms/tick ({mean_full_rows:.0f} rows); "
           f"{mean_inc / 60 * 100:.3f}% of a core (budget {BUDGET_CORE * 100}%), was {mean_full / 60 * 100:.3f}%")
     # Work, not time: the change-keyed pass reads O(change) rows, not O(state). Deterministic, so it always runs.
+    assert mean_full_rows > 0, "row accounting recorded nothing: the work checks below would pass vacuously"
     assert steady_rows <= mean_full_rows / 10
     assert sum(inc_rows) <= sum(full_rows) / 3  # including the FULL_EVERY_S ceiling reads
     # CPU time is a quiet-hardware contract (plugins/runners/INVENTORY-BUDGET.md convention): the hermes-mods
