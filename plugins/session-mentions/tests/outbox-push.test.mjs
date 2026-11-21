@@ -307,3 +307,38 @@ test('two gateways sharing a feed id (cloned image): an untagged event drains bo
   assert.equal(m.pushLive('hub'), true) // a tag that agrees with its own feed is exact
   assert.equal(m.pushLive('local'), false)
 })
+
+test('an agreeing tag drains every connection on that outbox but vouches only for the tagged one', async () => {
+  // Two connections to one gateway outbox (or a cloned image's twin): both answered with the same feed.
+  const shared = 'gw:eeeeeeeeeeee'
+  const { api, calls } = backend({ outbox: () => ({ requests: [], feed: shared }) })
+  const m = await load(api)
+  await m.courierTick()
+  await m.onOutboxEvent({ connectionId: 'hub', payload: { feed: shared, seq: 1 } })
+  assert.deepEqual(calls.outbox, { local: 2, hub: 2 })
+  assert.equal(m.pushLive('hub'), true)
+  assert.equal(m.pushLive('local'), false)
+})
+
+test('a removed connection no longer makes a feed look shared', async () => {
+  const c = clock()
+  try {
+    const shared = 'gw:ffffffffffff'
+    let list = conns
+    const { api, calls } = backend({ outbox: () => ({ requests: [], feed: shared }) })
+    const m = await load(api, { connections: async () => list })
+    await m.courierTick() // both connections answered with the same feed
+    await m.onOutboxEvent({ payload: { feed: shared, seq: 1 } })
+    assert.equal(m.pushLive('local'), false) // shared: nobody vouched for
+    list = conns.filter(x => x.id === 'local') // hub removed from the registry
+    c.advance(61_000) // past the plugin's 60 s connection-list cache
+    const hubBefore = calls.outbox.hub
+    await m.onOutboxEvent({ payload: { feed: shared, seq: 2 } })
+    assert.equal(m.pushLive('local'), true) // the feed is local's alone now
+    assert.equal(calls.outbox.hub, hubBefore)
+    assert.equal(m.courierStateForTests().feedConns.get(shared).size, 1)
+    assert.equal(m.courierStateForTests().pushAt.has('hub'), false)
+  } finally {
+    c.restore()
+  }
+})

@@ -78,11 +78,14 @@ Contract:
   teach the Desktop which feed belongs to which connection; an event never does. The Desktop tags each event with a
   `connectionId`, but core stamps primary-socket events with the *active* connection's id, so this Mac's own gateway
   pushes arrive tagged `hub` while a hub chat is open. The tag is therefore trusted only when that connection's own
-  feed equals the event's `feed`. Otherwise the event goes by `feed`: one connection gets the drain and becomes
+  feed equals the event's `feed`. Then only the tagged connection becomes push-live, but every connection with that
+  feed is drained, so two connections to one outbox or a cloned image's twin don't miss it. Otherwise the event
+  goes by `feed`: one connection gets the drain and becomes
   push-live. Several connections sharing a feed (gateways cloned from one image) are all drained, but none becomes
   push-live, so each keeps its 3 s drain instead of trusting pushes that may be another gateway's. A tag naming a
   connection whose feed isn't known yet is drained but not marked push-live. `feed` is per outbox (host + path
-  hash), so the serve processes and turn-isolation child of one gateway share it.
+  hash), so the serve processes and turn-isolation child of one gateway share it. Connections that leave the connection list are pruned from
+  the feed map, so a removed connection can't make a feed look shared.
 - **Push-live connection.** A connection is push-live when a push or heartbeat attributed to it arrived within 60 s.
   A push makes the courier drain that connection immediately, with at most one drain in flight per connection:
   pushes that arrive during a drain fold into one more drain after it. The courier also runs a safety drain every
@@ -111,7 +114,7 @@ unclaimed request every 5 s and not an old one, heartbeating with `pending`, lis
 stat did not change, stopping on unload until the plugin registers again, and `/ping` refreshing liveness without
 claiming. `tests/outbox-push.test.mjs` covers a push draining the right connection (by feed; a `connectionId` tag only when it
 agrees with that connection's own feed; a local push mis-tagged with the active hub connection still drains local;
-two gateways sharing a feed), a lost push drained within 15 s by the re-push, a `pending` heartbeat
+two gateways sharing a feed; a removed connection pruned), a lost push drained within 15 s by the re-push, a `pending` heartbeat
 draining, burst coalescing, the safety drain, ping and fallback cadences, retry of a failed push drain, and the `register()`
 subscription. `tests/courier-liveness.test.mjs` pins both cadences inside the 20 s windows. Delivery of the event
 through a running Desktop's socket is untested here.

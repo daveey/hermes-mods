@@ -1615,6 +1615,7 @@ export async function courierTick() {
       })
     }
     const now = Date.now()
+    pruneFeeds(conns)
     await Promise.all(
       conns.map(conn => {
         const backoff = (courierState.get(conn.id)?.until || 0) > now
@@ -1649,7 +1650,8 @@ function learnFeed(feed, connectionId) {
  *  only when it agrees with that: core stamps primary-socket events with the ACTIVE connection's id, so while a hub
  *  chat is active this Mac's own gateway pushes arrive tagged `hub`; believing the tag would drain hub and leave the
  *  local request sitting past the pickup timeouts.
- *   - tag whose own feed equals `feed`: that connection, push-live;
+ *   - tag whose own feed equals `feed`: that connection is push-live; every connection with that feed is drained
+ *     (two connections to one outbox, or a cloned image's twin, get the drain too, but only the tag is vouched for);
  *   - otherwise by `feed`: one connection -> it, push-live; several (gateways cloned from one image share a feed) ->
  *     drain them all (a spare drain claims nothing it shouldn't) but mark none push-live, so each keeps its 3 s
  *     fallback drain rather than trusting pushes that may be another gateway's;
@@ -1660,25 +1662,35 @@ export function attributeOutboxEvent(ev) {
   const p = ev?.payload
   const feed = typeof p?.feed === 'string' ? p.feed : ''
   const tag = typeof ev?.connectionId === 'string' && ev.connectionId ? ev.connectionId : ''
-  if (tag && feed && connFeed.get(tag) === feed) return { ids: new Set([tag]), live: true }
   const byFeed = feed ? feedConns.get(feed) : null
-  if (byFeed?.size) return { ids: new Set(byFeed), live: byFeed.size === 1 }
-  if (tag && !connFeed.has(tag)) return { ids: new Set([tag]), live: false }
-  return { ids: new Set(), live: false }
+  if (tag && feed && connFeed.get(tag) === feed) return { ids: new Set([tag, ...(byFeed || [])]), live: new Set([tag]) }
+  if (byFeed?.size) return { ids: new Set(byFeed), live: byFeed.size === 1 ? new Set(byFeed) : new Set() }
+  if (tag && !connFeed.has(tag)) return { ids: new Set([tag]), live: new Set() }
+  return { ids: new Set(), live: new Set() }
+}
+
+/** Forget feeds and push state of connections no longer in the list, so a removed connection can't make a feed
+ *  look shared (which would stop its twin from becoming push-live). */
+export function pruneFeeds(conns) {
+  const present = new Set((conns || []).map(c => c.id))
+  for (const [feed, ids] of feedConns) {
+    for (const id of ids) if (!present.has(id)) ids.delete(id)
+    if (!ids.size) feedConns.delete(feed)
+  }
+  for (const map of [connFeed, pushAt, lastDrainAt, lastPingAt]) for (const id of map.keys()) if (!present.has(id)) map.delete(id)
 }
 
 export async function onOutboxEvent(ev) {
   const p = ev?.payload
   if (!p || typeof p !== 'object') return
+  const conns = await connections()
+  pruneFeeds(conns)
   const { ids, live } = attributeOutboxEvent(ev)
   if (!ids.size) return
-  if (live) {
-    const now = Date.now()
-    for (const id of ids) pushAt.set(id, now)
-  }
+  const now = Date.now()
+  for (const id of live) pushAt.set(id, now)
   // A heartbeat that says a request waits: the push for it was lost (socket reconnect) or never sent. Drain.
   if (p.heartbeat && !p.pending) return
-  const conns = await connections()
   await Promise.all(conns.filter(c => ids.has(c.id)).map(c => drainConnection(c, conns, { push: true })))
 }
 
