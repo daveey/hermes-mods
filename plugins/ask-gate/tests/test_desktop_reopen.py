@@ -69,6 +69,7 @@ def test_controls(gate, text):
 @pytest.mark.parametrize('tool,args', [
     ('action_request', {'request': {'kind': 'approval', 'title': 'Apply update',
                                    'scope': {'markdown': 'Please restart Desktop.'}}}),
+    ('action_request', {'request': {'title': 'Apply update', 'scope': {'markdown': '⌘Q and reopen'}}}),
     ('action_request', {'request': {'title': 'Reopen Desktop'}}),
     ('kanban_create', {'human_request': {'action': 'Reopen Desktop'}}),
     ('kanban_block', {'human_request': {'action': 'Reopen Desktop'}}),

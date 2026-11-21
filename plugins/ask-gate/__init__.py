@@ -836,7 +836,7 @@ def _desktop_reopen_tool_gate(session_id: str, tool_name: str, args: dict) -> di
         req = args.get('request')
         if not isinstance(req, dict):
             return None
-        text = str(req.get('title') or '') + '\n' + json.dumps(req.get('scope') or '')
+        text = str(req.get('title') or '') + '\n' + json.dumps(req.get('scope') or '', ensure_ascii=False)
     elif tool_name in ('kanban_create', 'kanban_block') and isinstance(args.get('human_request'), dict):
         text = str(args['human_request'].get('action') or '')
     else:
