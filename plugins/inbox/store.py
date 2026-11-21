@@ -293,6 +293,13 @@ CREATE TABLE IF NOT EXISTS key_releases (
   key         TEXT PRIMARY KEY,
   released_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS handled_archives (
+  session_id TEXT PRIMARY KEY,
+  key TEXT NOT NULL,
+  poster TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK(outcome='vetoed'),
+  handled_at REAL NOT NULL
+);
 """
 # Added with card types; ALTERed into older sidecars on open (idempotent).
 _COLUMNS = (("type", "TEXT"), ("fields_json", "TEXT"), ("actions_json", "TEXT"), ("outcome", "TEXT"),
@@ -885,10 +892,15 @@ class Inbox:
         row = side.execute("SELECT unmuted_at FROM unmutes WHERE poster=? AND fix_commit IS NOT NULL", (family,)).fetchone()
         since = max(now - MUTE_WINDOW_S, float(row["unmuted_at"]) if row else 0.0)
         streak = 0
-        for r in side.execute("SELECT session_id, state, poster, outcome, ask_json FROM items WHERE created_at>=? "
+        for r in side.execute("SELECT session_id, key, state, poster, outcome, ask_json FROM items WHERE created_at>=? "
                               "ORDER BY created_at DESC, rowid DESC", (since,)):
             if policy.family(r["poster"]) != family:
                 continue
+            if r["state"] == "archived" and side.execute(
+                "SELECT 1 FROM handled_archives WHERE session_id=? AND key=? AND poster=? AND outcome='vetoed'",
+                (r["session_id"], r["key"], r["poster"]),
+            ).fetchone():
+                break  # Producer honored this typed veto; the immutable archive still belongs in strict audits.
             if r["state"] == "resolved":
                 break
             if r["state"] == "accepted" and (r["outcome"] or "") not in GENERIC_ACCEPTS:
@@ -1324,6 +1336,16 @@ class Inbox:
                 if session["archived"] and not session["hidden"]:
                     return result("skipped")
             elif item["state"] not in ("open", "accepted") or session["archived"]:
+                # A hidden typed review may define Archive as veto. Record that the producer
+                # honored it separately: never rewrite history, resolve the archived item,
+                # append a status message, release its key, or clear an explicit Junk mute.
+                if (item["state"] == "archived" and item.get("outcome") == "archived"
+                        and session["archived"] and session["hidden"] and outcome == "vetoed"
+                        and any(a.get("id") == "veto" and a.get("kind") == "prompt"
+                                for a in item_type(item)["actions"])):
+                    conn.execute("INSERT OR IGNORE INTO inbox.handled_archives VALUES (?,?,?,?,?)",
+                                 (session_id, key, poster, "vetoed", self.clock()))
+                    return dict(result("skipped"), handled_archive=True)
                 return result("skipped", "archived" if session["archived"] and
                               item["state"] in ("open", "accepted") else None)
 
