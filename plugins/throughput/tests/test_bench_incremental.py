@@ -115,6 +115,12 @@ def replay(tmp_path, incremental: bool, monkeypatch):
         if hasattr(S, "_batch_rows"):
             monkeypatch.setattr(S, "_batch_rows", lambda c, sql, width, parameters=():
                                 c.execute(sql, parameters).fetchall())
+    rows = []
+
+    class Rows(S._NoAccounting):  # the sampler's own row accounting (loop_accounting.Pass.rows): work, not time
+        def rows(self, n):
+            rows[-1] += n
+    monkeypatch.setattr(S, "accounted_pass", lambda name: Rows())
     rng = random.Random(1)
     cpu = []
     try:
@@ -125,23 +131,38 @@ def replay(tmp_path, incremental: bool, monkeypatch):
                 if n in RELOAD_TICKS:
                     smp = S.Sampler(root, store, registry=lambda: {"me": "hub", "machines": {}},
                                     clock=lambda: clock[0])
+                rows.append(0)
                 t0 = time.thread_time()
                 smp.sample_local_tokens("hub", M + 60 * n)
                 cpu.append(time.thread_time() - t0)
     finally:
         monkeypatch.undo()
         c.close()
-    return cpu  # live accounting includes initial/reload baselines
+    return cpu, rows  # live accounting includes initial/reload baselines
 
 
 def test_sample_local_tokens_replay_budget(tmp_path, monkeypatch):
-    inc = replay(tmp_path, True, monkeypatch)
-    full = replay(tmp_path, False, monkeypatch)
+    inc, inc_rows = replay(tmp_path, True, monkeypatch)
+    full, full_rows = replay(tmp_path, False, monkeypatch)
     mean_inc, mean_full = sum(inc) / len(inc), sum(full) / len(full)
     steady = sorted(inc)[len(inc) // 2]  # the median pass is incremental
-    print(f"\nsample_local_tokens: incremental mean {mean_inc * 1000:.1f} ms/tick (median {steady * 1000:.2f} ms), "
-          f"full-read mean {mean_full * 1000:.1f} ms/tick; {mean_inc / 60 * 100:.3f}% of a core "
-          f"(budget {BUDGET_CORE * 100}%), was {mean_full / 60 * 100:.3f}%")
+    steady_rows = sorted(inc_rows)[len(inc_rows) // 2]
+    mean_full_rows = sum(full_rows) / len(full_rows)
+    print(f"\nsample_local_tokens: incremental mean {mean_inc * 1000:.1f} ms/tick (median {steady * 1000:.2f} ms, "
+          f"{steady_rows} rows), full-read mean {mean_full * 1000:.1f} ms/tick ({mean_full_rows:.0f} rows); "
+          f"{mean_inc / 60 * 100:.3f}% of a core (budget {BUDGET_CORE * 100}%), was {mean_full / 60 * 100:.3f}%")
+    # Work, not time: the change-keyed pass reads O(change) rows, not O(state). Deterministic, so it always runs.
+    assert steady_rows <= mean_full_rows / 10
+    assert sum(inc_rows) <= sum(full_rows) / 3  # including the FULL_EVERY_S ceiling reads
+    # CPU time is a quiet-hardware contract (plugins/runners/INVENTORY-BUDGET.md convention): the hermes-mods
+    # pre-push gate (scripts/pre-push-suites sets HERMES_MODS_PUSH_GATE=1) runs on whichever machine pushes, at
+    # whatever load. On hermes-hub at load 30-45 (2026-11-21) origin/main itself failed the time ratio below
+    # (median incremental 23.6 ms vs full/10 22.3 ms), on a change that did not touch the sampler. Thread CPU per
+    # small operation rises on a contended host, so the timing numbers mean nothing there; the row counts above
+    # still gate the work. THROUGHPUT_BENCH_REQUIRE_TIMING=1 runs them anyway (hardware proof).
+    if os.environ.get("HERMES_MODS_PUSH_GATE") == "1" and os.environ.get("THROUGHPUT_BENCH_REQUIRE_TIMING") != "1":
+        import pytest
+        pytest.skip("CPU-time budget needs quiet hardware (pre-push gate host is not); row-count work checks passed")
     assert mean_inc / 60 <= BUDGET_CORE
     assert steady <= mean_full / 10  # the change-keyed pass is O(change), not O(state)
     assert mean_inc <= mean_full / 3  # including the FULL_EVERY_S ceiling reads
