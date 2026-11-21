@@ -475,3 +475,30 @@ def test_a_long_recompute_pass_keeps_heartbeating():
     t['now'] += feedmod.FULL_EVERY_S + 1
     f.tick()
     assert sum(1 for p in pushed if p.get('heartbeat')) >= 1, 'heartbeats went out during the pass'
+
+
+def test_a_plugin_reload_resumes_the_feed_so_clients_see_no_reset():
+    # [daveey 2026-11-21] panels flipped while the hub reloaded plugins for each new session and the feed restarted
+    # with a new epoch and no bundles.
+    old, r, pushed, t = make()
+    first = old.changes(['S1', 'S2'])
+    old.stopped.set()  # plugin unload
+    new = feedmod.Feed(r, emit=pushed.append, clock=lambda: t['now']).resume(old)
+    assert new.epoch == old.epoch and new.rev == old.rev
+    again = new.changes(['S1', 'S2'], since=first['rev'], epoch=first['epoch'])
+    assert again['reset'] is False and again['bundles'] == {}, 'the client keeps its revision chain'
+    # Carried bundles are not vouched for until recomputed; the next tick recomputes them.
+    pushed.clear()
+    t['now'] += 100  # a heartbeat is due
+    new._publish({}, heartbeat=True)
+    assert pushed and pushed[-1]['fresh'] == [], 'nothing carried is vouched for before a recompute'
+    pushed.clear()
+    r.cards['t_ccccccc3'] = detail('t_ccccccc3', 'done', session='S9')
+    new.tick()
+    assert pushed and pushed[-1]['epoch'] == first['epoch'] and pushed[-1]['prev'] == first['rev']
+    assert set(pushed[-1]['bundles']) == {'S1'} and pushed[-1]['fresh'] == ['S1', 'S2']
+    # The stopped feed emits nothing more and takes no revision.
+    rev = new.rev
+    pushed.clear()
+    old._publish({'S1': old.compute('S1')}, heartbeat=True)
+    assert pushed == [] and new.rev == rev

@@ -490,7 +490,9 @@ def feed():
     core = _load_feed()
     with core.PROCESS_LOCK:
         if core.PROCESS_FEED is None or core.PROCESS_FEED.stopped.is_set():
-            core.PROCESS_FEED = core.Feed(CoreReaders(), emit=_emit)
+            prev, core.PROCESS_FEED = core.PROCESS_FEED, core.Feed(CoreReaders(), emit=_emit)
+            if prev is not None:  # a plugin reload stopped it: carry its revisions on, so clients see no reset
+                core.PROCESS_FEED.resume(prev)
             threading.Thread(target=_run, args=(core.PROCESS_FEED,), name='session-panel-feed', daemon=True).start()
         return core.PROCESS_FEED
 

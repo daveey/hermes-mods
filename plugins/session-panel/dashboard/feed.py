@@ -110,6 +110,25 @@ class Feed:
         self._flights: dict[str, _Flight] = {}
         self._retry: set[str] = set()  # a tick joined reads that may predate its change cursor
 
+    def resume(self, prev: 'Feed') -> 'Feed':
+        """Carry a stopped feed of this process into this one, so clients see no reset.
+        [daveey 2026-11-21] "the panels keep flipping between correct and incorrect": a gateway reloads its plugins
+        for a new session whenever plugin inputs changed, which unloads this plugin and stopped the feed; the next
+        request started a new epoch with no bundles (4 resets in 15 min on the hub), and every Desktop dropped its
+        trust and re-read. The revision space, held bundles and interest carry over; every held chat is recomputed
+        before a push vouches for it again. `prev` emits nothing after this (its in-flight push finishes first)."""
+        with prev.compute_lock, prev.lock:
+            prev.stopped.set()
+            self.epoch, self.rev, self.last_emit = prev.epoch, prev.rev, prev.last_emit
+            self.bundles = dict(prev.bundles)
+            self.interest = dict(prev.interest)
+            self.failures = dict(prev.failures)
+            self._retry = set(prev._retry) | set(prev.bundles)
+            # A carried bundle never outranks a newer computation: sequence numbers continue past every held one.
+            top = max((int(b['bundle'].get('computed_seq') or 0) for b in prev.bundles.values()), default=0)
+            self._seq = itertools.count(top + 1)
+        return self
+
     # ── interest ────────────────────────────────────────────────────────────
     def watch(self, sessions: Iterable[str]) -> list[str]:
         now = self.clock()
@@ -255,6 +274,8 @@ class Feed:
     def _publish(self, computed: dict[str, dict], *, heartbeat: bool = False) -> dict[str, dict]:
         """Store what was computed and push one batch (or a heartbeat when nothing changed and one is due)."""
         with self.compute_lock:
+            if self.stopped.is_set():
+                return {}  # stopped (and possibly resumed by a successor): its revision space is no longer ours
             prev = self.rev
             with self.lock:
                 for s, b in computed.items():
