@@ -52,7 +52,7 @@ def _schedule(tid, **extra):
     wake = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 72 * 3600))
     out = json.loads(kt._handle_schedule({
         "task_id": tid, "reason": f"SCHEDULED_UNTIL={wake} re-check the deploy", "clock_only": True,
-        "awaiting": {"kind": "clock", "ref": "deploy soak"}, **extra}))
+        "awaiting": {"kind": "clock", "why": "deployment release slot opens"}, **extra}))
     assert out.get("status") == "scheduled", out
     return out
 
@@ -71,7 +71,7 @@ def _fill(gate, kb, n):
 def test_watch_park_is_not_open_work_but_stays_listed(gate, board, monkeypatch):
     n = gate.core.LINKED_CAP + 2  # past the cap, so more_open is printed
     opens = _fill(gate, board, n)
-    watch = _card(board, "re-check the deploy after the soak", 5000.0)  # newest: ranks first if counted open
+    watch = _card(board, "re-check the deploy at the release slot", 5000.0)  # newest: ranks first if counted open
     assert _schedule(watch, watch=True).get("watch") is True
     core_open = _core_open(board, monkeypatch)
     assert core_open == set(opens), "core leaves the watch park out of the chat's open cards"
@@ -100,7 +100,7 @@ def test_watch_park_with_human_request_is_never_pinned(gate, board, monkeypatch)
     chat-tasks (review 5893091490)."""
     n = gate.core.LINKED_CAP + 2
     opens = _fill(gate, board, n)
-    watch = _card(board, "re-check the deploy after the soak", 500.0)  # oldest: outside any recency window
+    watch = _card(board, "re-check the deploy at the release slot", 500.0)  # oldest: outside any recency window
     assert _schedule(watch, watch=True).get("watch") is True
     db = board.kanban_db_path()
     hr = {"action": "Approve the deploy in this chat. Unblock = ship; archive = drop.", "why_human": "approval",
