@@ -249,10 +249,11 @@ app adds a `Proof` check run to every PR head, concluded SKIPPED ("Proof is set 
 when asked"). It is an AI demo, not CI evidence, and each run costs money, so the state
 preflight (`on_demand_proof_skip` in `guard.py`; it is the only rollup evaluation for a state
 merge, and the update-branch carry and land-turn reads take their checks from that same
-preflight) ignores it. It counts only when it is a `CheckRun` named `Proof`, COMPLETED and
+preflight) ignores it. It is ignored only when it is a `CheckRun` named `Proof`, COMPLETED and
 SKIPPED, has no `workflowName`, and its `detailsUrl` is `https` on `blacksmith.sh` or a
 subdomain. Proof with any other conclusion or status, another app's skipped check, or a
-look-alike host still refuses. At least one other check must exist and be green. The
+look-alike host still refuses; so does a `detailsUrl` with userinfo, a backslash,
+whitespace/control characters or a non-string value. At least one other check must exist and be green. The
 upstream-sync route and main ship are unchanged. Tests: `tests_proof_skip.py`.
 
 **Why a carry needs no confirm review on the new head.** A carry does not ask

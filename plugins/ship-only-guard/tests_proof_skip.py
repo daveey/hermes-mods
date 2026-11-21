@@ -115,3 +115,28 @@ def test_proof_subdomain_and_apex_hosts_accepted():
 def test_failure_message_counts_proof_with_total(monkeypatch):
     got = run_all(monkeypatch, [ok(), proof(), {**ok("t"), "conclusion": "FAILURE"}])
     assert "1 of 3 checks not green: t=FAILURE" in got["argv"]
+
+
+@pytest.mark.parametrize("bad", [
+    proof(status="IN_PROGRESS"), proof(status="QUEUED"), proof(status=None),
+    proof(detailsUrl="https://u:p@blacksmith.sh/"),
+    proof(detailsUrl="https://evil.com\\.blacksmith.sh/"),
+    proof(detailsUrl="https://blacksmith.sh/ x"),
+    proof(detailsUrl="https://blacksmith.sh/\tx"),
+    proof(detailsUrl="https://blacksmith.sh/\nx"),
+    proof(detailsUrl=1), proof(detailsUrl=["https://blacksmith.sh/"]),
+    proof(detailsUrl="https://[blacksmith.sh/"),
+])
+def test_predicate_pins_status_url_hardening_and_bad_types(bad):
+    assert not g.on_demand_proof_skip(bad)
+
+
+@pytest.mark.parametrize("bad", [
+    proof(status="IN_PROGRESS"), proof(detailsUrl=1), proof(detailsUrl="https://[blacksmith.sh/"),
+    proof(detailsUrl="https://evil.com\\.blacksmith.sh/"), proof(detailsUrl="https://blacksmith.sh/ x"),
+])
+def test_status_url_hardening_refuse_every_path(monkeypatch, bad):
+    got = run_all(monkeypatch, [ok(), bad])
+    assert got["argv"] and "checks not green" in got["argv"]
+    assert got["shell"] and "checks not green" in got["shell"]
+    assert got["cli"] == 1 and got["hook"]["action"] == "block"
