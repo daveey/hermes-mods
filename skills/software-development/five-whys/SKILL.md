@@ -289,6 +289,8 @@ When fixtures depend on event chronology or expiry, read `references/clock-fixtu
   since the incident and search open cards on every board for the same symptom: another session reading the same
   logs often lands the fix first. If one did, run your tests against its commit instead of pushing a second fix.
 
+For native recovery proofs, distinguish stdio `tui_gateway.entry` from the web backend: the web lifespan starts the startup-resume sweep; a stdio process restart alone does not exercise it. Test supported `session.resume` on the original stored ID for client-reconnect coverage and report that separately from automatic boot recovery. Internal handler parameters may be refused by the external RPC schema. Decode `record_json` before counting child promises/attempts, and verify a preassigned delegation ID actually has a ledger row: capacity fallback can retain the ID without successful async admission.
+
 When testing asynchronous lifecycle behavior, read `references/async-lifecycle-test-pitfalls.md` (startup cancellation, bootstrap, React, starvation, downloads, dispatch and negative assertions).
 
 When attributing CPU or worker activity, read `references/resource-observability-pitfalls.md` (macOS thread accounting and worker identity independent of retained task rows).
