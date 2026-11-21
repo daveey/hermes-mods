@@ -16,12 +16,14 @@ class Pool:
         self.index = 0
         self.accounts = [NS(id='a', label='first'), NS(id='b', label='second')]
         self.rotated = []
+        self.selected_models = []
 
     def entries(self):
         return self.accounts
 
     def select(self, *, model=None):
         assert model == 'claude-test'
+        self.selected_models.append(model)
         return self.accounts[self.index]
 
     def mark_exhausted_and_rotate(self, **kw):
@@ -151,6 +153,9 @@ def test_quota_before_first_event_rotates(endpoint):
     assert [c[0] for c in endpoint.calls] == ['a', 'b']
     assert len(endpoint.pool.rotated) == 1
     assert all(s.closed for s in endpoint.streams)
+    # Selection and the quota bench are scoped to the request's model, never the whole account.
+    assert endpoint.pool.selected_models and set(endpoint.pool.selected_models) == {endpoint.calls[0][1]['model']}
+    assert endpoint.pool.rotated[0]['model'] == endpoint.calls[0][1]['model']
 
 
 @pytest.mark.parametrize('error', [pl.UpstreamError(429, 'quota'), ValueError('broken event')])

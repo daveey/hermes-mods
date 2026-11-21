@@ -246,7 +246,9 @@ def anthropic_messages(body: dict, *, pool=None, route: Optional[dict] = None) -
         resp = anthropic_client(entry).messages.create(**wire_body)
         return restore_tool_names(resp.model_dump(exclude_none=True), names)
 
-    return with_rotation(call, pool)
+    # Scope selection to the requested model: an unscoped select treats ANY model's cooldown as blocking, so one
+    # benched model (e.g. a weekly Fable cap on every account) made the whole pool look exhausted for Haiku/Sonnet.
+    return with_rotation(call, pool, model=body.get("model"))
 
 
 def codex_responses(body: dict, *, pool=None, route: Optional[dict] = None) -> dict:
@@ -260,7 +262,7 @@ def codex_responses(body: dict, *, pool=None, route: Optional[dict] = None) -> d
             final = stream.get_final_response()
         return final.model_dump(exclude_none=True)
 
-    return with_rotation(call, pool)
+    return with_rotation(call, pool, model=body.get("model"))
 
 
 def _chat_to_anthropic(messages: list, max_tokens: int, model: str) -> dict:
