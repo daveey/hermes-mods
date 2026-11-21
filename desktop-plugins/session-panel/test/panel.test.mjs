@@ -31,6 +31,31 @@ after(async () => {
   dom.window.close()
 })
 
+test('source failures are footer diagnostics, not waiting cards', async () => {
+  const chip = { key: 'unavailable-lineage', kind: 'kanban-status', title: 'Session lineage unavailable' }
+  const sorted = m.classify([chip])
+  assert.equal(sorted.waiting.length, 0)
+  assert.equal(sorted.sources.length, 1)
+  assert.equal(m.hasOpenWork(sorted), true)
+  host.state.focusedStoredSessionId.value = 'source-failure-chat'
+  window.localStorage.removeItem('hermes.sessionPanel.collapsed.v1')
+  window.__userSteps = { openAskCount: () => 0 }
+  window.__sessionTasks = { snapshot: { stored: 'source-failure-chat', chips: [chip] } }
+  await show(J.jsx(m.Panel, {}))
+  assert.match(el().querySelector('[data-source-unavailable]').textContent, /Session lineage unavailable/)
+  assert.equal(el().querySelector('[data-waiting-line]'), null)
+  assert.doesNotMatch(el().textContent, /1 waiting/)
+  host.state.focusedStoredSessionId.value = 'S1'
+})
+
+test('WaitLine pip reflects its own card rather than a container default', async () => {
+  for (const [state, expected] of [['ready', 'ready'], ['todo', 'queued'], ['running', 'running'], ['blocked', 'waiting']]) {
+    const chip = { key: `own-${state}`, id: `own-${state}`, kind: 'kanban', state, waitingOn: 'external service' }
+    await show(J.jsx(m.WaitLine, { i: { key: chip.key, label: state, kind: 'kanban', chip } }))
+    assert.equal(el().querySelector('[data-line-pip]').getAttribute('data-line-pip'), expected)
+  }
+})
+
 test('person dependency is linked and visible even without card work or with panel collapsed', async () => {
   host.state.focusedStoredSessionId.value = 'person-chat'
   window.localStorage.setItem('hermes.sessionPanel.collapsed.v1', '[]')
@@ -843,7 +868,8 @@ test('panel: one-line rows carry their box (yellow waiting, the hub "H"); a bloc
   const hub = folded.querySelector('[data-waiting-line="kb:t_h"] [data-line-pip]')
   assert.equal(hub.hasAttribute('data-line-pip-hub'), true)
   assert.equal(hub.textContent, 'H')
-  assert.equal(folded.querySelector('[data-waiting-line="kb:t_bu"] [data-line-pip]').getAttribute('data-line-pip'), 'waiting')
+  // The dependency reason stays separate; the todo card's own box is queued.
+  assert.equal(folded.querySelector('[data-waiting-line="kb:t_bu"] [data-line-pip]').getAttribute('data-line-pip'), 'queued')
 })
 
 test('panel: chains cross chats: each card names the chat that owns it (opens it), ending on the leaf', async () => {

@@ -284,7 +284,7 @@ export function chipAsOf(c, nowMs = Date.now()) {
 }
 export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsked = () => false, presentationFor = () => null, evidence = () => null, info = cardInfo } = {}) {
   const now = nowMs / 1000
-  const out = { active: [], stuck: [], blockedUpstream: [], waiting: [], ready: [], queued: [], unasked: [], reported: [], lastActivity: 0 }
+  const out = { active: [], stuck: [], blockedUpstream: [], waiting: [], ready: [], queued: [], unasked: [], reported: [], sources: [], lastActivity: 0 }
   const seen = at => { if (Number(at) > out.lastActivity) out.lastActivity = Number(at) }
   for (const c of chips || []) {
     if (!c || !c.key) continue
@@ -297,7 +297,7 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
       continue
     }
     if (c.kind === 'machine') { out.active.push({ ...item(c), detail: 'rented machine' }); continue }
-    if (c.kind === 'kanban-status') { out.waiting.push({ ...item(c), detail: str(c.title) || 'status unknown' }); continue }
+    if (c.kind === 'kanban-status') { out.sources.push({ ...item(c), detail: str(c.title) || 'status unknown' }); continue }
     if (c.kind !== 'kanban') continue
     seen(c.activityAt)
     // Progress = the newest event, else the current run's start (session-tasks `progressAt`); 0 = unknown. Only a
@@ -732,7 +732,7 @@ export function waitKind(i) {
  *  step or an agent issue. Done/archived cards never count as open work; history has its own disclosure. */
 export function hasOpenWork(sorted, { asks = 0, steps = [], issues = [] } = {}) {
   const open = list => (list || []).some(i => !(i.kind === 'kanban' && TERMINAL.has(str(i.chip?.state))))
-  return !!(asks || sorted.unasked.length || open(sorted.active) || open(sorted.stuck) || open(sorted.blockedUpstream) || open(sorted.waiting) || open(sorted.ready) || open(sorted.queued) || (sorted.reported || []).length ||
+  return !!(asks || (sorted.sources || []).length || sorted.unasked.length || open(sorted.active) || open(sorted.stuck) || open(sorted.blockedUpstream) || open(sorted.waiting) || open(sorted.ready) || open(sorted.queued) || (sorted.reported || []).length ||
     (Array.isArray(steps) && steps.some(s => s?.id && (s.status || 'open') === 'open')) || (Array.isArray(issues) && issues.length))
 }
 
@@ -1876,6 +1876,7 @@ const STATE_BOX = { running: 'running', review: 'waiting', ready: 'ready', todo:
 
 /** One line per waiting card for the folded and collapsed views: box · title · ● root cause · detail · via N cards · age. */
 export function WaitLine({ i, now = Date.now(), k = 'waiting', local = new Map() }) {
+  k = STATE_BOX[i.chip?.state] || k
   const ch = chainFor(i, now, { local })
   const L = LEAF[ch.leaf.kind] || LEAF.unknown
   const age = rowWait(i, now, needsPark(i) ? parkFor(i.chip, now) : null).age
@@ -2629,6 +2630,7 @@ export function Panel() {
       jsx(Pips, { n, hub: hubCounts(sorted) }),
       summaryParts.length > 0 && jsx('span', { 'data-status-summary': '', ...(collapsed ? { 'data-collapsed-summary': '' } : {}), className: 'min-w-0 truncate', children: summaryParts.flatMap((p, idx) => [idx > 0 && ' · ', jsx('span', { style: p.k === 'needsYou' || p.k === 'stuck' ? { color: C[p.k], fontWeight: 600 } : undefined, children: p.text }, p.k)].filter(Boolean)) })
     ] }) }),
+    sorted.sources.length > 0 && jsx('div', { 'data-source-unavailable': '', style: { ...muted, padding: '2px 12px' }, children: `Source status: ${sorted.sources.map(i => i.detail).join('; ')}. Work may be missing from this panel.` }),
     // Collapsed, a bare "2 waiting" left the user asking "on what?": keep one short line per waiting card.
     collapsed && lineRows.length > 0 && jsxs('div', { 'data-collapsed-waiting': '', style: { padding: '0 12px 2px 30px', minWidth: 0 }, children: [
       ...lineRows.slice(0, WAIT_LINES_COLLAPSED).map(i => jsx(WaitLine, { i, now, local }, i.key)),
