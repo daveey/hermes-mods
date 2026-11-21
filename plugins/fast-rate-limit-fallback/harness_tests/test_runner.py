@@ -124,8 +124,10 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((home / 'plugins/fast-rate-limit-fallback/plugin.yaml').read_text(), 'owned source')
 
     def test_real_child_failure_cleanup(self):
-        # Execute the actual worker. This minimal core intentionally lacks
-        # bootstrap; the child fails before pytest and the parent still reaps it.
+        # Execute the actual worker. This minimal core's bootstrap refuses, so the child fails before pytest
+        # and the parent still reaps it. Without that file an interpreter that has core installed (core's own
+        # venv, as CI and the hub use) imported the real bootstrap and ran a nested pytest in the shared home.
+        (self.repo / 'hermes_bootstrap.py').write_text("raise SystemExit('fixture core: no bootstrap')\n")
         with patch.object(runner.tempfile, 'tempdir', str(self.root)), patch.object(runner, 'INSTALLED', self.repo):
             self.assertNotEqual(runner.main(['--repo', str(self.repo)]), 0)
         self.assert_clean()
