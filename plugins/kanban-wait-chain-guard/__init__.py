@@ -187,8 +187,9 @@ def _time_park(conn, cards, now):
         if wake:
             iso = _iso(wake)
             return (f" {c['id']} wakes at {iso} (scheduled on a clock). If nothing here can run before then, park "
-                    f"this card on that clock instead: kanban_block(kind='time', reason='SCHEDULED_UNTIL={iso} — …') "
-                    f"or kanban_schedule; if lifting the gate is David's call, kanban_block(kind='needs_input', "
+                    f"this card on that clock instead: kanban_block(kind='time', reason='SCHEDULED_UNTIL={iso} — …', "
+                    f"awaiting={{kind:'card', ref:'{c['id']}', why:'it wakes at {iso}'}}) or kanban_schedule with the same "
+                    f"awaiting; if lifting the gate is David's call, kanban_block(kind='needs_input', "
                     f"human_request=…). A dependency park behind it is not an ending")
     return ''
 
