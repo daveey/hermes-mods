@@ -228,6 +228,7 @@ Countermeasures:
 For a chain going into a new card's body, check the draft before `kanban_create`: a worker claims the card within minutes, so a fix round after filing needs a body edit plus a steer its live run actually receives.
 
 ## Done means
+- [ ] For `backend-timeouts`, did the unchanged detector show `count: 0` over a full fresh 30-minute production window starting after final serving-process activation, with failed cold-call evidence (including over-budget 17-second calls) preserved and operational acceptance kept separate from historical causal attribution, rather than treating fast individual calls or a recovered reboot as proof?
 - [ ] For CPU-starvation reproduction, did you enumerate descendants through every task/thread child list and apply the SIGSTOP/SIGCONT duty cycle to detached canonical test workers as well as their launcher, rather than only the launcher process group?
 - [ ] For a fixture-teardown race, did the test join the producer thread before asserting cleanup or restoring mocks, rather than treating file publication as completion (it can precede pending-row deletion)?
 - [ ] For a 'forwarder has not reported' card, did you first compare `hosts.json` reach values across hosts and check whether synced `selfheal-config.json` gives several hosts the same reach, causing the hub to probe the wrong machine?
