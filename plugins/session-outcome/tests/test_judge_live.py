@@ -78,7 +78,26 @@ REVIEW_ANSWER = (
     "explicit owner instructions, and the post-change evidence is too young to justify reverting.**\n\n"
     "No revert performed, and I have not recorded a user `keep` decision on your behalf.")
 
+# A monitoring close-out mentioned red CI owned by another worker and its creator.
+# The old prompt alternated NO/YES/NO on the unchanged real reply: its unconditional
+# "still broken" rule conflicted with independently owned work being complete here.
+MONITOR_REQUEST = "Find cards waiting on CI, monitor them here, check CI and fix if needed."
+MONITOR_CLOSED = (
+    "None of the CI waits I was watching is still open. Every card has been picked up again or settled.\n"
+    "- Port test t_101: CI passed and its worker resumed.\n"
+    "- Validator t_102: CI is red. Its worker fixed two test groups locally, not pushed yet. "
+    "The card is parked waiting for its creator to decide how to fix the validator; CI, landing and deploy "
+    "remain with that worker card.\n"
+    "- Obsolete rule t_103: I verified main retired the rule, closed the obsolete PR, and archived the card.")
+
 CASES = [
+    (MONITOR_REQUEST, MONITOR_CLOSED, "YES"),
+    (MONITOR_REQUEST, "CI is still running on t_101. I'm watching it here.", "NO"),
+    (MONITOR_REQUEST, "All watched waits ended. Validator t_102 is red; I'll fix it and report back.", "NO"),
+    (MONITOR_REQUEST, "All watched waits ended. Validator CI is still red and nobody owns its repair.", "NO"),
+    (MONITOR_REQUEST, "All watched waits ended. Validator t_102 is red: which repair should I apply?", "NO"),
+    (MONITOR_REQUEST, "All watched waits ended. Validator t_102 is parked waiting for you, its creator, "
+     "to decide. Please choose the repair before we can finish.", "NO"),
     (POSTED_REQUEST, POSTED_ANSWER, "YES"),
     ("", POSTED_ANSWER, "YES"),
     (REVIEW_REQUEST, REVIEW_ANSWER, "YES"),
