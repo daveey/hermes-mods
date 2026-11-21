@@ -188,6 +188,7 @@ class Supervisor:
         self.last_end = 0.
         self.source_paths = None
         self.fallback = Fallback()
+        self.cursor_read = None  # (exact process, shared in-flight control future)
         threading.Thread(target=self._run, name='lanes-projector-supervisor', daemon=True).start()
 
     def acquire(self):
@@ -230,12 +231,29 @@ class Supervisor:
     def cursor(self):
         with self.cv:
             process = self.process
-        if process is None or process.closed:
-            return None
+            if process is None or process.closed:
+                return None  # unavailable, not an observed revision
+            leader = self.cursor_read is None or self.cursor_read[0] is not process
+            if leader:
+                future = concurrent.futures.Future()
+                self.cursor_read = process, future
+            else:
+                future = self.cursor_read[1]
+        if leader:
+            try:
+                value = process.request({'op': 'observation_cursor'}, .75)
+            except Exception:
+                value = None
+            future.set_result(value)
+            with self.cv:
+                if self.cursor_read == (process, future):
+                    self.cursor_read = None
         try:
-            return process.request({'op': 'observation_cursor'}, .75)
-        except Unavailable:
+            value = future.result(.8)
+        except concurrent.futures.TimeoutError:
             return None
+        with self.cv:
+            return value if self.process is process and not process.closed else None
 
     def _configuration(self):
         from hermes_cli import kanban_db_sync as sync, kanban_worker_node as wn

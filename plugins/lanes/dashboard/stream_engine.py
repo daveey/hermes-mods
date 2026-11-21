@@ -22,6 +22,7 @@ async def run(api, ws, params, debug):
     pending = None
     current_task = None
     last_end = 0.
+    observed_child = None
 
     async def receive():
         nonlocal params, pending
@@ -68,15 +69,25 @@ async def run(api, ws, params, debug):
                 if not api._identity.matches(api._loaded_identity):
                     raise RuntimeError('fallback identity moved')
                 return {'view': view, 'mode': 'fallback', 'projector_pid': None,
+                        'revision': [gen, api._rpc_client.rpc.digest(rev)],
                         'timing': {'project_start': started, 'project_end': time.time()}}
             future = api._compat_fallback.submit((key, api._rpc_client.rpc.digest(rev)), compute)
             result = await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(future)), 3)
-        return key, rev, timing, result
+        revision = result['revision']
+        if revision != [gen, api._rpc_client.rpc.digest(rev)]:
+            # A shared queued future may follow a newer revision. Its view has
+            # that provenance, not this waiter's superseded detection timestamps.
+            timing = {}
+        return key, revision, timing, result
 
     def source_cursor():
+        nonlocal observed_child
         source = api.change_cursor()
         child = supervisor.cursor() if supervisor else None
-        return [source, child] if supervisor else source
+        if child is not None:
+            observed_child = child
+        # A refused/timed-out read is absence of evidence, not a dirty revision.
+        return [source, observed_child] if supervisor else source
 
     async def poll():
         nonlocal cursor, generation, pending
@@ -118,7 +129,8 @@ async def run(api, ws, params, debug):
                             frame['timing'] = {**timing, **result['timing']}
                             frame['load'] = {'pid': api.os.getpid(), 'stream_viewers': api._active_streams}
                             frame['projector'] = {'mode': result['mode'], 'projector_pid': result['projector_pid'],
-                                                  'source_current': revision == cursor}
+                                                  'revision': revision,
+                                                  'source_current': revision == [api._generation, api._rpc_client.rpc.digest(cursor)]}
                         enqueue(frame)
                         last_hash = digest
             if pending is not None and current_task is None and time.monotonic() - last_end >= api.MIN_PROJECT_GAP_S:
