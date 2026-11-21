@@ -17,6 +17,8 @@ lane holds the cards agents file for themselves until they are admitted.
 
 Everything goes through `hermes kanban lanes`. Never edit card priorities or `config.yaml` by hand for this.
 
+On a pool worker, the local CLI write fence may refuse even `lanes assign`. Use the supported `hub-admin 'hermes kanban lanes assign <card> <lane> --reason "..."'` route when hub-write access is installed, then read back with `hub-admin 'hermes kanban lanes explain <card>'`. Do not unset worker identity or mutate the board with raw SQL to bypass the fence.
+
 ## Read the state first
 
 ```sh
@@ -33,7 +35,7 @@ lane (typically chat-filed cards); fix classification, not shares, and `reclassi
 
 A lane under its target with `ready: 0` is short of cards, not slots. Say that; changing shares will not help it.
 
-For lane-accounting repairs, distinguish scopes: `show` uses the fleet replica when available, while `unclassified` and `reclassify` read the current owning board. Audit the fleet's open `other` rows, then run supported dry-run/apply on each owning board; never write the fleet replica. Read back each changed card's actual tenant after synchronization: an empty repeat dry-run or a `lane_assigned` event alone does not establish that the tenant persisted. Preserve containment and custody if a protected row reverts. The run-hour report joins runs to each card's current tenant; open-card repair intentionally leaves terminal historical cards unchanged, so quantify their residual run-hours rather than promising an immediate historical drain.
+For lane-accounting repairs, distinguish scopes: `show` uses the fleet replica when available, while `unclassified` and `reclassify` read the current owning board. Audit the fleet's open `other` rows, then run supported dry-run/apply on each owning board; never write the fleet replica. Read back each changed card's actual tenant after synchronization: an empty repeat dry-run or a `lane_assigned` event alone does not establish that the tenant persisted. Preserve containment and custody if a protected row reverts. A successful `lanes assign` message can accompany a `lane_assigned` event while a protected contained triage row retains its old tenant: verify the persisted tenant, record the unsuccessful move separately, and never release containment or repeatedly reassign it to make a migration count look complete. Resume a timed-out multi-card apply from per-card readbacks, skipping terminal/already-moved cards; persist receipts on disk before aggregating. The run-hour report joins runs to each card's current tenant; open-card repair intentionally leaves terminal historical cards unchanged, so quantify their residual run-hours rather than promising an immediate historical drain.
 
 For a semantic-classifier live proof after deployment, use a fresh hidden scratch chat with no explicit lane, parents, skills or deterministic rule metadata; an older worker process still imports its pre-deploy classifier. Read back `lanes explain` for `source=classified`, archive the exact unclaimed fixture immediately, delete the scratch chat, and independently verify both cleanups. A direct helper replay proves model routing, not the chat-create transaction path.
 
