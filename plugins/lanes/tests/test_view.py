@@ -14,6 +14,7 @@ def load():
 
 def test_lane_view_counts_and_conservation(monkeypatch):
     api = load()
+    monkeypatch.setattr(api, 'core', lambda: None)  # exercise the older-core projection seam
     cards = [dict(id=f't_{i}', lane='work', step=step, reason=reason, age_h=2,
                   source={'kind': 'user'}) for i, (step, reason) in enumerate([
                       ('running', 'run'), ('waiting', 'you'), ('ready', 'slot'), ('waiting', 'dep')])]

@@ -1,0 +1,106 @@
+"""Strip, Floor and Flow read the same fresh local/fleet source set."""
+import contextlib
+import json
+import time
+import threading
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+import test_pr_projection as fixtures
+
+board = fixtures.board
+
+
+def test_owner_status_push_does_not_wait_for_replica(board, tmp_path, monkeypatch):
+    sources = pytest.importorskip('hermes_cli.kanban_lanes_sources')
+    from hermes_cli import kanban_db_sync as sync, kanban_db_connect as kbc, kanban_lanes_cli as cli
+    api, connect, _calls = board
+    fleet_path = tmp_path / 'fleet.db'
+    with contextlib.closing(kbc.connect(fleet_path)) as fleet:
+        sync.apply_sync_schema_steps(fleet)
+        fleet.execute("INSERT INTO tasks(id,title,status,created_at,tenant,sync_version) VALUES('t_pr','old','ready',100,'work',1)")
+    with connect() as conn:
+        sync.apply_sync_schema_steps(conn)
+        conn.execute("UPDATE tasks SET status='running',sync_version=1 WHERE id='t_pr'")
+        conn.execute("INSERT INTO tasks(id,title,status,created_at,tenant) VALUES('unrelated','fixture','archived',100,'work')")
+        conn.execute('BEGIN')
+        conn.executemany("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('t_pr','heartbeat','{}',100)",
+                         [()] * 40000)
+        conn.commit()
+    monkeypatch.setattr(sync, 'board_mode', lambda c: 'primary')
+    monkeypatch.setattr(cli, '_fleet', lambda *a, **kw: kbc.connect(fleet_path))
+    monkeypatch.setattr(api, '_ws_upgrade_authorized', lambda ws: True)
+    # Deliberately equal revision with a lagging status: local owns equal rows.
+    view = api.lane_view(6, '6h', True)
+    assert view['totals']['running'] == 1, view
+    assert view['totals']['open'] == view['flow']['graphs']['project']['total'] == 1
+    assert [c['count'] for c in view['floor']['cells'] if c['step'] == 'running'] == [1]
+    assert sources is not None
+    app = FastAPI()
+    app.include_router(api.router)
+    stop = threading.Event()
+    def churn():
+        with connect() as conn:
+            while not stop.is_set():
+                conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('unrelated','heartbeat','{}',100)")
+                stop.wait(.05)
+    writer = threading.Thread(target=churn)
+    with TestClient(app) as client, contextlib.ExitStack() as sockets:
+        viewers = [sockets.enter_context(client.websocket_connect('/v1/lanes/stream?expanded=true')) for _ in range(3)]
+        for ws in viewers:
+            assert ws.receive_json()['view']['totals']['running'] == 1
+        start = time.monotonic()
+        writer.start()
+        try:
+            with connect() as conn:
+                conn.execute("UPDATE tasks SET status='scheduled' WHERE id='t_pr'")
+                conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('t_pr','scheduled','{}',100)")
+            for ws in viewers:
+                frame = ws.receive_json()
+                assert time.monotonic() - start < 3
+                assert frame['view']['totals']['running'] == 0
+                assert frame['view']['totals']['open'] == frame['view']['flow']['graphs']['project']['total'] == 1
+            start = time.monotonic()
+            with connect() as conn:
+                conn.execute("UPDATE tasks SET status='archived' WHERE id='t_pr'")
+                conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('t_pr','archived','{}',100)")
+            for ws in viewers:
+                frame = ws.receive_json()
+                assert time.monotonic() - start < 3
+                assert frame['view']['totals']['open'] == frame['view']['flow']['graphs']['project']['total'] == 0
+        finally:
+            stop.set()
+            writer.join(3)
+            assert not writer.is_alive()
+    # We never changed the replica, even to simulate convergence.
+    with contextlib.closing(kbc.connect(fleet_path)) as fleet:
+        assert fleet.execute("SELECT status FROM tasks WHERE id='t_pr'").fetchone()[0] == 'ready'
+
+
+def test_context_identity_changes_with_selected_database(board, tmp_path):
+    sources = pytest.importorskip('hermes_cli.kanban_lanes_sources')
+    from hermes_cli import kanban_db_connect as kbc, kanban_db_sync as sync, kanban_lanes_flow as flow
+    api, connect, _calls = board
+    with connect() as local, contextlib.closing(kbc.connect(tmp_path / 'fleet.db')) as fleet:
+        for db in (local, fleet):
+            sync.apply_sync_schema_steps(db)
+        fleet.execute("INSERT INTO tasks(id,title,status,created_at,tenant,completion_contract,sync_version) VALUES('t_pr','old','ready',100,'work',?,2)", (fixtures.URL,))
+        fleet.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('t_pr','created','{}',100)")
+        local.execute("UPDATE tasks SET status='ready',completion_contract=?,sync_version=1 WHERE id='t_pr'", (fixtures.URL,))
+        first = api._pr_contexts(fleet, flow, evidence=sources.Sources(local, fleet))
+        local.execute("UPDATE tasks SET sync_version=3 WHERE id='t_pr'")
+        second = api._pr_contexts(fleet, flow, evidence=sources.Sources(local, fleet))
+        assert first[fixtures.URL] != second[fixtures.URL]
+
+
+def test_failed_flow_keeps_fresh_strip(board, monkeypatch):
+    pytest.importorskip('hermes_cli.kanban_lanes_sources')
+    from hermes_cli import kanban_lanes_flow as flow
+    api, _connect, _calls = board
+    def broken(*a, **kw):
+        raise RuntimeError('fixture flow failure')
+    monkeypatch.setattr(flow, 'snapshot', broken)
+    view = api.lane_view(6, '6h', True)
+    assert view['configured'] and view['totals']['open'] == 1
+    assert 'fixture flow failure' in view['flow_error']
