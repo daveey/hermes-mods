@@ -98,6 +98,40 @@ def test_continuous_churn_bounds_projection_duty_and_preserves_latest(monkeypatc
             assert time.monotonic() - changed < .6
 
 
+def test_debug_viewer_census_includes_plain_clients_and_releases_on_disconnect(monkeypatch):
+    import os
+    api = load()
+    state = {'status': 'a', 'cursor': 0}
+    with TestClient(stream_app(api, monkeypatch, state)) as client:
+        with client.websocket_connect('/v1/lanes/stream') as plain:
+            assert 'load' not in plain.receive_json()
+            with client.websocket_connect('/v1/lanes/stream?debug=true') as debug:
+                assert debug.receive_json()['load'] == {'pid': os.getpid(), 'stream_viewers': 2}
+            # A new debug frame after the second context closes must see only
+            # itself and the original plain viewer, not the disconnected one.
+            with client.websocket_connect('/v1/lanes/stream?debug=true') as debug:
+                assert debug.receive_json()['load']['stream_viewers'] == 2
+        with client.websocket_connect('/v1/lanes/stream?debug=true') as debug:
+            assert debug.receive_json()['load']['stream_viewers'] == 1
+    assert api._active_streams == 0
+
+
+def test_debug_viewer_census_releases_on_projection_error(monkeypatch):
+    api = load()
+    state = {'status': 'a', 'cursor': 0}
+    app = stream_app(api, monkeypatch, state)
+    def broken(*args):
+        raise RuntimeError('controlled projection failure')
+    monkeypatch.setattr(api, 'lane_view', broken)
+    from starlette.websockets import WebSocketDisconnect
+    import pytest
+    with TestClient(app) as client:
+        with client.websocket_connect('/v1/lanes/stream?debug=true') as ws:
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_json()
+    assert api._active_streams == 0
+
+
 def test_debug_frames_carry_ordered_server_stage_timings_only_on_request(monkeypatch):
     api = load()
     state = {'status': 'a', 'cursor': 0}

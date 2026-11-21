@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import threading
 import time
 from functools import lru_cache
@@ -348,6 +349,7 @@ WATCH_S = 0.25  # change-cursor poll; a change is projected on the first tick th
 MIN_PROJECT_GAP_S = 1.0  # idle time between projections under sustained source churn
 HEARTBEAT_S = 30.0
 _seen_cursor = None
+_active_streams = 0  # accepted viewers in this backend process, including non-debug clients
 
 
 def _refresh_cursor(cursor):
@@ -407,6 +409,7 @@ def change_cursor():
 
 @router.websocket('/v1/lanes/stream')
 async def stream_lanes(ws: WebSocket):
+    global _active_streams
     import hashlib
     import json
     if not _ws_upgrade_authorized(ws):
@@ -438,8 +441,10 @@ async def stream_lanes(ws: WebSocket):
             if debug:
                 # Wall-clock epoch seconds per stage, for this change only; never part of the view digest.
                 frame['timing'] = {**(timing or {}), 'project_start': started, 'project_end': finished, 'sent': time.time()}
+                frame['load'] = {'pid': os.getpid(), 'stream_viewers': _active_streams}
             await ws.send_json(frame)
             last_hash = digest
+    _active_streams += 1
     try:
         cursor = await asyncio.to_thread(change_cursor)
         _refresh_cursor(cursor)
@@ -490,3 +495,5 @@ async def stream_lanes(ws: WebSocket):
             await ws.close(code=1011)
         except (RuntimeError, WebSocketDisconnect):
             pass
+    finally:
+        _active_streams -= 1
