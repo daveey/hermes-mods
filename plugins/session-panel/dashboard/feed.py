@@ -43,6 +43,8 @@ QUIET_FULL_EVERY_S = 300.0   # one with none (it changes only through card event
 HEARTBEAT_S = 20.0           # with nothing to push, a heartbeat at least this often (clients' liveness)
 INTEREST_TTL_S = 15 * 60.0   # a chat nobody re-registers stops being computed
 MAX_WATCHED = 200            # interest cap across all clients
+SNAPSHOT_VERSION = 1         # the on-disk shape of Feed.snapshot()
+RESTORE_REV_GAP = 1_000_000  # a restored feed's revisions start this far past the snapshot's (see Feed.restore)
 CHAIN_DEPTH = 6              # hops per chain (session-panel walks at most six cards)
 CHAIN_CARDS = 80             # cards per bundle
 TERMINAL = {'done', 'archived', 'cancelled'}
@@ -291,6 +293,47 @@ class Feed:
                         if self._flights.get(s) is flight:
                             self._flights.pop(s)
                         flight.ready.set()
+
+    # ── across processes ────────────────────────────────────────────────────
+    def snapshot(self) -> dict:
+        """What a later process of this gateway needs to carry this feed on (Feed.restore): the revision space, the
+        held bundles and the interest. Taken under the publish lock, so it is one consistent revision."""
+        with self.compute_lock, self.lock:
+            return {'version': SNAPSHOT_VERSION, 'epoch': self.epoch, 'rev': self.rev, 'saved_at': self.clock(),
+                    'bundles': {s: {'rev': b['rev'], 'hash': b['hash'], 'bundle': b['bundle']}
+                                for s, b in self.bundles.items()},
+                    'interest': dict(self.interest)}
+
+    def restore(self, snap: dict) -> 'Feed':
+        """Carry on a feed a previous process of this gateway saved, so clients keep their revision chain across a
+        restart. [daveey 2026-11-21] "we restart the hub for updates, figure out how to preserve the feed": every
+        restart began a new epoch under a new feed id, and every Desktop dropped its trust and re-read.
+        Revisions continue RESTORE_REV_GAP past the snapshot's: the old process may still push for a while after
+        it saved (a restart overlaps the two), and a client following it must find every revision of this one
+        newer than anything it holds (it then catches up, never resets). Held bundles are served to catch-ups but
+        vouched for only after this process recomputes them (the next pass recomputes every one); interest that
+        has not expired carries over. Raises ValueError on a snapshot of another shape (the caller starts fresh)."""
+        if snap.get('version') != SNAPSHOT_VERSION or not isinstance(snap.get('epoch'), str):
+            raise ValueError('not a session-panel feed snapshot of this version')
+        now = self.clock()
+        bundles = {}
+        for s, held in (snap.get('bundles') or {}).items():
+            bundle = held['bundle']
+            rows = list(bundle['tasks']) + list(bundle['done'])
+            bundles[str(s)] = {'rev': int(held['rev']), 'hash': str(held['hash']), 'bundle': bundle,
+                               'refs': set(bundle['cards']) | {str(t.get('id')) for t in rows if t.get('id')},
+                               'lineage': set(bundle['lineage']), 'source_stale': False}
+        interest = {str(s): float(until) for s, until in (snap.get('interest') or {}).items() if float(until) > now}
+        with self.compute_lock, self.lock:
+            self.epoch = snap['epoch']
+            self.rev = int(snap['rev']) + RESTORE_REV_GAP
+            self.bundles = bundles
+            self.interest = interest
+            self._retry = set(bundles)
+            self._carried = set(bundles)
+            top = max((int(b['bundle'].get('computed_seq') or 0) for b in bundles.values()), default=0)
+            self._seq = itertools.count(top + 1)
+        return self
 
     def _store(self, session: str, bundle: dict) -> bool:
         """Keep `bundle`; True when it differs from what clients last got (it took a new revision)."""

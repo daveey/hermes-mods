@@ -618,3 +618,91 @@ def test_resuming_an_older_class_feed_routes_its_entry_points_to_the_new_feed():
     assert sent == [] and old.rev == rev, 'the old object neither pushes nor moves a revision'
     assert out['epoch'] == new.epoch and out['rev'] == new.rev and 'S2' in new.interest
     assert 'S2' in out['bundles'] and 'S2' in new.bundles, 'answered (and computed) by the new feed'
+
+
+def _roundtrip(snap):
+    import json
+    return json.loads(json.dumps(snap))
+
+
+def test_a_restarted_process_restores_the_feed_with_a_revision_gap_and_vouches_only_after_recompute():
+    # [daveey 2026-11-21] "we restart the hub for updates, figure out how to preserve the feed".
+    old, r, pushed, t = make()
+    first = old.changes(['S1', 'S2'])
+    for _ in range(2):
+        t['now'] += 61
+        old.tick()
+    top = max(b['bundle']['computed_seq'] for b in old.bundles.values())
+    snap = _roundtrip(old.snapshot())
+    new = feedmod.Feed(Readers(), emit=pushed.append, clock=lambda: t['now']).restore(snap)
+    assert new.epoch == first['epoch'] and new.rev == old.rev + feedmod.RESTORE_REV_GAP
+    assert set(new.interest) == {'S1', 'S2'} and set(new.bundles) == {'S1', 'S2'}
+    again = new.changes(['S1', 'S2'], since=old.rev, epoch=first['epoch'])
+    assert again['reset'] is False and again['bundles'] == {}, 'a client of the old process keeps its chain'
+    fresh_client = new.changes(['S1'], since=0, epoch=None)
+    assert set(fresh_client['bundles']) == {'S1'}, 'a new client is served the restored bundle at once'
+    pushed.clear()
+    t['now'] += 21
+    new._publish({}, heartbeat=True)
+    assert pushed[-1]['fresh'] == [], 'nothing restored is vouched for before this process recomputes it'
+    new.tick()
+    t['now'] += 21
+    new._publish({}, heartbeat=True)
+    assert pushed[-1]['fresh'] == ['S1', 'S2']
+    assert all(b['bundle']['computed_seq'] > top for b in new.bundles.values())
+
+
+def test_revisions_after_a_restore_stay_above_what_the_old_process_pushes_during_the_overlap():
+    old, r, pushed, t = make()
+    first = old.changes(['S1', 'S2'])
+    snap = _roundtrip(old.snapshot())
+    new = feedmod.Feed(r, emit=pushed.append, clock=lambda: t['now']).restore(snap)
+    # The old process keeps running a while after it saved and pushes a change a client then holds.
+    r.cards['t_ccccccc3'] = detail('t_ccccccc3', 'done', session='S9')
+    r.events, r.stamp = [('t_ccccccc3', 'S9')], 2
+    t['now'] += 1
+    old.tick()
+    client_rev = old.rev
+    assert client_rev > first['rev']
+    pushed.clear()
+    new.tick()  # recomputes every restored chat: S1 differs from what was saved
+    assert pushed and all(p['rev'] > client_rev for p in pushed)
+    out = new.changes(['S1', 'S2'], since=client_rev, epoch=first['epoch'])
+    assert out['reset'] is False and set(out['bundles']) == {'S1'}, 'the client catches up, never resets'
+
+
+def test_restore_drops_expired_interest_and_refuses_another_shape():
+    old, r, pushed, t = make()
+    old.changes(['S1'])
+    snap = _roundtrip(old.snapshot())
+    snap['interest']['S_old'] = t['now'] - 1
+    new = feedmod.Feed(r, emit=pushed.append, clock=lambda: t['now']).restore(snap)
+    assert 'S_old' not in new.interest and 'S1' in new.interest
+    with pytest.raises(ValueError):
+        feedmod.Feed(r, emit=pushed.append).restore({**snap, 'version': 99})
+
+
+def test_a_restored_chat_is_not_vouched_for_by_a_heartbeat_in_the_middle_of_its_recompute():
+    old, r, pushed, t = make()
+    old.changes(['S1', 'S2'])
+    new = feedmod.Feed(r, emit=pushed.append, clock=lambda: t['now']).restore(_roundtrip(old.snapshot()))
+    t['now'] += 21
+    pushed.clear()
+    out = new._compute_all(['S2', 'S1'])  # S2's retry mark clears when it is reserved; S1's reservation heartbeats
+    beats = [p for p in pushed if p.get('heartbeat')]
+    assert beats and all(p['fresh'] == [] for p in beats), beats
+
+
+def test_a_quiet_restored_chat_is_recomputed_on_the_first_pass():
+    old, r, pushed, t = make()
+    r.lineages['S3'] = ['S3']
+    old.changes(['S3'])
+    t['now'] += 61
+    old.tick()
+    new = feedmod.Feed(r, emit=pushed.append, clock=lambda: t['now']).restore(_roundtrip(old.snapshot()))
+    t['now'] += 21
+    new.tick()
+    t['now'] += 21
+    pushed.clear()
+    new._publish({}, heartbeat=True)
+    assert pushed and pushed[-1]['fresh'] == ['S3']

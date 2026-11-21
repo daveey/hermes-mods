@@ -18,6 +18,8 @@ import copy
 from contextlib import contextmanager
 import importlib.util
 import json
+import contextlib
+import re
 import logging
 import os
 import socket
@@ -591,8 +593,105 @@ def _request_profile() -> str:
         return 'default'
 
 
-FEED_ID = f'{socket.gethostname()}:{os.getpid()}'
+def _feed_role(argv: Optional[list[str]] = None) -> str:
+    """Which backend of this host this process is, stable across its restarts: the hermes subcommand (`serve`,
+    `dashboard`, ...) and, for a Desktop's ssh-launched backend, that Desktop's slot (the directory of its session
+    token file; the token itself changes per launch). Two Desktops on one hub are two roles."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    sub = next((a for a in args if a and not a.startswith('-')), 'proc')
+    slot = ''
+    for i, a in enumerate(args):
+        if a == '--ssh-session-token-file' and i + 1 < len(args):
+            slot = Path(args[i + 1]).parent.name
+        elif a.startswith('--ssh-session-token-file='):
+            slot = Path(a.split('=', 1)[1]).parent.name
+    return re.sub(r'[^A-Za-z0-9_.-]', '_', f'{sub}-{slot}' if slot else sub)[:80]
+
+
+FEED_ROLE = _feed_role()
+# Stable across restarts (not the pid): clients match pushes by it, so a restarted backend's pushes count at once.
+FEED_ID = f'{socket.gethostname()}:{FEED_ROLE}'
 LAUNCH_PROFILE = _launch_profile()
+SNAPSHOT_EVERY_S = 5.0        # a changed feed is saved at most this often (and on stop / exit)
+RESTORE_MAX_AGE_S = 15 * 60.0  # an older snapshot starts a new revision space instead
+
+
+def _snapshot_path() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        home = Path(get_hermes_home())
+    except ImportError:  # no core on the path (plugin-only test runs)
+        home = Path(os.environ.get('HERMES_HOME') or Path.home() / '.hermes')
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', f'{FEED_ROLE}-{LAUNCH_PROFILE}')
+    return Path(get_hermes_home()) / 'session-panel' / f'feed-{safe}.json'
+
+
+# When this process started (kept across plugin reloads): a snapshot names the process that wrote it, and an older
+# process (one a restart is replacing, still running for a while) never overwrites a newer one's.
+PROCESS_STARTED = _LOADER.__dict__.setdefault('process_started', time.time())
+
+
+def _read_header(path: Path) -> Optional[dict]:
+    """A snapshot file is two lines: a small JSON header (who wrote it, which revision) and the JSON snapshot."""
+    try:
+        with path.open('r', encoding='utf-8') as fh:
+            head = json.loads(fh.readline())
+        return head if isinstance(head, dict) else None
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def save_snapshot(f, path: Optional[Path] = None) -> bool:
+    """Write `f`'s snapshot atomically (temp file + replace). False when a newer process owns the file, or (logged)
+    when it could not be written."""
+    tmp = None
+    try:
+        path = path or _snapshot_path()
+        held = _read_header(path)
+        if held and float(held.get('owner_started') or 0) > PROCESS_STARTED:
+            return False  # a newer process of this backend carries the feed on now
+        snap = json_safe(f.snapshot())
+        head = {'version': snap['version'], 'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'epoch': snap['epoch'],
+                'rev': snap['rev'], 'saved_at': snap['saved_at'], 'owner_started': PROCESS_STARTED,
+                'owner_pid': os.getpid()}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f'.{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
+        tmp.write_text(json.dumps(head, separators=(',', ':')) + '\n' + json.dumps(snap, separators=(',', ':')),
+                       encoding='utf-8')
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        log.warning('session-panel feed: snapshot not saved', exc_info=True)
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+        return False
+
+
+def load_snapshot(path: Optional[Path] = None, *, now: Optional[float] = None) -> Optional[dict]:
+    """This backend's last snapshot when it can be carried on: same feed id and profile, at most RESTORE_MAX_AGE_S
+    old. None otherwise (missing, stale, unreadable, another backend's)."""
+    try:
+        path = path or _snapshot_path()
+        head_line, _, body = path.read_text(encoding='utf-8').partition('\n')
+        head, snap = json.loads(head_line), json.loads(body)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        log.warning('session-panel feed: snapshot unreadable; starting a new revision space', exc_info=True)
+        return None
+    now = time.time() if now is None else now
+    if not (isinstance(head, dict) and isinstance(snap, dict)) or head.get('feed') != FEED_ID \
+            or head.get('profile') != LAUNCH_PROFILE or head.get('epoch') != snap.get('epoch'):
+        return None
+    try:
+        if now - float(head.get('saved_at')) > RESTORE_MAX_AGE_S:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return snap
 
 
 def feed():
@@ -610,6 +709,19 @@ def feed():
                     except Exception:  # never leave the process without a running feed: start clean (clients reset)
                         log.warning('session-panel feed: resume failed; starting a new revision space', exc_info=True)
                         new = core.Feed(CoreReaders(), emit=_emit)
+                else:  # this process's first feed: carry on the one its previous process saved
+                    snap = load_snapshot()
+                    if snap is not None:
+                        try:
+                            new.restore(snap)
+                            log.info('session-panel feed: restored epoch %s at rev %s (%d bundles)',
+                                     new.epoch, new.rev, len(new.bundles))
+                        except Exception:
+                            log.warning('session-panel feed: snapshot not restored; starting a new revision space',
+                                        exc_info=True)
+                            new = core.Feed(CoreReaders(), emit=_emit)
+                    save_snapshot(new)  # claim it now: the process this one replaces no longer overwrites it
+                    _save_at_exit()
                 core.PROCESS_FEED = new
                 threading.Thread(target=_run, args=(core.PROCESS_FEED,), name='session-panel-feed', daemon=True).start()
             return core.PROCESS_FEED
@@ -626,6 +738,8 @@ def stop() -> None:
 
 
 def _run(f) -> None:
+    saved = (None, None)  # (rev, watched chats) last written
+    saved_at = 0.0
     try:
         while not f.stopped.is_set():
             started = time.monotonic()
@@ -633,9 +747,31 @@ def _run(f) -> None:
                 f.tick()
             except Exception:
                 log.warning('session-panel feed tick failed', exc_info=True)
+            state = (f.rev, frozenset(f.interest))
+            if state != saved and time.monotonic() - saved_at >= SNAPSHOT_EVERY_S:
+                saved_at = time.monotonic()
+                if save_snapshot(f):
+                    saved = state
             f.stopped.wait(max(0.2, TICK_S - (time.monotonic() - started)))
     finally:
+        # A plugin reload's successor owns the revision space now (and saves it); a plain stop saves the last state.
+        if getattr(f, '_successor', None) is None:
+            save_snapshot(f)
         f.readers.release()  # retained connections belong to this thread, including plugin unload
+
+
+def _save_at_exit() -> None:
+    """Once per process: at interpreter exit (a restart for an update) save the running feed's last state."""
+    if _LOADER.__dict__.setdefault('atexit_registered', False):
+        return
+    _LOADER.atexit_registered = True
+    import atexit
+
+    def save():
+        f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
+        if f is not None and not f.stopped.is_set():
+            save_snapshot(f)
+    atexit.register(save)
 
 
 class ChangesBody(BaseModel):

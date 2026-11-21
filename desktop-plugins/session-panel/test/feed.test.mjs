@@ -218,3 +218,29 @@ test('a catch-up bundle is trusted only for chats the last push vouched for; war
   assert.equal(m.feedVouches({ connectionId: 'C1', profile: 'default', session: 'S1' }), true)
   assert.equal(m.feedVouches({ connectionId: 'C1', profile: 'default', session: 'S2' }), false)
 })
+
+// [daveey 2026-11-21] "we restart the hub for updates, figure out how to preserve the feed": a restarted backend
+// keeps its feed id and epoch and jumps its revisions past the old process's; the client catches up and stays live.
+test('a restarted backend that restored its feed is followed by catch-up, never a reset, and stays trusted', async () => {
+  window.__answer = () => answer({ rev: 3 })
+  await m.feedCatchUp(target())
+  push({ prev: 3, rev: 4, bundles: { S1: bundle() }, fresh: ['S1'] })
+  await settle()
+  assert.equal(m.feedIsLive({ connectionId: 'C1', profile: 'default' }), true)
+  calls.length = 0
+  const logged = []
+  window.hermesDesktop.logLine = line => logged.push(line)
+  const restored = 4 + 1_000_000
+  window.__answer = () => answer({ rev: restored + 1, reset: false, bundles: { S1: bundle() } })
+  push({ prev: restored, rev: restored + 1, bundles: { S1: bundle() }, fresh: ['S1'] })  // the new process's first push
+  await settle(); await settle()
+  assert.equal(calls.at(-1).body.epoch, 'E1', 'same epoch: a catch-up, not a reset')
+  assert.equal(calls.at(-1).body.since, 4, 'from the last revision applied')
+  assert.equal(m.feedIsLive({ connectionId: 'C1', profile: 'default' }), true, 'trust kept across the restart')
+  assert.equal(logged.filter(l => /registered/.test(l)).length, 0, 'no re-registration')
+  const before = ingested.length
+  push({ prev: restored + 1, rev: restored + 2, bundles: { S1: bundle() }, fresh: ['S1'] })
+  assert.equal(ingested.length, before + 1, 'later pushes of the new process apply in order')
+  push({ prev: 4, rev: 5, bundles: { S1: bundle() }, fresh: ['S1'] })  // the old process, still finishing
+  assert.equal(ingested.length, before + 1, "the old process's later pushes are older: ignored")
+})

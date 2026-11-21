@@ -204,3 +204,73 @@ def test_a_reload_from_real_older_feed_code_hands_over_with_the_same_epoch(monke
         assert out['epoch'] == f.epoch and 'S2' in f.interest and 'S2' in out['bundles']
     finally:
         _restore(api, current)
+
+
+def test_feed_role_is_stable_across_launches_and_tells_backends_apart():
+    api = load('_spf_role_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
+    tok = '/home/u/.hermes/desktop-ssh/5caca281/b6911608.token'
+    assert api._feed_role(['serve', '--isolated', '--port', '9148', '--ssh-session-token-file', tok]) == 'serve-5caca281'
+    assert api._feed_role(['serve', '--port', '9149', f'--ssh-session-token-file={tok.replace("b69", "c00")}']) == \
+        'serve-5caca281', 'the port and the per-launch token change; the Desktop slot does not'
+    assert api._feed_role(['dashboard', '--port', '9147']) == 'dashboard'
+    assert api._feed_role([]) == 'proc'
+    assert api.FEED_ID.endswith(':' + api.FEED_ROLE) and str(__import__('os').getpid()) not in api.FEED_ID.split(':')
+
+
+def test_snapshot_save_and_load_round_trip_and_refusals(tmp_path, monkeypatch, caplog):
+    import json
+    import time
+    api = load('_spf_snap_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
+    fakes = load('_spf_snap_fakes', HERE.parent / 'test_feed.py')
+    core = api._load_feed()
+    f = core.Feed(fakes.Readers(), emit=lambda p: None)
+    first = f.changes(['S1'])
+    path = tmp_path / 'feed.json'
+    assert api.save_snapshot(f, path)
+    snap = api.load_snapshot(path)
+    assert snap['epoch'] == first['epoch'] and snap['rev'] == f.rev and set(snap['bundles']) == {'S1'}
+    head = json.loads(path.read_text().split('\n', 1)[0])
+    assert head['feed'] == api.FEED_ID and head['owner_started'] == api.PROCESS_STARTED
+    assert api.load_snapshot(path, now=time.time() + api.RESTORE_MAX_AGE_S + 1) is None, 'stale'
+    monkeypatch.setattr(api, 'FEED_ID', 'otherhost:serve')
+    assert api.load_snapshot(path) is None, "another backend's"
+    monkeypatch.undo()
+    # A newer process of this backend owns the file: this (older) one never overwrites it.
+    head['owner_started'] = api.PROCESS_STARTED + 100
+    body = path.read_text().split('\n', 1)[1]
+    path.write_text(json.dumps(head) + '\n' + body)
+    f.changes(['S2'])
+    assert api.save_snapshot(f, path) is False
+    assert set(api.load_snapshot(path)['bundles']) == {'S1'}, 'file unchanged'
+    path.write_text('{not json')
+    assert api.load_snapshot(path) is None and 'snapshot unreadable' in caplog.text
+    assert api.load_snapshot(tmp_path / 'missing.json') is None
+    assert not [p for p in tmp_path.iterdir() if p.name.endswith('.tmp')], 'no temp files left behind'
+
+
+def test_a_new_process_restores_the_saved_feed_and_saves_on_stop(monkeypatch):
+    import json
+    import time
+    api, original = _hot(monkeypatch, 'restore')
+    try:
+        f1 = api.feed()
+        first = f1.changes(['S1', 'S2'])
+        assert api.save_snapshot(f1)
+        # A new process: nothing running in it yet (the old one is gone or still finishing).
+        f1.stopped.set()
+        monkeypatch.setattr(f1, '_successor', object())  # keep the stopping thread from saving over the test
+        original.PROCESS_FEED = None
+        f2 = api.feed()
+        assert f2 is not f1 and f2.epoch == first['epoch']
+        assert f2.rev == f1.rev + api._load_feed().RESTORE_REV_GAP
+        head = json.loads(api._snapshot_path().read_text().split('\n', 1)[0])
+        assert head['rev'] == f2.rev, 'the new process claimed the snapshot at once'
+        # A plain stop saves the last state from the feed thread.
+        f2.changes(['S3'])
+        f2.stopped.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and 'S3' not in (api.load_snapshot() or {}).get('bundles', {}):
+            time.sleep(0.05)
+        assert 'S3' in api.load_snapshot()['bundles']
+    finally:
+        _restore(api, original)
