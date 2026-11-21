@@ -1,0 +1,117 @@
+"""Reviewer probes: real core Reader + real subprocess (fake gh binary), no fake store."""
+import contextlib
+import importlib.util
+import json
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+PLUGIN = Path(__file__).parents[1] / 'dashboard' / 'plugin_api.py'
+URL = 'https://github.com/example/repo/pull/1'
+
+
+def load():
+    spec = importlib.util.spec_from_file_location('lanes_review_api', PLUGIN)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture
+def board(tmp_path, monkeypatch):
+    kbc = pytest.importorskip('hermes_cli.kanban_db_connect')
+    from hermes_cli import kanban_lanes as lanes, kanban_lanes_cli as cli
+    import hermes_constants
+    import subprocess
+    from hermes_cli import kanban_db_dispatch_pr_state as st
+    root = tmp_path / 'home'
+    root.mkdir()
+    for key in ('HERMES_HOME', 'HERMES_KANBAN_HOME'):
+        monkeypatch.setenv(key, str(root))
+    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+    monkeypatch.delenv('HERMES_KANBAN_BOARD', raising=False)
+    monkeypatch.setattr(hermes_constants, 'get_default_hermes_root', lambda: root)
+    (root / 'config.yaml').write_text(json.dumps({'kanban': {'admission': {'lanes': {'work': {'share': 1}}, 'lane_default': 'work'}}}))
+    monkeypatch.setattr(lanes, '_LAST_GOOD', [])
+    monkeypatch.setattr(cli, '_fleet', lambda *a, **k: None)
+    path = root / 'fixture.db'
+    with contextlib.closing(kbc.connect(path)) as conn:
+        conn.execute("INSERT INTO tasks(id,title,status,created_at,created_by,tenant) VALUES('t_pr','pr','ready',?,'user','work')", (int(time.time()) - 60,))
+        conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES('t_pr','review_requested',?,?)",
+                     (int(time.time()), json.dumps({'metadata': {'pr': URL}})))
+        conn.commit()
+
+    @contextlib.contextmanager
+    def connect():
+        with contextlib.closing(kbc.connect(path)) as conn:
+            yield conn
+    monkeypatch.setattr(kbc, 'connect_closing', connect)
+    gh = tmp_path / 'gh.py'
+    gh.write_text(
+        "import sys, json, time\n"
+        "time.sleep(float(__import__('os').environ.get('FAKE_GH_SLEEP', '2')))\n"
+        "if sys.argv[2] == 'checks':\n print(json.dumps([{'bucket': 'pass'}]))\n"
+        "else:\n print(json.dumps({'state': 'OPEN', 'headRefOid': 'abc', 'reviewDecision': 'APPROVED', 'author': {'login': 'a'}, 'reviews': []}))\n")
+    monkeypatch.setattr(st, '_gh_argv', lambda: [sys.executable, str(gh)])
+    calls = []
+    real_run = subprocess.run
+
+    def run(argv, *a, **k):
+        if str(gh) in map(str, argv):
+            calls.append(threading.current_thread().name)
+        return real_run(argv, *a, **k)
+    monkeypatch.setattr(subprocess, 'run', run)
+    api = load()
+    yield api, connect, calls
+    if api._observations.cache_info().currsize:
+        api._observations().join(30)
+
+
+def pr_of(body):
+    c = next(c for c in body['cards'] if c['id'] == 't_pr')
+    return (c.get('step'), c.get('reason'))
+
+
+def test_real_reader_off_request_thread_then_publishes(board):
+    api, connect, calls = board
+    main = threading.current_thread().name
+    t = time.monotonic()
+    body = api.flow('6h')
+    assert time.monotonic() - t < 3, time.monotonic() - t
+    unobserved = pr_of(body)
+    print('unobserved', unobserved)
+    api._observations().join(20)
+    assert calls and main not in calls, calls
+    api._written()
+    body = api.flow('6h')
+    print('published pr', pr_of(body), 'gh calls', len(calls))
+    assert api._observations().reader(api._observations().contexts).get(URL)['approved'] is True
+    assert pr_of(body) != unobserved
+
+
+@pytest.mark.parametrize('head_kind', ['commented', 'external_watch'])
+def test_busy_board_still_publishes(board, head_kind):
+    """Unrelated events (heartbeats) every ~1 s, as on the live default board."""
+    api, connect, calls = board
+    seen = []
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        with connect() as conn:
+            conn.execute("INSERT INTO task_events(task_id,kind,created_at) VALUES('t_other','heartbeat',?)", (int(time.time()),))
+            conn.execute("INSERT INTO task_events(task_id,kind,created_at) VALUES('t_pr','heartbeat',?)", (int(time.time()),))
+            conn.commit()
+        api._written()  # what the WS _refresh_cursor does on each cursor change
+        seen.append(pr_of(api.flow('6h')))
+        time.sleep(1)
+    print('gh subprocess calls during churn:', len(calls), 'renders:', seen, 'revision', api._observations().revision)
+    assert ('merge', 'review') in seen, 'PR never classified on a busy board'
+    assert len(calls) == 3, 'unrelated events must not repeat network observations'
+    with connect() as conn:
+        conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES('t_pr',?,?,?)",
+                     (head_kind, int(time.time()), json.dumps({'metadata': {'published_pr': URL, 'head': 'changed'}})))
+        conn.commit()
+    api._written()
+    assert pr_of(api.flow('6h'))[0] != 'merge', 'new PR/head evidence reused old approval'

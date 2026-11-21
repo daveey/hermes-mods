@@ -51,7 +51,22 @@ reads, writes and the stream to that connection, independent of the active chat.
 The current SDK `ctx.socket` has no connection/send/status API: unscoped older
 hosts use it; native connection-pinned hosts use the same `getPluginWsUrl` ticket
 bridge as core, with bounded lookups and reconnect backoff. OAuth stays on REST.
-No core modification or Desktop restart is needed.
+The render-only push interface needs no Desktop restart. Fast expanded projection
+requires core's additive `snapshot(..., reader=...)` seam; older cores remain
+compatible but use the previous synchronous PR reads until upgraded naturally.
+
+PR network observation runs in one process-shared, bounded background worker,
+not the stream or GET request. A report consumes an immutable published reader.
+Entries expire 60 seconds after read **start**, refresh becomes due at 30 seconds,
+and publication/refresh/expiry wakes the stream's normal hash-deduplicated path.
+Each URL binds to its own cards' evidence revisions and contract/status; unrelated
+board events and plain heartbeat/watch ticks cannot starve publication. A changed
+PR/head event on an owning card invalidates its old observation immediately on
+projection. Results completing after invalidation cannot resurrect old approval.
+Missing/expired/failed observations stay unknown under the existing classifier.
+External GitHub changes not yet reported to the board are bounded by that TTL;
+these display observations never authorize shipping. Core's fresh head confirmation
+and all ship/review gates remain unchanged. No share/planner policy changes.
 
 Floor/Flow, lane/card navigation, window/tab persistence, per-lane valves, explicit
 null clearing, multi-parent dependency hints and the compact collapsed strip are

@@ -31,6 +31,7 @@ FLOW_WINDOWS = ("1h", "6h", "24h", "7d")
 LIMIT_FIELDS = ("cards_per_day", "usd_per_day", "max_workers")
 _flow_cache: Dict[str, tuple] = {}
 _lock = threading.Lock()
+_observer_init_lock = threading.Lock()
 _cache: Dict[float, tuple] = {}
 _generation = 0
 
@@ -94,9 +95,10 @@ def flow(window: str, now: Optional[float] = None) -> Dict[str, Any]:
     now = time.time() if now is None else now
     with _lock:
         hit = _flow_cache.get(window)
-        if hit and now - hit[0] < CACHE_S:
+        if hit and now - hit[0] < CACHE_S and hit[2] == _observation_cursor():
             return hit[1]
         generation = _generation
+    observation_cursor = _observation_cursor()
     try:
         with kbc.connect_closing() as conn:
             # Match the CLI's fleet/local selection and ownership of its replica.
@@ -105,7 +107,16 @@ def flow(window: str, now: Optional[float] = None) -> Dict[str, Any]:
                 raise RuntimeError("this Hermes core has no lanes support yet")
             replica = fleet_modules[2]._fleet(conn, local=False)
             try:
-                body = dict(kanban_lanes_flow.snapshot(replica if replica is not None else conn, window=window))
+                db = replica if replica is not None else conn
+                if 'reader' in inspect.signature(kanban_lanes_flow.snapshot).parameters:
+                    contexts = _pr_contexts(db, kanban_lanes_flow)
+                    with _observer_init_lock:
+                        reader = _observations().reader(contexts)
+                        observation_cursor = reader.cursor
+                    body = dict(kanban_lanes_flow.snapshot(db, window=window, reader=reader))
+                else:
+                    # Compatibility while the additive core reader seam rolls out.
+                    body = dict(kanban_lanes_flow.snapshot(db, window=window))
             finally:
                 if replica is not None:
                     replica.close()
@@ -116,8 +127,49 @@ def flow(window: str, now: Optional[float] = None) -> Dict[str, Any]:
         body["reason"] = "no lanes are configured (kanban.admission.lanes)"
     with _lock:
         if generation == _generation:
-            _flow_cache[window] = (now, body)
+            _flow_cache[window] = (now, body, observation_cursor)
     return body
+
+
+def _pr_contexts(db, flow_module):
+    """Only a PR's owning card evidence invalidates its network observation.
+
+    Heartbeats/external-watch ticks carry no head evidence. Other events on the
+    card (including comments/new publication) conservatively invalidate it.
+    """
+    from collections import defaultdict
+    groups = defaultdict(list)
+    identity = tuple(tuple(row) for row in db.execute('PRAGMA database_list'))
+    for row in db.execute(f'SELECT * FROM tasks WHERE status IN {flow_module._OPEN}'):
+        events = db.execute('SELECT id,kind,payload FROM task_events WHERE task_id=? ORDER BY id', (row['id'],)).fetchall()
+        pr = flow_module._pr_snapshot(row, events, flow_module._awaiting(row, events))
+        if pr and pr.get('url'):
+            revision = 0
+            for event in events:
+                payload = flow_module._payload(dict(event))
+                meta = payload.get('metadata')
+                evidence = meta if isinstance(meta, dict) else payload
+                carries_pr = any(key in evidence for key in ('published_pr', 'reviewed_pr', 'pr', 'flow_pr', 'head', 'head_sha', 'headRefOid'))
+                if event['kind'] not in ('heartbeat', 'external_watch') or carries_pr:
+                    revision = max(revision, event['id'])
+            groups[pr['url']].append((row['id'], row['status'], row['completion_contract'], revision))
+    return {url: (identity, tuple(sorted(cards))) for url, cards in groups.items()}
+
+
+def _observation_cursor():
+    return _observations().cursor() if _observations.cache_info().currsize else None
+
+
+@lru_cache(maxsize=1)
+def _observations():
+    import importlib.util
+    from pathlib import Path
+    from hermes_cli.kanban_lanes_flow_pr import Reader
+    spec = importlib.util.spec_from_file_location('lanes_observations', Path(__file__).with_name('observations.py'))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.Observations(Reader)
 
 
 @lru_cache(maxsize=1)
@@ -279,6 +331,8 @@ def change_cursor():
             cursors.append((stat.st_mtime_ns, stat.st_size))
         except FileNotFoundError:
             cursors.append(None)
+    if _observations.cache_info().currsize:
+        cursors.append(_observations().cursor())
     return cursors
 
 

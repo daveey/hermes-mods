@@ -9,7 +9,8 @@ from fastapi.testclient import TestClient
 from test_view import load
 
 
-def test_real_board_view_and_status_push(tmp_path, monkeypatch):
+@pytest.mark.parametrize('slow_pr', [False, True])
+def test_real_board_view_and_status_push(tmp_path, monkeypatch, slow_pr, request):
     kbc = pytest.importorskip('hermes_cli.kanban_db_connect')
     from hermes_cli import kanban_lanes as lanes, kanban_lanes_cli as cli
     import hermes_constants
@@ -36,8 +37,28 @@ def test_real_board_view_and_status_push(tmp_path, monkeypatch):
             yield conn
     monkeypatch.setattr(kbc, 'connect_closing', connect)
     api = load()
+    request.addfinalizer(lambda: api._observations().join(10) if api._observations.cache_info().currsize else None)
+    if slow_pr:
+        import threading
+        from hermes_cli import kanban_lanes_flow_pr as prs
+        started = threading.Event()
+        class Slow:
+            def prefetch(self, urls):
+                started.set()
+                time.sleep(4)
+            def get(self, url):
+                return {}
+        monkeypatch.setattr(prs, 'Reader', Slow)
+        with connect() as conn:
+            conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES('t_fixture0','review_requested',?,?)",
+                         (int(time.time()), json.dumps({'metadata': {'pr': 'https://github.com/example/repo/pull/1'}})))
+            conn.commit()
     monkeypatch.setattr(api, '_ws_upgrade_authorized', lambda ws: True)
+    initial_start = time.monotonic()
     view = api.lane_view(6, '6h', True)
+    assert time.monotonic() - initial_start < 3
+    if slow_pr:
+        assert started.wait(1)
     assert view['configured'], view
     assert view['lanes']['work']['not_ready'] == 1
     assert view['totals']['open'] == 3
