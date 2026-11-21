@@ -156,6 +156,10 @@ If failed-only rerun is refused, read `references/refused-failed-only-rerun.md` 
 
 Before parking CI/release work, read [external-run card contracts](references/external-run-cards.md) for native-versus-shell adapter selection, aggregate typed status, control tests and live probe readback. Asked which cards wait on CI: same file, §Auditing which cards wait on CI.
 
+## Optional Python lanes and setup-uv cache cleanup
+
+When an optional job can skip every `uv run`, set setup-uv's `ignore-nothing-to-cache: true` (or disable caching for that leg). setup-uv may otherwise fail in its post step because no cache directory was created, turning an intentional test skip into a red job. Verify the hosted post-step result as well as the skipped test step; local shell gate tests do not exercise action cleanup.
+
 ## Done means
 - [ ] The sha was copied from `git`/`gh` output and passed positionally (not `--sha`; `--head-sha` only with `--run-id`), and `--once` ran with the same arguments before any "waiting on CI"?
 - [ ] Ordinary waits use `wait_for_ci.py`; input-specific controls additionally verify exact dispatch/job execution, not a skipped same-head success?
