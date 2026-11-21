@@ -772,15 +772,17 @@ test('panel: a chain through this chat\'s running card ends there; its card open
     card('t_kid', 'scheduled', { look: 'waiting', waitingOn: 'card t_aaaaaaaa', label: 'Child' })
   ] })
   await show(React.createElement(m.Panel, { key: 'wait-link' }))
-  const line = el().querySelector('[data-folded-waiting] [data-wait-line]')
-  assert.equal(lineText(line), 'Child | running· running on G1 · via 1 card | ')
-  await React.act(async () => el().querySelector('[data-waiting-toggle]').click())
-  const chain = el().querySelector('[data-wait-chain="kb:t_kid"]')
-  assert.equal(chain.querySelector('[data-wait-reason]').textContent, 'waiting on running work · 2 hops')
-  assert.equal(chain.querySelector('[data-chain-card="t_aaaaaaaa"] [data-this-chat]').textContent, 'this chat')
-  await React.act(async () => { chain.querySelector('[data-wait-card="t_aaaaaaaa"]').click() })
+  // The waiting card nests under its running card in In progress (one tree); there is no flat Waiting line for it.
+  assert.equal(el().querySelector('[data-folded-waiting] [data-wait-line]'), null)
+  assert.equal(el().querySelector('[data-waiting-toggle]'), null)
+  const tree = el().querySelector('[data-running-list] [data-wait-group="t_aaaaaaaa"]')
+  assert.equal(tree.querySelector('[data-running-title]').textContent, 'Parent build')
+  const chain = tree.querySelector('[data-wait-kids] [data-wait-chain="kb:t_kid"]')
+  assert.equal(chain.querySelector('[data-wait-parent]').textContent, 'Waiting on Parent build')
+  // The running card opens from its own row; its dependent's long form opens the waiting card itself.
+  await React.act(async () => { tree.querySelector('[data-running-row] button').click() })
+  await React.act(async () => { tree.querySelector('[data-running-row] [data-open-card]').click() })
   assert.deepEqual(b.opened, ['t_aaaaaaaa'])
-  // The root's title opens its long form; Open card there opens the waiting card itself.
   await React.act(async () => { chain.querySelector('[data-wait-toggle]').click() })
   assert.match(chain.querySelector('[data-row-detail]').textContent, /waiting on card "Parent build" \(t_aaaaaaaa\)/)
   await React.act(async () => { chain.querySelector('[data-open-card]').click() })
@@ -824,7 +826,7 @@ test('panel: collapsed, each waiting card keeps its one line; a retired ask keep
   assert.match(el().querySelector('[data-card-status]').textContent, /t_0123abcd · blocked · request dismissed/)
   await React.act(async () => el().querySelector('[data-panel-toggle]').click())
   const line = el().querySelector('[data-collapsed-waiting] [data-waiting-line="kb:t_kid2"]')
-  assert.equal(lineText(line), 'Kid | running· running on G1 · via 1 card | ')
+  assert.equal(lineText(line), 'Kid | Waiting on Upstream — running on G1 | ')
 })
 
 test('panel: one-line rows carry their box (yellow waiting, the hub "H"); a blocked-upstream card is a waiting line', async () => {
@@ -888,6 +890,219 @@ test('panel: a chain that runs into another waiting card of this chat shows "sam
   assert.equal(b.querySelector('[data-chain-leaf]'), null)
 })
 
+// Every place a card can be drawn in the WHOLE panel (not one section): In progress row, prerequisite root,
+// chain card, waiting chain / one-liner. A card must be drawn exactly once.
+const drawn = (id, title) => {
+  const r = el()
+  return [
+    ...[...r.querySelectorAll('[data-running-row]')].filter(x => x.getAttribute('data-panel-row') === `kb:${id}`),
+    ...r.querySelectorAll(`[data-chain-prereq="${id}"], [data-chain-card="${id}"], [data-wait-chain="kb:${id}"], [data-wait-line][data-waiting-line="kb:${id}"]`)
+  ].length
+}
+const sTitles = () => [...el().querySelectorAll('[data-running-title], [data-prereq-title], [data-wait-title]')].map(x => x.textContent)
+const settle = async () => { for (let n = 0; n < 3; n++) await React.act(async () => { await flush(); await flush() }) }
+const D = 't_a0a0d001', E = 't_a0a0e001', F = 't_a0a0f001', G = 't_a0a0a001'
+const wchip = (id, label, on) => card(id, 'scheduled', { label, look: 'waiting', waitingOn: `card ${on}`, waitingSince: Date.now() / 1000 - 600 })
+
+test('panel (whole): two dependents + a multilevel waiter nest under the running card in In progress; the root is drawn once and nothing is left in a flat Waiting list', async () => {
+  window.localStorage.clear()
+  bridges({ chips: [card(D, 'running', { label: 'Stage2 (d)', activityAt: Date.now() / 1000 - 30 }), wchip(E, 'Stage2 (e)', D), wchip(F, 'Baseline producer', D), wchip(G, 'Closeout', E)] })
+  await show(React.createElement(m.Panel, { key: 'whole-two' }))
+  await settle()
+  const root = el()
+  // Totals are the header's: one running card, three waiting cards, counted once each.
+  assert.match(root.querySelector('[data-status-summary]').textContent, /1 running/)
+  assert.match(root.querySelector('[data-status-summary]').textContent, /3 waiting/)
+  // The running card is drawn once across the whole panel, and it is the root of ONE tree in In progress.
+  assert.equal(drawn(D), 1)
+  const tree = root.querySelector('[data-running-list] [data-wait-group]')
+  assert.equal(tree.getAttribute('data-wait-group'), D)
+  assert.equal(tree.querySelector('[data-running-title]').textContent, 'Stage2 (d)')
+  assert.equal(tree.querySelectorAll('[data-chain-prereq]').length, 0, 'the running row is the root, no second prerequisite row')
+  const top = [...tree.querySelector(':scope > [data-wait-kids]').children].map(x => x.getAttribute('data-wait-chain'))
+  assert.deepEqual(top, [`kb:${E}`, `kb:${F}`])
+  const e = tree.querySelector(`[data-wait-chain="kb:${E}"]`)
+  assert.equal(e.querySelector('[data-wait-parent]').textContent, 'Waiting on Stage2 (d)')
+  assert.equal(e.querySelector('[data-line-pip]').getAttribute('data-line-pip'), 'waiting', 'waiters stay yellow, not running')
+  assert.ok(e.querySelector(`:scope > [data-wait-kids] [data-wait-chain="kb:${G}"]`), 'Closeout nests under Stage2 (e)')
+  for (const id of [E, F, G]) assert.equal(drawn(id), 1, id)
+  // No separate flat Waiting rendering of these cards: no Waiting section, no folded lines, no open-waiting list.
+  assert.equal(root.querySelector('[data-section="waiting"]'), null)
+  assert.equal(root.querySelector('[data-waiting-toggle]'), null)
+  assert.equal(root.querySelectorAll('[data-folded-waiting] [data-wait-line], [data-open-waiting] [data-wait-chain]').length, 0)
+  assert.equal(sTitles().filter(t => t === 'Stage2 (d)').length, 1)
+})
+
+test('panel (whole): a single waiting dependent uses the same hierarchy (no two-card threshold)', async () => {
+  window.localStorage.clear()
+  bridges({ chips: [card(D, 'running', { label: 'Stage2 (d)', activityAt: Date.now() / 1000 - 30 }), wchip(E, 'Stage2 (e)', D)] })
+  await show(React.createElement(m.Panel, { key: 'whole-one' }))
+  await settle()
+  const root = el()
+  assert.equal(drawn(D), 1)
+  assert.equal(drawn(E), 1)
+  const tree = root.querySelector('[data-running-list] [data-wait-group]')
+  assert.equal(tree.getAttribute('data-wait-group'), D)
+  const kid = tree.querySelector(':scope > [data-wait-kids] > [data-wait-chain]')
+  assert.equal(kid.getAttribute('data-wait-chain'), `kb:${E}`)
+  assert.equal(kid.querySelector('[data-wait-parent]').textContent, 'Waiting on Stage2 (d)')
+  assert.equal(root.querySelector('[data-section="waiting"]'), null)
+  assert.match(root.querySelector('[data-status-summary]').textContent, /1 running.*1 waiting/)
+})
+
+test('panel (whole): unrelated waiting cards keep the flat Waiting list while the nested ones leave it; totals stay accurate', async () => {
+  window.localStorage.clear()
+  bridges({ chips: [card(D, 'running', { label: 'Stage2 (d)', activityAt: Date.now() / 1000 - 30 }), wchip(E, 'Stage2 (e)', D),
+    card('t_b0b0b001', 'scheduled', { label: 'CI waiter', look: 'waiting', waitingOn: 'ci https://github.com/o/r/actions/runs/7', waitingSince: Date.now() / 1000 - 600 })] })
+  await show(React.createElement(m.Panel, { key: 'whole-mixed' }))
+  await settle()
+  assert.match(el().querySelector('[data-status-summary]').textContent, /2 waiting/)
+  assert.equal(el().querySelector('[data-section="waiting"]').textContent, 'Waiting · 1', 'only the cards still listed there')
+  assert.equal(drawn('t_b0b0b001'), 1)
+  assert.equal(drawn(E), 1)
+  assert.equal(drawn(D), 1)
+  assert.equal(el().querySelectorAll('[data-folded-waiting] [data-wait-line]').length, 1)
+  // Expanded Waiting: still one chain for the CI waiter and no second copy of the nested ones.
+  await React.act(async () => el().querySelector('[data-waiting-toggle]').click())
+  await settle()
+  assert.equal(el().querySelectorAll('[data-open-waiting] [data-wait-chain]').length, 1)
+  assert.equal(drawn(E), 1)
+  assert.equal(drawn(D), 1)
+})
+
+test('panel (whole): collapsed panel keeps one line per waiting card and draws no running row or tree', async () => {
+  window.localStorage.clear()
+  bridges({ chips: [card(D, 'running', { label: 'Stage2 (d)', activityAt: Date.now() / 1000 - 30 }), wchip(E, 'Stage2 (e)', D), wchip(F, 'Baseline producer', D)] })
+  await show(React.createElement(m.Panel, { key: 'whole-collapsed' }))
+  await settle()
+  await React.act(async () => el().querySelector('[data-panel-toggle]').click())
+  await settle()
+  const root = el()
+  assert.equal(root.querySelector('[data-panel-body]'), null)
+  assert.equal(root.querySelectorAll('[data-collapsed-waiting] [data-wait-line]').length, 2)
+  assert.equal(root.querySelectorAll('[data-running-row], [data-wait-group], [data-chain-prereq]').length, 0)
+  assert.match(root.querySelector('[data-status-summary]').textContent, /1 running.*2 waiting/)
+  assert.match(root.querySelector('[data-collapsed-waiting] [data-wait-reason]').textContent, /^Waiting on Stage2 \(d\) — running on G1$/)
+})
+
+test('panel (whole): a running prerequisite that is not this chat\'s card is the tree root, drawn once, even with a single waiter', async () => {
+  window.localStorage.clear()
+  bridges({ chips: [wchip(E, 'Stage2 (e)', 't_d7d7000001'), wchip(G, 'Closeout', E)] })
+  window.hermesDesktop = { api: async a => /tasks\/t_d7d7000001/.test(a.path)
+    ? { task: { id: 't_d7d7000001', title: 'Remote build', status: 'running', claim_lock: 'worker-a1:9', session_id: 'local-x' }, events: [], links: { parents: [] } }
+    : { tasks: [], includes: ['done'] } }
+  await show(React.createElement(m.Panel, { key: 'whole-remote' }))
+  await settle()
+  await React.act(async () => el().querySelector('[data-waiting-toggle]').click())
+  await settle()
+  const root = el()
+  assert.equal(root.querySelector('[data-running-list]'), null, 'not an In progress row of this chat')
+  const groups = root.querySelectorAll('[data-wait-group]')
+  assert.equal(groups.length, 1)
+  assert.equal(root.querySelectorAll('[data-chain-prereq="t_d7d7000001"]').length, 1)
+  assert.equal(root.querySelector('[data-prereq-state]').textContent, 'running on worker-a1')
+  assert.equal(root.querySelectorAll('[data-chain-card="t_d7d7000001"]').length, 0)
+  const e = groups[0].querySelector(`:scope > [data-wait-kids] > [data-wait-chain="kb:${E}"]`)
+  assert.ok(e && e.querySelector(`:scope > [data-wait-kids] > [data-wait-chain="kb:${G}"]`), 'multilevel nesting under the remote root')
+  assert.equal(drawn(E), 1)
+  assert.equal(drawn(G), 1)
+  assert.match(root.querySelector('[data-section="waiting"]').textContent, /^Waiting · 2$/)
+})
+
+// A running card is a hierarchy root whichever bucket draws it (In progress or Stuck). Earlier whole-panel tests only
+// used a fresh running card (the `active` bucket), so root attachment limited to `active` passed them all.
+const STUCK_AT = () => Date.now() / 1000 - 3 * 3600, FRESH_AT = () => Date.now() / 1000 - 30
+const physical = id => el().querySelectorAll(`[data-stuck="kb:${id}"], [data-running-row][data-panel-row="kb:${id}"], [data-chain-prereq="${id}"], [data-chain-card="${id}"]`).length
+const everyOnce = ids => { for (const id of ids) assert.equal(drawn(id) + el().querySelectorAll(`[data-stuck="kb:${id}"]`).length, 1, `${id} drawn once`) }
+
+test('panel (whole): a Stuck running prerequisite is the single root of its waiters (single, shared, multilevel); warning and totals stay', async () => {
+  window.localStorage.clear()
+  bridges({ chips: [card(D, 'running', { label: 'Stuck build', activityAt: STUCK_AT() }), wchip(E, 'Stage2 (e)', D), wchip(F, 'Baseline producer', D), wchip(G, 'Closeout', E)] })
+  await show(React.createElement(m.Panel, { key: 'stuck-root' }))
+  await settle()
+  const root = el()
+  const sum = root.querySelector('[data-status-summary]').textContent
+  assert.match(sum, /1 stuck/); assert.match(sum, /3 waiting/)
+  assert.match(root.querySelector('[data-section="stuck"]').textContent, /^Stuck · 1$/)
+  assert.equal(root.querySelectorAll(`[data-stuck="kb:${D}"]`).length, 1, 'stuck warning card kept, once')
+  assert.equal(physical(D), 1, 'the running card is one physical row in the whole panel')
+  const tree = root.querySelector(`[data-wait-group="${D}"]`)
+  assert.ok(tree.querySelector(`[data-stuck="kb:${D}"]`), 'the Stuck card is the tree root')
+  assert.deepEqual([...tree.querySelector(':scope > [data-wait-kids]').children].map(x => x.getAttribute('data-wait-chain')), [`kb:${E}`, `kb:${F}`])
+  assert.ok(tree.querySelector(`[data-wait-chain="kb:${E}"] > [data-wait-kids] [data-wait-chain="kb:${G}"]`), 'multilevel nesting')
+  // Nothing left flat: no Waiting section, toggle, folded lines.
+  assert.equal(root.querySelector('[data-section="waiting"]'), null)
+  assert.equal(root.querySelector('[data-waiting-toggle]'), null)
+  assert.equal(root.querySelectorAll('[data-folded-waiting] [data-wait-line], [data-open-waiting] [data-wait-chain]').length, 0)
+  everyOnce([D, E, F, G])
+  // Collapsed, then expanded again: still one row per id.
+  await React.act(async () => root.querySelector('[data-panel-toggle]').click()); await settle()
+  assert.equal(el().querySelector('[data-panel-body]'), null)
+  assert.equal(el().querySelectorAll('[data-collapsed-waiting] [data-wait-line]').length, 3)
+  assert.match(el().querySelector('[data-status-summary]').textContent, /1 stuck.*3 waiting/)
+  await React.act(async () => el().querySelector('[data-panel-toggle]').click()); await settle()
+  assert.equal(physical(D), 1)
+  assert.ok(el().querySelector(`[data-wait-group="${D}"] [data-stuck="kb:${D}"]`))
+  everyOnce([D, E, F, G])
+})
+
+test('panel (whole): a Stuck root with a single dependent', async () => {
+  window.localStorage.clear()
+  bridges({ chips: [card(D, 'running', { label: 'Stuck build', activityAt: STUCK_AT() }), wchip(E, 'Stage2 (e)', D)] })
+  await show(React.createElement(m.Panel, { key: 'stuck-one' }))
+  await settle()
+  assert.equal(physical(D), 1)
+  assert.ok(el().querySelector(`[data-wait-group="${D}"] > [data-wait-kids] > [data-wait-chain="kb:${E}"]`))
+  assert.equal(el().querySelector('[data-section="waiting"]'), null)
+  assert.match(el().querySelector('[data-status-summary]').textContent, /1 stuck.*1 waiting/)
+  everyOnce([D, E])
+})
+
+test('panel (whole): live active → stuck → active on one mounted panel keeps one row per id and the same tree', async () => {
+  window.localStorage.clear()
+  const chips = at => [card(D, 'running', { label: 'Stage2 (d)', activityAt: at }), wchip(E, 'Stage2 (e)', D), wchip(F, 'Baseline producer', D), wchip(G, 'Closeout', E)]
+  const b = bridges({ chips: chips(FRESH_AT()) })
+  await show(React.createElement(m.Panel, { key: 'live-transition' }))
+  await settle()
+  const check = async (name, kind) => {
+    const tree = el().querySelector(`[data-wait-group="${D}"]`)
+    assert.ok(tree, `${name}: tree`)
+    assert.equal(tree.querySelectorAll(kind === 'stuck' ? '[data-stuck]' : '[data-running-row]').length, 1, `${name}: root is the ${kind} row`)
+    assert.equal(tree.querySelectorAll(kind === 'stuck' ? '[data-running-row]' : '[data-stuck]').length, 0)
+    assert.equal(physical(D), 1, `${name}: one row for the running card`)
+    assert.equal(tree.querySelectorAll('[data-wait-chain]').length, 3)
+    assert.equal(el().querySelector('[data-section="waiting"]'), null)
+    assert.equal(el().querySelectorAll('[data-wait-group]').length, 1)
+    everyOnce([D, E, F, G])
+    assert.match(el().querySelector('[data-status-summary]').textContent, new RegExp(`1 ${kind === 'stuck' ? 'stuck' : 'running'}.*3 waiting`))
+  }
+  await check('active', 'active')
+  await React.act(async () => { b.push(chips(STUCK_AT())) }); await settle()
+  await check('stuck', 'stuck')
+  // Collapsed while stuck, re-expanded, then back to active: still one row per id.
+  await React.act(async () => el().querySelector('[data-panel-toggle]').click()); await settle()
+  assert.equal(el().querySelectorAll('[data-running-row], [data-stuck], [data-wait-group]').length, 0)
+  await React.act(async () => el().querySelector('[data-panel-toggle]').click()); await settle()
+  await check('stuck re-expanded', 'stuck')
+  await React.act(async () => { b.push(chips(FRESH_AT())) }); await settle()
+  await check('active again', 'active')
+})
+
+test('panel (whole): a Stuck root and a separate flat waiter keep both layouts, one row per id', async () => {
+  window.localStorage.clear()
+  const H = 't_b0b0b001'
+  bridges({ chips: [card(D, 'running', { label: 'Stuck build', activityAt: STUCK_AT() }), wchip(E, 'Stage2 (e)', D),
+    card(H, 'scheduled', { label: 'CI waiter', look: 'waiting', waitingOn: 'ci https://github.com/o/r/actions/runs/7', waitingSince: Date.now() / 1000 - 600 })] })
+  await show(React.createElement(m.Panel, { key: 'stuck-mixed' }))
+  await settle()
+  assert.equal(el().querySelector('[data-section="waiting"]').textContent, 'Waiting · 1')
+  assert.equal(el().querySelectorAll('[data-folded-waiting] [data-wait-line]').length, 1)
+  await React.act(async () => el().querySelector('[data-waiting-toggle]').click()); await settle()
+  assert.equal(el().querySelectorAll('[data-open-waiting] [data-wait-chain]').length, 1)
+  assert.equal(physical(D), 1)
+  everyOnce([D, E, H])
+})
+
 test('panel: the Waiting heading counts cards by root cause', async () => {
   window.localStorage.clear()
   bridges({ chips: [
@@ -943,7 +1158,7 @@ test('panel: a card another gateway owns opens its chat on that gateway; with no
     await show(React.createElement(m.Panel, { key: 'owner-gw' }))
     await React.act(async () => el().querySelector('[data-waiting-toggle]').click())
     for (let n = 0; n < 4; n++) await React.act(async () => { await flush(); await flush() })
-    const chip = el().querySelector('[data-chain-card="t_c9c9000001"] [data-open-session]')
+    const chip = el().querySelector('[data-chain-prereq="t_c9c9000001"] [data-open-session]')
     assert.match(chip.textContent, /Worker chat/)
     await React.act(async () => { chip.click() })
     assert.deepEqual(opens, [['20261120_090000_bbbbbb', 'CW']])
