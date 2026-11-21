@@ -12,6 +12,7 @@ its own reads for that profile.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import copy
 from contextlib import contextmanager
 import importlib.util
@@ -26,9 +27,24 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
+
+
+# Thread lanes (core ``hermes_cli.web_thread_lanes``): this plugin's Desktop-polled reads get their own thread
+# budget and a queue deadline (503 + Retry-After, never started) instead of the shared AnyIO pool, which slow
+# reads filled for ~2 h on 2026-11-21. A core without lanes keeps the shared pool, as before. [daveey]
+try:
+    from hermes_cli.web_thread_lanes import run_in_lane as _run_in_lane
+except ImportError:  # core before thread lanes
+    _run_in_lane = None
+
+
+async def _on_lane(lane, fn, *args, request=None, deadline=None, **kwargs):
+    if _run_in_lane is None:
+        return await run_in_threadpool(functools.partial(fn, *args, **kwargs))
+    return await _run_in_lane(lane, fn, *args, request=request, deadline=deadline, **kwargs)
 
 PLUGIN_ID = 'session-panel'
 TICK_S = float(os.environ.get('HERMES_SESSION_PANEL_FEED_TICK_S', '1'))
@@ -535,12 +551,13 @@ router = APIRouter()
 
 
 @router.post('/changes')
-async def changes(body: ChangesBody):
+async def changes(body: ChangesBody, request: Request):
     profile = _request_profile()
     if profile != LAUNCH_PROFILE:
         return {'feed': FEED_ID, 'profile': profile, 'profile_unsupported': True}
-    f = await run_in_threadpool(feed)  # a resume waits for the stopped feed's in-flight push: never on the loop
-    out = await run_in_threadpool(f.changes, body.sessions, since=body.since, epoch=body.epoch)
+    # A resume waits for the stopped feed's in-flight push: never on the loop, and on the feed lane like the read.
+    f = await _on_lane('feed', feed, request=request)
+    out = await _on_lane('feed', f.changes, body.sessions, since=body.since, epoch=body.epoch, request=request)
     return json_safe({'feed': FEED_ID, 'profile': LAUNCH_PROFILE, **out})
 
 
