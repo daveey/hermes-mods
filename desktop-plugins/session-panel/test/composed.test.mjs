@@ -356,4 +356,35 @@ test('composed: two bound requests on one card render as 1/2 and 2/2 tiles, no u
   }
 })
 
+// Live shape (a blocked card on the serving gateway's own board): the
+// backend tags only other gateways' rows, so a serving-gateway card row has no gateway id. Its mirrored card question
+// is bound to it, yet the card drew a second NEEDS YOU row under the question tile ("Needs you · 2" for one ask).
+test('composed: a serving-gateway card row (no gateway id) is covered by its bound question, drawn once', async () => {
+  await React.act(async () => root.render(null))
+  const id = 't_local_fixture'
+  const raw = { id, board: 'ops', status: 'blocked', block_kind: 'needs_input', title: TITLE, human_request: ask, via: 'created', key: `ops/${id}`,
+    wait: { wait_state: 'human', waiting_on: 'you', waiting_since: S - 600, agent_owned: false, agent_owned_certain: true } }
+  const [local] = taskProjection.sessionTaskChips([raw], { connectionId: 'C1', profile: 'default' })
+  assert.equal(local.gatewayId, '', 'live local rows carry no gateway id')
+  assert.equal(local.look, 'needs-you')
+  const ref = { gatewayId: 'G1', profile: 'default', type: 'kanban', board: 'ops', id }
+  const request = { ...canonicalRequest, requestId: '00000000-0000-4000-8000-000000000097', aliases: [],
+    scope: { complete: true, markdown: 'Pick a color. Unblock = continue; archive = abandon.', sourceRefs: [ref] },
+    presentation: { kind: 'kanban-question', question: 'Pick a color.', details: 'Original evidence', other: true, sourceRef: ref } }
+  const rowsFor = () => [...el().querySelectorAll('[data-panel-row]')].filter(r => r.getAttribute('data-panel-row').endsWith(id))
+  const dispose = wire({ chips: [local], items: [], requests: [request], ledgerSteps: [] })
+  await render('local-bound-question')
+  assert.equal(el().querySelectorAll('[data-action-request]').length, 1)
+  assert.equal(rowsFor().length, 0, 'no second NEEDS YOU row for the same card')
+  assert.equal(el().querySelector('[data-section="needs-you"]').textContent, 'Needs you · 1')
+  // Only a bound question on the same profile/board/id covers an untagged row; aliases keep exact identity.
+  assert.equal(steps.requestsForSource([request], { ...ref, gatewayId: '' }).length, 1)
+  assert.equal(steps.requestForSource([request], { ...ref, gatewayId: '' }), request)
+  for (const change of [{ board: 'other' }, { profile: 'work' }, { id: 't_other' }]) assert.equal(steps.requestsForSource([request], { ...ref, gatewayId: '', ...change }).length, 0)
+  assert.equal(steps.requestsForSource([request], { ...ref, gatewayId: 'G2' }).length, 0, 'another gateway\u2019s card is not this owner\u2019s')
+  const aliasOnly = { ...canonicalRequest, aliases: [ref] }
+  assert.equal(steps.requestForSource([aliasOnly], { ...ref, gatewayId: '' }), null, 'aliases still need the full qualified key')
+  await React.act(async () => root.render(null)); dispose()
+})
+
 test('done', () => { root.unmount() })

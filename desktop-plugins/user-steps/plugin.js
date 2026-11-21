@@ -680,7 +680,18 @@ export function projectRequests(requests) {
   }
   return [...byId.values()]
 }
+// A serving-gateway card row carries no gateway id (the backend tags only other gateways' rows), so it has no
+// sourceKey. The owner's own bound question (server presentation.sourceRef, same gateway as its owner) still covers
+// it when profile, board and id match exactly. Aliases never match without the full key.
+const untaggedCard = s => s?.type === 'kanban' && !s.gatewayId && !!s.profile && !!s.id
+const boundToUntagged = (r, s) => {
+  const ref = cardPresentation(r)?.sourceRef
+  return ref?.type === 'kanban' && ref.gatewayId === r.owner.gatewayId && ref.profile === r.owner.profile &&
+    ref.profile === s.profile && (ref.board || 'default') === (s.board || 'default') && ref.id === s.id
+}
+const liveFirst = matches => { const live = matches.filter(r => r.state !== 'withdrawn'); return live.length ? live : matches }
 export function requestForSource(requests, source) {
+  if (untaggedCard(source)) { const pool = liveFirst(projectRequests(requests).filter(r => boundToUntagged(r, source))); return pool.length === 1 ? pool[0] : null }
   const key = sourceKey(source)
   if (!key) return null
   const matches = projectRequests(requests).filter(r => {
@@ -701,6 +712,7 @@ export function requestForSource(requests, source) {
 // drawn as their own tile, so several asks on one card are all shown and the card is never also a legacy row.
 // Without a bound request this falls back to the singular alias match (ambiguous aliases still match nothing).
 export function requestsForSource(requests, source) {
+  if (untaggedCard(source)) return liveFirst(projectRequests(requests).filter(r => boundToUntagged(r, source)))
   const key = sourceKey(source)
   if (!key) return []
   const bound = projectRequests(requests).filter(r => {
