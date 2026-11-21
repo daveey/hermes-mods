@@ -9,7 +9,8 @@ a hub under load timed the worker out and respawned it every ~1.3 s):
 * The share window the advisory measures only moves when a minute ends (``slots.collect``: ``until`` is the last
   minute boundary; the sampler writes that minute ~2 s after it). So each owner computes once per minute:
   ``TICK_OFFSET_S`` after the boundary, and at most once for that minute however many reads arrive and whether the
-  flight succeeded or failed (a failure waits for the next minute; it is never retried within one).
+  flight succeeded or failed (a failure waits for the next minute; it is never retried within one). Nothing starts
+  in a minute's first ``TICK_OFFSET_S`` (the sampler has not written the minute that just ended).
 * Reads do not drive refreshes. A read records interest (``read(..., interest=True)``); a read that finds no usable
   snapshot and no flight yet for its minute starts that minute's flight (cold start). The scheduler thread runs only
   while some read recorded interest in the last ``INTEREST_S``; with none it exits and nothing is computed.
@@ -57,10 +58,11 @@ class Owner:
     def interested(self) -> bool:
         return time.monotonic() < self.last_read + INTEREST_S
 
-    def launch(self, request):
-        """Called under lock; at most one child, including during kill/reap, and one per minute."""
-        minute = minute_of(request)
-        if (self.cancel.is_set() or self.attempted == minute
+    def launch(self, request, minute=None):
+        """Called under lock; at most one child, including during kill/reap, and one per minute (``minute``: the
+        minute this flight stands for; default the request's)."""
+        minute = minute_of(request) if minute is None else minute
+        if (self.cancel.is_set() or (self.attempted is not None and self.attempted >= minute)
                 or (self.thread is not None and self.thread.is_alive())):
             return False
         self.attempted = minute
@@ -81,8 +83,10 @@ class Owner:
                 self.prepare = prepare
             if not self.interested():
                 return hit  # nobody asked lately: never compute (the pusher's own reads record no interest)
-            if not fresh(hit):
-                self.launch(request)  # cold start; a no-op once this minute had its flight
+            # Cold start; a no-op once this minute had its flight. Never in the first TICK_OFFSET_S of a minute:
+            # the sampler has not written the minute that just ended, and the flight would spend the minute on it.
+            if not fresh(hit) and float(request["now"]) % 60 >= TICK_OFFSET_S:
+                self.launch(request)
             if self.prepare is not None and (self.scheduler is None or not self.scheduler.is_alive()):
                 self.scheduler = threading.Thread(target=self.schedule,
                                                    name="throughput-slots-schedule", daemon=True)
@@ -104,14 +108,20 @@ class Owner:
                 delay = min(delay, self.last_read + INTEREST_S - time.monotonic())
                 prepare = self.prepare
                 running = self.thread is not None and self.thread.is_alive()
-                pending = self.attempted is None or self.attempted < due
+                # Only the current minute's tick, once its offset has passed (a cold start in the first
+                # TICK_OFFSET_S waits for this minute's tick instead of computing the last one early).
+                pending = due == int(wall // 60) and (self.attempted is None or self.attempted < due)
             if pending and not running and prepare is not None:
                 # Preparation is restricted to clocks and the nonblocking Cards snapshot.
                 # Never retain a request's old attribution or timestamp for a future flight.
                 request = prepare()
                 with self.lock:
-                    if self.interested():
-                        self.launch(request)
+                    # The flight stands for the due tick, whatever clock the request carries: a request whose
+                    # minute lags the wall clock must not leave the tick pending (and this loop spinning).
+                    launched = self.interested() and self.launch(request, due)
+                if launched:
+                    continue
+                self.wake.wait(max(0.01, delay))
                 continue
             self.wake.wait(max(0.01, delay) if not running else 0.05)
 

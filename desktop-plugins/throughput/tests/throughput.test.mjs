@@ -976,3 +976,40 @@ test('applySnapshot: series by name only are re-read; invalid bodies never land;
   assert.deepEqual(set, [[['throughput', 'throttle'], { percent: 40 }]])
   assert.equal(P.applySnapshot(client, null), false)
 })
+
+test('push: one that leaves out this window\'s view is not trusted and the window watches again', async () => {
+  localStorage.setItem(P.STORE_KEY, JSON.stringify({ unit: 'm', range: '1h', cache: false }))
+  const listeners = new Map()
+  const FEED = 'hub:78'
+  const ctx = ctxWith((path) => path === '/v1/watch' ? { feed: FEED, series_keys: [], series: {}, throttle: null } : forRange(path))
+  ctx.onEvent = (type, fn) => { listeners.set(type, fn); return () => listeners.delete(type) }
+  const ui = await mount(React.createElement(P.Throughput, { ctx }))
+  const realNow = Date.now
+  try {
+    const watches = () => ctx.calls.filter(([p]) => p === '/v1/watch').length
+    assert.equal(watches(), 1)
+    const series = () => ui.client.getQueryCache().find({ queryKey: ['throughput', 'series', '1h'] })
+    const t0 = realNow()
+    Date.now = () => t0 + P.REWATCH_MS + 1
+    // Our gateway pushes, but only other windows' views (ours was pushed out of its four).
+    await React.act(async () => listeners.get(P.SNAPSHOT_EVENT)({ payload: { feed: FEED, series_keys: ['6h|gateway', '24h|gateway', '7d|gateway', '6h|model'], series: {} } }))
+    await ui.flush()
+    assert.equal(series().observers[0].options.refetchInterval, P.POLL_MS, 'not live: our view was not pushed')
+    assert.equal(watches(), 2, 're-registered')
+    await React.act(async () => listeners.get(P.SNAPSHOT_EVENT)({ payload: { feed: FEED, series_keys: ['6h|gateway'], series: {} } }))
+    await ui.flush()
+    assert.equal(watches(), 2, 'at most one re-watch per REWATCH_MS')
+    await React.act(async () => listeners.get(P.SNAPSHOT_EVENT)({ payload: { feed: FEED, series_keys: ['1h|gateway'], series: { '1h|gateway': payload() } } }))
+    await ui.flush()
+    assert.equal(series().observers[0].options.refetchInterval, P.SAFETY_MS, 'covered: live')
+  } finally {
+    Date.now = realNow
+    await ui.close()
+  }
+})
+
+test('pushCovers: every view this window shows must be named', () => {
+  assert.equal(P.pushCovers({ series_keys: ['1h|gateway', '1h|model'] }, ['1h|gateway', '1h|model']), true)
+  assert.equal(P.pushCovers({ series_keys: ['1h|gateway'] }, ['1h|gateway', '1h|model']), false)
+  assert.equal(P.pushCovers({}, ['1h|gateway']), false)
+})

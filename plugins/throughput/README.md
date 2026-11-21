@@ -451,8 +451,8 @@ registers interest for 5 minutes and answers the current snapshot (the catch-up)
 `GET /v1/throttle` count as interest too; only `GET /v1/throttle` and a watch with `advisory: true` keep the slots
 advisory computing. While anyone is interested, the process serving the Desktop (`hermes serve`; no thread starts
 where the gateway transport is not loaded) pushes **`plugin.throughput.snapshot`** once a minute, right after that
-minute's advisory flight (at the latest 20 s into the minute), plus once when interest starts and after a cold-start
-flight:
+minute's advisory flight (at the latest 20 s into the minute), plus once when interest starts and after every other
+finished advisory flight (a cold start), changed or not:
 
 ```json
 {"feed": "hub:4242", "epoch": "…", "seq": 7, "at": 1800000003.1, "minute": 1800000000, "interval_s": 60,

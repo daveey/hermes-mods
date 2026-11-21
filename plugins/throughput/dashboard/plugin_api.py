@@ -13,8 +13,9 @@ POST /api/plugins/throughput/v1/watch (body ``{"series": [{"range": "6h", "by": 
 register interest (5 min) and catch up: answers the current snapshot (below). GET /v1/throttle and /v1/series count as
 interest too. Only GET /v1/throttle and a watch with ``advisory: true`` keep the per-minute slots advisory computing.
 Push: ``plugin.throughput.snapshot`` ``{feed, epoch, seq, at, minute, interval_s, throttle, series, series_keys}`` once a
-minute (right after the minute's advisory flight, advisory.py; at the latest ``PUSH_DEADLINE_S`` into the minute) and
-after an advisory flight that changed it, while a client showed interest in the last ``INTEREST_S``. ``throttle`` is
+minute (right after the minute's advisory flight, advisory.py; at the latest ``PUSH_DEADLINE_S`` into the minute), once
+when interest starts, and after every other finished advisory flight (a cold start), while a client showed interest
+in the last ``INTEREST_S``. ``throttle`` is
 the GET /v1/throttle payload, ``series`` the GET /v1/series payloads of the (range, by) views read or watched lately
 (at most ``MAX_SERIES_KEYS``). JSON-safe; over ``PUSH_MAX_BYTES`` the series are sent by name only (``series_keys``).
 ``feed`` (host:pid) is also on the GET /v1/throttle payload, so a client can tell which connection a push is from.
@@ -441,7 +442,6 @@ class Pusher:
         self.interest_at = float("-inf")
         self.keys: Dict[str, float] = {}  # "range|by" -> last interest
         self.pushed_minute = None
-        self.last_hash = None
         self.kick = threading.Event()
         self.stopped = threading.Event()
         self.thread = None
@@ -473,12 +473,13 @@ class Pusher:
         to push to; elsewhere (tests, a CLI importing the router) no thread starts."""
         return "tui_gateway.server" in sys.modules
 
-    def snapshot(self) -> Dict[str, Any]:
-        """The push body (also the catch-up answer). Reads record no interest (they must not keep themselves alive)."""
+    def snapshot(self, build_throttle=None) -> Dict[str, Any]:
+        """The push body (also the catch-up answer). The push's reads record no interest (they must not keep
+        themselves alive); the watch passes its own ``build_throttle``."""
         with self.lock:
             keys = sorted(k for k, at in self.keys.items() if self.clock() - at < INTEREST_S)
         try:
-            throttle = self.build_throttle()
+            throttle = (build_throttle or self.build_throttle)()
         except Exception:
             _log.debug("throughput push: throttle unavailable", exc_info=True)
             throttle = None
@@ -495,11 +496,9 @@ class Pusher:
 
     def push(self) -> Dict[str, Any]:
         body = json_safe(self.snapshot())
-        digest = json.dumps({k: body.get(k) for k in ("throttle", "series")}, sort_keys=True)
         body["seq"] = next(self.seq)
         if len(json.dumps(body)) > PUSH_MAX_BYTES:
             body["series"] = {}  # names stay in series_keys: clients read those views themselves
-        self.last_hash = digest
         self.emit(body)
         self.pushes += 1
         return body
@@ -602,5 +601,5 @@ async def watch(body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
     # ``advisory: true`` (a client that shows slot limits) keeps the per-minute slots advisory alive, like a GET
     # /v1/throttle; a client that only charts series does not.
     advisory = bool((body or {}).get("advisory"))
-    snap = await asyncio.to_thread(lambda: {**p.snapshot(), "throttle": throttle_payload(interest=advisory)})
+    snap = await asyncio.to_thread(p.snapshot, lambda: throttle_payload(interest=advisory))
     return json_safe({**snap, "seq": None, "interest_s": INTEREST_S})

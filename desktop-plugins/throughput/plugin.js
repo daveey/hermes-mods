@@ -21,6 +21,7 @@ export const POLL_MS = 30000
 export const SNAPSHOT_EVENT = 'plugin.throughput.snapshot'
 export const PUSH_TRUST_MS = 120000
 export const SAFETY_MS = 240000
+export const REWATCH_MS = 30000
 export const REQUEST_TIMEOUT_MS = 20000 // the hub answers in 0.3-10 s under load
 export const STORE_KEY = 'hermes-throughput-view'
 export const RANGES = ['1h', '6h', '24h', '7d']
@@ -38,6 +39,10 @@ const BAR = 'inline-flex h-full items-center gap-1.5 px-1.5 text-[0.6875rem] tex
 export const validSeries = (body, by = 'gateway') =>
   !!body && Array.isArray(body.gateways) && (by !== 'model' || Array.isArray(body.models)) && !!body.series && !!body.bucket_s
 export const seriesQueryKey = (range, by = 'gateway') => by === 'model' ? ['throughput', 'series', range, 'model'] : ['throughput', 'series', range]
+
+// A push counts toward liveness only when it carries every view this window shows (by name: a view too big to push is
+// still named in series_keys and re-read).
+export const pushCovers = (p, keys) => Array.isArray(p?.series_keys) && keys.every((k) => p.series_keys.includes(k))
 
 // One snapshot (a push, or the watch answer) into the query cache: every series view it carries, and the throttle. A
 // view sent by name only (too big to push) is re-read. True when it carried anything usable.
@@ -796,6 +801,11 @@ export function Throughput({ ctx }) {
   const client = useQueryClient()
   // Push: the gateway's feed id (from the watch answer) and when its last push arrived.
   const feed = useRef(null)
+  // This window's views as the gateway names them; a push that leaves one out (the gateway keeps the 4 most recently
+  // watched views, and another window or a hover prefetch may have pushed ours out) is not trusted, and we re-watch.
+  const want = useRef([])
+  want.current = [`${view.range}|gateway`, ...(view.by === 'model' ? [`${view.range}|model`] : [])]
+  const rewatch = useRef(() => {})
   const [liveAt, setLiveAt] = useState(-Infinity)
   const [clock, setClock] = useState(() => Date.now())
   const live = clock - liveAt < PUSH_TRUST_MS
@@ -806,6 +816,7 @@ export function Throughput({ ctx }) {
       const p = ev?.payload
       if (!p?.feed || p.feed !== feed.current) return // another gateway's, or before our watch answered
       applySnapshot(client, p)
+      if (!pushCovers(p, want.current)) { rewatch.current(); return }
       const t = Date.now()
       setLiveAt(t); setClock(t)
     }) : null
@@ -830,9 +841,14 @@ export function Throughput({ ctx }) {
         applySnapshot(client, body)
       } catch { /* an older gateway without /v1/watch: the polls below carry on */ }
     }
-    void watch()
-    const t = setInterval(() => void watch(), SAFETY_MS)
-    return () => { gone = true; clearInterval(t) }
+    let lastAt = -Infinity
+    rewatch.current = () => { // at most every REWATCH_MS: two windows with different views must not ping-pong
+      if (Date.now() - lastAt < REWATCH_MS) return
+      lastAt = Date.now(); void watch()
+    }
+    rewatch.current()
+    const t = setInterval(() => { lastAt = Date.now(); void watch() }, SAFETY_MS)
+    return () => { gone = true; clearInterval(t); rewatch.current = () => {} }
   }, [ctx, client, visible, view.range, view.by, advisory])
   // Hovering a range button fetches it ahead of the click, so switching is usually instant.
   const prefetch = (range) => {

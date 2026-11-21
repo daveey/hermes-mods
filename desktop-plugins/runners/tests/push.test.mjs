@@ -60,6 +60,12 @@ test('pushes from another gateway or profile are ignored; a heartbeat confirms o
   t += 60000
   assert.equal(transport.applyPush({ feed: FEED, profile: 'example', heartbeat: true, hash: 'nope' }), false)
   assert.equal(transport.routes.values().next().value.at, NOW, 'an unmatched heartbeat does not vouch for the data')
+  assert.equal(transport.routes.values().next().value.dirty, true, 'an unmatched heartbeat means a missed change')
+  const before = ctx.calls.length
+  t += P.POLL_OPEN_MS
+  await transport.poll()
+  assert.equal(ctx.calls.length, before + 1, 'so the next poll reads it although pushes are live')
+  assert.equal(transport.routes.values().next().value.dirty, false)
   assert.equal(transport.applyPush({ feed: FEED, profile: 'example', heartbeat: true, hash: 'h1' }), true)
   assert.equal(transport.routes.values().next().value.at, t, 'same hash as our answer: current again')
 })

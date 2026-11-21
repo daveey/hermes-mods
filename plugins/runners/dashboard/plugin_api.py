@@ -5,8 +5,9 @@ OAuth verification and token verification. No caller-selected profile/home is us
 
 Push (see FleetPusher at the end): while a client read GET /v1/fleet in the last FLEET_INTEREST_S, this process
 checks its own (launch) profile's fleet every FLEET_CHECK_S and pushes ``plugin.runners.fleet``
-``{feed, epoch, seq, at, profile, fleet}`` when it changed, else ``{..., heartbeat: true}`` every
-FLEET_HEARTBEAT_S. GET /v1/fleet carries the same ``feed`` (host:pid), so a client can tell which connection a push
+``{feed, epoch, seq, at, profile, hash, fleet}`` when it changed (ignoring build and machine-report times), else
+every FLEET_HEARTBEAT_S the fleet again if its reported loads/times moved or ``{..., heartbeat: true}``. The push
+thread stops with the router's lifespan. GET /v1/fleet carries the same ``feed`` (host:pid), so a client can tell which connection a push
 came from. A fleet over FLEET_PUSH_MAX_BYTES goes out as ``{changed: true}`` only (clients read it).
 
 Cookie sessions require a same-origin Origin for refresh; native loopback session
@@ -139,7 +140,18 @@ def authorize(request: Request):
         raise HTTPException(403, 'origin_required')
 
 
-router = APIRouter(prefix='/v1', dependencies=[Depends(authorize)])
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def _lifespan(app):
+    try:
+        yield
+    finally:
+        stop_fleet_pusher()  # plugin reload / server shutdown: no push thread outlives this router
+
+
+router = APIRouter(prefix='/v1', dependencies=[Depends(authorize)], lifespan=_lifespan)
 
 
 def invoke(operation, *args, **kwargs):
@@ -678,7 +690,13 @@ FLEET_INTEREST_S = 300.0   # no GET /v1/fleet for 5 min: no checks, no pushes
 FLEET_CHECK_S = 15.0       # the Desktop's old poll cadence, now once per process instead of per window and route
 FLEET_HEARTBEAT_S = 60.0   # with nothing changed, clients still hear from us this often (their trust lasts 2 min)
 FLEET_PUSH_MAX_BYTES = 256 * 1024
-_VOLATILE = ('generated_at',)
+# Fields that move with the clock, not with the fleet: a rebuild stamps them anew (fleet.py ``with_worker_events``
+# ``events_since = now - 24 h``, ``generated_at``). Left in the digest, every 15 s check would push the whole fleet.
+_VOLATILE = frozenset(('generated_at', 'events_since'))
+# Also left out of the *change* digest (they move every ~30 s as machines report): last_seen, load and CI
+# observation times. They still reach clients: a fleet whose full digest moved is sent in place of the heartbeat
+# (at most every FLEET_HEARTBEAT_S), so load bars stay under a minute old without a push every check.
+_REPORTED = frozenset(('last_seen', 'load', 'observed_at'))
 _push_log = logging.getLogger('hermes.plugins.runners')
 
 
@@ -694,10 +712,22 @@ def _json_safe(v):
     return str(v)
 
 
-def fleet_digest(fleet):
-    """One fleet's identity, ignoring when it was built."""
-    return hashlib.sha1(json.dumps({k: v for k, v in fleet.items() if k not in _VOLATILE},
-                                   sort_keys=True, default=str).encode()).hexdigest()
+def _without(v, keys):
+    if isinstance(v, dict):
+        return {k: _without(x, keys) for k, x in v.items() if k not in keys}
+    if isinstance(v, list):
+        return [_without(x, keys) for x in v]
+    return v
+
+
+def fleet_digest(fleet, ignore=_VOLATILE):
+    """One fleet's identity, ignoring fields that only say when it was built (at any depth)."""
+    return hashlib.sha1(json.dumps(_without(fleet, ignore), sort_keys=True, default=str).encode()).hexdigest()
+
+
+def fleet_change_digest(fleet):
+    """What makes a push worth sending at once: the fleet without build times and machine report times."""
+    return fleet_digest(fleet, _VOLATILE | _REPORTED)
 
 
 class FleetPusher:
@@ -709,7 +739,8 @@ class FleetPusher:
         self.seq = itertools.count(1)
         self.lock = threading.Lock()
         self.interest_at = float('-inf')
-        self.last_hash = None
+        self.last_hash = None     # full digest of the fleet clients last got (heartbeats name it)
+        self.last_change = None   # its change digest
         self.last_push = float('-inf')
         self.stopped = threading.Event()
         self.thread = None
@@ -735,19 +766,20 @@ class FleetPusher:
             return None
         profile, fleet = self.build()
         fleet = _json_safe(fleet)
-        digest = fleet_digest(fleet)
+        digest, change = fleet_digest(fleet), fleet_change_digest(fleet)
         now = self.clock()
+        due = now - self.last_push >= FLEET_HEARTBEAT_S
         base = dict(feed=FEED_ID, epoch=self.epoch, at=self.wall(), profile=profile, hash=digest)
-        if digest != self.last_hash:
+        if change != self.last_change or (due and digest != self.last_hash):
             body = dict(base, seq=next(self.seq), fleet=fleet)
             if len(json.dumps(body)) > FLEET_PUSH_MAX_BYTES:
                 body = dict(base, seq=body['seq'], fleet=None, changed=True)
-        elif now - self.last_push >= FLEET_HEARTBEAT_S:
+        elif due:
             body = dict(base, seq=next(self.seq), heartbeat=True)
         else:
             return None
         self.emit(body)
-        self.last_hash, self.last_push = digest, now
+        self.last_hash, self.last_change, self.last_push = digest, change, now
         return body
 
     def run(self):
@@ -787,3 +819,10 @@ def fleet_pusher():
         if p is None or p.stopped.is_set():
             p = _fleet_pusher['p'] = FleetPusher(_emit_fleet, _launch_fleet)
         return p
+
+
+def stop_fleet_pusher():
+    with _fleet_pusher_lock:
+        p = _fleet_pusher.pop('p', None)
+    if p is not None:
+        p.stop()

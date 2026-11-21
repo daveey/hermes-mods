@@ -9,9 +9,12 @@ The dashboard mounts `plugin_api.py` at `/api/plugins/runners`:
   `hash` (the fleet's identity, ignoring `generated_at`).
 - Push `plugin.runners.fleet` `{feed, epoch, seq, at, profile, hash, fleet | heartbeat | changed}`: while a client
   read `/v1/fleet` in the last 5 min, the serving process (where core's gateway transport is loaded) checks its
-  own profile's fleet every 15 s and pushes it when it changed, else a heartbeat every 60 s; JSON-safe, and over
-  256 KB only `changed: true` (clients read it). The push thread starts on the first read and exits when interest
-  lapses. Tests: `tests/test_fleet_push.py`.
+  own profile's fleet every 15 s and pushes it when it changed, ignoring build times (`generated_at`,
+  `events_since`) and machine report times (`last_seen`, `load`, `observed_at`); every 60 s it sends the fleet again
+  if only those report fields moved, else a heartbeat naming the fleet's `hash`. JSON-safe, and over 256 KB only
+  `changed: true` (clients read it). The push thread starts on the first read, exits when interest lapses, and is
+  stopped by the router's lifespan (reload, shutdown). Tests: `tests/test_fleet_push.py`, `tests/test_api.py`
+  `test_fleet_route_carries_feed_and_the_push_hash`.
 
 Uses core `_require_token` and verified `request.state.token_authenticated`.
 Query tokens and connection identifiers are not credentials. Every supplied Origin

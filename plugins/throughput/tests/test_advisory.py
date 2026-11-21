@@ -412,3 +412,40 @@ def test_register_owns_reload_cleanup(monkeypatch):
     assert A._stopped
     plugin.register(Context())
     assert not A._stopped
+
+
+def test_a_request_behind_the_wall_clock_does_not_spin_the_scheduler(tmp_path, monkeypatch):
+    clock = fake_clock(monkeypatch)
+    series, replica = measurement(tmp_path)
+    assert S.payload(tmp_path, series, 1000, replicas=[replica]) is None
+    owner = join(tmp_path)
+    calls = []
+    stale = owner.prepare
+
+    def lagging():  # a request stamped a minute behind the wall clock
+        calls.append(1)
+        req = stale()
+        req["now"] -= 60
+        return req
+    with owner.lock:
+        owner.prepare = lagging
+    clock[0] += 60  # the next tick is due
+    owner.wake.set()
+    wait_for(lambda: owner.attempted == int((clock[0] - A.TICK_OFFSET_S) // 60))
+    owner.thread.join(3)
+    time.sleep(0.2)  # a spinning loop would call prepare() thousands of times here
+    assert len(calls) == 1 and owner.flights == 2
+
+
+def test_no_cold_start_flight_before_the_tick_offset(tmp_path, monkeypatch):
+    clock = fake_clock(monkeypatch, start=END + 60 + 1)  # 1 s into a minute: the sampler has not written yet
+    series = tmp_path / "series.db"
+    Store(series).put("worker-1", "tokens_io", [(END, 900000)])
+    replica = _replica(tmp_path, [("t", "done", START + 60, END + 60, {"holder": "worker-1"}, False)])
+    assert S.payload(tmp_path, series, 1000, replicas=[replica]) is None
+    owner = A._owners[str(tmp_path)]
+    time.sleep(0.05)
+    assert owner.thread is None and owner.attempted is None  # this minute's flight is not spent early
+    clock[0] = END + 60 + A.TICK_OFFSET_S  # the tick: the scheduler (started by that read) computes it
+    settle(owner, clock)
+    assert owner.flights == 1 and S.payload(tmp_path, series, 1000, replicas=[replica]) is not None

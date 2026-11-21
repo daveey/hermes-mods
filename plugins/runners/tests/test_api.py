@@ -931,3 +931,19 @@ def test_local_cap_reads_the_kanban_home_config_for_every_profile(api, monkeypat
     assert module._local_cap() == 8
     (tmp_path / 'config.yaml').unlink()
     assert module._local_cap() == 8
+
+
+def test_fleet_route_carries_feed_and_the_push_hash(disk_api, monkeypatch):
+    """REST path: GET /v1/fleet names this process's feed and the same hash its pushes give the same fleet."""
+    module, client, _, _, _, _ = disk_api
+    module.FLEET_CACHE_S = 60
+    monkeypatch.setattr(module, '_gateway_section', lambda: dict(state='ready', machines=[dict(name='hub', slots=4, running=[])],
+                                                                  events_since=1.5))
+    body = client.get(PREFIX + '/fleet', headers=TOKEN).json()
+    assert body['feed'] == module.FEED_ID
+    sent = []
+    pusher = module.FleetPusher(sent.append, lambda: (body['profile'], module._fleet_cache[body['profile']]['value']))
+    pusher.note()
+    pushed = pusher.step()
+    assert pushed['hash'] == body['hash'] and pushed['fleet']['gateways']['machines'] == body['gateways']['machines']
+    assert 'feed' not in module._fleet_cache[body['profile']]['value'], 'the cached build is never mutated'

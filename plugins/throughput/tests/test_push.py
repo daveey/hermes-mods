@@ -132,3 +132,50 @@ def test_push_thread_pushes_on_a_kick_and_exits_without_interest(api, monkeypatc
     assert not thread.is_alive() and p.thread is None  # no interest: the thread is gone, nothing more pushed
     assert len(sent) == 2
     p.stop()
+
+
+@pytest.mark.parametrize("advisory", [True, False])
+def test_watch_builds_the_throttle_once_with_advisory_interest_only_when_asked(api, tmp_path, monkeypatch, advisory):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(api, "_registry", lambda: {"me": "worker-1"})
+    builds = []
+    monkeypatch.setattr(api, "throttle_payload", lambda now=None, interest=True: builds.append(interest) or {"percent": 3})
+    app = FastAPI()
+    app.include_router(api.router, prefix="/p")
+    with TestClient(app) as client:
+        got = client.post("/p/v1/watch", json={"series": [], "advisory": advisory}).json()
+    assert got["throttle"] == {"percent": 3}
+    assert builds == [advisory]  # one build, recording advisory interest only when asked
+
+
+def test_watch_advisory_flag_reaches_the_real_slots_interest(api, tmp_path, monkeypatch):
+    import importlib
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(api, "_registry", lambda: {"me": "worker-1"})
+    app = FastAPI()
+    app.include_router(api.router, prefix="/p")
+    with TestClient(app) as client:
+        advisory = importlib.import_module(api.pkg().__name__ + ".advisory")
+        client.post("/p/v1/watch", json={"advisory": False})
+        owner = advisory._owners.get(str(api._state["root"]))
+        assert owner is None or not owner.interested()  # a chart-only watcher keeps nothing computing
+        client.post("/p/v1/watch", json={"advisory": True})
+        assert advisory._owners[str(api._state["root"])].interested()
+
+
+def test_lifespan_shutdown_stops_the_pusher(api, tmp_path, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(api, "_registry", lambda: {"me": "worker-1"})
+    app = FastAPI()
+    app.include_router(api.router, prefix="/p")
+    with TestClient(app) as client:
+        client.get("/p/v1/throttle")
+        p = api.pusher()
+        assert not p.stopped.is_set()
+    assert p.stopped.is_set() and "p" not in api._pusher

@@ -68,7 +68,7 @@ export function createTransport(ctx, hostRef = host, clock = () => Date.now()) {
       )
       if (body?.contract_version !== 1 || !body.gateways || !body.ci) throw Error('Invalid fleet response')
       const cur = routes.get(key) || {}
-      routes.set(key, { route, body, at: clock(), fetchedAt: clock(), failures: 0, nextAt: 0, liveAt: cur.liveAt, pushHash: typeof body.hash === 'string' ? body.hash : undefined })
+      routes.set(key, { route, body, at: clock(), fetchedAt: clock(), failures: 0, nextAt: 0, liveAt: cur.liveAt, pushHash: typeof body.hash === 'string' ? body.hash : undefined, dirty: false })
     } catch (e) {
       const failures = s.failures + 1
       const status = e?.status ?? e?.statusCode
@@ -137,10 +137,11 @@ export function createTransport(ctx, hostRef = host, clock = () => Date.now()) {
         routes.set(key, { ...s, body: { ...p.fleet, feed: p.feed }, at: now, failures: 0, nextAt: 0, liveAt: now, pushHash: p.hash, dirty: false })
         changed = true
       } else if (p.heartbeat) {
-        // The gateway's fleet is still the one we hold (same hash as our last answer or push): current again. A
-        // heartbeat over data we cannot match only keeps the gateway counted as live.
-        routes.set(key, { ...s, liveAt: now, ...(s.pushHash && s.pushHash === p.hash ? { at: now } : {}) })
-        changed = changed || (s.pushHash && s.pushHash === p.hash)
+        // The gateway's fleet is still the one we hold (same hash as our last answer or push): current again. Any
+        // other hash means we missed a change: read it on the next poll.
+        const same = !!s.pushHash && s.pushHash === p.hash
+        routes.set(key, { ...s, liveAt: now, ...(same ? { at: now } : { dirty: true }) })
+        changed = changed || same
       } else {
         routes.set(key, { ...s, liveAt: now, dirty: true }) // too big to push: read it on the next poll
       }
