@@ -83,6 +83,8 @@ ask is moot. Agree with that owner which PR lands; the other then conflicts and 
 
 ## Telling the user when it merges
 
+Claim "approved" or "CI green" only for the SHA the approval or run names, and only when that SHA is the PR's current `headRefOid`. Being an ancestor of the head isn't enough, because later commits carry unreviewed code. Check with `gh run list -b <branch> --json headSha,conclusion`; a superseded run is `cancelled`.
+
 Never tell the user when a PR will merge, land or deploy from a card's plan or an earlier reply. Check that PR in
 the same turn (this checker, or `gh pr view N --json state,mergeStateStatus,reviewDecision` plus `gh pr checks N`)
 and list every open step: failing or pending checks and whether main fails the same ones, whether the approval
