@@ -32,7 +32,9 @@ PROCESS_MESSAGE = ("[coach long_wait_pending_reply] The user is waiting and has 
                    "use it to report the actual result. Otherwise reply now with what you know; its completion "
                    "notification brings the result. " + _PENDING + " (This long wait was not run.)")
 
-_SLEEP = re.compile(r"\bsleep\s+(\d+(?:\.\d+)?)([smhd]?)\b")
+# Shell `sleep 30` and Python/JS `time.sleep(30)` / `asyncio.sleep(30)` (self-heal: a 240 s `while ...: time.sleep(1)`
+# heredoc sampler ran unrefused because only the shell form was matched).
+_SLEEP = re.compile(r"\bsleep(?:\s+|\s*\(\s*)(\d+(?:\.\d+)?)([smhd]?)\b")
 _UNIT = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 # The user asked for the delay: "wait 2 minutes", "check in 5 min", "after the update finishes", "later".
 _ASKS_DELAY = re.compile(
@@ -48,10 +50,7 @@ def wait_seconds(tool: str, args) -> float | None:
         return None
     name = str(tool or "").rsplit("__", 1)[-1]
     if name == "terminal":
-        if args.get("background"):
-            return None
-        total = sum(float(n) * _UNIT[u] for n, u in _SLEEP.findall(str(args.get("command") or "")))
-        return total or None
+        return terminal_wait(args)  # a loop with sleep is unbounded, so the first silent sampler is held too
     if name == "process_manage" and str(args.get("action") or "") == "wait":
         t = args.get("timeout")
         try:
@@ -61,8 +60,16 @@ def wait_seconds(tool: str, args) -> float | None:
     return None
 
 
+# A decision-button turn opens with core's boilerplate ("... after validating, call action_request ..."), whose
+# "after" turned off both wait rules for the whole turn (incident 20261121_045343_355be8: two silent foreground
+# samplers, 80 s and 240 s). A button pick never asks for a delay, so it counts as no delay ask.
+_DECISION = "Canonical user decision."
+
+
 def asks_delay(ask) -> bool:
-    return isinstance(ask, str) and bool(_ASKS_DELAY.search(ask))
+    if not isinstance(ask, str) or ask.lstrip().startswith(_DECISION):
+        return False
+    return bool(_ASKS_DELAY.search(ask))
 
 
 def live_turn(platform: str = "", parent_session_id: str = "") -> bool:
@@ -122,7 +129,12 @@ LIVE_MESSAGE = ("[coach live_chat_sleep] A person is waiting in this chat and ha
                 "a foreground wait shows them nothing until it ends. First reply with the status: what is done, what "
                 "you are waiting for, and until when. Then run the wait and the retry with terminal(background=true, "
                 "notify=true) (or park them on a scheduled card) and end the turn. (This {what} wait was not run.)")
-_LOOP_SLEEP = re.compile(r"\b(while|until|for)\b[^\n]*?(;|\n|\bdo\b)[\s\S]*?\bsleep\s+\d", re.I)
+# A real loop whose body sleeps: a shell `for|while|until ... do ... sleep N ... done` starting a command, or a Python
+# `while|for ...:` line followed by `sleep(N)`. The bare word "for" in prose (`--reason "... for rows 4-6"; sleep 2`)
+# or a sleep after `done` is no loop: replaying 3 days of hub desktop commands, the looser form flagged 41 such calls.
+_LOOP_SLEEP = re.compile(
+    r"(?:^|[;&|({'\"]|\bdo\b|\bthen\b)\s*(?:for|while|until)\b[^\n]*?\bdo\b(?:(?!\bdone\b)[\s\S])*?\bsleep\s+\d"
+    r"|^[ \t]*(?:while|for)\b[^\n]*:[ \t]*$[\s\S]*?\bsleep\s*\(\s*\d", re.M)
 
 
 def now() -> float:
@@ -189,12 +201,14 @@ def check(turns: dict, session_id: str, tool: str, args, log) -> str | None:
         return None
     name = str(tool).rsplit("__", 1)[-1]
     if t.get("held"):
-        log({"event": "long_wait_repeat", "rule": RULE, "session_id": session_id, "tool": name, "secs": secs})
+        log({"event": "long_wait_repeat", "rule": RULE, "session_id": session_id, "tool": name,
+             "secs": None if secs == float("inf") else secs})
         return None
     if persisted_reply(session_id):  # the interim hook is queued; text sent with this very call may not be in yet
         t["replied"] = True
         t["replied_at"] = now()  # text the hook has not delivered yet is this moment's status (live_chat_sleep)
         return None
     t["held"] = True
-    log({"event": "agent_block", "rule": RULE, "session_id": session_id, "tool": name, "secs": secs})
+    log({"event": "agent_block", "rule": RULE, "session_id": session_id, "tool": name,
+         "secs": None if secs == float("inf") else secs})
     return PROCESS_MESSAGE if name == "process_manage" else MESSAGE

@@ -129,10 +129,11 @@ def test_loop_with_sleep_is_unbounded_and_blocked(chat):
     store, hooks, clock = chat
     _incident_turn(hooks, clock)
     assert _block(hooks, LOOP)
-    # and before any reply at all, where long_wait_pending_reply's 60 s sum misses it (one sleep 30)
+    # and before any reply at all: long_wait_pending_reply now counts a loop with sleep as unbounded too
     hooks["pre_llm_call"](session_id="s9", user_message=ASK, platform="desktop")
-    assert _block(hooks, LOOP, sid="s9")
-    assert [r["secs"] for r in _rows(store) if r.get("rule") == "live_chat_sleep"] == [None, None]
+    out = _block(hooks, LOOP, sid="s9")
+    assert out and "long_wait_pending_reply" in out["message"]
+    assert [r["secs"] for r in _rows(store) if r.get("rule") == "live_chat_sleep"] == [None]
 
 
 def test_first_wait_before_any_reply_stays_long_wait_pending_reply(chat):
