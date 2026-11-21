@@ -106,6 +106,63 @@ def test_changes_watches_and_returns_everything_on_a_new_epoch_then_only_newer_r
     assert set(stale['bundles']) == {'S1'}, 'a client behind gets the newer bundle'
 
 
+def test_concurrent_catch_ups_compute_each_missing_chat_once():
+    """Live, hub serve 2026-11-21: 13 request threads each ran `_compute_all` for the same missing chats; the Desktop's
+    15 s timeout then retried them, adding more, until no request reached the backend in time (no cards shown)."""
+    import threading, time as _t
+    f, r, _, _ = make()
+    started, release, calls = threading.Event(), threading.Event(), []
+    real = r.lineage
+    def slow_lineage(s):
+        calls.append(s)
+        started.set()
+        release.wait(5)
+        return real(s)
+    r.lineage = slow_lineage
+    out = {}
+    first = threading.Thread(target=lambda: out.__setitem__('a', f.changes(['S1'])))
+    first.start()
+    assert started.wait(5)
+    second = threading.Thread(target=lambda: out.__setitem__('b', f.changes(['S1'])))
+    second.start()
+    _t.sleep(0.2)
+    assert calls == ['S1'], 'the second catch-up waits for the compute already running, it does not start its own'
+    release.set()
+    first.join(5); second.join(5)
+    assert set(out['a']['bundles']) == {'S1'} and set(out['b']['bundles']) == {'S1'}
+    assert calls == ['S1']
+
+
+def test_a_catch_up_waits_a_bounded_time_for_another_threads_compute(monkeypatch):
+    import threading
+    monkeypatch.setattr(feedmod, 'CATCHUP_WAIT_S', 0.2)
+    f, r, _, _ = make()
+    started, release = threading.Event(), threading.Event()
+    real = r.lineage
+    def slow_lineage(s):
+        started.set()
+        release.wait(5)
+        return real(s)
+    r.lineage = slow_lineage
+    t1 = threading.Thread(target=lambda: f.changes(['S1']))
+    t1.start()
+    assert started.wait(5)
+    r.lineage = real
+    quick = f.changes(['S1', 'S2'])
+    assert set(quick['bundles']) == {'S2'}, 'S1 is still computing: answer without it, the push delivers it'
+    release.set(); t1.join(5)
+    assert set(f.changes(['S1'], since=0, epoch=quick['epoch'])['bundles']) == {'S1'}
+
+
+def test_a_failed_compute_releases_its_claim():
+    f, r, _, _ = make()
+    real = r.lineage
+    r.lineage = lambda s: (_ for _ in ()).throw(RuntimeError('db locked'))
+    assert f.changes(['S1'])['bundles'] == {}
+    r.lineage = real
+    assert set(f.changes(['S1'])['bundles']) == {'S1'}, 'the next catch-up computes it again'
+
+
 def test_tick_pushes_only_chats_whose_cards_changed_in_one_batch():
     f, r, pushed, t = make()
     f.changes(['S1', 'S2'])
