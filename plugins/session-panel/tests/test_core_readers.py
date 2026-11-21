@@ -87,10 +87,17 @@ def test_push_payload_is_json_safe_and_bounded(api):
 
 
 def test_heartbeats_change_nothing_in_a_card_record(api, board, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import kanban_queue_position as kqp
+
     path, conn = board
     a = kanban_db.create_task(conn, title='A', initial_status='running', session_id='S1')
+    # Cross a second boundary deterministically, without changing unrelated core clocks.
+    clock = [2_000_000_000]
+    monkeypatch.setattr(kqp, 'time', SimpleNamespace(time=lambda: clock[0]))
     r = readers_for(api, path, monkeypatch)
     before = r.card(a, 'default')
+    clock[0] += 2
     conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'heartbeat', '{}', 1)", (a,))
     conn.execute('UPDATE tasks SET last_heartbeat_at = 123 WHERE id = ?', (a,))
     conn.commit()
@@ -104,6 +111,26 @@ def test_heartbeats_change_nothing_in_a_card_record(api, board, monkeypatch):
     diff = {k: (fb.get(k), fa.get(k)) for k in set(fb) | set(fa) if fb.get(k) != fa.get(k)}
     assert diff == {}, f'a heartbeat alone never re-pushes a bundle: {diff}'
     assert 'ready_since' in after['detail']['task']
+
+
+def test_card_keeps_queue_changes_and_recorded_evidence(api, board, monkeypatch):
+    from hermes_cli import kanban_queue_position as kqp
+
+    path, conn = board
+    a = kanban_db.create_task(conn, title='A', initial_status='running', session_id='S1')
+    queue = {'lane': 'local', 'ahead': 2, 'observed_at': 100,
+             'skip': {'reason': 'capacity', 'observed_at': 90}}
+    monkeypatch.setattr(kqp, 'detail_fields', lambda *_: {'queue': queue, 'queue_note': 'waiting'})
+    r = readers_for(api, path, monkeypatch)
+    before = r.card(a, 'default')['detail']
+    assert before['queue'] == {'lane': 'local', 'ahead': 2,
+                               'skip': {'reason': 'capacity', 'observed_at': 90}}
+    assert queue['observed_at'] == 100, 'do not mutate the core snapshot'
+    queue['ahead'] = 1
+    after = r.card(a, 'default')['detail']
+    assert after['queue']['ahead'] == 1
+    assert after['queue_note'] == 'waiting'
+    assert before['queue']['ahead'] == 2
 
 
 def test_each_thread_reads_on_its_own_connection_and_a_replaced_file_is_reopened(api, board, monkeypatch, tmp_path):
