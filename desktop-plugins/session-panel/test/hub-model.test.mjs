@@ -86,18 +86,14 @@ test('header counts/pips remain server values, not recomputed row totals', async
  assert.equal(document.querySelector('[data-model-pip]').textContent, '91 hub value')
  assert.equal(document.querySelector('[data-model-section="running"] h3').textContent, 'In progress · 78')
 })
-test('default-off setting registers a Desktop page; opt-in switches mount cached models with no legacy fetch', async () => {
- assert.equal(m.hubModelEnabled(), false)
- let page
+test('hub renderer is unconditional, registers no settings, and switches cached scopes without raw reads', async () => {
+ let page, registered
  const timers = [globalThis.setTimeout, globalThis.setInterval]
  globalThis.setTimeout = () => 0; globalThis.setInterval = () => 0
- const dispose = m.default.register({ register: () => {}, registerSettingsPage: p => { page = p } })
+ const dispose = m.default.register({ register: p => { registered = p }, registerSettingsPage: p => { page = p } })
  ;[globalThis.setTimeout, globalThis.setInterval] = timers
- assert.equal(page.title, 'Session Panel')
- await paint(page.render())
- assert.equal(document.querySelector('input').checked, false)
- await React.act(async () => document.querySelector('input').click())
- assert.equal(window.localStorage.getItem('sessionPanel.hubModel'), 'true')
+ assert.equal(page, undefined)
+ assert.equal(registered.area, 'composer.top')
  const a = publicCases.own_letters.model, b = publicCases.external_watch.model
  m.ingestBundle('conn', 'default', { session: 'chat', model: a })
  m.ingestBundle('conn', 'default', { session: 'other', model: b })
@@ -112,12 +108,41 @@ test('default-off setting registers a Desktop page; opt-in switches mount cached
  assert.ok(requests.every(r => r.path === '/api/plugins/session-panel/changes'), 'only the existing feed registration, no classification/card/brief/person-wait reads')
  await paint(null)
  current = { connectionId: 'conn', profile: 'default', session: 'chat' }
- dispose(); m.setHubModelEnabled(false)
+ dispose()
 })
-test('card option drafts only; question uses choice_id, verified owner route and exact revision with readback', async () => {
- const row = structuredClone(publicCases.remote_card.model.sections.needs_you[0])
- await m.chooseModelOption(row, row.options[0], current)
- assert.equal(drafts.at(-1)[1], m.chooseText(row, row.options[0]))
+test('Open card resolves the supplied owner target rather than the focused connection', async () => {
+ const model = structuredClone(publicCases.own_letters.model)
+ const row = model.sections.needs_you[0]
+ row.actions = [{ kind: 'open_card', label: 'Open original', target: { gateway: 'owner-gateway', profile: 'work', board: 'board-a', id: 't_example' } }]
+ const opened = []
+ window.__sessionTasks = {
+  connectionForHubGateway: gateway => gateway === 'owner-gateway' ? 'owner-connection' : null,
+  openTaskChip: chip => opened.push(chip)
+ }
+ m.ingestBundle(current.connectionId, current.profile, { session: current.session, model })
+ await paint(J.jsx(m.Panel, {}))
+ const button = [...document.querySelectorAll('button')].find(b => b.textContent === 'Open original')
+ assert.ok(button)
+ await React.act(async () => button.click())
+ assert.deepEqual(opened, [{ id: 't_example', kind: 'kanban', gatewayId: 'owner-gateway', profile: 'work', board: 'board-a', connectionId: 'owner-connection' }])
+ await paint(null)
+})
+test('unbound options are disabled and rejected, never drafted or posted', async () => {
+ const model = structuredClone(publicCases.own_letters.model)
+ const row = model.sections.needs_you[0]
+ row.request_id = null; row.actions = row.actions.filter(a => a.kind !== 'decide')
+ let invoked = 0
+ await paint(m.renderModel(model, { onChoose: () => invoked++ }))
+ for (const option of document.querySelectorAll('[data-choice-letter]')) {
+  assert.equal(option.disabled, true)
+  await React.act(async () => option.click())
+ }
+ assert.equal(invoked, 0)
+ await assert.rejects(m.chooseModelOption(row, row.options[0], current, { call: async () => { invoked++ } }), /No canonical decision binding/)
+ assert.equal(invoked, 0); assert.equal(drafts.length, 0)
+ assert.ok(!document.body.textContent.includes('Choosing drafts'))
+})
+test('request choices use choice_id, verified owner route and exact revision with readback', async () => {
  const q = structuredClone(publicCases.own_letters.model.sections.needs_you[0])
  const posts = [], calls = []
  const action = q.actions.find(a => a.kind === 'decide')

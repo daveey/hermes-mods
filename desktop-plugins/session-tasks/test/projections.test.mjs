@@ -840,62 +840,27 @@ test('an unreleased closed remote card keeps what its owner reported (done or ar
   assert.equal(m.sessionTaskChips([{ ...row, status: 'scheduled', reported_status: 'scheduled' }])[0].reported, null)
 })
 
-test('humanRequestOf: a generate-unblock-card scope carries its brief (situation, options, recommend)', () => {
-  const scope = 'Situation: The Mac app fix is installed; one check needs a debug run.\nOptions:\nA) One supervised run — ~1 min restart, reversible.\n- B) Accept the gap — lowers acceptance.\n**Recommend:** A — covers the bug you hit.'
+test('humanRequestOf no longer parses the scope into a brief; the hub PanelModel owns display text', () => {
+  const scope = 'Situation: The Mac app fix is installed; one check needs a debug run.\nOptions:\nA) One run.\nB) Accept.\nRecommend: A — cheap.'
   const r = m.humanRequestOf({ action: 'Choose. Unblock = A. Archive = B.', why_human: 'Tried: x.', interaction: 'approval', scope })
-  assert.deepEqual(r.brief, {
-    situation: 'The Mac app fix is installed; one check needs a debug run.',
-    options: ['A) One supervised run — ~1 min restart, reversible.', 'B) Accept the gap — lowers acceptance.'],
-    recommend: 'A — covers the bug you hit.'
-  })
-  assert.equal(m.briefOf('just a scope line'), null)
-  assert.equal(m.briefOf('Options:\nA) x\nB) y'), null, 'no situation, no brief')
+  assert.deepEqual(r, { action: 'Choose. Unblock = A. Archive = B.', why: 'Tried: x.', interaction: 'approval' })
+  assert.equal('brief' in r, false)
+  for (const name of ['brief' + 'Of', 'brief' + 'Options']) assert.equal(m[name], undefined, name)
 })
 
-test('briefOf: same parse as ask-gate unblock_card_quality (single line, headings, wrapped options, contract lines)', () => {
-  assert.deepEqual(m.briefOf('Situation: The fix is installed and one check remains open. Options: A) run once more, 1 min. B) accept the gap. Recommend: A - cheap and covers the real bug.'), {
-    situation: 'The fix is installed and one check remains open.',
-    options: ['A) run once more, 1 min.', 'B) accept the gap.'], recommend: 'A - cheap and covers the real bug.' })
-  assert.deepEqual(m.briefOf('## Situation\nThe app closed so the last check cannot attach anymore.\n## Options\n- **A)** restart\n  wrapped line\n- **B)** accept\n## Recommendation\nA because it is a one minute restart.'), {
-    situation: 'The app closed so the last check cannot attach anymore.',
-    options: ['A) restart wrapped line', 'B) accept'], recommend: 'A because it is a one minute restart.' })
-  const phys = m.briefOf('Situation: The ring has been asleep since last night here.\nRecommend: plug it in at the desk.\nDEVICE: ring\nHUMAN_STEP: plug')
-  assert.equal(phys.recommend, 'plug it in at the desk.', 'contract lines end the part')
-  assert.equal(m.briefOf('Situation: we weighed the options: none are cheap here at all.').situation, 'we weighed the options: none are cheap here at all.', 'mid-sentence word is prose')
-  assert.deepEqual(m.briefOptions('see the buttons.\n1. first for 2 - 3 min\n2. second'), ['1. first for 2 - 3 min', '2. second'])
-  assert.equal(m.briefOf('Situation: short'), null)
-})
-
-test('humanRequestOf: the hub replica JSON text carries the brief too', () => {
-  const scope = 'Situation: The Mac app fix is installed; one check needs a debug run.\nOptions:\nA) run\nB) accept\nRecommend: A — covers the bug you hit.'
-  const r = m.humanRequestOf(JSON.stringify({ action: 'Choose; unblock = A; archive = B.', why_human: 'Tried: x.', interaction: 'approval', scope }))
-  assert.deepEqual(r.brief.options, ['A) run', 'B) accept'])
-})
-
-test('briefOf parity: option over-split, double spaces, CRLF (review of ask-gate unblock_card_quality)', () => {
-  assert.deepEqual(m.briefOptions('A) Use plan B: restart once\nB) accept'), ['A) Use plan B: restart once', 'B) accept'])
-  assert.deepEqual(m.briefOptions('A) I prefer option A. It is cheap.\nB) Python 3. Then rerun.'), ['A) I prefer option A. It is cheap.', 'B) Python 3. Then rerun.'])
-  assert.deepEqual(m.briefOptions('I prefer option A. It is cheap.'), [])
-  const b = m.briefOf('Situation: The fix is installed and one check is open.  Options: A) x. B) y.  Recommend: A - cheap and covers it.')
-  assert.deepEqual(b, { situation: 'The fix is installed and one check is open.', options: ['A) x.', 'B) y.'], recommend: 'A - cheap and covers it.' })
-  assert.equal(m.briefOf('## Situation\r\nThe app closed so the last check cannot attach.\r\n').situation, 'The app closed so the last check cannot attach.')
-  assert.equal(m.briefOf('Situation: **short** __x__'), null, 'length counts after markup is removed')
-})
-
-test('briefOf parity: label inside option text, bullet leak, nested sub-steps (third review)', () => {
-  const b = m.briefOf('Situation: The patch is ready and the vendor signed off on it.\nOptions:\nA) Apply the patch. Recommended: by vendor.\nB) Wait a week.\nRecommend: A because it fixes it now.')
-  assert.deepEqual(b.options, ['A) Apply the patch. Recommended: by vendor.', 'B) Wait a week.'])
-  assert.equal(b.recommend, 'A because it fixes it now.')
-  const c = m.briefOf('- Situation: The app closed and the check is open.\n- Options:\n- A) one\n- B) two\n- Recommend: A - it is cheap enough.')
-  assert.deepEqual(c, { situation: 'The app closed and the check is open.', options: ['A) one', 'B) two'], recommend: 'A - it is cheap enough.' })
-  assert.deepEqual(m.briefOptions('A) restart\n1. stop\n2. start\nB) accept'), ['A) restart 1. stop 2. start', 'B) accept'])
-})
-
-test('briefOf parity: mixed layouts keep sentence-end labels not repeated at a line start', () => {
-  for (const scope of ['Situation: The fix is installed and one check is open.\nOptions: A) run once more. B) accept the gap. Recommend: A because it is cheap.',
-    'Situation: The fix is installed and one check is open. Options: A) run once more. B) accept the gap.\nRecommend: A because it is cheap.']) {
-    const b = m.briefOf(scope)
-    assert.deepEqual(b.options, ['A) run once more.', 'B) accept the gap.'])
-    assert.equal(b.recommend, 'A because it is cheap.')
-  }
+test('card chips read the PanelModel row display text (title/detail) verbatim', () => {
+  const model = { version: 1, header: {}, sections: {
+    needs_you: [{ id: 't_a', kind: 'card', gateway: 'hub', profile: 'default', board: 'default', title: 'Hub says: pick a path', detail: 'asked 3m ago' }, { id: 't_a', kind: 'question', title: 'not a card' }],
+    stuck: [], running: [{ id: 't_b', kind: 'card', gateway: 'other', profile: 'default', board: 'default', title: 'wrong gateway' }], waiting: [], ready: [], done: [] } }
+  const chips = [
+    { kind: 'kanban', id: 't_a', gateway: 'hub', profile: 'default', board: 'default', label: 'Raw card title' },
+    { kind: 'kanban', id: 't_b', gateway: 'hub', profile: 'default', board: 'default', label: 'Other card' },
+    { kind: 'sub', id: 't_a', label: 'sub-agent' }
+  ]
+  const out = m.withModelDisplay(chips, model)
+  assert.deepEqual(out[0].display, { title: 'Hub says: pick a path', detail: 'asked 3m ago' })
+  assert.equal(out[1].display, undefined, 'a row for another gateway is not this card')
+  assert.equal(out[2].display, undefined)
+  assert.equal(m.withModelDisplay(chips, null), chips)
+  assert.equal(m.withModelDisplay(chips, { version: 2, sections: {} })[0].display, undefined)
 })

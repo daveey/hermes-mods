@@ -172,8 +172,10 @@ only the last kanban alias is live, earlier cards keep their decided binding.
 
 ## Blocked work-card asks
 
-The Desktop `/requests` read projects a blocked work card's `human_request` into
-one server-bound `choice` request. Explicit `{label, value}` choices retain their
+The session-panel feed reconciles local card asks before reading its canonical
+requests; the compatibility `/requests` read also reconciles. Both project a
+blocked or triage work card's `human_request` into one server-bound `choice`
+request. Block-loop escalation events are part of the generation fence. Explicit `{label, value}` choices retain their
 exact values; absent choices produce **Unblock / Archive**. Selecting a supplied
 choice records the value in the card's comment thread and resumes the card through
 core's normal dependency gating. The fallback Archive abandons it. These are not
@@ -195,6 +197,13 @@ and operation receipt atomically. Receipt readback makes retries safe after a
 crash between the board commit and outbox acknowledgment. Dedicated metadata
 cards described above remain on their separate delivery path.
 
+Remote card asks are not yet projected by this mirror. The supported hub task
+courier's plain `comment`/`unblock` actions do not expose an atomic exact-ask
+precondition plus operation receipt. The Board operator courier also refuses
+human holds. Neither is a safe substitute for this producer's local transaction:
+remote support requires a supported owner-side fenced decision interface first.
+Do not write replica task rows or treat a source reference as delivery authority.
+
 Requires core `archive_task(precondition=..., comment=..., event_extra=...)`;
 on an older core the projection publishes no tiles (logged "Card projection paused") instead
 of offering clicks that cannot be delivered. `action_request` kinds are explicitly enumerated:
@@ -210,6 +219,8 @@ to register normally. `test_reader_lifecycle.py` covers these ownership boundari
 in-flight/queued opens, rollback, and unchanged projections after write/reopen.
 
 Tests: `test_kanban_mirror.py` covers projection, exact values, lifecycle and REST;
+`test_kanban_mirror_triage.py` covers triage, stale-generation rejection, the
+feed-owned canonical read and profile isolation;
 `test_kanban_mirror_hardening.py` covers conflicts, concurrency, subscription
 ownership, failed reads and tampering; `test_kanban_mirror_core.py` exercises real
 core transactions and replay; `test_kanban_mirror_compression.py` exercises core

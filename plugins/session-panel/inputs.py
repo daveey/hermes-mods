@@ -1,5 +1,5 @@
-"""Read-only adapters for the panel reducer's extra inputs. No mirror reconciliation,
-request migration, decisions or cloud lifecycle operations are performed here.
+"""Adapters for the panel reducer's extra inputs. The feed reconciles canonical
+asks before rendering; no decisions or cloud lifecycle operations run here.
 """
 from __future__ import annotations
 
@@ -36,6 +36,13 @@ def read(reader, session, lineage):
     # Read the current frozen revision, but overlay its CURRENT lifecycle. A revision
     # body still says open after withdrawal; reading body alone resurrects old asks.
     profile = home.name if home.parent.name == 'profiles' else 'default'
+    canonical = None
+    if hasattr(reader, 'reconcile_user_steps'):
+        try:
+            canonical = reader.reconcile_user_steps(session, lineage)
+        except Exception:
+            out['input_errors'].append('user-steps reconciliation unavailable')
+            log.debug('panel canonical reconciliation unavailable', exc_info=True)
     store = reader.conn(home / 'user-steps' / 'actions.sqlite3')
     out['profile'] = profile
     try:
@@ -44,7 +51,9 @@ def read(reader, session, lineage):
         # Core raises SyncUnavailable (RuntimeError) on standalone/unenrolled
         # installs. Missing hub identity must not discard the local panel inputs.
         out['gateway'] = ''
-    if store is not None:
+    if canonical is not None:
+        out['requests'] = canonical
+    elif store is not None:
         try:
             marks = ','.join('?' for _ in lineage)
             rows = store.execute('SELECT r.state,r.resolution,v.body FROM requests r JOIN revisions v '

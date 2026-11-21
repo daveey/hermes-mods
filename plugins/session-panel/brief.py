@@ -16,6 +16,17 @@ _OPTION = re.compile(
     r"(?<!\S)(?:[-*][ \t]+)?(?:\*\*)?(?:[Oo]ption[ \t]+)?\(?"
     r"(?:[A-F](?:\)|\.(?=\s)|:|[ \t]+[-—–](?=\s))|[1-9](?:\)|\.(?=\s)))(?:\*\*)?")
 _RECOMMENDED = re.compile(r"\(recommended\)", re.I)
+_OWN_LETTER = re.compile(r"^\s*(?:option\s+)?\(?([A-Za-z])(?:\)|:|\.(?=\s)|\s+[-–—](?=\s))\s*", re.I)
+
+
+def panel_letters(rows: list[str], extra: int) -> list[str]:
+    """Choice-owned badges, then supplemental Skip/Other badges; otherwise positional."""
+    choices = rows[:len(rows) - extra]
+    own = [(m.group(1).upper() if (m := _OWN_LETTER.match(label)) else '') for label in choices]
+    top = max((ord(c) for c in own if c), default=0)
+    if not own or not all(own) or len(set(own)) != len(own) or top + extra > 90:
+        return [chr(65 + i) for i in range(len(rows))]
+    return own + [chr(top + 1 + i) for i in range(extra)]
 
 
 def _norm(name: str) -> str:
@@ -157,9 +168,10 @@ def parse_brief(request: dict) -> dict:
     if choices:
         # user-steps b262ccfb: badges and answer IDs follow choice order, not
         # scope order. Own letters are used only when ALL are present/unique.
-        own = [re.match(r'^\s*(?:option\s+)?\(?([A-Za-z])(?:\)|:|\.(?=\s)|\s+[-–—](?=\s))\s*', str(c.get('label') or ''), re.I) for c in choices]
-        letters = [m[1].upper() if m else '' for m in own]
-        use_own = all(letters) and len(set(letters)) == len(letters) and max(map(ord, letters)) + 2 <= 90
+        labels = [str(c.get('label') or '') for c in choices]
+        own = [_OWN_LETTER.match(label) for label in labels]
+        letters = panel_letters(labels + ['Skip', 'Other'], 2)[:len(choices)]
+        use_own = all(own) and letters == [m[1].upper() for m in own if m]
         by_letter = {o['letter']: o for o in parsed_options}
         projected = []
         for i, c in enumerate(choices):

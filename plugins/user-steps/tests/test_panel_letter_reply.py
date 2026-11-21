@@ -36,6 +36,15 @@ def _plugin(name, tmp_path, monkeypatch):
     return load_module(name, ROOT / "__init__.py")
 
 
+def test_panel_letters_delegates_shared_brief(tmp_path, monkeypatch):
+    plugin = _plugin('panel_letter_shared', tmp_path, monkeypatch)
+    shared = plugin._panel_brief()
+    calls = []
+    monkeypatch.setattr(shared, 'panel_letters', lambda rows, extra: calls.append((rows, extra)) or ['shared'])
+    assert plugin._panel_letters(['C: Choose', 'Skip'], 1) == ['shared']
+    assert calls == [(['C: Choose', 'Skip'], 1)]
+
+
 def test_bare_letter_maps_to_panel_option_not_plan_part(tmp_path, monkeypatch):
     plugin = _plugin("panel_letter_pure", tmp_path, monkeypatch)
     mirror, store = _incident_mirror(tmp_path)
@@ -234,16 +243,15 @@ def test_pre_llm_call_contains_mapping_failure_and_keeps_decisions(tmp_path, mon
     assert "user-steps pre_llm_call failed" not in caplog.text
 
 
-def test_python_letter_order_still_matches_the_desktop_panel():
-    """_panel_rows mirrors plugin.js; if the panel's lettering or order changes, update both together."""
-    js = (ROOT.parents[1] / "desktop-plugins" / "user-steps" / "plugin.js").read_text()
-    assert "const letters = panelLetters(ordered.map(c => c.label), extraRows)" in js
-    assert "const extraRows = 1 + (presentation?.other === true ? 1 : 0)" in js
-    assert "const OWN_LETTER = /^\\s*(?:option\\s+)?\\(?([A-Za-z])(?:\\)|:|\\.(?=\\s)|\\s+[-\\u2013\\u2014](?=\\s))\\s*/i" in js
-    assert "const ordered = recommended ? [recommended, ...shown.filter(c => c !== recommended)] : shown" in js
-    assert "questionRow('skip', ordered.length, 'Skip'" in js
-    assert "questionRow('answer-text', ordered.length + 1, 'Other (type your answer)'" in js
-    assert "presentation?.kind === 'kanban-question'" in js
+def test_python_letter_order_matches_shared_panel_brief(tmp_path, monkeypatch):
+    """The retired Desktop renderer no longer owns the badge grammar."""
+    plugin = _plugin('panel_letter_contract', tmp_path, monkeypatch)
+    for labels in (['C: Choose', 'A: Wait'], ['A: Choose', 'A: Wait'], ['Z: Choose', 'B: Wait'],
+                   ['Choose', 'Wait'], ['Option D - Choose', '(B) Wait']):
+        parsed = plugin._panel_brief().parse_brief({'choices': [{'label': label} for label in labels]})
+        assert plugin._panel_letters(labels + ['Skip', 'Other'], 2)[:len(labels)] == [
+            option['letter'] for option in parsed['options']]
+
 
 
 def test_own_option_letters_survive_recommended_first_order(tmp_path, monkeypatch):

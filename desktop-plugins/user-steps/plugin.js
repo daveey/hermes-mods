@@ -739,44 +739,6 @@ const currentRoute = route => routeKey(route) === routeKey(decisionRoute())
 const operations = new Map() // authoritative readbacks shared by mounted tiles
 const INTENT_PREFIX = 'hermes.actionIntent.v2:'
 // Persist only retry intent, NOT authorization or delivery success. Every recovery queries the owner.
-// Card-ask option letters. A choice labelled "C: …" keeps its own letter (the card's brief calls it C), so the badge
-// never reads "A  C: …"; Skip and Other take the letters after the highest one. Without own letters on every choice
-// (or with duplicates) the rows are lettered A, B, C… in display order. Mirrored by _panel_letters in
-// plugins/user-steps/__init__.py, which maps a typed letter to the same option: change both together.
-const OWN_LETTER = /^\s*(?:option\s+)?\(?([A-Za-z])(?:\)|:|\.(?=\s)|\s+[-\u2013\u2014](?=\s))\s*/i
-export function panelLetters(labels, extra) {
-  const own = labels.map(l => OWN_LETTER.exec(str(l))?.[1]?.toUpperCase() || '')
-  const top = own.length ? Math.max(...own.map(l => (l ? l.charCodeAt(0) : 0))) : 0
-  if (!own.length || !own.every(Boolean) || new Set(own).size !== own.length || top + extra > 90)
-    return Array.from({ length: labels.length + extra }, (_, i) => String.fromCharCode(65 + i))
-  return [...own, ...Array.from({ length: extra }, (_, i) => String.fromCharCode(top + 1 + i))]
-}
-/** A choice label for its lettered row: no "(recommended)" suffix, no own-letter prefix when the badge shows it. */
-export function optionName(label, ownLetters) {
-  const t = str(label).replace(/\s*\(recommended\)\s*$/i, '')
-  const n = ownLetters ? t.replace(OWN_LETTER, '') : t
-  return n ? n[0].toUpperCase() + n.slice(1) : t
-}
-/** The generate-unblock-card brief inside a card ask's details: Situation, per-letter option detail, the
- *  recommendation's reason and the "Only you can: …" line. Missing parts are empty; nothing here is required. */
-export function cardBrief(details) {
-  const t = str(details).replace(/\r\n?/g, '\n')
-  const sec = name => (new RegExp(`(?:^|\\n)[ \\t]*(?:[-*][ \\t]*)?(?:\\*\\*)?${name}(?:\\*\\*)?[ \\t]*:(?:\\*\\*)?[ \\t]*([\\s\\S]*?)(?=\\n[ \\t]*(?:[-*][ \\t]*)?(?:\\*\\*)?(?:Situation|Options?|Recommend(?:ation|ed)?)(?:\\*\\*)?[ \\t]*:|\\n[ \\t]*\\n|$)`, 'i').exec(t)?.[1] || '').trim()
-  const options = {}
-  for (const raw of sec('Options?').split('\n')) {
-    const line = raw.replace(/^\s*[-*]\s*/, '').replace(/\*\*/g, '')
-    const m = OWN_LETTER.exec(line)
-    if (!m) continue
-    const rest = line.slice(m[0].length), sep = /:\s|\s[-\u2013\u2014]\s/.exec(rest)
-    const detail = (sep && sep.index > 0 && sep.index <= 80 ? rest.slice(sep.index + sep[0].length) : '').trim()
-    options[m[1].toUpperCase()] = detail ? detail[0].toUpperCase() + detail.slice(1) : ''
-  }
-  const recText = sec('Recommend(?:ation|ed)?')
-  const rec = /^(?:option\s+)?\(?([A-Za-z])\)?(?=[\s:,.\u2013\u2014-]|$)\s*(?:[-\u2013\u2014:,]|because)?\s*/i.exec(recText)
-  const only = /\bonly you can\s*:\s*([^\n]+)/i.exec(t)
-  return { situation: sec('Situation').replace(/\s+/g, ' '), options, recommendLetter: rec ? rec[1].toUpperCase() : '',
-    reason: rec ? recText.slice(rec[0].length).replace(/^because\s+/i, '').trim() : '', onlyYou: only ? only[1].trim() : '' }
-}
 const cardPresentation = r => r?.presentation?.kind === 'kanban-question' && typeof r.presentation.question === 'string' && typeof r.presentation.details === 'string' ? r.presentation : null
 function recoverIntent(key, request) {
   try {
@@ -990,7 +952,7 @@ const failedText = op => sessionBusy(op)
   ? 'Decision recorded. The session is busy with another turn; it is delivered automatically when that turn ends.'
   : 'Decision recorded; delivery unconfirmed. Work may have started. Retrying automatically with the same operation.'
 
-export function DecisionRow({ request, route, call = api, unavailable = false, position = 1, total = 1 }) {
+export function DecisionRow({ request, route, call = api, unavailable = false }) {
   const key = `${routeKey(route)}:${requestKey(request)}`
   const [state, setState] = useState(() => {
     const decision = recoverIntent(key, request)
@@ -1190,7 +1152,6 @@ export function DecisionRow({ request, route, call = api, unavailable = false, p
       if (live.current) setDismissal(outcome)
     }
   }
-  const presentation = cardPresentation(r)
   const choices = Array.isArray(r.choices) ? r.choices : []
   const selected = choices.find(c => c.id === (r.resolution?.choiceId || state.operation?.decision?.choiceId || state.decision?.choiceId))
   // Pre-v2 migrations stored one placeholder choice; it is agent work, never a user-facing control.
@@ -1211,51 +1172,25 @@ export function DecisionRow({ request, route, call = api, unavailable = false, p
   const explainOf = c => typeof c.explain === 'string' && c.explain.trim() ? c.explain.trim()
     : c.authorizes === true ? 'Approves running exactly the plan above.'
     : r.kind === 'approval' && ['approve','decline'].includes(c.effect) ? str(r.outcomes?.[c.effect]).trim() : ''
-  const recommended = shown.find(c => c.id === presentation?.recommendedChoiceId || c.recommended === true)
+  const recommended = shown.find(c => c.recommended === true)
   const ordered = recommended ? [recommended, ...shown.filter(c => c !== recommended)] : shown
   const explained = ordered.filter(c => !needsText(c) && explainOf(c))
   const primary = c => recommended ? c === recommended : c.effect === 'approve' || c.authorizes === true
   // Questions: each explained option is its own full-width button. Approvals keep their Approve/Decline row.
-  const optionButtons = question && !presentation
+  const optionButtons = question
   const choiceDisabled = c => unavailable || dismissal.busy || (['approve','answer'].includes(c.effect) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open'))
   const kindLabel = { approval: 'Approval', choice: 'Question', input: 'Question', external_step: 'Your step' }[r.kind] || 'Ask'
   const scopeView = jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'normal', lineHeight: 1.55, maxHeight: '30vh', overflowY: 'auto' }, tabIndex: 0, 'aria-label': r.kind === 'approval' ? 'Complete plan' : 'Question', children: jsx(MessageTextContent, { media: false, text: r.scope?.markdown || (r.kind === 'approval' ? 'The full plan has not been provided.' : 'The question has not been provided.') }) })
   const limitsView = !!r.limits?.length && jsxs('div', { 'data-action-limits': '', children: [jsx('strong', { children: 'Limits' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20, ...planStyle }, children: r.limits.map((l,i) => jsx('li', { children: `${l.key}: ${l.value}${permissionNote(l.permissionRequired)}` }, i)) })] })
   const exclusionsView = !!r.exclusions?.length && jsxs('div', { style: planStyle, children: [jsx('strong', { children: 'Not included' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20 }, children: r.exclusions.map((text,i) => jsx('li', { children: text }, i)) })] })
   const fold = (label, children) => jsxs('details', { 'data-action-fold': '', children: [jsx('summary', { style: { cursor: 'pointer', fontSize: 12, color: 'var(--muted-foreground)', minHeight: 28, display: 'flex', alignItems: 'center' }, children: label }), ...children] })
-  const brief = presentation ? cardBrief(presentation.details) : null
-  const extraRows = 1 + (presentation?.other === true ? 1 : 0)
-  const letters = panelLetters(ordered.map(c => c.label), extraRows)
-  const ownLetters = ordered.length > 0 && ordered.every((c, i) => OWN_LETTER.exec(str(c.label))?.[1]?.toUpperCase() === letters[i])
-  const letter = i => letters[i]
-  const questionRow = (id, index, label, onClick, disabled, isRecommended = false, detail = '', reason = '') => jsxs('button', { type: 'button', 'data-clarify-row': id, 'data-decision-option': id, ...(isRecommended ? { 'data-recommended-row': '' } : {}), disabled, onClick, style: { width: '100%', display: 'grid', gridTemplateColumns: '22px minmax(0,1fr)', columnGap: 10, alignItems: 'start', padding: '7px 9px', minHeight: 32, border: `1px solid ${isRecommended ? 'color-mix(in srgb, var(--primary, var(--accent)) 55%, transparent)' : 'transparent'}`, borderRadius: 6, marginBottom: 2, textAlign: 'left', font: 'inherit', fontSize: 13, color: 'var(--foreground)', cursor: 'pointer', background: isRecommended ? 'color-mix(in srgb, var(--primary, var(--accent)) 10%, transparent)' : 'transparent' }, children: [
-    jsx('span', { 'data-choice-letter': '', 'aria-hidden': true, style: { width: 22, height: 22, borderRadius: 999, display: 'grid', placeItems: 'center', fontSize: 11.5, fontWeight: 700, background: isRecommended ? 'var(--primary, var(--accent))' : 'color-mix(in srgb, var(--foreground) 12%, transparent)', color: isRecommended ? 'var(--primary-foreground, #fff)' : 'var(--foreground)' }, children: letter(index) }),
-    jsxs('span', { style: { display: 'block', minWidth: 0, lineHeight: '22px' }, children: [
-      jsxs('span', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 6 }, children: [
-        jsx('span', { 'data-option-label': '', style: { fontWeight: detail || isRecommended ? 600 : 400, overflowWrap: 'anywhere' }, children: label }),
-        isRecommended && jsx('span', { 'data-recommended': '', style: { ...recommendedPill, lineHeight: 1.5 }, children: 'Recommended' })
-      ] }),
-      detail && jsx('span', { 'data-option-detail': '', style: { display: 'block', fontSize: 12, lineHeight: 1.45, color: 'var(--muted-foreground)', marginTop: 1, overflowWrap: 'anywhere' }, children: detail }),
-      isRecommended && reason && jsx('span', { 'data-option-reason': '', style: { display: 'block', fontSize: 12, lineHeight: 1.45, marginTop: 3, color: 'var(--primary, var(--accent))', overflowWrap: 'anywhere' }, children: `Why: ${reason}` })
-    ] })
-  ] }, id)
-  return jsxs('article', { ref: article, 'data-action-request': requestKey(r), 'data-decision-audience': agentPending(r) ? 'agent' : 'human', tabIndex: -1, 'aria-label': presentation?.question || r.title, style: { ...rowStyle, minWidth: 0 }, children: [
-    !presentation && jsxs('div', { 'data-action-meta': '', style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 6, rowGap: 2, fontSize: 11, color: 'var(--muted-foreground)', marginTop: 4 }, children: [
+  return jsxs('article', { ref: article, 'data-action-request': requestKey(r), 'data-decision-audience': agentPending(r) ? 'agent' : 'human', tabIndex: -1, 'aria-label': r.title, style: { ...rowStyle, minWidth: 0 }, children: [
+    jsxs('div', { 'data-action-meta': '', style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 6, rowGap: 2, fontSize: 11, color: 'var(--muted-foreground)', marginTop: 4 }, children: [
       jsx('span', { 'data-action-kind': r.kind, style: { padding: '0 6px', borderRadius: 4, color: r.kind === 'approval' ? AMBER : 'var(--muted-foreground)', background: `color-mix(in srgb, ${r.kind === 'approval' ? AMBER : 'var(--muted-foreground)'} 14%, transparent)` }, children: kindLabel }),
       age && jsx('time', { 'data-asked-age': '', dateTime: r.createdAt, title: `${new Date(r.createdAt).toLocaleString()} · revision ${r.revision}`, style: { flex: 'none' }, children: age })
     ] }),
-    !presentation && jsx('h3', { style: { margin: '2px 0 4px', fontSize: 14, fontWeight: 600, lineHeight: 1.4, overflowWrap: 'anywhere', minWidth: 0 }, children: r.title }),
-    presentation && jsx('div', { 'data-action-card-title': '', style: { fontWeight: 600, fontSize: 13, overflowWrap: 'anywhere' }, children: r.title }),
-    presentation && jsxs('div', { 'data-clarify-question': '', style: { display: 'flex', alignItems: 'baseline', gap: 8, margin: '8px 0 4px', fontSize: 13, lineHeight: 1.5 }, children: [jsx('p', { style: { margin: 0, flex: 1, overflowWrap: 'anywhere' }, children: `${position}/${total} — ${presentation.question}` }), jsx('span', { style: { flex: 'none', color: 'var(--muted-foreground)', fontSize: 10 }, children: 'Pick one' })] }),
-    presentation && brief.situation && jsx('div', { 'data-ask-situation': '', title: brief.situation, style: { fontSize: 12.5, lineHeight: 1.5, margin: '0 0 6px', overflowWrap: 'anywhere', display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' }, children: brief.situation }),
-    !locked && presentation && jsx('div', { role: 'group', 'aria-label': 'Options', children: [
-      ...ordered.map((c, i) => { const code = letter(i); return questionRow(c.id, i, optionName(c.label, ownLetters), () => void send(c), choiceDisabled(c), c === recommended, ownLetters ? brief.options[code] || '' : '', ownLetters && brief.recommendLetter && brief.recommendLetter !== code ? '' : brief.reason) }),
-      questionRow('skip', ordered.length, 'Skip', () => dismissRequest(r), unavailable || dismissal.busy),
-      presentation.other === true && questionRow('answer-text', ordered.length + 1, 'Other (type your answer)', e => { trigger.current = e.currentTarget; setEditing({ id: 'answer-text', label: 'Other (type your answer)', effect: 'answer' }) }, choiceDisabled({ effect: 'answer' }))
-    ] }),
-    !locked && presentation && brief.onlyYou && jsx('div', { 'data-ask-only-you': '', style: { fontSize: 12, lineHeight: 1.45, color: 'var(--muted-foreground)', margin: '4px 0', overflowWrap: 'anywhere' }, children: `Only you can: ${brief.onlyYou}` }),
-    !locked && presentation && fold('Details', [jsx('div', { 'data-action-scope': '', style: { ...planStyle, whiteSpace: 'pre-wrap' }, children: presentation.details }), limitsView, exclusionsView]),
-    !locked && !presentation && (explained.length
+    jsx('h3', { style: { margin: '2px 0 4px', fontSize: 14, fontWeight: 600, lineHeight: 1.4, overflowWrap: 'anywhere', minWidth: 0 }, children: r.title }),
+    !locked && (explained.length
       ? fold(r.kind === 'approval' ? 'Full plan and limits' : 'Full question', [scopeView, limitsView, exclusionsView])
       : jsxs('div', { style: { display: 'contents' }, children: [scopeView, (limitsView || exclusionsView) && fold('Limits and exclusions', [limitsView, exclusionsView])] })),
     // Explained options ARE the buttons: what it is, what happens, and the agent's pick, in one target.
@@ -1266,7 +1201,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false, p
       ] }),
       jsx('span', { 'data-option-explain': '', style: { display: 'block', color: 'var(--muted-foreground)', fontSize: 12.5, fontWeight: 400, lineHeight: 1.45 }, children: explainOf(c) })
     ] }, c.id)) }),
-    !locked && !presentation && !optionButtons && explained.length > 0 && jsx('div', { 'data-decision-options': '', style: { display: 'flex', flexDirection: 'column', gap: 6, margin: '6px 0' }, children: explained.map(c => jsxs('div', { 'data-decision-option': c.id, style: { padding: '6px 8px', borderRadius: 6, background: 'color-mix(in srgb, var(--muted-foreground) 8%, transparent)', lineHeight: 1.45, ...planStyle, whiteSpace: 'normal' }, children: [
+    !locked && !optionButtons && explained.length > 0 && jsx('div', { 'data-decision-options': '', style: { display: 'flex', flexDirection: 'column', gap: 6, margin: '6px 0' }, children: explained.map(c => jsxs('div', { 'data-decision-option': c.id, style: { padding: '6px 8px', borderRadius: 6, background: 'color-mix(in srgb, var(--muted-foreground) 8%, transparent)', lineHeight: 1.45, ...planStyle, whiteSpace: 'normal' }, children: [
       jsx('strong', { style: { fontWeight: 600 }, children: choiceLabel(c, choices, r.kind) }),
       c.recommended === true && jsx('span', { 'data-recommended': '', style: { marginLeft: 6, fontSize: 11, color: 'var(--primary, var(--accent))' }, children: 'recommended' }),
       jsx('div', { style: { color: 'var(--muted-foreground)', fontSize: 12.5 }, children: jsx(MessageTextContent, { media: false, text: explainOf(c) }) })
@@ -1276,7 +1211,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false, p
     state.phase === 'confirmed' && jsx('div', { 'data-owner-phase': ownerPhase(state.consumer), children: ownerPhaseText(state.consumer) }),
     selected && locked && jsx('div', { children: `${state.operation || r.resolution ? 'Recorded choice' : 'Submitted choice'}: ${selected.label}. ${state.phase === 'cancelled' ? 'Cancelled before delivery.' : explainOf(selected)}` }),
     state.error && jsx('div', { role: delivering ? 'status' : 'alert', style: delivering ? { color: 'var(--muted-foreground)' } : undefined, children: state.error }),
-    !locked && !presentation && jsxs('div', { style: flowStyle, children: [
+    !locked && jsxs('div', { style: flowStyle, children: [
       ...ordered.filter(c => !optionButtons || !explained.includes(c)).map(c => jsx('button', { type: 'button', 'data-decision-effect': c.effect, 'data-primary': primary(c) ? '' : undefined, title: explainOf(c) || c.label, style: needsText(c) ? { ...actionStyle, fontSize: 12.5, borderColor: 'transparent', background: 'transparent', color: 'var(--muted-foreground)' } : primary(c) ? primaryStyle : choiceStyle(c.effect === 'approve' ? 'neutral' : c.effect), disabled: choiceDisabled(c), onClick: e => { if (needsText(c)) { trigger.current = e.currentTarget; setEditing(c) } else void send(c) }, children: c.recommended === true && !needsText(c) && !explained.includes(c) ? `${choiceLabel(c, choices, r.kind)} · Recommended` : choiceLabel(c, choices, r.kind) }, c.id)),
       ...(approvalPending ? [
         jsx('button', { type: 'button', 'data-ask-plan': '', style: actionStyle, onClick: () => askAgentForPlan(r, route), children: r.kind === 'approval' ? 'Ask agent for the plan' : 'Ask agent for the full step' }, 'ask-plan'),

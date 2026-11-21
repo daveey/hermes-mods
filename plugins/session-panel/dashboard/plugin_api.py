@@ -415,6 +415,18 @@ class CoreReaders:
             requests = None
         return (outcome, requests)
 
+    def reconcile_user_steps(self, session, lineage):
+        path = Path(__file__).resolve().parents[2] / 'user-steps' / 'dashboard' / 'plugin_api.py'
+        key = '_session_panel_user_steps_api_' + str(path)
+        mod = sys.modules.get(key)
+        if mod is None:
+            spec = importlib.util.spec_from_file_location(key, path)
+            assert spec is not None and spec.loader is not None
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod = sys.modules.setdefault(key, mod)
+        return mod.panel_requests(self.state_db().parent, session, lineage)
+
     def panel_inputs(self, session, lineage):
         path = Path(__file__).resolve().parents[1] / 'inputs.py'
         spec = importlib.util.spec_from_file_location('_session_panel_inputs', path)
