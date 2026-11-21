@@ -20,7 +20,8 @@ class Pool:
     def entries(self):
         return self.accounts
 
-    def select(self):
+    def select(self, *, model=None):
+        assert model == 'claude-test'
         return self.accounts[self.index]
 
     def mark_exhausted_and_rotate(self, **kw):

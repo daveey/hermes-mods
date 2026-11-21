@@ -549,7 +549,7 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
                         pass
                     raise
 
-            client, stream, events, first = with_rotation(open_stream, pool)
+            client, stream, events, first = with_rotation(open_stream, pool, model=body.get("model"))
 
             def send_event(payload):
                 if payload.get("type") == "content_block_start":
