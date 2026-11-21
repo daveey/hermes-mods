@@ -138,6 +138,20 @@ class PluginSuitesWorkflow(unittest.TestCase):
         self.assertIn("exit $rc", run)
 
 
+class SkillTestsRootEvidence(unittest.TestCase):
+    def test_root_guards_emit_verbose_results_without_replacing_skill_suites(self):
+        text = (ROOT / ".github/workflows/skill-tests.yml").read_text()
+        step = text.split("      - name: Root guard node evidence\n", 1)[1].split("\n      - ", 1)[0]
+        self.assertEqual(step, '''        run: |
+          "$HERMES_MODS_PYTHON" -m unittest -v tests/test_plugin_suites_ci.py tests/test_sqlite_ro_guard.py''')
+        self.assertLess(text.index('echo "${RUNNER_TEMP}/tools" >> "$GITHUB_PATH"'),
+                        text.index("      - name: Root guard node evidence"))
+        self.assertLess(text.index("      - name: Root guard node evidence"),
+                        text.index("      - name: Skill suites"))
+        self.assertIn('"$HERMES_MODS_PYTHON" scripts/test-all -k skills/ -j 4', text)
+        self.assertNotIn("continue-on-error", text)
+
+
 WORKFLOWS = ROOT / ".github" / "workflows"
 
 
