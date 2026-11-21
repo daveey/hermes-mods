@@ -274,7 +274,12 @@ argparse/CLI implementation without loading unrelated plugins from a live profil
 
 `desktop-plugins/inbox/plugin.js`:
 - Registers a `SIDEBAR_SECTIONS_AREA` section (order 5, ahead of Kanban's Blocked at 10).
-- Reads `/items` on every gateway (`ctx.rest(…, {connectionId})`) every 30 s while visible and after each action.
+- Reads `/items` on every gateway (`ctx.rest(…, {connectionId})`) on load, after each action, and when a gateway
+  pushes `plugin.inbox.changed` {feed, seq}. Each `/items` answer carries `feed` (the gateway process, hostname:pid);
+  a push re-reads only the connection(s) whose last answer had that feed (a burst within 400 ms is one read; an
+  unknown feed reads every gateway). A 5-minute safety poll (was 30 s) covers missed pushes, the hub replica and
+  sessions archived through core's sidebar (state.db only, no sidecar write). Nothing is read while the window is
+  hidden; showing it runs one full pass, which absorbs any pushes that arrived meanwhile.
 - Opens rows on their own gateway (owner route).
 - Marks a message read through core's `PATCH /api/sessions/{id} {unread:false}` when its chat is focused.
 - Adds a composer bar when the focused chat is an open message: the card type's actions (primary first, Archive last), with an inline editor for `input` actions and a confirm prompt for `confirm` ones. `prompt` actions submit the returned prompt into the chat; `resolve` and `task` actions close the card and open the next message (`task` also toasts "Queued <id>"). Items from a gateway without card types (`api` < 3, no `actions`) keep **Do it** / **Archive**.
@@ -284,6 +289,16 @@ argparse/CLI implementation without loading unrelated plugins from a live profil
 - **⌘⇧A** on a message archives it and opens the next message (the one below, else the top); on the last one it steps to the next session like core's ⌘⇧A. Uses `ctx.registerArchiveHotkeyHandler` (fork core patch 0147, `core/plugin-archive-hotkey.md`); on an older core ⌘⇧A archives through core.
 
 The row's hover Archive button and bold unread title use the `actions`/`strong` props of `SidebarSectionRow` (fork core patch, see `core/sidebar-row-actions.md`). On an older core the row ignores them and still works: archive it from the composer bar.
+
+## Change push
+
+The gateway backend (`dashboard/plugin_api.py`) pushes `plugin.inbox.changed` {feed, seq} on its event stream when
+an inbox sidecar is written: a post, an update of a keyed card, act / accept / archive / junk / settle, from any
+process (the `inbox_post` tool, `hermes inbox post`, cron, this API). A watcher thread compares the stat (mtime,
+size) of `inbox.db`, `-wal` and `-journal` every 2 s (`HERMES_INBOX_WATCH_TICK_S`), for this profile and, on the root
+dashboard, every named profile's sidecar. A write through the REST API pushes at once. Reads never write the sidecar,
+so a refresh never triggers another push. The watcher starts on the first `GET /items`, so only the process serving a
+Desktop runs it. Tests: `tests/test_push.py`, `desktop-plugins/inbox/test/push.test.mjs`.
 
 ## Profiles
 
@@ -301,5 +316,5 @@ The sidecar `<HERMES_HOME>/inbox/inbox.db` (`items`: session_id, key, title, pos
 ```bash
 PYTHONPATH=~/.hermes/hermes-agent uv run --python 3.11 --with pytest --with ruamel.yaml --with pyyaml \
   --with python-dotenv --with fastapi --with httpx python -m pytest -q -p no:cacheprovider plugins/inbox/tests
-/opt/homebrew/bin/node --test --test-reporter=tap desktop-plugins/inbox/test/plugin.test.mjs
+/opt/homebrew/bin/node --test --test-reporter=tap desktop-plugins/inbox/test/*.test.mjs
 ```

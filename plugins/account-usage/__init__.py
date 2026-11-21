@@ -6,6 +6,12 @@ same way core's rate-limit recovery does (``agent._credential_pool_entry_id``, e
 ``pool.current()``). Result goes to ``$HERMES_HOME/account_usage_last.json``:
 ``{provider: {"entry_id", "account_id", "label", "at"}}`` (``account_id`` = the usage panel's
 row id, when core can name it). Fail-open: any error is swallowed.
+
+Each observed call also pushes ``plugin.account-usage.changed`` {feed, provider, at} to the Desktop
+(at most once per provider per ``PUSH_MIN_GAP_S``), so the status-bar chips re-read usage while
+quota is actually being spent instead of polling every 30 s. Only a process that already runs the
+gateway server (``hermes serve`` and its turn children) pushes: a Kanban worker or CLI has no
+Desktop client, and importing the server there would cost a heavy import for nothing.
 """
 from __future__ import annotations
 
@@ -19,6 +25,28 @@ import weakref
 _lock = threading.Lock()
 _last: dict = {}
 _observed_requests: dict = {}
+PLUGIN_ID = "account-usage"
+PUSH_MIN_GAP_S = 60.0
+_pushed: dict = {}  # provider -> monotonic time of its last push
+
+
+def _push_changed(provider: str) -> bool:
+    """Tell the Desktop this provider's usage moved (throttled per provider). True when a push was sent."""
+    try:
+        if not provider or "tui_gateway.server" not in sys.modules:
+            return False
+        now = time.monotonic()
+        with _lock:
+            if now - _pushed.get(provider, -PUSH_MIN_GAP_S) < PUSH_MIN_GAP_S:
+                return False
+            _pushed[provider] = now
+        import socket
+        from hermes_cli.plugin_events import broadcast_plugin_event
+        broadcast_plugin_event(PLUGIN_ID, "changed", {"feed": f"{socket.gethostname()}:{os.getpid()}",
+                                                      "provider": provider, "at": time.time()})
+        return True
+    except Exception:
+        return False
 
 
 def _state_path() -> str:
@@ -102,6 +130,7 @@ def _on_api(**kw):
         provider = str(kw.get("provider") or getattr(agent, "provider", "") or "").lower()
         if not provider:
             return None
+        _push_changed(provider)
         now = time.time()
         rec = {"entry_id": entry.id, "label": str(entry.label or ""), "at": now}
         account_id = _wire_account_id(provider, entry)
@@ -163,6 +192,7 @@ def _observe_selected(agent, snapshot):
             with open(tmp, 'w') as fh:
                 json.dump(data, fh)
             os.replace(tmp, path)
+        _push_changed(str(snapshot.provider or ""))
     except Exception:
         pass
 

@@ -20,7 +20,11 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import logging
+import os
+import socket
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -28,6 +32,10 @@ from fastapi import APIRouter, Body, HTTPException
 
 router = APIRouter()
 _STORE = Path(__file__).resolve().parents[1] / "store.py"
+PLUGIN_ID = "inbox"
+FEED_ID = f"{socket.gethostname()}:{os.getpid()}"
+WATCH_TICK_S = float(os.environ.get("HERMES_INBOX_WATCH_TICK_S", "2"))
+log = logging.getLogger("inbox.push")
 
 
 def _store():
@@ -82,6 +90,88 @@ def _all_items() -> list:
     return out
 
 
+# ── change push ──────────────────────────────────────────────────────────────
+
+def _sidecar_paths() -> list:
+    """The sidecars GET /items reads: this profile's, plus every named profile's on the root dashboard."""
+    st = _store()
+    paths = [st.Inbox().path]
+    if _profile() == "default":
+        paths += [home / "inbox" / "inbox.db" for _, home in st.profile_homes(st._home())[1:]]
+    return paths
+
+
+def _signature(paths) -> tuple:
+    """(path, mtime_ns, size) of each sidecar and its -wal / -journal; None for a missing file."""
+    out = []
+    for path in paths:
+        for f in (Path(path), Path(f"{path}-wal"), Path(f"{path}-journal")):
+            try:
+                st = f.stat()
+                out.append((str(f), st.st_mtime_ns, st.st_size))
+            except OSError:
+                out.append((str(f), None))
+    return tuple(out)
+
+
+def _emit(payload: Dict[str, Any]) -> None:
+    from hermes_cli.plugin_events import broadcast_plugin_event
+    broadcast_plugin_event(PLUGIN_ID, "changed", payload)
+
+
+class _Watch:
+    """Push `plugin.inbox.changed` when the sidecar signature moves. `check()` is also called right after a
+    write through this API, so the Desktop does not wait for the next tick."""
+
+    def __init__(self, paths=_sidecar_paths, emit=None):
+        self._paths, self._emit = paths, emit
+        self.seq = 0
+        self.sig = None
+        self.lock = threading.Lock()
+        self.thread = None
+        self.stop = threading.Event()
+
+    def check(self) -> bool:
+        try:
+            sig = _signature(self._paths())
+        except Exception:
+            log.debug("inbox watch: signature failed", exc_info=True)
+            return False
+        with self.lock:
+            if self.sig is None or sig == self.sig:
+                self.sig = sig  # the first read is the baseline: nothing changed yet
+                return False
+            self.sig = sig
+            self.seq += 1
+            payload = {"feed": FEED_ID, "seq": self.seq}
+        try:
+            (self._emit or _emit)(payload)
+        except Exception:
+            log.debug("inbox watch: push failed", exc_info=True)
+        return True
+
+    def start(self) -> None:
+        with self.lock:
+            if self.thread is not None:
+                return
+            self.thread = threading.Thread(target=self._run, name="inbox-watch", daemon=True)
+        self.check()  # baseline before the first tick
+        self.thread.start()
+
+    def _run(self) -> None:
+        while not self.stop.wait(WATCH_TICK_S):
+            self.check()
+
+
+WATCH = _Watch()
+
+
+def _changed() -> None:
+    """After a write through this API: push now (the watcher would within WATCH_TICK_S)."""
+    if WATCH.thread is not None:
+        WATCH.check()
+
+
 async def _run(fn):
     try:
         return await asyncio.to_thread(fn)
@@ -105,15 +195,20 @@ async def ping() -> Dict[str, Any]:
 @router.get("/items")
 async def items() -> Dict[str, Any]:
     rows = await asyncio.to_thread(_all_items)
-    return {"items": rows, "profile": _profile()}
+    if WATCH.thread is None:
+        await asyncio.to_thread(WATCH.start)
+    return {"items": rows, "profile": _profile(), "feed": FEED_ID}
 
 
 @router.post("/items")
 async def post(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    return await _run(lambda: _store().Inbox().post(
-        payload.get("title", ""), payload.get("body", ""), payload.get("accept_prompt", ""),
-        key=payload.get("key"), poster=payload.get("poster"), cwd=payload.get("cwd"),
-        prompt_label=payload.get("prompt_label"), type=payload.get("type"), fields=payload.get("fields"), ask=payload.get("ask")))
+    try:
+        return await _run(lambda: _store().Inbox().post(
+            payload.get("title", ""), payload.get("body", ""), payload.get("accept_prompt", ""),
+            key=payload.get("key"), poster=payload.get("poster"), cwd=payload.get("cwd"),
+            prompt_label=payload.get("prompt_label"), type=payload.get("type"), fields=payload.get("fields"), ask=payload.get("ask")))
+    finally:
+        _changed()
 
 
 @router.get("/items/{session_id}")
@@ -134,7 +229,10 @@ async def act(session_id: str, payload: Dict[str, Any] = Body(...), profile: Opt
     value = payload.get("input")
     if value is not None and not isinstance(value, str):
         raise HTTPException(status_code=400, detail="input must be a string")
-    item = await _run(lambda: inbox.act(session_id, action, value))
+    try:
+        item = await _run(lambda: inbox.act(session_id, action, value))
+    finally:
+        _changed()
     if not item:
         _not_open(inbox, session_id)
     return _public(item)
@@ -162,6 +260,8 @@ async def accept(session_id: str, profile: Optional[str] = None) -> Dict[str, An
         item = await _run(run)
     except _Conflict as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    finally:
+        _changed()
     if not item:
         _not_open(inbox, session_id)
     return _public(item)
@@ -175,6 +275,7 @@ class _Conflict(Exception):
 async def archive(session_id: str, profile: Optional[str] = None) -> Dict[str, Any]:
     inbox = _inbox(profile)
     ok = await asyncio.to_thread(lambda: inbox.archive(session_id))
+    _changed()
     if not ok:
         raise HTTPException(status_code=404, detail="not an inbox message")
     return {"ok": True}
@@ -185,6 +286,7 @@ async def junk(session_id: str, profile: Optional[str] = None) -> Dict[str, Any]
     """Owner marks a card as junk: archive, mute the poster family, file a five-whys Kanban card."""
     inbox = _inbox(profile)
     result = await asyncio.to_thread(lambda: inbox.junk(session_id))
+    _changed()
     if not result:
         raise HTTPException(status_code=404, detail="not an inbox message")
     return result

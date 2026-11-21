@@ -16,7 +16,16 @@
  * Red = out of quota (waits for the provider reset); amber = a temporary pool cooldown. Both
  * stay unselectable; an older backend without limit_kind stays red (never masked as green).
  * Read-only: the call serves cached snapshots and kicks a background refresh,
- * so polling it never blocks a turn or rotates a credential.
+ * so reading it never blocks a turn or rotates a credential.
+ * Cadence: that background provider-usage fetch is started by core's model.options handler
+ * (hermes_cli/inventory.py _apply_usage, itself throttled to one fetch per provider per 120 s), not by
+ * this plugin, so every read here can cost provider traffic. Reads happen on load (+8 s, to pick up
+ * that fetch), when the gateway pushes `plugin.account-usage.changed` (the plugin's post_api_request
+ * hook: quota was just spent; at most one per provider per 60 s there, and at most one read per
+ * EVENT_GAP_MS here), every 5 minutes as a safety net, and when the window is shown again (if a push
+ * came while hidden or the last read is older than EVENT_GAP_MS).
+ * Nothing is read while the window is hidden. Was: model.options + /last + /disabled + /selection
+ * every 30 s, hidden or not.
  * Disable/Enable (row details) = `hermes auth disable|enable` for every pooled row of that account
  * (REST /disabled); a disabled account is grey, never counted ready and never selectable.
  */
@@ -26,7 +35,11 @@ import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'account-usage'
-const POLL_MS = 30_000
+// Safety net; pushes drive the live updates (was 30 s, which also drove a provider usage fetch every 2 min).
+const POLL_MS = 5 * 60_000
+export const CHANGED_EVENT = 'plugin.account-usage.changed'
+// A busy chat pushes once a minute per provider; several providers or gateways still mean one read per this gap.
+export const EVENT_GAP_MS = 30_000
 const WARN_PCT = 80
 // A credential that served a call within this window is "in use" (pulses); older = "last used" (ring).
 const ACTIVE_MS = 10 * 60_000
@@ -1505,6 +1518,32 @@ function UsageBar({ store, selectionStore, reconnectStore, disableStore }) {
   ] })
 }
 
+const isHidden = () => typeof document !== 'undefined' && !!document.hidden
+
+/** Push-driven reads: `onChanged` reads at once, or once EVENT_GAP_MS after the last read; while hidden it
+ *  only marks the state stale, and `onShow` reads then (or when the last read is older than EVENT_GAP_MS). `tick` is the safety poll (skipped while hidden).
+ *  Exported for tests (`now`/`schedule` are seams). */
+export function createRefresher(read, { now = () => Date.now(), schedule = (fn, ms) => setTimeout(fn, ms), cancel = t => clearTimeout(t) } = {}) {
+  let last = -Infinity, timer = null, stale = false
+  const run = () => { timer = null; stale = false; last = now(); return read() }
+  const onChanged = () => {
+    if (isHidden()) { stale = true; return }
+    if (timer) return
+    const wait = last + EVENT_GAP_MS - now()
+    if (wait <= 0) run()
+    else timer = schedule(run, wait)
+  }
+  const tick = () => { if (!isHidden()) run() }
+  // Shown again: read if something changed meanwhile or the last read is older than the gap (alt-tabbing is free).
+  const onShow = () => {
+    if (isHidden() || (!stale && now() - last < EVENT_GAP_MS)) return
+    if (timer) { cancel(timer); timer = null }
+    run()
+  }
+  const dispose = () => { if (timer) cancel(timer); timer = null }
+  return { onChanged, tick, onShow, dispose, isStale: () => stale }
+}
+
 export default {
   id: ID,
   name: 'Account Usage',
@@ -1529,7 +1568,16 @@ export default {
     store.refresh()
     // Second read shortly after: the first call kicks background usage fetches.
     ctx.setTimeout(() => store.refresh(), 8_000)
-    ctx.setInterval(() => { store.refresh(); selectionStore.refresh() }, POLL_MS)
+    const refresher = createRefresher(() => { store.refresh(); selectionStore.refresh() })
+    ctx.onDispose(refresher.dispose)
+    ctx.setInterval(refresher.tick, POLL_MS)
+    const subscribe = typeof ctx.onEvent === 'function' ? ctx.onEvent : host?.onEvent
+    const offChanged = typeof subscribe === 'function' ? subscribe(CHANGED_EVENT, refresher.onChanged) : null
+    if (typeof offChanged === 'function') ctx.onDispose(offChanged)
+    if (typeof document !== 'undefined' && document.addEventListener) {
+      document.addEventListener('visibilitychange', refresher.onShow)
+      ctx.onDispose(() => document.removeEventListener('visibilitychange', refresher.onShow))
+    }
     ctx.register({ id: 'chips', area: STATUSBAR_AREAS.right, order: 5, render: () => jsx(UsageBar, { store, selectionStore, reconnectStore, disableStore }) })
   }
 }

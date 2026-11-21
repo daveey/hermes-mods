@@ -5,8 +5,13 @@
  *
  * Each message is a real session (hidden from Recents) whose first message is
  * the proposal; see plugins/inbox/store.py. Data: GET /api/plugins/inbox/items
- * on EVERY gateway (`ctx.rest(path, { connectionId })`), polled every 30 s while
- * visible and after each action. Opening a row opens that session on its own
+ * on EVERY gateway (`ctx.rest(path, { connectionId })`), read on load, after each
+ * action, and when a gateway pushes `plugin.inbox.changed` {feed, seq} (a card was
+ * posted, updated or archived there): only the connection whose /items answer
+ * carried that `feed` is read again (coalesced; an unknown feed reads them all).
+ * A 5-minute safety poll covers missed pushes and the hub replica; nothing is
+ * read while the window is hidden, and one pass runs when it is shown again
+ * (a push that arrived while hidden is kept for then). Opening a row opens that session on its own
  * gateway (owner route), which marks it read. Do it = POST …/accept (the session
  * moves to Recents) then submit the proposal's prompt into the chat. Typing a
  * reply accepts it too (agent-side hook). Archive = POST …/archive.
@@ -61,13 +66,28 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'inbox'
-const POLL_MS = 30_000
+// Safety net only: pushes (`plugin.inbox.changed`) drive refreshes. Was a 30 s poll of every gateway + the hub.
+const POLL_MS = 5 * 60_000
+export const CHANGED_EVENT = 'plugin.inbox.changed'
+// A burst of pushes (a poster updating several cards) becomes one read per connection.
+const COALESCE_MS = 400
 const FIRST = 5
 const STEP = 10
 const LOCAL = 'local'
 
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 const log = (...a) => console.info(`[${ID}]`, ...a)
+
+const isHidden = () => typeof document !== 'undefined' && !!document.hidden
+
+/** Run `tick` every `ms` while the window is visible, and `onShow` when it is shown again. Exported for tests. */
+export function pollWhileVisible(ctx, tick, ms, onShow = tick) {
+  ctx.setInterval(() => { if (!isHidden()) tick() }, ms)
+  if (typeof document === 'undefined' || !document.addEventListener) return
+  const onVis = () => { if (!isHidden()) onShow() }
+  document.addEventListener('visibilitychange', onVis)
+  ctx.onDispose?.(() => document.removeEventListener?.('visibilitychange', onVis))
+}
 
 // ── pure helpers (exported for tests) ───────────────────────────────────────
 
@@ -464,6 +484,14 @@ export function createStore(ctx) {
   const fetching = new Set()
   let inflight = null
   let again = false
+  // feed (gateway process, from its /items answer) -> connection ids, to route a push to its connection.
+  const feeds = new Map()
+  const noteFeed = (gateway, feed) => {
+    if (typeof feed !== 'string' || !feed) return
+    for (const [f, ids] of feeds) if (f !== feed) ids.delete(gateway)
+    if (!feeds.has(feed)) feeds.set(feed, new Set())
+    feeds.get(feed).add(gateway)
+  }
 
   // hub-sync REST on the routed gateway (ctx.hubRest: test seam).
   const hubRest = (path, opts = {}) => {
@@ -508,7 +536,10 @@ export function createStore(ctx) {
       gatewayIds().map(gateway =>
         ctx
           .rest('/items', gateway === routed ? { timeoutMs: 8000 } : { connectionId: gateway, timeoutMs: 8000 })
-          .then(r => ({ gateway, profile: r && r.profile, items: r && r.items }))
+          .then(r => {
+            noteFeed(gateway, r && r.feed)
+            return { gateway, profile: r && r.profile, items: r && r.items }
+          })
           .catch(() => ({ gateway, items: [], failed: true }))
       )
     )
@@ -535,11 +566,63 @@ export function createStore(ctx) {
     return inflight
   }
 
+  // One connection's live cards again (a push from it); the rest of the list stays. A failed or odd answer
+  // falls back to the full pass (which also brings in that gateway's hub replica rows).
+  const refreshGateway = gateway => {
+    if (inflight) {
+      again = true
+      return inflight
+    }
+    const routed = routedGateway()
+    return Promise.resolve()
+      .then(() => ctx.rest('/items', gateway === routed ? { timeoutMs: 8000 } : { connectionId: gateway, timeoutMs: 8000 }))
+      .then(r => {
+        if (!r || !Array.isArray(r.items)) return refresh()
+        noteFeed(gateway, r.feed)
+        const name = hubName(gateway)
+        const cur = $items.get()
+        const others = cur.filter(i => !i.hub && i.gateway !== gateway)
+        const hubRows = cur.filter(i => i.hub && !(name && i.hub.gateway === name) && i.gateway !== gateway)
+        const live = mergeItems([{ gateway, profile: r.profile, items: r.items }, ...others.map(i => ({ gateway: i.gateway, profile: i.profile, items: [i] }))])
+        $items.set(hubRows.length ? [...live, ...hubRows] : live)
+        markRead(itemFor($items.get(), host.state.focusedStoredSessionId?.get?.()), { poll: true })
+      })
+      .catch(() => refresh())
+  }
+
+  // Pushes: coalesced per connection; while hidden they wait for the window to show.
+  const dirty = new Set()
+  let dirtyAll = false
+  let flushTimer = null
+  const flush = () => {
+    flushTimer = null
+    if (isHidden()) return
+    const all = dirtyAll
+    const ids = [...dirty]
+    dirtyAll = false
+    dirty.clear()
+    if (all) return void refresh()
+    for (const id of ids) void refreshGateway(id)
+  }
+  const onChanged = ev => {
+    const feed = ev && ev.payload && ev.payload.feed
+    const ids = typeof feed === 'string' ? feeds.get(feed) : null
+    if (ids && ids.size) for (const id of ids) dirty.add(id)
+    else dirtyAll = true // a gateway we have not read yet: read them all
+    if (!flushTimer && !isHidden()) flushTimer = setTimeout(flush, COALESCE_MS)
+  }
+  // Shown again: one pass (pushes that arrived while hidden are folded into it).
+  const onShow = () => {
+    dirty.clear()
+    dirtyAll = false
+    return refresh()
+  }
+
   // Desktop's own read state is client-side only, so the inbox keeps the
   // server watermark itself (any door that focuses the chat counts). Inbox
   // sessions are hidden from Recents (and may live on another gateway), so
   // core's clearUnreadOnOpen, which only acts on $sessions rows, never sees them.
-  // The 30 s poll re-marks the focused chat only once per activity stamp: a
+  // A refresh re-marks the focused chat only once per activity stamp: a
   // write that failed must not re-fire every poll (it did, as 409s in desktop.log).
   const polledRead = new Set()
   const markRead = (item, { poll = false } = {}) => {
@@ -758,7 +841,7 @@ export function createStore(ctx) {
     return true
   }
 
-  const store = { $items, $open, $busy, $editing, $selected, $cards, refresh, open, markRead, archive, archiveHotkey, accept, act, run, onKeyDown, setOpen, select, cardItem, fetchCard }
+  const store = { $items, $open, $busy, $editing, $selected, $cards, refresh, refreshGateway, onChanged, onShow, open, markRead, archive, archiveHotkey, accept, act, run, onKeyDown, setOpen, select, cardItem, fetchCard }
   return store
 }
 
@@ -1173,9 +1256,10 @@ export default {
     const store = createStore(ctx)
     if (typeof window !== 'undefined') window.__inbox = { store, refresh: store.refresh }
     void store.refresh()
-    ctx.setInterval(() => {
-      if (typeof document === 'undefined' || !document.hidden) void store.refresh()
-    }, POLL_MS)
+    const subscribe = typeof ctx.onEvent === 'function' ? ctx.onEvent : host?.onEvent
+    const offChanged = typeof subscribe === 'function' ? subscribe(CHANGED_EVENT, store.onChanged) : null
+    if (typeof offChanged === 'function') ctx.onDispose?.(offChanged)
+    pollWhileVisible(ctx, () => void store.refresh(), POLL_MS, () => void store.onShow())
     // Focusing a message (from any door) marks it read.
     const unsub = host.state.focusedStoredSessionId?.listen?.(sid => store.markRead(itemFor(store.$items.get(), sid)))
     if (unsub) ctx.onDispose?.(unsub)
