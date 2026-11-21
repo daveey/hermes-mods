@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from contextvars import ContextVar, copy_context
 from concurrent.futures import ThreadPoolExecutor
 
@@ -2606,6 +2607,36 @@ def _state_merge(words, repo, cwd, env):
             _WAITING_RECEIPT.reset(receipt)
 
 
+def on_demand_proof_skip(c):
+    """True only for the Blacksmith app's `Proof` check run that was never asked to run.
+
+    Since 2026-11-21 every PR head gets it (conclusion SKIPPED, "run only when asked", no
+    workflow, details on blacksmith.sh). It is an AI demo, not CI evidence, so a state
+    preflight does not count it as a failure. Anything else non-green still refuses.
+    """
+    if not isinstance(c, dict):
+        return False
+    if (c.get("__typename") != "CheckRun" or c.get("name") != "Proof"
+            or c.get("status") != "COMPLETED" or c.get("conclusion") != "SKIPPED"
+            or c.get("workflowName")):
+        return False
+    url = c.get("detailsUrl")
+    if not isinstance(url, str):
+        return False
+    # Browsers read a backslash as a slash, so `https://u@evil.com\\@blacksmith.sh/` parses here as
+    # host blacksmith.sh but leads elsewhere: refuse backslashes, whitespace/control chars and userinfo.
+    if "\\" in url or re.search(r"[\s\x00-\x1f\x7f]", url):
+        return False
+    try:
+        parts = urllib.parse.urlparse(url)
+        host = parts.hostname
+        userinfo = parts.username is not None or parts.password is not None
+    except ValueError:
+        return False
+    return (parts.scheme == "https" and not userinfo and bool(host)
+            and (host == "blacksmith.sh" or host.endswith(".blacksmith.sh")))
+
+
 def _state_merge_scoped(words, repo, cwd, env):
     """Narrow state-only exception, never a general non-main merge allowance.
 
@@ -2709,10 +2740,15 @@ def _state_merge_scoped(words, repo, cwd, env):
             name = c.get("name") or c.get("context") or "?"
             return f"{name}={c.get('conclusion') or c.get('state') or c.get('status') or '?'}"
 
-        bad = [label(c) for c in checks if not green(c)]
+        # The one exemption: Blacksmith's on-demand `Proof` demo run that never ran.
+        counted = [c for c in checks if not on_demand_proof_skip(c)]
+        bad = [label(c) for c in counted if not green(c)]
         if bad:
             return failed(f"{len(bad)} of {len(checks)} checks not green: " + ", ".join(bad[:8])
                           + (f", +{len(bad) - 8} more" if len(bad) > 8 else ""))
+        if not counted:
+            return failed("no check other than the skipped on-demand Blacksmith `Proof` run exists "
+                          "(needs at least one green check)")
         refusal = _review_reply_refusal(number, data)
         if refusal:
             return refusal
