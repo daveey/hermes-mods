@@ -197,12 +197,27 @@ and operation receipt atomically. Receipt readback makes retries safe after a
 crash between the board commit and outbox acknowledgment. Dedicated metadata
 cards described above remain on their separate delivery path.
 
-Remote card asks are not yet projected by this mirror. The supported hub task
-courier's plain `comment`/`unblock` actions do not expose an atomic exact-ask
-precondition plus operation receipt. The Board operator courier also refuses
-human holds. Neither is a safe substitute for this producer's local transaction:
-remote support requires a supported owner-side fenced decision interface first.
-Do not write replica task rows or treat a source reference as delivery authority.
+Remote card asks are projected only for an exact linked chat and an owner-published
+ask generation. The binding freezes owner gateway/profile/board/task/generation.
+Answers use the authenticated `card-answer` courier: the owner independently reads
+the recorded source operation, then atomically fences the generation, records the
+comment and transitions the card. Retry/readback retains the same operation and
+courier request ID; queued or unverifiable responses are never success receipts.
+**Other** uses `mode: comment`: record a user-relayed comment, leave the human ask
+and lifecycle untouched, even when the text is a named choice or `archive`.
+The session panel no longer drafts answers into the chat composer. A missing
+binding disables choices until the owner ask can be mirrored. Never write replica
+rows or substitute separate `comment` and `unblock` calls.
+
+Offline cross-repo proof (M1 core and courier plus the record-only extension):
+
+```sh
+HERMES_HUB_CLIENT_REAL=/path/to/courier/client/hermes_hub.py \
+  bash plugins/user-steps/run-core-integration.sh /path/to/isolated/core -k mirrored_real_store
+```
+
+This exercises the real ActionStore, source proof, courier journals and owner DB;
+network authentication/OS identity are fixtures, not live HTTPS or Desktop proof.
 
 Requires core `archive_task(precondition=..., comment=..., event_extra=...)`;
 on an older core the projection publishes no tiles (logged "Card projection paused") instead
