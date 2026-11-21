@@ -121,21 +121,27 @@ class Feed:
         trust and re-read. The revision space, held bundles and interest carry over; every held chat is recomputed
         before a push vouches for it again. `prev` emits nothing after this (its in-flight push finishes first)."""
         with prev.compute_lock, prev.lock:
+            # First: whatever follows, the old object pushes nothing more under the revision space handed over here.
+            prev.emit = lambda payload: None
             prev.stopped.set()
             self.epoch, self.rev, self.last_emit = prev.epoch, prev.rev, prev.last_emit
-            self.last_tick_s = prev.last_tick_s
-            self.bundles = {s: dict(b) for s, b in prev.bundles.items()}
-            self.interest = dict(prev.interest)
-            self.failures = {s: dict(f) for s, f in prev.failures.items()}
-            self._retry = set(prev._retry) | set(prev.bundles)  # recompute every carried chat on the next pass
-            self._carried = set(prev.bundles)  # ...and vouch for none of them until its new bundle is stored
+            self.last_tick_s = getattr(prev, 'last_tick_s', 0.0)
+            bundles = getattr(prev, 'bundles', {})
+            self.bundles = {s: dict(b) for s, b in bundles.items()}
+            self.interest = dict(getattr(prev, 'interest', {}))
+            self.failures = {s: dict(f) for s, f in getattr(prev, 'failures', {}).items()}
+            self._retry = set(getattr(prev, '_retry', ())) | set(bundles)  # recompute every carried chat next pass
+            self._carried = set(bundles)  # ...and vouch for none of them until its new bundle is stored
             # A carried bundle never outranks a newer computation: sequence numbers continue past every held one.
-            top = max((int(b['bundle'].get('computed_seq') or 0) for b in prev.bundles.values()), default=0)
+            top = max((int(b['bundle'].get('computed_seq') or 0) for b in bundles.values()), default=0)
             self._seq = itertools.count(top + 1)
             prev._successor = self
-            # Older feed code (a hot reload) has no stopped-check in its publish: silence it, so nothing it still
-            # computes is pushed under the revision space this feed now owns.
-            prev.emit = lambda payload: None
+            # Older feed code (a hot reload) reads neither `stopped` in its publish nor `_successor`: its entry points
+            # are routed here as instance attributes (found before the class's), so a request still on it neither
+            # moves its revision nor answers with one this feed never issued.
+            prev._publish = lambda computed, heartbeat=False: {}
+            prev.watch = self.watch
+            prev.changes = self.changes
         return self
 
     def _current(self) -> 'Feed':

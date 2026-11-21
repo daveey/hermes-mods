@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import hashlib
 import copy
 from contextlib import contextmanager
 import importlib.util
@@ -24,6 +25,7 @@ import sqlite3
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 from typing import Any, Optional
 
@@ -54,7 +56,11 @@ log = logging.getLogger(PLUGIN_ID)
 
 _FEED_KEY = '_session_panel_feed_core'
 _FEED_PATH = Path(__file__).resolve().parent / 'feed.py'
-_FEED_LOAD_LOCK = threading.Lock()
+# Process-wide (not per plugin_api generation: a hot reload re-imports this file while the old generation's threads
+# may still call their own _load_feed): one lock and a generation counter for loading feed.py.
+_LOADER = sys.modules.setdefault('_session_panel_feed_loader', types.ModuleType('_session_panel_feed_loader'))
+_LOADER.__dict__.setdefault('lock', threading.Lock())
+_LOADER.__dict__.setdefault('generation', 0)
 
 
 def _feed_stamp() -> tuple:
@@ -67,40 +73,63 @@ def _feed_stamp() -> tuple:
 
 def _load_feed():
     """feed.py as a module of this process: it holds the process's one feed (PROCESS_FEED), so it outlives plugin
-    reloads (plugin_api.py is re-imported; this module is not). A changed feed.py on disk is loaded anew on the next
-    call and the running feed is handed over: it is stopped here and the next feed() resumes it under the new code
-    (same epoch and revisions). [daveey 2026-11-21] a hot mods-reload re-imported plugin_api.py but kept the old
-    feed.py, so a feed fix did not take effect until the backend process restarted."""
+    reloads (plugin_api.py is re-imported; this module is not). When feed.py's bytes change on disk the new code is
+    loaded and the running feed handed over: it is stopped and resumed under the new code at once (same epoch and
+    revisions). [daveey 2026-11-21] a hot mods-reload re-imported plugin_api.py but kept the old feed.py, so a feed
+    fix did not take effect until the backend process restarted."""
     stamp = _feed_stamp()
     old = sys.modules.get(_FEED_KEY)
-    # Current, or feed.py unreadable (keep what runs). A module loaded by older code carries no stamp: reloaded.
+    # Current, or feed.py unreadable (keep what runs). A module loaded by older code carries no stamp: checked.
     if old is not None and (not stamp or getattr(old, 'SOURCE_STAMP', None) == stamp):
         return old
-    with _FEED_LOAD_LOCK:
+    restart = False
+    with _LOADER.lock:
         old = sys.modules.get(_FEED_KEY)
         if old is not None and (not stamp or getattr(old, 'SOURCE_STAMP', None) == stamp):
             return old
-        spec = importlib.util.spec_from_file_location(_FEED_KEY, _FEED_PATH)
+        try:
+            source = _FEED_PATH.read_bytes()
+        except OSError:
+            if old is not None:
+                return old
+            raise
+        digest = hashlib.sha256(source).hexdigest()
+        if old is not None and getattr(old, 'SOURCE_SHA', None) == digest:
+            old.SOURCE_STAMP = stamp  # touched or rewritten with the same bytes: nothing to load
+            return old
+        _LOADER.generation += 1
+        # Executed under its own name (dataclasses resolve it in sys.modules), so no caller ever sees a half-built
+        # module at _FEED_KEY.
+        name = f'{_FEED_KEY}_g{_LOADER.generation}'
+        spec = importlib.util.spec_from_file_location(name, _FEED_PATH)
         mod = importlib.util.module_from_spec(spec)
-        sys.modules[_FEED_KEY] = mod  # dataclasses resolve their module while it executes
+        sys.modules[name] = mod
         try:
             spec.loader.exec_module(mod)
         except BaseException:
-            if old is not None:
-                sys.modules[_FEED_KEY] = old
-            else:
-                sys.modules.pop(_FEED_KEY, None)
-            raise
-        if old is not None:
-            with old.PROCESS_LOCK:
-                running = getattr(old, 'PROCESS_FEED', None)
-                mod.PROCESS_LOCK = old.PROCESS_LOCK  # one lock for every generation of this process's feed
-                mod.PROCESS_FEED = running
-                mod.RESTART = getattr(old, 'RESTART', None)
-                if running is not None and not isinstance(running, mod.Feed):
-                    running.stopped.set()  # the next feed() resumes it with the new code
-        mod.SOURCE_STAMP = stamp  # last: callers that saw no stamp waited on the lock above
-        return mod
+            sys.modules.pop(name, None)
+            if old is None:
+                raise
+            log.warning('session-panel: feed.py failed to load; keeping the running feed until it changes again',
+                        exc_info=True)
+            old.SOURCE_STAMP = stamp  # not retried on every call; the next change on disk is
+            return old
+        mod.SOURCE_STAMP, mod.SOURCE_SHA, mod.RESTART = stamp, digest, feed
+        if old is None:
+            sys.modules[_FEED_KEY] = mod
+            return mod
+        with old.PROCESS_LOCK:
+            running = getattr(old, 'PROCESS_FEED', None)
+            mod.PROCESS_LOCK = old.PROCESS_LOCK  # one lock for every generation of this process's feed
+            mod.PROCESS_FEED = running
+            sys.modules[_FEED_KEY] = mod  # swapped under the lock feed() re-checks with
+            if running is not None and not running.stopped.is_set():
+                # Any running feed here is of an older class (a reload always makes a new one): hand it over.
+                running.stopped.set()
+                restart = True
+    if restart:  # resume it now, not at the next request: pushes and heartbeats continue
+        threading.Thread(target=feed, name='session-panel-feed-resume', daemon=True).start()
+    return mod
 
 
 class CoreReaders:
@@ -541,19 +570,22 @@ LAUNCH_PROFILE = _launch_profile()
 
 def feed():
     """The process's one feed, started on first use (its thread ticks every TICK_S until stopped)."""
-    core = _load_feed()
-    with core.PROCESS_LOCK:
-        if core.PROCESS_FEED is None or core.PROCESS_FEED.stopped.is_set():
-            prev, new = core.PROCESS_FEED, core.Feed(CoreReaders(), emit=_emit)
-            if prev is not None:  # a plugin reload stopped it: carry its revisions on, so clients see no reset
-                try:
-                    new.resume(prev)
-                except Exception:  # never leave the process without a running feed: start clean (clients reset)
-                    log.warning('session-panel feed: resume failed; starting a new revision space', exc_info=True)
-                    new = core.Feed(CoreReaders(), emit=_emit)
-            core.PROCESS_FEED = new
-            threading.Thread(target=_run, args=(core.PROCESS_FEED,), name='session-panel-feed', daemon=True).start()
-        return core.PROCESS_FEED
+    while True:
+        core = _load_feed()
+        with core.PROCESS_LOCK:
+            if sys.modules.get(_FEED_KEY) is not core:
+                continue  # a reload swapped the module (under this same lock) after we loaded it: use the new one
+            if core.PROCESS_FEED is None or core.PROCESS_FEED.stopped.is_set():
+                prev, new = core.PROCESS_FEED, core.Feed(CoreReaders(), emit=_emit)
+                if prev is not None:  # a plugin reload stopped it: carry its revisions on, so clients see no reset
+                    try:
+                        new.resume(prev)
+                    except Exception:  # never leave the process without a running feed: start clean (clients reset)
+                        log.warning('session-panel feed: resume failed; starting a new revision space', exc_info=True)
+                        new = core.Feed(CoreReaders(), emit=_emit)
+                core.PROCESS_FEED = new
+                threading.Thread(target=_run, args=(core.PROCESS_FEED,), name='session-panel-feed', daemon=True).start()
+            return core.PROCESS_FEED
 
 
 _load_feed().RESTART = feed  # plugin register() after a reload resumes the feed now, not at the next request

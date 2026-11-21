@@ -95,34 +95,70 @@ def test_a_plugin_reload_resumes_the_process_feed_on_register_and_on_the_next_re
         core.PROCESS_FEED = None
 
 
-def test_a_changed_feed_py_is_loaded_anew_and_the_running_feed_handed_over(monkeypatch):
-    # [daveey 2026-11-21] a hot mods-reload re-imported plugin_api.py but kept the old feed.py module, so the feed
-    # fix stayed inactive until the backend restarted.
-    api = load('_spf_hot_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
-    fakes = load('_spf_hot_fakes', HERE.parent / 'test_feed.py')
+
+def _hot(monkeypatch, tag):
+    api = load(f'_spf_hot_api_{tag}', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
+    fakes = load(f'_spf_hot_fakes_{tag}', HERE.parent / 'test_feed.py')
     monkeypatch.setattr(api, 'CoreReaders', fakes.Readers)
     monkeypatch.setattr(api, '_emit', lambda payload: None)
-    old_mod = api._load_feed()
-    assert api._load_feed() is old_mod, 'an unchanged feed.py is not reloaded'
-    old_mod.PROCESS_FEED = None
+    original = sys.modules[api._FEED_KEY]
+    original.PROCESS_FEED = None
+    return api, original
+
+
+def _restore(api, original):
+    mod = sys.modules.get(api._FEED_KEY)
+    if mod is not None and mod.PROCESS_FEED is not None:
+        mod.PROCESS_FEED.stopped.set()
+    original.PROCESS_FEED = None
+    sys.modules[api._FEED_KEY] = original
+
+
+def test_a_changed_feed_py_is_loaded_anew_and_the_running_feed_handed_over_at_once(monkeypatch):
+    # [daveey 2026-11-21] a hot mods-reload re-imported plugin_api.py but kept the old feed.py module, so the feed
+    # fix stayed inactive until the backend restarted.
+    import time
+    api, old_mod = _hot(monkeypatch, 'a')
     try:
+        assert api._load_feed() is old_mod, 'an unchanged feed.py is not reloaded'
         running = api.feed()
         first = running.changes(['S1'])
-        monkeypatch.setattr(old_mod, 'SOURCE_STAMP', ('older code',))  # feed.py on disk differs from what runs
+        # Touched with the same bytes: nothing reloads.
+        monkeypatch.setattr(old_mod, 'SOURCE_STAMP', ('touched',))
+        assert api._load_feed() is old_mod and old_mod.SOURCE_STAMP == api._feed_stamp()
+        # Different bytes on disk (as if feed.py changed): the new code loads and the feed is resumed under it.
+        monkeypatch.setattr(old_mod, 'SOURCE_STAMP', ('older code',))
+        monkeypatch.setattr(old_mod, 'SOURCE_SHA', 'older code')
         new_mod = api._load_feed()
         assert new_mod is not old_mod and new_mod.Feed is not old_mod.Feed
-        assert new_mod.PROCESS_FEED is running and running.stopped.is_set(), 'the old-class feed is stopped'
-        assert new_mod.PROCESS_LOCK is old_mod.PROCESS_LOCK
-        f = api.feed()
+        assert sys.modules[api._FEED_KEY] is new_mod and new_mod.PROCESS_LOCK is old_mod.PROCESS_LOCK
+        assert running.stopped.is_set()
+        deadline = time.monotonic() + 5
+        while not isinstance(new_mod.PROCESS_FEED, new_mod.Feed) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        f = new_mod.PROCESS_FEED  # resumed without any request
         assert isinstance(f, new_mod.Feed) and not f.stopped.is_set()
-        assert f.epoch == first['epoch'] and f.rev == running.rev, 'same revision space under the new code'
+        assert f.epoch == first['epoch'] and f.rev == running.rev
+        assert api.feed() is f
         out = f.changes(['S1'], since=first['rev'], epoch=first['epoch'])
         assert out['reset'] is False and out['bundles'] == {}
-        sent = []
-        running.emit(sent.append)  # the old feed's emit is silenced
-        assert sent == []
     finally:
-        mod = api._load_feed()
-        if mod.PROCESS_FEED is not None:
-            mod.PROCESS_FEED.stopped.set()
-        mod.PROCESS_FEED = None
+        _restore(api, old_mod)
+
+
+def test_a_feed_py_that_fails_to_load_keeps_the_running_feed(monkeypatch, tmp_path, caplog):
+    api, old_mod = _hot(monkeypatch, 'b')
+    try:
+        running = api.feed()
+        bad = tmp_path / 'feed.py'
+        bad.write_text('raise RuntimeError("half-written")\n')
+        monkeypatch.setattr(api, '_FEED_PATH', bad)
+        gen = api._LOADER.generation
+        assert api._load_feed() is old_mod and not running.stopped.is_set()
+        assert f'{api._FEED_KEY}_g{gen + 1}' not in sys.modules, 'the failed generation is not left registered'
+        assert 'failed to load' in caplog.text
+        assert sys.modules[api._FEED_KEY] is old_mod
+        caplog.clear()
+        assert api._load_feed() is old_mod and caplog.text == '', 'not retried until feed.py changes again'
+    finally:
+        _restore(api, old_mod)

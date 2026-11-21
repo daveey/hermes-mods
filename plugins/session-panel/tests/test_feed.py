@@ -585,3 +585,36 @@ def test_forgetting_a_carried_chat_clears_its_carried_mark():
     assert 'S1' in new._carried
     new._forget('S1')
     assert 'S1' not in new._carried
+
+
+
+class _OlderFeed(feedmod.Feed):
+    """Feed code from before resume: publish has no stopped-check and changes knows no successor."""
+
+    def _publish(self, computed, *, heartbeat=False):
+        with self.compute_lock:
+            self.rev += 1
+            self.emit({'epoch': self.epoch, 'rev': self.rev})
+            return computed
+
+    def changes(self, sessions, *, since=0, epoch=None):
+        self.watch(sessions)
+        self._publish({})
+        return {'epoch': self.epoch, 'rev': self.rev, 'reset': False, 'bundles': {}}
+
+
+def test_resuming_an_older_class_feed_routes_its_entry_points_to_the_new_feed():
+    r = Readers()
+    t = {'now': 1000.0}
+    sent = []
+    old = _OlderFeed(r, emit=sent.append, clock=lambda: t['now'])
+    old.changes(['S1'])
+    del old._retry  # the oldest feed.py had none
+    new = feedmod.Feed(r, emit=lambda p: None, clock=lambda: t['now']).resume(old)
+    sent.clear()
+    rev = old.rev
+    old._publish({})
+    out = old.changes(['S2'])  # a request still holding the old object
+    assert sent == [] and old.rev == rev, 'the old object neither pushes nor moves a revision'
+    assert out['epoch'] == new.epoch and out['rev'] == new.rev and 'S2' in new.interest
+    assert 'S2' in out['bundles'] and 'S2' in new.bundles, 'answered (and computed) by the new feed'
