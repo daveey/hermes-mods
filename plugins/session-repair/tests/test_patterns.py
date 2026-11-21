@@ -33,13 +33,37 @@ def none(env, rule, card):
 def test_ready_card_unclaimed_while_a_slot_is_free(env):
     tid = F.ready_worker_free(env.conn, env.now)
     f = one(env, 'BS-ready-worker-free', tid)
-    assert f['variant'] == 'free_slot' and f['fix']['kind'] == 'auto'
+    assert f['variant'] == 'free_slot' and f['fix']['kind'] == 'auto' and f['area'] == 'hermes'
     assert f['evidence']['running'] == 0 and f['evidence']['limit'] == 4
     assert any('dispatch' in c for c in f['fix']['commands'])
 
 
+def test_ready_local_lane_uses_cores_30_minute_unrecorded_rule(env):
+    from hermes_cli import kanban_dispatch_skip as kds
+    assert kds.UNRECORDED_AFTER_SECONDS == 30 * 60
+    none(env, 'BS-ready-worker-free', F.ready_worker_free(env.conn, env.now, waited_s=20 * 60))
+
+
 def test_ready_card_not_flagged_when_recent(env):
     none(env, 'BS-ready-worker-free', F.ready_worker_free(env.conn, env.now, waited_s=120))
+
+
+def test_a_skip_recorded_in_the_episode_explains_the_wait_however_old(env):
+    tid = F.ready_with_old_skip(env.conn, env.now)
+    from hermes_cli import kanban_db, kanban_queue_position as kqp
+    src = env.sources()
+    assert (kqp.read(src.conn('default'), kanban_db.get_task(src.conn('default'), tid), 'default') or {}).get('skip'), \
+        'fixture: core sees the recorded skip'
+    none(env, 'BS-ready-worker-free', tid)
+
+
+def test_pool_could_run_is_its_own_variant_with_a_replace_card(env, monkeypatch):
+    from hermes_cli import kanban_queue_position as kqp
+    monkeypatch.setattr(kqp, 'read', lambda conn, task, board=None: {
+        'lane': 'local', 'running': 4, 'limit': 4, 'pool_could_run': ['w1']})
+    f = one(env, 'BS-ready-worker-free', F.ready_worker_free(env.conn, env.now, waited_s=900))
+    assert f['variant'] == 'pool_could_run' and f['fix']['kind'] == 'card'
+    assert not any('dispatch' in c for c in f['fix']['commands']), 'never a local dispatch for pool work'
 
 
 def test_ready_card_not_flagged_when_every_slot_is_busy(tmp_path, monkeypatch):
@@ -76,6 +100,8 @@ def test_scheduled_with_no_wake_just_parked_is_fine(env):
 def test_wake_probe_past_its_next_run(env):
     f = one(env, 'BS-overdue-wake', F.overdue_probe(env.conn, env.now))
     assert f['variant'] == 'probe_overdue' and f['evidence']['probe_cmd'] == 'true'
+    assert f['fix']['kind'] == 'card', 'never an automatic unblock before the probe is run'
+    assert f['fix']['commands'][0] == 'true' and 'unblock' in f['fix']['commands'][1], 'probe first, then unblock'
 
 
 def test_wake_probe_on_time_is_fine(env):
@@ -86,6 +112,21 @@ def test_wake_probe_on_time_is_fine(env):
 def test_blocked_with_no_reason(env):
     f = one(env, 'BS-unexplained-wait', F.blocked_no_reason(env.conn, env.now))
     assert f['variant'] == 'no_reason'
+
+
+def test_no_reason_has_its_own_30_minute_threshold(env):
+    assert env.scan_mod.NO_REASON_S == 30 * 60
+    none(env, 'BS-unexplained-wait', F.blocked_no_reason(env.conn, env.now, waited_s=20 * 60))
+
+
+def test_a_reason_given_as_error_is_a_reason(env):
+    none(env, 'BS-unexplained-wait', F.blocked_reason_in_error(env.conn, env.now))
+
+
+def test_wait_vocabulary_comes_from_core(env):
+    from hermes_cli import kanban_wait_info as kwi
+    assert env.scan_mod._core_wait() == (kwi.PARK_EVENT_KINDS, kwi.AGENT_BLOCK_KINDS)
+    assert not hasattr(env.scan_mod, 'AGENT_BLOCK_KINDS') and not hasattr(env.scan_mod, 'PARK_EVENTS')
 
 
 def test_blocked_with_an_invalid_human_request(env):
@@ -109,7 +150,28 @@ def test_agent_owned_block_under_two_hours_is_fine(env):
 # BS-parent-done
 def test_todo_whose_parents_finished(env):
     f = one(env, 'BS-parent-done', F.todo_parents_done(env.conn, env.now))
-    assert f['variant'] == 'parents_done' and 'promote' in f['fix']['commands'][0]
+    assert f['variant'] == 'parents_done' and f['fix']['kind'] == 'card', 'a residual core miss: a card, not a promote'
+
+
+def test_a_cancelled_parent_does_not_satisfy_core_promotion(env):
+    none(env, 'BS-parent-done', F.todo_parent_cancelled(env.conn, env.now))
+
+
+def test_core_deliberate_holds_are_not_findings(env, monkeypatch):
+    none(env, 'BS-parent-done', F.blocked_dependency_breaker(env.conn, env.now))  # recovery_held (breaker)
+    tid = F.todo_parents_done(env.conn, env.now)
+    from hermes_cli import kanban_containment_connections as containment
+    monkeypatch.setattr(containment, 'held', lambda conn, task_id: task_id == tid)
+    none(env, 'BS-parent-done', tid)
+
+
+def test_worker_copies_are_skipped_by_every_rule(env, monkeypatch):
+    tids = [F.todo_parents_done(env.conn, env.now), F.overdue_clock(env.conn, env.now),
+            F.blocked_no_reason(env.conn, env.now), F.running_quiet(env.conn, env.now)]
+    from hermes_cli import kanban_wake_check
+    monkeypatch.setattr(kanban_wake_check, 'foreign_ids', lambda conn, own=None: set(tids))
+    out = env.scan()
+    assert [f for f in out['findings'] if f['card'] in tids] == []
 
 
 def test_todo_whose_parent_just_finished_is_fine(env):
@@ -137,6 +199,15 @@ def test_running_with_no_event_for_an_hour(env):
     assert f['variant'] == 'quiet' and f['fix']['kind'] == 'card'
 
 
+def test_running_whose_lease_expired(env):
+    f = one(env, 'BS-stuck-run', F.running_lease_expired(env.conn, env.now))
+    assert f['variant'] == 'lease_expired' and f['evidence']['lease_holder'] == 'worker-x'
+
+
+def test_running_with_no_claim_lease_or_run(env):
+    assert one(env, 'BS-stuck-run', F.running_no_claim(env.conn, env.now))['variant'] == 'no_claim'
+
+
 def test_running_whose_claim_expired(env):
     assert one(env, 'BS-stuck-run', F.running_claim_expired(env.conn, env.now))['variant'] == 'claim_expired'
 
@@ -151,6 +222,15 @@ def test_review_with_no_review_run(env):
     assert f['evidence']['last_review_event'] == 'review_requested'
 
 
+def test_review_with_review_dispatch_off_is_a_card_for_its_owner(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    (tmp_path / 'config.yaml').write_text('kanban:\n  max_in_progress: 4\n  review_dispatch: false\n')
+    from hermes_cli import kanban_db_dispatch
+    monkeypatch.setattr(kanban_db_dispatch, 'review_dispatch_enabled', lambda: False)
+    f = one(env, 'BS-review-no-reviewer', F.review_idle(env.conn, env.now))
+    assert f['variant'] == 'idle_manual_review' and f['fix']['kind'] == 'card' and f['area'] == 'card'
+
+
 def test_review_with_a_review_running_is_fine(env):
     none(env, 'BS-review-no-reviewer', F.review_running(env.conn, env.now))
 
@@ -163,6 +243,11 @@ def test_review_just_requested_is_fine(env):
 def test_waiting_on_a_card_no_board_has(env):
     f = one(env, 'BS-broken-chain', F.missing_parent(env.conn, env.now))
     assert f['variant'] == 'missing_parent' and f['evidence']['missing'] == ['t_00000000deadbeef']
+
+
+def test_parked_on_a_card_no_board_has(env):
+    f = one(env, 'BS-broken-chain', F.awaiting_missing(env.conn, env.now))
+    assert f['variant'] == 'missing_awaited' and f['evidence']['missing'] == ['t_00000000feedface']
 
 
 def test_dependency_cycle(env):
@@ -180,7 +265,12 @@ def test_notice_whose_closeout_failed_for_good(env):
     F.notice_chat(env.state, 'C1', env.now, age_s=3600, closeout={'state': 'error', 'at': env.now - 3000})
     hits = env.findings(rule='BS-notice-undelivered')
     assert [(h['chat'], h['variant']) for h in hits] == [('C1', 'closeout_error')]
-    assert hits[0]['fingerprint'] == 'BS-notice-undelivered:chat/C1' and 'C1' in hits[0]['fix']['commands'][0]
+    assert hits[0]['fingerprint'] == 'BS-notice-undelivered:chat/C1' and hits[0]['area'] == 'hermes'
+    import shlex
+    from hermes_cli._parser import build_top_level_parser
+    argv = shlex.split(hits[0]['fix']['commands'][0])
+    args = build_top_level_parser()[0].parse_args(argv[1:])  # core's own parser accepts the re-delivery command
+    assert args.resume == 'C1' and args.oneshot_exit and args.query.startswith('[Kanban close-out]')
 
 
 def test_notice_never_claimed_for_hours(env):
@@ -264,3 +354,37 @@ def test_machine_lane_free_slots_are_alloted_to_the_longest_waiters(env, monkeyp
     machines['w1']['metrics']['active_card_runs'] = 2
     machines['w1']['last_seen'] = now_ms - 3600 * 1000
     assert env.findings(rule='BS-ready-worker-free') == [], 'a machine not seen recently is not a free worker'
+
+
+# the repair session never repairs itself
+def test_the_repair_chat_and_its_own_cards_are_never_judged(env):
+    F.notice_chat(env.state, 'R1', env.now, age_s=3 * 3600, closeout={'state': 'error'})
+    env.state.execute("UPDATE sessions SET title = 'Session repair' WHERE id = 'R1'")
+    env.state.commit()
+    mine = F.card(env.conn, 'Filed by the repair chat', status='blocked', session='R1')
+    F.event(env.conn, mine, 'blocked', {}, at=env.now - 7200)
+    ours = F.repair_card(env.conn, env.now)
+    out = env.scan()
+    assert out['excluded_chats'] == ['R1']
+    assert [f for f in out['findings'] if f['chat'] == 'R1' or f['card'] in (mine, ours)] == [], out['findings']
+
+
+def test_chat_json_names_the_repair_chat_too(env):
+    (env.home / 'session-repair').mkdir()
+    (env.home / 'session-repair' / 'chat.json').write_text('{"session": "R2"}')
+    F.notice_chat(env.state, 'R2', env.now, age_s=3 * 3600, closeout={'state': 'error'})
+    assert env.findings(rule='BS-notice-undelivered') == []
+
+
+def test_no_fix_kind_human_is_emitted(env):
+    for build in (F.blocked_invalid_ask, F.blocked_no_reason, F.scheduled_no_wake, F.missing_parent):
+        build(env.conn, env.now)
+    assert {f['fix']['kind'] for f in env.scan()['findings']} <= {'auto', 'card'}
+
+
+def test_chats_over_the_cap_are_counted_and_logged(env, monkeypatch, caplog):
+    for i in range(3):
+        F.card(env.conn, f'c{i}', status='todo', session=f'S{i}')
+    monkeypatch.setattr(env.scan_mod, 'MAX_CHATS', 2)
+    out = env.scan()
+    assert out['truncated_chats'] == 1 and any('MAX_CHATS' in e['error'] for e in out['errors'])

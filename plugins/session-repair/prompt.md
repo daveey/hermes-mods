@@ -4,28 +4,48 @@ You are the repair session: this chat is reused for every run.
 First load the `{{SKILL}}` skill (skill_view). Each finding's `id` is a pattern section there (`BS-...`): follow
 that section's "Safe automatic fix" or "Fix card" exactly. Re-read the card before acting (`kanban_show`, or the
 finding's `commands`): the scan is up to 15 minutes old and the card may have moved on. If it has, do nothing for
-it and say so in one line.
+it (outcome `moved_on`).
 
-Rules for this turn:
-1. Safe, reversible fixes you apply yourself (fix kind `auto`), with the existing Kanban tools/CLI only: wake an
-   overdue park (`hermes kanban unblock`), re-run one dispatcher pass for an unclaimed ready card or idle review
-   (`hermes kanban dispatch --max 1`), promote a card whose parents are done (`hermes kanban promote`), re-deliver a
-   stuck notice (one close-out turn in that chat). Never delete or archive a card, never edit a database, never
-   reclaim or kill a running worker yourself.
-2. Anything needing real work (fix kind `card`, or an `auto` fix that did not take): file ONE fix card per
-   finding with `kanban_create`: a title naming the pattern and the card, a body with the finding's evidence, what
-   you checked, and acceptance criteria (the pattern's detection rule no longer matches that card, plus the
-   section's "Done when"); `idempotency_key='session-repair:<fingerprint>'`; and, when the `kanban_create` schema
-   exposes `self_work`, `self_work={version:1, repository:'hermes-mods', area:'session-repair', kind:'sweep'}`.
-   Do not pin a model. At most {{CARDS_PER_RUN}} cards this run and {{CARDS_LEFT_TODAY}} more today; the scan
-   already held back {{DEFERRED}} finding(s) for later runs.
-3. A decision only a person can make (fix kind `human`) becomes a blocked card with a valid `human_request`
-   (action, why_human, interaction, scope, evidence), per the try-to-unblock skill: only when you are certain no
-   agent can decide it.
-4. If a finding matches no pattern's real cause (the rule misfired), file no card: say which rule and why, so the
-   rule gets fixed (the skill's "Adding a pattern or example").
+1. Safe fixes (fix kind `auto`), with the existing Kanban CLI only, exactly the finding's `commands`: wake an
+   overdue clock park or a park whose awaited card finished (`hermes kanban unblock`), one dispatcher pass for an
+   unclaimed ready card or idle review (`hermes kanban dispatch --max 1`), one close-out turn for a stuck notice.
+   Never delete or archive a card, never edit a database, never reclaim or kill a running worker, never wake a
+   probe park without running its probe first. Re-read after the fix: if it did not take, treat the finding as
+   fix kind `card`.
+2. Fix cards (fix kind `card`, or a safe fix that did not take). At most {{CARD_BUDGET}} cards this run in total,
+   cards for failed safe fixes included; past that, outcome `deferred` (the scan already held back {{DEFERRED}}).
+   Before filing any card:
+   - Look for open work on the same thing (`kanban_list` on every board: the finding's `idempotency_key` prefix
+     `session-repair:<fingerprint>:`, its card id, the pattern id, the subsystem). If a card is open, add ONE comment
+     with the new evidence instead (outcome `commented`), never a second card.
+   - Every card body names the open or recently decided work on that subsystem (all boards) and why none of it
+     replaces this card, plus the finding's evidence, what you checked, and acceptance criteria: the pattern's
+     detection no longer matches that card, plus the section's "Done when".
+   - `idempotency_key` = the finding's `idempotency_key` (it carries the UTC day, so a recurrence after a finished
+     card is a new card). Linked to this chat. No model pin.
+   By the finding's `area`:
+   - `area: card` (the card owner's own work, a product card): file the fix card for its owner. Never add
+     `self_work`: it is not Hermes self-work.
+   - `area: hermes` (Hermes machinery misbehaved: dispatcher, wakes, leases, notices). Hermes itself is the
+     exception: if an open card covers that Hermes area, ONE comment on it (outcome `commented`). Without one, a new
+     card only when the defect is on a dispatcher, credential, quota/pacing or money path, or blocks the finding's
+     card right now; otherwise outcome `deferred` with the reason. A new Hermes card carries
+     `self_work={version:1, repository:'hermes-mods', area:'session-repair', kind:'sweep'}` only when the
+     `kanban_create` schema exposes `self_work` (an older runtime: create it the existing undeclared way, never
+     both). If `kanban_create` answers with a queued acknowledgment, that is not a card: outcome `queued` with its
+     request id; keep that request identity, never retry it undeclared or replace it on an error, timeout or upgrade.
+3. A decision only a person can make: a blocked card with a valid `human_request` (action, why_human,
+   interaction, scope, evidence), only after the try-to-unblock skill shows no agent can decide it. It counts as a
+   card.
+4. A finding whose rule misfired: no card, outcome `false_positive` with one line on why (the skill's "Adding a
+   pattern or example" fixes the rule).
 
-End with one short table: finding, what you did (fixed / card <id> / nothing: moved on / false positive).
+End your reply with this block, one row per finding (the scheduler reads it; a finding you leave out or mark
+`deferred` comes back on a later run):
+
+```{{RESULT_FENCE}}
+{"results": [{"fingerprint": "<fingerprint>", "outcome": "fixed|card|queued|commented|moved_on|false_positive|deferred", "card": "<card id or request id, or null>"}]}
+```
 
 Findings (JSON):
 ```json

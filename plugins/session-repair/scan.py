@@ -30,13 +30,14 @@ from typing import Any, Callable, Iterable, Optional
 log = logging.getLogger('session-repair')
 
 TERMINAL = ('done', 'archived', 'cancelled')
-OPEN = ('todo', 'ready', 'running', 'review', 'blocked', 'scheduled', 'triage')
+SATISFIED = ('done', 'archived')  # core recompute_ready: a parent satisfies its child only done or archived
 
 # Thresholds (seconds). The skill's pattern sections quote these; change both together.
-READY_UNCLAIMED_S = 10 * 60        # BS-ready-worker-free
-SKIP_EXPLAINS_S = 15 * 60          # a dispatcher skip this recent explains a ready wait
+READY_UNCLAIMED_S = 10 * 60        # BS-ready-worker-free, worker lanes (core kanban.sync.pickup_stall_seconds default)
+# BS-ready-worker-free, local lane: core kanban_dispatch_skip.unrecorded() (30 min, free slot, no recorded skip)
 WAKE_OVERDUE_S = 30 * 60           # BS-overdue-wake
 AGENT_BLOCK_S = 2 * 3600           # BS-unexplained-wait (agent-owned block)
+NO_REASON_S = 30 * 60              # BS-unexplained-wait (blocked with no kind and no reason)
 PARENT_DONE_S = 10 * 60            # BS-parent-done
 RUN_QUIET_S = 60 * 60              # BS-stuck-run
 CLAIM_GRACE_S = 5 * 60             # BS-stuck-run: an expired claim/lease this long
@@ -48,11 +49,11 @@ MAX_CHATS = 1000
 
 RULES = ('BS-ready-worker-free', 'BS-overdue-wake', 'BS-unexplained-wait', 'BS-parent-done', 'BS-stuck-run',
          'BS-review-no-reviewer', 'BS-broken-chain', 'BS-notice-undelivered')
-AGENT_BLOCK_KINDS = ('transient', 'capability', 'assignment', 'needs_input')  # core kanban_wait_info
+REPAIR_CHAT_TITLE = 'Session repair'
+REPAIR_KEY_PREFIX = 'session-repair:'
 READY_ENTRY_EVENTS = ('promoted', 'unblocked', 'continuation_woken', 'created', 'reclaimed', 'released', 'status',
                       'reopened', 'changes_requested')
 REVIEW_ENTRY_EVENTS = ('review_requested', 'hub_review_admitted', 'review_route_deferred', 'status')
-PARK_EVENTS = ('blocked', 'scheduled', 'continued', 'gave_up', 'triage_swept', 'block_loop_detected', 'status')
 NOTIFY_KINDS_FALLBACK = ('completed', 'blocked', 'gave_up', 'crashed', 'timed_out', 'status', 'archived', 'unblocked')
 
 
@@ -65,8 +66,9 @@ class Finding:
     title: str
     summary: str
     evidence: dict
-    fix: dict            # {kind: auto|card|human, action, commands: [...], why}
+    fix: dict            # {kind: auto|card, action, commands: [...], why}
     variant: str = ''
+    area: str = 'card'   # who acts on a fix card: 'hermes' (a Hermes machinery defect) or 'card' (the card's owner)
 
     @property
     def fingerprint(self) -> str:
@@ -77,7 +79,7 @@ class Finding:
     def to_dict(self) -> dict:
         return {'id': self.rule, 'variant': self.variant, 'card': self.card, 'board': self.board, 'chat': self.chat,
                 'title': self.title, 'summary': self.summary, 'evidence': self.evidence, 'fix': self.fix,
-                'fingerprint': self.fingerprint}
+                'area': self.area, 'fingerprint': self.fingerprint}
 
 
 # ── loading the session-panel backend (its readers and chain walk) ─────────────────────────────────────────────────
@@ -150,7 +152,8 @@ def kanban_cmd(board: str, verb: str, *args: str) -> str:
 class Sources:
     """The reads the rules need, all through the session-panel readers' query-only connections."""
 
-    def __init__(self, readers: Any = None, *, now: Optional[float] = None):
+    def __init__(self, readers: Any = None, *, now: Optional[float] = None,
+                 exclude_chats: Optional[Iterable[str]] = None):
         api, feedmod = load_panel()
         self.api = api
         self.readers = readers if readers is not None else api.CoreReaders()
@@ -160,6 +163,36 @@ class Sources:
         self.now = time.time() if now is None else now
         self.errors: list[dict] = []
         self._own: dict[str, Optional[str]] = {}
+        self._copies: dict[str, set] = {}
+        self.exclude_chats = set(exclude_chats) if exclude_chats is not None else self.repair_chats()
+
+    def repair_chats(self) -> set[str]:
+        """The Session repair chat(s): never scanned, never a notice target (`chat.json` from run.py, and any
+        unarchived chat with that title in state.db)."""
+        out: set[str] = set()
+        try:
+            home = Path(Path(self.readers.state_db()).parent)
+            out.add(str(json.loads((home / 'session-repair' / 'chat.json').read_text())['session']))
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        c = self.state_conn()
+        if c is not None:
+            try:
+                out |= {str(r[0]) for r in c.execute('SELECT id FROM sessions WHERE title = ?', (REPAIR_CHAT_TITLE,))}
+            except Exception as e:  # noqa: BLE001
+                self.error('repair chat lookup', e)
+        return out
+
+    def copies(self, board: str) -> set:
+        """Worker-node copies on this board (core `kanban_wake_check.foreign_ids`): their home board owns them."""
+        if board not in self._copies:
+            try:
+                from hermes_cli.kanban_wake_check import foreign_ids
+                self._copies[board] = set(foreign_ids(self.conn(board)))
+            except Exception as e:  # noqa: BLE001
+                self.error(f'foreign_ids {board}', e)
+                self._copies[board] = set()
+        return self._copies[board]
 
     def error(self, where: str, exc: BaseException) -> None:
         self.errors.append({'where': where, 'error': f'{type(exc).__name__}: {exc}'[:300]})
@@ -297,6 +330,11 @@ class Card:
     def title(self) -> str:
         return str(getattr(self.task, 'title', '') or '')
 
+    @property
+    def ours(self) -> bool:
+        """A card the repair session itself filed (its idempotency key): never judged, so no repair loop."""
+        return str(getattr(self.task, 'idempotency_key', '') or '').startswith(REPAIR_KEY_PREFIX)
+
     def base(self) -> dict:
         ev = {'status': self.status}
         if self.via:
@@ -307,9 +345,16 @@ class Card:
 Rule = Callable[[Card, Sources], Optional[Finding]]
 
 
-def _finding(rule: str, card: Card, variant: str, summary: str, evidence: dict, fix: dict) -> Finding:
+def _finding(rule: str, card: Card, variant: str, summary: str, evidence: dict, fix: dict,
+             area: str = 'card') -> Finding:
     return Finding(rule=rule, card=card.id, board=card.board, chat=card.chat, title=card.title, summary=summary,
-                   evidence={**card.base(), **evidence}, fix=fix, variant=variant)
+                   evidence={**card.base(), **evidence}, fix=fix, variant=variant, area=area)
+
+
+def _core_wait():
+    """Core's wait vocabulary (kanban_wait_info): park events and agent-owned block kinds, never local copies."""
+    from hermes_cli import kanban_wait_info as kwi
+    return kwi.PARK_EVENT_KINDS, kwi.AGENT_BLOCK_KINDS
 
 
 # ── rules ──────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -347,22 +392,26 @@ def _machine_free(place: dict, src: Sources) -> tuple[Optional[str], dict]:
     return None, {}
 
 
+def _ready_since(c, card: Card) -> Optional[float]:
+    if _col(c, 'tasks', 'ready_since'):
+        rs = c.execute('SELECT ready_since FROM tasks WHERE id = ?', (card.id,)).fetchone()
+        if rs and _num(rs[0]):
+            return _num(rs[0]) / 1000.0
+    ev = _events(c, card.id, READY_ENTRY_EVENTS)
+    return _num(ev[0]['at']) if ev else _num(getattr(card.task, 'created_at', None))
+
+
 def rule_ready_worker_free(card: Card, src: Sources) -> Optional[Finding]:
-    """BS-ready-worker-free: ready, unclaimed > 10 min, while a worker that can run it has a free slot."""
+    """BS-ready-worker-free: ready and unclaimed while a worker that can run it has a free slot, with no recorded
+    dispatcher skip in the current ready episode (a skip of any age, or one with `until`, explains the wait)."""
     if card.status != 'ready':
         return None
     c, now = card.conn, src.now
-    since = None
-    if _col(c, 'tasks', 'ready_since'):
-        rs = c.execute('SELECT ready_since FROM tasks WHERE id = ?', (card.id,)).fetchone()
-        since = _num(rs[0]) / 1000.0 if rs and _num(rs[0]) else None
-    if since is None:
-        ev = _events(c, card.id, READY_ENTRY_EVENTS)
-        since = _num(ev[0]['at']) if ev else _num(getattr(card.task, 'created_at', None))
-    waited = _age(now, since)
-    if waited is None or waited < READY_UNCLAIMED_S:
+    waited = _age(now, _ready_since(c, card))
+    if waited is None:
         return None
     try:
+        from hermes_cli import kanban_dispatch_skip as kds
         from hermes_cli import kanban_queue_position as kqp
         place = kqp.read(c, card.task, card.board) or {}
         note = kqp.describe(place) if place else None
@@ -372,42 +421,50 @@ def rule_ready_worker_free(card: Card, src: Sources) -> Optional[Finding]:
     lane = place.get('lane')
     ev = {'ready_for_s': waited, 'lane': lane, 'queue_note': note}
     if lane == 'leftover_claim':
+        if waited < READY_UNCLAIMED_S:
+            return None
         return _finding('BS-ready-worker-free', card, 'leftover_claim',
                         f'ready {_fmt_age(waited)} but still holds claim {place.get("claim_lock")!r}: the dispatcher '
                         f'never picks a claimed card', {**ev, 'claim_lock': place.get('claim_lock'),
                                                         'worker_pid': place.get('worker_pid')},
                         {'kind': 'card', 'action': 'clear the leftover claim so the dispatcher can pick the card',
                          'commands': [kanban_cmd(card.board, 'show', card.id)],
-                         'why': 'releasing a claim on a ready card is not one of the automatic fixes'})
-    skip = place.get('skip') or {}
-    skip_at = _num(skip.get('at'))
-    if skip_at is not None and now - skip_at < SKIP_EXPLAINS_S:
-        return None  # the dispatcher passed it over just now, for a recorded reason: explained
-    free = None
-    if lane == 'local':
-        running, limit = place.get('running'), place.get('limit')
-        if isinstance(running, int) and isinstance(limit, int) and running < limit:
-            free = f'host runs {running} of {limit} workers'
+                         'why': 'releasing a claim on a ready card is not one of the automatic fixes'}, 'hermes')
+    if place.get('skip'):
+        return None  # the current ready episode has a recorded skip: the wait is explained, however old
     if place.get('pool_could_run'):
-        free = f'pool workers could run it now: {", ".join(map(str, place["pool_could_run"]))}'
-    free_machines: dict = {}
-    if lane == 'machine':
-        free, free_machines = _machine_free(place, src)
-    if not free:
-        return None
-    ev.update(free=free, running=place.get('running'), limit=place.get('limit'), ahead=place.get('ahead'),
-              skip=skip or None, free_machines=free_machines or None)
+        if waited < READY_UNCLAIMED_S:
+            return None
+        pool = ', '.join(map(str, place['pool_could_run']))
+        return _finding('BS-ready-worker-free', card, 'pool_could_run',
+                        f'ready {_fmt_age(waited)} for a host slot while pool workers could run it now: {pool}',
+                        {**ev, 'pool_could_run': place['pool_could_run'], 'running': place.get('running'),
+                         'limit': place.get('limit')},
+                        {'kind': 'card', 'action': 're-place the card on the pool (hermes kanban move) or fix why it '
+                         'is held home-only', 'commands': [kanban_cmd(card.board, 'show', card.id),
+                                                           kanban_cmd(card.board, 'move', card.id, '--help')],
+                         'why': 'a dispatcher pass here only uses host slots; the pool needs a re-placement'}, 'hermes')
     if lane == 'local':
-        fix = {'kind': 'auto', 'action': 're-run one dispatcher pass on the board',
-               'commands': [kanban_cmd(card.board, 'dispatch', '--max', '1', '--json')],
-               'why': 'one dispatcher pass claims ready cards by priority; it never runs a card twice'}
-    else:
-        fix = {'kind': 'card', 'action': "find why the free worker does not lease it (the worker's pickup skips: "
-               "`kanban_show` there, skill hermes-workers), fix that, or re-place the card",
-               'commands': [kanban_cmd(card.board, 'show', card.id)],
-               'why': 'a dispatcher pass here cannot start work on another machine'}
-    return _finding('BS-ready-worker-free', card, 'free_slot' if lane == 'local' else 'free_worker',
-                    f'ready {_fmt_age(waited)}, unclaimed, while {free}', ev, fix)
+        if not kds.unrecorded(place, waited):  # core: >= 30 min, running < limit, no recorded skip
+            return None
+        return _finding('BS-ready-worker-free', card, 'free_slot',
+                        f'ready {_fmt_age(waited)}, unclaimed, with no recorded skip, while the host runs '
+                        f'{place.get("running")} of {place.get("limit")} workers',
+                        {**ev, 'running': place.get('running'), 'limit': place.get('limit'), 'ahead': place.get('ahead')},
+                        {'kind': 'auto', 'action': 're-run one dispatcher pass on the board',
+                         'commands': [kanban_cmd(card.board, 'dispatch', '--max', '1', '--json')],
+                         'why': 'one pass claims ready cards by priority, or records why it skipped them'}, 'hermes')
+    if lane == 'machine' and waited >= READY_UNCLAIMED_S:
+        free, free_machines = _machine_free(place, src)
+        if free:
+            return _finding('BS-ready-worker-free', card, 'free_worker',
+                            f'ready {_fmt_age(waited)}, unclaimed, while {free}', {**ev, 'free': free,
+                                                                                  'free_machines': free_machines},
+                            {'kind': 'card', 'action': "find why the free worker does not lease it (the worker's "
+                             "pickup skips: `kanban_show` there, skill hermes-workers), fix that, or re-place the card",
+                             'commands': [kanban_cmd(card.board, 'show', card.id)],
+                             'why': 'a dispatcher pass here cannot start work on another machine'}, 'hermes')
+    return None
 
 
 def rule_overdue_wake(card: Card, src: Sources) -> Optional[Finding]:
@@ -417,23 +474,20 @@ def rule_overdue_wake(card: Card, src: Sources) -> Optional[Finding]:
     c, now = card.conn, src.now
     try:
         from hermes_cli import kanban_continuation as kc
-        from hermes_cli.kanban_wake_check import foreign_ids
-        if card.id in foreign_ids(c):
-            return None  # a worker node's copy: its home board owns the wake
         park = kc.park_state(c, card.id)
     except Exception as e:  # noqa: BLE001
         src.error(f'park {card.board}/{card.id}', e)
         return None
-    fix = {'kind': 'auto', 'action': 'wake the park now (scheduled -> ready, or todo while a parent is open)',
-           'commands': [kanban_cmd(card.board, 'unblock', card.id)],
-           'why': 'the wake is past due; unblock is what the wake itself would have done'}
     if park.get('timed'):
         wake_at = _num((park.get('payload') or {}).get('wake_at'))
         late = _age(now, wake_at)
         if late is not None and late > WAKE_OVERDUE_S:
-            return _finding('BS-overdue-wake', card, 'clock_overdue',
-                            f'clock wake {_fmt_age(late)} past due', {'wake_at': wake_at, 'late_s': late,
-                                                                     'parked_at': park.get('parked_at')}, fix)
+            return _finding('BS-overdue-wake', card, 'clock_overdue', f'clock wake {_fmt_age(late)} past due',
+                            {'wake_at': wake_at, 'late_s': late, 'parked_at': park.get('parked_at')},
+                            {'kind': 'auto', 'action': 'wake the park now (scheduled -> ready, or todo while a parent '
+                             'is open)', 'commands': [kanban_cmd(card.board, 'unblock', card.id)],
+                             'why': 'the clock wake is past due; unblock is what the wake itself would have done'},
+                            'hermes')
         return None
     probe = None
     if c.execute("SELECT 1 FROM sqlite_master WHERE name='task_wake_checks'").fetchone():
@@ -443,12 +497,15 @@ def rule_overdue_wake(card: Card, src: Sources) -> Optional[Finding]:
     if probe is not None:
         late = _age(now, _num(probe[1]))
         if late is not None and late > WAKE_OVERDUE_S:
-            return _finding('BS-overdue-wake', card, 'probe_overdue',
-                            f'wake probe {_fmt_age(late)} past its next run',
+            return _finding('BS-overdue-wake', card, 'probe_overdue', f'wake probe {_fmt_age(late)} past its next run',
                             {'probe_cmd': str(probe[0])[:300], 'probe_next_at': probe[1], 'probe_last_at': probe[2],
                              'probe_last_rc': probe[3], 'probe_fails': probe[4], 'late_s': late},
-                            {**fix, 'action': 'run the probe by hand; if its condition holds, wake the park',
-                             'why': 'probes run every dispatcher tick; one this late means the probe runner is stuck'})
+                            {'kind': 'card', 'action': 'run the probe command (evidence.probe_cmd) by hand first: '
+                             'exit 0 = its condition holds, then unblock the card; otherwise leave the park and fix '
+                             'the stuck probe runner', 'commands': [str(probe[0])[:300],
+                                                                    kanban_cmd(card.board, 'unblock', card.id)],
+                             'why': 'waking a park whose condition is not met restarts work early; the probe runner '
+                             'being this late is a gateway defect'}, 'hermes')
         return None
     parked = _age(now, _num(park.get('parked_at')))
     if parked is not None and parked > WAKE_OVERDUE_S:
@@ -481,19 +538,24 @@ def _human_request(task) -> tuple[Any, bool]:
         return value, True
 
 
+def _park_reason(payload: dict) -> str:
+    return str(payload.get('reason') or payload.get('error') or '')
+
+
 def rule_unexplained_wait(card: Card, src: Sources) -> Optional[Finding]:
     """BS-unexplained-wait: blocked with no reason, an invalid human_request, or an agent-owned block > 2 h."""
     if card.status not in ('blocked', 'triage'):
         return None
     c, now = card.conn, src.now
+    park_kinds, agent_kinds = _core_wait()
     kind = getattr(card.task, 'block_kind', None)
     hr, valid = _human_request(card.task)
     if hr is not None and valid:
         return None  # a real ask: the chat is red, the user acts
-    park = _events(c, card.id, PARK_EVENTS)
+    park = _events(c, card.id, park_kinds)
     since = _num(park[0]['at']) if park else _last_event_at(c, card.id)
     waited = _age(now, since)
-    reason = str((park[0]['payload'] or {}).get('reason') or '') if park else ''
+    reason = _park_reason(park[0]['payload'] or {}) if park else ''
     if hr is not None and not valid:
         return _finding('BS-unexplained-wait', card, 'invalid_human_request',
                         f'{card.status} on a human_request core does not accept (the ask is invisible to you)',
@@ -504,7 +566,7 @@ def rule_unexplained_wait(card: Card, src: Sources) -> Optional[Finding]:
                          'commands': [kanban_cmd(card.board, 'show', card.id)],
                          'why': 'an invalid ask never reaches Needs you; only the owner can restate it'})
     if card.status == 'blocked' and kind is None and not reason.strip():
-        if waited is not None and waited >= PARENT_DONE_S:
+        if waited is not None and waited >= NO_REASON_S:
             return _finding('BS-unexplained-wait', card, 'no_reason', f'blocked {_fmt_age(waited)} with no reason given',
                             {'waiting_s': waited},
                             {'kind': 'card', 'action': 'ask the owning chat why it blocked; unblock it or block again '
@@ -512,7 +574,7 @@ def rule_unexplained_wait(card: Card, src: Sources) -> Optional[Finding]:
                              'why': 'nobody can act on a block with no reason'})
         return None
     wait = (card.row or {}).get('wait') or {}
-    agent = wait.get('agent_owned') if isinstance(wait, dict) and 'agent_owned' in wait else (kind in AGENT_BLOCK_KINDS)
+    agent = wait.get('agent_owned') if isinstance(wait, dict) and 'agent_owned' in wait else (kind in agent_kinds)
     since_w = _num(wait.get('waiting_since')) if isinstance(wait, dict) else None
     waited_w = _age(now, since_w) if since_w is not None else waited
     if agent and waited_w is not None and waited_w > AGENT_BLOCK_S:
@@ -564,33 +626,71 @@ def _awaited_card(c, card: str) -> Optional[dict]:
     return None
 
 
+def _failure_limit(kbd) -> int:
+    """`kanban.failure_limit` from config, else core's default (the breaker recovery_held compares against)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        value = int(((load_config_readonly() or {}).get('kanban') or {}).get('failure_limit'))
+        return value if value > 0 else kbd.DEFAULT_FAILURE_LIMIT
+    except (TypeError, ValueError, ImportError):
+        return kbd.DEFAULT_FAILURE_LIMIT
+
+
+def _promotion_held(c, card: Card) -> Optional[str]:
+    """Why core's recompute_ready deliberately leaves this card where it is (kanban_db.recompute_ready's holds), else
+    None: containment, a pending spend decision (triage), or a sticky stop / failure breaker (`recovery_held`)."""
+    from hermes_cli import kanban_containment_connections as containment
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import kanban_spend_decision as spend
+    from hermes_cli.kanban_block_routing import recovery_held
+    if containment.held(c, card.id):
+        return 'containment'
+    if card.status == 'triage' and spend.pending(c, card.id):
+        return 'spend_decision'
+    row = c.execute('SELECT id, status, consecutive_failures, max_retries FROM tasks WHERE id = ?', (card.id,)).fetchone()
+    if row is not None and recovery_held(c, row, _failure_limit(kbd)):
+        return 'recovery_held'
+    return None
+
+
 def rule_parent_done(card: Card, src: Sources) -> Optional[Finding]:
-    """BS-parent-done: still waiting on parents/an awaited card that are done or archived for > 10 min."""
+    """BS-parent-done: still waiting on parents (core's promotion set: done/archived) or an awaited card that
+    finished > 10 min ago, with none of core's deliberate holds."""
     c, now = card.conn, src.now
     if card.status == 'todo' or (card.status == 'blocked' and getattr(card.task, 'block_kind', None) == 'dependency'):
         parents = _parents(c, card.id)
         if not parents:
             return None
-        states = {pid: _parent_state(c, pid) for pid in parents}
-        if any(s is None or s['status'] not in TERMINAL for s in states.values()):
+        try:
+            from hermes_cli import kanban_db
+            from hermes_cli import kanban_db_sync as sync
+            states = dict(kanban_db.parent_states(c, card.id, remote=sync.has_remote_parents(c)))
+            held = _promotion_held(c, card)
+        except Exception as e:  # noqa: BLE001
+            src.error(f'parent_states {card.board}/{card.id}', e)
             return None
-        last = max((s['completed_at'] or 0) for s in states.values()) or None
+        if held or not states or any(st not in SATISFIED for st in states.values()):
+            return None
+        times = [(_parent_state(c, p) or {}).get('completed_at') for p in states]
+        last = max((t for t in times if t is not None), default=None)
         since = _age(now, last)
         if since is None or since < PARENT_DONE_S:
             return None
         return _finding('BS-parent-done', card, 'parents_done',
-                        f'{card.status} {_fmt_age(since)} after its last parent finished',
-                        {'parents': {p: s['status'] for p, s in states.items()}, 'since_last_parent_s': since},
-                        {'kind': 'auto', 'action': 'promote the card: every parent is finished',
-                         'commands': [kanban_cmd(card.board, 'promote', card.id)],
-                         'why': 'the dispatcher promotes a todo when its parents finish; it missed this one'})
+                        f'{card.status} {_fmt_age(since)} after its last parent finished; core did not promote it',
+                        {'parents': states, 'since_last_parent_s': since},
+                        {'kind': 'card', 'action': "find why recompute_ready skipped it (the dispatcher's promotion "
+                         "pass), fix that; promote by hand only with that cause named",
+                         'commands': [kanban_cmd(card.board, 'show', card.id), kanban_cmd(card.board, 'promote', card.id)],
+                         'why': 'core promotes such a card on its own unless it holds it on purpose; a residual case '
+                         'is a promotion defect, not something to paper over'}, 'hermes')
     if card.status == 'scheduled':
         awaited = _awaited_card(c, card.id)
         if not awaited:
             return None
         ref = awaited['ref']
         board, state = src.find_card(ref, card.board)
-        if not state or state['status'] not in TERMINAL:
+        if not state or state['status'] not in SATISFIED:
             return None
         since = _age(now, _num(state.get('completed_at')))
         if since is None or since < PARENT_DONE_S:
@@ -601,7 +701,7 @@ def rule_parent_done(card: Card, src: Sources) -> Optional[Finding]:
                          'since_s': since},
                         {'kind': 'auto', 'action': 'wake the park: the card it awaits has finished',
                          'commands': [kanban_cmd(card.board, 'unblock', card.id)],
-                         'why': 'the awaited-card wake did not fire'})
+                         'why': 'the awaited-card wake did not fire'}, 'hermes')
     return None
 
 
@@ -644,7 +744,7 @@ def rule_stuck_run(card: Card, src: Sources) -> Optional[Finding]:
         variant, summary = 'quiet', f'running, no event (not even a heartbeat) for {_fmt_age(quiet)}'
     if variant is None:
         return None
-    return _finding('BS-stuck-run', card, variant, summary, ev, fix)
+    return _finding('BS-stuck-run', card, variant, summary, ev, fix, 'hermes')
 
 
 def rule_review_no_reviewer(card: Card, src: Sources) -> Optional[Finding]:
@@ -667,13 +767,17 @@ def rule_review_no_reviewer(card: Card, src: Sources) -> Optional[Finding]:
         auto = review_dispatch_enabled()
     except Exception:  # noqa: BLE001
         auto = None
-    fix = ({'kind': 'auto', 'action': 're-run one dispatcher pass: review dispatch is on, so it starts a reviewer',
-            'commands': [kanban_cmd(card.board, 'dispatch', '--max', '1', '--json')],
-            'why': 'review runs are dispatched like ready cards'} if auto else
-           {'kind': 'card', 'action': 'start a review (review dispatch is off on this gateway) or send it back',
-            'commands': [kanban_cmd(card.board, 'show', card.id)], 'why': 'no automatic reviewer will come'})
-    return _finding('BS-review-no-reviewer', card, 'idle', f'in review {_fmt_age(idle)} with no review run',
-                    {'idle_s': idle, 'review_dispatch': auto, 'last_review_event': (ev[0]['kind'] if ev else None)}, fix)
+    if auto:
+        fix = {'kind': 'auto', 'action': 're-run one dispatcher pass: review dispatch is on, so it starts a reviewer',
+               'commands': [kanban_cmd(card.board, 'dispatch', '--max', '1', '--json')],
+               'why': 'review runs are dispatched like ready cards'}
+    else:
+        fix = {'kind': 'card', 'action': 'start a review (review dispatch is off on this gateway) or send it back',
+               'commands': [kanban_cmd(card.board, 'show', card.id)], 'why': 'no automatic reviewer will come'}
+    return _finding('BS-review-no-reviewer', card, 'idle' if auto else 'idle_manual_review',
+                    f'in review {_fmt_age(idle)} with no review run',
+                    {'idle_s': idle, 'review_dispatch': auto, 'last_review_event': (ev[0]['kind'] if ev else None)},
+                    fix, 'hermes' if auto else 'card')
 
 
 def _cycle(c, start: str, limit: int = 60) -> Optional[list[str]]:
@@ -786,6 +890,8 @@ def notice_findings(src: Sources, on_person: Callable[[str], bool]) -> list[Find
         src.error('notices', e)
         return out
     for r in rows:
+        if str(r['sid']) in src.exclude_chats:
+            continue  # never re-deliver into the repair chat itself
         meta = _json(r['meta']) or {}
         ts = _num(r['ts'])
         if ts is None:
@@ -798,7 +904,7 @@ def notice_findings(src: Sources, on_person: Callable[[str], bool]) -> list[Find
             continue  # a card it names is blocked on a person: core refreshes, never wakes (by design)
         variant, summary = verdict
         out.append(Finding(rule='BS-notice-undelivered', card=None, board=None, chat=str(r['sid']),
-                           title=str(r['title'] or ''), summary=summary, variant=variant,
+                           title=str(r['title'] or ''), summary=summary, variant=variant, area='hermes',
                            evidence={'msg_id': r['msg_id'], 'notice_age_s': int(now - ts), 'closeout': meta.get('closeout'),
                                      'cards': cards, 'notice_head': str(r['content'] or '')[:200]},
                            fix={'kind': 'auto', 'action': 're-deliver: start one close-out turn in the chat',
@@ -834,11 +940,12 @@ def subscription_findings(src: Sources, chats_alive: Callable[[str], bool]) -> l
                     continue
                 e = c.execute('SELECT kind, created_at FROM task_events WHERE id = ?', (r['eid'],)).fetchone()
                 lag = _age(now, _num(e[1])) if e else None
-                if lag is None or lag < SUB_LAG_S or lag > NOTICE_LOOKBACK_S or not chats_alive(str(r['chat_id'])):
+                if (lag is None or lag < SUB_LAG_S or lag > NOTICE_LOOKBACK_S or str(r['chat_id']) in src.exclude_chats
+                        or not chats_alive(str(r['chat_id']))):
                     continue
                 out.append(Finding(rule='BS-notice-undelivered', card=str(r['task_id']), board=slug, chat=str(r['chat_id']),
                                    title='', summary=f'{e[0]} event on {r["task_id"]} undelivered to its chat for {_fmt_age(lag)}',
-                                   variant='subscription_lag',
+                                   variant='subscription_lag', area='hermes',
                                    evidence={'event_id': r['eid'], 'event_kind': e[0], 'lag_s': lag,
                                              'cursor': r['last_event_id']},
                                    fix={'kind': 'card', 'action': 'find why the unloaded sweeper skips this subscription '
@@ -891,7 +998,12 @@ def scan(src: Optional[Sources] = None, *, rules: Optional[Iterable[str]] = None
     wanted = set(rules or RULES)
     started = time.monotonic()
     findings: dict[str, Finding] = {}
-    chats = src.linked_chats()
+    linked = src.linked_chats()
+    chats = {k: v for k, v in linked.items() if k not in src.exclude_chats}
+    truncated = max(0, len(chats) - MAX_CHATS)
+    if truncated:
+        log.warning('session-repair: %d chats over MAX_CHATS=%d not scanned', truncated, MAX_CHATS)
+        src.errors.append({'where': 'scan', 'error': f'{truncated} chats over MAX_CHATS={MAX_CHATS} not scanned'})
     judged: set[tuple[str, str]] = set()
     human_blocked: dict[str, bool] = {}
 
@@ -904,8 +1016,8 @@ def scan(src: Optional[Sources] = None, *, rules: Optional[Iterable[str]] = None
             return
         card = Card(id=cid, board=board, chat=chat, task=task, conn=conn, row=row, via=via)
         human_blocked[cid] = card.status in ('blocked', 'triage') and _human_request(task)[1]
-        if card.status in TERMINAL:
-            return
+        if card.status in TERMINAL or card.ours or cid in src.copies(board):
+            return  # finished; filed by the repair session itself; or a worker copy its home board owns
         for rule in CARD_RULES:
             rid = 'BS-' + rule.__name__[len('rule_'):].replace('_', '-')
             if rid not in wanted:
@@ -948,7 +1060,8 @@ def scan(src: Optional[Sources] = None, *, rules: Optional[Iterable[str]] = None
     _allot_free_workers(findings)
     out = sorted(findings.values(), key=lambda f: (RULES.index(f.rule), f.board or '', f.card or '', f.chat or ''))
     return {'scanned_at': src.now, 'duration_s': round(time.monotonic() - started, 3), 'chats': len(chats),
-            'cards': len(judged), 'findings': [f.to_dict() for f in out], 'errors': src.errors[:50],
+            'cards': len(judged), 'truncated_chats': truncated, 'excluded_chats': sorted(src.exclude_chats),
+            'findings': [f.to_dict() for f in out], 'errors': src.errors[:50],
             'error_count': len(src.errors)}
 
 

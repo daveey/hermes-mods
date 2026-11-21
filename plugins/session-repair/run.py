@@ -1,18 +1,22 @@
 """Session-repair tick: scan, dedupe, cap, then log (shadow) or hand the new findings to the repair chat (live).
 
 Run every 15 min by a Hermes cron no-agent job (install.py). Silent (no stdout) when nothing is new, so the job
-delivers nothing; one summary line otherwise.
+delivers nothing; one summary line otherwise; exit 1 when the repair turn failed (the job's failure target shows it).
 
 Modes (`SESSION_REPAIR` env, else `$HERMES_HOME/session-repair/config.json` `{"mode": ...}`, default `shadow`):
 - off: do nothing.
 - shadow: scan and log what would be fixed / filed to `actions-shadow.jsonl`; no agent turn, no board write.
 - live: start one agent turn in the chat titled "Session repair" (`hermes chat -c "Session repair"
   --create-if-missing`, the same chat every time) with prompt.md and the new findings; that turn applies the safe
-  fixes and files the fix cards. This script itself never writes a board.
+  fixes and files the fix cards, and ends with a `session-repair-result` block naming each finding's outcome. This
+  script itself never writes a board.
 
-Dedupe: a fingerprint (rule + card, or rule + chat) handed over is not handed over again for 24 h (per mode).
-Caps: findings that need a card (fix kind `card` or `human`) are handed over at most 5 per run and 20 per 24 h;
-the rest wait (not marked seen) for a later run. Safe-fix findings are capped at 20 per run.
+Seen (24 h dedupe per fingerprint) only once handled: shadow marks what it logged; live marks what the turn's result
+block reports handled (`fixed`, `card`, `queued`, `commented`, `moved_on`, `false_positive`). `deferred` or a finding
+the block does not name stays unseen for the next tick. Caps: at most 5 fix cards per run and 20 per 24 h (cards
+the turn reports, including cards for safe fixes that did not take); safe fixes at most 20 per run. A failed turn
+(non-zero exit, no result block) backs off per fingerprint (15 min doubling, at most 6 h) and globally; after 5
+failed attempts a fingerprint is given up for 24 h and logged.
 """
 from __future__ import annotations
 
@@ -20,6 +24,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -38,6 +43,13 @@ FIXES_PER_RUN = 20
 CHAT_TITLE = 'Session repair'
 TURN_TIMEOUT_S = 45 * 60
 SKILL = 'broken-sessions'
+BACKOFF_BASE_S = 15 * 60
+BACKOFF_MAX_S = 6 * 3600
+MAX_ATTEMPTS = 5
+LOG_MAX_LINES = 2000          # ledger-*.jsonl / actions-shadow.jsonl keep their newest lines only
+RESULT_FENCE = 'session-repair-result'
+HANDLED = ('fixed', 'card', 'queued', 'commented', 'moved_on', 'false_positive')
+CARD_OUTCOMES = ('card', 'queued')
 
 
 def hermes_home() -> Path:
@@ -90,11 +102,22 @@ def _write_json(p: Path, value) -> None:
     os.replace(tmp, p)
 
 
-def _append(p: Path, rows: list[dict]) -> None:
-    if rows:
-        with p.open('a') as f:
-            for r in rows:
-                f.write(json.dumps(r, default=str) + '\n')
+def _append(p: Path, rows: list[dict], max_lines: int = LOG_MAX_LINES) -> None:
+    """Append rows; keep only the newest `max_lines` lines (bounded logs)."""
+    if not rows:
+        return
+    with p.open('a') as f:
+        for r in rows:
+            f.write(json.dumps(r, default=str) + '\n')
+    try:
+        lines = p.read_text().splitlines()
+    except OSError:
+        return
+    if len(lines) > max_lines:
+        fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f'.{p.name}.')
+        with os.fdopen(fd, 'w') as f:
+            f.write('\n'.join(lines[-max_lines:]) + '\n')
+        os.replace(tmp, p)
 
 
 def _ledger(p: Path, since: float) -> list[dict]:
@@ -113,7 +136,7 @@ def _ledger(p: Path, since: float) -> list[dict]:
 
 
 class Dedupe:
-    """fingerprint -> when it was last handed over (per mode), kept 24 h."""
+    """fingerprint -> when it was last handled (per mode), kept 24 h."""
 
     def __init__(self, path: Path, now: float):
         self.path, self.now = path, now
@@ -130,14 +153,60 @@ class Dedupe:
         _write_json(self.path, self.seen)
 
 
+class Attempts:
+    """Failed repair turns: per fingerprint `{n, next_at}` and a global `{failures, next_at}` (exponential backoff)."""
+
+    def __init__(self, path: Path, now: float):
+        self.path, self.now = path, now
+        raw = _read_json(path, {})
+        self.fps: dict = raw.get('fps', {}) if isinstance(raw, dict) else {}
+        self.turn: dict = raw.get('turn', {}) if isinstance(raw, dict) else {}
+
+    @staticmethod
+    def delay(n: int) -> float:
+        return min(BACKOFF_BASE_S * 2 ** max(0, n - 1), BACKOFF_MAX_S)
+
+    def waiting(self, fp: str) -> bool:
+        return (self.fps.get(fp) or {}).get('next_at', 0) > self.now
+
+    def turn_waiting(self) -> bool:
+        return self.turn.get('next_at', 0) > self.now
+
+    def failed(self, fps: list[str], *, turn: bool = True) -> list[str]:
+        """Count one failed attempt for each (and, with `turn`, one failed turn); returns the ones that reached
+        MAX_ATTEMPTS (given up)."""
+        gave_up = []
+        for fp in fps:
+            n = int((self.fps.get(fp) or {}).get('n', 0)) + 1
+            if n >= MAX_ATTEMPTS:
+                self.fps.pop(fp, None)
+                gave_up.append(fp)
+            else:
+                self.fps[fp] = {'n': n, 'next_at': self.now + self.delay(n)}
+        if turn:
+            failures = int(self.turn.get('failures', 0)) + 1
+            self.turn = {'failures': failures, 'next_at': self.now + self.delay(failures)}
+        self.save()
+        return gave_up
+
+    def succeeded(self, handled: list[str]) -> None:
+        for fp in handled:
+            self.fps.pop(fp, None)
+        self.turn = {}
+        self.save()
+
+    def save(self) -> None:
+        _write_json(self.path, {'fps': self.fps, 'turn': self.turn})
+
+
 def needs_card(f: dict) -> bool:
-    return (f.get('fix') or {}).get('kind') in ('card', 'human')
+    return (f.get('fix') or {}).get('kind') == 'card'
 
 
-def select(new: list[dict], filed_24h: int) -> tuple[list[dict], list[dict]]:
-    """(handed over now, deferred) under the caps: card-needing findings at most CARDS_PER_RUN per run and
-    CARDS_PER_DAY per 24 h, safe fixes at most FIXES_PER_RUN per run."""
-    room = max(0, min(CARDS_PER_RUN, CARDS_PER_DAY - filed_24h))
+def select(new: list[dict], card_room: int) -> tuple[list[dict], list[dict]]:
+    """(handed over now, deferred): card findings at most `card_room` (min of 5 per run and what is left of 20 per
+    24 h), safe fixes at most FIXES_PER_RUN per run."""
+    room = max(0, card_room)
     take, later, fixes = [], [], 0
     for f in new:
         if needs_card(f):
@@ -154,6 +223,12 @@ def select(new: list[dict], filed_24h: int) -> tuple[list[dict], list[dict]]:
     return take, later
 
 
+def idempotency_key(fingerprint: str, now: float) -> str:
+    """`session-repair:<fingerprint>:<UTC day>`: a recurrence on a later day is a new card, never absorbed into a
+    finished one (the prompt also has the turn check for an open card first)."""
+    return f'session-repair:{fingerprint}:{time.strftime("%Y%m%d", time.gmtime(now))}'
+
+
 # ── the repair turn ───────────────────────────────────────────────────────────────────────────────────────────────
 def hermes_argv() -> list[str]:
     env = os.environ.get('SESSION_REPAIR_HERMES')
@@ -163,32 +238,54 @@ def hermes_argv() -> list[str]:
     return [found] if found else [sys.executable, '-m', 'hermes_cli.main']
 
 
-def build_prompt(take: list[dict], *, filed_24h: int, deferred: int) -> str:
+def turn_argv(prompt_path: Path) -> list[str]:
+    return hermes_argv() + ['chat', '-c', CHAT_TITLE, '--create-if-missing', '--oneshot', '-Q', '--source', 'cli',
+                            '--query-file', str(prompt_path)]
+
+
+def build_prompt(take: list[dict], *, card_budget: int, deferred: int) -> str:
     template = (HERE / 'prompt.md').read_text()
-    room_day = max(0, CARDS_PER_DAY - filed_24h)
     body = json.dumps(take, indent=1, default=str)
-    return (template.replace('{{SKILL}}', SKILL).replace('{{CARDS_PER_RUN}}', str(CARDS_PER_RUN))
-            .replace('{{CARDS_LEFT_TODAY}}', str(room_day)).replace('{{DEFERRED}}', str(deferred))
-            .replace('{{COUNT}}', str(len(take))).replace('{{FINDINGS}}', body))
+    return (template.replace('{{SKILL}}', SKILL).replace('{{CARD_BUDGET}}', str(card_budget))
+            .replace('{{DEFERRED}}', str(deferred)).replace('{{COUNT}}', str(len(take)))
+            .replace('{{RESULT_FENCE}}', RESULT_FENCE).replace('{{FINDINGS}}', body))
 
 
-def start_turn(prompt: str, sd: Path, runner: Callable[..., Any] = subprocess.run) -> tuple[bool, str]:
-    """One turn in the "Session repair" chat (created on first use). (ok, detail)."""
+def parse_result(text: str) -> Optional[dict[str, dict]]:
+    """{fingerprint: {outcome, card}} from the turn's last ```session-repair-result``` block, else None."""
+    blocks = re.findall(r'```' + re.escape(RESULT_FENCE) + r'\s*\n(.*?)```', text or '', re.S)
+    if not blocks:
+        return None
+    try:
+        data = json.loads(blocks[-1])
+    except ValueError:
+        return None
+    rows = data.get('results') if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return None
+    out = {}
+    for r in rows:
+        if isinstance(r, dict) and isinstance(r.get('fingerprint'), str):
+            out[r['fingerprint']] = {'outcome': str(r.get('outcome') or ''), 'card': r.get('card')}
+    return out
+
+
+def start_turn(prompt: str, sd: Path, runner: Callable[..., Any] = subprocess.run) -> tuple[bool, str, str]:
+    """One turn in the "Session repair" chat (created on first use). (ok, detail, stdout)."""
     path = sd / 'last-prompt.md'
     path.write_text(prompt)
-    argv = hermes_argv() + ['chat', '-c', CHAT_TITLE, '--create-if-missing', '--oneshot', '-Q', '--source', 'cli',
-                            '--query-file', str(path)]
     try:
-        r = runner(argv, capture_output=True, text=True, timeout=TURN_TIMEOUT_S)
+        r = runner(turn_argv(path), capture_output=True, text=True, timeout=TURN_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError) as e:
-        return False, f'{type(e).__name__}: {e}'
-    tail = ((r.stdout or '')[-1500:] + ('\n' + (r.stderr or '')[-800:] if r.stderr else '')).strip()
+        return False, f'{type(e).__name__}: {e}', ''
+    tail = ((r.stdout or '')[-4000:] + ('\n' + (r.stderr or '')[-800:] if r.stderr else '')).strip()
     (sd / 'last-turn.txt').write_text(tail)
-    return r.returncode == 0, f'rc={r.returncode}'
+    return r.returncode == 0, f'rc={r.returncode}', r.stdout or ''
 
 
 def pin_chat(sd: Path, runner: Callable[..., Any] = subprocess.run, home: Optional[Path] = None) -> Optional[str]:
-    """Pin the repair chat once (CLI-created chats are hidden from the Desktop sidebar unless pinned)."""
+    """Pin the repair chat once (CLI-created chats are hidden from the Desktop sidebar unless pinned) and record its
+    id in chat.json (the scanner never scans or re-delivers into it)."""
     import sqlite3
     db = (home or hermes_home()) / 'state.db'
     if not db.exists():
@@ -231,6 +328,12 @@ def _lock(sd: Path):
         f.close()
 
 
+def _row(now: float, m: str, f: dict, **extra) -> dict:
+    return {'at': now, 'mode': m, 'fingerprint': f['fingerprint'], 'rule': f['id'], 'variant': f.get('variant'),
+            'card': f.get('card'), 'board': f.get('board'), 'chat': f.get('chat'), 'area': f.get('area'),
+            'commands': (f.get('fix') or {}).get('commands'), 'summary': f.get('summary'), **extra}
+
+
 def tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] = None,
          runner: Callable[..., Any] = subprocess.run, now: Optional[float] = None,
          run_mode: Optional[str] = None) -> dict:
@@ -243,43 +346,69 @@ def tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] =
     sd = state_dir(home)
     with _lock(sd) as held:
         if not held:
-            out['line'] = ''
             out['skipped'] = 'locked'
             return out
         result = (scanner or (lambda: load_scan().scan()))()
         findings = result.get('findings') or []
         dedupe = Dedupe(sd / f'seen-{m}.json', now)
+        attempts = Attempts(sd / f'attempts-{m}.json', now)
         new = [f for f in findings if dedupe.new(f['fingerprint'])]
-        filed_24h = sum(1 for r in _ledger(sd / f'ledger-{m}.jsonl', now - DEDUPE_S) if r.get('card_needed'))
-        take, later = select(new, filed_24h)
+        ready = [f for f in new if not attempts.waiting(f['fingerprint'])]
+        ledger = sd / f'ledger-{m}.jsonl'
+        filed_24h = sum(1 for r in _ledger(ledger, now - DEDUPE_S) if r.get('outcome') in CARD_OUTCOMES)
+        card_budget = max(0, min(CARDS_PER_RUN, CARDS_PER_DAY - filed_24h))
+        take, later = select(ready, card_budget)
+        for f in take:
+            f['idempotency_key'] = idempotency_key(f['fingerprint'], now)
         _write_json(sd / 'last.json', {**result, 'mode': m, 'new': [f['fingerprint'] for f in new],
                                        'handed': [f['fingerprint'] for f in take], 'deferred': len(later),
-                                       'tick_at': now})
-        out.update(new=len(new), deferred=len(later))
+                                       'backing_off': len(new) - len(ready), 'tick_at': now})
+        out.update(new=len(new), deferred=len(later) + len(new) - len(ready))
         if not take:
             return out
-        if m == 'live':
-            ok, detail = start_turn(build_prompt(take, filed_24h=filed_24h, deferred=len(later)), sd, runner)
-            out['turn'] = detail
-            if not ok:  # nothing marked seen: the next tick hands the same findings over again
-                out['line'] = f'session-repair: repair turn failed ({detail}); {len(take)} finding(s) kept for retry'
-                out['failed'] = True
-                return out
-            pin_chat(sd, runner, home)
-        rows = [{'at': now, 'mode': m, 'fingerprint': f['fingerprint'], 'rule': f['id'], 'variant': f.get('variant'),
-                 'card': f.get('card'), 'board': f.get('board'), 'chat': f.get('chat'),
-                 'would' if m == 'shadow' else 'handed': 'file' if needs_card(f) else 'fix',
-                 'card_needed': needs_card(f), 'commands': (f.get('fix') or {}).get('commands'),
-                 'summary': f.get('summary')} for f in take]
-        _append(sd / f'ledger-{m}.jsonl', rows)
         if m == 'shadow':
+            rows = [_row(now, m, f, would='file' if needs_card(f) else 'fix',
+                         outcome='card' if needs_card(f) else 'fixed') for f in take]
+            _append(ledger, rows)
             _append(sd / 'actions-shadow.jsonl', rows)
-        dedupe.mark(f['fingerprint'] for f in take)
-        out['handed'] = [f['fingerprint'] for f in take]
-        fixes = sum(1 for f in take if not needs_card(f))
-        verb = 'would fix' if m == 'shadow' else 'handed to the repair chat:'
-        out['line'] = (f'session-repair ({m}): {len(new)} new finding(s); {verb} {fixes} fix(es), '
-                       f'{len(take) - fixes} card(s); {len(later)} deferred by caps')
+            dedupe.mark(f['fingerprint'] for f in take)
+            out['handed'] = [f['fingerprint'] for f in take]
+            fixes = sum(1 for f in take if not needs_card(f))
+            out['line'] = (f'session-repair (shadow): {len(new)} new finding(s); would fix {fixes}, '
+                           f'file {len(take) - fixes} card(s); {out["deferred"]} deferred')
+            return out
+        if attempts.turn_waiting():
+            out['skipped'] = 'backoff'
+            return out
+        ok, detail, stdout = start_turn(build_prompt(take, card_budget=card_budget, deferred=len(later)), sd, runner)
+        out['turn'] = detail
+        results = parse_result(stdout) if ok else None
+        fps = [f['fingerprint'] for f in take]
+        if results is None:
+            gave_up = attempts.failed(fps)
+            if gave_up:
+                dedupe.mark(gave_up)
+                _append(ledger, [_row(now, m, f, outcome='gave_up') for f in take if f['fingerprint'] in gave_up])
+            out['failed'] = True
+            why = detail if not ok else 'no result block'
+            out['line'] = (f'session-repair: repair turn failed ({why}); {len(fps) - len(gave_up)} finding(s) retry after '
+                           f'backoff, {len(gave_up)} given up after {MAX_ATTEMPTS} attempts')
+            return out
+        pin_chat(sd, runner, home)
+        handled = [fp for fp in fps if (results.get(fp) or {}).get('outcome') in HANDLED]
+        missing = [fp for fp in fps if fp not in results]
+        by_fp = {f['fingerprint']: f for f in take}
+        _append(ledger, [_row(now, m, by_fp[fp], outcome=results[fp]['outcome'], filed=results[fp].get('card'))
+                         for fp in fps if fp in results])
+        dedupe.mark(handled)
+        attempts.succeeded(handled)
+        if missing:  # the turn ran but did not account for these: retried after backoff, never silently dropped
+            gave_up = attempts.failed(missing, turn=False)
+            dedupe.mark(gave_up)
+        out['handed'] = handled
+        cards = sum(1 for fp in handled if results[fp]['outcome'] in CARD_OUTCOMES)
+        out['line'] = (f'session-repair (live): {len(new)} new finding(s); handled {len(handled)} ({cards} card(s)), '
+                       f'{len(fps) - len(handled)} left for a later tick; {out["deferred"]} deferred')
         return out
 
 

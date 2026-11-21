@@ -3,6 +3,7 @@
     python3 install.py                 # show what would change
     python3 install.py --apply         # write the wrapper script + config, create the cron job if missing
     python3 install.py --apply --mode live   # also switch the tick to live (default: shadow)
+    python3 install.py --apply --failure-deliver telegram   # where a failed tick shows (default: bot-chat)
 
 What it does:
 1. `$HERMES_HOME/scripts/session_repair_tick.py`: a 3-line wrapper (Hermes cron runs only files under
@@ -10,7 +11,9 @@ What it does:
    hermes-sync update takes effect on the next tick.
 2. `$HERMES_HOME/session-repair/config.json` `{"mode": "shadow"}` unless it exists (or `--mode` is given).
 3. `hermes cron create "every 15m" --name session-repair --no-agent --script session_repair_tick.py --deliver local
-   --catch-up off`, unless a job named `session-repair` exists (read from `$HERMES_HOME/cron/jobs.json`).
+   --failure-deliver bot-chat --catch-up off`, unless a job named `session-repair` exists (read from
+   `$HERMES_HOME/cron/jobs.json`). Successes stay local (silent); a failed tick (exit 1: the repair turn failed) is
+   delivered to the profile's Bot Chat, a visible chat, instead of only `hermes cron list`.
 """
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ from pathlib import Path
 JOB_NAME = 'session-repair'
 SCRIPT_NAME = 'session_repair_tick.py'
 SCHEDULE = 'every 15m'
+FAILURE_DELIVER = 'bot-chat'
 WRAPPER = '''#!/usr/bin/env python3
 # session-repair tick (hermes-mods plugins/session-repair, installed by its install.py): silent unless something is new
 import os, runpy
@@ -51,12 +55,14 @@ def job_exists(h: Path) -> bool:
     return any(isinstance(j, dict) and j.get('name') == JOB_NAME for j in jobs or [])
 
 
-def cron_argv() -> list[str]:
+def cron_argv(failure_deliver: str = FAILURE_DELIVER) -> list[str]:
+    if failure_deliver == 'local':
+        raise ValueError('failure-deliver local would hide failed ticks; name a visible target')
     return hermes() + ['cron', 'create', SCHEDULE, '--name', JOB_NAME, '--no-agent', '--script', SCRIPT_NAME,
-                       '--deliver', 'local', '--catch-up', 'off']
+                       '--deliver', 'local', '--failure-deliver', failure_deliver, '--catch-up', 'off']
 
 
-def plan(h: Path, mode: str | None) -> list[tuple[str, str]]:
+def plan(h: Path, mode: str | None, failure_deliver: str = FAILURE_DELIVER) -> list[tuple[str, str]]:
     steps = []
     script = h / 'scripts' / SCRIPT_NAME
     if not script.exists() or script.read_text() != WRAPPER:
@@ -67,7 +73,7 @@ def plan(h: Path, mode: str | None) -> list[tuple[str, str]]:
     if not (h / 'plugins' / 'session-repair' / 'run.py').exists():
         steps.append(('warn', f'{h}/plugins/session-repair is not linked yet: run hermes-sync first'))
     if not job_exists(h):
-        steps.append(('cron', ' '.join(cron_argv())))
+        steps.append(('cron', ' '.join(cron_argv(failure_deliver))))
     return steps
 
 
@@ -75,9 +81,13 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument('--apply', action='store_true')
     p.add_argument('--mode', choices=('off', 'shadow', 'live'))
+    p.add_argument('--failure-deliver', default=FAILURE_DELIVER,
+                   help='cron --failure-deliver target for failed ticks (default bot-chat; never local)')
     args = p.parse_args(argv)
+    if args.failure_deliver == 'local':
+        p.error('--failure-deliver local would hide failed ticks')
     h = home()
-    steps = plan(h, args.mode)
+    steps = plan(h, args.mode, args.failure_deliver)
     if not steps:
         print('session-repair: already installed')
         return 0
@@ -95,7 +105,7 @@ def main(argv=None) -> int:
             cfg.parent.mkdir(parents=True, exist_ok=True)
             cfg.write_text(json.dumps({'mode': what}) + '\n')
         elif kind == 'cron':
-            r = subprocess.run(cron_argv(), capture_output=True, text=True)
+            r = subprocess.run(cron_argv(args.failure_deliver), capture_output=True, text=True)
             print(r.stdout.strip() or r.stderr.strip())
             if r.returncode != 0:
                 return r.returncode

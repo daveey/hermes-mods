@@ -33,53 +33,72 @@ Use it two ways:
 - **Act on the repair chat's findings**: each finding names its section; follow "Safe automatic fix" or "Fix card".
 
 ```sh
-# read-only; on the hub (where the boards live). Prints {findings: [...], errors: [...]}
-nice python3 ~/.hermes/plugins/session-repair/scan.py              # every chat with an open linked card
-nice python3 ~/.hermes/plugins/session-repair/scan.py --rule BS-overdue-wake
+# read-only; on the hub (where the boards live), with core's Python. Prints {findings: [...], errors: [...]}
+nice ~/.hermes/hermes-agent/.venv/bin/python ~/.hermes/plugins/session-repair/scan.py   # every chat with an open linked card
+nice ~/.hermes/hermes-agent/.venv/bin/python ~/.hermes/plugins/session-repair/scan.py --rule BS-overdue-wake
 curl -s localhost:<dashboard port>/api/plugins/session-repair/findings?chat=<session id>   # last cron scan
 ```
 
-Every finding carries `id`, `variant`, `card`, `board`, `chat`, `evidence`, `fix {kind, action, commands, why}`
-and `fingerprint` (`<id>:<board>/<card>`, or `<id>:chat/<session>`). Fix kinds: `auto` = safe and reversible, the
-repair chat applies it; `card` = needs real work, file a fix card; `human` = only a person can decide.
+Every finding carries `id`, `variant`, `card`, `board`, `chat`, `evidence`, `fix {kind, action, commands, why}`,
+`area` and `fingerprint` (`<id>:<board>/<card>`, or `<id>:chat/<session>`); the cron adds `idempotency_key`.
+Fix kinds: `auto` = safe and reversible, the repair chat applies it; `card` = needs real work, file a fix card.
+`area`: `hermes` = Hermes machinery misbehaved (dispatcher, wakes, leases, notices); `card` = the card owner's own
+work. Never judged: the Session repair chat itself (its `chat.json` id and any chat with that title), cards the
+repair session filed (idempotency key `session-repair:...`), and worker-node copies (core `foreign_ids`: their home
+board owns them).
 
 Rules for every fix:
 - Re-read the card first (`kanban_show <id>`); findings can be 15 minutes old. Moved on = do nothing.
 - Use the Kanban tools/CLI only. Never edit a database, delete or archive a card, or kill/reclaim a live worker.
-- A fix card: one per finding, `idempotency_key='session-repair:<fingerprint>'`, linked to the chat it is filed
-  from, acceptance = the pattern's detection no longer matches that card plus the section's "Done when";
-  `self_work={version:1, repository:'hermes-mods', area:'session-repair', kind:'sweep'}` when the `kanban_create`
-  schema exposes it. No model pin. The cron caps hand-overs at 5 card-needing findings per run, 20 per day.
-- A human-only step is a blocked card with a valid `human_request`, and only after try-to-unblock.
+- A safe fix that did not take becomes a fix card, and counts against the card cap.
+- Before any fix card, look for open work on the same thing (the finding's `idempotency_key` prefix
+  `session-repair:<fingerprint>:`, the card id, the pattern id, the subsystem, on every board): open = ONE comment,
+  never a second card. The card body names the open or recently decided work on that subsystem and why none
+  replaces it, plus evidence and acceptance (the detection no longer matches that card, plus "Done when").
+  `idempotency_key` = the finding's (`session-repair:<fingerprint>:<UTC YYYYMMDD>`: a recurrence on a later day is
+  a new card, never absorbed into a finished one). Linked to the repair chat. No model pin.
+- `area: card`: the fix card is product work for the card's owner; never `self_work`.
+- `area: hermes`: Hermes itself is the exception. An open card for that Hermes area gets one comment. With none, a
+  new card only on a dispatcher, credential, quota/pacing or money path, or when the defect blocks the finding's
+  card now; otherwise leave it (outcome `deferred`, with the reason). A new Hermes card carries
+  `self_work={version:1, repository:'hermes-mods', area:'session-repair', kind:'sweep'}` only when the
+  `kanban_create` schema exposes it. A queued acknowledgment is not a card: keep its request identity (outcome
+  `queued`), never retry it undeclared or replace it.
+- A human-only step is a blocked card with a valid `human_request`, only after try-to-unblock. It counts as a card.
+- The cron hands at most 5 card findings per run (20 per 24 h, counting every card the turn reports) and 20 safe
+  fixes per run; the turn's `session-repair-result` block decides what is marked seen.
 
 ## BS-ready-worker-free: ready, unclaimed, while a worker is free
 
 **Seen as:** the panel's Ready section, `ready · waiting for a worker to claim it`, for a long time while the hub
 or a pool worker is idle.
 
-**Detection** (`rule_ready_worker_free`): status `ready`, ready for > 10 min (`ready_since`, else the newest
-promoted/unblocked/woken/created event), no dispatcher skip recorded in the last 15 min (a recent skip explains
-the wait), and core's queue view (`kanban_queue_position.read`) says a slot is free:
-- `lane: local` and `running < limit` (host workers vs `kanban.max_in_progress`) → variant `free_slot`;
-- `pool_could_run` names pool workers → `free_worker`;
-- `lane: machine`: a fitting machine that is active, unheld, not draining, seen within 5 min, with
+**Detection** (`rule_ready_worker_free`): status `ready`; ready since `ready_since`, else the newest
+promoted/unblocked/woken/created event. Any dispatcher skip recorded in the current ready episode (core
+`kanban_dispatch_skip.latest`, the queue view's `skip`, however old, with or without `until`) explains the wait: no
+finding. Otherwise, by core's queue view (`kanban_queue_position.read`):
+- `lane: leftover_claim` (ready but still holding a claim: the dispatcher never picks it), ready > 10 min →
+  `leftover_claim`;
+- `pool_could_run` names pool workers, ready > 10 min → `pool_could_run`;
+- `lane: local` and core's `kanban_dispatch_skip.unrecorded()` (ready >= 30 min, `running < limit`, no recorded
+  skip) → `free_slot`;
+- `lane: machine`, ready > 10 min: a fitting machine that is active, unheld, not draining, seen within 5 min, with
   `max_card_runs - active_card_runs` > the cards ranked ahead on its labels → `free_worker`. Free slots are
-  allotted oldest waiter first, so 15 ready cards and 3 free slots flag 3 cards, not 15;
-- `lane: leftover_claim` (ready but still holding a claim: the dispatcher never picks it) → `leftover_claim`.
+  allotted oldest waiter first, so 15 ready cards and 3 free slots flag 3 cards, not 15.
 
-**Evidence:** `queue_note`, running/limit, free machines and slots, `ready_for_s`, the last skip.
+**Evidence:** `queue_note`, running/limit, free machines and slots, pool workers, `ready_for_s`.
 
 **Safe automatic fix** (`free_slot` only): `hermes kanban [--board B] dispatch --max 1 --json`, then re-read.
-**Fix card** (`free_worker`, `leftover_claim`, or the dispatch did not claim it): why the worker does not lease it
-(its pickup skips via `kanban_show` on that worker, skill hermes-workers), fix that or re-place the card.
-**Done when:** the card is claimed, or its queue note names a real reason (pacing, quota, placement).
+**Fix card** (area hermes): `leftover_claim`: clear the claim; `pool_could_run`: re-place the card on the pool
+(`hermes kanban move`) or fix why it is held home-only; `free_worker`: why the worker does not lease it (its pickup
+skips via `kanban_show` on that worker, skill hermes-workers). **Done when:** the card is claimed, or its queue
+note names a real reason (pacing, quota, placement).
 
 ## BS-overdue-wake: a park whose wake never fired
 
 **Seen as:** `⚠ 4h overdue · due Fri 13:50`, or `no wake published`, on a scheduled card.
 
-**Detection** (`rule_overdue_wake`): status `scheduled`, not a worker node's copy (`foreign_ids`), and by core's
-`kanban_continuation.park_state`:
+**Detection** (`rule_overdue_wake`): status `scheduled`, and by core's `kanban_continuation.park_state`:
 - a timed park whose `wake_at` is > 30 min past → `clock_overdue`;
 - an untimed park with a wake probe (`task_wake_checks`, purpose `wake`) whose `next_at` is > 30 min past →
   `probe_overdue`;
@@ -88,11 +107,12 @@ the wait), and core's queue view (`kanban_queue_position.read`) says a slot is f
 
 **Evidence:** `wake_at`/`late_s`, the probe command, last rc and fails, the park reason.
 
-**Safe automatic fix** (`clock_overdue`; `probe_overdue` after running the probe by hand and seeing its
-condition met): `hermes kanban [--board B] unblock <id>` (scheduled → ready, or todo while a parent is open).
-**Fix card** (`no_wake`, or a probe that is not met): the owner re-parks with a real wake (`kanban_schedule` with
-`awaiting`/`wake_at`/`wake_check`) or unblocks. A dispatcher that wakes nothing for 30 min is a gateway defect: say
-so in the card. **Done when:** the card left `scheduled`, or holds a future wake.
+**Safe automatic fix** (`clock_overdue` only): `hermes kanban [--board B] unblock <id>` (scheduled → ready, or todo
+while a parent is open). **Fix card:** `probe_overdue` (area hermes): run the probe command
+(`evidence.probe_cmd`, the first of `commands`) by hand first; exit 0 = its condition holds, then unblock; otherwise
+leave the park and fix the stuck probe runner. `no_wake` (area card): the owner re-parks with a real wake
+(`kanban_schedule` with `awaiting`/`wake_at`/`wake_check`) or unblocks. **Done when:** the card left `scheduled`,
+or holds a future wake.
 
 ## BS-unexplained-wait: a block nobody can act on
 
@@ -100,28 +120,35 @@ so in the card. **Done when:** the card left `scheduled`, or holds a future wake
 waiting card.
 
 **Detection** (`rule_unexplained_wait`), status `blocked` or `triage`, never a card on a valid ask
-(`needs_human` true: that is the user's move):
+(`needs_human` true: that is the user's move). The reason is the newest park event's (core
+`kanban_wait_info.PARK_EVENT_KINDS`) `reason`, else its `error`:
 - a `human_request` core's `needs_human` rejects → `invalid_human_request` (the ask is invisible);
-- `blocked`, no `block_kind`, empty reason on the newest park event, for > 10 min → `no_reason`;
-- an agent-owned wait (the session-tasks row's `wait.agent_owned`, else block kind transient / capability /
-  assignment / needs_input) older than 2 h → `agent_owned_stalled`.
+- `blocked`, no `block_kind`, no reason, for >= 30 min → `no_reason`;
+- an agent-owned wait (the session-tasks row's `wait.agent_owned`, else a block kind in core
+  `kanban_wait_info.AGENT_BLOCK_KINDS`) older than 2 h → `agent_owned_stalled`.
 
-**Fix card:** `invalid_human_request`: re-file the ask validly (action, why_human, interaction, scope, evidence)
-or clear the block if no person is needed (try-to-unblock). `no_reason`: ask the owning chat; unblock or block
-again with a typed kind and reason. `agent_owned_stalled`: an agent clears the block. **Done when:** the card is
-unblocked, or blocked on a valid ask.
+**Fix card** (area card): `invalid_human_request`: re-file the ask validly (action, why_human, interaction, scope,
+evidence) or clear the block if no person is needed (try-to-unblock). `no_reason`: ask the owning chat; unblock or
+block again with a typed kind and reason. `agent_owned_stalled`: an agent clears the block. **Done when:** the card
+is unblocked, or blocked on a valid ask.
 
 ## BS-parent-done: still waiting on something that finished
 
 **Seen as:** a chain ending on a green `finished` leaf; `on <card> · done` for a long time.
 
 **Detection** (`rule_parent_done`):
-- `todo` (or `blocked` kind `dependency`) whose parents (`task_links`, local or `kanban_sync_remote_parents`)
-  are all done/archived/cancelled, the last one > 10 min ago → `parents_done`;
-- `scheduled` whose newest park's `awaiting` is a card (`kind: card`) that is finished > 10 min → `awaited_done`.
+- `todo` (or `blocked` kind `dependency`) whose parents by core's `kanban_db.parent_states` (local, or the remote
+  parent mirror) are all done or archived (cancelled does not satisfy, as in core's `recompute_ready`), the last
+  one > 10 min ago, and none of core's deliberate holds: containment (`kanban_containment_connections.held`), a
+  pending spend decision, or `recovery_held` (sticky stop, failure breaker at `kanban.failure_limit`) →
+  `parents_done`;
+- `scheduled` whose newest park's `awaiting` is a card (`kind: card`) that is done or archived > 10 min →
+  `awaited_done`.
 
-**Safe automatic fix:** `parents_done`: `hermes kanban [--board B] promote <id>`; `awaited_done`:
-`hermes kanban [--board B] unblock <id>`. **Done when:** the card is ready or running.
+**Safe automatic fix** (`awaited_done` only): `hermes kanban [--board B] unblock <id>`.
+**Fix card** (`parents_done`, area hermes): core promotes such a card on its own, so a residual one is a
+promotion defect: find why `recompute_ready` skipped it; promote by hand only with that cause named. **Done when:**
+the card is ready or running.
 
 ## BS-stuck-run: running, but nothing is running it
 
@@ -133,19 +160,21 @@ unblocked, or blocked on a valid ask.
 - no claim, no lease, no current run → `no_claim`;
 - no event of any kind (heartbeats count) for > 60 min → `quiet`.
 
-**Fix card** (never automatic: reclaiming a live worker's card loses its work): read `hermes kanban log <id>` and
-`runs <id>`, check the lease holder (skill hermes-workers); reclaim (`hermes kanban reclaim <id>`) only when the
-worker is gone. **Done when:** the card has a live run with fresh events, or is back in ready.
+**Fix card** (area hermes; never automatic: reclaiming a live worker's card loses its work): read
+`hermes kanban log <id>` and `runs <id>`, check the lease holder (skill hermes-workers); reclaim
+(`hermes kanban reclaim <id>`) only when the worker is gone. **Done when:** the card has a live run with fresh
+events, or is back in ready.
 
 ## BS-review-no-reviewer: a review nobody runs
 
 **Seen as:** `no reviewer running · review_requested 2h ago`.
 
 **Detection** (`rule_review_no_reviewer`): status `review`, no current run in `running`, newest
-review_requested / hub_review_admitted / review_route_deferred / status event > 60 min old.
+review_requested / hub_review_admitted / review_route_deferred / status event > 60 min old. Review dispatch on
+(`kanban.review_dispatch`) → `idle` (area hermes); off → `idle_manual_review` (area card).
 
-**Safe automatic fix** (review dispatch on, `kanban.review_dispatch`): `hermes kanban dispatch --max 1 --json`.
-**Fix card** otherwise: start a review or send it back. **Done when:** a review run is running or the card left review.
+**Safe automatic fix** (`idle`): `hermes kanban dispatch --max 1 --json`. **Fix card** (`idle_manual_review`):
+start a review or send it back. **Done when:** a review run is running or the card left review.
 
 ## BS-broken-chain: waiting on nothing
 
@@ -156,15 +185,16 @@ review_requested / hub_review_admitted / review_route_deferred / status event > 
 - a park awaiting a card (no `gateway` named) that no board here has → `missing_awaited`;
 - a dependency cycle over parent links → `cycle`.
 
-**Fix card:** relink to the right parent or unlink the missing one (`hermes kanban unlink <parent> <child>`): the
-owner decides, it changes what the card waits for. **Done when:** every parent resolves and no cycle remains.
+**Fix card** (area card): relink to the right parent or unlink the missing one
+(`hermes kanban unlink <parent> <child>`): the owner decides, it changes what the card waits for. **Done when:**
+every parent resolves and no cycle remains.
 
 ## BS-notice-undelivered: a notice that never woke its chat
 
 **Seen as:** a chat whose last message is a Kanban notice with no reply; the sidebar shows it unresolved.
 
 **Detection** (`notice_findings`, `subscription_findings`), unarchived, unmuted chats active in the last 3 days
-(core `notice_guarantee.LOOKBACK_S`):
+(core `notice_guarantee.LOOKBACK_S`), never the Session repair chat:
 - the chat's last active message is a `kanban_notice` whose close-out is final `error`, final `busy` (with
   `busy_attempts`), `deferred` > 2 h past `retry_at`, `claimed` > 2 h with no verdict, or unclaimed > 2 h (and
   not `blocked_on_human`, and naming no card blocked on a valid ask: core never wakes those by design) →
@@ -172,11 +202,11 @@ owner decides, it changes what the card waits for. **Done when:** every parent r
 - a `tui` subscription whose oldest undelivered notify-kind event is > 60 min old (no inflight claim), for a
   live chat → `subscription_lag` (the unloaded sweeper never wrote the row).
 
-**Safe automatic fix** (chat variants): one close-out turn,
+**Safe automatic fix** (chat variants, area hermes): one close-out turn,
 `hermes chat --resume <session> --oneshot -Q -q "[Kanban close-out] The Kanban notice above reached this chat and
-no turn followed it. Act on it now."` (the turn core's guarantee would start). **Fix card**
-(`subscription_lag`, or a close-out that fails again): find why the sweeper skips it (gateway log
-`kanban-unloaded`, `poller miss`). **Done when:** a turn followed the notice / the cursor passed the event.
+no turn followed it. Act on it now."` (the turn core's guarantee would start). **Fix card** (`subscription_lag`,
+or a close-out that fails again): find why the sweeper skips it (gateway log `kanban-unloaded`, `poller miss`).
+**Done when:** a turn followed the notice / the cursor passed the event.
 
 ## Adding a pattern or example
 
@@ -193,7 +223,8 @@ When the user shows a broken session (screenshot, chat id, "this one again"):
    `tests/test_patterns.py`.
 4. If no rule caught it: add a rule to `plugins/session-repair/scan.py` (`rule_<name>` → id `BS-<name>`, append
    to `RULES` and `CARD_RULES`) and a section here with the same id: seen as, detection (data and thresholds),
-   evidence, safe automatic fix (only if reversible and already a Kanban CLI/tool action), fix card, done when.
+   evidence, safe automatic fix (only if reversible and already a Kanban CLI/tool action), fix card with its
+   `area`, done when. Reuse core's own predicates and constants (never a copy) and honour core's deliberate holds.
 5. A rule that misfired (the repair chat called it a false positive): tighten the rule, add the counter-example as
    a negative test.
 6. Run the suite (`plugins/session-repair/README.md`, Tests), commit in a hermes-mods worktree.

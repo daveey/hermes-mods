@@ -41,7 +41,7 @@ def age_all_events(conn, tid: str, at: float) -> None:
 
 
 # ── BS-ready-worker-free ─────────────────────────────────────────────────────────────────────────────────────────
-def ready_worker_free(conn, now, *, waited_s=1200):
+def ready_worker_free(conn, now, *, waited_s=2400):
     tid = card(conn, 'Ready, unclaimed, free slot', status='ready', ready_since=int((now - waited_s) * 1000))
     age_all_events(conn, tid, now - waited_s)
     return tid
@@ -51,6 +51,13 @@ def ready_leftover_claim(conn, now):
     tid = card(conn, 'Ready but still claimed', status='ready', ready_since=int((now - 3600) * 1000),
                claim_lock='host:123', worker_pid=123)
     age_all_events(conn, tid, now - 3600)
+    return tid
+
+
+def ready_with_old_skip(conn, now):
+    """Ready 2 h; the dispatcher recorded a skip 50 min ago (its episode started then): explained, however old."""
+    tid = ready_worker_free(conn, now, waited_s=7200)
+    event(conn, tid, 'dispatch_skipped', {'reason': 'llm_paced', 'detail': 'pool paced'}, at=now - 3000)
     return tid
 
 
@@ -95,6 +102,13 @@ def blocked_no_reason(conn, now, *, waited_s=3600):
     return tid
 
 
+def blocked_reason_in_error(conn, now, *, waited_s=3600):
+    tid = card(conn, 'Blocked, reason in error', status='blocked')
+    age_all_events(conn, tid, now - waited_s)
+    event(conn, tid, 'blocked', {'error': 'git push rejected'}, at=now - waited_s)
+    return tid
+
+
 def blocked_invalid_ask(conn, now):
     tid = card(conn, 'Blocked on an invalid ask', status='blocked', block_kind='needs_input',
                human_request=json.dumps({'action': 'do it'}))
@@ -123,6 +137,22 @@ def todo_parents_done(conn, now, *, done_s=1800):
     parent = card(conn, 'Finished parent', status='done', session=None, completed_at=int(now - done_s))
     tid = card(conn, 'Todo after a finished parent', status='todo', parents=[parent])
     age_all_events(conn, tid, now - done_s - 60)
+    return tid
+
+
+def todo_parent_cancelled(conn, now):
+    parent = card(conn, 'Cancelled parent', status='cancelled', session=None, completed_at=int(now - 3600))
+    tid = card(conn, 'Todo after a cancelled parent', status='todo', parents=[parent])
+    age_all_events(conn, tid, now - 3600)
+    return tid
+
+
+def blocked_dependency_breaker(conn, now):
+    """Dependency-blocked, parents done, but at the failure breaker: core's recovery_held keeps it on purpose."""
+    parent = card(conn, 'Finished parent', status='done', session=None, completed_at=int(now - 3600))
+    tid = card(conn, 'Held at the breaker', status='blocked', block_kind='dependency', parents=[parent],
+               consecutive_failures=5)
+    age_all_events(conn, tid, now - 3600)
     return tid
 
 
@@ -170,6 +200,31 @@ def running_claim_expired(conn, now):
     return tid
 
 
+def synced_columns(conn) -> None:
+    """The Board-lease columns a synced board has (a fresh local board does not)."""
+    have = {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}
+    for col, typ in (('lease_holder', 'TEXT'), ('lease_expires', 'INTEGER')):
+        if col not in have:
+            conn.execute(f'ALTER TABLE tasks ADD COLUMN {col} {typ}')
+    conn.commit()
+
+
+def running_lease_expired(conn, now):
+    synced_columns(conn)
+    tid = card(conn, 'Running on a worker whose lease lapsed', status='running', started_at=int(now - 3600),
+               lease_holder='worker-x', lease_expires=int((now - 1800) * 1000))
+    age_all_events(conn, tid, now - 600)
+    _run(conn, tid, now, started_s=3600, heartbeat_s=60)
+    event(conn, tid, 'heartbeat', {}, at=now - 60)
+    return tid
+
+
+def running_no_claim(conn, now):
+    tid = card(conn, 'Running with nothing behind it', status='running', started_at=int(now - 600))
+    age_all_events(conn, tid, now - 60)
+    return tid
+
+
 def running_healthy(conn, now):
     tid = card(conn, 'Running, heartbeating', status='running', claim_lock='host:1', claim_expires=int(now + 3600),
                started_at=int(now - 3 * 3600))
@@ -199,6 +254,23 @@ def missing_parent(conn, now):
     conn.execute('INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)', ('t_00000000deadbeef', tid))
     conn.commit()
     age_all_events(conn, tid, now - 3600)
+    return tid
+
+
+def awaiting_missing(conn, now):
+    tid = card(conn, 'Parked on a card nobody has', status='scheduled')
+    age_all_events(conn, tid, now - 3600)
+    event(conn, tid, 'scheduled', {'wake_at': int(now + 86400), 'reason': 'waits on t_00000000feedface',
+                                   'awaiting': {'kind': 'card', 'ref': 't_00000000feedface', 'why': 'its result'}},
+          at=now - 3600)
+    return tid
+
+
+def repair_card(conn, now):
+    """A card the repair session filed (its idempotency key): broken on purpose, never judged."""
+    tid = blocked_no_reason(conn, now)
+    conn.execute("UPDATE tasks SET idempotency_key = 'session-repair:BS-x:default/t_1:20261121' WHERE id = ?", (tid,))
+    conn.commit()
     return tid
 
 
