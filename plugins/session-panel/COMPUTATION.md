@@ -6,7 +6,9 @@ before its computation, not while queued behind unrelated sessions; other reques
 compute a later session while an earlier session is blocked. Joiners wait outside publication
 locks, emitting due heartbeats. Results remain joinable until publication. Exceptions release
 ownership, and subsequent requests retry. A tick joining older reads retains dirty interest for
-the next tick even after consuming its change cursor.
+the next tick even after consuming its change cursor. There is no arbitrary join deadline: a cold
+request must await its owner, not return empty/partial success. A genuinely slow owner can still
+exceed the unchanged client HTTP deadline; this fix reduces duplicated work, not that deadline.
 
 `CoreReaders.batch` retains only thread-local, pass-scoped work. It shares local enriched rows per
 board/status set and replica inventory before lineage-dependent origin-obligation deduplication.
@@ -19,8 +21,14 @@ on exit. There is no cross-request trusted snapshot. Large union lineages fall b
 reads. No queue/detail fields, deadlines, scheduling policy, or JSON keys are removed/changed.
 
 Compute sequence and trust age are assigned before the pass's first snapshot reads. Older
-snapshots cannot replace newer publications. Heartbeats do not vouch failed, known-dirty, or
-older-than-full-refresh bundles. The epoch/revision/full-refresh contracts remain intact.
+snapshots cannot replace newer publications. Heartbeats do not vouch failed, known-dirty,
+source-degraded (`stale`, `partial_source_unknown`, `_execution_error`), or older-than-full-refresh
+bundles. Source degradation is tracked internally without new JSON keys and retries on the next
+tick even if stamps do not change. The epoch/revision/full-refresh contracts remain intact.
+Review found the original age-stale regression missed successful core busy-fallback rows: no
+exception meant they were classified as fresh. Task/done flag regressions and a real-reader
+busy→fallback→heartbeat→recovery regression now exercise that detection gap, including newer
+publication winning over older source-stale work.
 
 ## Failure analysis
 
