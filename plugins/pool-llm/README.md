@@ -42,8 +42,31 @@ Plain chat requests without tool fields/history keep their legacy response shape
 This support is on the HTTP serve endpoint, not the text-only `complete()`/`client()` library helpers.
 Regression coverage: `tests/test_chat_tools.py`. `POST /v1/embeddings` is forwarded to OpenRouter (key `OPENROUTER_API_KEY` from Hermes's `.env`; a bare model such
 as `text-embedding-3-large` becomes `openai/text-embedding-3-large` and the reply names the model as asked; upstream
-errors keep their status; the key is never logged). Non-streaming only. Each reply carries an `x-hermes-pool-route` header
+errors keep their status; the key is never logged). Each reply carries an `x-hermes-pool-route` header
 (provider, model, account). Only models the managed routing registry lists as subscription routes are accepted.
+
+### Streaming Messages
+
+`POST /v1/messages` accepts `stream: true`, including the Anthropic SDK's `messages.stream()`:
+
+```python
+import anthropic
+client = anthropic.Anthropic(base_url="http://127.0.0.1:8765", api_key="pool")
+with client.messages.stream(model="claude-haiku-5-5", max_tokens=256,
+        messages=[{"role": "user", "content": "Explain server-sent events briefly."}]) as stream:
+    for text in stream.text_stream:
+        print(text, end="", flush=True)
+```
+
+Events are forwarded as SSE and flushed individually, with tool names restored in
+`content_block_start` events. The response uses connection-close framing (no content length).
+Quota rotation and auth recovery apply only until the first upstream event is received;
+errors after that become an SSE `error` event and close the connection, never a replay on
+another account. Before the first event, failures keep the usual JSON HTTP error responses.
+OpenAI `/v1/responses` and `/v1/chat/completions`, and embeddings, remain non-streaming;
+`stream: true` returns HTTP 400 naming `/v1/messages` as the supported streaming route.
+Regression coverage: `tests/test_messages_stream.py` exercises incremental forwarding,
+restored tools, pre-event quota/auth recovery, post-event errors, and non-stream compatibility.
 
 On a 429/quota/credit error the account is marked exhausted in the pool and the call retries on the next account;
 when all refuse it raises `PoolExhausted` (HTTP 429 from `serve`) naming the accounts tried.

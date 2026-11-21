@@ -519,6 +519,75 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
             self.end_headers()
             self.wfile.write(data)
 
+        def _stream_messages(self, body, pool, route):
+            # Prime inside rotation: opening HTTP alone does not establish that an
+            # account can serve. After the first event, never replay the request.
+            wire_body, names = oauth_messages_body(body)
+            wire_body["stream"] = True
+
+            def open_stream(entry):
+                client = anthropic_client(entry)
+                stream = None
+                try:
+                    stream = client.messages.create(**wire_body)
+                    events = iter(stream)
+                    try:
+                        first = next(events)
+                    except StopIteration as exc:
+                        raise UpstreamError(502, "upstream stream ended before its first event") from exc
+                    route.update(provider="anthropic", model=body.get("model"), account=entry_label(entry))
+                    return client, stream, events, first
+                except Exception:
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    raise
+
+            client, stream, events, first = with_rotation(open_stream, pool)
+
+            def send_event(payload):
+                if payload.get("type") == "content_block_start":
+                    restore_tool_names({"content": [payload.get("content_block")]}, names)
+                data = f"event: {payload['type']}\ndata: {json.dumps(payload)}\n\n".encode()
+                self.wfile.write(data)
+                self.wfile.flush()
+
+            try:
+                self.close_connection = True
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.send_header("x-hermes-pool-route", json.dumps(route))
+                self.send_header("connection", "close")
+                self.end_headers()
+                try:
+                    send_event(first.model_dump(mode="json", exclude_unset=True))
+                    for event in events:
+                        send_event(event.model_dump(mode="json", exclude_unset=True))
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # client left; close upstream without another write
+                except Exception as exc:
+                    try:
+                        send_event({"type": "error", "error": {"type": "api_error", "message": str(exc)[:2000]}})
+                    except OSError:
+                        pass
+            finally:
+                # Do not let cleanup errors reach do_POST's JSON error handler:
+                # headers may already be committed to SSE.
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
         def do_GET(self):
             if self.path.rstrip("/") in ("", "/health"):
                 return self._send(200, {"ok": True})
@@ -529,10 +598,12 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
             try:
                 body = json.loads(self.rfile.read(int(self.headers.get("content-length") or 0)) or b"{}")
                 path = self.path.split("?")[0].rstrip("/")
-                if body.get("stream"):
-                    raise ValueError("stream=true is not supported by hermes-pool-llm serve; call without streaming")
+                if body.get("stream") and not path.endswith("/messages"):
+                    raise ValueError("stream=true is supported only on /v1/messages; call this route without streaming")
                 if path.endswith("/messages"):
                     resolve_model("anthropic", body.get("model"))
+                    if body.get("stream"):
+                        return self._stream_messages(body, pool_for("anthropic"), route)
                     out = anthropic_messages(body, pool=pool_for("anthropic"), route=route)
                 elif path.endswith("/responses"):
                     resolve_model("openai-codex", body.get("model"))
