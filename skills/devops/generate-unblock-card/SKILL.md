@@ -89,6 +89,12 @@ Fix whatever fails, then file. The `unblock_card_hold` (ask-gate, and owner-reco
 `Recommend:` or exactly one `(recommended)` choice. Put each label at the start of its own line and letter the
 options `A)`, `B)`. It can't judge clarity, so the cold read is yours.
 
+**Stop-or-relax asks (`replan_hold`).** A card that ends an approved goal unmet, or offers a redesign or new
+approach, is refused as a re-plan the agent owns. Before filing, get an independent feasibility review of
+untried approaches within the unchanged limits; it can find one. If none fits, name the exact acceptance limit
+the ask changes in `why_human` and the card body, for example "lowers the approved targets (links 0.2, memory
+128 MiB) or ends the goal unmet". Never offer "redesign" as an option.
+
 **Scope that is already a contract.** A PR approval (`scope` = `owner/repo#12 head abc1234`, pr-approval grammar)
 or a physical ask (`DEVICE:` / `HUMAN_STEP:` / `OBSERVATION:` / `EVIDENCE:` lines) keeps that scope exactly; the
 guard then asks only for `Tried:` and the single `(recommended)` choice. Put the situation, options and
