@@ -201,15 +201,8 @@ logger, right after filing it, before parking: a hit typed from an assumed forma
 often moves the failure somewhere quieter: a loud error that falls back to a slow path, an estimate that drifted from
 the real count, an urgent route parked by an unrelated hold. Each of those is a new why-chain.
 
-A live check that makes a Hermes detector fire on purpose (a failing command run 3x, a fake complaint) starts the
-session's first prompt with `[selfheal-probe]`, e.g. `hermes chat -q '[selfheal-probe] run <cmd> three times'`.
-CLI proof chats started under agent ancestry are hidden automatically, including SSH-forwarded `LC_HERMES_AGENT`;
-`--visible` / `HERMES_CHAT_VISIBLE=1` is an explicit opt-out, not needed for terminal relay or `--resume`.
-Verify the target's installed build has this behavior before relying on it. Hidden agent CLI proofs retire on
-completion or after 24 h idle independently of `sessions.auto_archive`; still archive each live probe when finished.
-The coach's self-heal lane then logs `selfheal_detect` with `probe: true` plus `selfheal_skip why=probe` and files no
-defect card; read those two lines as the proof. Never clean up by deleting `selfheal_pending` rows by hand: a
-deferred retry refiles the probe later.
+Before a deliberate detector proof chat, read `references/proof-chat-visibility.md`: `[selfheal-probe]` marking,
+automatic CLI/SSH hiding, opt-outs, cleanup and the detector's own proof lines.
 
 ### 7. Write it down
 
