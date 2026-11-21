@@ -202,7 +202,8 @@ def _watch_park(kb, tid):
     from hermes_cli.kanban_db_connect import connect_closing
     with connect_closing() as conn:
         assert kb.schedule_task(conn, tid, reason='SCHEDULED_UNTIL=2100-01-01T00:00:00Z recheck later',
-                                clock_only=True, watch=True)
+                                clock_only=True, watch=True,
+                                awaiting={'kind': 'clock', 'why': 'fixture cooldown deadline'})
         conn.commit()
     from hermes_cli import kanban_session_activity as ksa
     ksa._reset_cache_for_tests()
@@ -267,7 +268,8 @@ def test_real_core_linked_non_watch_park_still_listed(real_board):
     from hermes_cli.kanban_db_connect import connect_closing
     with connect_closing() as conn:
         assert real_board.schedule_task(conn, tid, reason='SCHEDULED_UNTIL=2100-01-01T00:00:00Z later',
-                                        clock_only=True)
+                                        clock_only=True,
+                                        awaiting={'kind': 'clock', 'why': 'fixture cooldown deadline'})
         conn.commit()
     from hermes_cli import kanban_session_activity as ksa
     ksa._reset_cache_for_tests()
