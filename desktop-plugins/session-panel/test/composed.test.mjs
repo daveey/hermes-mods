@@ -193,7 +193,8 @@ test('composed: resolved receipt keeps its queue mounted even when no actionable
   await React.act(async () => root.render(null))
   const id = 't_receipt_blocker'
   const ref = { gatewayId: 'G2', profile: 'default', type: 'kanban', board: 'default', id }
-  const request = { ...canonicalRequest, requestId: '00000000-0000-4000-8000-000000000099', state: 'resolved',
+  // Recorded, not yet delivered: the backend only writes state='resolved' once delivery is confirmed.
+  const request = { ...canonicalRequest, requestId: '00000000-0000-4000-8000-000000000099', state: 'open',
     resolution: { operationId: 'receipt-status', choiceId: 'a', revision: 1 },
     owner: { ...canonicalRequest.owner, gatewayId: 'G2' }, aliases: [ref] }
   const dispose = wire({ chips: [chip(id, { gatewayId: 'G2', gateway: 'G2', connectionId: 'C2' })], items: [], ledgerSteps: [], requests: [request] })
@@ -280,6 +281,32 @@ test('composed: recorded question delivery is agent-side, never a red human ask'
     assert.equal(window.__userSteps.openAskCount(), 1)
     assert.match(el().querySelector('[data-section="needs-you"]').textContent, /Needs you · 1/)
   } finally {
+    await React.act(async () => root.render(null)); dispose(); steps.resetCanonicalCacheForTests()
+  }
+})
+
+test('composed: an already-delivered (resolved) ask never reappears as Delivering to chat', async () => {
+  await React.act(async () => root.render(null))
+  steps.resetCanonicalCacheForTests()
+  window.localStorage.clear()
+  const done = { ...canonicalRequest, requestId: '00000000-0000-4000-8000-000000000097', aliases: [], state: 'resolved',
+    resolution: { operationId: 'old-delivered', choiceId: 'a', revision: 1 } }
+  const open = { ...canonicalRequest, requestId: '00000000-0000-4000-8000-000000000098', aliases: [] }
+  const requests = [done, open]
+  const dispose = wire({ chips: [], items: [], ledgerSteps: [], requests })
+  const reads = []
+  const originalApi = window.hermesDesktop.api
+  window.hermesDesktop.api = async opts => { if (opts.path.includes('/operations/')) reads.push(opts.path); return originalApi(opts) }
+  try {
+    await render('resolved-old-ask')
+    const rows = [...el().querySelectorAll('[data-action-request]')]
+    assert.equal(rows.length, 1, 'only the still-open ask is drawn')
+    assert.doesNotMatch(el().textContent, /Delivering to chat/)
+    assert.equal(el().querySelector('[data-agent-deliveries] [data-action-request]'), null)
+    assert.deepEqual(reads, [], 'no delivery readback for a terminal backend state')
+    assert.equal(window.__userSteps.openAskCount(), 1)
+  } finally {
+    window.hermesDesktop.api = originalApi
     await React.act(async () => root.render(null)); dispose(); steps.resetCanonicalCacheForTests()
   }
 })

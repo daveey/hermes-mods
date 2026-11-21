@@ -322,13 +322,16 @@ test('incomplete external steps await agent completion; complete external steps 
 
 test('For you hides closed and superseded requests but retains operation readback until terminal confirmation',async()=>{
  const closed=freshRequest({state:'resolved',title:'Old resolved'}),superseded=freshRequest({state:'superseded',title:'Old superseded'}),cancelled=freshRequest({state:'cancelled',title:'Old cancelled'})
- const pending=freshRequest({state:'resolved',title:'Pending receipt',resolution:{operationId:'queue-readback',choiceId:'yes',revision:1}})
+ // Recorded, not yet delivered (backend writes state='resolved' only on confirmed delivery).
+ const pending=freshRequest({state:'open',title:'Pending receipt',resolution:{operationId:'queue-readback',choiceId:'yes',revision:1}})
+ // An old answer the backend already marks resolved is terminal: never shown, never re-read.
+ const delivered0=freshRequest({state:'resolved',title:'Old delivered answer',resolution:{operationId:'old-delivered',choiceId:'yes',revision:1}})
  let delivered=false;const reads=[]
- window.hermesDesktop={api:async({path})=>{if(path.includes('/operations/')){reads.push(path);return {request:pending,operation:{operationId:'queue-readback',dispatchState:delivered?'delivered':'pending'}}}return {requests:[closed,superseded,cancelled,pending]}}}
+ window.hermesDesktop={api:async({path})=>{if(path.includes('/operations/')){reads.push(path);return {request:delivered?{...pending,state:'resolved'}:pending,operation:{operationId:'queue-readback',dispatchState:delivered?'delivered':'pending'}}}return {requests:[closed,superseded,cancelled,delivered0,pending]}}}
  await show(React.createElement(m.ActionQueue,{key:'closed-filter'}))
  assert.equal(el().querySelectorAll('[data-action-request]').length,1)
- assert.match(el().textContent,/Pending receipt/);assert.doesNotMatch(el().textContent,/Old resolved|Old superseded|Old cancelled/)
- assert.ok(reads.length>0)
+ assert.match(el().textContent,/Pending receipt/);assert.doesNotMatch(el().textContent,/Old resolved|Old superseded|Old cancelled|Old delivered answer/)
+ assert.ok(reads.length>0);assert.ok(reads.every(p=>!p.includes('old-delivered')),'terminal answer is not re-read')
  delivered=true;await click('Check status')
  assert.equal(el().querySelector('[data-action-queue]'),null)
  await React.act(async()=>{await m.refreshRequests();await flush()})

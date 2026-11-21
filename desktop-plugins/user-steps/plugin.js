@@ -1271,6 +1271,9 @@ function requestNeedsReadback(scope, r) {
   if (r.state === 'withdrawn' && !r.resolution) return false // nothing can be pending on a withdrawn revision
   const key = `${scope}:${requestKey(r)}`, op = operations.get(key)
   if (['confirmed','cancelled'].includes(op?.phase) && op.request?.revision === r.revision && operationId(op.operation) === r.resolution?.operationId) return false
+  // Terminal backend state is durable delivery confirmation: an old answered ask is neither pending nor shown.
+  // Local in-flight decisions and recovery intents still get their readback.
+  if (['resolved','superseded','cancelled'].includes(r.state) && r.resolution?.revision === r.revision && !op?.decision && !recoverIntent(key, r)) return false
   return !!(op?.decision || r.resolution?.operationId || recoverIntent(key, r))
 }
 /** Open asks for the focused chat that need the user (agent-pending and dismissed ones excluded). */
