@@ -57,6 +57,57 @@ def test_two_worker_citations_mirror_real_questions_in_order(tmp_path):
         assert snap['cited_set'] == originals
 
 
+@pytest.mark.parametrize('payload', ['"plain string"', '[1]', '{bad json'])
+def test_malformed_unrelated_block_event_does_not_hide_questions(tmp_path, payload):
+    mirror, store, path, hr, originals = cited_fixture(tmp_path)
+    unrelated = dict(hr, action='Answer the unrelated question', evidence='Legacy event')
+    with sqlite3.connect(path) as c:
+        c.execute('INSERT INTO tasks VALUES (?,?,?,?,?,NULL)',
+                  ('t_other', 'Unrelated question', 'blocked', 'session-a', json.dumps(unrelated)))
+        c.execute("INSERT INTO task_events(task_id,kind,payload) VALUES ('t_other','blocked',?)",
+                  (payload,))
+    mirror.reconcile(OWNER)
+    requests = store.requests(OWNER)
+    assert len(requests) == 3
+    cited = [r for r in requests if r['scope']['sourceRefs'][0]['id'] == 't_test']
+    assert [r['title'] for r in cited] == [r['title'] for r in originals]
+    fallback = next(r for r in requests if r['scope']['sourceRefs'][0]['id'] == 't_other')
+    assert fallback['title'] == 'Unrelated question'
+    assert 'cited_set' not in json.loads(mirror.binding(OWNER, fallback['requestId'])['snapshot'])
+
+
+@pytest.mark.parametrize('case', ['projection', 'owner-session'])
+def test_already_visible_citation_uses_fallback_without_copy(tmp_path, case):
+    mirror, store, path, hr = fixture(tmp_path)
+    visible_owner = dict(OWNER, storedSessionId='session-b') if case == 'projection' else OWNER
+    if case == 'projection':
+        with sqlite3.connect(path) as c:
+            c.execute("UPDATE tasks SET session_id='session-b'")
+        mirror.reconcile(visible_owner)
+        visible = store.requests(visible_owner)[0]
+    else:
+        visible = complete_request(title='Already visible question')
+        visible.update(kind='choice', outcomes={'answer': 'Record answer'},
+                       choices=[dict(id='yes', label='Yes', effect='answer')])
+        visible = store.create(OWNER, visible)
+    ask = dict(hr, action='Answer the cited question', evidence=visible['requestId'])
+    ask.pop('choices')
+    with sqlite3.connect(path) as c:
+        c.execute('INSERT INTO tasks VALUES (?,?,?,?,?,NULL)',
+                  ('t_other', 'Other question', 'blocked', 'session-a', json.dumps(ask)))
+        c.execute("INSERT INTO task_events(task_id,kind,payload) VALUES ('t_other','blocked','{}')")
+    mirror.reconcile(OWNER)
+    requests = store.requests(OWNER)
+    assert len(requests) == (1 if case == 'projection' else 3)
+    other = [r for r in requests if any(ref.get('id') == 't_other'
+             for ref in r['scope']['sourceRefs'])]
+    assert len(other) == 1
+    snap = mirror._read_snapshot('default', 't_other', OWNER)
+    assert 'cited_set' not in snap
+    assert other == [mirror._request(OWNER, 'default', snap)]
+    assert store.get(visible_owner, visible['requestId']) == visible
+
+
 def test_comments_then_final_unblock_and_replays(tmp_path):
     mirror, store, path, hr, originals = cited_fixture(tmp_path)
     mirror.reconcile(OWNER)
