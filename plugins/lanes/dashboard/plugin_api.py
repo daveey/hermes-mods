@@ -157,7 +157,8 @@ def _pr_contexts(db, flow_module, *, evidence=None):
                 carries_pr = any(key in pr_evidence for key in ('published_pr', 'reviewed_pr', 'pr', 'flow_pr', 'head', 'head_sha', 'headRefOid'))
                 if event['kind'] not in ('heartbeat', 'external_watch') or carries_pr:
                     revision = max(revision, event['id'])
-            groups[url].append((row['id'], row['status'], row['completion_contract'], revision))
+            source = evidence.identity(row['id']) if evidence is not None and hasattr(evidence, 'identity') else identity
+            groups[url].append((row['id'], row['status'], row['completion_contract'], (source, revision)))
     return {url: (identity, tuple(sorted(cards))) for url, cards in groups.items()}
 
 
@@ -189,9 +190,57 @@ def _view_module():
     return module
 
 
+@lru_cache(maxsize=1)
+def _shared_views():
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location('lanes_shared_views', Path(__file__).with_name('shared_views.py'))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.SharedViews(CACHE_S)
+
+
 def lane_view(hours: float = 6.0, window: str = "6h", expanded: bool = False):
+    _validate_view(hours, window, expanded)
+    with _lock:
+        generation = _generation
+    return _shared_views().get((hours, window, expanded), (generation, _observation_cursor()),
+                               lambda: _lane_view(hours, window, expanded))
+
+
+def _lane_view(hours, window, expanded):
+    mods = core()
+    if mods is not None and 'evidence' in inspect.signature(mods[2].snapshot).parameters:
+        return _current_view(mods, hours, window, expanded)
     snap = read(hours)
     return _view_module().project(snap, flow(window) if expanded and snap.get("configured") else None, expanded)
+
+
+def _current_view(mods, hours, window, expanded):
+    """One source selection under short read snapshots, for strip AND panel."""
+    from hermes_cli.kanban_lanes_sources import read_view
+    kbc, _, cli = mods
+    try:
+        with kbc.connect_closing() as conn, read_view(conn) as evidence:
+            snap = cli.snapshot(conn, hours=hours, evidence=evidence)
+            raw = None
+            if expanded and snap.get('configured'):
+                try:
+                    flow_mods = flow_core()
+                    if flow_mods is None:
+                        raise RuntimeError('this Hermes core has no lanes flow support yet')
+                    flow_mod = flow_mods[1]
+                    contexts = _pr_contexts(evidence.conn, flow_mod, evidence=evidence)
+                    with _observer_init_lock:
+                        reader = _observations().reader(contexts)
+                    raw = flow_mod.snapshot(evidence.conn, window=window, reader=reader, evidence=evidence)
+                    raw['configured'] = bool(raw.get('lanes'))
+                except Exception as exc:
+                    raw = {'configured': False, 'reason': f'lanes flow is unavailable: {exc}'}
+            return _view_module().project(snap, raw, expanded)
+    except Exception as exc:
+        return _view_module().project({'configured': False, 'reason': f'lanes view is unavailable: {exc}'}, None, expanded)
 
 
 def _need_core():

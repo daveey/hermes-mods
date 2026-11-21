@@ -62,6 +62,27 @@ once, and dependency parent reads are reused within that view; no classified car
 cache survives into the next request. Older cores retain the existing projection
 path until upgraded naturally.
 
+On core with `kanban_lanes_sources.read_view`, strip and expanded panel share one
+short, read-only pair of local/fleet snapshots and one whole-card source choice.
+Primary-mode local rows (including picked-up copies) win until pending edits are
+answered; otherwise strictly newer fleet revisions win, with ties local.
+Tombstones on either source suppress deleted cards; missing parents stay missing
+rather than trusting an older remote-parent mirror. Each card keeps its chosen
+source's complete history and child-owned edges, including empty unlink sets.
+PR context revisions include the chosen database identity, never bare cross-file
+event IDs. Run/cost/done/admission usage stays on the canonical fleet connection,
+so copies cannot double-count it. Held-card provenance is local to its source;
+daily-cap usage remains canonical. Shadow/off modes keep the prior behavior.
+
+Concurrent viewers of the same parameters share a single in-flight projection
+and a bounded view cache keyed by invalidation generation/PR observation cursor.
+No per-card classifier evidence is retained. A changed cursor or successful write
+invalidates the next view; a projection already started is allowed to finish,
+not retried until the board is quiet. First-dirty debounce remains bounded under
+continuous unrelated churn. Tests exercise three real sockets with 40,000 history
+events and an intentionally unchanged stale replica, plus separate cache-race
+and write-invalidation controls. Real deployment latency still needs a live proof.
+
 PR network observation runs in one process-shared, bounded background worker,
 not the stream or GET request. A report consumes an immutable published reader.
 Entries expire 60 seconds after read **start**, refresh becomes due at 30 seconds,
