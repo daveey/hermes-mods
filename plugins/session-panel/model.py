@@ -56,6 +56,18 @@ def seconds(value):
     return n / 1000 if n > 1e11 else n
 
 
+# Emoji-presentation symbols the Desktop fonts draw as tofu (a Hermes-bug title carried "⛔"). Plain text symbols
+# such as ⚠ ✓ → stay: they render everywhere.
+_EMOJI = re.compile('[\U0001F000-\U0001FAFF\u231a\u231b\u23e9-\u23f3\u23f8-\u23fa\u25fd\u25fe\u2614\u2615\u2648-\u2653\u267f\u2693'
+                    '\u26a1\u26aa\u26ab\u26bd\u26be\u26c4\u26c5\u26ce\u26d4\u26ea\u26f2\u26f3\u26f5\u26fa\u26fd\u2705\u270a\u270b'
+                    '\u2728\u274c\u274e\u2753-\u2755\u2757\u2795-\u2797\u27b0\u27bf\u2b1b\u2b1c\u2b50\u2b55\ufe0f\u200d\u20e3]')
+
+
+def clean(value):
+    """Display text without emoji glyphs the fonts cannot draw, whitespace collapsed."""
+    return flat(_EMOJI.sub('', text(value)))
+
+
 def short_dur(value):
     n = max(0, int(value))
     if n < 60:
@@ -121,12 +133,32 @@ def target(row):
 def row_view(row, kind='card'):
     return {'id': str(row.get('id') or ''), 'key': key(row), 'kind': kind,
             'gateway': row.get('gateway') or '', 'profile': row.get('profile') or 'default',
-            'board': row.get('board') or 'default', 'title': text(row.get('title')) or str(row.get('id') or 'task'),
+            'board': row.get('board') or 'default', 'title': clean(row.get('title')) or str(row.get('id') or 'task'),
             'detail': '', 'details': [], 'actions': [{'kind': 'open_card', 'label': 'Open card', 'target': target(row)}] if kind == 'card' else []}
 
 
+SKEW_S = 120  # worker clocks run a little ahead of the hub's; core rejects `now < observed_at` outright
+# Why a producer sent no usable execution evidence. The card is then described by its board status, never by a
+# made-up liveness claim, but it is not "status unknown" either: nothing contradicts the board.
+PRODUCER_GAPS = frozenset({'no_run_identity', 'producer_sent_no_observations', 'no_observation_for_card',
+                           'hub_replica_not_source_evidence', 'missing_qualified_identity', 'no_observation'})
+
+
+def _newest_observation(records):
+    stamps = []
+    for r in records:
+        if isinstance(r, dict):
+            stamps.append(r.get('observed_at'))
+            stamps.extend(s.get('observed_at') for s in r.get('required_sources') or [] if isinstance(s, dict))
+    return max([s for s in stamps if type(s) in (int, float) and 0 <= s < 8.64e12] or [0])
+
+
 def observation(row, now, kind, projector=None):
-    """Exact execution identity selection, same order as Desktop chipObservation."""
+    """Exact execution identity selection, same order as Desktop chipObservation.
+
+    A worker clock a little ahead of the reading clock is not a contradiction: `now` is lifted to the newest
+    observation when it is at most SKEW_S ahead (a larger lead stays core's `clock_inconsistent`).
+    """
     records = row.get('execution_observations')
     if not isinstance(records, list):
         return {'state': 'unknown', 'unknown_reason': 'hub_replica_not_source_evidence' if row.get('replica') or row.get('source') == 'replica' else 'producer_sent_no_observations'}
@@ -140,6 +172,9 @@ def observation(row, now, kind, projector=None):
         candidates.append(r)
     if not candidates:
         return {'state': 'unknown', 'unknown_reason': 'no_observation_for_card'}
+    newest = _newest_observation(candidates)
+    if now < newest <= now + SKEW_S:
+        now = newest
     if projector is None:
         try:
             from hermes_cli.execution_observations import select, identity_key
@@ -148,24 +183,67 @@ def observation(row, now, kind, projector=None):
         identities = {identity_key(r.get('identity')) for r in candidates}
         if len(identities) > 1:
             return {'state': 'unknown', 'unknown_reason': 'ambiguous_execution_identity', 'sourced': True}
-        return dict(select(candidates, identity=candidates[0]['identity'], now=now), sourced=True)
+        out: dict = dict(select(candidates, identity=candidates[0]['identity'], now=now), sourced=True)
+        # A replica row carries no run id, so its identity is no execution identity: the producer gave no run
+        # evidence. That is a gap in what was sent, not an invalid request by the reader.
+        if out.get('unknown_reason') == 'invalid_requested_identity' and identities == {None}:
+            out['unknown_reason'] = 'no_run_identity'
+        return out
     return projector(candidates, now=now)
 
 
-def wait_phrase(row, now):
+_URL = re.compile(r'https?://[^\s)\]]+')
+_HASHY = re.compile(r'\b(?:core|mods)?(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b(?:…|\.\.\.)?')
+WAIT_MAX = 100  # one short phrase; the full text is a Details line
+
+
+def _pr_number(row, urls, on):
+    """The PR a CI wait is about: the card's own pr_url, a /pull/N link in the wait, else the one PR its title names."""
+    for blob in (text(row.get('pr_url')), *urls):
+        m = re.search(r'/pull/(\d+)', blob)
+        if m:
+            return m[1]
+    found = {g for m in re.finditer(r'\bPRs?\s*#?(\d+)|#(\d{3,6})\b', f'{on} {text(row.get("title"))}') for g in m.groups() if g}
+    return found.pop() if len(found) == 1 else ''
+
+
+def wait_info(row, now):
+    """What a parked card waits on, as one short human phrase.
+
+    Returns `{text, raw, urls}`: `text` for the row line, `raw` the producer's own wording (a Details line, only
+    when it differs), `urls` for an Open action. Never inlines a URL, commit hash or run reference.
+    """
     wait = obj(row.get('wait'))
     on = text(wait.get('waiting_on'))
     since = number(wait.get('waiting_since'))
     if not on:
-        return ''
+        return {'text': '', 'raw': '', 'urls': []}
     match = re.match(r'the clock until (\d{4}-\d\d-\d\d) (\d\d:\d\d) UTC\b', on)
     if match:
         due = datetime.fromisoformat(f'{match[1]}T{match[2]}:00+00:00').timestamp()
         prefix = f'waiting {short_dur(now - since)} · ' if 0 < since <= now else ''
         if due >= now:
-            return f'{prefix}{short_dur(due - now)} left (until {pacific(due)})'
-        return f'{prefix}{"⚠ " if now - due >= 1800 else ""}overdue by {short_dur(now - due)} (was due {pacific(due)})'
-    return f'waiting on {on}' + (f' for {short_dur(now - since)}' if since > 0 else '')
+            return {'text': f'{prefix}{short_dur(due - now)} left (until {pacific(due)})', 'raw': on if on != match[0] else '', 'urls': []}
+        return {'text': f'{prefix}{"⚠ " if now - due >= 1800 else ""}overdue by {short_dur(now - due)} (was due {pacific(due)})', 'raw': on if on != match[0] else '', 'urls': []}
+    urls = [u.rstrip('.,;') for u in _URL.findall(on)]
+    age = f' · {short_dur(now - since)}' if 0 < since <= now else ''
+    head = re.match(r'(ci|deploy)\b', on, re.I)
+    if head and head[1].lower() == 'ci':
+        pr = _pr_number(row, urls, on)
+        phrase = 'waiting on CI' + (f' · PR #{pr}' if pr else '')
+    elif head:
+        phrase = 'waiting on hub deploy' if re.search(r'\bhub\b', on, re.I) else 'waiting on deploy'
+    else:
+        body = flat(_HASHY.sub('', _URL.sub('', on)))
+        body = re.sub(r'\s+(?:for|and|/|·)\s*$', '', re.sub(r'\s{2,}', ' ', body)).strip()
+        if len(body) > WAIT_MAX:
+            body = body[:WAIT_MAX - 1].rstrip() + '…'
+        phrase = f'waiting on {body}' if body else 'waiting'
+    return {'text': phrase + age, 'raw': on, 'urls': urls[:1]}
+
+
+def wait_phrase(row, now):
+    return wait_info(row, now)['text']
 
 
 def human_owned(row):
@@ -207,7 +285,7 @@ def ask(row, request=None):
     action = text(hr.get('action'))
     title = re.split(r'\b(?:unblock|yes)\s*(?:\([^)]*\))?\s*=', action, maxsplit=1, flags=re.I)[0].strip()
     out.update(source='card' if row.get('id') else 'question', id=row.get('id') or request.get('requestId'),
-               title=title or request.get('title') or 'The exact step isn’t shown here.',
+               title=clean(title or request.get('title')) or 'The exact step isn’t shown here.',
                situation=parsed['situation'], only_you=parsed['only_you'], options=[],
                details=[s for s in (parsed.get('tried'), text(hr.get('evidence')), text(hr.get('scope'))) if s])
     choices = request.get('choices') or hr.get('choices') or []
@@ -288,9 +366,49 @@ def _ready(row, detail, now):
     return f'ready · waiting{f" {short_dur(now - since)}" if since else ""} for a worker to claim it'
 
 
+def route_model(row, detail):
+    """The model a run was routed to, from the card's own events, when the run row carries none.
+
+    `run_route` (what the dispatcher chose) beats `model_tier` (what the tier policy proposed); only the
+    current run's events count, else the newest ones when the run id is unknown."""
+    events = [e for e in detail.get('events') or [] if isinstance(e, dict) and e.get('kind') in ('run_route', 'model_tier')
+              and text(obj(e.get('payload')).get('model'))]
+    run = row.get('current_run_id')
+    if run is not None:
+        events = [e for e in events if e.get('run_id') == run]
+    for kind in ('run_route', 'model_tier'):
+        picked = [e for e in events if e['kind'] == kind]
+        if picked:
+            return text(obj(max(picked, key=lambda e: number(e.get('id')))['payload']).get('model'))
+    return ''
+
+
+def decision_text(request, now):
+    """One status line for an answered ask whose delivery has not been confirmed: `Done · delivers when this turn ends`."""
+    resolution = obj(request.get('resolution'))
+    choice = next((c for c in request.get('choices') or [] if isinstance(c, dict) and c.get('id') == resolution.get('choiceId')), {})
+    label = clean(re.sub(r'\s*\(recommended\)\s*$', '', text(choice.get('label')), flags=re.I)) or 'Answered'
+    try:
+        at = datetime.fromisoformat(text(resolution.get('recordedAt'))).timestamp()
+    except ValueError:
+        at = 0
+    # A decision that sat undelivered for long is no longer "waiting for the turn to end": say so.
+    return f'{label} · not delivered yet, recorded {ago(at, now)}' if at and now - at > RECORDED_STALE_S else f'{label} · delivers when this turn ends'
+
+
+def recorded(request):
+    """Answered but not yet delivered: the decision queue keeps the request open until delivery is confirmed."""
+    return bool(obj(request.get('resolution'))) and request.get('state') in ('open', 'needs_context')
+
+
+RECORDED_STALE_S = 900
+HEADER_LABELS = {'unresolved': 'interrupted'}
+
+
 def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, rentals=None, projector=None):
     """Return JSON-safe PanelModel v1. Inputs are snapshots, and are never mutated."""
     sections = {s: [] for s in SECTIONS}
+    rows_by_key = {}
     requests = list(requests if requests is not None else bundle.get('requests') or [])
     used, seen = set(), set()
     # The serving gateway's own names (board name + install owner id). Only these are equated, never a foreign one.
@@ -311,9 +429,12 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         detail = obj(rec.get('detail'))
         # Detail is supplementary only. Current list/wait wins over preserved block_kind and old ask text.
         row = {**obj(detail.get('task')), **row}
+        if row.get('status') in ('running', 'review') and not row.get('run_model'):
+            row['run_model'] = route_model(row, detail)
         k = key(row)
         if k in seen:
             continue
+        rows_by_key[k] = row
         state = row.get('status')
         if row.get('unfinished') and state not in ACTIVE:
             state = 'unknown'
@@ -323,7 +444,11 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         seen.add(k)
         v = row_view(row)
         progress = number(row.get('activity_at')) or number(row.get('current_run_started_at'))
-        on = wait_phrase(row, now)
+        wi = wait_info(row, now)
+        on = wi['text']
+        if wi['raw'] and wi['raw'] != on:
+            v['details'].append(f'Waiting on: {wi["raw"]}')
+        v['actions'].extend({'kind': 'open_url', 'label': 'Open CI' if wi['text'].startswith('waiting on CI') else 'Open link', 'url': u} for u in wi['urls'])
         if state == 'unknown' and row.get('reported_status', raw.get('status')) in ('done', 'archived', 'done_pending_release'):
             v['detail'] = f'reported {row.get("reported_status") or "done"} by {row.get("gateway") or "another gateway"} · not confirmed by its owner'
             sections['waiting'].append(v)
@@ -340,7 +465,12 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             elif matches:
                 # Retiring/Skip closes attention, not the blocked owner. No resurrected controls.
                 used.update(i for i, _ in matches)
-                v['detail'] = f'blocked · request {matches[0][1].get("state") or "dismissed"}'
+                answered = next((r for _, r in matches if recorded(r)), None)
+                if answered:
+                    # Answered, delivery pending: the card carries the one status line (`decision`), no ask card.
+                    v['detail'] = 'blocked · answered'
+                else:
+                    v['detail'] = f'blocked · request {matches[0][1].get("state") or "dismissed"}'
                 sections['waiting'].append(v)
             else:
                 sections['needs_you'].append(ask(row))
@@ -358,16 +488,26 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             sections['stuck'].append(v); continue
         ev = observation(row, now, 'card', projector)
         unknown = ev.get('state') == 'unknown'
+        reason = ev.get('unknown_reason') or 'unknown'
         v['evidence_state'] = ev.get('state')
-        if unknown and state in ('scheduled', 'blocked', 'triage', 'review', 'ready', 'todo') and 0 <= now - read_at <= 60:
+        reported = bool(row.get('remote') or row.get('source') in ('replica', 'origin-obligation'))
+        fresh = 0 <= now - read_at <= 60
+        # The owner's board says it is running and the producer sent no run evidence at all (a replica row has no
+        # run id): that is the owner's report, shown as such, not a contradiction and not "status unknown".
+        stale_sync = bool(row.get('synced_at')) and now - number(row.get('synced_at')) > 300
+        if unknown and state == 'running' and reported and reason in PRODUCER_GAPS and fresh and not stale_sync:
+            unknown = False
+            v.update(evidence_state='reported', reported=True)
+        provenance = (f'Reported by {row.get("gateway") or "another gateway"}\'s board; no live run evidence reached this gateway.'
+                      if reported else 'Board status; no live run evidence for this card.')
+        if unknown and state in ('scheduled', 'blocked', 'triage', 'review', 'ready', 'todo') and fresh:
             v['parked'] = True
-            source = 'reported board status' if row.get('remote') or row.get('source') == 'replica' else 'board status'
             queued = state == 'todo' and not on and not obj(row.get('upstream')).get('id')
-            v['detail'] = (_ready(row, detail, now) if state == 'ready' else 'not started' if queued else _parked(row, on)) + f' · {source}'
+            v['detail'] = _ready(row, detail, now) if state == 'ready' else 'not started' if queued else _parked(row, on)
+            v['details'].append(provenance)
             v['queued'] = queued
             sections['ready' if state == 'ready' or queued else 'waiting'].append(v); continue
         if unknown:
-            reason = ev.get('unknown_reason') or 'unknown'
             v['detail'] = f'status unknown ({reason.replace("_", " ")}) · last known: {ev.get("last_known_state") or state or "unknown"}'
             sections['waiting'].append(v); continue
         if state == 'running' and progress and now - progress >= STUCK_S:
@@ -375,6 +515,8 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             sections['stuck'].append(v)
         elif state in ('running', 'review'):
             v.update(run_meta(row, state, progress, now))
+            if v.get('reported'):
+                v['details'].append(provenance)
             sections['running'].append(v)
         elif state in ('ready', 'todo'):
             v.update(detail=_ready(row, detail, now) if state == 'ready' else 'not started', queued=state == 'todo')
@@ -390,6 +532,24 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             if linked and not any(human_owned(t) for t in linked):
                 continue
             sections['needs_you'].append(ask({}, r))
+    views = {x['key']: x for s in SECTIONS for x in sections[s]}
+    for r in requests:
+        if not recorded(r):
+            continue
+        # One status line next to the card the answer unblocks (or as its own row for a card-less ask), never a
+        # second block: it disappears when the request resolves, i.e. once delivery is confirmed.
+        info = {'request_id': r.get('requestId'), 'text': decision_text(r, now)}
+        owner = next((views[k] for k, row in rows_by_key.items() if k in views and any(_matches(row, a, same_gateway) for a in _aliases(r))), None)
+        if owner is not None and 'decision' not in owner:
+            owner['decision'] = info
+            if owner['detail'] == 'blocked · answered':
+                owner['detail'] = ''
+        elif owner is None:
+            own = obj(r.get('owner'))
+            v = row_view({'id': r.get('requestId'), 'title': r.get('title'), 'gateway': own.get('gatewayId'), 'profile': own.get('profile')}, 'decision')
+            v['key'] = 'decision:' + str(r.get('requestId'))
+            v['decision'] = info
+            sections['waiting'].append(v)
     for kind, rows in (('subagent', subagents if subagents is not None else bundle.get('subagents') or []),
                        ('process', processes if processes is not None else bundle.get('processes') or []),
                        ('machine', rentals if rentals is not None else bundle.get('rentals') or [])):
@@ -414,12 +574,18 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             continue
         done_seen.add(k)
         v = row_view(row)
-        v['detail'] = row.get('result') or row['status']
+        result = clean(row.get('result'))
+        v['detail'] = result if len(result) <= 80 else result[:79].rstrip() + '…'
         sections['done'].append(v)
     outcome = obj(bundle.get('outcome_json') or bundle.get('outcome'))
     counts = {s: len(sections[s]) for s in SECTIONS}
     pips = [{'section': s, 'count': counts[s], 'label': {'needs_you': 'needs you', 'running': 'running'}.get(s, s)} for s in SECTIONS if counts[s]]
-    result = {'version': 1, 'header': {'state': outcome.get('state') or outcome.get('kind') or 'unknown', 'counts': counts, 'pips': pips}, 'sections': sections,
+    state = outcome.get('state') or outcome.get('kind') or 'unknown'
+    pending = any(x.get('decision') for s in SECTIONS for x in sections[s])
+    # `state` stays the canonical outcome; `label` is what the header says. An answered ask is not "unresolved".
+    label = ('decision recorded' if pending and state in ('unresolved', 'unknown', 'decision', 'needs_user', 'needs_input') and not counts['needs_you']
+             else 'working' if state == 'unresolved' and counts['running'] else HEADER_LABELS.get(state, state))
+    result = {'version': 1, 'header': {'state': state, 'label': label, 'counts': counts, 'pips': pips}, 'sections': sections,
               'diagnostics': list(bundle.get('input_errors') or [])}
     result['revision'] = hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
     return result

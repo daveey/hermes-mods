@@ -72,7 +72,10 @@ def test_block_loop_triage_live_ask_but_no_block_kind_guessing():
     assert len(m['sections']['needs_you']) == 1
     m = model.reduce_panel(bundle(task(block_kind='needs_input')), now=NOW)
     assert not m['sections']['needs_you']
-    assert m['sections']['waiting'][0]['detail'] == 'blocked · no reason published · board status'
+    row = m['sections']['waiting'][0]
+    assert row['detail'] == 'blocked · no reason published'
+    assert not row['detail'].endswith('board status')
+    assert row['details'] == ['Board status; no live run evidence for this card.']  # provenance lives in Details only
 
 
 def test_stale_human_block_kind_external_running_regression():

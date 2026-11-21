@@ -512,6 +512,10 @@ export function StepBox({ attrs, streaming, deps }) {
     return fallback ? jsx('div', { 'data-user-step-fallback': '', style: { whiteSpace: 'pre-wrap' }, children: jsx(Linked, { text: fallback }) }) : null
   }
   const text = fallback || state.steps.map(s => s.text).join('\n')
+  // With the session panel loaded, an answered step has exactly one status line (on its card/ask row there); the
+  // transcript gets no second "Decision reference" block for it.
+  if (panelActive() && state.steps.length && state.steps.every(s => (s.status || 'open') === 'open'
+    && decisionRecorded({ ...attrs, gatewayId: attrs?.gatewayId || s.requestOwner?.gatewayId, profile: attrs?.profile || s.requestOwner?.profile, requestId: attrs?.requestId || s.requestId }, [s.id], scope))) return null
   return jsxs('div', {
     'data-user-step': key,
     style: {
@@ -767,6 +771,13 @@ function linkedRequest(attrs, ids, scope) {
 const withdrawnReceipt = r => {
   const reason = typeof r?.withdrawal?.reason === 'string' ? short(r.withdrawal.reason, 300) : ''
   return reason ? `No longer needed \u2014 ${reason}` : 'No longer needed.'
+}
+function decisionRecorded(attrs, ids, scope) {
+  if (canonical.scope !== scope) return false
+  const linked = linkedRequest(attrs, ids, scope)
+  if (!linked || linked.state === 'withdrawn') return false
+  const op = operations.get(`${scope}:${requestKey(linked)}`)
+  return !!(linked.resolution || op?.decision) && op?.phase !== 'cancelled'
 }
 function receiptStatus(attrs, ids, scope) {
   if (canonical.scope !== scope) return 'Reference only — review and decide above the composer.'
@@ -1325,7 +1336,15 @@ export function ActionQueue({ embedded = false, audience = 'all', companion = pa
   // Closed requests, including withdrawn (moot) asks, are not shown or counted; they still suppress their
   // own legacy references through requestForSource.
   const needsReadback = r => requestNeedsReadback(scope, r)
-  const requests = snap.requests.filter(r => representedInQueue(scope, r) && (audience === 'all' || (audience === 'agent') === agentPending(r)))
+  // Under the session panel an answered ask whose delivery is merely pending (or waiting out a busy turn) is one
+  // status line on its card/ask row, not a block here. Only a real delivery failure or unknown outcome stays,
+  // with Check status / Retry.
+  const panelCarries = r => {
+    if (!companion || !r.resolution || typeof window === 'undefined' || !window.__sessionPanel?.showsDecision?.(r.requestId)) return false
+    const op = operations.get(`${scope}:${requestKey(r)}`)
+    return !(op?.phase === 'unknown' || (op?.phase === 'failed' && !sessionBusy(op)) || op?.error && !sessionBusy(op))
+  }
+  const requests = snap.requests.filter(r => representedInQueue(scope, r) && !panelCarries(r) && (audience === 'all' || (audience === 'agent') === agentPending(r)))
   if (!requests.length && (!snap.error || audience === 'agent')) return null
   const visible = requests.filter(r => needsReadback(r) || `${r.title} ${r.scope?.markdown}`.toLowerCase().includes(filter.toLowerCase()))
   // Minimized holds only while every shown request was already shown when the user minimized; a new one (or a new
