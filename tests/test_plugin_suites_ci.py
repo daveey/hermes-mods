@@ -136,6 +136,8 @@ class PluginSuitesWorkflow(unittest.TestCase):
         self.assertNotIn("secrets.", step)  # public mirror: no credential reaches this public repo's CI
         self.assertLess(self.text.index("      - name: Check out public core"),
                         self.text.index("      - name: Run selected suites"))
+        # hermes-hub's hub-core-mirror matches its dispatch run by this exact title
+        self.assertIn("format('plugin-suites core={0}', inputs.core_ref || 'main')", self.text)
         inputs = self.text.split("  workflow_dispatch:\n", 1)[1].split("permissions:", 1)[0]
         self.assertIn("core_ref:", inputs)
         self.assertRegex(inputs, r"(?m)^        default: main$")

@@ -341,9 +341,11 @@ def test_C_twenty_thousand_files_register_quickly(monkeypatch, core, tmp_path):
         for j in range(1000):
             (d / f'f{j}').touch()
     external_dirs(core.home, str(big))
-    start = time.monotonic()
+    # CPU time of this process (user + system), not wall time: the bound is about the registration's own cost,
+    # and a contended CI runner (suites run 4 at a time) stretched wall time past 5 s with the same work.
+    start = time.process_time()
     gate(monkeypatch)()
-    assert time.monotonic() - start < 5
+    assert time.process_time() - start < 5
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason='root reads a 000 directory')
