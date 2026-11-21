@@ -3282,20 +3282,40 @@ def _sender(session_id: str | None) -> dict:
     return info
 
 
-def _take_back(path: Path) -> bool:
-    """Take an unclaimed request back out of the outbox. True only when this call took it, so the courier never did.
+_RELAY_FILES: Any = None
 
-    The courier's claim is os.replace of the same file, and the take-back must use os.replace too: on APFS a
-    concurrent unlink(outbox/x) can return success after the claim's rename already moved x (both "won" in about
-    1 of 5 races in a probe), whereas two renames of one name never both succeed. The taken copy keeps a dotted,
-    non-.json name, so no outbox listing or sweep ever sees it, and is deleted at once."""
-    taken = path.with_name(f".{path.stem}.taken")
+
+def _relay_files() -> Any:
+    """session-mentions' relay_files (the courier's outbox protocol), loaded from the sibling plugin dir."""
+    global _RELAY_FILES
+    if _RELAY_FILES is None:
+        import importlib.util
+        here = Path(__file__)
+        for d in (here.parent.parent, here.resolve().parent.parent):  # ~/.hermes/plugins, or the checkout
+            src = d / "session-mentions" / "relay_files.py"
+            if src.is_file():
+                spec = importlib.util.spec_from_file_location("_user_terminal_relay_files", src)
+                mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+                spec.loader.exec_module(mod)  # type: ignore[union-attr]
+                _RELAY_FILES = mod
+                break
+        else:
+            raise RuntimeError("the session-mentions plugin (relay_files.py) is not installed next to user-terminal")
+    return _RELAY_FILES
+
+
+def _take_back(path: Path) -> bool:
+    """relay_files.take_back: True only when this call took the request out of the outbox, so no courier did."""
+    return bool(_relay_files().take_back(path))
+
+
+def _withdrawn_unclaimed(base: Path, rid: str) -> bool:
+    """The start request ``rid`` was taken back by withdraw_remote (not claimed): its ledger entry says so."""
     try:
-        os.replace(path, taken)
-    except FileNotFoundError:
+        entry = json.loads((ledger_dir(base) / f"{rid}.json").read_text())
+    except (OSError, ValueError):
         return False
-    taken.unlink(missing_ok=True)
-    return True
+    return entry.get("state") == "withdrawn" and entry.get("withdrawn_where") == "gateway outbox"
 
 
 def relay_once(base: Path, device: str, args: dict, sender: dict, result_wait: float,
@@ -3303,6 +3323,7 @@ def relay_once(base: Path, device: str, args: dict, sender: dict, result_wait: f
     """One request to the Mac's courier. Errors (never a hang) when nobody claims it within PICKUP_S.
     yieldable (status polls only, never the start request whose answer carries the new job_id): a chat
     message returns {"ok": True, "status": "pending", "yielded": True} at once."""
+    rid_given = bool(rid)  # only a start's request id has a ledger entry
     rid = rid or uuid.uuid4().hex
     outbox, result = base / "outbox" / f"{rid}.json", base / "results" / f"{rid}.json"
     req = {"id": rid, "action": "user_terminal", "route": device, "args": args, "sender": sender,
@@ -3321,11 +3342,16 @@ def relay_once(base: Path, device: str, args: dict, sender: dict, result_wait: f
                 continue
             result.unlink(missing_ok=True)
             return data if isinstance(data, dict) else {"ok": False, "error": "courier posted no result"}
-        if time.time() > pickup and _take_back(outbox):  # claimed at the last moment: wait for its answer
+        # Past pickup: take it back. When that loses, a courier claimed it (await its answer) or withdraw_remote
+        # took it back first (its ledger entry says so).
+        if time.time() > pickup and _take_back(outbox):
             return {"ok": False, "code": "not_picked_up",
                     "error": (f"The Hermes Desktop on `{device}` did not pick up the request (it may "
                               f"be quitting, asleep, or running an older session-mentions plugin). "
                               f"Tell the owner; do not hand them the command.")}
+        if time.time() > pickup and rid_given and _withdrawn_unclaimed(base, rid):
+            return {"ok": False, "status": "withdrawn", "code": "withdrawn", "request_id": rid,
+                    "error": f"withdrawn before `{device}` claimed it (action=withdraw); nothing ran."}
         if _interrupted():
             return {"ok": False, "error": "interrupted"}
         if yieldable and _yield_requested():  # a chat message: hand control back; the Mac's job keeps waiting
@@ -3656,6 +3682,11 @@ def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
                 if res.get("job_id"):
                     entry.update(job_id=str(res["job_id"]), state="started")
                     ledger_put(base, entry)
+                if res.get("code") == "withdrawn":  # withdraw_remote took it back and closed the ledger itself
+                    known = ledger_lookup(base, rid) or entry
+                    return json.dumps({"ok": True, "status": "withdrawn", "job_id": rid, "request_id": rid,
+                                       "device": device, "reason": known.get("withdraw_reason") or "",
+                                       "note": "Withdrawn before any Mac claimed it; nothing ran."})
                 if not res.get("ok") or not res.get("job_id"):
                     return json.dumps(start_failed(base, entry, res, device))
                 job_id, terminal = str(res["job_id"]), res.get("terminal")

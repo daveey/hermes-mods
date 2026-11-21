@@ -1519,6 +1519,37 @@ def test_relay_once_claimed_at_the_pickup_deadline_waits_for_its_answer(remote, 
     assert not _outbox(base)
 
 
+def test_start_withdrawn_while_waiting_for_pickup_answers_withdrawn_and_keeps_the_withdrawal(remote, monkeypatch,
+                                                                                               tmp_path):
+    """withdraw_remote takes the start back while its own tool call still waits: that call answers withdrawn (not
+    "claimed but sent no answer"), and the ledger keeps the withdrawal, so a repeat withdraw says already."""
+    base, mac = remote
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DEVICE", "macbook")
+    monkeypatch.setattr(ut, "PICKUP_S", 1.0)
+    monkeypatch.setattr(ut, "START_RESULT_S", 20.0)
+    _beat(base, "macbook")
+    got = {}
+    t = threading.Thread(target=lambda: got.update(out=json.loads(ut.handle_remote(
+        {"command": "terraform apply", "cwd": str(tmp_path), "wait_s": 1}, "s1"))))
+    t0 = time.time()
+    t.start()
+    while not _outbox(base) and time.time() - t0 < 5:
+        time.sleep(0.01)
+    [req] = _outbox(base)
+    w = ut.withdraw_remote(base, req.stem, "superseded")
+    assert w["ok"] and w["status"] == "withdrawn" and w["where"] == "gateway outbox", w
+    t.join(10)
+    out = got["out"]
+    assert out["ok"] is True and out["status"] == "withdrawn" and out["job_id"] == req.stem, out
+    assert time.time() - t0 < 5  # answered after pickup, not after START_RESULT_S
+    led = _ledger(base, req.stem)
+    assert led["state"] == "withdrawn" and led["withdraw_confirmed"] and led["withdraw_reason"] == "superseded", led
+    again = ut.withdraw_remote(base, req.stem, "x")
+    assert again["ok"] and again.get("already"), again
+    assert _mac_jobs(mac) == []
+
+
 def test_mac_start_and_withdraw_of_one_request_exactly_one_wins(remote, monkeypatch, tmp_path):
     """Mac side: a claimed start racing its withdrawal. Withdraw first -> the start is refused before any job or
     window; start first -> the job exists and is withdrawn (the error-free result names the Mac job dir)."""

@@ -469,11 +469,7 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeou
             except OSError:
                 pass
             return json.dumps(data)
-        if outbox.exists() and time.time() > deadline_pickup:
-            try:
-                outbox.unlink()
-            except OSError:
-                pass
+        if time.time() > deadline_pickup and rf.take_back(outbox):  # else a courier claimed it: await its answer
             if route:
                 log.warning("cross_task: unroutable route=%s (no Desktop pickup)", route)
                 return _err(f"No connected Hermes Desktop that can reach `{route}` picked up the request "
@@ -483,7 +479,7 @@ def _relay(action: str, args: dict, session_id: str | None, wait: int, *, timeou
                         "session-mentions plugin enabled to reach other gateways.")
         time.sleep(0.5)
     if timeout_seconds is not None:
-        outbox.unlink(missing_ok=True)  # withdraw unclaimed bounded read requests
+        rf.take_back(outbox)  # withdraw unclaimed bounded read requests
     return _err("Timed out waiting for the Desktop to finish the request (it may still complete).")
 
 

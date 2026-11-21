@@ -691,15 +691,32 @@ def cancel(req_id: Any, base: Path | None = None) -> bool:
     rid = safe_id(req_id)
     if not rid:
         return False
+    return take_back(base / "outbox" / f"{rid}.json")
+
+
+def take_back(path: Path) -> bool:
+    """Take an unclaimed request back out of the outbox. True only when this call took it, so no courier did.
+
+    A courier's claim is os.replace of the same file, and the take-back must use os.replace too: on APFS a
+    concurrent unlink(outbox/x) can return success after the claim's rename already moved x (both "won" in
+    about 1 of 5 races in a probe), whereas two renames of one name never both succeed. The taken copy gets a
+    hidden, non-.json name, so no outbox listing sees it, and is deleted at once (``sweep`` drops a leftover)."""
+    taken = path.with_name(f".{path.stem}.taken")
     try:
-        (base / "outbox" / f"{rid}.json").unlink()
-        return True
-    except OSError:
+        os.replace(path, taken)
+    except FileNotFoundError:
         return False
+    taken.unlink(missing_ok=True)
+    return True
+
+
+# Hidden in-flight files: atomic_write's / a request writer's temp file and take_back's taken copy. A process
+# that died between writing and renaming/deleting one leaves it behind; nothing reads them, so they only age out.
+_HIDDEN_LEFTOVERS = (".tmp", ".taken")
 
 
 def sweep(base: Path) -> None:
-    """Delete protocol files older than STALE_SECONDS.
+    """Delete protocol files (and hidden .tmp/.taken leftovers) older than STALE_SECONDS.
 
     A dir is skipped while its identity is unchanged (no entry added, removed or renamed in), it was
     settled when last swept, ``now`` is before the earliest expiry deadline of the files that sweep kept,
@@ -719,7 +736,8 @@ def sweep(base: Path) -> None:
         if state is not None and state[0] == key and now < state[1] and 0 <= now - state[2] < SWEEP_RECHECK_SECONDS:
             continue
         deadline, complete = float("inf"), True
-        for path in d.glob("*.json"):
+        leftovers = [p for p in d.glob(".*") if p.name.endswith(_HIDDEN_LEFTOVERS)]
+        for path in [*d.glob("*.json"), *leftovers]:
             try:
                 mtime = path.stat().st_mtime
                 if mtime < cutoff:
