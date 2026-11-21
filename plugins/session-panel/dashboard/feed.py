@@ -263,7 +263,9 @@ class Feed:
                     # re-stamp only these (a dropped or failing chat is never confirmed by a heartbeat).
                     fresh = sorted(s for s in self.interest if s in self.bundles and s not in self.failures
                                    and s not in self._retry
-                                   and now - self.bundles[s]['bundle']['computed_at'] <= self.full_every_s)
+                                   and now - self.bundles[s]['bundle']['computed_at'] <= (
+                                       self.full_every_s if self.bundles[s]['bundle'].get('tasks')
+                                       else QUIET_FULL_EVERY_S))
                 try:
                     self.emit({'epoch': self.epoch, 'prev': prev, 'rev': self.rev, 'bundles': changed, 'fresh': fresh,
                                **({} if changed else {'heartbeat': True})})

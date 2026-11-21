@@ -133,25 +133,32 @@ def test_concurrent_catch_ups_compute_each_missing_chat_once():
     assert calls == ['S1']
 
 
-def test_a_catch_up_waits_a_bounded_time_for_another_threads_compute(monkeypatch):
+def test_catch_up_computes_disjoint_work_but_waits_for_every_missing_bundle():
+    # Synchronous cold catch-up must not return partial success at an arbitrary wait deadline.
     import threading
-    monkeypatch.setattr(feedmod, 'CATCHUP_WAIT_S', 0.2)
+    from concurrent.futures import ThreadPoolExecutor
     f, r, _, _ = make()
-    started, release = threading.Event(), threading.Event()
+    started, release, other_done = threading.Event(), threading.Event(), threading.Event()
     real = r.lineage
     def slow_lineage(s):
-        started.set()
-        release.wait(5)
+        if s == 'S1':
+            started.set()
+            assert release.wait(5)
+        else:
+            other_done.set()
         return real(s)
     r.lineage = slow_lineage
-    t1 = threading.Thread(target=lambda: f.changes(['S1']))
-    t1.start()
-    assert started.wait(5)
-    r.lineage = real
-    quick = f.changes(['S1', 'S2'])
-    assert set(quick['bundles']) == {'S2'}, 'S1 is still computing: answer without it, the push delivers it'
-    release.set(); t1.join(5)
-    assert set(f.changes(['S1'], since=0, epoch=quick['epoch'])['bundles']) == {'S1'}
+    with ThreadPoolExecutor(2) as pool:
+        first = pool.submit(f.changes, ['S1'])
+        assert started.wait(3)
+        second = pool.submit(f.changes, ['S1', 'S2'])
+        try:
+            assert other_done.wait(3), 'unrelated work proceeds before joining S1'
+            assert not second.done(), 'no empty/partial success while S1 is missing'
+        finally:
+            release.set()
+        assert set(first.result(5)['bundles']) == {'S1'}
+        assert set(second.result(5)['bundles']) == {'S1', 'S2'}
 
 
 def test_a_failed_compute_releases_its_claim():
@@ -231,7 +238,7 @@ def test_a_chat_with_no_open_cards_is_fully_refreshed_only_every_quiet_interval(
     f.changes(['S2', 'S3'])
     computed = []
     real = f.compute
-    f.compute = lambda s: (computed.append(s), real(s))[1]
+    f.compute = lambda s, **kwargs: (computed.append(s), real(s, **kwargs))[1]
     t['now'] += feedmod.FULL_EVERY_S + 1
     f.tick()
     assert computed == ['S2'], 'S3 has no open cards: not every minute'
