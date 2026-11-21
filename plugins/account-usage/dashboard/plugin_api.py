@@ -34,7 +34,29 @@ async def last() -> Dict[str, Any]:
 import importlib.util
 from pathlib import Path
 import sys
-from fastapi import Depends, HTTPException, Query
+import functools
+from fastapi import Depends, HTTPException, Query, Request
+from starlette.concurrency import run_in_threadpool
+
+
+# Thread lanes (core ``hermes_cli.web_thread_lanes``): the bar's forecast and selection reads get their own thread
+# budget and a queue deadline (503 + Retry-After, never started) instead of the shared AnyIO pool, which slow
+# reads filled for ~2 h on 2026-11-21. A core without lanes keeps the shared pool, as before. [daveey]
+try:
+    from hermes_cli.web_thread_lanes import run_in_lane as _run_in_lane
+except ImportError:  # core before thread lanes
+    _run_in_lane = None
+
+
+async def _on_lane(lane, fn, *args, request=None, deadline=None, **kwargs):
+    if _run_in_lane is None:
+        return await run_in_threadpool(functools.partial(fn, *args, **kwargs))
+    return await _run_in_lane(lane, fn, *args, request=request, deadline=deadline, **kwargs)
+
+
+# The selection store is its own sqlite file with a 10 s lock timeout: the short-deadline probe lane, never
+# the control lane (which must not wait on a lock). A busy lane answers 503; the bar keeps its last value.
+_SELECTION_DEADLINE_S = 5.0
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 
@@ -83,9 +105,10 @@ def _call(service, method, *args, **kwargs):
 
 
 @router.get('/selection')
-def get_selection(session_id: str = Query(min_length=1, max_length=256),
-                  service=Depends(selection_service)):
-    return _call(service, 'get', session_id)
+async def get_selection(request: Request, session_id: str = Query(min_length=1, max_length=256),
+                        service=Depends(selection_service)):
+    return await _on_lane('probe', _call, service, 'get', session_id, request=request,
+                          deadline=_SELECTION_DEADLINE_S)
 
 
 @router.put('/selection')
@@ -504,5 +527,7 @@ def forecasts(body: ForecastBody, home: Path | None = None, now: float | None = 
 
 
 @router.post('/forecast')
-def post_forecast(body: ForecastBody):
-    return forecasts(body)
+async def post_forecast(body: ForecastBody, request: Request):
+    # Small reads (the weekly windows + a 0.5 s-bounded pacing history): the control lane, so the bar's
+    # sparklines keep loading while slow session/kanban reads fill the shared pool.
+    return await _on_lane('control', forecasts, body, request=request)
