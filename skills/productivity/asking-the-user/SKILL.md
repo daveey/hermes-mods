@@ -115,7 +115,7 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
   not, run the ones that need no root yourself, or send it back. Fixture tests pass on a root-owned file or empty
   table the live host doesn't have. After a refusal, read live state back, comment "latch spent, nothing changed,
   approval not consumed" plus the cause, and require a new runner with a new latch and staging directory.
-- Owner-route runs to a pool worker: workers get rebuilt, and a rebuild loses the workspace and changes the host key.
+- Owner-route runs to a pool worker: rebuilds can lose the workspace; legacy/unprovisioned slots may change host keys. Receipt-v3 slots retain their provisioned ed25519 key.
   Before launching, re-stage the inputs from the durable hub package and re-hash them on the worker.
   If the Mac refuses with a host-key mismatch, read the worker's `/etc/ssh/ssh_host_ed25519_key.pub` over
   `hub-worker-exec` (SSM, a separate trusted path). Then, in the same window, run
@@ -270,9 +270,7 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
 
 - A bare "go" / "yes" after a reply that recommends several decisions approves all of them. Act on each one. Don't
   take it as approval of only the first and re-ask the rest: that costs the user another round trip.
-- ask-gate's injected "already answered or dismissed" list prints each recorded answer after `->`. If that answer
-  is a runtime notice (it opens with `[`, `<` or a symbol + `[`), the user never answered: treat the ask as still
-  open, never act on it as decided, and fix the gate's notice check (`hermes-mods-repo-plugin-design`).
+- ask-gate's injected "already answered or dismissed" list prints each recorded answer after `->`. If runtime provenance or `core.runtime_notice` identifies a notice, it is not a user answer: keep the ask open and never act on it as decided. The text fallback recognizes leading `[`/`<`, or Unicode `So`/`ℹ` followed by an optional variation selector, whitespace and `[`. If a notice leaked through, fix the gate's check (`hermes-mods-repo-plugin-design`).
 - A decide tile that drops off the open-asks list was answered, not lost: look for its receipt in the injected
   "Canonical user decisions" block before re-posting. Never call `session_outcome(kind=decide)` again for a question
   still open: every call mints a new request, so the user sees duplicates you then have to withdraw.
