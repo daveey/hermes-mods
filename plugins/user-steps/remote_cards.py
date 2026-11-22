@@ -96,6 +96,20 @@ class Courier:
             raise OSError('Card-answer receipt unavailable')
         return data['request']
 
+    def local_state(self, rid):
+        """Local courier journal state of this request id (None: never queued)."""
+        client = self.view.load_client()
+        if client is None:
+            raise OSError('Authenticated card-answer courier unavailable')
+        db = client.open_db(self.view.db_path())
+        try:
+            row = db.execute('SELECT state FROM sent WHERE id=?', (rid,)).fetchone()
+        except Exception as exc:
+            raise OSError('Card-answer local state unavailable') from exc
+        finally:
+            db.close()
+        return row[0] if row else None
+
     def exchange(self, envelope, rid):
         client = self.view.load_client()
         if client is None:
@@ -205,7 +219,10 @@ class Remote:
                 if not self._retire(owner, request['resolution']['operationId'], 'Source card ask changed before delivery'):
                     held_targets.add(target)
             elif request['state'] in ('open', 'needs_context'):
-                m._withdraw(owner, request)
+                if not m._withdraw(owner, request):
+                    # A click committed between our read and the withdrawal: its
+                    # pending intent suppresses a replacement decision tile.
+                    held_targets.add(target)
         for target, snap in current.items():
             if target in held_targets:
                 continue
@@ -226,31 +243,90 @@ class Remote:
     def _target(target):
         return tuple(target.get(k) for k in ('ownerGateway', 'ownerProfile', 'board', 'task'))
 
+    RETIRING = 'remote-retiring'
+    STABLE_REFUSAL_S = 120      # proof refusal must have been in force this long before absence counts
+    UNCONFIRMED_AFTER_S = 3600  # beyond the courier retry window the tile says delivery is unconfirmed
+    TERMINAL = ('rejected', 'expired', 'failed')
+
+    @staticmethod
+    def _age(op):
+        from datetime import datetime, timezone
+        try:
+            at = datetime.fromisoformat((op.get('retired') or {})['at'])
+            return max(0.0, (datetime.now(timezone.utc) - at).total_seconds())
+        except (KeyError, ValueError, TypeError):
+            return 0.0
+
+    def delivery_note(self, owner, request):
+        """Display-only: a held (retiring) remote operation is `Delivering`, never `Cancelled`."""
+        oid = (request.get('resolution') or {}).get('operationId')
+        if not oid:
+            return None
+        op = self.mirror.store.operation(owner, oid)['operation']
+        if op['dispatchState'] != 'cancelled' or (op.get('retired') or {}).get('evidence') != self.RETIRING:
+            return None
+        age = int(self._age(op))
+        target = self.mirror.binding(owner, request['requestId'])
+        gateway = json.loads(target['snapshot'])['remote']['target']['ownerGateway']
+        unconfirmed = age >= self.UNCONFIRMED_AFTER_S
+        return dict(state='delivering', ageSeconds=age, unconfirmed=unconfirmed,
+                    text=(f'Delivery to {gateway} not confirmed ({age // 60} min)' if unconfirmed else 'Delivering…'))
+
     def _retire(self, owner, oid, reason):
-        """Receipt reconciliation owns the same lease as ordinary dispatch."""
+        """Departure/generation change: state machine in docs/remote-card-answer-states.md.
+
+        Returns True only when the operation is terminal (delivered, or refused/absent with stable proof
+        refusal) so the target may remint; False keeps the target held and visible."""
         from types import SimpleNamespace
         store = self.mirror.store
         with store.delivery_lease(owner, oid) as held:
             if not held:
                 return False
             op = store.operation(owner, oid)['operation']
-            if op['dispatchState'] in ('delivered', 'cancelled'):
+            retiring = (op['dispatchState'] == 'cancelled'
+                        and (op.get('retired') or {}).get('evidence') == self.RETIRING)
+            if op['dispatchState'] == 'delivered' or (op['dispatchState'] == 'cancelled' and not retiring):
                 return True
             binding = self.mirror._bound(op)
             try:
                 record, receipt = self._observe(op, binding)
                 if receipt is not None:
+                    if retiring:
+                        _, again = self._observe(op, binding)  # independent readback before settling
+                        if again != receipt:
+                            return False
+                        store.settle_late_receipt(owner, oid, receipt, marker=self.RETIRING)
+                        return True
                     receiver = SimpleNamespace(deliver=lambda operation: receipt,
                         readback=lambda operation, value: self._observe(operation, binding)[1] == value)
                     result = store._dispatch(owner, oid, receiver)
                     return result['operation']['dispatchState'] == 'delivered'
-                if record is not None and record['state'] not in ('rejected', 'expired', 'failed'):
-                    return False  # queued/in-flight/unknown is not proof of no owner commit
+                local = None
+                if record is None:
+                    local_state = getattr(self.courier or Courier(), 'local_state', None)
+                    local = local_state(self._rid(op)) if local_state is not None else 'unknown'
             except (OSError, AttributeError, self.mirror.core.ActionError):
                 return False  # unverifiable preserves intent and blocks a fresh tile
-            with store._tx() as c:
-                store._retire_operation(c, owner, oid, by='system', reason='Remote card answer retired', evidence=reason)
-            return True
+            if record is not None and record['state'] in self.TERMINAL:
+                if retiring:
+                    store.finalize_retirement(owner, oid, marker=self.RETIRING,
+                                              evidence='Authenticated owner terminal refusal')
+                else:
+                    with store._tx() as c:
+                        store._retire_operation(c, owner, oid, by='system', reason='Remote card answer retired',
+                                                evidence='Authenticated owner terminal refusal')
+                return True
+            if not retiring:
+                # Turn proof refusal on first; absence/404/in-flight is never a terminal fact.
+                with store._tx() as c:
+                    store._retire_operation(c, owner, oid, by='system', reason='Remote card answer retiring',
+                                            evidence=self.RETIRING)
+                return False
+            if record is None and local in (None, 'rejected') and self._age(op) >= self.STABLE_REFUSAL_S:
+                store.finalize_retirement(owner, oid, marker=self.RETIRING,
+                                          evidence='Courier envelope absent with stable proof refusal')
+                return True
+            return False
 
     @staticmethod
     def _rid(op):

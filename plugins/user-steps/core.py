@@ -3316,6 +3316,32 @@ class ActionStore:
                   ('cancelled', self._ns(owner), op['requestId'], op['revision']))
         return {'operation': op, 'request': self._get(c, owner, op['requestId'])}
 
+    def settle_late_receipt(self, owner, oid, receipt, *, marker):
+        """A `retiring` remote operation (cancelled only to refuse new proofs) whose owner commit turned up
+        later becomes delivered: the committed answer wins over our local cancellation."""
+        with self._tx() as c:
+            op = self._operation(c, owner, oid)['operation']
+            if op['dispatchState'] != 'cancelled' or (op.get('retired') or {}).get('evidence') != marker:
+                raise ActionError('Operation is not retiring', 409)
+            retired = op.pop('retired')
+            op.update(dispatchState='delivered', receipt=receipt, lateReceiptAfter=retired.get('at'))
+            effect = op['intent']['effect']
+            state = {'revise': 'superseded', 'decline': 'cancelled'}.get(effect, 'resolved')
+            c.execute('UPDATE requests SET state=? WHERE namespace=? AND id=? AND revision=?',
+                      (state, self._ns(owner), op['requestId'], op['revision']))
+            c.execute('UPDATE operations SET body=? WHERE id=?', (_json(op), oid))
+            return {'operation': op, 'request': self._get(c, owner, op['requestId'])}
+
+    def finalize_retirement(self, owner, oid, *, marker, evidence):
+        """Turn a `retiring` operation into a terminal cancellation (a remint is then allowed)."""
+        with self._tx() as c:
+            op = self._operation(c, owner, oid)['operation']
+            if op['dispatchState'] != 'cancelled' or (op.get('retired') or {}).get('evidence') != marker:
+                raise ActionError('Operation is not retiring', 409)
+            op['retired']['evidence'] = evidence
+            c.execute('UPDATE operations SET body=? WHERE id=?', (_json(op), oid))
+            return {'operation': op}
+
     def pending_owners(self):
         with self._read() as c:
             owners = {_json(op['owner']): op['owner'] for row in c.execute('SELECT body FROM operations')

@@ -542,7 +542,8 @@ class Mirror:
             if len(marked) == 1:
                 recommended = f'card-{marked[0]}'
         details = '\n\n'.join(str(hr[k]) for k in ('action', 'why_human', 'scope', 'evidence') if hr.get(k))
-        return dict(request, presentation=dict(kind='kanban-question', question=question,
+        note = self.remote.delivery_note(request['owner'], request) if snap.get('remote') else None
+        return dict(request, **(dict(delivery=note) if note else {}), presentation=dict(kind='kanban-question', question=question,
                     details=details, recommendedChoiceId=recommended, other=True,
                     sourceRef=dict(gatewayId=snap.get('remote', {}).get('target', {}).get('ownerGateway', request['owner']['gatewayId']),
                                    profile=snap.get('remote', {}).get('target', {}).get('ownerProfile', request['owner']['profile']), type='kanban',
@@ -956,6 +957,7 @@ class Mirror:
                 reason="Source card left this block or its ask changed",
                 expected_revision=request["revision"],
             )
+            return True
         except self.core.ActionError as exc:
             if exc.status != 409:
                 raise
@@ -964,6 +966,7 @@ class Mirror:
                 "resolution"
             ):
                 raise  # only a proven concurrent terminal/decision transition is benign
+            return False  # a concurrent decision/transition won: not retired
 
     def _bound(self, op):
         binding = self.binding(op["owner"], op["requestId"])

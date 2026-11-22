@@ -364,8 +364,8 @@ def test_changed_remote_generation_settles_recorded_operation(tmp_path, departur
     mirror.remote.reconcile(OWNER)
     assert store.operation(OWNER, op['operationId'])['operation']['dispatchState'] == 'cancelled'
     assert store.get(OWNER, old['requestId'])['state'] == 'cancelled'
-    opens = [r for r in store.requests(OWNER) if r['state'] == 'open']
-    assert len(opens) == (0 if departure else 1)
+    # 404 is absence, not a terminal fact: the target stays held (no remint) until stable refusal evidence.
+    assert [r for r in store.requests(OWNER) if r['state'] == 'open'] == []
 
 
 @pytest.mark.parametrize('bad', ['stale', 'duplicate', 'malformed', 'action-validation'])

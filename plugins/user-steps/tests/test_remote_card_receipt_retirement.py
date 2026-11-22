@@ -40,14 +40,18 @@ def test_retirement_respects_exact_owner_receipt(tmp_path, state, departure):
     mirror.remote.reconcile(OWNER)
     result = store.operation(OWNER, op['operationId'])['operation']
     expected = ('delivered' if state == 'done' else 'cancelled'
-                if state in ('absent', 'rejected', 'expired', 'failed') else 'pending')
+                if state in ('absent', 'rejected', 'expired', 'failed', 'pending') else 'pending')
+    retiring = state in ('absent', 'pending')  # no terminal fact: proof refusal on, tile held, no remint
     assert result['dispatchState'] == expected
     assert reads
     if state == 'done':
         assert result['receipt']['operationId'] == op['operationId']
         assert len(reads) == 2  # fresh independent readback before settlement
     opens = [r for r in store.requests(OWNER) if r['state'] == 'open']
-    if expected == 'pending':
+    if retiring:
+        assert result['retired']['evidence'] == 'remote-retiring'
+        assert opens == []
+    elif expected == 'pending':
         assert [r['requestId'] for r in opens] == [old['requestId']]
     else:
         assert len(opens) == (0 if departure else 1)
