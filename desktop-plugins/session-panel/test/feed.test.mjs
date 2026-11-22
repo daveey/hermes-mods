@@ -122,14 +122,37 @@ test('pending catch-ups merge sessions/flags and never overlap', async () => {
  assert.equal(calls.length, 2); assert.equal(most, 1)
  assert.deepEqual(calls[1].body.sessions, ['S2', 'S3']); assert.equal(calls[1].body.since, 0)
 })
-test('cold focus retries an empty registered session with a focused-only full read', async () => {
+test('cold focus preserves warm coverage before advancing the shared connection cursor', async () => {
+ reply = () => answer({ bundles: { warm: bundle('warm', 'r3') } })
+ await m.feedCatchUp(target(['warm']))
+ reply = req => answer({ rev: 5, bundles: Object.fromEntries(req.body.sessions.map(s => [s, bundle(s, s === 'warm' ? 'r4' : 'r5')])) })
+ await m.feedFocus(route(), { wait: async () => {} })
+ assert.equal(m.cachedModel(route('warm'))?.revision, 'r4', 'a focused read must not skip a warm change behind its shared cursor')
+ assert.deepEqual(calls.at(-1).body.sessions, ['S1', 'warm'])
+ reply = () => answer({ rev: 5 })
+ await m.feedPass()
+ assert.equal(calls.at(-1).body.since, 5)
+ assert.equal(m.cachedModel(route('warm'))?.revision, 'r4')
+})
+test('queued cold focus retains coverage registered by the preceding flight', async () => {
+ let release
+ reply = () => new Promise(r => { release = r })
+ const first = m.feedCatchUp(target(['new-warm'])); await settle()
+ const focus = m.feedFocus(route(), { wait: async () => {} })
+ reply = req => answer({ rev: 6, bundles: Object.fromEntries(req.body.sessions.map(s => [s, bundle(s, 'r6')])) })
+ release(answer({ bundles: { 'new-warm': bundle('new-warm', 'r3') } }))
+ await first; await focus
+ assert.deepEqual(calls[1].body.sessions, ['S1', 'new-warm'])
+ assert.equal(m.cachedModel(route('new-warm')).revision, 'r6')
+})
+test('cold focus retries an empty registered session preserving watched coverage', async () => {
  await m.feedCatchUp(target(['S1', 'warm']))
  const waits = []
  reply = req => calls.length < 3 ? answer() : answer({ bundles: { S1: bundle() } })
  const ready = await m.feedFocus(route(), { wait: async ms => waits.push(ms) })
  assert.equal(m.cachedModel(route())?.revision, 'r1', 'empty registration must not suppress model hydration')
  assert.equal(ready, true)
- assert.deepEqual(calls.slice(1).map(c => c.body.sessions), [['S1'], ['S1']])
+ assert.deepEqual(calls.slice(1).map(c => c.body.sessions), [['S1', 'warm'], ['S1', 'warm']])
  assert.ok(calls.slice(1).every(c => c.body.since === 0))
  assert.deepEqual(waits, [250])
 })

@@ -141,6 +141,7 @@ export function feedCatchUp(target, opts = {}) {
     q.target.sessions = [...new Set([...(q.target.sessions || []), ...(target?.sessions || [])])]
     q.opts.full = q.opts.full || !!opts.full
     q.opts.reset = q.opts.reset || !!opts.reset
+    q.opts.preserveCoverage = q.opts.preserveCoverage || !!opts.preserveCoverage
     return q.p
   }
   const entry = { target: { ...target, sessions: [...(target?.sessions || [])] }, opts: { ...opts } }
@@ -156,12 +157,14 @@ export function feedCatchUp(target, opts = {}) {
   return entry.p
 }
 
-async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full = false } = {}) {
+async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full = false, preserveCoverage = false } = {}) {
   const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
   if (!bridge || !target?.connectionId || !target.sessions?.length) return false
   const profile = target.profile || 'default'
   const key = connKey(target.connectionId, profile)
   const st = feeds.get(key)
+  // Resolve after preceding flights complete: their watched set may have changed while queued.
+  if (preserveCoverage) target = { ...target, sessions: [...new Set([...target.sessions, ...(st?.sessions || [])])] }
   if (st?.unsupported && nowMs - st.at < FEED_UNSUPPORTED_RETRY_MS) return false
   const unsupported = why => {
     if (!st?.unsupported) feedLog(`${target.connectionId}/${profile} no-feed ${why}`)
@@ -191,7 +194,7 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
     // restart). Waiting for it to pass our revision could take hours: start over with it instead.
     if (!reset) {
       feedLog(`${target.connectionId}/${profile} behind rev=${r.rev} < ${cur.rev}: reset`)
-      return feedCatchUpNow(target, { nowMs, reset: true })
+      return feedCatchUpNow(target, { nowMs, reset: true, full, preserveCoverage })
     }
   }
   const next = { connectionId: target.connectionId, profile, feedProfile: str(r.profile) || profile, feed: r.feed, epoch: r.epoch, rev: Number(r.rev) || 0,
@@ -248,7 +251,8 @@ export async function feedFocus(route, { wait = ms => new Promise(r => setTimeou
     if (cachedModel(route)) return true
     const st = feeds.get(connKey(route.connectionId, route.profile))
     if (st?.unsupported) return false
-    await feedCatchUp({ connectionId: route.connectionId, profile: route.profile || 'default', sessions: [route.session] }, { full: true })
+    // The cursor is shared by every watched chat. Preserve its coverage at execution time.
+    await feedCatchUp({ connectionId: route.connectionId, profile: route.profile || 'default', sessions: [route.session] }, { full: true, preserveCoverage: true })
     if (cachedModel(route)) return true
   }
   return false
