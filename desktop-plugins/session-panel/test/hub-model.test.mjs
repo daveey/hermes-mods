@@ -284,4 +284,22 @@ test('stale revision and foreign owner fail closed before POST', async () => {
   assert.equal(posts, 0)
  }
 })
+test('owner lookup retries a restarting gateway, then explains a real outage in plain words without posting', async () => {
+ const q = structuredClone(publicCases.own_letters.model.sections.needs_you[0])
+ const action = q.actions.find(a => a.kind === 'decide')
+ const request = { requestId: q.request_id, revision: q.request_revision, state: 'open', owner: action.owner }
+ let fails = 1
+ const flaky = async (path, opts) => { if (opts.connectionId !== current.connectionId || fails-- > 0) throw Error("Error invoking remote method 'hermes:api': RemoteBackendDownError: backend is down"); return { request } }
+ const got = await m.modelRequestRoute(action, current, flaky, { delays: [0, 1] })
+ assert.equal(got.request.requestId, q.request_id); assert.equal(got.route.connectionId, current.connectionId)
+ let tries = 0
+ const down = async () => { tries++; throw Error("Error invoking remote method 'hermes:api': RemoteBackendDownError: backend is down") }
+ await assert.rejects(m.modelRequestRoute(action, current, down, { delays: [0, 1, 1] }), e => {
+  assert.match(e.message, /^Couldn't reach the gateway that holds this question \(RemoteBackendDownError: backend is down\)\. Nothing was sent/)
+  assert.doesNotMatch(e.message, /exact decision owner/); return true })
+ assert.equal(tries, 6) // source + foreign candidate, three passes
+ let tries404 = 0
+ await assert.rejects(m.modelRequestRoute(action, current, async () => { tries404++; throw Error('404: {"detail":"Unknown stored session on this profile"}') }, { delays: [0, 1, 1] }))
+ assert.equal(tries404, 2) // a definitive 4xx is not retried
+})
 test.after(async () => { await React.act(async () => root.unmount()); dom.window.close() })

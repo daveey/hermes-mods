@@ -522,17 +522,31 @@ export function modelDecisionStatus(row) {
 }
 const sameModelOwner = (a, b) => !!a && !!b && a.gatewayId === b.gatewayId && a.profile === b.profile && a.storedSessionId === b.storedSessionId
 /** Resolve on click only. Never use an ambient gateway for an unverified foreign request. */
-async function modelRequestRoute(action, sourceRoute, call) {
-  const candidates = [sourceRoute.connectionId]
-  try { for (const c of await host.connections?.() || []) if (!candidates.includes(c.id)) candidates.push(c.id) } catch {}
-  for (const connectionId of candidates.filter(Boolean)) {
-    const route = { connectionId, profile: action.owner.profile, session: action.owner.storedSessionId }
-    try {
-      const data = await call(`/api/plugins/user-steps/requests/${encodeURIComponent(action.request_id)}?session=${encodeURIComponent(route.session)}`, route)
-      if (data?.request?.requestId === action.request_id && sameModelOwner(data.request.owner, action.owner)) return { route, request: data.request }
-    } catch {}
+// A gateway that is restarting (update, reconnect) answers with a transport error: retry briefly instead of
+// failing the click. A 4xx answer is definitive for that gateway.
+const MODEL_ROUTE_RETRY_MS = [0, 1500, 4000]
+const transientRouteError = e => !/^4\d\d\b/.test(String(e?.message || e).replace(/^Error invoking remote method '[^']*':\s*/, ''))
+export async function modelRequestRoute(action, sourceRoute, call, { delays = MODEL_ROUTE_RETRY_MS } = {}) {
+  let sourceError = null, anyError = null
+  for (const wait of delays) {
+    if (wait) await new Promise(r => setTimeout(r, wait))
+    const candidates = [sourceRoute.connectionId]
+    try { for (const c of await host.connections?.() || []) if (!candidates.includes(c.id)) candidates.push(c.id) } catch {}
+    let retry = false
+    for (const connectionId of candidates.filter(Boolean)) {
+      const route = { connectionId, profile: action.owner.profile, session: action.owner.storedSessionId }
+      try {
+        const data = await call(`/api/plugins/user-steps/requests/${encodeURIComponent(action.request_id)}?session=${encodeURIComponent(route.session)}`, route)
+        if (data?.request?.requestId === action.request_id && sameModelOwner(data.request.owner, action.owner)) return { route, request: data.request }
+      } catch (e) {
+        anyError = anyError || e
+        if (connectionId === sourceRoute.connectionId) { sourceError = e; retry = transientRouteError(e) }
+      }
+    }
+    if (!retry) break
   }
-  throw Error('The exact decision owner is unavailable. No decision was posted.')
+  const why = String((sourceError || anyError)?.message || '').replace(/^Error invoking remote method '[^']*':\s*/, '').slice(0, 160)
+  throw Error(`Couldn't reach the gateway that holds this question${why ? ` (${why})` : ''}. Nothing was sent; try again in a moment.`)
 }
 const modelApi = (path, opts) => window.hermesDesktop.api({ path, timeoutMs: 10_000, ...opts })
 export async function chooseModelOption(row, option, sourceRoute, { call = modelApi } = {}) {
