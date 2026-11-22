@@ -11,6 +11,33 @@ from test_fact_subscription import bridge
 from test_fact_lifecycle import api
 
 
+def test_dashboard_mount_close_is_exact_and_retryable(api, monkeypatch):
+    from types import SimpleNamespace as NS
+    scope = contract.Scope('fixture-install', 'fixture-profile', None)
+    first_store, second_store = fakes.FakeStore(), fakes.FakeStore()
+    def context(store):
+        return NS(facts=NS(v1=store, scope=scope, handle=NS(demand=lambda *a: None)))
+    first = api.bind_facts(context(first_store))
+    second = api.bind_facts(context(second_store))
+    original = api._quiesce
+    try:
+        first.close()  # must not close the newly published binding
+        assert api._LOADER.facts_mount is second
+        assert not second.installation.stopped.is_set()
+        monkeypatch.setattr(api, '_quiesce', lambda f: False)
+        with pytest.raises(RuntimeError, match='quiesce'):
+            second.close()
+        assert api._LOADER.facts_mount is second
+        monkeypatch.setattr(api, '_quiesce', original)
+        second.close()
+        second.close()
+        assert api._LOADER.facts_mount is None
+        assert second.installation.stopped.is_set()
+    finally:
+        monkeypatch.setattr(api, '_quiesce', original)
+        second.close()
+
+
 def test_quiet_publication_readiness_is_serial_and_closes(api, monkeypatch):
     import threading
     from types import SimpleNamespace as NS
