@@ -143,6 +143,11 @@ class Feed:
         self.stopped = _Stop(self)
         self.last_emit = clock()          # the heartbeat clock starts with the feed
         self.last_tick_s = 0.0               # duration of the last tick that recomputed (shown by /status)
+        # Wall-clock timing readable without the session token (/status, and the timing file the run loop writes).
+        self.timing: dict[str, Any] = {'ticks': 0, 'tick_started_at': None, 'tick_duration_s': None,
+                                       'producer_s': None, 'producer_chats': 0, 'last_publish_at': None,
+                                       'last_publish_rev': None}
+        self._producer_seen: Any = None      # global source stamp the producer last settled (admission only)
         self._seq = itertools.count(1)       # compute order: a bundle computed earlier never replaces a later one
         self._stamps: Any = None
         self._panel_stamps: dict[str, Any] = {}
@@ -245,6 +250,7 @@ class Feed:
             prev.stopped.set()
             self.epoch, self.rev, self.last_emit = prev.epoch, prev.rev, prev.last_emit
             self.last_tick_s = getattr(prev, 'last_tick_s', 0.0)
+            self.timing.update(getattr(prev, 'timing', None) or {})
             bundles = getattr(prev, 'bundles', {})
             self.bundles = {s: dict(b) for s, b in bundles.items()}
             self.interest = dict(getattr(prev, 'interest', {}))
@@ -308,6 +314,8 @@ class Feed:
         self._retry.discard(s)
         self._carried.discard(s)
         self._reissue.discard(s)
+        for lane in (getattr(self, '_budgets', None) or {}).values():
+            lane.pop(s, None)
 
     # ── computing ───────────────────────────────────────────────────────────
     def compute(self, session: str, *, seq: Optional[int] = None) -> dict:
@@ -643,6 +651,8 @@ class Feed:
                     self.emit({'epoch': self.epoch, 'prev': prev, 'rev': self.rev, 'bundles': changed, 'fresh': fresh,
                                **({} if changed else {'heartbeat': True})})
                     self.last_emit = now
+                    if changed:
+                        self.__dict__.setdefault('timing', {}).update(last_publish_at=time.time(), last_publish_rev=self.rev)
                 except Exception:  # no client / transport down: clients catch up, and see no heartbeat meanwhile
                     log.debug('session-panel feed: push failed', exc_info=True)
             return changed
@@ -756,15 +766,46 @@ class Feed:
             self._decide.set()
         return len(self._publish({}, heartbeat=True, age_only=now - self.last_emit >= self.heartbeat_s))
 
+    def _produce(self, watched: list[str], source_seen: Any, admitted: Iterable[str]) -> None:
+        """Run the source producer for the admitted chats. A scoped reader's other chats were checked against
+        the same source stamp and found unaffected, so they settle on it unreconciled."""
+        scoped = bool(getattr(self.readers, 'reconcile_scoped', False))
+        wanted = set(admitted)
+        began = time.monotonic()
+        if scoped:
+            todo = [s for s in watched if s in wanted]
+        else:
+            todo = [s for s in watched if s not in self._reconcile_stamps
+                    or self._reconcile_stamps[s] != source_seen or s in wanted]
+        left: set = set()
+        if todo:
+            # A reader that isolates per-chat failures returns the chats it could not finish; one that
+            # raises fails the pass (tick() then restores every cursor).
+            left = {s for s in (self.readers.reconcile_sources(todo) or ()) if s in todo}
+        with self.lock:
+            settle = watched if scoped else todo
+            self._reconcile_stamps.update((s, source_seen) for s in settle if s in self.interest)
+            self._reconcile_deferred = {s for s in (self._reconcile_deferred - set(todo)) | left
+                                        if s in self.interest}
+            waiting = set(self._reconcile_deferred)
+        if todo:
+            retry_at = self._spend('reconcile', left.intersection(waiting), keep=waiting)
+            if left or not waiting:
+                self._reconcile_retry_at = retry_at
+        self._producer_seen = source_seen
+        self.__dict__.setdefault('timing', {}).update(producer_s=round(time.monotonic() - began, 4),
+                                                      producer_chats=len(todo))
+
     def tick(self) -> int:
         """Settle a source pass atomically, with finite recovery of unread changes."""
         import copy
         names = ('_panel_stamps', '_panel_files', '_stamps', '_board_stamps',
-                 '_external_stamps', '_external_captures', '_external_observations', '_cursor', '_reconcile_stamps')
+                 '_external_stamps', '_external_captures', '_external_observations', '_cursor', '_reconcile_stamps', '_producer_seen')
         saved = {name: copy.deepcopy(getattr(self, name, None)) for name in names}
         self._admission_retry_at = None
         self._hydrate_retry_at = None  # this pass is the retry; it re-arms below when a chat still fails
         self._attempted = set()
+        began, began_wall = time.monotonic(), time.time()
         try:
             result = self._tick()
         except Exception:
@@ -783,6 +824,9 @@ class Feed:
             self._admission_retry_at = self._backoff(attempt)
             raise
         self._admission_failures = 0
+        self.__dict__.setdefault('timing', {}).update(
+            ticks=self.timing.get('ticks', 0) + 1, tick_started_at=began_wall,
+            tick_duration_s=round(time.monotonic() - began, 4))
         # A chat whose hydration failed was caught inside the pass, after its source event was consumed.
         # Keep it unvouched and due again: the same event must not need another write to be shown.
         # So is one that succeeded with stale rows (core's busy fallback) or joined an older read: it is
@@ -823,25 +867,12 @@ class Feed:
         # Captured BEFORE producer writes. Its own action-store commit is not
         # a source event; a concurrent real source write remains eligible.
         source_seen = source_stamp() if callable(source_stamp) else None
-        # Producer admission is independent of presentation invalidation: a
-        # compression/membership change can move no current outcome/request row.
-        # Until canonical per-session source capture exists this producer phase
-        # remains conservative; unchanged presentation is still never hydrated.
-        if reconcile_enabled and callable(reconcile):
-            admitted = [s for s in watched if s not in self._reconcile_stamps
-                        or self._reconcile_stamps[s] != source_seen or s in redo]
-            if admitted:
-                # A reader that isolates per-chat failures returns the chats it could not finish; one that
-                # raises fails the pass (tick() then restores every cursor).
-                left = {s for s in (reconcile(admitted) or ()) if s in admitted}
-                with self.lock:
-                    self._reconcile_stamps.update((s, source_seen) for s in admitted if s in self.interest)
-                    self._reconcile_deferred = {s for s in (self._reconcile_deferred - set(admitted)) | left
-                                                if s in self.interest}
-                    waiting = set(self._reconcile_deferred)
-                retry_at = self._spend('reconcile', left.intersection(waiting), keep=waiting)
-                if left or not waiting:
-                    self._reconcile_retry_at = retry_at
+        # A reader with per-chat scope (`reconcile_scoped`) admits the producer only for the chats whose own
+        # inputs moved (below, once the per-chat dirty sets are known). Others keep the conservative contract:
+        # any source write admits every watched chat.
+        scoped = bool(reconcile_enabled and getattr(self.readers, 'reconcile_scoped', False))
+        if reconcile_enabled and not scoped:
+            self._produce(watched, source_seen, redo)
         panel_dirty = self._panel_dirty(watched)
         stamps = self.readers.stamps()
         external = getattr(self.readers, 'external_stamps', None)
@@ -851,7 +882,9 @@ class Feed:
         with self.lock:
             retry = self._retry.intersection(watched)
             missing = any(s not in self.bundles for s in watched)
-        if stamps == self._stamps and not full and not retry and not panel_dirty and not missing:
+        producer_due = scoped and bool(redo or any(s not in self._reconcile_stamps for s in watched)
+                                       or source_seen != self._producer_seen)
+        if stamps == self._stamps and not full and not retry and not panel_dirty and not missing and not producer_due:
             self._publish({}, heartbeat=True)
             return 0
         # Board events are read only when a board file moved (or on the safety-net pass): state.db is written all
@@ -922,7 +955,20 @@ class Feed:
                 dirty.update(watched)
         dirty.update(retry)
         dirty.update(panel_dirty)
-
+        if scoped:
+            # Only chats whose own inputs moved are reconciled. Lineage changes (compression/membership) have
+            # no held-input signal, so compare them here.
+            moved = source_seen != self._producer_seen
+            admitted = set(redo) | {s for s in watched if s not in self._reconcile_stamps}
+            if moved:
+                admitted |= dirty
+                with self.lock:
+                    held_lineage = {s: set(self.bundles[s]['lineage']) for s in watched if s in self.bundles}
+                admitted |= {s for s, ids in held_lineage.items() if set(self.readers.lineage(s) or [s]) != ids}
+            if admitted or moved:
+                self._produce(watched, source_seen, admitted)
+                # The producer's own request writes must reach the presentation of the chats it reconciled.
+                dirty.update(self._panel_dirty(watched))
         if not dirty:
             return len(self._publish({}, heartbeat=True))
         started = time.monotonic()
@@ -977,7 +1023,7 @@ class Feed:
     def status(self) -> dict:
         with self.lock:
             return {'epoch': self.epoch, 'rev': self.rev, 'watched': len(self.interest), 'bundles': len(self.bundles),
-                    'failures': {s: dict(f) for s, f in self.failures.items()}, 'last_tick_s': round(self.last_tick_s, 3),
+                    'failures': {s: dict(f) for s, f in self.failures.items()}, 'last_tick_s': round(self.last_tick_s, 3), 'timing': dict(getattr(self, 'timing', {})),
                     'decision_failures': sorted(self._decision_failures),
                     'stopped': self.stopped.is_set()}
 

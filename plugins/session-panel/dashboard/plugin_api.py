@@ -724,6 +724,9 @@ class CoreReaders:
         """Presentation never runs producer reconciliation or initializes stores."""
         return self._user_step_requests(session, lineage, reconcile=False)
 
+    # The feed admits the producer per chat (inputs that moved), not for every chat on any source write.
+    reconcile_scoped = True
+
     def reconciliation_stamp(self):
         """Source admission only: action-store writes cannot trigger their producer."""
         return self._stamps_of(self.board_paths() + [self.state_db()] + self.external_paths())
@@ -1021,6 +1024,7 @@ FEED_ROLE = _feed_role()
 # Stable across restarts (not the pid): clients match pushes by it, so a restarted backend's pushes count at once.
 FEED_ID = f'{socket.gethostname()}:{FEED_ROLE}'
 LAUNCH_PROFILE = _launch_profile()
+TIMING_EVERY_S = 1.0           # the timing file is rewritten at most this often
 SNAPSHOT_EVERY_S = 30.0        # a changed feed is saved at most this often (and on stop / exit)
 RESTORE_MAX_AGE_S = 15 * 60.0  # an older snapshot starts a new revision space instead
 SNAPSHOT_PRUNE_S = 7 * 86400.0  # snapshots of backends not seen for this long are deleted
@@ -1035,6 +1039,28 @@ def _warn(key: str, msg: str, *args, exc_info: bool = False) -> None:
     if now - _WARNED.get(key, -WARN_EVERY_S) >= WARN_EVERY_S:
         _WARNED[key] = now
         log.warning(msg, *args, exc_info=exc_info)
+
+
+def timing_path() -> Path:
+    """Tick duration and last publish time, readable from a shell without the Desktop session token."""
+    return _snapshot_path().with_name('timing-' + _snapshot_path().name)
+
+
+def write_timing(f, path: Optional[Path] = None) -> bool:
+    """Atomically write the feed's wall-clock timing (`Feed.timing`) as JSON. Best effort: never raises."""
+    try:
+        path = path or timing_path()
+        with f.lock:
+            body = {'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'pid': os.getpid(), 'written_at': time.time(),
+                    'rev': f.rev, 'watched': len(f.interest), **dict(getattr(f, 'timing', {}))}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + f'.{os.getpid()}.tmp')
+        tmp.write_text(json.dumps(json_safe(body)), encoding='utf-8')
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        log.debug('session-panel timing write failed', exc_info=True)
+        return False
 
 
 def _snapshot_path() -> Path:
@@ -1510,7 +1536,7 @@ def _run_decisions(f) -> None:
 
 def _run(f) -> None:
     saved = (None, None)  # (rev, watched chats) last written
-    saved_at = 0.0
+    saved_at = timing_at = 0.0
     try:
         last = 0.0
         _event_driven(f)
@@ -1536,6 +1562,9 @@ def _run(f) -> None:
             except Exception:
                 log.warning('session-panel feed tick failed', exc_info=True)
             f.readers.release()  # no connection outlives one pass
+            if time.monotonic() - timing_at >= TIMING_EVERY_S:
+                timing_at = time.monotonic()
+                write_timing(f)
             with f.lock:
                 state = (f.rev, frozenset(f.interest))
             if state != saved and time.monotonic() - saved_at >= SNAPSHOT_EVERY_S:
