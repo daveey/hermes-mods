@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v19-warm-sidebar'
+const VERSION = 'session-panel-v20-warm-sidebar'
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 // Emoji-presentation glyphs the Desktop fonts draw as tofu (a Hermes-bug title carried "⛔"); the model strips them
 // too, this covers a cached older model.
@@ -77,6 +77,8 @@ export const FEED_EVENT = 'plugin.session-panel.changed'
 export const FEED_CATCHUP_MS = 60_000
 export const FEED_STALE_MS = 60_000 // three missed 20 s heartbeats
 const FEED_UNSUPPORTED_RETRY_MS = 10 * 60_000
+// A backend that just started answers 503 (Retry-After: 1) until its feed exists: ask again shortly, a few times.
+export const FEED_STARTING = { retryMs: 1_000, tries: 3 }
 const feeds = new Map()      // JSON [connectionId, profile] -> { connectionId, profile, feed, epoch, rev, sessions, liveAt, unsupported, at }
 const feedFlights = new Map() // same key -> the catch-up in flight
 const connKey = (connectionId, profile) => JSON.stringify([connectionId || '', profile || 'default'])
@@ -161,7 +163,7 @@ export function feedCatchUp(target, opts = {}) {
   return entry.p
 }
 
-async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full = false, preserveCoverage = false } = {}) {
+async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full = false, preserveCoverage = false, attempt = 0 } = {}) {
   const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
   if (!bridge || !target?.connectionId || !target.sessions?.length) return false
   const profile = target.profile || 'default'
@@ -183,6 +185,10 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
   } catch (e) {
     // The Desktop bridge rejects a 404 with "404: ...": this gateway has no backend half.
     if (/^404\b/.test(String(e?.message || ''))) return unsupported('404')
+    if (/^503\b/.test(String(e?.message || '')) && attempt < FEED_STARTING.tries) {
+      await new Promise(done => setTimeout(done, FEED_STARTING.retryMs))
+      return feedCatchUpNow(target, { reset, full, preserveCoverage, attempt: attempt + 1 })
+    }
     log('feed catch-up failed', target.connectionId, e?.message || e)
     return false
   }

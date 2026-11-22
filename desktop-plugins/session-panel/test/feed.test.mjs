@@ -166,6 +166,19 @@ test('a peek against an unregistered, restarted or other feed applies nothing an
  reply = () => { throw Error('503: Session panel starting') }
  assert.equal(await m.feedPeek(target()), false)
 })
+test('a starting backend (503) is asked again shortly, a bounded number of times', async () => {
+ const saved = { ...m.FEED_STARTING }
+ Object.assign(m.FEED_STARTING, { retryMs: 1, tries: 3 })
+ try {
+  let n = 0
+  reply = () => { if (++n < 3) throw Error('503: Session panel starting'); return answer({ bundles: { S1: bundle('S1', 'up') } }) }
+  assert.equal(await m.feedCatchUp(target()), true)
+  assert.equal(calls.length, 3); assert.equal(m.cachedModel(route()).revision, 'up')
+  m.resetFeedForTests(); calls = []; reply = () => { throw Error('503: Session panel starting') }
+  assert.equal(await m.feedCatchUp(target()), false)
+  assert.equal(calls.length, 4, 'the first try and three more, then the periodic pass takes over')
+ } finally { Object.assign(m.FEED_STARTING, saved) }
+})
 test('a pass reads chats that joined the watched set beside the cursor, once', async () => {
  const rows = n => Array.from({ length: n }, (_, i) => ({ id: `side-${i}`, connection_id: 'C1', profile: 'default', last_active: i }))
  let sidebar = rows(2)
