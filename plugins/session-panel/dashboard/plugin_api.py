@@ -608,6 +608,11 @@ class CoreReaders:
         if task is None:
             return None
         d = dataclasses.asdict(task)
+        try:
+            from hermes_cli.kanban_session_wait_rows import _local_wait_info
+            d['wait'] = _local_wait_info(c, [card_id]).get(card_id, {})
+        except (ImportError, sqlite3.Error):
+            d['wait'] = {}
         # Heartbeats move these every minute without changing anything the chain shows: left out, so a heartbeat
         # alone never re-pushes a bundle (the card rows in `tasks` keep their own activity fields).
         d.pop('last_heartbeat_at', None)
