@@ -33,7 +33,9 @@ pulls carry observations without hydration or renewed computation/execution cloc
 Four bounded workers hydrate one chat each; a blocked reader does not hold the
 coordinator or another chat's publication. A separate event-driven capacity service
 drains completions and refills admitted slots even while the coordinator is inside
-strict external capture. It performs no source reads and shares the scheduler lock;
+strict external capture. Current API entry idempotently ensures that service on an
+existing lane created by a saved predecessor entry, without duplicating its capture
+thread or resetting source cursors. It performs no source reads and shares the scheduler lock;
 the coordinator remains the single source-cursor owner. Pending admissions are oldest-first;
 coalescing a newer write retains a chat's oldest unserved admission. Writes during
 an in-flight read coalesce
