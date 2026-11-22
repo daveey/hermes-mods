@@ -42,8 +42,8 @@ _MEMO_MAX = 256
 _PASS = threading.local()  # set by reconcile_pass(): bindings already checked by an earlier owner of the same pass
 
 
-def _binding_key(binding):
-    return (binding["namespace"], binding["request_id"], binding["request"], binding["snapshot"])
+def _binding_key(binding, scope):
+    return (scope, binding["namespace"], binding["request_id"], binding["request"], binding["snapshot"])
 
 
 @contextmanager
@@ -255,6 +255,8 @@ class Mirror:
         session_present=None,
     ):
         self.core, self.store, self.backend = core, store, backend
+        self._pass_source = object() if any(v is not None for v in
+            (backend, session_exists, tip, session_present)) else core
         path = Path(__file__).with_name('remote_cards.py')
         spec = importlib.util.spec_from_file_location('_user_steps_remote_cards', path)
         remote = importlib.util.module_from_spec(spec)
@@ -898,12 +900,19 @@ class Mirror:
                 )
             ]
         done = getattr(_PASS, "done", None)
+        # Resolve backing coordinates once per owner, not for every binding.
+        # Equal binding bytes from another store/source are not checked evidence.
+        scope = (str(Path(self.store.path).resolve()),
+                 tuple(sorted((board, str(Path(path).resolve())) for board, path in self.boards.items())),
+                 self._pass_source) if done is not None else None
         for binding in bindings:
             try:
                 self._reconcile_binding(owner, binding)
                 if done is not None:
-                    done.add(_binding_key(binding))
+                    done.add(_binding_key(binding, scope))
             except (ValueError, sqlite3.Error, OSError) as exc:
+                if done is not None:
+                    done.discard(_binding_key(binding, scope))
                 clean = False
                 logging.getLogger("user-steps").warning(
                     "Card binding reconciliation deferred request=%s: %s",
@@ -921,14 +930,16 @@ class Mirror:
                 )
             ]
         for binding in older:
-            if done is not None and _binding_key(binding) in done:
+            if done is not None and _binding_key(binding, scope) in done:
                 continue  # this feed pass already checked exactly this binding (see reconcile_pass)
             previous = dict(owner, storedSessionId=binding["session"])
             try:
                 self._reconcile_binding(previous, binding)
                 if done is not None:
-                    done.add(_binding_key(binding))
+                    done.add(_binding_key(binding, scope))
             except (ValueError, sqlite3.Error, OSError) as exc:
+                if done is not None:
+                    done.discard(_binding_key(binding, scope))
                 clean = False
                 logging.getLogger("user-steps").warning(
                     "Older card binding reconciliation deferred request=%s: %s",
