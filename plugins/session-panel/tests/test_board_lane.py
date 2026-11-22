@@ -140,6 +140,44 @@ def test_older_changed_chat_is_not_starved_by_continually_newer_changes():
         lane.close()
 
 
+def test_admitted_chats_refill_capacity_while_next_external_capture_blocks():
+    r = Readers()
+    f = feedmod.Feed(r, emit=lambda p: None)
+    f.changes(['S1', 'S2'])
+    lane = feedmod.BoardLane(f, lambda: r, capacity=0)
+    r.events = [('t_aaaaaa1', 'S1'), ('t_dddddd4', 'S2')]
+    lane.step()  # admitted, but no free worker slots yet
+    assert lane.pending
+    entered, release = threading.Event(), threading.Event()
+    r.external_stamps = lambda: 99
+    def blocked_capture(held):
+        entered.set()
+        assert release.wait(5)
+        return {s: 0 for s in held}
+    r.external_capture = blocked_capture
+    r.links['S1'] = [{**r.links['S1'][0], 'status': 'ready'}]
+    r.links['S2'] = [{**r.links['S2'][0], 'status': 'ready'}]
+    lane.capacity = 1
+    if hasattr(lane, 'start_service'):
+        lane.start_service()
+    capture = threading.Thread(target=lane.step)
+    capture.start()
+    try:
+        assert entered.wait(1)
+        end = time.monotonic() + 1
+        while time.monotonic() < end:
+            if all(f.bundles[s]['bundle']['tasks'][0]['status'] == 'ready' for s in ('S1', 'S2')):
+                break
+            time.sleep(.01)
+        assert all(f.bundles[s]['bundle']['tasks'][0]['status'] == 'ready' for s in ('S1', 'S2')), \
+            'slow recapture holds admitted work and prevents completion-driven slot refill'
+        assert not release.is_set()
+    finally:
+        release.set()
+        capture.join(5)
+        lane.close()
+
+
 def settle(lane, timeout=2):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
