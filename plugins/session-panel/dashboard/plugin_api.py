@@ -284,6 +284,36 @@ class CoreReaders:
                                 or row.get('id') in value['refs']))
                 for s, value in held.items()}
 
+    @staticmethod
+    def external_semantic(captured):
+        """Replica pull time is observation metadata, not a changed card.
+
+        Keep stale, executor evidence and every ledger field. The raw capture is
+        retained separately so advance_external can carry the actual observation
+        into the reducer; dropping its clock would prematurely expire evidence.
+        """
+        if captured is None:
+            return None
+        rows = [json.loads(row) for row in captured]
+        for row in rows:
+            if row.get('source') == 'replica':
+                row.pop('synced_at', None)
+        return tuple(sorted(json.dumps(row, sort_keys=True, separators=(',', ':')) for row in rows))
+
+    @staticmethod
+    def advance_external(bundle, captured):
+        """Pure observation carriage; never renew board reads or execution leases."""
+        def identity(row):
+            return tuple(row.get(k) for k in ('gateway', 'profile', 'board', 'id', 'session'))
+        rows = [json.loads(row) for row in captured]
+        clocks = {identity(row): row.get('synced_at') for row in rows if row.get('source') == 'replica'}
+        result = dict(bundle)
+        for field in ('tasks', 'done'):
+            result[field] = [{**row, 'synced_at': clocks[identity(row)]}
+                             if row.get('source') == 'replica' and identity(row) in clocks else row
+                             for row in bundle[field]]
+        return result
+
     def external_stamps(self):
         return tuple((str(p), self._stat(p)) for p in self.external_paths())
 

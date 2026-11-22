@@ -256,7 +256,7 @@ class Feed:
             # Older feed code (a hot reload) reads neither `stopped` in its publish nor `_successor`: its entry points
             # are routed here as instance attributes (found before the class's), so a request still on it neither
             # moves its revision nor answers with one this feed never issued.
-            prev._publish = lambda computed, heartbeat=False, canonical_only=False, age_only=False: {}
+            prev._publish = lambda computed, heartbeat=False, canonical_only=False, age_only=False, observations=None: {}
             prev.watch = self.watch
             prev.changes = self.changes
         return self
@@ -291,6 +291,8 @@ class Feed:
         self._decision_seen.pop(s, None)
         self.interest.pop(s, None)
         self._panel_stamps.pop(s, None)
+        (getattr(self, '_external_observations', None) or {}).pop(s, None)
+        (getattr(self, '_external_captures', None) or {}).pop(s, None)
         self.bundles.pop(s, None)
         self.failures.pop(s, None)
         self._retry.discard(s)
@@ -524,6 +526,10 @@ class Feed:
 
     def _store(self, session: str, bundle: dict, *, canonical_only: bool = False) -> bool:
         """Keep `bundle`; True when it differs from what clients last got (it took a new revision)."""
+        observation = (getattr(self, '_external_observations', None) or {}).get(session)
+        if observation and bundle.get('computed_seq', 0) <= observation[0]:
+            bundle = self.readers.advance_external(bundle, observation[1])
+            bundle = {**bundle, 'model': _model().reduce_panel(bundle, now=self.clock())}
         prev = self.bundles.get(session)
         if canonical_only and (not prev or prev['bundle']['lineage'] != bundle['lineage']):
             return False  # expired/re-watched or reparented while the cheap read was in flight
@@ -570,7 +576,7 @@ class Feed:
         return True
 
     def _publish(self, computed: dict[str, dict], *, heartbeat: bool = False, canonical_only: bool = False,
-                 age_only: bool = False) -> dict[str, dict]:
+                 age_only: bool = False, observations: Optional[dict] = None) -> dict[str, dict]:
         """Store what was computed and push one batch (or a heartbeat when nothing changed and one is due)."""
         with self.compute_lock:
             if self.stopped.is_set():
@@ -587,7 +593,13 @@ class Feed:
                     for s, held in list(self.bundles.items()):
                         if s not in self.interest or 'model' not in held['bundle']:
                             continue
-                        bundle = {**held['bundle'], 'model': reducer(held['bundle'], now=now)}
+                        base = held['bundle']
+                        if observations is not None:
+                            observation = observations.get(s)
+                            if observation is None or base.get('computed_seq', 0) > observation[0]:
+                                continue  # a later source capture owns a newer observation
+                            base = self.readers.advance_external(base, observation[1])
+                        bundle = {**base, 'model': reducer(base, now=now)}
                         digest = _hash(bundle)
                         if digest != held['hash']:
                             self.rev += 1
@@ -713,7 +725,7 @@ class Feed:
         """Settle a source pass atomically, with finite recovery of unread changes."""
         import copy
         names = ('_panel_stamps', '_panel_files', '_stamps', '_board_stamps',
-                 '_external_stamps', '_external_captures', '_cursor')
+                 '_external_stamps', '_external_captures', '_external_observations', '_cursor')
         saved = {name: copy.deepcopy(getattr(self, name, None)) for name in names}
         self._admission_retry_at = None
         try:
@@ -809,13 +821,21 @@ class Feed:
             capture = getattr(self.readers, 'external_capture', None)
             if callable(capture):
                 with self.lock:
+                    capture_seq = next(self._seq)
                     held = {s: {'lineage': set(self.bundles[s]['lineage']),
                                 'refs': set(self.bundles[s]['refs'])}
                             if s in self.bundles else {'lineage': {s}, 'refs': set()}
                             for s in watched}
                 captured = capture(held)
                 previous = getattr(self, '_external_captures', None) or {}
-                dirty.update(s for s in watched if captured[s] != previous.get(s))
+                semantic = getattr(self.readers, 'external_semantic', lambda value: value)
+                dirty.update(s for s in watched if semantic(captured[s]) != semantic(previous.get(s)))
+                if callable(getattr(self.readers, 'advance_external', None)):
+                    observations = {s: (capture_seq, captured[s]) for s in watched
+                                    if s not in dirty and captured[s] != previous.get(s)}
+                    with self.lock:
+                        self._external_observations = {**(getattr(self, '_external_observations', None) or {}), **observations}
+                    self._publish({}, age_only=True, observations=observations)
                 self._external_captures = captured
             else:  # Older/injected readers cannot attest unchanged external inputs.
                 dirty.update(watched)
