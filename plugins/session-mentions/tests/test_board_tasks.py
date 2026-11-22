@@ -160,6 +160,34 @@ def test_list_retains_orchestrator_gate(replica, monkeypatch):
     assert bt.handle({'action': 'list'})['error'] == 'orchestrator only'
 
 
+def test_canonical_authority_uses_exact_granted_board_and_closes(replica, monkeypatch):
+    from hermes_cli import kanban_sync_client as client
+    calls = []
+    class Authority:
+        def __init__(self, ident, **kw):
+            assert kw['timeout'] == 5 and kw['deadline'] > 0
+        def row_evidence(self, board, table, tid):
+            calls.append((board, table, tid))
+            return {'verified': True}
+        def close(self):
+            calls.append('closed')
+    monkeypatch.setattr(client, 'load_identity', lambda: object())
+    monkeypatch.setattr(client, 'Hub', Authority)
+    assert bt._canonical_evidence('default', 't_123') == {'verified': True}
+    assert calls == [('default', 'tasks', 't_123'), 'closed']
+    calls.clear()
+    with pytest.raises(ValueError, match='board pinned'):
+        bt._canonical_evidence('other', 't_123')
+    assert calls == []  # authorization precedes ALL network access
+
+
+def test_canonical_authority_refuses_selected_board_mismatch(replica, monkeypatch):
+    from hermes_cli import kanban_db_sync as sync, kanban_sync_client as client
+    monkeypatch.setattr(sync, 'board_slug_for_path', lambda path: 'other')
+    monkeypatch.setattr(client, 'load_identity', lambda: pytest.fail('authority opened before scope check'))
+    assert bt._canonical_evidence('default', 't_123') is None
+
+
 def test_missing_replica_no_live_fallback(replica, monkeypatch):
     from hermes_cli import kanban_foreign_card as fc
     monkeypatch.setattr(fc, 'replica_path', lambda path: None)

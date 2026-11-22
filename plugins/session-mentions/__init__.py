@@ -368,6 +368,10 @@ def _hub_route(action: str, args: dict, session_id: str | None) -> str | None:
     if _route_claimable(route, base) is not False:
         return None
     if route not in _hub_gateways() or not _hub_cli():
+        if action in ("read", "comment"):
+            canonical = bt.canonical_reference(args)
+            if canonical is not None:
+                return json.dumps(canonical)
         reach = sorted({n for c in rf.live_couriers(base) for n in rf.names(c.get("reach") or ())})
         log.warning("cross_task: unroutable route=%s", route)
         return _err(f"No Desktop courier reaches `{route}` (live reach lists: {', '.join(reach) or 'none'}) and the "

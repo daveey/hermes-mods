@@ -155,6 +155,86 @@ def test_unknown_gateway_fails_fast_and_names_the_command(env, caplog):
     assert not list((env["base"] / "outbox").glob("*.json"))
 
 
+def test_retired_explicit_reference_returns_verified_canonical_ref(env, monkeypatch):
+    # Scrubbed form of the original retired-worker reference. No global aliasing.
+    monkeypatch.setattr(sm.bt, "canonical_reference", lambda args: {
+        "ok": False, "rejection": "canonical_reference", "canonical_ref": "@task:default@hub/t_aaaa1111",
+        "error": "Retry the verified canonical reference explicitly; nothing was rerouted."}, raising=False)
+    out = json.loads(sm.handle_task({"action": "read", "target": "@task:default@worker-4/t_aaaa1111"}))
+    assert out.get("canonical_ref") == "@task:default@hub/t_aaaa1111", out
+    assert out["ok"] is False and out["rejection"] == "canonical_reference"
+    assert not env["calls"]() and not env["sent"]
+
+
+def test_canonical_evidence_yields_reference_without_body(env, monkeypatch):
+    monkeypatch.setattr(sm.bt, "_canonical_evidence", lambda board, tid: {
+        "board": board, "table": "tasks", "uid": tid, "state": "live", "tombstone": None,
+        "row": {"id": tid, "uid": tid, "created_on": "hub", "deleted_at": None,
+                "delete_pending": 0, "body": "not exported"}}, raising=False)
+    out = sm.bt.canonical_reference({"target": "@task:default@worker-4/t_aaaa1111"})
+    assert out["canonical_ref"] == "@task:default@hub/t_aaaa1111"
+    assert out["source"] == "authenticated_board_evidence"
+    assert "not exported" not in json.dumps(out)
+
+
+@pytest.mark.parametrize('change', [
+    {'board': 'other'}, {'uid': 't_other'}, {'table': 'sessions'}, {'state': 'deleted'},
+    {'state': 'unknown'}, {'row': None}, {'row': [{'id': 't_aaaa1111'}, {'id': 't_aaaa1111'}]},
+    {'tombstone': {'deleted_at': 1}},
+])
+def test_canonical_reference_rejects_unknown_ambiguous_or_wrong_board(env, monkeypatch, change):
+    evidence = {'board': 'default', 'table': 'tasks', 'uid': 't_aaaa1111', 'state': 'live',
+                'row': {'id': 't_aaaa1111', 'uid': 't_aaaa1111', 'created_on': 'hub', 'delete_pending': 0}}
+    evidence.update(change)
+    monkeypatch.setattr(sm.bt, '_canonical_evidence', lambda *a: evidence)
+    out = json.loads(sm.handle_task({'action': 'read', 'target': '@task:default@worker-4/t_aaaa1111'}))
+    assert out['ok'] is False and 'canonical_ref' not in out
+    assert 'does not know it' in out['error']
+    assert not env['sent'] and not env['calls']()
+
+
+@pytest.mark.parametrize('change', [
+    {'uid': 't_other'}, {'id': 't_other'}, {'deleted_at': 1}, {'delete_pending': 1},
+    {'created_on': ''}, {'created_on': ['hub', 'other']}, {'created_on': 'bad/owner'},
+    {'created_on': 'worker-4'},
+])
+def test_canonical_reference_rejects_uncertain_row(env, monkeypatch, change):
+    row = {'id': 't_aaaa1111', 'uid': 't_aaaa1111', 'created_on': 'hub', 'delete_pending': 0}
+    row.update(change)
+    monkeypatch.setattr(sm.bt, '_canonical_evidence', lambda *a: {
+        'board': 'default', 'table': 'tasks', 'uid': 't_aaaa1111', 'state': 'live', 'row': row})
+    assert sm.bt.canonical_reference({'target': '@task:default@worker-4/t_aaaa1111'}) is None
+
+
+@pytest.mark.parametrize('args', [
+    {'target': 'worker-4:t_aaaa1111'}, {'target': 't_aaaa1111'},
+    {'target': '@task:default@worker-4/t_aaaa1111', 'board': 'other'},
+    {'target': '@task:default@worker-4/t_aaaa1111', 'gateway': 'other'},
+    {'target': '@task:../private@worker-4/t_aaaa1111'},
+])
+def test_canonical_reference_never_searches_implicit_or_conflicting_scope(env, monkeypatch, args):
+    monkeypatch.setattr(sm.bt, '_canonical_evidence', lambda *a: pytest.fail('unexpected Board lookup'))
+    assert sm.bt.canonical_reference(args) is None
+
+
+def test_canonical_reference_authority_unavailable_preserves_refusal(env, monkeypatch):
+    def denied(*a):
+        raise PermissionError('denied private board')
+    monkeypatch.setattr(sm.bt, '_canonical_evidence', denied)
+    out = json.loads(sm.handle_task({'action': 'read', 'target': '@task:default@worker-4/t_aaaa1111'}))
+    assert out['ok'] is False and 'canonical_ref' not in out and 'private' not in out['error']
+
+
+def test_canonical_reference_comment_does_not_submit(env, monkeypatch):
+    monkeypatch.setattr(sm.bt, '_canonical_evidence', lambda board, tid: {
+        'board': board, 'table': 'tasks', 'uid': tid, 'state': 'live',
+        'row': {'uid': tid, 'id': tid, 'created_on': 'hub', 'delete_pending': 0}})
+    out = json.loads(sm.handle_task({'action': 'comment', 'target': '@task:default@worker-4/t_aaaa1111',
+                                     'message': 'not sent'}))
+    assert out['rejection'] == 'canonical_reference' and out['ok'] is False
+    assert not env['calls']() and not env['sent']
+
+
 def test_route_a_courier_reaches_still_uses_desktop_relay(env):
     out = json.loads(sm.handle_task({"action": "comment", "target": "@task:default@mini/t_cccc3333", "message": "hi"}))
     assert out == {"ok": True, "echo": "task_comment"}
