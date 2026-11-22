@@ -339,7 +339,7 @@ def _row(now: float, m: str, f: dict, **extra) -> dict:
             'commands': (f.get('fix') or {}).get('commands'), 'summary': f.get('summary'), **extra}
 
 
-def tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] = None,
+def _tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] = None,
          runner: Callable[..., Any] = subprocess.run, now: Optional[float] = None,
          run_mode: Optional[str] = None) -> dict:
     """One pass. Returns {mode, new, handed, deferred, turn, line} (line = what stdout prints, '' = silent)."""
@@ -429,6 +429,64 @@ def tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] =
         out['line'] = (f'session-repair (live): {len(new)} new finding(s); handled {len(handled)} ({cards} card(s)), '
                        f'{len(fps) - len(handled)} left for a later tick; {out["deferred"]} deferred')
         return out
+
+
+TICK_LOG_MAX_BYTES = 4 * 1024 * 1024  # current + one rotated segment; months at 15-minute cadence
+
+
+def _tick_summary(sd: Path, row: dict) -> None:
+    """Append immutable tick records, rotating whole segments rather than rewriting history."""
+    import fcntl
+    data = (json.dumps(row, default=str) + '\n').encode()
+    with (sd / 'ticks.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = sd / 'ticks.jsonl'
+        if path.exists() and path.stat().st_size + len(data) > TICK_LOG_MAX_BYTES:
+            os.replace(path, sd / 'ticks.jsonl.1')
+        with path.open('ab') as log:
+            log.write(data)
+            log.flush()
+            os.fsync(log.fileno())
+
+
+def tick(*, home: Optional[Path] = None, scanner: Optional[Callable[[], dict]] = None,
+         runner: Callable[..., Any] = subprocess.run, now: Optional[float] = None,
+         run_mode: Optional[str] = None) -> dict:
+    """Persist one summary even for silent, off, locked, scan-error and failed-turn ticks."""
+    import hashlib
+    started = time.monotonic()
+    ts = time.time() if now is None else now
+    m = run_mode or mode(home)
+    result, out, errors = {}, {}, []
+
+    def observe():
+        nonlocal result
+        value = (scanner or (lambda: load_scan().scan()))()
+        if not isinstance(value, dict):
+            raise TypeError('scanner must return a dict')
+        result = value
+        return result
+
+    try:
+        out = _tick(home=home, scanner=observe, runner=runner, now=ts, run_mode=m)
+        return out
+    except Exception as exc:
+        errors.append(f'{type(exc).__name__}: {str(exc)[:500]}')
+        raise
+    finally:
+        errors.extend(str(e)[:500] for e in result.get('errors', []))
+        if out.get('failed'):
+            errors.append(str(out.get('line') or 'repair turn failed')[:500])
+        # Include a source fingerprint so a soak cannot silently span a code change.
+        build = hashlib.sha256((HERE / 'scan.py').read_bytes() + (HERE / 'run.py').read_bytes()).hexdigest()
+        _tick_summary(state_dir(home), {
+            'ts': ts, 'mode': m, 'build': build, 'chats': result.get('chats', 0),
+            'cards': result.get('cards', 0), 'findings': len(result.get('findings') or []),
+            'errors': errors[:20], 'error_count': max(len(errors), result.get('error_count', 0)),
+            'duration_s': round(time.monotonic() - started, 6),
+            'scanned': bool(result), 'skipped': out.get('skipped'),
+            'handed': out.get('handed', []),
+        })
 
 
 def main(argv: Optional[list[str]] = None) -> int:

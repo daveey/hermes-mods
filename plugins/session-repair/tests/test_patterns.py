@@ -147,6 +147,54 @@ def test_agent_owned_block_under_two_hours_is_fine(env):
     none(env, 'BS-unexplained-wait', F.blocked_agent_owned(env.conn, env.now, waited_s=3600))
 
 
+def test_new_triage_cannot_inherit_previous_schedule_age(env):
+    tid = F.card(env.conn, 'New triage after a live run', status='triage', block_kind='transient')
+    F.age_all_events(env.conn, tid, env.now - 26 * 3600)
+    F.event(env.conn, tid, 'scheduled', {'reason': 'old scheduled reason'}, at=env.now - 25 * 3600)
+    F._run(env.conn, tid, env.now, started_s=13 * 60, status='completed')
+    F.event(env.conn, tid, 'gave_up', {'reason': 'new triage'}, at=env.now - 12 * 60)
+    none(env, 'BS-unexplained-wait', tid)
+    # A genuinely abandoned current triage still surfaces, with the new reason.
+    hits = env.findings(rule='BS-unexplained-wait', card=tid, now=env.now + 3 * 3600)
+    assert len(hits) == 1 and hits[0]['evidence']['reason'] == 'new triage'
+    assert hits[0]['evidence']['waiting_s'] < 4 * 3600
+
+
+def test_retained_spend_hold_is_explained_and_never_needs_unblock(env):
+    tid = F.card(env.conn, 'Explicit retained spend HOLD', status='triage', block_kind='transient')
+    F.age_all_events(env.conn, tid, env.now - 27 * 3600)
+    F.event(env.conn, tid, 'gave_up', {'reason': 'old wait'}, at=env.now - 26 * 3600)
+    F._run(env.conn, tid, env.now, started_s=4 * 3600, status='completed')
+    F.event(env.conn, tid, 'spend_budget_triaged', {'reason': 'Spend limit reached'}, at=env.now - 3 * 3600)
+    F.event(env.conn, tid, 'spend_budget_decision_ready', {'producer': {'kind': 'chats'}}, at=env.now - 3 * 3600)
+    F.event(env.conn, tid, 'decision_retained', {'disposition': {'reason': 'decision_pending'},
+            'summary': 'HOLD pending independent prerequisites; no new allowance'}, at=env.now - 2 * 3600)
+    before = env.conn.total_changes
+    none(env, 'BS-unexplained-wait', tid)
+    assert env.conn.total_changes == before
+    assert env.conn.execute('SELECT status,block_kind FROM tasks WHERE id=?', (tid,)).fetchone()[:] == ('triage', 'transient')
+
+
+def test_long_live_run_time_is_not_wait_time(env):
+    from hermes_cli import kanban_db
+    tid = F.blocked_agent_owned(env.conn, env.now, waited_s=26 * 3600)
+    rid = F._run(env.conn, tid, env.now, started_s=5 * 3600, status='completed')
+    env.conn.execute('UPDATE task_runs SET ended_at=? WHERE id=?', (int(env.now - 300), rid))
+    env.conn.commit()
+    card = env.scan_mod.Card(tid, 'default', F.CHAT, kanban_db.get_task(env.conn, tid), env.conn,
+                            {'wait': {'agent_owned': True, 'waiting_since': env.now - 26 * 3600}})
+    assert env.scan_mod.rule_unexplained_wait(card, env.sources()) is None
+
+
+def test_stale_display_age_is_fenced_by_latest_admission(env):
+    from hermes_cli import kanban_db
+    tid = F.blocked_agent_owned(env.conn, env.now, waited_s=26 * 3600)
+    F._run(env.conn, tid, env.now, started_s=12 * 60, status='completed')
+    card = env.scan_mod.Card(tid, 'default', F.CHAT, kanban_db.get_task(env.conn, tid), env.conn,
+                            {'wait': {'agent_owned': True, 'waiting_since': env.now - 26 * 3600}})
+    assert env.scan_mod.rule_unexplained_wait(card, env.sources()) is None
+
+
 # BS-parent-done
 def test_todo_whose_parents_finished(env):
     f = one(env, 'BS-parent-done', F.todo_parents_done(env.conn, env.now))

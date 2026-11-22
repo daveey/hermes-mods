@@ -48,7 +48,7 @@ so a core helper that tried to write raises instead (`tests/test_readonly.py`).
 
 `SESSION_REPAIR` env, else `$HERMES_HOME/session-repair/config.json` `{"mode": ...}`, default **shadow**:
 
-- `off`: nothing.
+- `off`: no scan or repair (still records a tick summary).
 - `shadow`: findings not seen in 24 h go to `actions-shadow.jsonl` as `would: fix|file`; no turn, no write.
 - `live`: those findings (under the caps) go to ONE turn in the chat titled **Session repair**:
   `hermes chat -c "Session repair" --create-if-missing --oneshot -Q --source cli --query-file last-prompt.md`
@@ -76,7 +76,22 @@ so a core helper that tried to write raises instead (`tests/test_readonly.py`).
 
 State (`$HERMES_HOME/session-repair/`): `config.json`, `seen-<mode>.json`, `ledger-<mode>.jsonl`,
 `actions-shadow.jsonl`, `attempts-<mode>.json`, `last.json` (the route's source), `last-prompt.md`, `last-turn.txt`,
-`chat.json`, `run.lock`.
+`chat.json`, `run.lock`, `ticks.jsonl`, `ticks.jsonl.1`, `ticks.lock`.
+
+Every tick appends an fsynced summary to `ticks.jsonl`, including silent/deduped scans, off/lock skips,
+scanner exceptions and failed turns: `ts` (epoch seconds), `mode`, `chats`, `cards`, `findings` (count),
+`errors`, `error_count`, `duration_s`, `scanned`, `skipped`, `handed`, and `build` (SHA-256 of scan/run sources).
+A separate lock serializes journal appends. Whole segments rotate at 4 MiB, retaining one previous segment
+(about 8 MiB bounded retention; normal 15-minute ticks retain far longer than 24 hours). An unwritable journal
+fails the cron tick rather than claiming an auditable success. No cron output-history retention is needed.
+For rollout, require a full 24-hour same-build shadow window with no errors, no unexplained gaps/skips, and
+adjudicate every would-act row in `actions-shadow.jsonl` (including any still-deduped findings in `last.json`).
+Do not infer clean shadow from a missing journal or from zero repair turns.
+
+Unexplained-wait detection excludes canonical pending spend decisions in triage, including retained HOLDs:
+these need an explicit owner decision, not a generic unblock. For other waits, an old generic park and the
+panel's projected age cannot predate the latest run's admission/end boundary. This scanner-side guard avoids
+reusing core projections from an earlier episode; it does not change the card, its budget or its block kind.
 
 ## Scheduling: Hermes cron, no-agent script
 

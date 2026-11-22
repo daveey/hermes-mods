@@ -713,8 +713,29 @@ def rule_unexplained_wait(card: Card, src: Sources) -> Optional[Finding]:
     hr, valid = _human_request(card.task)
     if hr is not None and valid:
         return None  # a real ask: the chat is red, the user acts
+    # Spend triage is a deliberate decision hold, not permission to clear an
+    # inherited agent-owned block. Use the canonical reader, not comment text
+    # matching (a retained HOLD may also carry a monotone scope restriction).
+    from hermes_cli import kanban_spend_decision as spend
+    if card.status == 'triage' and spend.pending(c, card.id):
+        return None
     park = _events(c, card.id, park_kinds)
-    since = _num(park[0]['at']) if park else _last_event_at(c, card.id)
+    # Core's projected wait can predate the current run: its generic park
+    # vocabulary omits spend triage and historically selected an old schedule.
+    # Never date a new blocked/triage episode before its latest admission.
+    row = c.execute('SELECT MAX(started_at), MAX(ended_at) FROM task_runs WHERE task_id = ?',
+                    (card.id,)).fetchone()
+    admitted = _num(row[0]) if row else None
+    ended = _num(row[1]) if row else None
+    boundary = max(t for t in (admitted, ended) if t is not None) if any(
+        t is not None for t in (admitted, ended)) else None
+    if park and admitted is not None and (_num(park[0]['at']) or 0) < admitted:
+        park = []
+    park_since = _num(park[0]['at']) if park else None
+    since = max(t for t in (park_since, boundary) if t is not None) if any(
+        t is not None for t in (park_since, boundary)) else None
+    if since is None:
+        since = _last_event_at(c, card.id)
     waited = _age(now, since)
     reason = _park_reason(park[0]['payload'] or {}) if park else ''
     if hr is not None and not valid:
@@ -737,7 +758,10 @@ def rule_unexplained_wait(card: Card, src: Sources) -> Optional[Finding]:
     wait = (card.row or {}).get('wait') or {}
     agent = wait.get('agent_owned') if isinstance(wait, dict) and 'agent_owned' in wait else (kind in agent_kinds)
     since_w = _num(wait.get('waiting_since')) if isinstance(wait, dict) else None
-    waited_w = _age(now, since_w) if since_w is not None else waited
+    # A display projection is advisory; it cannot backdate this episode.
+    effective_since = max(t for t in (since, since_w) if t is not None) if any(
+        t is not None for t in (since, since_w)) else None
+    waited_w = _age(now, effective_since)
     if agent and waited_w is not None and waited_w > AGENT_BLOCK_S:
         handled = src.closeout_waking(card.board, card.id, wait.get('premise') if isinstance(wait, dict) else None)
         if handled:

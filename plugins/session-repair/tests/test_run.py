@@ -58,9 +58,50 @@ def fake_bin(monkeypatch):
     monkeypatch.setenv('SESSION_REPAIR_HERMES', 'hermes')
 
 
-def test_off_does_nothing(tmp_path):
+def test_off_does_not_scan_but_records_tick(tmp_path):
     out = run.tick(home=tmp_path, scanner=lambda: 1 / 0, run_mode='off')
-    assert out['line'] == '' and not (tmp_path / 'session-repair').exists()
+    assert out['line'] == ''
+    assert lines(tmp_path / 'session-repair' / 'ticks.jsonl')[0]['scanned'] is False
+
+
+def test_tick_journal_keeps_silent_scans_and_errors(tmp_path):
+    sd = tmp_path / 'session-repair'
+    scan = lambda: {'chats': 3, 'cards': 7, 'findings': [], 'errors': []}
+    for ts in (1000, 1900):
+        assert run.tick(home=tmp_path, scanner=scan, now=ts, run_mode='shadow')['line'] == ''
+    before = (sd / 'ticks.jsonl').read_bytes()
+    run.tick(home=tmp_path, scanner=lambda: {'errors': ['read failed'], 'findings': []}, run_mode='shadow')
+    assert (sd / 'ticks.jsonl').read_bytes().startswith(before), 'history appended unchanged'
+    rows = lines(sd / 'ticks.jsonl')
+    assert [r['ts'] for r in rows[:2]] == [1000, 1900]
+    assert rows[0]['mode'] == 'shadow' and rows[0]['chats'] == 3 and rows[0]['cards'] == 7
+    assert rows[0]['findings'] == 0 and rows[0]['errors'] == [] and rows[0]['duration_s'] >= 0
+    assert len(rows[0]['build']) == 64
+    assert rows[2]['errors'] == ['read failed'] and rows[2]['error_count'] == 1
+    def broken():
+        raise RuntimeError('scanner failed')
+    with pytest.raises(RuntimeError):
+        run.tick(home=tmp_path, scanner=broken, run_mode='shadow')
+    assert lines(sd / 'ticks.jsonl')[-1]['errors'] == ['RuntimeError: scanner failed']
+
+
+def test_tick_journal_records_lock_skip_and_failed_turn(tmp_path):
+    sd = run.state_dir(tmp_path)
+    with run._lock(sd):
+        run.tick(home=tmp_path, scanner=lambda: 1 / 0, run_mode='shadow')
+    assert lines(sd / 'ticks.jsonl')[-1]['skipped'] == 'locked'
+    run.tick(home=tmp_path, scanner=scanner([finding(1)]), runner=FakeHermes(rc=1), run_mode='live')
+    assert lines(sd / 'ticks.jsonl')[-1]['error_count'] == 1
+
+
+def test_tick_journal_rotates_whole_segments_with_bounded_size(tmp_path, monkeypatch):
+    sd = run.state_dir(tmp_path)
+    monkeypatch.setattr(run, 'TICK_LOG_MAX_BYTES', 100)
+    for i in range(30):
+        run._tick_summary(sd, {'ts': i, 'payload': 'x' * 30})
+    assert (sd / 'ticks.jsonl').stat().st_size <= 100
+    assert (sd / 'ticks.jsonl.1').stat().st_size <= 100
+    assert lines(sd / 'ticks.jsonl')[-1]['ts'] == 29
 
 
 def test_mode_comes_from_env_then_config_then_shadow(tmp_path, monkeypatch):
