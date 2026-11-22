@@ -424,10 +424,13 @@ class CoreReaders:
         if c is None:
             raise RuntimeError('session outcome unavailable')
         row = c.execute('SELECT outcome_json FROM sessions WHERE id=?', (session,)).fetchone()
+        if row is None:
+            # user-steps cannot establish ownership without the watched session's
+            # own stored row and correctly rejects that request with 404. Do not
+            # call it for a known-deleted recent chat or infer an ancestor owner.
+            return {'outcome_json': {}, 'requests': []}
         try:
-            # A deleted chat may remain in Desktop's recent/watch list. A successful
-            # lookup with no row is known empty, unlike a failed/unavailable read.
-            outcome = json.loads(row['outcome_json'] or '{}') if row else {}
+            outcome = json.loads(row['outcome_json'] or '{}')
         except (TypeError, ValueError):
             outcome = {}
         return {'outcome_json': outcome if isinstance(outcome, dict) else {},
