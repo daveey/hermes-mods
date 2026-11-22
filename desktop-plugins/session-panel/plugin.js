@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v17-collapse'
+const VERSION = 'session-panel-v18-cold-loading'
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 // Emoji-presentation glyphs the Desktop fonts draw as tofu (a Hermes-bug title carried "⛔"); the model strips them
 // too, this covers a cached older model.
@@ -237,13 +237,21 @@ export async function feedPass() {
   for (const t of feedTargets()) if (await feedCatchUp(t)) done.push(t)
   return done
 }
-/** Focus moved: register the chat with its gateway's feed now if that feed does not watch it yet. */
-export function feedFocus(route) {
-  if (!route?.connectionId || !route?.session) return
-  const st = feeds.get(connKey(route.connectionId, route.profile))
-  if (st?.unsupported || st?.sessions?.includes(route.session)) return
-  const t = feedTargets().find(x => x.connectionId === route.connectionId && (x.profile || 'default') === (route.profile || 'default'))
-  if (t) void feedCatchUp(t)
+/** Hydrate the focused model, not every warm chat. Registration is not proof of a model:
+ *  a failed backend read may return an empty bundle map after successfully recording interest.
+ *  Retry that cold path at most three times; transport serialization still bounds one request per connection. */
+export async function feedFocus(route, { wait = ms => new Promise(r => setTimeout(r, ms)), active = () => true } = {}) {
+  if (!route?.connectionId || !route?.session) return false
+  for (const delay of [0, 250, 750]) {
+    if (delay) await wait(delay)
+    if (!active()) return false
+    if (cachedModel(route)) return true
+    const st = feeds.get(connKey(route.connectionId, route.profile))
+    if (st?.unsupported) return false
+    await feedCatchUp({ connectionId: route.connectionId, profile: route.profile || 'default', sessions: [route.session] }, { full: true })
+    if (cachedModel(route)) return true
+  }
+  return false
 }
 
 
@@ -507,18 +515,34 @@ export function showsDecision(requestId, route = panelRoute()) {
   const model = cachedModel(route)
   return !!requestId && !!model && MODEL_SECTIONS.some(([section]) => model.sections?.[section]?.some(row => row?.decision?.request_id === requestId))
 }
+export function PendingModel({ waiting, onRetry }) {
+  return jsxs('div', { 'data-hub-model-pending': '', role: 'status', children: [
+    waiting ? 'Loading session status…' : 'Session status is taking longer than usual. ',
+    !waiting && jsx('button', { type: 'button', onClick: onRetry, children: 'Retry' })
+  ] })
+}
 export function Panel() {
   const [, tick] = useState(0)
+  const [retry, setRetry] = useState(0)
+  const [pending, setPending] = useState(null)
   useValue(host.state.focusedStoredSessionId)
   useValue(host.state.focusedSessionOwner || host.state.connectionId)
   useValue(host.state.connectionId)
   useValue(host.state.profile || host.state.connectionId)
   const route = panelRoute(), scope = routeKey(route)
   useEffect(() => { const fn = () => tick(v => v + 1); modelSubs.add(fn); return () => modelSubs.delete(fn) }, [])
-  useEffect(() => { noteRecent(route); feedFocus(route) }, [scope])
+  useEffect(() => {
+    let active = true
+    noteRecent(route)
+    setPending({ scope, waiting: true })
+    void feedFocus(route, { active: () => active }).then(() => {
+      if (active) setPending({ scope, waiting: false })
+    })
+    return () => { active = false }
+  }, [scope, retry])
   const model = cachedModel(route)
   if (!route.session) return null
-  if (!model) return jsx('div', { 'data-hub-model-pending': '', children: 'Hub status model not available yet.' })
+  if (!model) return jsx(PendingModel, { waiting: pending?.scope !== scope || pending.waiting, onRetry: () => setRetry(v => v + 1) })
   const collapsed = isCollapsed(model, readCollapsed(scope))
   return renderModel(model, {
     collapsed,

@@ -122,6 +122,34 @@ test('pending catch-ups merge sessions/flags and never overlap', async () => {
  assert.equal(calls.length, 2); assert.equal(most, 1)
  assert.deepEqual(calls[1].body.sessions, ['S2', 'S3']); assert.equal(calls[1].body.since, 0)
 })
+test('cold focus retries an empty registered session with a focused-only full read', async () => {
+ await m.feedCatchUp(target(['S1', 'warm']))
+ const waits = []
+ reply = req => calls.length < 3 ? answer() : answer({ bundles: { S1: bundle() } })
+ const ready = await m.feedFocus(route(), { wait: async ms => waits.push(ms) })
+ assert.equal(m.cachedModel(route())?.revision, 'r1', 'empty registration must not suppress model hydration')
+ assert.equal(ready, true)
+ assert.deepEqual(calls.slice(1).map(c => c.body.sessions), [['S1'], ['S1']])
+ assert.ok(calls.slice(1).every(c => c.body.since === 0))
+ assert.deepEqual(waits, [250])
+})
+test('cold focus bounds failed reads, stops on unmount and does not reread a cached model', async () => {
+ reply = () => { throw Error('timeout') }
+ assert.equal(await m.feedFocus(route(), { wait: async () => {} }), false)
+ assert.equal(calls.length, 3, 'not an unbounded polling loop')
+ let active = true
+ assert.equal(await m.feedFocus(route('S2'), { active: () => active, wait: async () => { active = false } }), false)
+ assert.equal(calls.length, 4, 'no retry after focus changes')
+ m.ingestBundle('C1', 'default', bundle())
+ assert.equal(await m.feedFocus(route()), true)
+ assert.equal(calls.length, 4)
+})
+test('cold focus does not retry unsupported feeds', async () => {
+ reply = () => { throw Error('404: plugin missing') }
+ assert.equal(await m.feedFocus(route(), { wait: async () => {} }), false)
+ assert.equal(calls.length, 1)
+})
+
 test('warm targets retain recent priority, sidebar recency, dedupe and bounds', () => {
  for (let i = 0; i < 10; i++) m.noteRecent(route(`recent-${i}`))
  const recent = m.readRecent()

@@ -39,6 +39,54 @@ const paint = tree => React.act(async () => root.render(tree))
 const publicCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./hub-model-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
 const privateCases = process.env.HERMES_PANEL_GOLDENS ? JSON.parse(readFileSync(process.env.HERMES_PANEL_GOLDENS, 'utf8')) : {}
 const cases = { ...publicCases, ...privateCases }
+test('mounted cold panel shows loading, retries the registered gap and removes the placeholder', async () => {
+ await paint(null); m.resetFeedForTests()
+ current = { connectionId: 'cold', profile: 'default', session: 'cold-chat' }
+ let release, calls = 0
+ const model = cases.named_parent.model
+ window.hermesDesktop = { api: async req => {
+   calls++
+   assert.deepEqual(req.body.sessions, ['cold-chat'])
+   if (calls === 1) return new Promise(r => { release = r })
+   return { feed: 'cold-feed', epoch: 'cold-epoch', rev: 1, bundles: { 'cold-chat': { session: 'cold-chat', model } } }
+ } }
+ try {
+   await paint(J.jsx(m.Panel, {}))
+   assert.match(document.querySelector('[role="status"]').textContent, /Loading session status/)
+   assert.doesNotMatch(document.body.textContent, /not available yet/)
+   await React.act(async () => { release({ feed: 'cold-feed', epoch: 'cold-epoch', rev: 0, bundles: {} }); await new Promise(r => setTimeout(r, 300)) })
+   assert.equal(calls, 2)
+   assert.ok(document.querySelector('[data-hub-model-pending]') === null, 'model arrival removes loading')
+   assert.ok(document.querySelector('[data-session-panel]'))
+ } finally {
+   await paint(null); delete window.hermesDesktop; m.resetFeedForTests()
+   current = { connectionId: 'conn', profile: 'default', session: 'chat' }
+ }
+})
+
+test('mounted cold panel offers explicit Retry after its bounded attempts, then recovers', async () => {
+ await paint(null); m.resetFeedForTests()
+ current = { connectionId: 'retry', profile: 'default', session: 'retry-chat' }
+ let calls = 0
+ window.hermesDesktop = { api: async () => {
+   if (++calls <= 3) throw Error('timeout')
+   return { feed: 'retry-feed', epoch: 'retry-epoch', rev: 1, bundles: { 'retry-chat': { session: 'retry-chat', model: cases.named_parent.model } } }
+ } }
+ try {
+   await paint(J.jsx(m.Panel, {}))
+   await React.act(async () => { await new Promise(r => setTimeout(r, 1100)) })
+   assert.equal(calls, 3)
+   assert.match(document.querySelector('[role="status"]').textContent, /taking longer than usual/)
+   assert.doesNotMatch(document.body.textContent, /not available yet/)
+   await React.act(async () => document.querySelector('[role="status"] button').click())
+   assert.equal(calls, 4)
+   assert.ok(document.querySelector('[data-hub-model-pending]') === null, 'manual retry hydrates the panel')
+ } finally {
+   await paint(null); delete window.hermesDesktop; m.resetFeedForTests()
+   current = { connectionId: 'conn', profile: 'default', session: 'chat' }
+ }
+})
+
 test('named dependency paints human title and a parent-card action', async () => {
  const model = cases.named_parent.model
  await paint(m.renderModel(model))

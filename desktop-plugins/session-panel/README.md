@@ -14,9 +14,16 @@ as plain text, never HTML or executable commands.
 
 Models cache in memory by exact connection/profile/stored-session scope, up to
 100 scopes. A route switch paints that scope's cached model synchronously while
-feed registration runs separately. A missing or unsupported model shows **Hub
-status model not available yet.** It never borrows another scope's model or derives
-a substitute from raw task fields. A bundle without a supported model invalidates
+feed registration runs separately. A missing model shows **Loading session status…**
+while the focused scope gets up to three focused-only full reads (immediate, then
+250 ms and 750 ms after the preceding attempt). A registered session is not a
+cached model: empty responses and transient failures still retry. Requests retain
+the existing 15-second bridge deadline and per-connection serialization; this is
+not a five-second availability guarantee under an overloaded backend. After those
+attempts, the placeholder says status is taking longer and offers **Retry**; changing
+focus/unmount stops further attempts. Unsupported feeds stop automatic retries.
+It never borrows another scope's model or derives a substitute from raw task fields.
+A bundle without a supported model invalidates
 only its own cached scope. Cached models are last-known presentation, not proof
 that a worker is still running; heartbeats never recompute their work states.
 
