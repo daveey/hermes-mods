@@ -79,14 +79,16 @@ def test_transport_record_and_receipt_are_independently_validated(tmp_path, fiel
     assert len(calls) == 1
 
 
-def test_remote_readback_requires_equal_fresh_receipt(tmp_path):
+@pytest.mark.parametrize('matching', [False, True])
+def test_remote_readback_requires_equal_fresh_receipt(tmp_path, matching):
     mirror, store, _, hr = fixture(tmp_path)
     mirror.remote.cards = lambda owner: [remote_row(hr)]
     mirror.remote.reconcile(OWNER)
     op = decide(store, store.requests(OWNER)[0])
     calls = []
     mirror.remote.deliver = lambda *args: calls.append(args) or {'fresh': 'receipt'}
-    assert not mirror.readback(op, {'stale': 'receipt'})
+    receipt = {'fresh': 'receipt'} if matching else {'stale': 'receipt'}
+    assert mirror.readback(op, receipt) is matching
     assert len(calls) == 1
 
 
@@ -301,7 +303,8 @@ def test_membership_hydrates_only_exact_chat_gateway_profile_board_target(tmp_pa
     exact = dict(remote_row(hr), origin_gateway='fixture-sync', origin_profile=OWNER['profile'])
     membership = [exact, dict(exact, id='wrong-chat', session='someone-else'),
                   dict(exact, id='wrong-origin', origin_gateway='another-origin'),
-                  dict(exact, id='wrong-profile', origin_profile='another-profile')]
+                  dict(exact, id='wrong-profile', origin_profile='another-profile'),
+                  dict(exact, id='local-target', gateway='fixture-sync')]
     owner = dict(OWNER, gatewayId='install:' + '0' * 32)
     try:
         reader = importlib.import_module('hermes_cli.kanban_session_activity')
