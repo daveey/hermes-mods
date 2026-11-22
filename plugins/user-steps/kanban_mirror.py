@@ -241,6 +241,8 @@ class Mirror:
         self.session_exists = session_exists or self._user_session
         self.session_present = session_present or session_exists or self._stored_session
         self.tip = tip or self._tip
+        if getattr(store, 'read_only', False):
+            return  # only the reconciliation producer owns schema initialization
         try:
             st = os.stat(store.path)
             ready = (str(store.path), st.st_dev, st.st_ino)

@@ -23,7 +23,8 @@ def test_panel_read_produces_canonical_request_without_legacy_poll(tmp_path, mon
     monkeypatch.setattr(api, '_load', load)
     # Only the store constructor is substituted; projection, immutable binding,
     # presentation and decision delivery all use the real producer/store.
-    monkeypatch.setattr(core, 'ActionStore', lambda: store)
+    store_type = core.ActionStore
+    monkeypatch.setattr(core, 'ActionStore', lambda **kwargs: store_type(store.path, **kwargs))
     requests = api.panel_requests(tmp_path, OWNER['storedSessionId'], [OWNER['storedSessionId']])
     assert len(requests) == 1
     assert requests[0]['presentation']['kind'] == 'kanban-question'

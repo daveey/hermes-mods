@@ -52,11 +52,14 @@ def _state_db(h: Optional[Path] = None) -> Path:
 def _ro_connect(path, timeout=10):
     """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
     so fall back to mode=rw + query_only, which reads the same data and never writes rows."""
+    c = None
     try:
         c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
         c.execute("select 1 from sqlite_master limit 1")
         return c
     except sqlite3.OperationalError:
+        if c is not None:
+            c.close()
         c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
         c.execute("PRAGMA query_only=ON")
         return c
@@ -2606,9 +2609,12 @@ class ActionStore:
     No fuzzy identity, cross-session search, or automatic compression/branch inheritance.
     Immutable revision documents are separate from resolution and delivery projections.
     """
-    def __init__(self, path=None, timeout=30):
+    def __init__(self, path=None, timeout=30, *, read_only=False):
         self.path = Path(path) if path else home() / 'user-steps' / 'actions.sqlite3'
         self.timeout = timeout
+        self.read_only = read_only
+        if read_only:
+            return  # presentation never initializes or migrates a producer's store
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_wal()
         with self._connect() as c:
@@ -2663,6 +2669,11 @@ class ActionStore:
             c.close()
 
     def _connect(self):
+        if self.read_only:
+            c = _ro_connect(self.path, timeout=self.timeout)
+            c.row_factory = sqlite3.Row
+            c.execute('PRAGMA query_only=ON')
+            return c
         c = sqlite3.connect(self.path, timeout=self.timeout)
         c.row_factory = sqlite3.Row
         c.execute('PRAGMA synchronous=FULL')
@@ -3385,12 +3396,31 @@ class ActionStore:
     def view(self, owner, rid):
         with self._read() as c: return self._view(c, owner, rid)
 
+    @staticmethod
+    def _project_view(row):
+        """Project already materialized bytes; no connection survives into this step."""
+        body = json.loads(row['body'])
+        body['state'] = row['state']
+        if row['resolution']:
+            body['resolution'] = json.loads(row['resolution'])
+        if row['created_at'] is not None:
+            body['createdAt'] = _iso(row['created_at'])
+        if body['state'] == 'withdrawn' and row['withdrawal']:
+            body['withdrawal'] = json.loads(row['withdrawal'])
+        return body
+
     def views(self, owner, *, include_withdrawn=False):
+        ns = self._ns(owner)
         with self._read() as c:
-            rows = c.execute('SELECT id, state FROM requests WHERE namespace=? AND session=? ORDER BY rowid',
-                             (self._ns(owner), owner['storedSessionId'])).fetchall()
-            return [self._view(c, owner, row['id']) for row in rows
-                    if include_withdrawn or row['state'] != 'withdrawn']
+            rows = c.execute(
+                'SELECT r.state,r.resolution,v.body,l.created_at,l.withdrawal '
+                'FROM requests r LEFT JOIN revisions v ON '
+                'r.namespace=v.namespace AND r.id=v.id AND r.revision=v.revision '
+                'LEFT JOIN lifecycle l ON r.namespace=l.namespace AND r.id=l.id '
+                'WHERE r.namespace=? AND r.session=? ORDER BY r.rowid',
+                (ns, owner['storedSessionId'])).fetchall()
+        return [self._project_view(row) for row in rows
+                if include_withdrawn or row['state'] != 'withdrawn']
 
     def created_at(self, owner, rid):
         with self._read() as c:

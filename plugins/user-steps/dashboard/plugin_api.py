@@ -149,7 +149,9 @@ def panel_requests(home: Path, session: str, lineage, *, reconcile=True) -> list
         raise core.ActionError('Panel profile does not match current profile', 409)
     if not core._row(core._state_db(), session):
         raise core.ActionError('Unknown stored session on this profile', 404)
-    st = core.ActionStore()
+    st = core.ActionStore() if reconcile else core.ActionStore(read_only=True)
+    if not reconcile and not st.path.exists():
+        return []  # a fresh profile has no producer store; readers must not create it
     producer = _load('kanban_mirror').Mirror(core, st)
     requests = []
     for sid in dict.fromkeys([*lineage, session]):
