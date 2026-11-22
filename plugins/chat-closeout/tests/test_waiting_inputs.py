@@ -554,6 +554,15 @@ def test_a_remote_cards_sync_stamp_alone_re_reconciles_nothing(world, monkeypatc
     assert poll() == first  # the same answer
     assert world['work']['reconcile_done'] == ['c3']  # the pass ran (a card read), and only c3's row moved
     assert world['work']['read_cards'] > 0
+    for field, moved in (('unfinished', True), ('status', 'blocked')):  # fields settlement reads stay in the key
+        kept = remote[field]
+        for at, value in ((210, moved), (211, kept)):
+            reset(world['work'])
+            remote[field] = value
+            _nudge(world, at if field == 'unfinished' else at + 10)
+            poll()
+            assert 'other' in world['work']['reconcile_done'], field
+    assert poll() == first
     reset(world['work'])
     remote['stale'] = True  # a verdict settlement does read
     _nudge(world, 201)
