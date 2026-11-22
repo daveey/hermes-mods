@@ -95,6 +95,54 @@ def test_new_blocked_human_card_appears_while_other_chat_reader_blocks():
         lane.close()
 
 
+def test_terminal_change_after_sweep_read_removes_waiting_and_survives_old_publication():
+    from test_feed import detail
+    for terminal in ('archived', 'done'):
+        r = Readers()
+        r.links['S2'] = [{**r.links['S2'][0], 'status': 'scheduled'}]
+        r.cards['t_dddddd4'] = detail('t_dddddd4', 'scheduled', session='S2')
+        f = feedmod.Feed(r, emit=lambda p: None)
+        f.changes(['S2'])
+        assert f.bundles['S2']['bundle']['model']['sections']['waiting']
+        entered, release = threading.Event(), threading.Event()
+        original = r.linked
+        def captured_before_change(ids):
+            rows = original(ids)
+            if threading.current_thread().name == 'stale-terminal-sweep':
+                entered.set()
+                assert release.wait(5)
+            return rows
+        r.linked = captured_before_change
+        r.events = [('t_dddddd4', 'S2')]
+        r.stamp += 1
+        sweep = threading.Thread(target=f.tick, name='stale-terminal-sweep')
+        sweep.start()
+        lane = feedmod.BoardLane(f, lambda: r)
+        try:
+            assert entered.wait(1)
+            # The archive/complete commits just after the older sweep read.
+            r.links['S2'] = []
+            r.finished['S2'] = [{'id': 't_dddddd4', 'status': terminal, 'board': 'default'}]
+            r.cards['t_dddddd4'] = detail('t_dddddd4', terminal, session='S2')
+            r.events = [('t_dddddd4', 'S2')]
+            r.stamp += 1
+            started = time.monotonic()
+            settle(lane)
+            model = f.bundles['S2']['bundle']['model']
+            assert model['sections']['waiting'] == [], 'terminal card remains in Waiting'
+            assert time.monotonic() - started < 1
+            assert not release.is_set()
+            release.set()
+            sweep.join(5)
+            assert not sweep.is_alive()
+            assert f.bundles['S2']['bundle']['model']['sections']['waiting'] == [], \
+                'older pre-terminal sweep resurrected Waiting'
+        finally:
+            release.set()
+            sweep.join(5)
+            lane.close()
+
+
 def test_reconciliation_blocks_neither_board_capture_nor_publication():
     r = Readers()
     f = feedmod.Feed(r, emit=lambda p: None)
