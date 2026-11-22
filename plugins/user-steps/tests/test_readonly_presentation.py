@@ -53,6 +53,117 @@ def test_materialized_views_close_before_projection_and_preserve_lifecycle(tmp_p
         reader.create(OWNER, request())
 
 
+def test_mirror_views_batch_owners_and_close_before_presentation(tmp_path, monkeypatch):
+    from test_kanban_mirror import fixture
+    mirror, store, _, _ = fixture(tmp_path)
+    mirror.reconcile(OWNER)
+    other = dict(OWNER, storedSessionId='second-session')
+    store.create(other, dict(request(), owner=other))
+    foreign = dict(OWNER, profile='other-profile')
+    store.create(foreign, dict(request(), owner=foreign))
+    owners = [OWNER, other]
+    expected = [mirror.present(r) for own in owners
+                for r in store.views(own, include_withdrawn=True)]
+    mirror.store = core.ActionStore(store.path, read_only=True)
+    opened, closed = [], []
+    original = sqlite3.connect
+
+    class Connection(sqlite3.Connection):
+        def close(self):
+            closed.append(self)
+            super().close()
+
+    def connect(*args, **kwargs):
+        assert kwargs.get('uri') and 'mode=ro' in str(args[0])
+        c = original(*args, **kwargs, factory=Connection)
+        opened.append(c)
+        return c
+
+    monkeypatch.setattr(core.sqlite3, 'connect', connect)
+    present = mirror.present
+
+    def checked(*args, **kwargs):
+        assert opened == closed
+        return present(*args, **kwargs)
+
+    monkeypatch.setattr(mirror, 'present', checked)
+    assert mirror.views(owners, include_withdrawn=True) == expected
+    assert len(opened) == 1
+    assert len(expected) == 2
+
+
+@pytest.mark.parametrize('retiring,corrupt', [(False, False), (True, False), (True, True)])
+def test_materialized_remote_presentation_preserves_binding_and_delivery(tmp_path, monkeypatch, retiring, corrupt):
+    from test_remote_card_state_machine import setup, depart
+    mirror, store, row, old, _ = setup(tmp_path)
+    monkeypatch.setattr(mirror.remote, '_age', lambda op: 4000)
+    if retiring:
+        depart(mirror, row, departure=False)
+    if corrupt:
+        with store._tx() as c:
+            c.execute("UPDATE kanban_projections SET request='{}'")
+    expected = [mirror.present(r) for r in store.views(OWNER, include_withdrawn=True)]
+    mirror.store = core.ActionStore(store.path, read_only=True)
+    original = sqlite3.connect
+    handles = []
+
+    def connect(*args, **kwargs):
+        c = original(*args, **kwargs)
+        handles.append(c)
+        return c
+
+    monkeypatch.setattr(core.sqlite3, 'connect', connect)
+    present = mirror.present
+
+    def checked(*args, **kwargs):
+        assert len(handles) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+            handles[0].execute('SELECT 1')
+        return present(*args, **kwargs)
+
+    monkeypatch.setattr(mirror, 'present', checked)
+    actual = mirror.views([OWNER], include_withdrawn=True)
+    assert actual == expected
+    assert len(handles) == 1
+    if retiring and not corrupt:
+        assert actual[0]['delivery']['unconfirmed'] is True
+    if corrupt:
+        assert 'presentation' not in actual[0]
+
+
+@pytest.mark.parametrize('broken', ['missing-operation', 'wrong-request', 'wrong-session', 'missing-display'])
+def test_materialized_remote_missing_or_mismatched_evidence_falls_back(tmp_path, broken):
+    import json
+    from test_remote_card_state_machine import setup, depart
+    mirror, store, row, old, op = setup(tmp_path)
+    depart(mirror, row, departure=False)
+    with store._tx() as c:
+        if broken == 'missing-display':
+            c.execute('DROP TABLE kanban_projection_display')
+        elif broken == 'missing-operation':
+            c.execute('DELETE FROM operations')
+        elif broken == 'wrong-session':
+            c.execute("UPDATE operations SET session='other-session'")
+        else:
+            body = store._operation(c, OWNER, op['operationId'])['operation']
+            body['requestId'] = 'another-request'
+            c.execute('UPDATE operations SET body=?', (json.dumps(body),))
+    expected = store.view(OWNER, old['requestId'])
+    mirror.store = core.ActionStore(store.path, read_only=True)
+    assert mirror.views([OWNER], include_withdrawn=True) == [expected]
+
+
+def test_materialized_plain_store_needs_no_mirror_tables(tmp_path):
+    from test_kanban_mirror import fixture
+    mirror, _, _, _ = fixture(tmp_path)
+    path = tmp_path / 'plain.sqlite3'
+    store = core.ActionStore(path)
+    r = store.create(OWNER, request())
+    mirror.store = core.ActionStore(path, read_only=True)
+    assert mirror.views([OWNER]) == [store.view(OWNER, r['requestId'])]
+    assert mirror.views([]) == []
+
+
 def test_panel_read_does_not_reconcile_or_initialize(tmp_path, monkeypatch):
     import importlib.util
     from pathlib import Path
