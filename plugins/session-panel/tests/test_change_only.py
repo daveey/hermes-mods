@@ -50,6 +50,27 @@ def test_admission_retry_is_bounded_even_when_source_stays_unreadable(warm):
     assert not f._wake.is_set()
 
 
+def test_external_commits_compare_captured_inputs_before_compute():
+    f, r, pushed, t = make()
+    values = {'S1': ('receipt-a',), 'S2': ('receipt-b',)}
+    r.external_stamps = lambda: r.stamp
+    r.external_capture = lambda held: {s: values[s] for s in held}
+    f.watch(['S1', 'S2'])
+    f.tick()
+    before = {s: b['bundle'] for s, b in f.bundles.items()}
+    for _ in range(10):
+        r.stamp += 1
+        r.events = []
+        f.tick()
+    assert all(f.bundles[s]['bundle'] is b for s, b in before.items())
+    values['S1'] = ('receipt-a-released',)
+    r.links['S1'][0]['title'] = 'Receipt changed'
+    r.stamp += 1
+    f.tick()
+    assert f.bundles['S2']['bundle'] is before['S2']
+    assert f.bundles['S1']['bundle']['tasks'][0]['title'] == 'Receipt changed'
+
+
 def test_open_work_is_aged_without_reading_unchanged_sources(monkeypatch):
     f, r, pushed, t = make()
     f.watch(['S1', 'S2'])

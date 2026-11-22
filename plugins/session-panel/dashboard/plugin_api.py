@@ -256,6 +256,34 @@ class CoreReaders:
             return tuple(out)
         return tuple((str(p), data_stamp(p) or stat(p)) for p in self.files() + [self.state_db()]) + self.external_stamps()
 
+    def external_capture(self, held):
+        """Materialize canonical external inputs once, then partition by chat.
+
+        Strict reads are essential here: stale-while-revalidate may return the old
+        value and consume the only notification for a committed receipt.
+        """
+        from hermes_cli import kanban_session_activity as ksa, kanban_db_sync as sync
+        from hermes_cli import kanban_chat_links as links
+        cards, history = ksa.remote_links_and_origin_rows(stale_ok=False)
+        rows = list(cards) + list(history)
+        if sync.sync_config().get('links_reader') == 'replica':
+            ids = list(dict.fromkeys(i for value in held.values() for i in value['lineage']))
+            unreadable = []
+            rows.extend(links.replica_cards(
+                ids, self.ksc.load_identity().gateway,
+                tuple(ksa.LISTED_STATUSES) + ('done', 'archived'),
+                stale_ok=False, origin_cards=cards, unreadable_out=unreadable))
+            if unreadable:
+                raise RuntimeError('session-panel external replica capture unavailable')
+        # Retain every field, including evidence timestamps: they affect lease
+        # validity. No presentation classifier or guessed volatile-field filter.
+        return {s: tuple(sorted(json.dumps(row, sort_keys=True, separators=(',', ':'))
+                                for row in rows
+                                if set(value['lineage']).intersection(
+                                    (row.get('session'), row.get('origin_session'), row.get('resolved_session')))
+                                or row.get('id') in value['refs']))
+                for s, value in held.items()}
+
     def external_stamps(self):
         return tuple((str(p), self._stat(p)) for p in self.external_paths())
 
