@@ -21,7 +21,7 @@ metadata:
 
 # Session status panel
 
-Compute presentation on the backend; render that snapshot on Desktop. The model is not permission to execute a choice. All paths below are relative to the hermes-mods repository; work in an isolated worktree, not its deployment checkout.
+Compute classification and wording on the backend; render that snapshot on Desktop. For clock-only feed churn, read `references/relative-display-times.md`. The model is not permission to execute a choice. All paths below are relative to the hermes-mods repository; work in an isolated worktree, not its deployment checkout.
 
 ## When to Use
 
@@ -94,6 +94,8 @@ Before the Node command, provision dependencies exactly as `.github/workflows/de
 For a private historical golden, retain raw input, observation time, source revision and expected output in private task attachments. Pin `now` and source clocks to the recorded snapshot; distinguish historical replay from current production. Never publish personal/employer/network details or normalize source identifiers/timestamps just to make a replay pass. Include local, remote, triage, C/A ordering, stale human block kind, retired requests, canonical header and consent boundaries. Inspect every resulting assertion and test exit code; missing dependencies or a timeout are not behavioral proof.
 
 ## Latency, producer contention and stale panels
+
+Before changing independent source admission or queue scheduling, read `references/source-admission-fairness.md` (external/board coverage, observation-only carriage, saturated FIFO service).
 
 When the panel disagrees with the board ("nothing running", missing dependency) or you change the feed producer, read `references/latency-and-freshness.md` first: how to read the timing and published-model files, compare transition times with the painted pass, find remote parents, and the producer design rules.
 
