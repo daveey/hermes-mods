@@ -285,6 +285,13 @@ class CoreReaders:
                 for s, value in held.items()}
 
     @staticmethod
+    def _pull_observation(row):
+        # canonical hub projections have no source='replica' tag. Only these
+        # known producers define synced_at as an observation, not task evidence.
+        return row.get('source') == 'replica' or (
+            row.get('remote') is True and row.get('via') == 'shepherd')
+
+    @staticmethod
     def external_semantic(captured):
         """Replica pull time is observation metadata, not a changed card.
 
@@ -296,7 +303,7 @@ class CoreReaders:
             return None
         rows = [json.loads(row) for row in captured]
         for row in rows:
-            if row.get('source') == 'replica':
+            if CoreReaders._pull_observation(row):
                 row.pop('synced_at', None)
         return tuple(sorted(json.dumps(row, sort_keys=True, separators=(',', ':')) for row in rows))
 
@@ -304,13 +311,14 @@ class CoreReaders:
     def advance_external(bundle, captured):
         """Pure observation carriage; never renew board reads or execution leases."""
         def identity(row):
-            return tuple(row.get(k) for k in ('gateway', 'profile', 'board', 'id', 'session'))
+            return tuple(row.get(k) for k in ('gateway', 'profile', 'board', 'id', 'session', 'source', 'via'))
         rows = [json.loads(row) for row in captured]
-        clocks = {identity(row): row.get('synced_at') for row in rows if row.get('source') == 'replica'}
+        clocks = {identity(row): row['synced_at'] for row in rows
+                  if CoreReaders._pull_observation(row) and 'synced_at' in row}
         result = dict(bundle)
         for field in ('tasks', 'done'):
             result[field] = [{**row, 'synced_at': clocks[identity(row)]}
-                             if row.get('source') == 'replica' and identity(row) in clocks else row
+                             if CoreReaders._pull_observation(row) and identity(row) in clocks else row
                              for row in bundle[field]]
         return result
 
