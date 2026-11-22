@@ -713,7 +713,7 @@ class Feed:
         """Settle a source pass atomically, with finite recovery of unread changes."""
         import copy
         names = ('_panel_stamps', '_panel_files', '_stamps', '_board_stamps',
-                 '_external_stamps', '_cursor')
+                 '_external_stamps', '_external_captures', '_cursor')
         saved = {name: copy.deepcopy(getattr(self, name, None)) for name in names}
         self._admission_retry_at = None
         try:
@@ -803,11 +803,22 @@ class Feed:
         if board_changes is not None:
             with self.lock:
                 dirty.update(s for s in watched if s in self.bundles and board_changes.affects(self.bundles[s]))
-        # Origin receipt/replica files have no board task-event cursor. Until
-        # their materialized per-session capture is compared, invalidate the
-        # entire interested set rather than silently missing a remote change.
+        # File activity is only admission to capture, not proof that every
+        # session's inputs changed. Compare canonical external rows per lineage.
         if external_dirty:
-            dirty.update(watched)
+            capture = getattr(self.readers, 'external_capture', None)
+            if callable(capture):
+                with self.lock:
+                    held = {s: {'lineage': set(self.bundles[s]['lineage']),
+                                'refs': set(self.bundles[s]['refs'])}
+                            if s in self.bundles else {'lineage': {s}, 'refs': set()}
+                            for s in watched}
+                captured = capture(held)
+                previous = getattr(self, '_external_captures', None) or {}
+                dirty.update(s for s in watched if captured[s] != previous.get(s))
+                self._external_captures = captured
+            else:  # Older/injected readers cannot attest unchanged external inputs.
+                dirty.update(watched)
         dirty.update(retry)
         dirty.update(panel_dirty)
         if not dirty:
