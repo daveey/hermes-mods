@@ -177,6 +177,7 @@ run they came from; the owner corrects them on its next run.
 
 A cleaned card whose producer is unchanged is a symptom fix. Find what wrote the card and what kept feeding it,
 and change that in the same session:
+- **For worker-hours alerts, re-read the installed updater policy before interpreting reclaim counts.** An earlier idle-only owner can be superseded by a later approved bounded automatic-debt drain. Verify the introducing state commit and actual attribution function: automatic drains may deliberately omit `explicit_operator`, so missing attribution is UNKNOWN, not proof of a routine-policy violation. Reclaim slot-hours overlap total occupancy and are not measured lost work. Keep frozen report, current owner-DB and fleet-replica denominators separate. Audit missing product markers before treating product CI/review/Hub titles as infrastructure; retain negative controls for genuine Hermes UI work mentioning that product.
 - **First check whether the producer was already fixed.** Grep the skills for the rule you are about to add. If
   it is there and the symptom continues, the cause is cards created before the fix or a skill copy that never
   reached the workers; say which, do not add the rule twice.
