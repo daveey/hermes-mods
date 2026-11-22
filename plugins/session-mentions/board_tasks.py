@@ -37,6 +37,60 @@ def target_parts(args):
     return board, gateway, target
 
 
+def _canonical_evidence(board, tid):
+    """Exact authenticated Board GET, after the same local grant gate as replica reads."""
+    from tools import kanban_tools as kt
+    from hermes_cli.kanban_sync_client import Hub, load_identity
+    from hermes_cli.kanban_db_connect import _main_db_file
+    from hermes_cli.kanban_db_sync import board_slug_for_path
+
+    with kt._granted_board(board, tid) as (_, live, _):
+        path = _main_db_file(live)
+        if not path or board_slug_for_path(path) != board:
+            return None
+        hub = Hub(load_identity(), timeout=5, deadline=time.monotonic() + 5)
+        try:
+            return hub.row_evidence(board, "tasks", tid)
+        finally:
+            hub.close()
+
+
+def canonical_reference(args):
+    """Offer a verified current identity, NEVER silently rebind a stale route.
+
+    Replica membership and HLC authorship are not rehome authority. Only the
+    authenticated Board's exact live row establishes the canonical identity.
+    No body, history, or write is returned, even for comment requests.
+    """
+    try:
+        board, gateway, tid = target_parts(args)
+        if not board or not gateway or not tid:
+            return None  # no cross-board or implicit-default search
+        evidence = _canonical_evidence(board, tid)
+        if not isinstance(evidence, dict) or any(evidence.get(k) != v for k, v in
+                (("board", board), ("table", "tasks"), ("uid", tid), ("state", "live"))):
+            return None
+        row = evidence.get("row")
+        if (not isinstance(row, dict) or row.get("uid") != tid or row.get("id") != tid
+                or row.get("deleted_at") is not None or row.get("delete_pending") != 0
+                or evidence.get("tombstone") is not None):
+            return None
+        owner = row.get("created_on")
+        if not isinstance(owner, str) or not re.fullmatch(r"[a-zA-Z0-9_.-]+", owner) or owner == gateway:
+            return None
+        ref = f"@task:{board}@{owner}/{tid}"
+        return {"ok": False, "rejection": "canonical_reference", "canonical_ref": ref,
+                "source": "authenticated_board_evidence", "board": board, "task_id": tid,
+                "requested_gateway": gateway, "canonical_owner": owner,
+                "error": f"The requested gateway `{gateway}` is unavailable. The authenticated Board identifies "
+                         f"this exact task at `{ref}`. Retry that reference explicitly. No request was rerouted; "
+                         "this verifies the current canonical identity, not the historical gateway binding."}
+    except Exception:
+        # Missing/older core, unknown/deleted task, denied board, ambiguity or
+        # unavailable authority: preserve the original refusal, never guess.
+        return None
+
+
 def handle(args):
     from tools import kanban_tools as kt
     from hermes_cli.kanban_foreign_card import open_replica, replica_path

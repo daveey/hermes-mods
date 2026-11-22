@@ -20,6 +20,24 @@ Cross-session transcripts and message sending still require Desktop. Tests: `tes
 (entry routing regression, real SQLite read projections, target validation, owner mismatch, missing
 replica and comment refusal). This mode does not install or enable the plugin by itself.
 
+## Unreachable explicit task gateways
+
+In the default Desktop/courier transport, an explicit task reference whose gateway
+no live courier can claim and the hub replica cannot route gets one bounded,
+authenticated exact-row Board lookup. The lookup uses the existing selected-board
+grant gate; there is no global task-id search or gateway alias. A live canonical
+row with matching board/table/uid/id and a different unambiguous `created_on`
+returns `ok=false`, `rejection=canonical_reference`, and the precise
+`@task:<board>@<canonical-owner>/<task-id>` to retry explicitly. This establishes
+current canonical identity only, not the historical gateway binding. It neither
+silently reroutes a read nor submits a comment, and exports no task body/history.
+Unknown/deleted/ambiguous rows, conflicting selectors, denied boards, missing
+core support and unavailable authority retain the original transport refusal.
+Bare IDs, reachable couriers and opt-in `board_replica` behavior are unchanged.
+Tests: `test_cross_task_hub_route.py` (retired route, isolation, ambiguous/unknown
+identity, no comment submission), `test_board_tasks.py` (grant-before-network,
+exact-row authority call, selected-board mismatch and connection closure).
+
 ## Failure analysis
 
 The sender previously forwarded legacy replica keys unchanged (`locate` stripped
