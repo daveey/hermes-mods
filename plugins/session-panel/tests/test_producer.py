@@ -510,7 +510,7 @@ def test_pending_retry_is_unvouched_until_a_source_event():
     assert 'S1' not in f._retry
 
 
-def test_failed_decision_read_stays_unvouched_until_source_event():
+def test_failed_decision_read_is_retried_a_bounded_number_of_times_then_waits_for_a_source_event():
     f, r, pushed, t = make(Stamped())
     f.changes(['S1'])
     f.refresh_decisions()
@@ -520,12 +520,18 @@ def test_failed_decision_read_stays_unvouched_until_source_event():
     f.refresh_decisions()
     assert f._decision_failures == {'S1'}
     f.tick()
-    assert f.idle_wait() == f.heartbeat_s
-    t['now'] += feedmod.RETRY_EVERY_S * 2
+    retries = 0
+    for _ in range(int(feedmod.RETRY_EVERY_S * 20)):
+        t['now'] += 1
+        f.beat()
+        if f._decide.is_set():
+            f._decide.clear()
+            retries += 1
+            f.refresh_decisions()
+    assert retries == feedmod.RETRY_STEPS, 'a failed read is retried, but never as an endless timer'
+    assert f.idle_wait() == f.heartbeat_s and f._decision_failures == {'S1'}
     r.decision_inputs = real
-    f.beat()
-    assert not f._decide.is_set() and f._decision_failures == {'S1'}
-    r.store += 1  # a real source event admits recovery, not the passage of time
+    r.store += 1  # after the budget, a real source event admits recovery
     f.refresh_decisions()
     assert not f._decision_failures
     f._decide.clear()
@@ -534,7 +540,7 @@ def test_failed_decision_read_stays_unvouched_until_source_event():
     assert not f._decide.is_set()
 
 
-def test_event_loop_keeps_failed_sources_unvouched_without_idle_reads(tmp_path, monkeypatch):
+def test_event_loop_recovers_a_failed_decision_read_without_board_reads_or_idle_polling(tmp_path, monkeypatch):
     api = load('_spf_due_api', API)
     if not api.FileWatch().ok:
         pytest.skip('no kernel file notification on this platform')
@@ -567,15 +573,15 @@ def test_event_loop_keeps_failed_sources_unvouched_without_idle_reads(tmp_path, 
             time.sleep(0.01)
         assert f._decision_failures == {'S1'}
         computed.clear()
-        time.sleep(4.2)  # beyond the old full and retry periods; no write at all
-        assert computed == [], 'elapsed time cannot authorize a board refresh'
-        assert f._decision_failures == {'S1'}, 'failed evidence remains unvouched'
-        r.store += 1
-        r.db.write_bytes(b'2')
-        deadline = time.monotonic() + 1
+        deadline = time.monotonic() + 2
         while f._decision_failures and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert not f._decision_failures, 'the next source event recovers within one second'
+        assert not f._decision_failures, 'the failed read is retried without another write'
+        reads = []
+        r.decision_inputs = lambda s, lineage: (reads.append(s), real_inputs(s, lineage))[1]
+        time.sleep(4.2)  # beyond the old full and retry periods; no write at all
+        assert computed == [], 'elapsed time cannot authorize a board refresh'
+        assert reads == [], 'recovered: no decision read without a source event'
     finally:
         f.stopped.set()
         for t in threads:

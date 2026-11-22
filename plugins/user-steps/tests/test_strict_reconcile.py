@@ -22,3 +22,14 @@ def test_strict_reconcile_propagates_local_deferred_without_changing_legacy_api(
     mirror.reconcile(OWNER)  # legacy callers still accept partial presentation
     with pytest.raises(RuntimeError, match='Card reconciliation deferred'):
         mirror.reconcile(OWNER, strict=True)
+
+
+def test_strict_reconcile_mirrors_local_cards_before_reporting_an_unavailable_remote(tmp_path, monkeypatch):
+    mirror, store, _, _ = fixture(tmp_path)
+
+    def gone(owner):
+        raise OSError('Remote ask owner projection unavailable')
+    monkeypatch.setattr(mirror.remote, 'snapshots', gone)
+    with pytest.raises(OSError, match='projection unavailable'):
+        mirror.reconcile(OWNER, strict=True)
+    assert store.views(OWNER), 'an optional remote projection never suppresses local cards'

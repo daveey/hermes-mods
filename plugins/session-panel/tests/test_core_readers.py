@@ -517,7 +517,7 @@ def test_batched_panel_stamps_equal_the_per_chat_stamp_and_leave_no_connection_a
     r = api.CoreReaders(state_db=tmp_path / 'state.db')
     ids = ['S1', 'S2', 'S3', 'never-stored']
     single = {s: r.panel_stamp(s) for s in ids}
-    assert len(single['S2'][1]) == 2 and single['S1'][1] == () and single['never-stored'] == (None, ())
+    assert len(single['S2'][1]) == 2 and single['S1'][1] == () and single['never-stored'] == (None, (), None)
     assert r.panel_stamps(ids) == single
     assert r.panel_stamps([]) == {}
     before = r.panel_files_stamp()

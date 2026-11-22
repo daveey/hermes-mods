@@ -51,6 +51,7 @@ CHUNK = 16                   # ...then the rest this many at a time, so a click 
 DECISION_FULL_EVERY_S = 30.0 # a chat whose decision inputs did not move is still re-read this often
 RETRY_EVERY_S = 2.0          # with no write to wake a pass: a read that failed or raced is tried again this often
 MIN_IDLE_WAIT_S = 0.2        # the event-driven loop never sleeps less than this between idle checks
+RETRY_STEPS = 3              # failed work is retried this many times without a source event (0.1, 0.2, 0.4 s)
 OPEN_KEYS = ('tasks', 'requests', 'subagents', 'processes', 'rentals')  # a bundle with any of these ages
 SNAPSHOT_VERSION = 1         # the on-disk shape of Feed.snapshot()
 RESTORE_REV_GAP = 1_000_000  # a restored feed's revisions start this far past the snapshot's (see Feed.restore)
@@ -146,6 +147,12 @@ class Feed:
         self._stamps: Any = None
         self._panel_stamps: dict[str, Any] = {}
         self._reconcile_stamps: dict[str, Any] = {}
+        # Failed work is retried a few times on a short backoff, then waits for the next source event.
+        # It is never an idle timer: with nothing failed there is no retry time at all.
+        self._reconcile_deferred: set[str] = set()   # producer work a reader could not finish
+        self._reconcile_failed = self._hydrate_failed = self._decision_failed = 0
+        self._reconcile_retry_at = self._hydrate_retry_at = self._decision_retry_at = None
+        self._attempted: set[str] = set()            # chats the current pass tried to hydrate
         self._panel_files: Any = None        # the files behind _panel_stamps, as last read
         self._decision_files: Any = None     # the same for the decision lane's last complete pass
         self._cursor: Any = None
@@ -293,6 +300,7 @@ class Feed:
         self.interest.pop(s, None)
         self._panel_stamps.pop(s, None)
         self._reconcile_stamps.pop(s, None)
+        getattr(self, '_reconcile_deferred', set()).discard(s)
         (getattr(self, '_external_observations', None) or {}).pop(s, None)
         (getattr(self, '_external_captures', None) or {}).pop(s, None)
         self.bundles.pop(s, None)
@@ -384,6 +392,11 @@ class Feed:
                     log.debug('session-panel canonical refresh failed: %s', s, exc_info=True)
             if not self.stopped.is_set():
                 self._decision_files = moved if stamps else None
+            # A failed read is not consumed source work: retry it without waiting for another write.
+            with self.lock:
+                failing = bool(self._decision_failures.intersection(held))
+            self._decision_failed = getattr(self, '_decision_failed', 0) + 1 if failing else 0
+            self._decision_retry_at = self._backoff(self._decision_failed) if failing else None
             return count
         finally:
             self._decision_lock.release()
@@ -685,6 +698,10 @@ class Feed:
                 or any(self.bundles[s]['bundle'].get(k) for k in OPEN_KEYS)
                 or now - self.bundles[s]['bundle'].get('computed_at', 0) >= QUIET_FULL_EVERY_S}
 
+    def _backoff(self, attempt: int) -> Optional[float]:
+        """When failed work is next retried without a source event: RETRY_STEPS times, then not at all."""
+        return self.clock() + 0.1 * (2 ** (attempt - 1)) if attempt <= RETRY_STEPS else None
+
     def _due(self, now: float) -> tuple:
         """A cold, unattempted registration is due; time alone never admits DB work.
 
@@ -697,9 +714,11 @@ class Feed:
         # Time-derived presentation is reduced from held inputs by beat().
         with self.lock:
             missing = any(s not in self.bundles and s not in self.failures for s in self.interest)
-        retry_at = getattr(self, '_admission_retry_at', None)
-        retry_wait = max(0.0, retry_at - now) if retry_at is not None else None
-        return (0.0 if missing else retry_wait), None
+        ats = [at for at in (getattr(self, n, None) for n in
+                             ('_admission_retry_at', '_hydrate_retry_at', '_reconcile_retry_at')) if at is not None]
+        retry_wait = max(0.0, min(ats) - now) if ats else None
+        decide_at = getattr(self, '_decision_retry_at', None)
+        return (0.0 if missing else retry_wait), (None if decide_at is None else max(0.0, decide_at - now))
 
     def idle_wait(self) -> float:
         """How long the event-driven loop sleeps when no file is written: to the liveness heartbeat, or sooner when
@@ -720,6 +739,7 @@ class Feed:
         if due is not None and due <= 0:
             self._wake.set()
         if decide is not None and decide <= 0:
+            self._decision_retry_at = None  # handed to the decision lane once; its pass re-arms on failure
             self._decide.set()
         return len(self._publish({}, heartbeat=True, age_only=now - self.last_emit >= self.heartbeat_s))
 
@@ -730,6 +750,8 @@ class Feed:
                  '_external_stamps', '_external_captures', '_external_observations', '_cursor', '_reconcile_stamps')
         saved = {name: copy.deepcopy(getattr(self, name, None)) for name in names}
         self._admission_retry_at = None
+        self._hydrate_retry_at = None  # this pass is the retry; it re-arms below when a chat still fails
+        self._attempted = set()
         try:
             result = self._tick()
         except Exception:
@@ -745,10 +767,16 @@ class Feed:
                         self.failures.setdefault(s, {'count': 0, 'at': self.clock(), 'error': 'source capture failed'})
             attempt = getattr(self, '_admission_failures', 0) + 1
             self._admission_failures = attempt
-            if attempt <= 3:
-                self._admission_retry_at = self.clock() + 0.1 * (2 ** (attempt - 1))
+            self._admission_retry_at = self._backoff(attempt)
             raise
         self._admission_failures = 0
+        # A chat whose hydration failed was caught inside the pass, after its source event was consumed.
+        # Keep it unvouched and due again: the same event must not need another write to be shown.
+        with self.lock:
+            failed = {s for s in self._attempted if s in self.failures and s in self.interest}
+            self._retry.update(failed)
+        self._hydrate_failed = getattr(self, '_hydrate_failed', 0) + 1 if failed else 0
+        self._hydrate_retry_at = self._backoff(self._hydrate_failed) if failed else None
         return result
 
     def _tick(self) -> int:
@@ -762,6 +790,12 @@ class Feed:
         with self.lock:
             self._expire(now)
         self._drain()
+        # Consumed here, whatever this pass goes on to do: a due retry time that outlived its chats
+        # must never keep the idle loop awake.
+        retry_at = getattr(self, '_reconcile_retry_at', None)
+        redo: set = set()
+        if retry_at is not None and now >= retry_at:
+            redo, self._reconcile_retry_at = set(self._reconcile_deferred), None
         with self.lock:
             watched = list(self.interest)
             self._publish_wire()
@@ -779,11 +813,21 @@ class Feed:
         # remains conservative; unchanged presentation is still never hydrated.
         if reconcile_enabled and callable(reconcile):
             admitted = [s for s in watched if s not in self._reconcile_stamps
-                        or self._reconcile_stamps[s] != source_seen]
+                        or self._reconcile_stamps[s] != source_seen or s in redo]
             if admitted:
-                reconcile(admitted)
+                # A reader that isolates per-chat failures returns the chats it could not finish; one that
+                # raises fails the pass (tick() then restores every cursor).
+                left = {s for s in (reconcile(admitted) or ()) if s in admitted}
                 with self.lock:
                     self._reconcile_stamps.update((s, source_seen) for s in admitted if s in self.interest)
+                    self._reconcile_deferred = {s for s in (self._reconcile_deferred - set(admitted)) | left
+                                                if s in self.interest}
+                    waiting = bool(self._reconcile_deferred)
+                if left:
+                    self._reconcile_failed = getattr(self, '_reconcile_failed', 0) + 1
+                    self._reconcile_retry_at = self._backoff(self._reconcile_failed)
+                elif not waiting:
+                    self._reconcile_failed, self._reconcile_retry_at = 0, None
         panel_dirty = self._panel_dirty(watched)
         stamps = self.readers.stamps()
         external = getattr(self.readers, 'external_stamps', None)
@@ -884,6 +928,7 @@ class Feed:
             # A focused chat alone (its reader waits for exactly it), then the rest asked for, then the sweep.
             chunk = self._focus[:1] or cold[:FIRST_CHUNK] or sorted(pending)[:CHUNK]
             tried.update(chunk)
+            self._attempted.update(chunk)
             pending.difference_update(chunk)
             pushed += len(self._publish(self._compute_all(chunk, refresh=True), heartbeat=True))
         self.last_tick_s = time.monotonic() - started

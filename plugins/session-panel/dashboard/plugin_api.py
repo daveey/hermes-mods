@@ -622,25 +622,30 @@ class CoreReaders:
                                            ids=ids, statuses=statuses)
 
     def panel_stamp(self, session):
-        """Cheap per-session outcome/request invalidation; no board hydration."""
+        """Cheap per-session outcome/request/membership invalidation; no board hydration.
+
+        The third value moves when the chat's row appears, disappears or changes parent: a lineage
+        change (attach, detach, deleted ancestor) moves no outcome and no request of the held lineage."""
         c = self.conn(self.state_db())
         try:
-            row = c.execute('SELECT outcome_json FROM sessions WHERE id=?', (session,)).fetchone() if c else None
+            row = c.execute('SELECT outcome_json,parent_session_id FROM sessions WHERE id=?', (session,)).fetchone() if c else None
             outcome = row['outcome_json'] if row else None
+            member = (row['parent_session_id'] or '') if row else None
         except sqlite3.Error:
-            outcome = None
+            outcome = member = None
         c = self.conn(self.state_db().parent / 'user-steps' / 'actions.sqlite3')
         try:
             requests = tuple(tuple(r) for r in c.execute('SELECT id,revision,state,resolution FROM requests WHERE session=? ORDER BY id', (session,))) if c else ()
         except sqlite3.Error:
             requests = None
-        return (outcome, requests)
+        return (outcome, requests, member)
 
     def panel_stamps(self, sessions):
-        """`panel_stamp` for many chats in two reads per 400 (not two per chat): {session: (outcome, requests)},
-        every asked chat present, each value exactly what `panel_stamp` returns for it."""
+        """`panel_stamp` for many chats in two reads per 400 (not two per chat): {session: (outcome, requests,
+        membership)}, every asked chat present, each value exactly what `panel_stamp` returns for it."""
         ids = list(dict.fromkeys(str(s) for s in sessions))
         outcomes: dict = {}
+        members: dict = {}
         requests: dict = {s: [] for s in ids}
         state = self.conn(self.state_db())
         actions = self.conn(self.state_db().parent / 'user-steps' / 'actions.sqlite3')
@@ -649,11 +654,13 @@ class CoreReaders:
             marks = ','.join('?' * len(part))
             try:
                 if state:
-                    for row in state.execute(f'SELECT id,outcome_json FROM sessions WHERE id IN ({marks})', part):
+                    for row in state.execute(f'SELECT id,outcome_json,parent_session_id FROM sessions WHERE id IN ({marks})', part):
                         outcomes[row['id']] = row['outcome_json']
+                        members[row['id']] = row['parent_session_id'] or ''
             except sqlite3.Error:
                 for s in part:
                     outcomes.pop(s, None)
+                    members.pop(s, None)
             try:
                 if actions:
                     for row in actions.execute('SELECT session,id,revision,state,resolution FROM requests '
@@ -663,7 +670,7 @@ class CoreReaders:
             except sqlite3.Error:
                 for s in part:
                     requests[s] = None
-        return {s: (outcomes.get(s), None if requests[s] is None else tuple(requests[s])) for s in ids}
+        return {s: (outcomes.get(s), None if requests[s] is None else tuple(requests[s]), members.get(s)) for s in ids}
 
     def board_stamps(self):
         """`stamps()` for the board files alone (no state.db)."""
@@ -729,8 +736,18 @@ class CoreReaders:
         capture API.
         """
         api = self._user_step_api()
+        deferred = set()
         for session in sessions:
-            api.panel_reconcile(self.state_db().parent, session, self.lineage(session))
+            # One chat's unavailable source must not fail every other chat's pass (this phase runs
+            # before all hydration). The feed retries what is returned here; it is never certified.
+            try:
+                left = api.panel_reconcile(self.state_db().parent, session, self.lineage(session))
+            except Exception as exc:
+                left = [f'{type(exc).__name__}: {exc}']
+            if left:
+                deferred.add(session)
+                log.debug('session-panel source reconciliation deferred: %s: %s', session, left)
+        return deferred
 
     def reconcile_user_steps(self, session, lineage):
         return self._user_step_requests(session, lineage, reconcile=True)
@@ -1469,7 +1486,13 @@ def _run_decisions(f) -> None:
             if not first:
                 # Startup, explicit registration and source events only. A
                 # refused watcher must never turn this lane into a poller.
-                f._decide.wait()
+                # A failed read's bounded retry (Feed._backoff) is the one timed wake.
+                retry_at = getattr(f, '_decision_retry_at', None)
+                if retry_at is None:
+                    f._decide.wait()
+                else:
+                    f._decide.wait(max(0.0, retry_at - f.clock()))
+                    f._decision_retry_at = None  # consumed: the pass re-arms it while a read still fails
                 f.stopped.wait(max(DEBOUNCE_S, MIN_GAP_S - (time.monotonic() - started)))
             if f.stopped.is_set():
                 break

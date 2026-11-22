@@ -205,18 +205,28 @@ def panel_requests_many(home: Path, lineages) -> dict:
             for sid, group in scopes.items()}
 
 
-def panel_reconcile(home: Path, session: str, lineage) -> None:
-    """Source-event producer, separate from read-only panel presentation."""
+def panel_reconcile(home: Path, session: str, lineage) -> list:
+    """Source-event producer, separate from read-only panel presentation.
+
+    Returns what stayed deferred, one line per owner ([] = every owner reconciled). One owner's
+    unavailable source (a host with no hub projection, a busy store) neither stops the other owners
+    nor fails the caller's pass: the caller retries the deferred work, it does not certify it.
+    """
     core = _load('core')
     try:
         owners = panel_owners(home, session, lineage)
     except core.ActionError as exc:
         if exc.status != 404:
             raise
-        return  # queried absent own session, not failed source or failed reconciliation
+        return []  # queried absent own session, not failed source or failed reconciliation
     producer = _load('kanban_mirror').Mirror(core, core.ActionStore())
+    deferred = []
     for own in owners:
-        producer.reconcile(own, strict=True)
+        try:
+            producer.reconcile(own, strict=True)
+        except Exception as exc:
+            deferred.append(f"{own['storedSessionId']}: {type(exc).__name__}: {exc}"[:300])
+    return deferred
 
 
 def panel_requests(home: Path, session: str, lineage, *, reconcile=True) -> list:
