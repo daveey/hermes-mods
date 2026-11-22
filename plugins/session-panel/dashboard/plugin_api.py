@@ -142,10 +142,13 @@ def _load_feed():
             # one with no successor was stopped by this plugin's unload during the same reload (loading plugin_api.py
             # means the plugin is being loaded, not disabled), so it is resumed too instead of waiting for a request.
             if running is not None and getattr(running, '_successor', None) is None:
+                if getattr(_LOADER, 'facts_registration', None) is not None:
+                    _LOADER.facts_transition_pending = True
                 running.stopped.set()
                 restart = True
     if restart:  # resume it now, not at the next request: pushes and heartbeats continue
-        threading.Thread(target=feed, name='session-panel-feed-resume', daemon=True).start()
+        target = _resume_facts_reload if getattr(_LOADER, 'facts_registration', None) is not None else feed
+        threading.Thread(target=target, name='session-panel-feed-resume', daemon=True).start()
     return mod
 
 
@@ -1315,6 +1318,10 @@ def feed():
         with core.PROCESS_LOCK:
             if sys.modules.get(_FEED_KEY) is not core:
                 continue  # a reload swapped the module (under this same lock) after we loaded it: use the new one
+            # Startup/reload callers cannot replace a predecessor still owned by
+            # a cutover. Failed joins retain this fence until a later join succeeds.
+            if getattr(_LOADER, 'facts_transition_pending', False):
+                return core.PROCESS_FEED
             if core.PROCESS_FEED is None or core.PROCESS_FEED.stopped.is_set():
                 readers = None if getattr(_LOADER, 'facts_mode', 'legacy') == 'facts' else CoreReaders()
                 prev, new = core.PROCESS_FEED, core.Feed(readers, emit=_emit)
@@ -1344,6 +1351,10 @@ def feed():
                     new._feed_thread = threading.Thread(target=_run_facts, args=(new, adapter), name='session-panel-facts', daemon=True)
                 else:
                     new._feed_thread = threading.Thread(target=_run, args=(new,), name='session-panel-feed', daemon=True)
+                readiness = getattr(_LOADER, 'facts_registration', None)
+                if readiness is not None:
+                    new._facts_readiness = readiness.wake
+                    readiness.wake.set()
                 core.PROCESS_FEED = new
                 new._feed_thread.start()
             if getattr(core.PROCESS_FEED, '_facts_mode', False):
@@ -1381,44 +1392,48 @@ def install_facts(v1, scope, handle):
     call this entry point and continue to use the installed legacy lanes.
     """
     core = _load_feed()
+    previous = getattr(_LOADER, 'facts_registration', None)
+    if previous is not None:
+        previous.close()
     with core.PROCESS_LOCK:
-        previous = getattr(_LOADER, 'facts_registration', None)
-        if previous is not None:
-            previous.close()
         _LOADER.facts_v1, _LOADER.facts_scope = v1, scope
         _LOADER.facts_handle = handle
         _LOADER.facts_ready = None
     registration = v1.bind_consumer('panel', scope, _facts_mode_changed)
-    _LOADER.facts_registration = registration
-    _warm_facts()
-    return registration
+    readiness = core.PanelReadiness(v1, scope, _warm_facts)
+    readiness.registration = registration
+    _LOADER.facts_registration = readiness
+    if core.PROCESS_FEED is not None:
+        core.PROCESS_FEED._facts_readiness = readiness.wake
+    return readiness
 
 
 def _warm_facts():
     """Background readiness only: no consumer claims readiness for cold panels."""
+    if getattr(_LOADER, 'facts_transition_pending', False):
+        return False, None
     v1 = getattr(_LOADER, 'facts_v1', None)
     if v1 is None:
-        return
+        return False, None
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     if f is None:
-        return  # readiness is reported after the real publisher exists
+        return False, None  # readiness awaits the real publisher
     with f.lock:
+        f._drain()
         sessions = tuple(f.interest)
     snapshot = v1.snapshot(_LOADER.facts_scope)
     ready = True
+    now, deadlines = f.clock(), []
     for session in sessions:
         view = snapshot.view('panel_bundle', {'session': session})
         fact = snapshot.get(v1.key(_LOADER.facts_scope, 'ChatWaitingFact', session))
-        if not isinstance(view, v1.Ready) or fact is None or fact.health != 'fresh':
+        if fact is not None and fact.valid_until is not None and fact.valid_until > now:
+            deadlines.append(fact.valid_until)
+        if (not isinstance(view, v1.Ready) or fact is None or fact.health != 'fresh'
+                or (fact.valid_until is not None and fact.valid_until <= now)):
             ready = False
             _LOADER.facts_handle.demand('panel_bundle', {'session': session})
-    if ready != _LOADER.facts_ready:
-        _LOADER.facts_ready = ready
-        # A facade may invoke its latch callback synchronously. Never ask the
-        # reader lane to join itself while withdrawing legacy admission.
-        threading.Thread(target=v1.report_ready, args=('panel', _LOADER.facts_scope),
-                         kwargs={'version': 1, 'ready': ready},
-                         name='session-panel-facts-ready', daemon=True).start()
+    return ready, (max(0.0, min(deadlines) - now) if deadlines else None)
 
 
 def _quiesce(f, timeout=25.0):
@@ -1455,22 +1470,30 @@ def _facts_mode_changed(mode, generation):
             if mode == current_mode and (previous is None or not previous.stopped.is_set()):
                 _LOADER.facts_generation = generation
                 return
-        # Do not hold the feed's process lock while joining its workers.
+            _LOADER.facts_transition_pending = True
+        # Do not hold the feed's process lock while joining its workers. Never
+        # clear custody or restart on timeout: a reader may still hold a DB pass.
         if previous is not None and not _quiesce(previous):
-            if mode == 'facts':
-                # The attempted cutover fenced old publication but did not gain
-                # source exclusivity. Resume legacy; never subscribe concurrently.
-                with core.PROCESS_LOCK:
-                    _LOADER.facts_mode = 'legacy'
-                feed()
-                raise RuntimeError('panel reader did not quiesce; facts activation refused')
+            raise RuntimeError('panel reader did not quiesce; mode transition refused')
+        if previous is not None:
             adapter = getattr(previous, '_fact_subscription', None)
             if adapter is not None:
                 adapter.close()
         with core.PROCESS_LOCK:
             _LOADER.facts_mode = mode
             _LOADER.facts_generation = generation
+            _LOADER.facts_transition_pending = False
         feed()
+
+
+def _resume_facts_reload():
+    """Reload uses the same quiescence/custody gate as a mode transition."""
+    try:
+        _facts_mode_changed(getattr(_LOADER, 'facts_mode', 'legacy'),
+                            getattr(_LOADER, 'facts_generation', 0))
+    except Exception:
+        log.warning('session-panel reload held until predecessor quiesces', exc_info=True)
+        _LOADER.facts_registration.wake.set()
 
 
 def _run_facts(f, adapter):
@@ -1877,10 +1900,9 @@ def _run(f) -> None:
             except Exception:
                 log.warning('session-panel feed tick failed', exc_info=True)
             f.readers.release()  # no connection outlives one pass
-            try:
-                _warm_facts()
-            except Exception:
-                log.warning('session-panel fact prewarm unavailable; retaining legacy', exc_info=True)
+            readiness = getattr(f, '_facts_readiness', None)
+            if readiness is not None:
+                readiness.set()
             write_timing(f)  # after every pass (at most one per MIN_GAP_S): the 1 s freshness target is read from it
             with f.lock:
                 state = (f.rev, frozenset(f.interest))
@@ -2006,6 +2028,11 @@ async def decision_refresh(body: DecisionRefreshBody):
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     if f is None or f.stopped.is_set():
         raise HTTPException(503, 'Session panel starting')
+    if getattr(f, '_facts_mode', False):
+        held = f._fact_subscription.decision_wires.get(body.session)
+        if held is None or (held[1] is not None and held[1] <= f.clock()):
+            raise HTTPException(503, 'Session panel decision pending', headers={'Retry-After': '1'})
+        return Response(_WIRE_PREFIX + held[0][1:], media_type='application/json')
     def read():
         readers = CoreReaders()
         try:
@@ -2013,9 +2040,7 @@ async def decision_refresh(body: DecisionRefreshBody):
             b = result['bundle']
             # Decision repaint must not enqueue megabytes of historical raw card
             # details on the same Desktop tunnel as the next interactive click.
-            result['bundle'] = {k: b[k] for k in ('session', 'lineage', 'model')}
-            result['bundle']['tasks'] = [{k: t[k] for k in ('id', 'gateway', 'profile', 'board') if k in t}
-                                         for t in b.get('tasks', [])]
+            result['bundle'] = f.decision_projection(b)
             return json_safe({'feed': FEED_ID, 'profile': LAUNCH_PROFILE, **result})
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
