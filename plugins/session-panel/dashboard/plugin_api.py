@@ -1570,6 +1570,7 @@ def _run_decisions(f) -> None:
 def _run_board(f, lane_type) -> None:
     """Source admission stays responsive while reconciliation or another chat blocks."""
     lane = lane_type(f, CoreReaders)
+    lane.start_service()
     first = True
     try:
         while not f.stopped.is_set():

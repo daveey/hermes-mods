@@ -25,44 +25,99 @@ class BoardLane:
         self.capture_retry_at = None
         self.attempted_stamp = object()
         self.external_captures = {}
+        self.service_wake = threading.Event()
+        self.service_stop = threading.Event()
+        self.service_worker = None
+
+    def start_service(self):
+        """Refill admitted slots on completions, never behind source recapture.
+
+        The capture thread remains the sole cursor/external-snapshot owner.
+        The service thread does no source I/O; scheduler state shares feed.lock.
+        """
+        with self.feed.lock:
+            if self.service_worker is not None:
+                return
+            self.service_worker = threading.Thread(target=self._serve,
+                name='session-panel-card-service', daemon=True)
+            self.service_worker.start()
+        self.service_wake.set()
+
+    def _serve(self):
+        while not self.service_stop.is_set():
+            self.service_wake.wait()
+            self.service_wake.clear()
+            if self.service_stop.is_set() or self.feed.stopped.is_set():
+                break
+            self.service()
 
     def close(self):
         # Reader ownership stays in each worker, even across unload. Publication
         # is stopped by Feed.stopped; never close another thread's SQLite handles.
-        self.pending.clear()
-        for worker in list(self.active.values()):
+        self.service_stop.set()
+        self.service_wake.set()
+        if self.service_worker is not None:
+            self.service_worker.join(2)
+        with self.feed.lock:
+            self.pending.clear()
+            workers = list(self.active.values())
+        for worker in workers:
             worker.join(2)
 
     def retry_at(self):
-        ats = [at for _, at in self.retries.values() if at is not None]
-        if self.capture_retry_at is not None:
-            ats.append(self.capture_retry_at)
-        return min(ats) if ats else None
+        with self.feed.lock:
+            ats = [at for _, at in self.retries.values() if at is not None]
+            if self.capture_retry_at is not None:
+                ats.append(self.capture_retry_at)
+            return min(ats) if ats else None
+
+    def service(self):
+        """Drain completions and refill FIFO slots without recapturing sources."""
+        f = self.feed
+        with f.lock:
+            if self.service_stop.is_set() or f.stopped.is_set():
+                return
+            now = f.clock()
+            while True:
+                try:
+                    session, token, error = self.completed.get_nowait()
+                except queue.Empty:
+                    break
+                self.active.pop(session, None)
+                if f._watch_tokens.get(session) is not token:
+                    self.retries.pop(session, None)
+                    continue
+                if error:
+                    count = self.retries.get(session, (0, None))[0] + 1
+                    self.retries[session] = (count, f._backoff(count))
+                else:
+                    self.retries.pop(session, None)
+            for session, (_, at) in list(self.retries.items()):
+                if at is not None and now >= at:
+                    self.pending.setdefault(session, time.time())
+                    self.retries[session] = (self.retries[session][0], None)
+            for session in sorted(self.pending, key=self.pending.get):
+                if len(self.active) >= self.capacity:
+                    break
+                if session in self.active:
+                    continue
+                held = f.bundles.get(session)
+                token = f._watch_tokens.get(session)
+                if session not in f.interest or not held or token is None:
+                    self.pending.pop(session, None)
+                    continue
+                admitted_at = self.pending.pop(session)
+                worker = threading.Thread(target=self._read,
+                    args=(session, token, held['bundle'], admitted_at),
+                    name='session-panel-card-' + session[:12], daemon=True)
+                self.active[session] = worker
+                worker.start()
 
     def step(self):
         f = self.feed
         f._board.clear()  # writes/completions during capture wake another pass
         now = f.clock()
-        while True:
-            try:
-                session, token, error = self.completed.get_nowait()
-            except queue.Empty:
-                break
-            self.active.pop(session, None)
-            with f.lock:
-                current = f._watch_tokens.get(session) is token
-            if not current:
-                self.retries.pop(session, None)
-                continue
-            if error:
-                count = self.retries.get(session, (0, None))[0] + 1
-                self.retries[session] = (count, f._backoff(count))
-            else:
-                self.retries.pop(session, None)
-        for session, (_, at) in list(self.retries.items()):
-            if at is not None and now >= at:
-                self.pending.setdefault(session, time.time())
-                self.retries[session] = (self.retries[session][0], None)
+        self.service()
         capture_started = time.time()
         rd = self.reader_factory()
         stamp = None
@@ -111,7 +166,7 @@ class BoardLane:
                     with f.lock:
                         self.pending.setdefault(session, at)  # retain the oldest unserved admission
                         f._board_failures.add(session)
-                    self.retries.pop(session, None)  # a real source event renews finite recovery
+                        self.retries.pop(session, None)  # a real source event renews finite recovery
                 self.external_captures = captured
                 self.cursor, self.stamp = cursor, stamp
                 self.capture_failures, self.capture_retry_at = 0, None
@@ -124,23 +179,8 @@ class BoardLane:
             log.warning('session-panel board capture failed', exc_info=True)
         finally:
             rd.release()
-        for session in sorted(self.pending, key=self.pending.get):
-            if len(self.active) >= self.capacity:
-                break
-            if session in self.active:
-                continue
-            with f.lock:
-                held = f.bundles.get(session)
-                token = f._watch_tokens.get(session)
-                if session not in f.interest or not held or token is None:
-                    self.pending.pop(session, None)
-                    continue
-                base = held['bundle']
-            admitted_at = self.pending.pop(session)
-            worker = threading.Thread(target=self._read, args=(session, token, base, admitted_at),
-                                      name='session-panel-card-' + session[:12], daemon=True)
-            self.active[session] = worker
-            worker.start()
+        self.service_wake.set()
+        self.service()
 
     def _read(self, session, token, base, admitted_at):
         f, rd = self.feed, None
@@ -174,4 +214,5 @@ class BoardLane:
             if rd is not None:
                 rd.release()
             self.completed.put((session, token, error))
+            self.service_wake.set()
             f._board.set()
