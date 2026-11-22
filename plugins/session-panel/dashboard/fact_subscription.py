@@ -32,7 +32,7 @@ class PanelReadiness:
     Subscribe before the first snapshot so quiet completion cannot be lost. No
     callback retains a delta or performs lifecycle work on the store's executor.
     """
-    def __init__(self, store, scope, refresh):
+    def __init__(self, store, scope, refresh, *, start=True):
         self.store, self.scope, self.refresh = store, scope, refresh
         self.wake = threading.Event()
         self.stopped = threading.Event()
@@ -40,6 +40,10 @@ class PanelReadiness:
         self.subscription = store.subscribe(scope, kinds=('ViewFact', 'ChatWaitingFact'),
                                             keys=None, after=None, callback=lambda _: self.wake.set())
         self.thread = threading.Thread(target=self._run, name='session-panel-facts-ready', daemon=True)
+        if start:
+            self.start()
+
+    def start(self):
         self.thread.start()
         self.wake.set()
 
@@ -54,6 +58,8 @@ class PanelReadiness:
                 ready, delay = self.refresh()
             except Exception:
                 ready, delay = False, 1.0  # outstanding failed read only
+            if self.stopped.is_set():
+                return
             if ready != reported:
                 try:
                     self.store.report_ready('panel', self.scope, version=1, ready=ready)
@@ -66,7 +72,7 @@ class PanelReadiness:
         self.stopped.set()
         self.subscription.close()
         self.wake.set()
-        if self.thread is not threading.current_thread():
+        if self.thread.ident is not None and self.thread is not threading.current_thread():
             self.thread.join()
         if self.registration is not None:
             self.registration.close()

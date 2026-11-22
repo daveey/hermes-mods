@@ -136,6 +136,66 @@ def test_closed_binding_callback_is_fenced_after_older_core_register(api, monkey
     assert not hasattr(api._LOADER, 'facts_v1')
 
 
+def test_replacement_waits_for_old_readiness_before_publishing(api, monkeypatch):
+    from types import SimpleNamespace as NS
+    entered, release = threading.Event(), threading.Event()
+    reports, closed, workers = [], [], []
+    class Store:
+        def __init__(self, name):
+            self.name = name
+        def bind_consumer(self, name, scope, callback):
+            def close():
+                closed.append(self.name)
+                if self.name == 'a':
+                    callback('facts', 99)  # superseded binding must be fenced
+            return NS(close=close)
+        def subscribe(self, *args, **kw):
+            return NS(close=lambda: None)
+        def report_ready(self, *args, **kw):
+            reports.append((self.name, api._LOADER.facts_scope))
+    a, b = Store('a'), Store('b')
+    def warm(store, scope, handle):
+        assert store.name == scope
+        if store is a:
+            entered.set()
+            assert release.wait(3)
+        return True, None
+    monkeypatch.setattr(api, '_warm_facts', warm)
+    first = api.install_facts(a, 'a', object())
+    assert entered.wait(2)
+    second = threading.Thread(target=lambda: workers.append(api.install_facts(b, 'b', object())))
+    second.start()
+    assert first.stopped.wait(2)
+    assert api._LOADER.facts_scope == 'a'
+    release.set()
+    second.join(3)
+    assert not second.is_alive() and len(workers) == 1
+    workers[0].close()
+    assert closed == ['a', 'b']
+    assert all(pair == ('b', 'b') for pair in reports)
+
+
+@pytest.mark.parametrize('failure', ['subscribe', 'start'])
+def test_failed_readiness_setup_releases_binding(api, monkeypatch, failure):
+    from types import SimpleNamespace as NS
+    closed = []
+    def subscribe(*a, **kw):
+        if failure == 'subscribe':
+            raise OSError('subscribe refused')
+        return NS(close=lambda: closed.append('subscription'))
+    def fail_start(self):
+        raise OSError('start refused')
+    store = NS(bind_consumer=lambda *a: NS(close=lambda: closed.append('binding')),
+               subscribe=subscribe)
+    if failure == 'start':
+        monkeypatch.setattr(api._load_feed().PanelReadiness, 'start', fail_start)
+    with pytest.raises(OSError, match='refused'):
+        api.install_facts(store, 'a', object())
+    assert closed == (['binding'] if failure == 'subscribe' else ['subscription', 'binding'])
+    assert api._LOADER.facts_binding_token is None
+    assert getattr(api._LOADER, 'facts_registration', None) is None
+
+
 def test_concurrent_start_cannot_escape_mode_transition(api, monkeypatch):
     core = api._load_feed()
     predecessor = core.PROCESS_FEED

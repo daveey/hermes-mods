@@ -97,6 +97,55 @@ def test_readiness_exception_recovery_and_deadline_without_publication():
         worker.close()
 
 
+def test_readiness_close_during_refresh_never_reports():
+    import threading
+    transport = Transport()
+    entered, release = threading.Event(), threading.Event()
+    reports = []
+    transport.report_ready = lambda *a, **kw: reports.append(kw)
+    def refresh():
+        entered.set()
+        assert release.wait(2)
+        return True, None
+    worker = bridge.PanelReadiness(transport, 'profile-a', refresh)
+    assert entered.wait(2)
+    closer = threading.Thread(target=worker.close)
+    closer.start()
+    assert worker.stopped.wait(2)
+    release.set()
+    closer.join(2)
+    assert not closer.is_alive()
+    assert reports == []
+
+
+def test_readiness_report_failure_retries_without_publication():
+    import threading
+    transport = Transport()
+    recovered = threading.Event()
+    reports = []
+    def report(*a, **kw):
+        reports.append(kw['ready'])
+        if len(reports) == 1:
+            raise OSError('temporary report failure')
+        recovered.set()
+    transport.report_ready = report
+    worker = bridge.PanelReadiness(transport, 'profile-a', lambda: (True, None))
+    try:
+        assert recovered.wait(3)
+        assert reports == [True, True]
+    finally:
+        worker.close()
+
+
+def test_readiness_deferred_start_can_close_without_reporting():
+    transport = Transport()
+    transport.report_ready = lambda *a, **kw: pytest.fail('unaccepted binding reported')
+    worker = bridge.PanelReadiness(transport, 'profile-a', lambda: (True, None), start=False)
+    assert worker.thread.ident is None
+    worker.close()
+    assert transport.closes
+
+
 def test_warm_and_cold_reads_never_call_source_helpers(setup, monkeypatch):
     f, readers, _, _, bundle, transport, adapter = setup
     transport.send(bundle)
