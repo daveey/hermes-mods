@@ -39,6 +39,25 @@ const paint = tree => React.act(async () => root.render(tree))
 const publicCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./hub-model-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
 const privateCases = process.env.HERMES_PANEL_GOLDENS ? JSON.parse(readFileSync(process.env.HERMES_PANEL_GOLDENS, 'utf8')) : {}
 const cases = { ...publicCases, ...privateCases }
+test('panel status pip consumes the published stripe and revision, never row-count authority', async () => {
+ const model = cases.canonical_done_with_open_rows.model
+ assert.ok(model.header.counts.needs_you > 0, 'contradictory row count is intentional')
+ await paint(m.renderModel(model))
+ const pip = document.querySelector('[data-panel-status-stripe]')
+ assert.equal(pip?.getAttribute('data-panel-status-stripe'), 'done')
+ assert.equal(pip?.getAttribute('data-panel-status-revision'), '41')
+ assert.equal(pip?.style.background, 'var(--color-emerald-500)')
+ assert.ok(document.body.textContent.includes('done'))
+})
+
+test('panel legacy done is unknown despite completed history', async () => {
+ await paint(m.renderModel(cases.canonical_unknown_with_done_history.model))
+ const pip = document.querySelector('[data-panel-status-stripe]')
+ assert.equal(pip?.getAttribute('data-panel-status-stripe'), 'attention')
+ assert.equal(pip?.style.background, 'var(--color-amber-500)')
+ assert.ok(!pip?.hasAttribute('data-panel-status-revision'))
+})
+
 test('mounted cold panel shows loading, retries the registered gap and removes the placeholder', async () => {
  await paint(null); m.resetFeedForTests()
  current = { connectionId: 'cold', profile: 'default', session: 'cold-chat' }

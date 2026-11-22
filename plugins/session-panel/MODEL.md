@@ -54,9 +54,10 @@ known-empty sources; successful retries clear failure diagnostics and restore `f
     "revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "diagnostics": {"type": "array", "items": {"type": "string"}},
     "header": {
-      "type": "object", "required": ["state", "counts", "pips"],
+      "type": "object", "required": ["state", "status", "counts", "pips"],
       "properties": {
         "state": {"type": "string"},
+        "status": {"type": ["object", "null"], "description": "Validated core status_version=1 envelope, preserved with identity, revision, generation, coverage and presentation."},
         "counts": {
           "type": "object",
           "required": ["needs_you", "stuck", "running", "waiting", "ready", "done"],
@@ -119,8 +120,14 @@ known-empty sources; successful retries clear failure diagnostics and restore `f
 
 `revision` is SHA-256 of the canonical JSON model excluding revision itself, not
 the feed's monotonic `rev`. Identical snapshots have identical revisions.
-`header.state` copies the session's canonical `outcome_json.state` or `.kind`;
-missing/unreadable outcome means `unknown`, never a state inferred from counts.
+`header.status` carries the validated core `outcome_json.status` envelope unchanged;
+`header.state` copies that envelope's `kind`. Desktop paints only its published
+`presentation.stripe`, never counts or a local classifier. Missing, unsupported,
+malformed or unavailable protocol means `status=null`, `state=unknown` and an
+attention palette. Green requires `kind=done` and complete coverage. Identity
+coordinates are nonempty strings and revision/generation are nonnegative JS-safe
+integers; boolean or string versions are unsupported. Legacy completion prose or
+`outcome_json.kind=done` alone is not canonical completion evidence.
 Counts are unique displayed rows per section; pips are nonempty counts in section
 order. Diagnostics distinguish unavailable extra inputs from a known empty source.
 

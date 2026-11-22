@@ -462,7 +462,7 @@ def test_answered_ask_attaches_to_its_card_and_keeps_it_out_of_needs_you():
     assert not m['sections']['needs_you']
     [row] = m['sections']['waiting']
     assert row['id'] == 't_abc123' and row['decision']['text'] == 'Done · delivers when this turn ends' and row['detail'] == ''
-    assert m['header']['label'] == 'decision recorded'
+    assert m['header']['label'] == 'unknown'  # request detail stays in rows, not a status override
     # the card runs again: the status line follows it
     m = model.reduce_panel(bundle(task(), requests=[req]), now=now, projector=lambda r, *, now: {'state': 'running', 'sourced': True},)
     assert not [r for r in m['sections']['waiting'] if r['kind'] == 'decision']
@@ -491,12 +491,12 @@ def test_long_undelivered_decision_says_so():
     assert model.reduce_panel(bundle(), now=now, requests=[req])['sections']['waiting'][0]['decision']['text'] == 'Done · not delivered yet, recorded 1 h ago'
 
 
-def test_header_label_never_says_unresolved_for_working_or_answered_sessions():
+def test_header_label_is_not_reclassified_by_working_or_answered_rows():
     run = task()
     run['execution_observations'] = [{'identity': {'kind': 'card', 'work_id': run['id'], 'gateway': 'remote', 'profile': 'default', 'board': 'default'}, 'state': 'running'}]
     m = model.reduce_panel(bundle(run, outcome_json='{"kind":"unresolved","reason":"interrupted"}'), now=NOW, projector=lambda r, *, now: {'state': 'running', 'sourced': True})
-    assert m['header']['state'] == 'unresolved' and m['header']['label'] == 'working'  # canonical state kept, label human
-    assert model.reduce_panel(bundle(outcome_json='{"kind":"unresolved"}'), now=NOW)['header']['label'] == 'interrupted'
+    assert m['header']['state'] == 'unknown' and m['header']['label'] == 'unknown'  # legacy kind is not the protocol
+    assert model.reduce_panel(bundle(outcome_json='{"kind":"unresolved"}'), now=NOW)['header']['label'] == 'unknown'
     now = model.datetime.fromisoformat(answered()['resolution']['recordedAt']).timestamp() + 5
     m = model.reduce_panel(bundle(outcome_json='{"kind":"unresolved"}'), now=now, requests=[answered()])
-    assert m['header']['label'] == 'decision recorded'
+    assert m['header']['label'] == 'unknown'  # request detail stays in rows, not a status override

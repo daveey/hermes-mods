@@ -10,6 +10,8 @@ f = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(f)
 
 cases = {
+    'canonical_done_with_open_rows': f.bundle(f.task(human_request=f.human(), wait={'wait_state': 'human'}), outcome_json=f.canonical_outcome('done', revision=41)),
+    'canonical_unknown_with_done_history': f.bundle(done=[f.task('t_done', status='done')], outcome_json={'kind': 'done'}),
     'own_letters': f.bundle(f.task(human_request=f.human(), wait={'wait_state': 'human'}), requests=[f.request()]),
     'remote_card': f.bundle(f.task(human_request=f.human(), wait={'wait_state': 'human'})),
     'triage': f.bundle(f.task(status='triage', human_request=f.human(), block_kind='needs_input')),

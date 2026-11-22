@@ -36,6 +36,30 @@ def obj(value):
         return {}
 
 
+def published_status(outcome):
+    """Validate the backend wire envelope; never derive a replacement from rows or legacy kind."""
+    status = outcome.get('status')
+    if not isinstance(status, dict) or type(status.get('status_version')) is not int or status['status_version'] != 1:
+        return None
+    for key in ('revision', 'generation'):
+        value = status.get(key)
+        if type(value) is not int or not 0 <= value <= 9007199254740991:
+            return None
+    identity, coverage, paint = (obj(status.get(k)) for k in ('identity', 'coverage', 'presentation'))
+    if not all(isinstance(identity.get(k), str) and identity[k] for k in ('gateway', 'profile', 'session_id', 'owner_epoch')):
+        return None
+    if coverage.get('state') not in ('complete', 'unknown') or paint.get('stripe') not in ('attention', 'blocked', 'done', 'none', 'stuck', 'waiting'):
+        return None
+    for value in (coverage.get('reasons'), paint.get('reason_codes')):
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            return None
+    if status.get('kind') not in ('decision', 'done', 'muted', 'running', 'unresolved', 'waiting'):
+        return None
+    if paint['stripe'] == 'done' and (coverage['state'] != 'complete' or status['kind'] != 'done'):
+        return None
+    return status
+
+
 def text(value):
     return value if isinstance(value, str) else ''
 
@@ -749,12 +773,10 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     outcome = obj(bundle.get('outcome_json') or bundle.get('outcome'))
     counts = {s: len(sections[s]) for s in SECTIONS}
     pips = [{'section': s, 'count': counts[s], 'label': {'needs_you': 'needs you', 'running': 'running'}.get(s, s)} for s in SECTIONS if counts[s]]
-    state = outcome.get('state') or outcome.get('kind') or 'unknown'
-    pending = any(x.get('decision') for s in SECTIONS for x in sections[s])
-    # `state` stays the canonical outcome; `label` is what the header says. An answered ask is not "unresolved".
-    label = ('decision recorded' if pending and state in ('unresolved', 'unknown', 'decision', 'needs_user', 'needs_input') and not counts['needs_you']
-             else 'working' if state == 'unresolved' and counts['running'] else HEADER_LABELS.get(state, state))
-    result = {'version': 1, 'header': {'state': state, 'label': label, 'counts': counts, 'pips': pips}, 'sections': sections,
+    status = published_status(outcome)
+    state = status['kind'] if status else 'unknown'
+    label = HEADER_LABELS.get(state, state)
+    result = {'version': 1, 'header': {'state': state, 'status': status, 'label': label, 'counts': counts, 'pips': pips}, 'sections': sections,
               'diagnostics': list(bundle.get('input_errors') or [])}
     result['revision'] = hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
     return result

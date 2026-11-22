@@ -1,3 +1,4 @@
+from test_model import canonical_outcome
 """POST /changes and GET /status through FastAPI, with the process feed over fake readers."""
 import importlib.util
 import sys
@@ -233,7 +234,7 @@ def test_current_api_adds_one_canonical_lane_to_feed_resumed_by_older_api(monkey
     class CurrentReaders(fakes.Readers):
         def decision_inputs(self, session, lineage):
             observed.set()
-            return {'outcome_json': {'kind': 'done'}, 'requests': []}
+            return {'outcome_json': canonical_outcome('done'), 'requests': []}
         def release(self):
             released.set()
     monkeypatch.setattr(api, 'CoreReaders', CurrentReaders)

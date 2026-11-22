@@ -11,6 +11,14 @@ spec.loader.exec_module(model)
 NOW = 1795281000
 
 
+def canonical_outcome(kind='done', revision=9):
+    stripe = {'done': 'done', 'running': 'none', 'decision': 'stuck', 'unresolved': 'attention', 'waiting': 'waiting', 'muted': 'blocked'}[kind]
+    return {'kind': kind, 'status': {'status_version': 1, 'revision': revision, 'generation': 3,
+        'identity': {'gateway': 'edge', 'profile': 'default', 'session_id': 'chat', 'owner_epoch': 'epoch'},
+        'kind': kind, 'coverage': {'state': 'complete', 'reasons': []},
+        'presentation': {'stripe': stripe, 'reason_codes': ['fixture']}}}
+
+
 def bundle(*tasks, **extra):
     return {'computed_at': NOW, 'tasks': list(tasks), 'done': [], 'cards': {}, **extra}
 
@@ -61,8 +69,8 @@ def test_own_letter_ask_eve_shape_and_canonical_ids():
 
 
 def test_canonical_header_never_rederived_from_rows():
-    m = model.reduce_panel(bundle(task(status='running'), outcome_json='{"kind":"needs_user"}'), now=NOW)
-    assert m['header']['state'] == 'needs_user'
+    m = model.reduce_panel(bundle(task(status='running'), outcome_json=canonical_outcome('decision')), now=NOW)
+    assert m['header']['state'] == 'decision'
     assert not m['sections']['needs_you']
     assert model.reduce_panel(bundle(), now=NOW)['header']['state'] == 'unknown'
 
