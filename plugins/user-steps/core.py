@@ -3339,6 +3339,7 @@ class ActionStore:
             if op['dispatchState'] != 'cancelled' or (op.get('retired') or {}).get('evidence') != marker:
                 raise ActionError('Operation is not retiring', 409)
             op['retired']['evidence'] = evidence
+            op['retired']['reason'] = 'Remote card answer retired'
             c.execute('UPDATE operations SET body=? WHERE id=?', (_json(op), oid))
             return {'operation': op}
 

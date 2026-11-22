@@ -21,7 +21,7 @@ if [[ -n "${HERMES_HUB_CLIENT_REAL:-}" ]]; then
 fi
 # Preserve the repository layout for cross-producer and Desktop contract tests.
 mkdir -p "$fixtures/plugins/coach" "$fixtures/desktop-plugins"
-for plugin in user-steps ask-gate session-outcome open-asks hub-sync; do
+for plugin in user-steps ask-gate session-outcome open-asks hub-sync session-panel; do
   cp -R "$plugins/$plugin" "$fixtures/plugins/$plugin"
 done
 cp "$plugins/coach/placement_evidence.py" "$fixtures/plugins/coach/placement_evidence.py"

@@ -339,6 +339,29 @@ test('For you hides closed and superseded requests but retains operation readbac
  await show(null);delete window.hermesDesktop
 })
 
+for (const companion of [false, true]) test(`remote retirement retains nonterminal custody without controls (hub companion=${companion})`, async()=>{
+ const r=freshRequest({state:'cancelled',title:'Retiring answer',resolution:{operationId:`retiring-${companion}`,choiceId:'yes',revision:1},delivery:{state:'delivering',text:'Delivery to remote not confirmed (120 min)',unconfirmed:true}})
+ let terminal=false; const reads=[]
+ window.hermesDesktop={api:async({path,method})=>{
+  assert.ok(!method || method === 'GET', 'retirement never retries or submits')
+  if(path.includes('/operations/')) { reads.push(path); return {request:terminal?{...r,state:'resolved',delivery:undefined}:r,operation:{operationId:r.resolution.operationId,dispatchState:terminal?'delivered':'cancelled',...(!terminal?{retired:{evidence:'remote-retiring'}}:{})}} }
+  return {requests:[terminal?{...r,state:'resolved',delivery:undefined}:r]}
+ }}
+ await show(React.createElement(m.ActionQueue,{key:`retiring-${companion}`,companion}))
+ assert.equal(el().querySelectorAll('[data-remote-retiring]').length,1)
+ assert.equal(el().querySelector('[data-remote-retiring]').textContent,r.delivery.text)
+ assert.equal(el().querySelector('[data-remote-retiring]').querySelectorAll('button').length,0)
+ assert.doesNotMatch(el().textContent,/Cancelled|no permission was delivered|Retry|Check status/)
+ assert.ok(reads.length>0)
+ const before=reads.length
+ await React.act(async()=>{await m.refreshRequests();await flush()})
+ assert.ok(reads.length>before, 'retiring operations keep readback polling')
+ terminal=true
+ await React.act(async()=>{await m.refreshRequests();await flush()})
+ assert.equal(el().querySelector('[data-action-queue]'),null)
+ await show(null);delete window.hermesDesktop
+})
+
 test('backend failure and malformed owner render inline errors and disable cached authorization',async()=>{
  const r=freshRequest()
  window.hermesDesktop={api:async()=>({requests:[r]})}

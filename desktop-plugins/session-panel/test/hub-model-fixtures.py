@@ -37,4 +37,12 @@ approval.update(kind='approval', limits=[{'key': 'Runtime', 'value': 'LIMIT-4-HO
 approval['scope'] = {**approval['scope'], 'complete': True, 'markdown': 'CANONICAL-PLAN distinct from the card brief'}
 approval['choices'][0].update(effect='approve', explain='Only the bounded stage is authorized')
 cases['approval_boundaries'] = f.bundle(f.task(human_request=f.human(), wait={'wait_state': 'human'}), requests=[approval])
+for departed in (False, True):
+    for unconfirmed in (False, True):
+        r = f.request(state='cancelled')
+        r.update(resolution={'operationId': 'retiring-op', 'choiceId': 'card-0', 'revision': 3},
+                 delivery={'state': 'delivering', 'unconfirmed': unconfirmed,
+                           'text': 'Delivery to remote not confirmed (120 min)' if unconfirmed else 'Delivering…'})
+        cases[f'retiring_{departed}_{unconfirmed}'] = f.bundle(
+            *([] if departed else [f.task(human_request=f.human(), wait={'wait_state': 'human'})]), requests=[r])
 print(json.dumps({name: {'model': f.model.reduce_panel(b, now=f.NOW, projector=f.project)} for name, b in cases.items()}))
