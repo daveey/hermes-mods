@@ -187,12 +187,15 @@ Order matters, matching Desktop `classify`:
   running row is shown In progress with `evidence_state: "reported"` and a Details line saying so; parked
   states show their board state. No `· board status` tail on any row.
 - Named dependency waits use `waiting on: <hydrated title> · age` with an `open_card` action labeled `Open parent card`.
-  Resolve only the primary dependency from existing bundle/card evidence; never link an own-card wake check to itself,
-  reinterpret clock/CI/deploy waits as parents, or substitute a secondary mention when the primary is unavailable.
-  Replica actions require a known owner. Missing hydration uses a short category; service/PID/task identifiers and
+  Resolve the primary explicit producer first; within that dependency, follow hydrated unfinished parents to the
+  deepest blocker (bounded, cycle-safe, deterministic ties). For a pure parent wait, consider all hydrated parents.
+  Never link an own-card wake check to itself, reinterpret clock/CI/deploy waits as parents, or substitute a secondary
+  mention when the primary is unavailable. Show the leaf title/status, `on <gateway> (<hostname>)` when known, and
+  its latest current awaiting/block/creator-ask reason (`asks origin: …` for chat waits); running work never reuses
+  a historical ask. Replica actions require a known owner. Missing hydration uses a short category. Full reasons and
   parent/release coordinates stay in `details[]`. No additional reader I/O is introduced.
-- Waiting text is one short phrase (`waiting on CI · PR #3881 · 2m`, `waiting on hub deploy · 15m`); URLs go to an
-  `open_url` action, the producer's wording to a `Waiting on:` Details line. Hashes never appear inline.
+- Waiting text keeps a short category or specific blocker reason; URLs and hashes stay in Details, not inline.
+  Own waits include their gateway, e.g. `waiting on CI · PR #3881 · 2m on remote`; URLs also go to an `open_url` action.
 - Answered-but-undelivered asks are one `decision: {request_id, text}` line on the card they unblock (own row
   if card-less) and vanish when the request resolves; header `label` never reads "unresolved" for them.
 - Running rows without `run_model` use the current run's `run_route`, else `model_tier`, event model.

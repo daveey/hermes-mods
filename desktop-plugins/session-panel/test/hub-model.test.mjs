@@ -91,9 +91,23 @@ test('named dependency paints human title and a parent-card action', async () =>
  const model = cases.named_parent.model
  await paint(m.renderModel(model))
  const row = document.querySelector('[data-panel-row]')
- assert.ok(row.textContent.includes('waiting on: Publish the release · 2m'))
+ assert.ok(row.textContent.includes('waiting on: Publish the release on remote · 2m'))
  assert.ok([...row.querySelectorAll('button')].some(b => b.textContent === 'Open parent card'))
- assert.equal(row.querySelector('[data-row-detail]').textContent, 'waiting on: Publish the release · 2m')
+ assert.equal(row.querySelector('[data-row-detail]').textContent, 'waiting on: Publish the release on remote · 2m')
+})
+
+test('deep leaf wait paints gateway and reason without dropping simultaneous Running', async () => {
+ const model = cases.leaf_wait_with_running.model
+ assert.equal(model.header.counts.running, 1)
+ assert.equal(model.header.counts.waiting, 1)
+ await paint(m.renderModel(model))
+ const wait = document.querySelector('[data-model-section="waiting"]')
+ assert.match(wait.textContent, /Reconcile cutover/)
+ assert.match(wait.textContent, /on worker-one \(worker-one-host\)/)
+ assert.match(wait.textContent, /asks origin: Choose which premise to retain/)
+ const running = document.querySelector('[data-model-section="running"]')
+ assert.ok(running, 'a populated Running section must not disappear beside waiting work')
+ assert.match(running.textContent, /Active portable work/)
 })
 
 test('a line row opens its own card by double-clicking the state square, with no Open card button', async () => {

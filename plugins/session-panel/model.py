@@ -298,6 +298,58 @@ def wait_target(row, bundle, detail):
     return None
 
 
+def wait_leaf(dependency, bundle):
+    """Deepest unfinished hydrated parent; bounded, cycle-safe, and deterministic on ties."""
+    best, best_depth = dependency, 0
+    pending = [(dependency, 0, frozenset())]
+    for _ in range(80):
+        if not pending:
+            break
+        dep, depth, visited = pending.pop(0)
+        identity = (dep.get('gateway'), dep.get('profile'), dep.get('board'), dep.get('id'))
+        if identity in visited or dep.get('status') in TERMINAL:
+            continue
+        if depth > best_depth:
+            best, best_depth = dep, depth
+        hydration = obj(obj(obj(bundle.get('cards')).get(dep['id'])).get('detail'))
+        parents = obj(hydration.get('links')).get('parents') or []
+        linked = {t.get('id'): t for t in hydration.get('link_tasks') or [] if isinstance(t, dict)}
+        for pid in parents:
+            rec = obj(obj(bundle.get('cards')).get(pid))
+            detail = obj(rec.get('detail'))
+            task = {**obj(linked.get(pid)), **obj(detail.get('task'))}
+            if not task.get('title') or task.get('status') in TERMINAL:
+                continue
+            owner = detail.get('owner')
+            task.update(id=pid, board=task.get('board') or rec.get('board') or dep.get('board'),
+                        gateway=task.get('home_gateway') or task.get('gateway') or
+                        (owner if isinstance(owner, str) else None),
+                        profile=task.get('profile') or dep.get('profile'))
+            if task.get('gateway') and task.get('profile'):
+                pending.append((task, depth + 1, visited | {identity}))
+    return best
+
+
+def wait_reason(row, bundle):
+    """Only the current wait's owner text, never an older ask on running work."""
+    if row.get('status') not in ('scheduled', 'blocked', 'triage', 'todo'):
+        return ''
+    detail = obj(obj(obj(bundle.get('cards')).get(row['id'])).get('detail'))
+    for event in reversed(detail.get('events') or []):
+        if not isinstance(event, dict):
+            continue
+        kind, payload = event.get('kind'), obj(event.get('payload'))
+        if kind == 'decision_requested':
+            return 'asks origin: ' + flat(payload.get('why') or payload.get('reason'))
+        if kind in ('scheduled', 'continued', 'blocked'):
+            awaiting = obj(payload.get('awaiting'))
+            reason = flat(awaiting.get('why') or payload.get('reason') or payload.get('checkpoint'))
+            return ('asks origin: ' if awaiting.get('kind') == 'chat' else '') + reason
+        if kind in ('claimed', 'unblocked', 'completed', 'archived'):
+            break
+    return flat(row.get('block_reason')) if row.get('status') in ('blocked', 'triage') else ''
+
+
 def wait_phrase(row, now):
     return wait_info(row, now)['text']
 
@@ -513,7 +565,25 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         progress = number(row.get('activity_at')) or number(row.get('current_run_started_at'))
         wi = wait_info(row, now)
         dependency = wait_target(row, bundle, detail)
+        dependency = wait_leaf(dependency, bundle) if dependency else None
+        if state in ('scheduled', 'todo', 'blocked', 'triage') and not wi['raw'] and obj(detail.get('links')).get('parents'):
+            leaf = wait_leaf(row, bundle)
+            if leaf.get('id') != row['id']:
+                dependency = leaf
         dependency_text = ''
+        blocker = dependency or row
+        why = wait_reason(blocker, bundle)
+        if why:
+            v['details'].append('Blocking reason: ' + why)
+            why = flat(re.sub(r'https?://\S+|\b[0-9a-f]{12,64}\b', '', why))
+            why = why if len(why) <= WAIT_MAX else why[:WAIT_MAX - 1].rstrip() + '…'
+        gateway = text(blocker.get('gateway'))
+        hostname = text(blocker.get('hostname'))
+        location = f' on {gateway}' + (f' ({hostname})' if hostname else '') if gateway else ''
+        if state in ('scheduled', 'todo', 'blocked', 'triage') and not dependency and (why or wi['text']):
+            base = why or wi['text']
+            cap = max(24, WAIT_MAX - len(location))
+            wi['text'] = (base if len(base) <= cap else base[:cap - 1].rstrip() + '…') + location
         if dependency:
             title = clean(dependency['title'])
             title = title if len(title) <= WAIT_MAX else title[:WAIT_MAX - 1].rstrip() + '…'
@@ -523,7 +593,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             # own here: its live status rides on this line, or a running dependency reads as idle.
             dep_status = text(dependency.get('status'))
             dep_state = f' ({dep_status})' if dep_status else ''
-            dependency_text = f'waiting on: {title}{dep_state}{age}'
+            dependency_text = f'waiting on: {title}{dep_state}{location}' + (f' · {why}' if why else '') + age
             v['details'].append(f'Blocking card: {dependency["id"]} ({dep_status or "status unknown"})')
             if not wi['text'].startswith(('waiting on CI', 'waiting on hub deploy', 'waiting on deploy')):
                 wi['text'] = dependency_text
