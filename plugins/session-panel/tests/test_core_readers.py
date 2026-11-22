@@ -139,6 +139,62 @@ def test_absent_recent_session_through_real_user_steps_does_not_fail_refresh(api
         db.close()
 
 
+def test_deleted_session_with_surviving_request_agrees_across_full_and_fast_reads(api, tmp_path, monkeypatch):
+    import uuid
+    from hermes_state import SessionDB
+    from test_feed import feedmod
+
+    db = SessionDB(db_path=tmp_path / 'state.db')
+    db.create_session('S2', 'desktop')
+    path = Path(__file__).resolve().parents[2] / 'user-steps' / 'core.py'
+    spec = importlib.util.spec_from_file_location('_deleted_request_core', path)
+    core = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = core
+    spec.loader.exec_module(core)
+    owner = core.server_owner('S2')
+    store = core.ActionStore()
+    store.create(owner, dict(
+        schemaVersion=2, owner=dict(owner), requestId=str(uuid.uuid4()), revision=1,
+        kind='approval', title='Approve the synthetic change',
+        scope=dict(markdown='Change example.py; run tests.', complete=True, sourceRefs=[]),
+        limits=[], exclusions=[], outcomes=dict(approve='Authorize this scope only',
+        revise='Keep work blocked', decline='Cancel'),
+        choices=[dict(id=e, label=e.title(), effect=e) for e in ('approve', 'revise', 'decline')],
+        aliases=[], state='open'))
+    r = api.CoreReaders(state_db=tmp_path / 'state.db')
+    monkeypatch.setattr(r, 'boards', lambda: [])
+    now = [1000.0]
+    pushed = []
+    f = feedmod.Feed(r, emit=pushed.append, clock=lambda: now[0])
+    try:
+        f.changes(['S2'])
+        assert len(f.bundles['S2']['bundle']['requests']) == 1
+        f.refresh_decisions()
+        assert db.delete_session('S2')
+        with sqlite3.connect(store.path) as c:
+            assert c.execute('SELECT count(*) FROM requests').fetchone()[0] == 1
+        f.tick()
+        now[0] += 1
+        f.tick()
+        for _ in range(3):
+            now[0] += 301
+            f.watch(['S2'])
+            f.tick()
+            bundle = f.bundles['S2']['bundle']
+            assert bundle['requests'] == [], 'full sweep must not resurrect a deleted chat ask'
+            assert bundle['model']['sections']['needs_you'] == []
+            revision = f.rev
+            now[0] += 1
+            f.refresh_decisions()
+            assert f.bundles['S2']['bundle']['requests'] == []
+            assert f.rev == revision, 'the fast lane must agree, without a second revision'
+            assert not f._decision_failures
+            assert not f.bundles['S2'].get('source_stale')
+    finally:
+        r.release()
+        db.close()
+
+
 def test_unavailable_decision_sources_raise_instead_of_vouching(api, tmp_path, monkeypatch):
     path = tmp_path / 'state.db'
     r = api.CoreReaders(state_db=path)
