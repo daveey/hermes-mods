@@ -95,6 +95,8 @@ For a private historical golden, retain raw input, observation time, source revi
 
 ## Latency and producer contention
 
+- Test sync-bookkeeping invalidation with real replica SQL and canonical projection adapters. A `pulled_at`-only commit must carry `synced_at` without renewing `computed_at`/execution evidence or hydrating every chat. Admit board-shadow writes even without a hub/ledger write. Canonical hub rows may lack `source='replica'`, and selection may add `source='origin-obligation'`: match observation producer plus owner/profile/board/card/session, not a raw source label or bare card ID. Keep true stale/status/receipt changes semantic, allow legitimate clock regression on source reset, and exercise a real concurrent producer publishing an older capture after a newer observation.
+
 - Prefer one short-lived read-only connection per source DB per producer pass, with set-based reads for all relevant sessions/cards; fetch results and close before Python processing. Do not introduce persistent reader connections as a latency optimization. Cache board projections until their source changes and make producer wakeups change-driven.
 - Measure the authenticated Desktop listener separately from the always-on proxy. Retain process birth identity, summed per-thread context-switch deltas and process CPU alongside route latency. A warm hub-local `/changes` response below 500 ms does not prove installed Desktop click-to-render, cold hydration or restart recovery. Preserve raw samples and label those acceptance gaps explicitly.
 
