@@ -605,7 +605,8 @@ class Feed:
                 with self.lock:
                     # The chats this push vouches for: held, watched, and last computed without a failure. Clients
                     # re-stamp only these (a dropped or failing chat is never confirmed by a heartbeat).
-                    fresh = sorted(s for s in self.interest if s in self.bundles and s not in self.failures
+                    fresh = sorted(s for s in self.interest if getattr(self, '_watching', True)
+                                   and s in self.bundles and s not in self.failures
                                    and s not in self._retry and s not in self._carried
                                    and s not in self._decision_failures
                                    and not self.bundles[s].get('source_stale')
@@ -646,15 +647,20 @@ class Feed:
         moved = files() if callable(files) else None
         if moved is not None and moved == self._panel_files and all(s in self._panel_stamps for s in watched):
             return dirty
-        self._panel_files = moved
         with self.lock:
             lineages = {s: list(self.bundles.get(s, {}).get('bundle', {}).get('lineage', [s])) for s in watched}
         rows = batch(list(dict.fromkeys(i for ids in lineages.values() for i in ids))) if callable(batch) else None
+        captured = {}
         for s, ids in lineages.items():
             stamp = tuple(rows[i] if rows is not None else single(i) for i in ids)
             if self._panel_stamps.get(s) != stamp:
                 dirty.add(s)
-            self._panel_stamps[s] = stamp
+            captured[s] = stamp
+        # Publish the cursor only after the entire capture succeeds. A transient
+        # failure (including incomplete batch results) must leave the same source
+        # event eligible for an explicit retry, without requiring another write.
+        self._panel_stamps.update(captured)
+        self._panel_files = moved
         return dirty
 
     def _full_dirty(self, watched, now: float) -> set:
@@ -719,6 +725,9 @@ class Feed:
             return 0
         panel_dirty = self._panel_dirty(watched)
         stamps = self.readers.stamps()
+        external = getattr(self.readers, 'external_stamps', None)
+        external_seen = external() if callable(external) else None
+        external_dirty = external_seen != getattr(self, '_external_stamps', None)
         full = self._stamps is None  # bootstrap only; wall time never authorizes a DB sweep
         with self.lock:
             retry = self._retry.intersection(watched)
@@ -742,6 +751,7 @@ class Feed:
             changed_cards = {}
         self._board_stamps = seen
         self._stamps = stamps
+        self._external_stamps = external_seen
         if full:
             self._last_full = now
             with self.lock:
@@ -763,6 +773,11 @@ class Feed:
         if board_changes is not None:
             with self.lock:
                 dirty.update(s for s in watched if s in self.bundles and board_changes.affects(self.bundles[s]))
+        # Origin receipt/replica files have no board task-event cursor. Until
+        # their materialized per-session capture is compared, invalidate the
+        # entire interested set rather than silently missing a remote change.
+        if external_dirty:
+            dirty.update(watched)
         dirty.update(retry)
         dirty.update(panel_dirty)
         if not dirty:
