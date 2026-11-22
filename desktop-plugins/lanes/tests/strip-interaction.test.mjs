@@ -58,7 +58,7 @@ test('pills select and deselect lanes and the totals follow the selection', asyn
   assert.equal(pill('product').getAttribute('aria-pressed'), 'true')
   assert.equal(pill('infra').dataset.dimmed, '1')
   assert.deepEqual(totals(view), { you: 2, ext: 1, run: 3 })
-  assert.match(view.container.querySelector('[data-status=you]').title, /in product$/)
+  assert.match(view.container.querySelector('[data-status=you]').title, /in product\. Click to select$/)
   await view.click(pill('infra'))
   assert.deepEqual(totals(view), { you: 3, ext: 5, worker: 2, run: 3, dep: 5, triage: 1 })
   await view.click(pill('product'))

@@ -24,6 +24,20 @@ def status_of(reason):
     return 'worker' if reason.startswith('limit:') else _STATUS_OF.get(reason, 'other')
 
 
+def session_counts(cards):
+    """Open cards per originating chat session: {session_id: {lane: {status: n}}}, for the strip's session filter."""
+    out = {}
+    for c in cards:
+        src = c.get('source') or {}
+        if src.get('kind') != 'session' or not src.get('id') or not c.get('lane'):
+            continue
+        lanes = out.setdefault(src['id'], {})
+        cats = lanes.setdefault(c['lane'], {})
+        key = status_of(c.get('reason'))
+        cats[key] = cats.get(key, 0) + 1
+    return out
+
+
 def status_counts(cards):
     tally = Counter(status_of(c.get('reason')) for c in cards)
     return {key: tally.get(key, 0) for key in STATUS}
@@ -99,6 +113,7 @@ def project(snap, raw, expanded):
             row['strip'] = {'blocked': lane['you'], 'running': lane['run'],
                             'other': sum(lane.values()) - lane['you'] - lane['run']}
             row['status'] = {key: lane.get(key, 0) for key in STATUS}  # the strip's totals for a lane selection
+        view['sessions'] = session_counts(raw['cards'])
     if not expanded:
         return view
     view['flow_error'] = raw.get('reason', '') if raw.get('configured') is False else ''

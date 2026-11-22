@@ -74,6 +74,21 @@ def test_collapsed_view_carries_all_lanes_status_counts(monkeypatch):
     assert 'status' not in api.lane_view(6, '6h', False)
 
 
+def test_collapsed_view_maps_open_cards_to_their_sessions(monkeypatch):
+    api = load()
+    monkeypatch.setattr(api, 'core', lambda: None)
+    cards = [dict(id='t_1', lane='a', reason='you', source={'kind': 'session', 'id': 's1'}),
+             dict(id='t_2', lane='a', reason='run', source={'kind': 'session', 'id': 's1'}),
+             dict(id='t_3', lane='b', reason='dep', source={'kind': 'session', 'id': 's1'}),
+             dict(id='t_4', lane='b', reason='gate', source={'kind': 'session', 'id': 's2'}),
+             dict(id='t_5', lane='a', reason='run', source={'kind': 'automation', 'id': 't_0'}),
+             dict(id='t_6', lane='a', reason='run')]
+    monkeypatch.setattr(api, 'read', lambda hours: {'configured': True, 'lanes': {'a': {'open': 4}, 'b': {'open': 2}}})
+    monkeypatch.setattr(api, 'flow', lambda window: {'configured': True, 'cards': cards, 'lanes': {}})
+    assert api.lane_view(6, '6h', False)['sessions'] == {
+        's1': {'a': {'you': 1, 'run': 1}, 'b': {'dep': 1}}, 's2': {'b': {'worker': 1}}}
+
+
 def test_get_flow_returns_the_same_expanded_view(monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient

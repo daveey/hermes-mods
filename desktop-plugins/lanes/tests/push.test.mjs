@@ -44,7 +44,7 @@ test('strip: no colour square, zero lanes hidden, all-lanes status counts on the
     const items=[...strip.querySelectorAll('[data-status]')]
     assert.deepEqual(items.map(i=>[i.dataset.status,i.querySelector('.hermes-lanes-n').textContent]),
       [['you','14'],['ext','43'],['worker','23'],['run','21'],['dep','37'],['triage','19']])
-    assert.equal(items[0].title,'14 blocked on you')
+    assert.equal(items[0].title,'Red: blocked on you, 14 cards. Click to select')
     const sw=(k)=>items.find(i=>i.dataset.status===k).querySelector('.hermes-lanes-sw').style.background
     assert.equal(sw('you'),'rgb(239, 68, 68)'); assert.equal(sw('ext'),'rgb(236, 72, 153)'); assert.equal(sw('worker'),'rgb(16, 185, 129)')
     assert.ok(items.find(i=>i.dataset.status==='triage').querySelector('.is-outline'))

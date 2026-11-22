@@ -37,6 +37,11 @@ export const STATUS = [
   ['worker', 'waiting for a worker', CARD_COLORS.worker], ['run', 'running', CARD_COLORS.run],
   ['dep', 'waiting on other cards', CARD_COLORS.dep], ['triage', 'in triage', null], ['other', 'other', null]
 ]
+/** The colour word a tooltip names for each count, so hovering says what the colour means. */
+export const COLOR_WORDS = { you: 'Red', ext: 'Pink', worker: 'Green', run: 'Blue', dep: 'Grey', triage: 'Outline', other: 'Outline' }
+// Desktops with the session-list filter hook export these; older ones do not, and the strip then filters nothing.
+export const SESSION_FILTER_AREA = sdk.SESSION_FILTER_AREA || ''
+const useSidebarSessions = typeof sdk.useSidebarSessions === 'function' ? sdk.useSidebarSessions : () => null
 
 // ── which gateway to talk to ──────────────────────────────────────────────
 // Lanes are configured on one gateway (the one that holds the board and runs the dispatcher), which is often
@@ -371,6 +376,42 @@ export function selectedStatus(snap, selected) {
   return out
 }
 
+const STATUS_SELECT_KEY = 'hermes.lanes.statusSelected'
+const NOCARDS_KEY = 'hermes.lanes.noCards'
+/** Categories (`STATUS` keys) picked in the strip. */
+export function loadStatusSelected(storage = globalThis.localStorage) {
+  try {
+    const v = JSON.parse(storage?.getItem(STATUS_SELECT_KEY) || '[]')
+    return Array.isArray(v) ? v.filter((x) => STATUS.some(([key]) => key === x)) : []
+  } catch { return [] }
+}
+export function saveStatusSelected(keys, storage = globalThis.localStorage) { try { storage?.setItem(STATUS_SELECT_KEY, JSON.stringify(keys)) } catch {} }
+export function loadNoCards(storage = globalThis.localStorage) { try { return storage?.getItem(NOCARDS_KEY) === '1' } catch { return false } }
+export function saveNoCards(on, storage = globalThis.localStorage) { try { storage?.setItem(NOCARDS_KEY, on ? '1' : '0') } catch {} }
+
+/** The open-card map entries for a sidebar session (its id and every lineage id: a compressed chat keeps its cards). */
+export function sessionCards(session, sessions) {
+  if (!session || !sessions) return []
+  const ids = new Set([session.id, session._lineage_root_id, ...(session._lineage_ids || [])].filter(Boolean))
+  return [...ids].map((id) => sessions[id]).filter(Boolean)
+}
+/** Does a sidebar session pass the strip's selection? `sessions` is the hub's {session: {lane: {category: n}}}.
+ *  Nothing selected: everything. Otherwise a session passes with an open card in a selected lane AND a selected
+ *  category (none selected on either side = any), or, with no-cards picked, when it has no open cards. */
+export function sessionMatches(session, sessions, { lanes = [], status = [], noCards = false } = {}) {
+  if (!lanes.length && !status.length && !noCards) return true
+  const entries = sessionCards(session, sessions)
+  if (!entries.length) return noCards
+  if (!lanes.length && !status.length) return false // only no-cards picked
+  for (const byLane of entries) {
+    for (const [lane, cats] of Object.entries(byLane)) {
+      if (lanes.length && !lanes.includes(lane)) continue
+      for (const [key, n] of Object.entries(cats || {})) if ((Number(n) || 0) > 0 && (!status.length || status.includes(key))) return true
+    }
+  }
+  return false
+}
+
 export function loadTab(storage = globalThis.localStorage) {
   try { const v = storage?.getItem(TAB_KEY); return TABS.some(([key]) => key === v) ? v : 'floor' } catch { return 'floor' }
 }
@@ -636,7 +677,7 @@ function MiniPill({ row, onToggle, selected, dimmed }) {
   const counts = laneCounts(row)
   return h('button', {
     type: 'button', className: 'hermes-lanes-pill', 'data-lane-pill': row.name,
-    title: `${row.name}: ${m.blocked} blocked on you · ${m.running} running · ${m.notReady} other · ${m.total} open`,
+    title: `${row.name}: red ${m.blocked} blocked on you · blue ${m.running} running · grey ${m.notReady} other · ${m.total} open. Click to ${selected ? 'deselect' : 'select'} this lane`,
     'aria-label': `${row.name}: ${m.blocked} blocked on you, ${m.running} running, ${m.notReady} other`,
     'aria-pressed': selected, 'data-selected': selected ? '1' : '0', 'data-dimmed': dimmed ? '1' : '0',
     onClick: (event) => { event.stopPropagation(); onToggle(row.name) }
@@ -647,22 +688,50 @@ function MiniPill({ row, onToggle, selected, dimmed }) {
       : h('span', { className: 'hermes-lanes-n hermes-lanes-dim', 'data-count': 'none' }, '0'))
 }
 
-/** The all-lanes counts on the right, from the hub's `status` projection (older hubs send none: nothing shows). */
-function StatusTotals({ status, scope }) {
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`
+
+/** The counts on the right, from the hub's `status` projection (older hubs send none: nothing shows): [all], one
+ *  toggle per category with cards, and the no-cards toggle (only where the Desktop can list and filter sessions). */
+function StatusTotals({ status, scope, picked, noCards, noCardsCount, anySelected, onToggle, onNoCards, onAll }) {
   if (!status) return null
-  const items = STATUS.filter(([key]) => (status[key] || 0) > 0)
-  return h('span', { className: 'hermes-lanes-status', 'data-slot': 'lanes-status', 'data-scope': scope || 'all' },
-    items.map(([key, label, color]) => h('span', {
-      key, className: 'hermes-lanes-status-item', 'data-status': key, title: `${status[key]} ${label}${scope ? ` in ${scope}` : ''}`
+  const items = STATUS.filter(([key]) => (status[key] || 0) > 0 || picked.includes(key))
+  const where = scope ? ` in ${scope}` : ''
+  return h('span', { className: 'hermes-lanes-status', role: 'group', 'aria-label': 'Card categories', 'data-slot': 'lanes-status', 'data-scope': scope || 'all' },
+    h('button', {
+      type: 'button', className: 'hermes-lanes-cat hermes-lanes-all', 'data-status-all': '1', 'aria-pressed': !anySelected,
+      'data-selected': anySelected ? '0' : '1', title: 'All: clear every lane and category selection',
+      onClick: (event) => { event.stopPropagation(); onAll() }
+    }, 'all'),
+    items.map(([key, label, color]) => {
+      const on = picked.includes(key)
+      const n = status[key] || 0
+      return h('button', {
+        type: 'button', key, className: 'hermes-lanes-cat hermes-lanes-status-item', 'data-status': key,
+        'aria-pressed': on, 'data-selected': on ? '1' : '0', 'data-dimmed': picked.length && !on ? '1' : '0',
+        title: `${COLOR_WORDS[key]}: ${label}, ${plural(n, 'card')}${where}. Click to ${on ? 'deselect' : 'select'}`,
+        onClick: (event) => { event.stopPropagation(); onToggle(key) }
+      },
+        h('span', { className: color ? 'hermes-lanes-sw' : 'hermes-lanes-sw is-outline', style: color ? { background: color } : undefined, 'aria-hidden': 'true' }),
+        h('span', { className: 'hermes-lanes-n' }, n),
+        h('span', { className: 'hermes-lanes-status-word' }, label))
+    }),
+    noCardsCount == null ? null : h('button', {
+      type: 'button', className: 'hermes-lanes-cat hermes-lanes-status-item', 'data-status': 'nocards',
+      'aria-pressed': noCards, 'data-selected': noCards ? '1' : '0',
+      title: `Dashed: sessions with no open cards, ${plural(noCardsCount, 'session')} in your list. Click to ${noCards ? 'deselect' : 'select'}`,
+      onClick: (event) => { event.stopPropagation(); onNoCards() }
     },
-      h('span', { className: color ? 'hermes-lanes-sw' : 'hermes-lanes-sw is-outline', style: color ? { background: color } : undefined, 'aria-hidden': 'true' }),
-      h('span', { className: 'hermes-lanes-n' }, status[key]),
-      h('span', { className: 'hermes-lanes-status-word' }, label))))
+      h('span', { className: 'hermes-lanes-sw is-dashed', 'aria-hidden': 'true' }),
+      h('span', { className: 'hermes-lanes-n' }, noCardsCount),
+      h('span', { className: 'hermes-lanes-status-word' }, 'no cards')))
 }
 
 export function Lanes({ ctx }) {
   const [open, setOpenState] = useState(loadOpen)
   const [selected, setSelectedState] = useState(loadSelected)
+  const [statusPicked, setStatusPicked] = useState(loadStatusSelected)
+  const [noCards, setNoCards] = useState(loadNoCards)
+  const sidebarSessions = useSidebarSessions()
   const [windowHours, setWindowState] = useState(loadWindow)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -717,6 +786,22 @@ export function Lanes({ ctx }) {
     window.addEventListener(KANBAN_CHIP_EVENT, take)
     return () => window.removeEventListener(KANBAN_CHIP_EVENT, take)
   }, [working])
+  // The session-list filter: registered only while something is selected (and re-registered when the selection or
+  // the hub's session map changes, so the list re-filters); the list's own "clear filters" calls onClear.
+  const sessionMap = snap?.sessions
+  const sessionKey = useMemo(() => JSON.stringify(sessionMap || null), [sessionMap])
+  const filterLanes = selected.filter((name) => snap?.lanes?.[name])
+  const filterKey = JSON.stringify([filterLanes, statusPicked, noCards])
+  useEffect(() => {
+    if (!SESSION_FILTER_AREA || !working || !sessionMap) return undefined
+    const sel = { lanes: filterLanes, status: statusPicked, noCards }
+    if (!sel.lanes.length && !sel.status.length && !sel.noCards) return undefined
+    const parts = [...sel.lanes, ...sel.status.map((key) => STATUS.find(([k]) => k === key)?.[1] || key), ...(sel.noCards ? ['no cards'] : [])]
+    return ctx.register({
+      id: 'session-filter', area: SESSION_FILTER_AREA,
+      data: { label: `Lanes: ${parts.join(', ')}`, match: (session) => sessionMatches(session, sessionMap, sel), onClear: () => clearAll() }
+    })
+  }, [filterKey, sessionKey, working])
   // One PUT per changed lane, in order. On a failure the lanes already written stay written: refetch so the panel
   // shows them, name the lane that failed, and keep the draft so the rest can be retried.
   const apply = async (pending) => {
@@ -746,6 +831,19 @@ export function Lanes({ ctx }) {
     saveSelected(next)
     return next
   })
+  function clearAll() {
+    setSelectedState([]); saveSelected([])
+    setStatusPicked([]); saveStatusSelected([])
+    setNoCards(false); saveNoCards(false)
+  }
+  const toggleStatus = (key) => setStatusPicked((prev) => {
+    const next = prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]
+    saveStatusSelected(next)
+    return next
+  })
+  const toggleNoCards = () => setNoCards((prev) => { saveNoCards(!prev); return !prev })
+  const anySelected = picked.length > 0 || statusPicked.length > 0 || noCards
+  const noCardsCount = sidebarSessions && snap?.sessions ? sidebarSessions.filter((s) => !sessionCards(s, snap.sessions).length).length : null
   const toggle = () => setOpen((value) => !value)
   return h('div', { ref: stripRef, className: 'hermes-lanes-strip', 'data-slot': 'lanes-strip', 'data-open': open ? '1' : '0' },
     h('div', { className: 'hermes-lanes-mini', role: 'group', 'aria-label': 'Lanes' },
@@ -753,7 +851,10 @@ export function Lanes({ ctx }) {
         key: row.name, row, onToggle: toggleLane,
         selected: picked.includes(row.name), dimmed: picked.length > 0 && !picked.includes(row.name)
       })),
-      h(StatusTotals, { status: selectedStatus(snap, picked), scope: picked.length ? picked.join(', ') : '' }),
+      h(StatusTotals, {
+        status: selectedStatus(snap, picked), scope: picked.length ? picked.join(', ') : '', picked: statusPicked, noCards,
+        noCardsCount: SESSION_FILTER_AREA ? noCardsCount : null, anySelected, onToggle: toggleStatus, onNoCards: toggleNoCards, onAll: clearAll
+      }),
       !live ? h('small', { className: 'hermes-lanes-dim', title: 'Push unavailable; refreshing every 60 seconds' }, 'not live') : null,
       h('button', {
         type: 'button', className: 'hermes-lanes-toggle', 'aria-expanded': open,
@@ -777,8 +878,13 @@ const CSS = `
 .hermes-lanes-pill[data-selected="1"]{border-color:var(--ui-text-tertiary);background:var(--ui-stroke-secondary)}
 .hermes-lanes-pill[data-dimmed="1"]{opacity:.45}
 .hermes-lanes-n{font-variant-numeric:tabular-nums;font-size:11.5px;font-weight:600}
-.hermes-lanes-status{margin-left:auto;display:inline-flex;align-items:center;gap:8px;padding-left:10px;border-left:1px solid var(--ui-stroke-secondary);white-space:nowrap}
+.hermes-lanes-status{margin-left:auto;display:inline-flex;align-items:center;gap:2px;padding-left:10px;border-left:1px solid var(--ui-stroke-secondary);white-space:nowrap}
 .hermes-lanes-status-item{display:inline-flex;align-items:center;gap:4px}
+.hermes-lanes-cat{height:22px;padding:0 6px;border:1px solid transparent;border-radius:999px;background:transparent;color:inherit;font:inherit;cursor:pointer}
+.hermes-lanes-cat[data-selected="1"]{border-color:var(--ui-text-tertiary);background:var(--ui-stroke-secondary)}
+.hermes-lanes-cat[data-dimmed="1"]{opacity:.45}
+.hermes-lanes-all{font-size:11px;color:var(--ui-text-secondary)}
+.hermes-lanes-sw.is-dashed{border:1px dashed var(--ui-text-tertiary)}
 .hermes-lanes-status-word{display:none;color:var(--ui-text-tertiary);font-size:11px}
 .hermes-lanes-sw{width:8px;height:8px;border-radius:2px;flex:none;box-sizing:border-box}
 .hermes-lanes-sw.is-outline{border:1px solid var(--ui-text-tertiary)}
