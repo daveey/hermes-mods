@@ -186,6 +186,7 @@ class Supervisor:
         self.failures = 0
         self.stopped = False
         self.last_end = 0.
+        self.last_start = 0.
         self.source_paths = None
         self.fallback = Fallback()
         self.cursor_read = None  # (exact process, shared in-flight control future)
@@ -314,12 +315,12 @@ class Supervisor:
                 if self.stopped:
                     return
                 key, (revision, future, queued) = next(iter(self.queue.items()))
-                gap = self.api.MIN_PROJECT_GAP_S - (time.monotonic() - self.last_end)
-                reuse = self.recent if gap > 0 and self.recent and self.recent[:2] == (key, revision) else None
+                gap = self.api.MIN_PROJECT_GAP_S - (time.monotonic() - self.last_start)
+                reuse = self.recent if time.monotonic() - self.last_end < self.api.MIN_PROJECT_GAP_S and self.recent and self.recent[:2] == (key, revision) else None
                 if gap > 0 and reuse is None:
                     self.cv.wait(gap)
                     continue
-                if gap <= 0:
+                if time.monotonic() - self.last_end >= self.api.MIN_PROJECT_GAP_S:
                     self.recent = None
                 self.queue.pop(key)
                 self.active = key, revision, future
@@ -332,6 +333,7 @@ class Supervisor:
                     continue
                 self.recent = None
             selected_at = time.time()
+            self.last_start = time.monotonic()
             attempted = False
             try:
                 config = self._configuration()

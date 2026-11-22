@@ -368,7 +368,7 @@ async def post_admit(card: str, body: Dict[str, Any] = Body(default={})) -> Dict
 
 
 WATCH_S = 0.25  # change-cursor poll; a change is projected on the first tick that sees it
-MIN_PROJECT_GAP_S = 1.0  # idle time between projections under sustained source churn
+MIN_PROJECT_GAP_S = 1.0  # start-to-start floor; projections remain single-flight
 HEARTBEAT_S = 30.0
 _seen_cursor = None
 _active_streams = 0  # accepted viewers in this backend process, including non-debug clients

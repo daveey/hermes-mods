@@ -21,7 +21,7 @@ async def run(api, ws, params, debug):
     generation = 0
     pending = None
     current_task = None
-    last_end = 0.
+    last_start = 0.
     observed_child = None
 
     async def receive():
@@ -118,7 +118,7 @@ async def run(api, ws, params, debug):
             if current_task is not None and current_task.done():
                 key, revision, timing, result = current_task.result()
                 current_task = None
-                last_end = time.monotonic()
+
                 # Parameter/session supersession never leaks an old-key frame.
                 # A source change during compute is allowed as a revision-bound
                 # view, with its pending follow-up retained, never labelled current.
@@ -136,10 +136,11 @@ async def run(api, ws, params, debug):
                                                   'source_current': revision == [api._generation, api._rpc_client.rpc.digest(cursor)]}
                         enqueue(frame)
                         last_hash = digest
-            if pending is not None and current_task is None and time.monotonic() - last_end >= api.MIN_PROJECT_GAP_S:
+            if pending is not None and current_task is None and time.monotonic() - last_start >= api.MIN_PROJECT_GAP_S:
                 timing, pending = pending, None
                 if timing:
                     timing = {**timing, 'released': time.time()}
+                last_start = time.monotonic()
                 current_task = asyncio.create_task(project(params, cursor, api._generation, timing), name='lanes-project')
                 current_task.add_done_callback(lambda _: wake.set())
             if time.monotonic() - last_heartbeat >= api.HEARTBEAT_S:
@@ -151,7 +152,7 @@ async def run(api, ws, params, debug):
             now = time.monotonic()
             deadline = min(next_poll, last_heartbeat + api.HEARTBEAT_S)
             if pending is not None and current_task is None:
-                deadline = min(deadline, last_end + api.MIN_PROJECT_GAP_S)
+                deadline = min(deadline, last_start + api.MIN_PROJECT_GAP_S)
             try:
                 await asyncio.wait_for(wake.wait(), max(0., deadline - now))
             except TimeoutError:

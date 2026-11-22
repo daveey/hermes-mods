@@ -79,6 +79,38 @@ def setup_supervisor(monkeypatch, gap=.12):
     return supervisor, calls, entered, release
 
 
+@pytest.mark.parametrize('duration', [.16, .4])
+def test_midflight_change_uses_start_gap_not_completion_gap(monkeypatch, duration):
+    gap = .3
+    supervisor, calls, entered, release = setup_supervisor(monkeypatch, gap=gap)
+    try:
+        first = supervisor.submit((6., '6h', False), 1, [1])
+        assert entered.wait(2)
+        second = supervisor.submit((6., '6h', True), 2, [2])
+        time.sleep(duration)
+        ended = time.monotonic()
+        release.set()
+        first.result(2)
+        second.result(2)
+        expected = max(calls[0][1] + gap, ended)
+        assert expected - .01 <= calls[1][1] < expected + .12, calls
+    finally:
+        release.set(); supervisor.close()
+
+
+def test_burst_starts_at_most_once_per_gap_window(monkeypatch):
+    gap = .12
+    supervisor, calls, entered, release = setup_supervisor(monkeypatch, gap=gap)
+    try:
+        release.set()
+        for revision in range(5):
+            supervisor.submit((6., '6h', True), revision, [revision]).result(2)
+        assert len(calls) == 5
+        assert all(b[1] - a[1] >= gap - .005 for a, b in zip(calls, calls[1:])), calls
+    finally:
+        release.set(); supervisor.close()
+
+
 def test_opposite_expansion_viewers_share_active_job(monkeypatch):
     supervisor, calls, entered, release = setup_supervisor(monkeypatch)
     try:
