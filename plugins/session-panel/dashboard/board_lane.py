@@ -28,6 +28,10 @@ class BoardLane:
         self.service_wake = threading.Event()
         self.service_stop = threading.Event()
         self.service_worker = None
+        # A saved predecessor API can construct this lane without starting the
+        # new service. Expose the fully initialized owner for current API repair.
+        with feed.lock:
+            feed._board_lane = self
 
     def start_service(self):
         """Refill admitted slots on completions, never behind source recapture.

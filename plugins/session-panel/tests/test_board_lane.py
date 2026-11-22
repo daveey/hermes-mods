@@ -47,6 +47,54 @@ def test_changed_chat_publishes_while_other_chat_reader_is_blocked():
             lane.close()
 
 
+def test_new_blocked_human_card_appears_while_other_chat_reader_blocks():
+    from test_feed import detail
+    from test_model import human
+    r = Readers()
+    f = feedmod.Feed(r, emit=lambda p: None)
+    f.changes(['S1', 'S2'])
+    entered, release = threading.Event(), threading.Event()
+    original = r.linked
+    def slow(ids):
+        if 'S1' in ids:
+            entered.set()
+            assert release.wait(5)
+        return original(ids)
+    r.linked = slow
+    r.events = [('t_aaaaaa1', 'S1')]
+    r.stamp += 1
+    sweep = threading.Thread(target=f.tick)
+    sweep.start()
+    lane = feedmod.BoardLane(f, lambda: r)
+    try:
+        assert entered.wait(1)
+        # New membership, not merely a changed status on an existing card.
+        card = {'id': 't_ffffff6', 'session_id': 'S2', 'board': 'default',
+                'status': 'blocked', 'title': 'Choose the bounded test',
+                'human_request': human(), 'wait': {'wait_state': 'human'}}
+        r.links['S2'].append(card)
+        r.cards[card['id']] = detail(card['id'], 'blocked', session='S2')
+        r.cards[card['id']]['detail']['task'].update(card)
+        r.events = [(card['id'], 'S2')]
+        r.stamp += 1
+        started = time.monotonic()
+        lane.step()
+        deadline = started + 1
+        rows = []
+        while time.monotonic() < deadline:
+            rows = f.bundles['S2']['bundle']['model']['sections']['needs_you']
+            if any(row['id'] == card['id'] for row in rows):
+                break
+            time.sleep(.01)
+        assert any(row['id'] == card['id'] for row in rows), 'new human ask withheld behind unrelated reader'
+        assert time.monotonic() - started < 1
+        assert not release.is_set()
+    finally:
+        release.set()
+        sweep.join(5)
+        lane.close()
+
+
 def test_reconciliation_blocks_neither_board_capture_nor_publication():
     r = Readers()
     f = feedmod.Feed(r, emit=lambda p: None)

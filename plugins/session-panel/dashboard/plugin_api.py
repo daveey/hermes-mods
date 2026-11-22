@@ -1266,6 +1266,12 @@ def feed():
                                         name='session-panel-board', daemon=True)
                 core.PROCESS_FEED._board_thread = lane
                 lane.start()
+            # A saved older entry may already own a live capture thread. Do not
+            # duplicate it or reset its cursor; repair that lane's capacity service.
+            with core.PROCESS_FEED.lock:
+                board = getattr(core.PROCESS_FEED, '_board_lane', None)
+                if board is not None:
+                    board.start_service()
             return core.PROCESS_FEED
 
 

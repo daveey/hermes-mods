@@ -278,6 +278,63 @@ def test_current_api_adds_one_canonical_lane_to_feed_resumed_by_older_api(monkey
         _restore(api, core)
 
 
+def test_saved_predecessor_board_entry_gets_completion_service(monkeypatch):
+    import threading
+    import time
+    from test_feed import Readers
+    api, core = _hot(monkeypatch, 'mixed_board_service')
+    r = Readers()
+    f = core.Feed(r, emit=lambda p: None)
+    f.changes(['S1', 'S2'])
+    r.links = {s: [{**rows[0], 'status': 'ready'}] for s, rows in r.links.items()}
+    entered, release = threading.Event(), threading.Event()
+    r.external_stamps = lambda: 99
+    def capture(held):
+        entered.set()
+        assert release.wait(5)
+        return {s: 0 for s in held}
+    r.external_capture = capture
+    lanes = []
+    original_lane = core.BoardLane
+    class Lane(original_lane):
+        def __init__(self, f, factory):
+            super().__init__(f, factory, capacity=1)
+            self.pending = {'S1': time.time(), 'S2': time.time() + .001}
+            lanes.append(self)
+    monkeypatch.setattr(core, 'BoardLane', Lane)
+    monkeypatch.setattr(api, 'CoreReaders', lambda: r)
+    monkeypatch.setattr(api, 'write_timing', lambda f: None)
+    monkeypatch.setattr(api, '_run_decisions', lambda f: f.stopped.wait(5))
+    core.PROCESS_FEED = f
+    ns = dict(api.__dict__)
+    source = (HERE.parent / 'fixtures' / 'board_entry_before_service.py').read_text()
+    exec(compile(source, 'board_entry_before_service.py', 'exec'), ns)
+    try:
+        assert ns['feed']() is f
+        assert entered.wait(1)
+        assert api.feed() is f
+        board_thread = f._board_thread
+        assert api.feed() is f and f._board_thread is board_thread
+        end = time.monotonic() + 1
+        while time.monotonic() < end:
+            if all(f.bundles[s]['bundle']['tasks'][0]['status'] == 'ready' for s in ('S1', 'S2')):
+                break
+            time.sleep(.01)
+        assert all(f.bundles[s]['bundle']['tasks'][0]['status'] == 'ready' for s in ('S1', 'S2')), \
+            'predecessor closure retained a lane without completion-driven slot refill'
+        assert len(lanes) == 1 and lanes[0].service_worker is not None
+        assert not release.is_set()
+    finally:
+        release.set()
+        f.stopped.set()
+        if hasattr(f, '_board_thread'):
+            f._board_thread.join(3)
+        if lanes:
+            lanes[0].close()
+            assert not lanes[0].service_worker or not lanes[0].service_worker.is_alive()
+        _restore(api, core)
+
+
 def test_feed_role_is_stable_across_launches_and_tells_backends_apart():
     api = load('_spf_role_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
     tok = '/home/u/.hermes/desktop-ssh/5caca281/b6911608.token'
