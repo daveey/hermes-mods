@@ -256,7 +256,7 @@ class Feed:
             # Older feed code (a hot reload) reads neither `stopped` in its publish nor `_successor`: its entry points
             # are routed here as instance attributes (found before the class's), so a request still on it neither
             # moves its revision nor answers with one this feed never issued.
-            prev._publish = lambda computed, heartbeat=False, canonical_only=False: {}
+            prev._publish = lambda computed, heartbeat=False, canonical_only=False, age_only=False: {}
             prev.watch = self.watch
             prev.changes = self.changes
         return self
@@ -571,18 +571,36 @@ class Feed:
                                  'lineage': set(bundle['lineage']), 'source_stale': source_stale}
         return True
 
-    def _publish(self, computed: dict[str, dict], *, heartbeat: bool = False, canonical_only: bool = False) -> dict[str, dict]:
+    def _publish(self, computed: dict[str, dict], *, heartbeat: bool = False, canonical_only: bool = False,
+                 age_only: bool = False) -> dict[str, dict]:
         """Store what was computed and push one batch (or a heartbeat when nothing changed and one is due)."""
         with self.compute_lock:
             if self.stopped.is_set():
                 return {}  # stopped (and possibly resumed by a successor): its revision space is no longer ours
             prev = self.rev
             with self.lock:
-                for s, b in computed.items():
-                    flight = self._flights.get(s)
-                    if flight is not None and flight.bundle is b:
-                        self._flights.pop(s)
-                changed = {s: self.bundles[s]['bundle'] for s, b in computed.items() if s in self.interest and self._store(s, b, canonical_only=canonical_only)}
+                if age_only:
+                    # Reduce exactly the current publication while holding the writer
+                    # lock. An age pass cannot race/replace a newer decision or change
+                    # input clocks, component sequences, carried trust or retry state.
+                    changed = {}
+                    reducer = _model().reduce_panel
+                    now = self.clock()
+                    for s, held in list(self.bundles.items()):
+                        if s not in self.interest or 'model' not in held['bundle']:
+                            continue
+                        bundle = {**held['bundle'], 'model': reducer(held['bundle'], now=now)}
+                        digest = _hash(bundle)
+                        if digest != held['hash']:
+                            self.rev += 1
+                            self.bundles[s] = {**held, 'bundle': bundle, 'hash': digest, 'rev': self.rev}
+                            changed[s] = bundle
+                else:
+                    for s, b in computed.items():
+                        flight = self._flights.get(s)
+                        if flight is not None and flight.bundle is b:
+                            self._flights.pop(s)
+                    changed = {s: self.bundles[s]['bundle'] for s, b in computed.items() if s in self.interest and self._store(s, b, canonical_only=canonical_only)}
                 self._publish_wire()
             now = self.clock()
             if changed or (heartbeat and now - self.last_emit >= self.heartbeat_s):
@@ -650,25 +668,18 @@ class Feed:
                 or now - self.bundles[s]['bundle'].get('computed_at', 0) >= QUIET_FULL_EVERY_S}
 
     def _due(self, now: float) -> tuple:
-        """(seconds until a pass is due with no write behind it or None, the same for the decision lane). Memory
-        only. What the passing of time alone makes due: the safety-net pass for a held chat that ages (its
-        time-derived lines, evidence expiry and vouch), and the retry of a read that failed or raced. A backend
-        whose watched chats have no open work and no failure has nothing due before QUIET_FULL_EVERY_S."""
+        """A cold, unattempted registration is due; time alone never admits DB work.
+
+        Failed inputs remain unvouched until a source event or explicit request.
+        Held presentation ages separately, without renewing input observations.
+        """
+        # Source failure is not a source event. Keep its stale/unvouched state,
+        # but don't turn canonical unknown evidence into an endless two-second
+        # read loop. Source writes (or a new explicit cold request) admit retry.
+        # Time-derived presentation is reduced from held inputs by beat().
         with self.lock:
-            watched = [s for s in self.interest if s in self.bundles]
-            due = None
-            if len(watched) < len(self.interest) or self._retry.intersection(self.interest):
-                due = self._last_pass + RETRY_EVERY_S
-            full_at = self._last_full + self.full_every_s
-            for s in watched:
-                b = self.bundles[s]['bundle']
-                at = full_at if any(b.get(k) for k in OPEN_KEYS) else max(
-                    full_at, b.get('computed_at', 0) + QUIET_FULL_EVERY_S)
-                due = at if due is None else min(due, at)
-                if due <= now:
-                    break
-            decide = self._last_decision + RETRY_EVERY_S if self._decision_failures.intersection(self.interest) else None
-        return (None if due is None else due - now, None if decide is None else decide - now)
+            missing = any(s not in self.bundles and s not in self.failures for s in self.interest)
+        return (0.0 if missing else None), None
 
     def idle_wait(self) -> float:
         """How long the event-driven loop sleeps when no file is written: to the liveness heartbeat, or sooner when
@@ -690,7 +701,7 @@ class Feed:
             self._wake.set()
         if decide is not None and decide <= 0:
             self._decide.set()
-        return len(self._publish({}, heartbeat=True))
+        return len(self._publish({}, heartbeat=True, age_only=now - self.last_emit >= self.heartbeat_s))
 
     def tick(self) -> int:
         """One pass: recompute what changed and push it, else a heartbeat when due. Returns bundles pushed.
@@ -710,7 +721,7 @@ class Feed:
             return 0
         panel_dirty = self._panel_dirty(watched)
         stamps = self.readers.stamps()
-        full = now - self._last_full >= self.full_every_s
+        full = self._stamps is None  # bootstrap only; wall time never authorizes a DB sweep
         with self.lock:
             retry = self._retry.intersection(watched)
             missing = any(s not in self.bundles for s in watched)
