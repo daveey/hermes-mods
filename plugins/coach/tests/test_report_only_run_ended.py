@@ -154,7 +154,8 @@ def test_park_line_records_run_ended_and_target_card():
     other = ar.park_result_line("kanban_block", {**BLOCK_ARGS, "task_id": "t_0000000000000abc"}, result=BLOCK_OK)
     assert json.loads(other.split("park=", 1)[1])["task"] == "t_0000000000000abc"
     for tool in ar.PARK_TOOLS:
-        assert json.loads(ar.park_result_line(tool, {}).split("park=", 1)[1])["run_ended"] is True, tool
+        result = {"ok": True, "terminal_for_run": True}
+        assert json.loads(ar.park_result_line(tool, {}, result=result).split("park=", 1)[1])["run_ended"] is True, tool
 
 
 def test_run_ended_reads_own_card_parks_only():
@@ -204,7 +205,7 @@ def test_item_key_ignores_a_short_leading_label():
 
 # (e) every run-ending Kanban tool is classified: its report_only finding goes to the card, or it stays nudged
 RUN_ENDING_TOOLS = ("kanban_block", "kanban_schedule", "kanban_continue", "kanban_complete", "kanban_move",
-                    "kanban_request_review", "kanban_request_changes")
+                    "kanban_request_review", "kanban_request_changes", "kanban_retain")
 
 
 def test_every_run_ending_tool_routes_to_card_or_is_deliberately_judged():

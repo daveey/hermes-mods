@@ -89,6 +89,49 @@ def test_kanban_schedule_direct_and_deferred_is_a_lifecycle_park():
         assert rc.report_only_guard(ASK, DRAFT, log) == "lifecycle_park", call[0]
 
 
+RETAIN_ARGS = {"summary": "Scope stays stopped; acceptance is incomplete.", "reason": "scope_stopped",
+               "next_step": "Owning decision route must resolve the prerequisite.",
+               "release_condition": "Authenticated scope release", "evidence": ["scope stop receipt"]}
+RETAIN_OK = json.dumps({"ok": True, "terminal_for_run": True, "dependency_satisfied": False,
+                        "status": "triage", "task_id": "t_0000000000000005"})
+
+
+def test_confirmed_retention_direct_deferred_and_namespaced_is_a_lifecycle_park():
+    for call in (("kanban_retain", RETAIN_ARGS, RETAIN_OK),
+                 _deferred("kanban_retain", RETAIN_ARGS) + (RETAIN_OK,),
+                 ("mcp__kanban_retain", RETAIN_ARGS, RETAIN_OK)):
+        log = _log(BEFORE + [call])
+        assert rc.lifecycle_park(log), log
+        assert rc.report_only_guard(ASK, DRAFT, log) == "lifecycle_park"
+        assert _check(log) is None
+        assert rc.run_end_tool(log) == "kanban_retain"
+        assert rc.own_run_ended(log, "t_0000000000000005") == "kanban_retain"
+        assert rc.own_run_ended(log, "") is None
+
+
+def test_refused_or_unknown_retention_stays_judged():
+    for result in ({"ok": False, "terminal_for_run": False, "error": "delivery unknown"},
+                   {"ok": True, "terminal_for_run": False}, {"ok": True},
+                   {"ok": True, "terminal_for_run": "true"}):
+        for call in (("kanban_retain", RETAIN_ARGS, json.dumps(result)),
+                     _deferred("kanban_retain", RETAIN_ARGS) + (json.dumps(result),)):
+            log = _log(BEFORE + [call])
+            assert not rc.lifecycle_park(log), log
+            assert rc.run_end_tool(log) is None
+            assert rc.own_run_ended(log, "t_0000000000000005") is None
+            assert _check(log)["rule"] == "report_only"
+
+
+def test_pre_verify_logs_guard_after_confirmed_retention(tmp_path, monkeypatch):
+    hooks, logf = _hooks(tmp_path, monkeypatch)
+    hooks["pre_llm_call"](session_id="retained", user_message=ASK, platform="kanban")
+    hooks["post_tool_call"](tool_name="kanban_retain", session_id="retained", args=RETAIN_ARGS, result=RETAIN_OK)
+    assert hooks["pre_verify"](session_id="retained", platform="kanban", attempt=0, final_response=DRAFT) is None
+    logged = [json.loads(line) for line in logf.read_text().splitlines()]
+    assert any(row["event"] == "reply_checked" and row.get("guard") == "lifecycle_park" for row in logged)
+    assert not any(row["event"] == "reply_nudge" for row in logged)
+
+
 def test_goal_mode_time_block_is_a_lifecycle_park():
     log = _log(BEFORE + [("kanban_block", {"kind": "time", "reason": SCHED_ARGS["reason"]}, OK)])
     assert rc.report_only_guard(ASK, DRAFT, log) == "lifecycle_park"
@@ -224,7 +267,7 @@ def test_pre_verify_logs_guard_lifecycle_park_after_a_review_handoff(tmp_path, m
 # someone decides whether report_only may still judge the turn it ended. agent-9f966b0682 and agent-8a6863884a were
 # both a run-ending tool nobody had classified.
 RUN_ENDING_TOOLS = ("kanban_block", "kanban_schedule", "kanban_continue", "kanban_complete", "kanban_move",
-                    "kanban_request_review", "kanban_request_changes")
+                    "kanban_request_review", "kanban_request_changes", "kanban_retain")
 
 
 def _classified(tool):
