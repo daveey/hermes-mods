@@ -53,6 +53,7 @@ RETRY_EVERY_S = 2.0          # with no write to wake a pass: a read that failed 
 MIN_IDLE_WAIT_S = 0.2        # the event-driven loop never sleeps less than this between idle checks
 RECENT_PUBLISHES = 32        # pushes kept in `Feed.timing['recent']` (rev, time, chats, pass start)
 PRODUCER_FULL_EVERY_S = 60.0 # source-event ceiling for canonical time/courier and unkeyed mirror inputs
+CEILING_CHUNK = 4            # ceiling-due chats reconciled per slice; a new source write ends the pass after a slice
 RETRY_STEPS = 3              # failed work is retried this many times without a source event (0.1, 0.2, 0.4 s)
 OPEN_KEYS = ('tasks', 'requests', 'subagents', 'processes', 'rentals')  # a bundle with any of these ages
 SNAPSHOT_VERSION = 1         # the on-disk shape of Feed.snapshot()
@@ -177,6 +178,7 @@ class Feed:
         self._producer_lineage: dict[str, tuple] = {}  # lineage each chat was last reconciled under
         self._producer_owed: set[str] = set()  # outcome/request stamp moved under a stamp that predated it
         self._producer_at: dict[str, float] = {}  # last actual producer pass, not an unaffected stamp settlement
+        self._ceiling_left: set[str] = set()  # ceiling-due chats a pass left for the next (a source write cut its slices short)
         self._pass: Optional[tuple] = None   # (thread ident, wall start) of the pass in flight
         self._seq = itertools.count(1)       # compute order: a bundle computed earlier never replaces a later one
         self._stamps: Any = None
@@ -345,6 +347,7 @@ class Feed:
         self.__dict__.setdefault('_producer_lineage', {}).pop(s, None)
         self.__dict__.setdefault('_producer_owed', set()).discard(s)
         self._producer_at.pop(s, None)
+        getattr(self, '_ceiling_left', set()).discard(s)
         getattr(self, '_reconcile_deferred', set()).discard(s)
         (getattr(self, '_external_observations', None) or {}).pop(s, None)
         (getattr(self, '_external_captures', None) or {}).pop(s, None)
@@ -890,7 +893,10 @@ class Feed:
 
     def _produce(self, watched: list[str], source_seen: Any, admitted: Iterable[str]) -> None:
         """Run the source producer for the admitted chats. A scoped reader's other chats were checked against
-        the same source stamp and found unaffected, so they settle on it unreconciled."""
+        the same source stamp and found unaffected, so they settle on it unreconciled. A pass may run it several
+        times (the event-admitted chats, then ceiling slices): the pass's timing adds them up."""
+        more = self.__dict__.get('_pass_produced', False)
+        self._pass_produced = True
         scoped = bool(getattr(self.readers, 'reconcile_scoped', False))
         wanted = set(admitted)
         began = time.monotonic()
@@ -916,17 +922,20 @@ class Feed:
             if left or not waiting:
                 self._reconcile_retry_at = retry_at
         self._producer_seen = source_seen
-        self.__dict__.setdefault('timing', {}).update(producer_s=round(time.monotonic() - began, 4),
-                                                      producer_chats=len(todo),
-                                                      producer_readers=getattr(self.readers, 'reconcile_timings', []))
+        timing = self.__dict__.setdefault('timing', {})
+        spent = round(time.monotonic() - began, 4)
+        timing.update(producer_s=round((timing.get('producer_s') or 0) + spent, 4) if more else spent,
+                      producer_chats=(timing.get('producer_chats') or 0) + len(todo) if more else len(todo),
+                      producer_readers=getattr(self.readers, 'reconcile_timings', []))
 
     def tick(self) -> int:
         """Settle a source pass atomically, with finite recovery of unread changes."""
         import copy
         names = ('_panel_stamps', '_panel_files', '_stamps', '_board_stamps',
                  '_external_stamps', '_external_captures', '_external_observations', '_cursor', '_reconcile_stamps', '_producer_seen',
-                 '_producer_lineage', '_producer_owed', '_producer_at')
+                 '_producer_lineage', '_producer_owed', '_producer_at', '_ceiling_left')
         saved = {name: copy.deepcopy(getattr(self, name, None)) for name in names}
+        self._pass_produced = False
         self._admission_retry_at = None
         self._hydrate_retry_at = None  # this pass is the retry; it re-arms below when a chat still fails
         self._attempted = set()
@@ -999,6 +1008,7 @@ class Feed:
         # inputs moved (below, once the per-chat dirty sets are known). Others keep the conservative contract:
         # any source write admits every watched chat.
         scoped = bool(reconcile_enabled and getattr(self.readers, 'reconcile_scoped', False))
+        ceiling: set = set()
         if reconcile_enabled and not scoped:
             self._produce(watched, source_seen, redo)
         panel_dirty = self._panel_dirty(watched)
@@ -1011,7 +1021,8 @@ class Feed:
             retry = self._retry.intersection(watched)
             missing = any(s not in self.bundles for s in watched)
         producer_due = scoped and bool(redo or any(s not in self._reconcile_stamps for s in watched)
-                                       or source_seen != self._producer_seen)
+                                       or source_seen != self._producer_seen
+                                       or any(s in self.interest for s in (getattr(self, '_ceiling_left', None) or ())))
         if stamps == self._stamps and not full and not retry and not panel_dirty and not missing and not producer_due:
             self._publish({}, heartbeat=True)
             return 0
@@ -1099,13 +1110,18 @@ class Feed:
             owed = self.__dict__.setdefault('_producer_owed', set())
             owed.update(panel_dirty)
             lineages = {}
+            # Chats due only by the ceiling (nothing of theirs changed): reconciled AFTER everything a source
+            # event admitted has been computed and pushed, and a slice at a time, so a write never waits behind
+            # them. [acceptance 2026-11-22] 40 of 48 chats were ceiling-due on every pass, one pass took 196 s and
+            # a change reached the panel 106-186 s after its write. Chats a pass left are admitted by the next.
+            ceiling = {s for s in (getattr(self, '_ceiling_left', None) or ()) if s in self.interest}
             if moved:
                 # The canonical producer reads clock/courier state and has a 60 s local-mirror
                 # fallback for inputs outside its key. Settling an unaffected source stamp must
                 # not starve those paths forever. Preserve their old source-event liveness with
                 # a per-chat ceiling, never an idle timer or an every-write global reconcile.
-                admitted |= {s for s in watched
-                             if now - self._producer_at.get(s, float('-inf')) >= PRODUCER_FULL_EVERY_S}
+                ceiling |= {s for s in watched
+                            if now - self._producer_at.get(s, float('-inf')) >= PRODUCER_FULL_EVERY_S}
                 # Any source write re-admits producer work still owed after its retries ran out.
                 with self.lock:
                     admitted |= self._reconcile_deferred
@@ -1117,6 +1133,7 @@ class Feed:
                 admitted |= {s for s, ids in lineages.items() if known.get(s) != ids}
             else:
                 lineages = {s: tuple(self.readers.lineage(s) or [s]) for s in admitted if s not in known}
+            ceiling -= admitted
             if admitted or moved:
                 self._produce(watched, source_seen, admitted)
                 owed.difference_update(admitted)
@@ -1125,7 +1142,13 @@ class Feed:
                 # The producer's own request writes must reach the presentation of the chats it reconciled.
                 dirty.update(self._panel_dirty(watched))
         if not dirty:
-            return len(self._publish({}, heartbeat=True))
+            pushed = len(self._publish({}, heartbeat=True))
+            return pushed + (self._ceiling_slices(watched, ceiling, source_seen) if scoped else 0)
+        pushed = self._compute_pending(dirty)
+        return pushed + (self._ceiling_slices(watched, ceiling, source_seen) if scoped else 0)
+
+    def _compute_pending(self, dirty: set) -> int:
+        """Recompute and push `dirty` in chunks, the chats a reader is waiting for first (see `_tick`)."""
         started = time.monotonic()
         pushed, pending, tried = 0, set(dirty), set()
         while pending and not self.stopped.is_set():
@@ -1147,6 +1170,28 @@ class Feed:
             pending.difference_update(chunk)
             pushed += len(self._publish(self._compute_all(chunk, refresh=True), heartbeat=True))
         self.last_tick_s = time.monotonic() - started
+        return pushed
+
+    def _ceiling_slices(self, watched: list[str], due: set, source_seen: Any) -> int:
+        """Reconcile the ceiling-due chats, oldest producer pass first, CEILING_CHUNK at a time; each slice's
+        chats are computed and pushed before the next begins. Called after the pass's event-admitted work, so
+        what a write changed never waits behind this safety net. The first slice always runs (the ceiling is
+        never starved); after it, a new source write or a waiting reader ends the pass and the chats not yet
+        done stay due (`_ceiling_left`). No timer: with no source write the loop never wakes for them."""
+        left = sorted((s for s in due if s in self.interest), key=lambda s: self._producer_at.get(s, float('-inf')))
+        pushed, ran = 0, False
+        stamp = getattr(self.readers, 'reconciliation_stamp', None)
+        while left and not self.stopped.is_set():
+            if ran and (self._cold.is_set() or not self._registrations.empty()
+                        or (callable(stamp) and stamp() != source_seen)):
+                break
+            chunk, left = left[:CEILING_CHUNK], left[CEILING_CHUNK:]
+            ran = True
+            self._produce(watched, source_seen, chunk)
+            dirty = self._panel_dirty(watched)  # the producer's own request writes reach those chats' presentation
+            if dirty:
+                pushed += self._compute_pending(dirty)
+        self._ceiling_left = {s for s in left if s in self.interest}
         return pushed
 
     # ── catch-up ────────────────────────────────────────────────────────────

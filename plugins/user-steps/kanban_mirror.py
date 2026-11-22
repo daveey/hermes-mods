@@ -39,6 +39,31 @@ _EVENT_KINDS = ("created", "blocked", "block_loop_detected", "unblocked", "archi
 _MEMO: dict = {}  # owner key -> (inputs key, monotonic time of the full pass that produced it)
 _MEMO_LOCK = threading.Lock()
 _MEMO_MAX = 256
+_PASS = threading.local()  # set by reconcile_pass(): bindings already checked by an earlier owner of the same pass
+
+
+def _binding_key(binding):
+    return (binding["namespace"], binding["request_id"], binding["request"], binding["snapshot"])
+
+
+@contextmanager
+def reconcile_pass():
+    """Owners reconciled inside one block (one feed producer pass, this thread) check each binding once.
+
+    Every owner's pass also re-checks every OTHER owner's bindings of the namespace, so N owners re-checked
+    each binding N times: on the live hub (48 watched chats) that sweep was ~30% of the producer's py-spy
+    samples. A binding whose check failed is not recorded, so the next owner retries it, as before.
+    Nothing survives the block."""
+    if getattr(_PASS, "done", None) is not None:
+        yield
+        return
+    _PASS.done = set()
+    try:
+        yield
+    finally:
+        _PASS.done = None
+
+
 _POOL: dict = {}
 _POOL_LOCK = threading.Lock()
 _POOL_MAX = 64
@@ -873,9 +898,12 @@ class Mirror:
                     (self.store._ns(owner), owner["storedSessionId"]),
                 )
             ]
+        done = getattr(_PASS, "done", None)
         for binding in bindings:
             try:
                 self._reconcile_binding(owner, binding)
+                if done is not None:
+                    done.add(_binding_key(binding))
             except (ValueError, sqlite3.Error, OSError) as exc:
                 clean = False
                 logging.getLogger("user-steps").warning(
@@ -894,9 +922,13 @@ class Mirror:
                 )
             ]
         for binding in older:
+            if done is not None and _binding_key(binding) in done:
+                continue  # this feed pass already checked exactly this binding (see reconcile_pass)
             previous = dict(owner, storedSessionId=binding["session"])
             try:
                 self._reconcile_binding(previous, binding)
+                if done is not None:
+                    done.add(_binding_key(binding))
             except (ValueError, sqlite3.Error, OSError) as exc:
                 clean = False
                 logging.getLogger("user-steps").warning(

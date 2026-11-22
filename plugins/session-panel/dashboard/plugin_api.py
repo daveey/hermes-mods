@@ -761,19 +761,21 @@ class CoreReaders:
         api = self._user_step_api()
         deferred = set()
         timings = []
-        for session in sessions:
-            # One chat's unavailable source must not fail every other chat's pass (this phase runs
-            # before all hydration). The feed retries what is returned here; it is never certified.
-            began = time.monotonic()
-            try:
-                left = api.panel_reconcile(self.state_db().parent, session, self.lineage(session))
-            except Exception as exc:
-                left = [f'{type(exc).__name__}: {exc}']
-            timings.append({'session': session, 'reconcile_s': round(time.monotonic() - began, 4),
-                            'deferred': bool(left)})
-            if left:
-                deferred.add(session)
-                log.debug('session-panel source reconciliation deferred: %s: %s', session, left)
+        pass_scope = getattr(api, 'panel_pass', None)
+        with pass_scope() if callable(pass_scope) else contextlib.nullcontext():
+            for session in sessions:
+                # One chat's unavailable source must not fail every other chat's pass (this phase runs
+                # before all hydration). The feed retries what is returned here; it is never certified.
+                began = time.monotonic()
+                try:
+                    left = api.panel_reconcile(self.state_db().parent, session, self.lineage(session))
+                except Exception as exc:
+                    left = [f'{type(exc).__name__}: {exc}']
+                timings.append({'session': session, 'reconcile_s': round(time.monotonic() - began, 4),
+                                'deferred': bool(left)})
+                if left:
+                    deferred.add(session)
+                    log.debug('session-panel source reconciliation deferred: %s: %s', session, left)
         self.reconcile_timings = timings
         return deferred
 
