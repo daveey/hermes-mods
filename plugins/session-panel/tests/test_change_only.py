@@ -1,5 +1,53 @@
 """A source event, never elapsed wall time, admits database work."""
 from test_feed import make
+import pytest
+
+
+def test_failed_admission_preserves_cursors_and_retries_without_a_write():
+    f, r, pushed, t = make()
+    r.panel_files_stamp = lambda: r.stamp
+    r.panel_stamps = lambda ids: {s: r.stamp for s in ids}
+    f.watch(['S1'])
+    f.tick()
+    old = (dict(f._panel_stamps), f._panel_files, f._stamps, f._cursor)
+    read = r.changed_cards
+    r.stamp += 1
+    r.links['S1'][0]['title'] = 'New panel value'
+    r.changed_cards = lambda cursor: (_ for _ in ()).throw(OSError('busy'))
+    with pytest.raises(OSError):
+        f.tick()
+    assert (f._panel_stamps, f._panel_files, f._stamps, f._cursor) == old
+    t['now'] += f.heartbeat_s
+    f.beat()
+    assert 'S1' not in pushed[-1]['fresh']
+    assert f._wake.is_set()
+    r.changed_cards = read
+    f.tick()
+    assert f.bundles['S1']['bundle']['tasks'][0]['title'] == 'New panel value'
+    assert 'S1' not in f._retry
+
+
+@pytest.mark.parametrize('warm', [False, True])
+def test_admission_retry_is_bounded_even_when_source_stays_unreadable(warm):
+    f, r, pushed, t = make()
+    f.watch(['S1'])
+    if warm:
+        f.tick()
+    r.stamp += 1
+    r.changed_cards = lambda cursor: (_ for _ in ()).throw(OSError('busy'))
+    with pytest.raises(OSError):
+        f.tick()
+    attempts = 0
+    for _ in range(30):
+        t['now'] += 1
+        f.beat()
+        if f._wake.is_set():
+            attempts += 1
+            with pytest.raises(OSError):
+                f.tick()
+    assert 1 <= attempts <= 3
+    assert 'S1' in f._retry
+    assert not f._wake.is_set()
 
 
 def test_open_work_is_aged_without_reading_unchanged_sources(monkeypatch):
