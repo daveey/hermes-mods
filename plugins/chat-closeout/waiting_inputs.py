@@ -33,6 +33,10 @@ logger = logging.getLogger("chat_closeout")
 
 VERSION = 1
 LIVENESS_FIELDS = ("activity_at", "activity_kind")
+# A remote card's ``synced_at`` follows every hub pull (``min(owner seen, last_ok)``) without any verdict changing:
+# settlement reads the card's ``stale`` verdict, never the stamp. Left out of the waiting pass's per-row key, or
+# every pull re-reconciles every row holding a remote card (hub, 2026-11-22: 10 rows per pass, 4 s apart).
+STAMP_FIELDS = ("synced_at",)
 REPLICA_FRESH_S = 180.0      # core project(): replica fresh / owner observation recent within 180 s
 HUB_STALE_AFTER_S = 180.0    # core fallback when kanban_session_activity is unavailable
 FLOOR_S = 600.0              # every key carries this bucket: a missed input is recomputed within 10 min (C9)
@@ -503,24 +507,31 @@ def lineage_key(marks: Optional[dict[str, tuple]], ids: Iterable[str]) -> Option
 
 
 # ---- per-row cache --------------------------------------------------------------------------------------------
-def card_view(cards: Any, keys: Iterable[str]) -> Any:
-    """What a read says about ``keys``: each card as read plus the read's uncertainty about them."""
+def card_view(cards: Any, keys: Iterable[str], drop: Iterable[str] = ()) -> Any:
+    """What a read says about ``keys``: each card as read (without the ``drop`` fields) plus the read's uncertainty
+    about them."""
     keys = sorted(set(keys))
-    return [[k, (cards or {}).get(k)] for k in keys] + [
+    drop = frozenset(drop)
+
+    def seen(card: Any) -> Any:
+        return {k: v for k, v in card.items() if k not in drop} if drop and isinstance(card, dict) else card
+
+    return [[k, seen((cards or {}).get(k))] for k in keys] + [
         sorted(set(getattr(cards, "uncertain", ())) & set(keys)),
         sorted(set(getattr(cards, "absence_veto", ())) & set(keys)),
         bool(getattr(cards, "readable", True))]
 
 
 def row_key(row: dict, cards: Any, lineage: Optional[list], fields: Optional[Iterable[str]] = None,
-            extra: Any = None) -> Optional[str]:
+            extra: Any = None, drop: Iterable[str] = ()) -> Optional[str]:
     """Everything one row's settlement reads: its fields (``None``: the whole row), its batch and covered cards as
-    read, and its lineage's transcript watermark. None (never reused) when the watermark is unknown."""
+    read (without the ``drop`` card fields), and its lineage's transcript watermark. None (never reused) when the
+    watermark is unknown."""
     if lineage is None:
         return None
     keys = set(row.get("batch") or []) | set(row.get("covered") or [])
     own = sorted(row.items()) if fields is None else [[f, row.get(f)] for f in fields]
-    return digest([own, card_view(cards, keys), lineage, extra])
+    return digest([own, card_view(cards, keys, drop), lineage, extra])
 
 
 class RowCache:
