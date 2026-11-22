@@ -2,6 +2,7 @@
 import collections
 import contextlib
 import sqlite3
+import time
 
 import pytest
 
@@ -227,6 +228,91 @@ def test_primary_mirror_union_falls_back_when_its_evidence_read_failed(graph, mo
             assert local in {t['id'] for t in r.linked([sid])}
     assert ['S0'] in calls and ['S1'] in calls
     assert sum(len(ids) > 1 for ids in calls) == 1
+
+
+def _differences(a, b, key=''):
+    """Where two reads differ, clocks of the read itself aside."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        return [d for k in a.keys() | b.keys() if k != 'age_seconds'
+                for d in _differences(stable(a).get(k), stable(b).get(k), key + '/' + str(k))]
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)) and len(a) == len(b):
+        return [d for i, (x, y) in enumerate(zip(a, b)) for d in _differences(x, y, key + '/' + str(i))]
+    return [] if a == b else [(key, a, b)]
+
+
+def _attested_running_card(path, c, session):
+    """A card core's own primary-mirror query attests: the board has the sync uid columns, and the card's current
+    run is live with an executor event. Nothing in the attestation is stubbed."""
+    from hermes_cli.kanban_db_sync import apply_sync_schema_steps
+    apply_sync_schema_steps(c)
+    tid = kanban_db.create_task(c, title='Running on its executor', session_id=session, initial_status='running')
+    now = int(time.time())
+    run = c.execute("INSERT INTO task_runs (task_id, status, started_at, uid) VALUES (?, 'running', ?, ?)",
+                    (tid, now, 'run-' + tid)).lastrowid
+    c.execute("UPDATE tasks SET status='running', current_run_id=?, assignee='default' WHERE id=?", (run, tid))
+    c.execute("INSERT INTO task_events (task_id, run_id, kind, created_at, uid) VALUES (?, ?, 'heartbeat', ?, ?)",
+              (tid, run, now, 'beat-' + tid))
+    c.commit()
+    return tid
+
+
+def test_primary_mirror_union_keeps_attested_and_parked_cards_as_each_chat_reads_them(graph, board, monkeypatch):
+    """Mixed mirror, core's real attestation query on the reader's connection: one card running on its executor
+    (attested, not marked), one parked (marked). The pass shares one read and every chat gets its own answer."""
+    r, local, _, ksa = graph
+    path, c = board
+    running = _attested_running_card(path, c, 'S1')
+    _make_primary(path)
+    ksa._reset_cache_for_tests()
+    sessions = ['S0', 'S1', 'S2']
+    baseline = {s: (r.linked([s]), r.done([s])) for s in sessions}
+    own = {t['id']: t for t in baseline['S1'][0]}
+    states = {tid: [o.get('state') for o in own[tid].get('execution_observations') or []] for tid in (running, local)}
+    assert states == {running: ['running'], local: ['unknown']}, 'core attested the running card only'
+    assert running not in {t['id'] for t in baseline['S0'][0]}
+    ksa._reset_cache_for_tests()
+    calls = _count_reads(ksa, monkeypatch)
+    with r.batch(sessions):
+        actual = {s: (r.linked([s]), r.done([s])) for s in sessions}
+    assert not _differences(actual, baseline), _differences(actual, baseline)[:6]
+    assert len(calls) == 2 and all(len(ids) > 1 for ids in calls), 'one shared read per status set'
+
+
+def test_primary_mirror_union_whose_attestation_failed_is_found_out_by_the_real_recheck(graph, board, monkeypatch):
+    """The union's own evidence read fails, so the running card comes back marked too. Asked again, core attests
+    it (real query, no stub on the second ask): the union is refused and each chat reads for itself."""
+    from hermes_cli import kanban_primary_execution as kpe
+    r, local, _, ksa = graph
+    path, c = board
+    running = _attested_running_card(path, c, 'S1')
+    _make_primary(path)
+    ksa._reset_cache_for_tests()
+    sessions = ['S0', 'S1']
+    baseline = {s: r.linked([s]) for s in sessions}
+    ksa._reset_cache_for_tests()
+    original, read, union, calls = kpe.attach, ksa._read_session_tasks, [], []
+
+    def attach(conn, rows, **k):
+        if union:  # only core's own call inside the union read fails
+            raise sqlite3.OperationalError('fixture: board busy')
+        return original(conn, rows, **k)
+
+    def reading(path, ids, *a, **k):
+        calls.append(list(ids))
+        if len(ids) > 1:
+            union.append(1)
+        try:
+            return read(path, ids, *a, **k)
+        finally:
+            union.clear()
+    monkeypatch.setattr(kpe, 'attach', attach)
+    monkeypatch.setattr(ksa, '_read_session_tasks', reading)
+    with r.batch(sessions):
+        actual = {s: r.linked([s]) for s in sessions}
+    assert ['S0'] in calls and ['S1'] in calls, 'each chat read for itself'
+    assert not _differences(actual, baseline), _differences(actual, baseline)[:6]
+    seen = {t['id']: t for t in actual['S1']}[running]
+    assert [o.get('state') for o in seen['execution_observations']] == ['running'], 'not the failed union\'s unknown'
 
 
 def test_batch_failure_falls_back_to_stable_lineage_reads(graph, monkeypatch):
