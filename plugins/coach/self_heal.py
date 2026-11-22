@@ -949,6 +949,48 @@ _SYNC_LINE_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \[[^\]]*\] (mods-
 _PMSET_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [+-]\d{4})\s+(Sleep|DarkWake|Wake)\s+(.*)$")
 
 
+# ── gateway-9aaf151a15 (came back again): a provider refusal's automatic retry is not a backend stop ──
+# Core's refused-turn retry (session_auto_continue._schedule_refused_turn_retry) replays a turn that ended in a
+# retryable provider error (HTTP 429 quota) as an auto-continue whose note says "the app or its backend process
+# stopped": false, the backend never stopped. gui.log records the real sequence per chat, so a crash note with no
+# known stop cause whose chat's previous turn ended `status=error` is that retry, not a crash.
+_GUI_TS_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)[,.]\d+ ")
+_GUI_PROMPT_RE = re.compile(r"tui prompt accepted: .*?\bkind=(\w+)")
+_GUI_FINISH_RE = re.compile(r"tui turn finished: .*?\bstatus=(\w+)(?:.*?\bfailure_reason=(\S+))?")
+
+
+def provider_retry_evidence(session_id: str, since: float, until: float, home: Optional[Path] = None) -> str:
+    """Evidence when the chat's newest turn event before `until` is an auto-continue accepted right after a turn that
+    finished `status=error` (a provider refusal retried by core), else "". Fail-open: unreadable logs say nothing."""
+    if not session_id:
+        return ""
+    needle = f"agent_session_id={session_id}"
+    events = []  # (ts, kind, detail, raw line)
+    for ln in _tail_lines(hermes_home(home) / "logs" / "gui.log", 8 << 20):
+        if needle not in ln:
+            continue
+        m = _GUI_TS_RE.match(ln)
+        if not m:
+            continue
+        try:
+            ts = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))  # gui.log logs local time
+        except (ValueError, OverflowError):
+            continue
+        if not since <= ts <= until:
+            continue
+        if (a := _GUI_PROMPT_RE.search(ln)):
+            events.append((ts, "accepted", a.group(1), ln))
+        elif (f := _GUI_FINISH_RE.search(ln)):
+            events.append((ts, "finished", f"{f.group(1)} {f.group(2) or ''}".strip(), ln))
+    events.sort(key=lambda e: e[0])
+    if len(events) < 2:
+        return ""
+    last, before = events[-1], events[-2]
+    if last[1] == "accepted" and last[2] == "auto_continue" and before[1] == "finished" and before[2].startswith("error"):
+        return f"gui.log {before[3][:19]}: turn finished {before[2]}; auto-continue retry accepted {last[3][:19]}"[:300]
+    return ""
+
+
 def is_crash_hit(hit: Optional[dict]) -> bool:
     return bool(hit) and hit.get("source") == "signal" and str(hit.get("symptom") or "").startswith(CRASH_SYMPTOM[:-1])
 
@@ -1846,7 +1888,12 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
             clock = getattr(store, "clock", None)
             now = float(clock()) if callable(clock) else time.time()
             since, until = stop_window(hit, session_id, now)
-            hit = with_stop_cause(hit, stop_cause(None, since, until))
+            stop_found = stop_cause(None, since, until)
+            if stop_found.get("cause") == "unknown" and (why := provider_retry_evidence(session_id, since, until)):
+                store.log({"event": "selfheal_skip", "mode": m, "fingerprint": hit["fingerprint"],
+                           "why": "provider_retry", "session_id": session_id, "evidence": why})
+                return None  # core retried a refused turn with its crash note: no backend stopped
+            hit = with_stop_cause(hit, stop_found)
         except Exception as exc:  # fail-open: an unreadable log only loses the cause, never the alert
             hit = with_stop_cause(hit, {"cause": "unknown", "evidence": f"stop_cause failed: {exc}"[:200]})
     # A machine signal carries what failed; lead with it here, not only in the caller, because a long-running gateway
