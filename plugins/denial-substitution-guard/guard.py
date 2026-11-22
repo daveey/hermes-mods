@@ -2561,6 +2561,7 @@ class _PyAnalysis:
             self.local[scope].discard(name)
             if kind == 'global': self.local[tree].add(name)  # a function-only global still binds the module
         self.env = {}
+        self.format_folds = {}
 
     # ----- indexing -------------------------------------------------------
     def _bind(self, scope, name):
@@ -2681,6 +2682,15 @@ class _PyAnalysis:
     def _product(self, lefts, rights, combine):
         return _py_cap((kind, combine(lv, rv)) for kind, lv in lefts for _, rv in rights)
 
+    def _format_fold(self, pattern, value):
+        # Charge input scans, not just the shorter output; repeated bindings
+        # must not redo thousands of regex matches for an identical value.
+        _py_work(len(value) + 1)
+        key = (pattern, value)
+        if key not in self.format_folds:
+            self.format_folds[key] = re.sub(pattern, _PY_HOLE, value)
+        return self.format_folds[key]
+
     def eval(self, node, scope, depth=0):
         """Never empty: an empty result would silently mean 'no possible value'."""
         return self._eval(node, scope, depth) or self.UNKNOWN
@@ -2722,7 +2732,7 @@ class _PyAnalysis:
             if isinstance(node.op, ast.Div):
                 return _py_cap(('path', _py_join(lv, rv)) for _, lv in left for _, rv in right)
             if isinstance(node.op, ast.Mod):
-                return _py_cap((kind, re.sub(r'%(?:\([^)]*\))?[-#0 +]*[\d*]*(?:\.[\d*]+)?[a-zA-Z%]', _PY_HOLE, v))
+                return _py_cap((kind, self._format_fold(r'%(?:\([^)]*\))?[-#0 +]*[\d*]*(?:\.[\d*]+)?[a-zA-Z%]', v))
                                for kind, v in left)
             return self.UNKNOWN
         if isinstance(node, ast.Attribute):
@@ -2772,7 +2782,7 @@ class _PyAnalysis:
                 return _py_cap(('path', _py_join(a, b)) for _, a in paths for _, b in (values[0] if values else self.UNKNOWN))
             strings = frozenset(item for item in receiver if item[0] == 'str')
             if strings and attr == 'format':
-                return _py_cap(('str', re.sub(r'\{[^{}]*\}', _PY_HOLE, v)) for _, v in strings)
+                return _py_cap(('str', self._format_fold(r'\{[^{}]*\}', v)) for _, v in strings)
         return self.UNKNOWN
 
     # ----- fixpoint -------------------------------------------------------

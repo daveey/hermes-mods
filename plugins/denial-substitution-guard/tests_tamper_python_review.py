@@ -82,6 +82,22 @@ class PythonReviewFindings(unittest.TestCase):
         # Work-bound exhaustion applies the baseline rule, never "no mutation".
         self.assertIsNotNone(g._tamper('python', cases['plus_self'] + f"open('{G}','w')"))
 
+    def test_reused_format_strings_are_scanned_once_per_analysis(self):
+        from unittest.mock import patch
+        original_sub = g.re.sub
+        for template, expression in (('a%s' * 100, 'x%1'), ('a{}' * 100, 'x.format(1)')):
+            code = 'x=' + repr(template) + '\n' + '\n'.join(f'y{i}={expression}' for i in range(30))
+            for _ in range(2):  # Caches must not require a previous top-level call.
+                scans = []
+                def counted_sub(pattern, replacement, text, *args, **kwargs):
+                    if text == template:
+                        scans.append(pattern)
+                    return original_sub(pattern, replacement, text, *args, **kwargs)
+                with patch.object(g.re, 'sub', side_effect=counted_sub):
+                    self.assertIsNone(g._tamper('python', code))
+                self.assertEqual(len(scans), 1, expression)
+                self.assertIsNotNone(g._tamper('python', code + f"\nopen('{G}','w')"))
+
     def test_l1_nested_subscript(self):
         self.assertIsNotNone(g._tamper('python', f"x=[['{G}']]\nopen(x[0][0],'w')"))
         self.assertIsNone(g._tamper('python', f"x=[['{G}']]\nprint(open(x[0][0]).read())"))
