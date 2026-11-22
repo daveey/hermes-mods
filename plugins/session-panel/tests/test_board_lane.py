@@ -274,6 +274,33 @@ def test_admitted_chats_refill_capacity_while_next_external_capture_blocks():
         lane.close()
 
 
+def test_capacity_service_registration_respects_stop_and_single_owner():
+    r = Readers()
+    f = feedmod.Feed(r, emit=lambda p: None)
+    f._board_service_required = True
+    f.stopped.set()
+    lane = feedmod.BoardLane(f, lambda: r)
+    lane.start_service()
+    assert lane.service_worker is None
+    lane.close()
+
+    f = feedmod.Feed(r, emit=lambda p: None)
+    lane = feedmod.BoardLane(f, lambda: r)
+    lane.close()
+    lane.start_service()
+    assert lane.service_worker is None
+
+    lane = feedmod.BoardLane(f, lambda: r)
+    try:
+        lane.start_service()
+        worker = lane.service_worker
+        lane.start_service()
+        assert lane.service_worker is worker and worker.is_alive()
+    finally:
+        lane.close()
+        assert not worker.is_alive()
+
+
 def settle(lane, timeout=2):
     end = time.monotonic() + timeout
     while time.monotonic() < end:

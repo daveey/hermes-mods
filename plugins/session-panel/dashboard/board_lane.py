@@ -32,6 +32,8 @@ class BoardLane:
         # new service. Expose the fully initialized owner for current API repair.
         with feed.lock:
             feed._board_lane = self
+            if getattr(feed, '_board_service_required', False):
+                self.start_service()
 
     def start_service(self):
         """Refill admitted slots on completions, never behind source recapture.
@@ -40,7 +42,7 @@ class BoardLane:
         The service thread does no source I/O; scheduler state shares feed.lock.
         """
         with self.feed.lock:
-            if self.service_worker is not None:
+            if self.service_worker is not None or self.service_stop.is_set() or self.feed.stopped.is_set():
                 return
             self.service_worker = threading.Thread(target=self._serve,
                 name='session-panel-card-service', daemon=True)

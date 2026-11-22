@@ -1269,6 +1269,9 @@ def feed():
             # A saved older entry may already own a live capture thread. Do not
             # duplicate it or reset its cursor; repair that lane's capacity service.
             with core.PROCESS_FEED.lock:
+                # Registration can still be pending in an older capture thread.
+                # Publish the requirement under the same lock used by registration.
+                core.PROCESS_FEED._board_service_required = True
                 board = getattr(core.PROCESS_FEED, '_board_lane', None)
                 if board is not None:
                     board.start_service()

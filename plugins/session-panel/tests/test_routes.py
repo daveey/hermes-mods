@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from fastapi import FastAPI
+import pytest
 from fastapi.testclient import TestClient
 
 HERE = Path(__file__).resolve()
@@ -278,7 +279,8 @@ def test_current_api_adds_one_canonical_lane_to_feed_resumed_by_older_api(monkey
         _restore(api, core)
 
 
-def test_saved_predecessor_board_entry_gets_completion_service(monkeypatch):
+@pytest.mark.parametrize('before_registration', [False, True])
+def test_saved_predecessor_board_entry_gets_completion_service(monkeypatch, before_registration):
     import threading
     import time
     from test_feed import Readers
@@ -295,9 +297,13 @@ def test_saved_predecessor_board_entry_gets_completion_service(monkeypatch):
         return {s: 0 for s in held}
     r.external_capture = capture
     lanes = []
+    constructing, register = threading.Event(), threading.Event()
     original_lane = core.BoardLane
     class Lane(original_lane):
         def __init__(self, f, factory):
+            if before_registration:
+                constructing.set()
+                assert register.wait(5)
             super().__init__(f, factory, capacity=1)
             self.pending = {'S1': time.time(), 'S2': time.time() + .001}
             lanes.append(self)
@@ -311,10 +317,17 @@ def test_saved_predecessor_board_entry_gets_completion_service(monkeypatch):
     exec(compile(source, 'board_entry_before_service.py', 'exec'), ns)
     try:
         assert ns['feed']() is f
-        assert entered.wait(1)
-        assert api.feed() is f
         board_thread = f._board_thread
-        assert api.feed() is f and f._board_thread is board_thread
+        if before_registration:
+            assert constructing.wait(1)
+            assert api.feed() is f and f._board_thread is board_thread
+            assert api.feed() is f and f._board_thread is board_thread
+            register.set()
+            assert entered.wait(1)
+        else:
+            assert entered.wait(1)
+            assert api.feed() is f
+            assert api.feed() is f and f._board_thread is board_thread
         end = time.monotonic() + 1
         while time.monotonic() < end:
             if all(f.bundles[s]['bundle']['tasks'][0]['status'] == 'ready' for s in ('S1', 'S2')):
@@ -325,6 +338,7 @@ def test_saved_predecessor_board_entry_gets_completion_service(monkeypatch):
         assert len(lanes) == 1 and lanes[0].service_worker is not None
         assert not release.is_set()
     finally:
+        register.set()
         release.set()
         f.stopped.set()
         if hasattr(f, '_board_thread'):
