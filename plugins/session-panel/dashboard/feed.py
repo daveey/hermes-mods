@@ -66,7 +66,7 @@ def _model():
 
 
 def _hash(bundle: dict) -> str:
-    body = {k: v for k, v in bundle.items() if k not in ('computed_at', 'computed_seq')}
+    body = {k: v for k, v in bundle.items() if k not in ('computed_at', 'computed_seq', 'canonical_seq')}
     return hashlib.sha1(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -128,6 +128,8 @@ class Feed:
         self._carried: set[str] = set()  # bundles resumed from a stopped feed: never vouched for until restored
         self._reissue: set[str] = set()  # restored from another process: their recompute takes a new revision
         self._successor: Optional['Feed'] = None  # the feed that resumed this one (requests still here move on)
+        self._decision_failures: set[str] = set()
+        self._decision_lock = threading.Lock()  # cheap read lane, never board computation
 
     def resume(self, prev: 'Feed') -> 'Feed':
         """Carry a stopped feed of this process into this one, so clients see no reset.
@@ -151,13 +153,13 @@ class Feed:
             # Restored from another process and not recomputed yet: still re-issued on its recompute.
             self._reissue = set(getattr(prev, '_reissue', ())) & set(bundles)
             # A carried bundle never outranks a newer computation: sequence numbers continue past every held one.
-            top = max((int(b['bundle'].get('computed_seq') or 0) for b in bundles.values()), default=0)
+            top = max((max(int(b['bundle'].get(k) or 0) for k in ('computed_seq', 'canonical_seq')) for b in bundles.values()), default=0)
             self._seq = itertools.count(top + 1)
             prev._successor = self
             # Older feed code (a hot reload) reads neither `stopped` in its publish nor `_successor`: its entry points
             # are routed here as instance attributes (found before the class's), so a request still on it neither
             # moves its revision nor answers with one this feed never issued.
-            prev._publish = lambda computed, heartbeat=False: {}
+            prev._publish = lambda computed, heartbeat=False, canonical_only=False: {}
             prev.watch = self.watch
             prev.changes = self.changes
         return self
@@ -188,6 +190,7 @@ class Feed:
                 self._forget(s)
 
     def _forget(self, s: str) -> None:
+        self._decision_failures.discard(s)
         self.interest.pop(s, None)
         self._panel_stamps.pop(s, None)
         self.bundles.pop(s, None)
@@ -225,9 +228,43 @@ class Feed:
                   'computed_at': self.clock(), 'computed_seq': seq}
         panel_inputs = getattr(r, 'panel_inputs', None)
         if callable(panel_inputs):
+            bundle['canonical_seq'] = next(self._seq)
             bundle.update(panel_inputs(session, lineage))
         bundle['model'] = _model().reduce_panel(bundle, now=bundle['computed_at'])
         return bundle
+
+    def refresh_decisions(self) -> int:
+        """Read canonical decisions without board hydration during a long full sweep.
+
+        Never reconcile mirrors or refresh board trust clocks here. Independent board
+        and canonical sequences merge at publication. Failed reads remain unvouched.
+        """
+        read = getattr(self.readers, 'decision_inputs', None)
+        if not callable(read) or not self._decision_lock.acquire(blocking=False):
+            return 0
+        try:
+            with self.lock:
+                held = {s: b['bundle'] for s, b in self.bundles.items() if s in self.interest}
+            count = 0
+            for s, base in held.items():
+                if self.stopped.is_set():
+                    break
+                seq = next(self._seq)
+                try:
+                    inputs = read(s, base['lineage'])
+                    if not isinstance(inputs, dict) or any(k not in inputs for k in ('outcome_json', 'requests')):
+                        raise ValueError('incomplete canonical decision inputs')
+                    with self.lock:
+                        self._decision_failures.discard(s)
+                    update = {k: inputs[k] for k in ('outcome_json', 'requests')}
+                    count += len(self._publish({s: {**base, **update, 'canonical_seq': seq}}, canonical_only=True))
+                except Exception:
+                    with self.lock:
+                        self._decision_failures.add(s)
+                    log.debug('session-panel canonical refresh failed: %s', s, exc_info=True)
+            return count
+        finally:
+            self._decision_lock.release()
 
     def _wait_flight(self, flight: _Flight) -> Optional[dict]:
         # No interest/publication lock while waiting, including heartbeat emits.
@@ -347,16 +384,35 @@ class Feed:
             self._retry = set(bundles)
             self._carried = set(bundles)
             self._reissue = set(bundles)
-            top = max((int(b['bundle'].get('computed_seq') or 0) for b in bundles.values()), default=0)
+            top = max((max(int(b['bundle'].get(k) or 0) for k in ('computed_seq', 'canonical_seq')) for b in bundles.values()), default=0)
             self._seq = itertools.count(top + 1)
         return self
 
-    def _store(self, session: str, bundle: dict) -> bool:
+    def _store(self, session: str, bundle: dict, *, canonical_only: bool = False) -> bool:
         """Keep `bundle`; True when it differs from what clients last got (it took a new revision)."""
-        h = _hash(bundle)
         prev = self.bundles.get(session)
-        if prev and prev['bundle'].get('computed_seq', 0) > bundle.get('computed_seq', 0):
-            return False  # computed before what we hold (a slow catch-up racing the tick): never goes back
+        if canonical_only and (not prev or prev['bundle']['lineage'] != bundle['lineage']):
+            return False  # expired/re-watched or reparented while the cheap read was in flight
+        board_refresh = not prev or bundle.get('computed_seq', 0) > prev['bundle'].get('computed_seq', 0)
+        merged = canonical_only
+        if prev:
+            old = prev['bundle']
+            if old.get('computed_seq', 0) > bundle.get('computed_seq', 0):
+                if old.get('canonical_seq', 0) >= bundle.get('canonical_seq', 0) or old['lineage'] != bundle['lineage']:
+                    return False
+                bundle = {**old, **{k: bundle[k] for k in ('canonical_seq', 'outcome_json', 'requests')}}
+                merged = True
+            elif old.get('canonical_seq', 0) > bundle.get('canonical_seq', 0) and old['lineage'] == bundle['lineage']:
+                bundle = {**bundle, **{k: old[k] for k in ('canonical_seq', 'outcome_json', 'requests')}}
+                merged = True
+            if not board_refresh and bundle.get('canonical_seq') and all(bundle.get(k) == old.get(k) for k in ('outcome_json', 'requests')):
+                prev['bundle'] = {**old, 'canonical_seq': max(old.get('canonical_seq', 0), bundle.get('canonical_seq', 0))}
+                return False  # no re-reduction of unchanged canonical data every second
+            if merged and bundle.get('canonical_seq'):
+                # Evaluate ageing execution against current time, but retain computed_at:
+                # a fresh decision is never fresh board evidence or a renewed lease.
+                bundle = {**bundle, 'model': _model().reduce_panel(bundle, now=self.clock())}
+        h = _hash(bundle)
         rows = bundle['tasks'] + bundle['done']
         refs = set(bundle['cards']) | {str(t.get('id')) for t in rows if t.get('id')}
         # Core's busy fallback succeeds with last-observed rows, not an exception. Keep them visible,
@@ -367,9 +423,10 @@ class Feed:
         # Recomputed: its bundle is this feed's own now. One restored from another process takes a new revision even
         # when unchanged: a client may hold a newer copy the old process pushed after it saved (a restart's
         # overlap), which a catch-up would otherwise never replace while this feed vouched for it.
-        reissue = session in self._reissue
-        self._carried.discard(session)
-        self._reissue.discard(session)
+        reissue = board_refresh and session in self._reissue
+        if board_refresh:
+            self._carried.discard(session)
+            self._reissue.discard(session)
         if prev and prev['hash'] == h and not reissue:
             prev.update(bundle=bundle, refs=refs, lineage=set(bundle['lineage']), source_stale=source_stale)
             return False
@@ -378,7 +435,7 @@ class Feed:
                                  'lineage': set(bundle['lineage']), 'source_stale': source_stale}
         return True
 
-    def _publish(self, computed: dict[str, dict], *, heartbeat: bool = False) -> dict[str, dict]:
+    def _publish(self, computed: dict[str, dict], *, heartbeat: bool = False, canonical_only: bool = False) -> dict[str, dict]:
         """Store what was computed and push one batch (or a heartbeat when nothing changed and one is due)."""
         with self.compute_lock:
             if self.stopped.is_set():
@@ -389,7 +446,7 @@ class Feed:
                     flight = self._flights.get(s)
                     if flight is not None and flight.bundle is b:
                         self._flights.pop(s)
-                changed = {s: b for s, b in computed.items() if s in self.interest and self._store(s, b)}
+                changed = {s: self.bundles[s]['bundle'] for s, b in computed.items() if s in self.interest and self._store(s, b, canonical_only=canonical_only)}
             now = self.clock()
             if changed or (heartbeat and now - self.last_emit >= self.heartbeat_s):
                 with self.lock:
@@ -397,6 +454,7 @@ class Feed:
                     # re-stamp only these (a dropped or failing chat is never confirmed by a heartbeat).
                     fresh = sorted(s for s in self.interest if s in self.bundles and s not in self.failures
                                    and s not in self._retry and s not in self._carried
+                                   and s not in self._decision_failures
                                    and not self.bundles[s].get('source_stale')
                                    and now - self.bundles[s]['bundle']['computed_at'] <= (
                                        self.full_every_s if self.bundles[s]['bundle'].get('tasks')
@@ -493,6 +551,7 @@ class Feed:
         with self.lock:
             return {'epoch': self.epoch, 'rev': self.rev, 'watched': len(self.interest), 'bundles': len(self.bundles),
                     'failures': {s: dict(f) for s, f in self.failures.items()}, 'last_tick_s': round(self.last_tick_s, 3),
+                    'decision_failures': sorted(self._decision_failures),
                     'stopped': self.stopped.is_set()}
 
 

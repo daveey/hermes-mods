@@ -4,6 +4,24 @@
 all existing bundle fields and add `bundle.model`. P1 does not change Desktop.
 The model is a presentation snapshot, not authorization or execution authority.
 
+## Canonical decision freshness
+
+A separate backend lane reads canonical request lifecycle/resolution and session outcome
+once per second. It uses the same verified owner/profile request views, without mirror
+reconciliation or board hydration. Full sweeps still reconcile mirrors and refresh all
+execution, dependency and inventory inputs. This prevents an unrelated slow board read
+from hiding the entire answered-but-not-delivered interval.
+
+`canonical_seq` orders request/outcome reads independently of `computed_seq` (the board
+snapshot). Publication merges each newest component, rejects a fast read after interest
+was forgotten or lineage changed, and preserves `computed_at`. A decision refresh never
+renews an execution lease, restored/carried board trust or board-source freshness. On a
+merge the reducer evaluates execution expiry at the current clock, not the old board
+clock; unchanged canonical inputs do not re-reduce or issue revisions every second.
+Failed fast reads are retried on the next pass and excluded from heartbeat `fresh`;
+`/status.decision_failures` exposes the affected sessions. Real delivery failures and
+unknown operations retain user-steps Check status/Retry recovery.
+
 ## Contract
 
 ```json

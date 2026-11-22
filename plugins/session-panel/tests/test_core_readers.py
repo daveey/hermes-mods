@@ -79,6 +79,25 @@ def test_lineage_walks_parent_sessions(api, tmp_path, monkeypatch):
     assert r.lineage('unknown') == ['unknown']
 
 
+@pytest.mark.parametrize('raw, expected', [('bad-json', {}), ('null', {}), ('[]', {}), ('{"kind":"done"}', {'kind': 'done'})])
+def test_cheap_decision_inputs_match_outcome_normalization_without_board_reads(api, tmp_path, monkeypatch, raw, expected):
+    path = tmp_path / 'state.db'
+    with sqlite3.connect(path) as c:
+        c.execute('CREATE TABLE sessions(id TEXT, outcome_json TEXT)')
+        c.execute('INSERT INTO sessions VALUES (?,?)', ('S1', raw))
+    r = api.CoreReaders(state_db=path)
+    calls = []
+    def canonical(session, lineage, *, reconcile):
+        calls.append((session, lineage, reconcile))
+        return []
+    monkeypatch.setattr(r, '_user_step_requests', canonical)
+    assert r.decision_inputs('S1', ['S1']) == {'outcome_json': expected, 'requests': []}
+    assert calls == [('S1', ['S1'], False)]
+    with pytest.raises(RuntimeError, match='stored session'):
+        r.decision_inputs('foreign', ['foreign'])
+    r.release()
+
+
 def test_push_payload_is_json_safe_and_bounded(api):
     body = api.push_payload({'epoch': 'e', 'prev': 1, 'rev': 2, 'bundles': {'S1': {'x': float('nan'), 'title': 'NaN Infinity'}}})
     assert body['bundles']['S1'] == {'x': None, 'title': 'NaN Infinity'}, 'text is untouched'

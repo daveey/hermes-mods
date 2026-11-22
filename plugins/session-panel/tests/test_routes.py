@@ -303,7 +303,9 @@ def test_old_snapshots_of_other_backends_are_pruned_on_claim(tmp_path):
 def test_a_new_process_restores_the_saved_feed_claims_it_and_saves_on_stop_and_exit(monkeypatch):
     import json
     import time
+    import threading
     api, original = _hot(monkeypatch, 'restore')
+    run_gate = threading.Event()
     monkeypatch.setattr(api, 'SNAPSHOT_EVERY_S', 10_000.0)  # no periodic save: only the paths under test write
     try:
         f1 = api.feed()
@@ -317,11 +319,19 @@ def test_a_new_process_restores_the_saved_feed_claims_it_and_saves_on_stop_and_e
         saved_rev = json.loads(api._snapshot_path().read_text().split('\n', 1)[0])['rev']
         original.PROCESS_FEED = None
         api._CLAIMS.clear()
+        # Claim is synchronous; do not let the resumed background sweep change
+        # the revision between reading that claim and comparing it to the feed.
+        run = api._run
+        def gated_run(feed):
+            assert run_gate.wait(5)
+            run(feed)
+        monkeypatch.setattr(api, '_run', gated_run)
         f2 = api.feed()
         assert f2 is not f1 and f2.epoch == first['epoch']
         assert f2.rev >= saved_rev + api._load_feed().RESTORE_REV_GAP
         head = json.loads(api._snapshot_path().read_text().split('\n', 1)[0])
         assert head['rev'] == f2.rev and head['gen'] == old_claim + 1, 'the new process claimed the snapshot at once'
+        run_gate.set()
         # The old process (its claim superseded) can no longer save.
         mine = api._CLAIMS[str(api._snapshot_path())]
         api._CLAIMS[str(api._snapshot_path())] = old_claim
@@ -338,6 +348,7 @@ def test_a_new_process_restores_the_saved_feed_claims_it_and_saves_on_stop_and_e
             time.sleep(0.05)
         assert 'S4' in api.load_snapshot()['bundles']
     finally:
+        run_gate.set()
         _restore(api, original)
 
 

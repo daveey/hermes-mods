@@ -138,7 +138,7 @@ def _with_terminal_history(tasks, history, ids):
     return out
 
 
-def panel_requests(home: Path, session: str, lineage) -> list:
+def panel_requests(home: Path, session: str, lineage, *, reconcile=True) -> list:
     """Reconcile the canonical producer before the feed renders; no legacy GET needed.
 
     The feed's context must be the owning profile. Never turn a supplied filesystem
@@ -156,7 +156,8 @@ def panel_requests(home: Path, session: str, lineage) -> list:
         if not core._row(core._state_db(), sid):
             continue
         own = core.server_owner(sid)
-        producer.reconcile(own)
+        if reconcile:
+            producer.reconcile(own)
         requests.extend(producer.present(r) for r in st.views(own, include_withdrawn=True))
     return requests
 
