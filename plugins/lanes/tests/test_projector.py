@@ -144,9 +144,11 @@ def test_managed_subprocess_primary_overlay_parity_and_source_rebuild(actual_boa
                 db.commit()
             with worker.readers(config['local'], config['fleet'], 'primary') as (local, fleet):
                 expected = api._project_evidence(api.core(), local, sources.presentation(local, fleet), 6., '6h', True)
+                collapsed = api._project_evidence(api.core(), local, sources.presentation(local, fleet), 6., '6h', False)
                 before = local.execute("SELECT sql FROM sqlite_master ORDER BY name").fetchall()
             result = project(api, child, config, index)
             assert result['projector_pid'] != os.getpid()
+            assert result['views'] == {'collapsed': collapsed, 'expanded': expected}
             assert json.dumps(result['view'], sort_keys=True) == json.dumps(expected, sort_keys=True)
             assert result['view']['totals']['open'] == (0 if status == 'archived' else 1)
             assert result['view']['totals']['running'] == (1 if status == 'running' else 0)
@@ -185,9 +187,12 @@ def test_result_fences_session_revision_params_and_nonfinite():
     rpc = module('projector_protocol')
     cmd = rpc.project_command('s', 1, (6., '6h', True), 1, [], 'off')
     reply = cmd | {'op': 'result', 'view': {'configured': False}, 'projector_pid': 2,
+                   'views': {'collapsed': {'configured': False}, 'expanded': {'configured': False}},
                    'timing': {'project_start': 1., 'project_end': 2.}}
     assert rpc.validate_result(reply, cmd) == reply
     for delta in ({'session': 'old'}, {'revision': [0, '0' * 64]}, {'params': [24., '24h', True]},
+                  {'views': None}, {'views': {'expanded': {'configured': False}}},
+                  {'views': {'expanded': {'configured': False}, 'collapsed': {'configured': 1}}},
                   {'view': []}, {'projector_pid': None}, {'timing': {'project_start': 1., 'project_end': float('nan')}}):
         with pytest.raises(ValueError):
             rpc.validate_result(reply | delta, cmd)
@@ -324,7 +329,9 @@ def test_supervisor_backoff_fallback_is_fresh_and_coalesces(monkeypatch):
     from types import SimpleNamespace
     client = module('projector_client')
     state = {'value': 1}
-    api = SimpleNamespace(MIN_PROJECT_GAP_S=.01, _lane_view=lambda *a: {'configured': False, 'value': state['value']})
+    api = SimpleNamespace(MIN_PROJECT_GAP_S=.01,
+                          _lane_views=lambda *a: {name: {'configured': False, 'value': state['value']}
+                                                 for name in ('collapsed', 'expanded')})
     supervisor = client.Supervisor(api, {})
     supervisor.retry_at = time.monotonic() + 30
     config = {'local': 'fixture', 'fleet': None}

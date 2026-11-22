@@ -189,6 +189,7 @@ class Supervisor:
         self.source_paths = None
         self.fallback = Fallback()
         self.cursor_read = None  # (exact process, shared in-flight control future)
+        self.recent = None  # one completed projection, reusable only within the gap
         threading.Thread(target=self._run, name='lanes-projector-supervisor', daemon=True).start()
 
     def acquire(self):
@@ -203,30 +204,52 @@ class Supervisor:
             self.idle_since = time.monotonic()
             self.cv.notify_all()
 
+    @staticmethod
+    def _variant(future, params):
+        # Called under cv. Cancellation of a socket cannot cancel shared work.
+        variants = getattr(future, '_lanes_variants', None)
+        if variants is None:
+            variants = future._lanes_variants = {}
+        if params[2] not in variants:
+            selected = concurrent.futures.Future()
+            selected.set_running_or_notify_cancel()
+            variants[params[2]] = selected
+            def done(job):
+                try:
+                    result = dict(job.result())
+                    views = result.pop('views')
+                    result['view'] = views['expanded' if params[2] else 'collapsed']
+                    result['params'] = list(params)
+                    selected.set_result(result)
+                except BaseException as exc:
+                    selected.set_exception(exc)
+            future.add_done_callback(done)
+        return variants[params[2]]
+
     def submit(self, params, generation, cursor):
         rpc.validate_params(params)
         revision = (generation, rpc.digest(cursor))
-        key = tuple(params)
+        # expanded only changes pure presentation, not the expensive evidence.
+        # Always ask the worker for both variants from one source snapshot.
+        params = tuple(params)
+        key = (*params[:2], True)
         with self.cv:
             if self.active and self.active[:2] == (key, revision):
-                return self.active[2]
+                return self._variant(self.active[2], params)
             old = self.queue.get(key)
             if old and old[0] == revision:
-                return old[1]
+                return self._variant(old[1], params)
             if len(self.queue) >= 32 and key not in self.queue:
                 raise Unavailable('lanes pending limit')
             if old:
-                # All waiters for this key follow its one latest queued revision.
-                # Superseding a queued revision is NOT an error/disconnect for
-                # the sockets already waiting on the same parameter key.
                 self.queue[key] = (revision, old[1], old[2])
                 self.cv.notify_all()
-                return old[1]
+                return self._variant(old[1], params)
             future = concurrent.futures.Future()
             future.set_running_or_notify_cancel()
             self.queue[key] = (revision, future, time.monotonic())
             self.cv.notify_all()
-            return future
+            return self._variant(future, params)
 
     def cursor(self):
         with self.cv:
@@ -282,18 +305,33 @@ class Supervisor:
         while True:
             with self.cv:
                 while not self.queue and not self.stopped:
+                    if time.monotonic() - self.last_end >= self.api.MIN_PROJECT_GAP_S:
+                        self.recent = None
                     if self.process and not self.viewers and time.monotonic() - self.idle_since >= 30:
                         self.process.close()
                         self.process = None
                     self.cv.wait(1)
                 if self.stopped:
                     return
+                key, (revision, future, queued) = next(iter(self.queue.items()))
                 gap = self.api.MIN_PROJECT_GAP_S - (time.monotonic() - self.last_end)
-                if gap > 0:
+                reuse = self.recent if gap > 0 and self.recent and self.recent[:2] == (key, revision) else None
+                if gap > 0 and reuse is None:
                     self.cv.wait(gap)
                     continue
-                key, (revision, future, queued) = self.queue.popitem(last=False)
+                if gap <= 0:
+                    self.recent = None
+                self.queue.pop(key)
                 self.active = key, revision, future
+            if reuse is not None:
+                # Identity I/O stays on this daemon, never on the socket loop.
+                if identity.matches(self.manifest):
+                    with self.cv:
+                        self.active = None
+                    future.set_result(reuse[2])
+                    continue
+                self.recent = None
+            selected_at = time.time()
             attempted = False
             try:
                 config = self._configuration()
@@ -308,9 +346,14 @@ class Supervisor:
                         self.source_paths = paths
                     command = rpc.project_command(self.process.session, 0, key, revision[0], None, config['mode'])
                     command['revision'] = list(revision)
+                    rpc_start = time.time()
                     result = self.process.request(command, max(.01, 10 - (time.monotonic() - queued)))
+                    received_at = time.time()
                     if not identity.matches(self.manifest):
                         raise Unavailable('projection identity moved')
+                    result['timing'] = {**result['timing'], 'selected': selected_at,
+                                        'rpc_start': rpc_start, 'rpc_received': received_at,
+                                        'result_ready': time.time()}
                     self.failures = 0
                     result['mode'] = 'projector'
                 else:
@@ -327,10 +370,11 @@ class Supervisor:
                         raise Unavailable('loaded projection identity unavailable')
                     def compute(key=key, revision=revision):
                         started = time.time()
-                        view = self.api._lane_view(*key)  # uncached, current sources
+                        views = self.api._lane_views(*key[:2])
+                        view = views['expanded']
                         if not identity.matches(self.manifest):
                             raise Unavailable('fallback identity moved')
-                        return {'view': view, 'projector_pid': None, 'mode': 'fallback',
+                        return {'view': view, 'views': views, 'projector_pid': None, 'mode': 'fallback',
                                 'revision': list(revision), 'params': list(key),
                                 'timing': {'project_start': started, 'project_end': time.time()}}
                     job = self.fallback.submit((key, revision), compute)
@@ -341,6 +385,7 @@ class Supervisor:
             with self.cv:
                 self.last_end = time.monotonic()
                 self.active = None
+                self.recent = (key, revision, result) if result is not None and result['mode'] == 'projector' else None
             if result is not None:
                 future.set_result(result)
 

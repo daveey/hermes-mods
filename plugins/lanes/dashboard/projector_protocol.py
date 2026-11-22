@@ -68,6 +68,12 @@ def validate_result(reply, cmd):
     if (reply.get('op') != 'result' or not isinstance(view, dict) or
             type(view.get('configured')) is not bool):
         raise ValueError('invalid projection view')
+    views = reply.get('views')
+    if (not isinstance(views, dict) or set(views) != {'collapsed', 'expanded'} or
+                              any(not isinstance(v, dict) or type(v.get('configured')) is not bool
+                                  for v in views.values()) or
+                              views['expanded' if cmd['params'][2] else 'collapsed'] != view):
+        raise ValueError('invalid projection variants')
     timing = reply.get('timing', {})
     if not all(type(timing.get(k)) in (int, float) for k in ('project_start', 'project_end')):
         raise ValueError('invalid projection timing')

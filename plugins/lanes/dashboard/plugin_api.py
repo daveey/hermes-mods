@@ -225,27 +225,39 @@ def lane_view(hours: float = 6.0, window: str = "6h", expanded: bool = False):
                                lambda: _lane_view(hours, window, expanded))
 
 
-def _lane_view(hours, window, expanded):
+def _lane_views(hours, window):
+    """Both presentation variants share the same hub evidence, including fallback."""
+    return _lane_view(hours, window, True, variants=True)
+
+
+def _lane_view(hours, window, expanded, *, variants=False):
     mods = core()
     if mods is not None and 'evidence' in inspect.signature(mods[2].snapshot).parameters:
-        return _current_view(mods, hours, window, expanded)
+        return _current_view(mods, hours, window, expanded, variants=variants)
     snap = read(hours)
-    # The collapsed strip needs the open cards' reasons too (its all-lanes status counts).
-    return _view_module().project(snap, flow(window) if snap.get("configured") else None, expanded)
+    raw = flow(window) if snap.get("configured") else None
+    if variants:
+        return {name: _view_module().project(snap, raw, flag)
+                for name, flag in (('collapsed', False), ('expanded', True))}
+    return _view_module().project(snap, raw, expanded)
 
 
-def _current_view(mods, hours, window, expanded):
+def _current_view(mods, hours, window, expanded, *, variants=False):
     """One source selection under short read snapshots, for strip AND panel."""
     from hermes_cli.kanban_lanes_sources import read_view
     kbc = mods[0]
     try:
         with kbc.connect_closing() as conn, read_view(conn) as evidence:
-            return _project_evidence(mods, conn, evidence, hours, window, expanded)
+            return _project_evidence(mods, conn, evidence, hours, window, expanded, variants=variants)
     except Exception as exc:
-        return _view_module().project({'configured': False, 'reason': f'lanes view is unavailable: {exc}'}, None, expanded)
+        snap = {'configured': False, 'reason': f'lanes view is unavailable: {exc}'}
+        if variants:
+            return {name: _view_module().project(snap, None, flag)
+                    for name, flag in (('collapsed', False), ('expanded', True))}
+        return _view_module().project(snap, None, expanded)
 
 
-def _project_evidence(mods, conn, evidence, hours, window, expanded):
+def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants=False):
     """Same hub-computed projection for owned in-process or borrowed RPC readers."""
     snap = mods[2].snapshot(conn, hours=hours, evidence=evidence)
     raw = None
@@ -262,6 +274,10 @@ def _project_evidence(mods, conn, evidence, hours, window, expanded):
             raw['configured'] = bool(raw.get('lanes'))
         except Exception as exc:
             raw = {'configured': False, 'reason': f'lanes flow is unavailable: {exc}'}
+    if variants:
+        # Only presentation differs: read/project source evidence once on the hub.
+        return {name: _view_module().project(snap, raw, flag)
+                for name, flag in (('collapsed', False), ('expanded', True))}
     return _view_module().project(snap, raw, expanded)
 
 
@@ -470,5 +486,5 @@ def _projector():
         if _projector_instance is None:
             from types import SimpleNamespace
             _projector_instance = _rpc_client.Supervisor(
-                SimpleNamespace(core=core, _lane_view=_lane_view, MIN_PROJECT_GAP_S=MIN_PROJECT_GAP_S), _loaded_identity)
+                SimpleNamespace(core=core, _lane_views=_lane_views, MIN_PROJECT_GAP_S=MIN_PROJECT_GAP_S), _loaded_identity)
         return _projector_instance
