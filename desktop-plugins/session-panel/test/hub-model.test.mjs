@@ -345,6 +345,7 @@ test('request choices use choice_id, verified owner route and exact revision wit
  const request = { requestId: q.request_id, revision: q.request_revision, state: 'open', owner: action.owner, scope: { complete: true, markdown: 'Full scope' }, choices: q.options.map(o => ({ id: o.choice_id, label: o.name, effect: 'answer' })) }
  const call = async (path, opts) => {
   calls.push([path, opts])
+  if (path.endsWith('/decision-refresh')) return {}
   if (opts.connectionId !== 'foreign') return { request: { ...request, owner: { ...action.owner, gatewayId: 'wrong' } } }
   if (opts.method === 'POST') { posts.push(opts); return { operation: { operationId: 'op' } } }
   if (path.includes('/operations/op')) return { operation: { operationId: 'op', dispatchState: 'delivered' }, request: { ...request, resolution: { operationId: 'op' } } }
@@ -360,6 +361,47 @@ test('request choices use choice_id, verified owner route and exact revision wit
  assert.equal(m.modelDecisionStatus(q).text, 'Decision delivered.')
  await m.chooseModelOption(q, q.options[1], current, { call }); assert.equal(posts.length, 1)
  assert.ok(calls.some(([p]) => p.includes('/operations/op')))
+})
+test('2xx receipt repaints authoritative panel within 1s without polling', async () => {
+ m.resetFeedForTests()
+ const q = structuredClone(publicCases.own_letters.model.sections.needs_you[0]); q.request_revision += 21
+ const action = q.actions.find(a => a.kind === 'decide'); action.revision = q.request_revision
+ const route = { connectionId: 'instant', profile: 'default', session: 'instant-chat' }
+ const request = { requestId: q.request_id, revision: q.request_revision, state: 'open', owner: action.owner,
+   scope: { complete: true, markdown: 'Exact scope' }, choices: [{ id: q.options[0].choice_id, effect: 'answer', label: 'Pick' }] }
+ const calls = []
+ let feedRev = 1
+ window.hermesDesktop = { api: async () => ({ feed: 'instant-feed', epoch: 'instant-epoch', rev: feedRev,
+   bundles: feedRev === 1 ? { [route.session]: { session: route.session, model: publicCases.own_letters.model } } : {} }) }
+ const target = { ...route, sessions: [route.session] }
+ await m.feedCatchUp(target)
+ const started = performance.now()
+ await m.chooseModelOption(q, q.options[0], route, { call: async (path, opts) => {
+   calls.push(path)
+   if (path.endsWith('/decision-refresh')) {
+     // Another chat advanced the connection cursor after this scoped capture.
+     // It must not suppress a newer decision model for this particular session.
+     feedRev = 3; await m.feedCatchUp(target)
+     return { feed: 'instant-feed', epoch: 'instant-epoch', rev: 2,
+       bundle: { session: route.session, model: publicCases.instant_decision.model } }
+   }
+   if (path.endsWith('/decisions')) return { operation: { operationId: 'instant-op', dispatchState: 'delivered', idempotencyKey: opts.body.idempotencyKey },
+     request: { ...request, resolution: { operationId: 'instant-op' } } }
+   if (path.includes('/operations')) throw Error('Receipt GET deliberately blocked')
+   return { request }
+ } })
+ await paint(m.renderModel(m.cachedModel(route)))
+ assert.ok(performance.now() - started < 1000)
+ assert.equal(m.modelDecisionStatus(q).text, 'Decision delivered.')
+ assert.equal(m.cachedModel(route).header.counts.needs_you, 0)
+ assert.ok(document.querySelector('[data-model-section="needs_you"]') === null, 'answered ask left needs you')
+ assert.equal(calls.filter(p => p.endsWith('/decisions')).length, 1)
+ assert.equal(calls.filter(p => p.includes('/operations')).length, 0)
+ assert.equal(m.ingestBundle(route.connectionId, route.profile, { session: route.session, model: publicCases.own_letters.model },
+   { feed: 'instant-feed', epoch: 'instant-epoch', rev: 1 }), false)
+ assert.equal(m.cachedModel(route).header.counts.needs_you, 0)
+ delete window.hermesDesktop
+ m.resetFeedForTests()
 })
 test('lost POST remains locked across alternate choices and check queries the retained key, never reposts', async () => {
  const q = structuredClone(publicCases.own_letters.model.sections.needs_you[0]); q.request_revision += 2

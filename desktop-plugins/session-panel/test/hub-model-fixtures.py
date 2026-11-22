@@ -58,5 +58,8 @@ for name, row in f.retiring_owner_cases().items():
 cases['relative_clock'] = f.bundle(f.observed(f.task('t_clock', status='running',
     current_run_started_at=f.NOW - 36 * 60, activity_at=f.NOW - 60,
     run_machine='worker', run_model='example-model', activity_kind='tool')))
+decided = f.request(state='resolved')
+decided['resolution'] = {'operationId': 'instant-op', 'choiceId': 'card-0', 'revision': 3}
+cases['instant_decision'] = f.bundle(f.task(human_request=f.human(), wait={'wait_state': 'human'}), requests=[decided])
 print(json.dumps({name: {'model': f.model.reduce_panel(b, now=f.NOW, projector=f.project,
     wire=name == 'relative_clock'), 'now': f.NOW} for name, b in cases.items()}))

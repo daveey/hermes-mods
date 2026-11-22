@@ -16,6 +16,9 @@ import sys
 import time
 import logging
 import threading
+import asyncio
+import weakref
+import anyio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -40,6 +43,27 @@ async def _on_lane(lane, fn, *args, request=None, deadline=None, **kwargs):
 from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr
 
 API_VERSION = 2
+# Separate capacity from both feed reads and the default AnyIO read pool.
+_DECISION_LIMITERS = weakref.WeakKeyDictionary()
+
+
+async def _on_decision(fn, *args):
+    loop = asyncio.get_running_loop()
+    gate, runner = _DECISION_LIMITERS.setdefault(loop, (asyncio.BoundedSemaphore(4), anyio.CapacityLimiter(4)))
+    try:
+        async with asyncio.timeout(0.75):
+            await gate.acquire()
+    except TimeoutError:
+        raise HTTPException(503, 'Decision service busy; check status before retrying', headers={'Retry-After': '1'})
+    work = asyncio.create_task(anyio.to_thread.run_sync(functools.partial(fn, *args), limiter=runner))
+    # Native task cancellation must not free capacity while a worker is still
+    # delivering the frozen operation. Keep its context and slot until it exits.
+    def finished(task):
+        gate.release()
+        if not task.cancelled():
+            task.exception()  # retrieve errors even if the HTTP caller left
+    work.add_done_callback(finished)
+    return await asyncio.shield(work)
 # Background re-delivery of decisions refused because the session was mid-turn. ~1h of attempts, then manual Retry.
 RETRY_INTERVAL_S = float(os.environ.get('HERMES_USER_STEPS_RETRY_S', '15'))
 RETRY_MAX_ATTEMPTS = 240
@@ -272,7 +296,13 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         await run_in_threadpool(recover_once)
         yield
 
-    router = APIRouter(lifespan=lifespan, dependencies=[Depends(recover_once)])
+    async def ensure_recovered():
+        # A sync dependency would queue before the isolated endpoint can start.
+        key = str(_load('core').home().resolve())
+        if key not in recovered:
+            await _on_decision(recover_once)
+
+    router = APIRouter(lifespan=lifespan, dependencies=[Depends(ensure_recovered)])
 
     def ledger():
         return _load('core').Ledger(ledger_dir, state_db)
@@ -405,8 +435,8 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         return await _on_lane('feed', run, action, request=request)
 
     @router.get('/requests/{request_id}')
-    def request(request_id: str, session: str):
-        return run(lambda: {'request': mirror().present(store().view(owner(session), request_id))})
+    async def request(request_id: str, session: str):
+        return await _on_decision(run, lambda: {'request': mirror().present(store().view(owner(session), request_id))})
 
     @router.post('/requests/{request_id}/withdraw')
     def withdraw(request_id: str, body: WithdrawBody):
@@ -418,8 +448,10 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         return run(action)
 
     @router.post('/requests/{request_id}/decisions')
-    def decide(request_id: str, body: DecisionBody):
+    async def decide(request_id: str, body: DecisionBody):
+        received = time.monotonic()
         def action():
+            started = time.monotonic()
             own = owner(body.session); st = store()
             payload = body.model_dump(exclude={'session'})
             payload['requestId'] = request_id
@@ -428,8 +460,14 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
             recorded = (producer.decide_other(own, payload)
                         if payload['choiceId'] == 'answer-text' and producer.binding(own, request_id)
                         else st.decide(own, payload))  # durable commit BEFORE receiver effects
-            return st.dispatch(own, recorded['operation']['operationId'], delivery())
-        return run(action)
+            committed = time.monotonic()
+            result = st.dispatch(own, recorded['operation']['operationId'], delivery())
+            logging.getLogger('user-steps').info(
+                'Decision timing operation=%s queue_ms=%.1f record_ms=%.1f dispatch_ms=%.1f',
+                recorded['operation']['operationId'], (started-received)*1000,
+                (committed-started)*1000, (time.monotonic()-committed)*1000)
+            return result
+        return await _on_decision(run, action)
 
     @router.post('/requests/{request_id}/reconcile-chat')
     def reconcile_chat(request_id: str, body: ChatReconcileBody):
@@ -461,22 +499,22 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         return result
 
     @router.get('/operations')
-    def operation_by_key(session: str, idempotencyKey: str):
-        return run(lambda: present_operation(store().operation(owner(session), key=idempotencyKey)))
+    async def operation_by_key(session: str, idempotencyKey: str):
+        return await _on_decision(run, lambda: present_operation(store().operation(owner(session), key=idempotencyKey)))
 
     @router.get('/operations/{operation_id}')
-    def operation(operation_id: str, session: str):
-        return run(lambda: present_operation(store().operation(owner(session), oid=operation_id)))
+    async def operation(operation_id: str, session: str):
+        return await _on_decision(run, lambda: present_operation(store().operation(owner(session), oid=operation_id)))
 
     @router.get('/operations/{operation_id}/receipts')
-    def receipts(operation_id: str, session: str):
+    async def receipts(operation_id: str, session: str):
         # Read only: owner receipts are written by the owning agent through its action_request tool (server-derived
         # owner), never through this human surface, so the UI cannot claim an acknowledgment or application.
-        return run(lambda: store().receipts(owner(session), operation_id))
+        return await _on_decision(run, lambda: store().receipts(owner(session), operation_id))
 
     @router.post('/operations/{operation_id}/retry')
-    def retry(operation_id: str, session: str):
-        return run(lambda: store().dispatch(owner(session), operation_id, delivery()))
+    async def retry(operation_id: str, session: str):
+        return await _on_decision(run, lambda: store().dispatch(owner(session), operation_id, delivery()))
 
     @router.post('/reconcile')
     def reconcile(session: str):

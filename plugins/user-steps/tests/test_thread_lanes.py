@@ -2,6 +2,75 @@
 a core without lanes keeps the shared pool. Live 2026-11-21 these reads held shared-pool threads for minutes
 and starved /api/status on the hub's always-on backend."""
 import importlib.util
+import asyncio
+import threading
+import time
+
+import anyio
+import httpx
+
+
+def test_decision_owner_write_and_receipt_bypass_a_saturated_read_pool(setup, monkeypatch):
+    api, client = setup
+    monkeypatch.setattr(api, 'RETRY_INTERVAL_S', 0)
+    app = client().app
+    request_id = client().get('/requests', params={'session': 'session-a'}).json()['requests'][0]['requestId']
+    ft = load_module('decision_lane_feed_tests', ROOT.parent / 'session-panel/tests/test_feed.py')
+    r = ft.Readers()
+    r.links = {}; r.finished = {}; r.cards = {}
+    st = app.state.action_store
+    initial = client().get('/requests/' + request_id, params={'session': 'session-a'}).json()['request']
+    def canonical(session, lineage):
+        return {'outcome_json': {}, 'requests': st.views(initial['owner'], include_withdrawn=True)}
+    r.panel_inputs = r.decision_inputs = canonical
+    f = ft.feedmod.Feed(r, clock=lambda: 1000, emit=lambda payload: None)
+    f.watch(['session-a'])
+    f._publish({'session-a': f.compute('session-a')})
+    assert f.bundles['session-a']['bundle']['model']['header']['counts']['needs_you'] == 1
+    board_clock = f.bundles['session-a']['bundle']['computed_at']
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as c:
+            # Warm startup before saturating all shared read capacity.
+            assert (await c.get('/requests/' + request_id, params={'session': 'session-a'})).status_code == 200
+            limiter = anyio.to_thread.current_default_thread_limiter()
+            old = limiter.total_tokens
+            limiter.total_tokens = 1
+            entered, release = threading.Event(), threading.Event()
+            def blocked_read():
+                entered.set()
+                assert release.wait(5)
+            slow = asyncio.create_task(anyio.to_thread.run_sync(blocked_read))
+            try:
+                while not entered.is_set():
+                    await asyncio.sleep(0)
+                started = time.monotonic()
+                async def decision():
+                    response = await c.get('/requests/' + request_id, params={'session': 'session-a'})
+                    assert response.status_code == 200
+                    view = response.json()['request']
+                    posted = await c.post('/requests/' + request_id + '/decisions', json={
+                        'session': 'session-a', 'expectedRevision': view['revision'],
+                        'choiceId': view['choices'][0]['id'], 'idempotencyKey': 'isolated-lane'})
+                    assert posted.status_code == 200, posted.text
+                    result = posted.json()
+                    assert result['request']['resolution']['operationId'] == result['operation']['operationId']
+                    receipt = await c.get('/operations/' + result['operation']['operationId'], params={'session': 'session-a'})
+                    assert receipt.status_code == 200
+                    # Keep the background decision sweep blocked too: interactive
+                    # publication reads only this session and never waits for it.
+                    with f._decision_lock:
+                        refreshed = f.refresh_decision('session-a', readers=r)
+                    assert refreshed['bundle']['model']['header']['counts']['needs_you'] == 0
+                    assert refreshed['bundle']['computed_at'] == board_clock
+                await asyncio.wait_for(decision(), timeout=0.95)
+                assert time.monotonic() - started < 1
+                assert not release.is_set()
+            finally:
+                release.set()
+                await slow
+                limiter.total_tokens = old
+    asyncio.run(exercise())
 from pathlib import Path
 
 import pytest
@@ -20,6 +89,39 @@ def load_module(name, path):
     return mod
 
 
+def test_decision_lane_bounds_queue_and_keeps_cancelled_worker_capacity(setup):
+    api, _ = setup
+    async def exercise():
+        entered = 0
+        release = threading.Event()
+        lock = threading.Lock()
+        def hold():
+            nonlocal entered
+            with lock:
+                entered += 1
+            assert release.wait(5)
+        tasks = [asyncio.create_task(api._on_decision(hold)) for _ in range(4)]
+        try:
+            while entered < 4:
+                await asyncio.sleep(0)
+            tasks[0].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await tasks[0]
+            ran = []
+            with pytest.raises(HTTPException) as exc:
+                await api._on_decision(lambda: ran.append(True))
+            assert exc.value.status_code == 503
+            assert ran == []
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            # The shielded first worker also must finish before fixture teardown.
+            gate, _ = api._DECISION_LIMITERS[asyncio.get_running_loop()]
+            while gate._value != 4:
+                await asyncio.sleep(0)
+    asyncio.run(exercise())
+
+
 @pytest.fixture
 def setup(tmp_path):
     api = load_module('user_steps_lanes_api', ROOT / 'dashboard' / 'plugin_api.py')
@@ -30,6 +132,7 @@ def setup(tmp_path):
 
     def client():
         app = FastAPI()
+        app.state.action_store = s
         app.include_router(api.create_router(
             ledger_dir=tmp_path / 'ledger', state_db=tmp_path / 'state.db', action_store=s,
             owner_resolver=lambda session: dict(decisions.OWNER, storedSessionId=session),

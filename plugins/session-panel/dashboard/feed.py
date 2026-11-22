@@ -375,6 +375,37 @@ class Feed:
         bundle['model'] = _model().reduce_panel(bundle, now=bundle['computed_at'], wire=True)
         return bundle
 
+    def refresh_decision(self, session, *, readers):
+        """Interactive canonical read, independent of the sweep's decision lock.
+
+        Uses the existing component merge: never refresh board clocks or infer
+        running work from a delivered decision. Old in-flight reads lose by seq.
+        """
+        with self.lock:
+            held = self.bundles.get(session)
+            if session not in self.interest or held is None:
+                raise ValueError('Session panel is not hydrated')
+            base = held['bundle']
+            seq = next(self._seq)
+        try:
+            inputs = readers.decision_inputs(session, base['lineage'])
+            if not isinstance(inputs, dict) or any(k not in inputs for k in ('outcome_json', 'requests')):
+                raise ValueError('incomplete canonical decision inputs')
+        except Exception:
+            with self.lock:
+                if session in self.interest:
+                    self._decision_failures.add(session)
+            raise
+        with self.lock:
+            self._decision_failures.discard(session)
+        self._publish({session: {**base, **{k: inputs[k] for k in ('outcome_json', 'requests')},
+                                 'canonical_seq': seq}}, canonical_only=True)
+        with self.lock:
+            held = self.bundles.get(session)
+            if session not in self.interest or held is None or held['bundle']['lineage'] != base['lineage']:
+                raise ValueError('Session panel changed during decision refresh')
+            return {'bundle': held['bundle'], 'epoch': self.epoch, 'rev': self.rev}
+
     def refresh_decisions(self, *, readers=None) -> int:
         """Read canonical decisions without board hydration during a long full sweep.
 
