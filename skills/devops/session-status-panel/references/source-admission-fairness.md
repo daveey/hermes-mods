@@ -2,6 +2,8 @@
 
 An independent task-refresh lane must admit external hub/origin-ledger/replica writes as well as local board revisions: a file-watch wake alone proves nothing if unchanged board stamps skip capture. Exercise an external-only semantic change while the full sweep is blocked, and real adapter observation-only pulls without hydration or renewed execution clocks.
 
+When adding a lane capacity-service thread, run the genuine predecessor `feed` and `_run_board` entry functions against the current Feed/BoardLane, then call the current API entry. A live coordinator does not prove its service thread was started: older saved restart closures can instantiate current classes without invoking newly added startup methods. Require idempotent service establishment and behaviorally prove two admitted chats refill a single slot while recapture stays blocked; retain a current-entry control.
+
 Bound service priority separately from payload coalescing: preserve the first unserved admission time and use oldest-first/bounded-aging scheduling. A continually rewritten newest-first queue can starve a quiet changed chat despite bounded memory. Test saturated capacity with continuing newer arrivals.
 
 Measure admission-to-publication as well as reader-start-to-publication; a passing reader p95 can hide a failing queue. Exercise completion-driven slot refill while the NEXT strict external capture is event-blocked, not only while another hydration worker blocks. A synchronous recapture before draining completions can leave finished workers occupying bounded slots for entire capture passes. Preserve the failed live interval and process/path provenance; a timing-writer PID is not necessarily the executing worker PID during hot reload.
