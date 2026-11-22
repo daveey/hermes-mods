@@ -27,7 +27,8 @@ def graph(api, board, tmp_path, monkeypatch):
     # An empty origin ledger is an independent input; replica selection itself is NOT stubbed.
     monkeypatch.setattr(ksa, '_remote_links', lambda stale_ok=False: [])
     monkeypatch.setattr(ksa, 'remote_links_and_origin_rows', lambda stale_ok=False: ([], []))
-    monkeypatch.setattr(sync, 'sync_config', lambda: {'enabled': True, 'links_reader': 'replica'})
+    # Scope attestation to the fixture gateway, never the developer's enrolled HOME.
+    monkeypatch.setattr(sync, 'sync_config', lambda: {'enabled': True, 'links_reader': 'replica', 'gateway': 'local-test'})
     ksa._reset_cache_for_tests()
     state = sqlite3.connect(tmp_path / 'state.db')
     state.execute('CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT)')
