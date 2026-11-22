@@ -46,7 +46,11 @@ something concrete, the card is not blocked on a human. It is unclear work. Re-p
 
 Read the card's newest comments and runs, the linked PR/CI, and the actual state the blocker refers to (process
 alive? file present? token valid? PR merged?). Many asks are already answered, already done, or about a process
-that no longer exists. If the premise is gone, the block is gone: comment what you read and unblock.
+that no longer exists. If the premise is gone, remove that ask without releasing independent holds. A stale
+human ask can coexist with a valid spend hold: use `action_request` withdrawal for its exact request ID, then
+`hermes kanban block <id> --metadata-only --human-request null '<reason>'` to clear the card's human-request
+metadata without authorizing execution. Read back both results. This does not change block kind or renew spend;
+report the remaining hold accurately rather than promoting merely to make the status look clear.
 
 A macOS permission ask (Screen Recording, Accessibility, "grant it at the Mac") is a premise to read, not to relay.
 Read the Mac's existing grants first (query and how to read it: `references/macos-permission-grants.md`). Often
@@ -72,7 +76,8 @@ Stop at the first rung that works. Each rung is something agents may do without 
 ## 4. Decide
 
 - **Resolved at rung a–f** → do it now. Comment on the card: `try-to-unblock: resolved at rung <x>: <what you did>;
-  reverse with <how>`. Unblock it (or never block it) and read the status back. Retitle a resolved decision card to
+  reverse with <how>`. Release only the resolved hold and read back state; preserve independent spend/safety holds.
+  Retitle a resolved decision card to
   the work it now owns (`hermes kanban edit <id> --title …`): task notices and chat task lists quote the title, so a
   question title keeps reading as an open ask to David.
 - **Rung g** → you are certain David is needed. Write down, for the next skill:
@@ -82,10 +87,6 @@ Stop at the first rung that works. Each rung is something agents may do without 
   - the decision David actually owns, phrased as a question he can answer without reading the card's history.
   Then load **generate-unblock-card** and file the card with it.
 
-If you are relaying an existing blocked card (summary, sweep) whose ask is unclear or that rung a–f resolves,
-don't relay it: resolve it, or rewrite its `human_request` with generate-unblock-card (`kanban_block` again on
-the same card with the new request) before it reaches David.
-
 ## 5. Leave a trail
 
 Whatever the outcome, one comment on the card with the rung reached and the evidence (verbatim tool output, not
@@ -94,5 +95,5 @@ a paraphrase). The next agent and the ask-gate judge read it; without it they re
 ## Done means
 - [ ] The blocker is one concrete sentence, and its premise was re-read live this turn.
 - [ ] Every rung a–f was considered; the comment says why each one that applies failed.
-- [ ] Either the card is unblocked (status read back) or generate-unblock-card filed the request, never a bare
-      "needs David" in chat or a `kanban_block` reason.
+- [ ] Readback proves either release, a valid filed human request, or removal of the stale ask while an
+      independent hold remains. Distinguish metadata correction from execution authorization.
