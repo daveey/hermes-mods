@@ -9,6 +9,7 @@ import contextvars
 import functools
 import importlib.util
 import inspect
+import json
 import os
 import sqlite3
 import sys
@@ -138,6 +139,33 @@ def _with_terminal_history(tasks, history, ids):
     return out
 
 
+def panel_owners(home: Path, session: str, lineage) -> list:
+    """Capture stored membership once, closing SQL before owner derivation.
+
+    Absence is a 404; an unreadable source is an error, never an empty snapshot.
+    Identity is resolved once in the current profile, not from supplied paths.
+    """
+    core = _load('core')
+    if core.home().resolve() != Path(home).resolve():
+        raise core.ActionError('Panel profile does not match current profile', 409)
+    ids = list(dict.fromkeys([*lineage, session]))
+    c = core._ro_connect(core._state_db(), timeout=2)
+    try:
+        c.execute('PRAGMA query_only=ON')
+        rows = c.execute('SELECT id FROM sessions WHERE id IN (SELECT value FROM json_each(?))',
+                         (json.dumps(ids),)).fetchall()
+    finally:
+        c.close()
+    present = {row[0] for row in rows}
+    if session not in present:
+        raise core.ActionError('Unknown stored session on this profile', 404)
+    identity = core.server_owner(session)
+    owners = [dict(identity, storedSessionId=sid) for sid in ids if sid in present]
+    for own in owners:
+        core.validate_owner(own)
+    return owners
+
+
 def panel_requests(home: Path, session: str, lineage, *, reconcile=True) -> list:
     """Reconcile the canonical producer before the feed renders; no legacy GET needed.
 
@@ -145,20 +173,12 @@ def panel_requests(home: Path, session: str, lineage, *, reconcile=True) -> list
     path or source reference into write authority for a different profile.
     """
     core = _load('core')
-    if core.home().resolve() != Path(home).resolve():
-        raise core.ActionError('Panel profile does not match current profile', 409)
-    if not core._row(core._state_db(), session):
-        raise core.ActionError('Unknown stored session on this profile', 404)
+    owners = panel_owners(home, session, lineage)
     st = core.ActionStore() if reconcile else core.ActionStore(read_only=True)
     if not reconcile and not st.path.exists():
         return []  # a fresh profile has no producer store; readers must not create it
     producer = _load('kanban_mirror').Mirror(core, st)
-    owners = []
-    for sid in dict.fromkeys([*lineage, session]):
-        if not core._row(core._state_db(), sid):
-            continue
-        own = core.server_owner(sid)
-        owners.append(own)
+    for own in owners:
         if reconcile:
             producer.reconcile(own)
     return producer.views(owners, include_withdrawn=True)
