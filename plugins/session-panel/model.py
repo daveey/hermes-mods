@@ -351,6 +351,14 @@ def ask(row, request=None):
         out['options'].append({**option, 'recommended': recommended,
                                'reason': parsed['reason'] if recommended else '',
                                'choice_id': choice.get('id') if request else None})
+    if request.get('state') == 'needs_context':
+        # An approval asked without a written plan: user-steps offers only "Request changes" (a text reply), and
+        # nothing can be approved. Drawing that lone revise choice as "A · Request changes / Choose A" under an
+        # "Approve ..." title read as a one-button approve/reject card. Show no choices and say what is missing.
+        out['options'] = []
+        parsed = {**parsed, 'recommend_letter': '', 'reason': ''}
+        out['situation'] = ('The agent asked for your approval but posted no plan, so there is nothing to approve '
+                            'yet. Ask it for the plan in the chat, or ignore this if the work no longer needs it.')
     out['recommend_letter'], out['reason'] = parsed['recommend_letter'], parsed['reason']
     out['request_id'] = request.get('requestId')
     out['request_revision'] = request.get('revision')

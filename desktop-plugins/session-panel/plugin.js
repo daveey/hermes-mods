@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v16-status-lines'
+const VERSION = 'session-panel-v17-collapse'
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 // Emoji-presentation glyphs the Desktop fonts draw as tofu (a Hermes-bug title carried "⛔"); the model strips them
 // too, this covers a cached older model.
@@ -280,7 +280,26 @@ const PANEL_CSS = `[data-session-panel] [data-choice-letter]:not(:disabled):hove
 const STATE_LABEL = { decision: 'needs your decision', needs_input: 'needs you', needs_user: 'needs you', working: 'working', done: 'done', stuck: 'stuck', idle: 'idle' }
 
 /** Pure model -> React tree. No parsing, classification, I/O, clock or ambient state. */
-export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck } = {}) {
+/** Rows that reopen a collapsed panel: any ask or stuck item not already seen when it was collapsed. */
+export const attentionKeys = model => validModel(model) ? ['needs_you', 'stuck'].flatMap(section => model.sections[section].map(row => str(row.key))) : []
+const COLLAPSED_KEY = 'hermes.sessionPanel.collapsed.v2'
+/** Collapsed state for one chat: the attention keys present when the user collapsed it, or null (expanded). */
+export function readCollapsed(scope) {
+  try { const all = JSON.parse(window.localStorage.getItem(COLLAPSED_KEY) || '{}'); return Array.isArray(all[scope]) ? all[scope] : null } catch { return null }
+}
+export function writeCollapsed(scope, keys) {
+  try {
+    const all = JSON.parse(window.localStorage.getItem(COLLAPSED_KEY) || '{}')
+    if (keys) all[scope] = keys; else delete all[scope]
+    // Bounded: keep the 200 most recently written chats.
+    const entries = Object.entries(all).slice(-200)
+    window.localStorage.setItem(COLLAPSED_KEY, JSON.stringify(Object.fromEntries(entries)))
+  } catch {}
+}
+/** Collapsed only while every current ask/stuck row was already present when the user collapsed the panel. */
+export const isCollapsed = (model, stored) => !!stored && attentionKeys(model).every(k => stored.includes(k))
+
+export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck, collapsed = false, onToggle } = {}) {
   if (!validModel(model)) return null
   // Spec: hidden when there is neither open work nor finished history.
   if (!MODEL_SECTIONS.some(([section]) => model.sections[section].length)) return null
@@ -362,11 +381,17 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
     ] }, row.key)
   }
   return jsxs('section', { 'data-session-panel': '', 'data-hub-model': model.revision, 'aria-label': 'Session status',
-    style: { minWidth: 0, width: '100%', color: 'var(--foreground)', maxHeight: '55vh', overflowY: 'auto', padding: '6px 12px 8px', boxSizing: 'border-box',
+    'data-collapsed': collapsed ? '' : undefined,
+    style: { minWidth: 0, width: '100%', color: 'var(--foreground)', maxHeight: '55vh', overflowY: 'auto', padding: collapsed ? '6px 12px 4px' : '6px 12px 8px', boxSizing: 'border-box',
       borderBottom: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', userSelect: 'text', WebkitUserSelect: 'text' }, children: [
     jsx('style', { 'data-panel-css': '', children: PANEL_CSS }),
     jsxs('header', { style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', fontSize: 12, lineHeight: '18px', minWidth: 0 }, children: [
-      jsxs('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 6, color: 'var(--muted-foreground)' }, children: [
+      // The caret minimizes the panel to this header line; a new ask or stuck item reopens it.
+      jsxs(onToggle ? 'button' : 'span', { ...(onToggle ? { type: 'button', 'data-panel-toggle': '', 'aria-expanded': !collapsed,
+          'aria-label': collapsed ? 'Expand session status' : 'Collapse session status',
+          title: collapsed ? 'Expand' : 'Collapse (reopens when something new needs you or gets stuck)', onClick: onToggle } : {}),
+        style: { display: 'inline-flex', alignItems: 'center', gap: 6, color: 'var(--muted-foreground)', background: 'transparent', border: 0, padding: 0, font: 'inherit', cursor: onToggle ? 'pointer' : 'default' }, children: [
+        onToggle && jsx('span', { 'aria-hidden': true, 'data-panel-caret': '', style: { display: 'inline-block', width: 10, fontSize: 10, transform: collapsed ? 'rotate(-90deg)' : 'none', transition: 'transform 120ms' }, children: '\u25be' }),
         jsx('span', { 'aria-hidden': true, style: { width: 7, height: 7, borderRadius: '50%', background: alert ? SECTION_COLOR.needs_you : (model.header.counts.running ? SECTION_COLOR.running : SECTION_COLOR.done) } }),
         jsx('span', { children: 'This session' })
       ] }),
@@ -379,7 +404,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
       ...MODEL_SECTIONS.map(([section]) => jsx('span', { 'data-model-count': section, hidden: true, children: model.header.counts[section] }, section))
     ] }),
     ...MODEL_SECTIONS.map(([section, label]) => {
-      if (!model.sections[section].length) return false
+      if (collapsed || !model.sections[section].length) return false
       const heading = jsx('h3', { 'data-section': section.replaceAll('_', '-'), style: { display: 'inline', fontSize: 11, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', margin: 0, color: section === 'needs_you' ? ALERT_TEXT : section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)' }, children: `${label} · ${model.header.counts[section]}` })
       const rows = model.sections[section].map(row => section === 'needs_you' ? askRow(row) : lineRow(row, section))
       // Finished history stays one click away (closed by default), as before the cutover.
@@ -494,7 +519,10 @@ export function Panel() {
   const model = cachedModel(route)
   if (!route.session) return null
   if (!model) return jsx('div', { 'data-hub-model-pending': '', children: 'Hub status model not available yet.' })
+  const collapsed = isCollapsed(model, readCollapsed(scope))
   return renderModel(model, {
+    collapsed,
+    onToggle: () => { writeCollapsed(scope, collapsed ? null : attentionKeys(model)); tick(v => v + 1) },
     onChoose: (row, option) => void chooseModelOption(row, option, route),
     decisionStatus: modelDecisionStatus, onCheck: row => void checkModelDecision(row),
     onAction: (row, action) => {

@@ -170,3 +170,25 @@ print(json.dumps(f.reduce_panel({'tasks':[card],'requests':[old,live]}, now=1795
 })
 
 test.after(async () => { await React.act(async () => root.unmount()); dom.window.close() })
+
+test('collapse: the caret minimizes to the header line and a new ask reopens it', async () => {
+  const toggles = []
+  const mdl = model({ waiting: [row('w')], needs_you: [row('a1', { options: [] })] })
+  await paint(m.renderModel(mdl, { collapsed: false, onToggle: () => toggles.push(1) }))
+  const btn = document.querySelector('[data-panel-toggle]')
+  assert.equal(btn.getAttribute('aria-expanded'), 'true')
+  assert.ok(text().includes('Card w'))
+  await React.act(async () => btn.click())
+  assert.equal(toggles.length, 1)
+  await paint(m.renderModel(mdl, { collapsed: true, onToggle: () => {} }))
+  assert.equal(document.querySelector('[data-panel-toggle]').getAttribute('aria-expanded'), 'false')
+  assert.ok(!text().includes('Card w') && !text().includes('Card a1'), 'collapsed shows rows')
+  assert.ok(text().includes('This session'))
+  // Persistence: collapsed while the same asks remain; a new ask reopens.
+  m.writeCollapsed('scope', m.attentionKeys(mdl))
+  assert.equal(m.isCollapsed(mdl, m.readCollapsed('scope')), true)
+  const more = model({ waiting: [row('w')], needs_you: [row('a1', { options: [] }), row('a2', { options: [] })] })
+  assert.equal(m.isCollapsed(more, m.readCollapsed('scope')), false)
+  m.writeCollapsed('scope', null)
+  assert.equal(m.readCollapsed('scope'), null)
+})

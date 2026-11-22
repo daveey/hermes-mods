@@ -180,6 +180,22 @@ def test_boolean_recommendation_and_explanation_in_native_question():
     assert a['options'][0]['choice_id'] == 'fast'
 
 
+def test_planless_approval_shows_no_choice_and_says_why():
+    # user-steps turns an approve step without a plan into needs_context with only a revise choice.
+    r = {'requestId': 'q', 'revision': 1, 'state': 'needs_context', 'kind': 'approval',
+         'title': 'Approve building the filter as planned',
+         'scope': {'markdown': 'Approve building the filter as planned', 'complete': False},
+         'choices': [{'id': 'revise', 'label': 'Request changes', 'effect': 'revise'}]}
+    m = model.reduce_panel(bundle(requests=[r]), now=NOW)
+    a = m['sections']['needs_you'][0]
+    assert a['options'] == [] and a['recommend_letter'] == ''
+    assert 'posted no plan' in a['situation']
+    assert a['request_id'] == 'q'
+    # An open request with the same choice still renders it (only needs_context is special).
+    a = model.reduce_panel(bundle(requests=[{**r, 'state': 'open'}]), now=NOW)['sections']['needs_you'][0]
+    assert [o['name'] for o in a['options']] == ['Request changes']
+
+
 def test_running_row_shows_where_model_and_run_time():
     row = task(status='running', run_machine='worker-a4', run_model='claude-opus-5-5', current_run_started_at=NOW - 750,
                activity_at=NOW - 30, activity_kind='tool', assignee='default')
