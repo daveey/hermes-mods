@@ -358,6 +358,20 @@ Retirement paths and evidence review:
   posting a reply/draft/card still publish. Legacy cards with no `origin_session` are never
   treated as owned. Coverage: `tests/test_reply_draft_owner.py` (incident replay included).
 
+- **delivered-decision re-asks**: the final-reply producer can withdraw an untouched,
+  revision-1 extracted incomplete approval after a later canonical authorizing decision
+  was durably delivered in that exact owner session. A successful extraction must report
+  no new asks/repeats; a suppression-only scope judge must confirm the entire old ask is
+  covered by the frozen decision and the reply confirms proceeding without asking again.
+  Similar titles or silence alone do not qualify. At most two semantic comparisons run
+  per final reply; errors or uncertain coverage keep the ask. Withdrawal atomically
+  rechecks the evidence request's revision/resolution and the target request's revision
+  and lack of decision, then mirrors retirement to the ledger. This grants nothing and
+  never changes the canonical operation. No queue sweeper or timer is involved.
+  Coverage: `tests/test_decided_reasks.py` replays question → prose re-ask → delivered
+  canonical approval → quiet completion, and protects new scopes, absent/pending/older/
+  non-authorizing decisions, revisions, renewed asks, judge errors and concurrent changes.
+
 - **deleted owner**: `reconcile_moot` withdraws an undecided request by `system` with
   reason `its chat no longer exists` after a successful read confirms the session is absent
   from its known local owner profile's `state.db`. Unknown profiles, foreign gateways,
