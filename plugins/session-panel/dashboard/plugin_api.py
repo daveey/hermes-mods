@@ -1390,15 +1390,28 @@ def feed():
 
 
 def install_facts(v1, scope, handle):
+    # Binding custody spans close, publication and start. Do not share the mode
+    # transition lock: close/report_ready may synchronously invoke that callback.
+    lock = _LOADER.__dict__.setdefault('facts_binding_lock', threading.Lock())
+    with lock:
+        return _install_facts(v1, scope, handle)
+
+
+def _install_facts(v1, scope, handle):
     """Bind the authorized, host-injected API; only its global latch may switch.
 
     Called at plugin registration/startup, never from a request. Old cores do not
     call this entry point and continue to use the installed legacy lanes.
     """
     core = _load_feed()
+    with core.PROCESS_LOCK:
+        if getattr(_LOADER, 'facts_unloading', False):
+            raise RuntimeError('panel unload in progress; registration refused')
+        _LOADER.facts_binding_token = None
     previous = getattr(_LOADER, 'facts_registration', None)
     if previous is not None:
         previous.close()
+        _LOADER.facts_registration = None
     token = object()
     with core.PROCESS_LOCK:
         if getattr(_LOADER, 'facts_unloading', False):
@@ -1407,9 +1420,18 @@ def install_facts(v1, scope, handle):
         _LOADER.facts_v1, _LOADER.facts_scope = v1, scope
         _LOADER.facts_handle = handle
         _LOADER.facts_ready = None
-    registration = v1.bind_consumer('panel', scope,
-                                   lambda mode, generation: _facts_mode_changed(mode, generation, token=token))
-    readiness = core.PanelReadiness(v1, scope, _warm_facts)
+    registration = None
+    try:
+        registration = v1.bind_consumer('panel', scope,
+                                       lambda mode, generation: _facts_mode_changed(mode, generation, token=token))
+        readiness = core.PanelReadiness(v1, scope,
+                                       lambda: _warm_facts(v1, scope, handle), start=False)
+    except Exception:
+        with core.PROCESS_LOCK:
+            _LOADER.facts_binding_token = None
+        if registration is not None:
+            registration.close()
+        raise
     readiness.registration = registration
     with core.PROCESS_LOCK:
         accepted = (getattr(_LOADER, 'facts_binding_token', None) is token
@@ -1421,10 +1443,24 @@ def install_facts(v1, scope, handle):
         raise RuntimeError('panel registration superseded by unload or replacement')
     if core.PROCESS_FEED is not None:
         core.PROCESS_FEED._facts_readiness = readiness.wake
+    try:
+        readiness.start()
+    except Exception:
+        with core.PROCESS_LOCK:
+            _LOADER.facts_binding_token = None
+            _LOADER.facts_registration = None
+        readiness.close()
+        raise
     return readiness
 
 
 def stop_facts():
+    lock = _LOADER.__dict__.setdefault('facts_binding_lock', threading.Lock())
+    with lock:
+        return _stop_facts()
+
+
+def _stop_facts():
     """Unload without releasing predecessor custody before every lane exits."""
     core = _load_feed()
     with core.PROCESS_LOCK:
@@ -1453,11 +1489,14 @@ def stop_facts():
             _LOADER.facts_transition_pending = False
 
 
-def _warm_facts():
+def _warm_facts(v1=None, scope=None, handle=None):
     """Background readiness only: no consumer claims readiness for cold panels."""
     if getattr(_LOADER, 'facts_transition_pending', False):
         return False, None
-    v1 = getattr(_LOADER, 'facts_v1', None)
+    if v1 is None:
+        v1 = getattr(_LOADER, 'facts_v1', None)
+        scope = getattr(_LOADER, 'facts_scope', None)
+        handle = getattr(_LOADER, 'facts_handle', None)
     if v1 is None:
         return False, None
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
@@ -1466,18 +1505,18 @@ def _warm_facts():
     with f.lock:
         f._drain()
         sessions = tuple(f.interest)
-    snapshot = v1.snapshot(_LOADER.facts_scope)
+    snapshot = v1.snapshot(scope)
     ready = True
     now, deadlines = f.clock(), []
     for session in sessions:
         view = snapshot.view('panel_bundle', {'session': session})
-        fact = snapshot.get(v1.key(_LOADER.facts_scope, 'ChatWaitingFact', session))
+        fact = snapshot.get(v1.key(scope, 'ChatWaitingFact', session))
         if fact is not None and fact.valid_until is not None and fact.valid_until > now:
             deadlines.append(fact.valid_until)
         if (not isinstance(view, v1.Ready) or fact is None or fact.health != 'fresh'
                 or (fact.valid_until is not None and fact.valid_until <= now)):
             ready = False
-            _LOADER.facts_handle.demand('panel_bundle', {'session': session})
+            handle.demand('panel_bundle', {'session': session})
     return ready, (max(0.0, min(deadlines) - now) if deadlines else None)
 
 
