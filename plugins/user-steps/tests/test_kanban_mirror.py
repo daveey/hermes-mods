@@ -96,6 +96,7 @@ def fixture(tmp_path):
         session_exists=lambda sid: sid in ("session-a", "session-b"),
         tip=lambda sid: sid,
     )
+    mirror.remote.gateway = lambda: 'fixture-sync'
     return mirror, store, path, hr
 
 

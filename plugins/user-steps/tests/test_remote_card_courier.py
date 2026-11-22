@@ -3,6 +3,9 @@
 Authenticated service/OS identity are offline fixtures, not a live HTTPS proof.
 Run with run-core-integration.sh and HERMES_HUB_CLIENT_REAL pointing to M1+ client.
 """
+import copy
+import hashlib
+import json
 import importlib
 import sys
 from pathlib import Path
@@ -19,6 +22,104 @@ def remote_row(hr, **changes):
                 card_answer_generation='a' * 64, title='Choose remotely', **changes)
 
 
+@pytest.mark.parametrize('failure', ['missing-client', 'gateway', 'key-exit', 'offline', 'http'])
+def test_real_courier_refusals_and_unavailability(tmp_path, failure):
+    module = load_module('courier_refusals', ROOT / 'remote_cards.py')
+    queued, closed = [], []
+    def read_key():
+        if failure == 'key-exit':
+            raise SystemExit('No key')
+        return 'fixture-key'
+    def call(*args):
+        if failure == 'offline':
+            raise RuntimeError('offline')
+        return (503, {})
+    client = SimpleNamespace(open_db=lambda path: SimpleNamespace(commit=lambda: None,
+        close=lambda: closed.append(True)), mget=lambda db, key: 'wrong' if failure == 'gateway' else 'fixture-sync',
+        queue_request=lambda *args, **kwargs: queued.append((args, kwargs)),
+        load_config=lambda: {'hub_url': 'https://example.test'}, read_key=read_key,
+        Api=lambda *args: SimpleNamespace(call=call))
+    exchange = module.Courier.__new__(module.Courier)
+    exchange.view = SimpleNamespace(load_client=lambda: None if failure == 'missing-client' else client,
+        db_path=lambda: tmp_path / 'courier.db', _send_now=lambda *args: None, SEND_WAIT_S=0)
+    envelope = dict(to_gw='remote', key='worker/other/t_remote', args={'source': {'gateway': 'fixture-sync'}})
+    with pytest.raises(OSError):
+        exchange.exchange(envelope, 'exact-request')
+    assert len(queued) == (0 if failure in ('missing-client', 'gateway') else 1)
+    assert len(closed) == (0 if failure == 'missing-client' else 1)
+
+
+@pytest.mark.parametrize('field', ['id', 'from', 'to_gw', 'coll', 'key', 'action', 'args',
+    'state', 'result', 'receipt-choice', 'receipt-operationId', 'receipt-originGateway',
+    'receipt-destination', 'receipt-executionStarted', 'receipt-decisionProvenance'])
+def test_transport_record_and_receipt_are_independently_validated(tmp_path, field):
+    mirror, store, _, hr = fixture(tmp_path)
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    mirror.remote.reconcile(OWNER)
+    op = decide(store, store.requests(OWNER)[0])
+    calls = []
+    class Transport:
+        def exchange(self, envelope, rid):
+            calls.append(rid)
+            expected = 'hr-card-answer-' + hashlib.sha256(json.dumps(
+                [op['owner'], op['operationId']], sort_keys=True).encode()).hexdigest()
+            assert rid == expected
+            receipt = dict(copy.deepcopy(envelope['args']['answer']), originGateway='fixture-sync',
+                destination='kanban_ask', executionStarted=False, decisionProvenance='recorded_desktop_operation')
+            record = dict(copy.deepcopy(envelope), id=rid, state='done', result=receipt,
+                          **{'from': 'gw:fixture-sync'})
+            if field.startswith('receipt-'):
+                receipt[field.removeprefix('receipt-')] = 'tampered'
+            else:
+                record[field] = 'tampered'
+            return record
+    mirror.remote.courier = Transport()
+    with pytest.raises((OSError, core.ActionError)):
+        mirror.deliver(op)
+    assert len(calls) == 1
+
+
+def test_remote_readback_requires_equal_fresh_receipt(tmp_path):
+    mirror, store, _, hr = fixture(tmp_path)
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    mirror.remote.reconcile(OWNER)
+    op = decide(store, store.requests(OWNER)[0])
+    calls = []
+    mirror.remote.deliver = lambda *args: calls.append(args) or {'fresh': 'receipt'}
+    assert not mirror.readback(op, {'stale': 'receipt'})
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('change', [dict(status='ready'), dict(gateway='fixture-sync')])
+def test_not_a_remote_active_ask(tmp_path, change):
+    mirror, store, _, hr = fixture(tmp_path)
+    row = remote_row(hr)
+    row.update(change)
+    mirror.remote.cards = lambda owner: [row]
+    mirror.remote.reconcile(OWNER)
+    assert not store.requests(OWNER)
+
+
+@pytest.mark.parametrize('change', ['provenance', 'execution', 'permissions', 'choice'])
+def test_other_binding_cannot_authorize_execution_or_unknown_choice(tmp_path, change):
+    mirror, store, _, hr = fixture(tmp_path)
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    mirror.remote.reconcile(OWNER)
+    request = store.requests(OWNER)[0]
+    op = mirror.decide_other(OWNER, dict(requestId=request['requestId'], expectedRevision=1,
+        idempotencyKey='other-answer', choiceId='answer-text', revisionText='Only record this'))['operation']
+    if change == 'provenance':
+        op['provenance'] = {}
+    if change == 'execution':
+        op['intent']['executionAuthorized'] = True
+    if change == 'permissions':
+        op['intent']['permissionGrants'] = ['network']
+    if change == 'choice':
+        op['decision']['choiceId'] = 'unknown-choice'
+    with pytest.raises(core.ActionError):
+        mirror.remote.envelope(op, mirror._bound(op))
+
+
 def test_remote_binding_uses_owner_not_source_and_is_atomic(tmp_path):
     mirror, store, _, hr = fixture(tmp_path)
     mirror.remote.cards = lambda owner: [remote_row(hr)]
@@ -31,7 +132,7 @@ def test_remote_binding_uses_owner_not_source_and_is_atomic(tmp_path):
     assert envelope['key'] == 'worker/other/t_remote'
     assert envelope['args']['answer'] == dict(ownerGateway='remote', ownerProfile='worker', board='other',
         task='t_remote', generation='a' * 64, choice='green', operationId=op['operationId'])
-    assert envelope['args']['source'] == dict(gateway=OWNER['gatewayId'], profile=OWNER['profile'],
+    assert envelope['args']['source'] == dict(gateway='fixture-sync', profile=OWNER['profile'],
                                              session=OWNER['storedSessionId'])
     assert mirror.present(request)['presentation']['sourceRef']['gatewayId'] == 'remote'
     assert not op['intent']['executionAuthorized'] and op['intent']['permissionGrants'] == []
@@ -43,8 +144,48 @@ def test_no_remote_tiles_without_fresh_portable_generation(tmp_path, changed):
     row = remote_row(hr)
     row.update(changed)
     mirror.remote.cards = lambda owner: [row]
-    mirror.remote.reconcile(OWNER)
+    if changed.get('stale'):
+        with pytest.raises(OSError, match='stale'):
+            mirror.remote.reconcile(OWNER)
+    else:
+        mirror.remote.reconcile(OWNER)
     assert store.requests(OWNER) == []
+
+
+@pytest.mark.parametrize('error', [KeyError('bad remote row'), TypeError('bad choices'), RuntimeError('reader failure')])
+def test_remote_reader_failure_does_not_suppress_local_cards(tmp_path, error):
+    mirror, store, _, _ = fixture(tmp_path)
+    def unavailable(owner):
+        raise error
+    mirror.remote.cards = unavailable
+    mirror.reconcile(OWNER)
+    assert store.requests(OWNER)
+
+
+@pytest.mark.parametrize('choices', [[{}], ['bad'], [{'label': 'A'}], {'bad': 'shape'}])
+def test_malformed_remote_choices_preserve_open_request_and_local_cards(tmp_path, choices):
+    mirror, store, _, hr = fixture(tmp_path)
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    mirror.remote.reconcile(OWNER)
+    request = store.requests(OWNER)[0]
+    malformed = dict(hr, choices=choices)
+    mirror.remote.cards = lambda owner: [remote_row(malformed)]
+    mirror.reconcile(OWNER)
+    assert store.get(OWNER, request['requestId'])['state'] == 'open'
+    assert len(store.requests(OWNER)) > 1
+
+
+def test_stale_remote_projection_retains_existing_tile(tmp_path):
+    mirror, store, _, hr = fixture(tmp_path)
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    mirror.remote.reconcile(OWNER)
+    request = store.requests(OWNER)[0]
+    mirror.remote.cards = lambda owner: [remote_row(hr, stale=True)]
+    mirror.reconcile(OWNER)
+    assert store.get(OWNER, request['requestId'])['state'] == 'open'
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    mirror.remote.reconcile(OWNER)
+    assert store.get(OWNER, request['requestId'])['state'] == 'open'
 
 
 def test_unavailable_membership_is_not_withdrawal_but_confirmed_departure_is(tmp_path):
@@ -92,10 +233,11 @@ def test_mirrored_real_store_answer_receipt_against_owner(tmp_path, monkeypatch,
             answer = helpers.setup_answer(conn)
             snap = ca.snapshot(conn, answer['task'])
         world = World(courier, tmp_path, owner_home, monkeypatch)
-        source = dict(gatewayId='origin', profile='work', storedSessionId='chat-one')
+        source = dict(gatewayId='install:source-install', profile='work', storedSessionId='chat-one')
         store = core.ActionStore(world.homes['source'] / 'user-steps/actions.sqlite3')
         mod = load_module('remote_integration_mirror', ROOT / 'kanban_mirror.py')
         mirror = mod.Mirror(core, store, boards=[], session_exists=lambda s: True, tip=lambda s: s)
+        mirror.remote.gateway = lambda: 'origin'
         mirror.remote.cards = lambda owner: [dict(gateway='owner', profile='default', board='default',
             id=answer['task'], session='chat-one', status='blocked', human_request=snap['ask'],
             card_answer_generation=snap['generation'], title='Pick a plan')]
@@ -111,19 +253,21 @@ def test_mirrored_real_store_answer_receipt_against_owner(tmp_path, monkeypatch,
                 kb._append_event(conn, answer['task'], 'blocked', {'reason': 'new generation'})
                 conn.commit()
 
-        class Exchange:
-            def exchange(self, envelope, rid):
-                with world.host('source'):
-                    courier.queue_request(world.dbs['source'], envelope['to_gw'], envelope['coll'], envelope['key'],
-                                          envelope['action'], envelope['args'], rid=rid)
-                    world.dbs['source'].commit()
-                    world.service.deliver(world.dbs['source'], 'origin')
-                world.tick('owner')
-                world.tick('source')
-                world.tick('owner')
-                return world.service.get(rid)
-
-        mirror.remote.courier = Exchange()
+        remote_module = load_module('remote_integration_courier', ROOT / 'remote_cards.py')
+        exchange = remote_module.Courier.__new__(remote_module.Courier)
+        source_db = Path(world.dbs['source'].execute('PRAGMA database_list').fetchone()[2])
+        def send_now(client, path, timeout):
+            world.service.deliver(world.dbs['source'], 'origin')
+            world.tick('owner')
+            world.tick('source')
+            world.tick('owner')
+        monkeypatch.setattr(courier, 'load_config', lambda: {'hub_url': 'https://example.test'})
+        monkeypatch.setattr(courier, 'read_key', lambda: 'fixture-key')
+        monkeypatch.setattr(courier, 'Api', lambda *args: SimpleNamespace(
+            call=lambda method, path: (200, {'request': world.service.get(path.rsplit('/', 1)[1])})))
+        exchange.view = SimpleNamespace(load_client=lambda: courier, db_path=lambda: source_db,
+                                        _send_now=send_now, SEND_WAIT_S=0)
+        mirror.remote.courier = exchange
         if stale:
             with pytest.raises(core.ActionError, match='refused'):
                 mirror.deliver(op)
@@ -154,23 +298,25 @@ def test_mirrored_real_store_answer_receipt_against_owner(tmp_path, monkeypatch,
 def test_membership_hydrates_only_exact_chat_gateway_profile_board_target(tmp_path, monkeypatch):
     mirror, _, _, hr = fixture(tmp_path)
     module = sys.modules[mirror.remote.__class__.__module__] if mirror.remote.__class__.__module__ in sys.modules else load_module('remote_membership', ROOT / 'remote_cards.py')
-    exact = remote_row(hr)
+    exact = dict(remote_row(hr), origin_gateway='fixture-sync', origin_profile=OWNER['profile'])
     membership = [exact, dict(exact, id='wrong-chat', session='someone-else'),
                   dict(exact, id='wrong-origin', origin_gateway='another-origin'),
                   dict(exact, id='wrong-profile', origin_profile='another-profile')]
+    owner = dict(OWNER, gatewayId='install:' + '0' * 32)
     try:
         reader = importlib.import_module('hermes_cli.kanban_session_activity')
         monkeypatch.setattr(reader, '_remote_cards', lambda *args: membership)
     except ImportError:
         monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_session_activity',
                             SimpleNamespace(_remote_cards=lambda *args: membership))
-    candidates = [('remote', 'worker/other/t_remote', exact, None, False),
-                  ('remote', 'wrong/other/t_remote', dict(exact, profile='wrong'), None, False),
+    candidates = [(r['gateway'], '/'.join(r[k] for k in ('profile', 'board', 'id')), r, None, False)
+                  for r in membership]
+    candidates += [('remote', 'wrong/other/t_remote', dict(exact, profile='wrong'), None, False),
                   ('remote', 'worker/wrong/t_remote', dict(exact, board='wrong'), None, False),
                   ('stranger', 'worker/other/t_remote', dict(exact, gateway='stranger'), None, False)]
     closed = []
-    view = SimpleNamespace(rows=lambda coll, pick: [c[2] for c in pick(candidates)],
+    view = SimpleNamespace(gateway='fixture-sync', rows=lambda coll, pick: [c[2] for c in pick(candidates)],
                            conn=SimpleNamespace(close=lambda: closed.append(True)))
     monkeypatch.setattr(module, 'load_file', lambda path: SimpleNamespace(open_view=lambda: view))
-    assert module.linked_cards(OWNER) == [exact]
+    assert module.linked_cards(owner) == [exact]
     assert closed == [True]
