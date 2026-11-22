@@ -116,6 +116,8 @@ target host's logs, process list and session DB never show the change; the actor
 
 **Before profiling a live service, rule out observer-induced stalls:** read `references/resource-observability-pitfalls.md` (non-blocking py-spy, the profiler guard and wrapper, the journalctl check).
 
+For sampled worker-boot attribution, select the main-thread profile by name/PID, not index: an initial `Thread 0` profile may precede it. Do not align per-thread speedscope sample-count time directly with wall time. Anchor the prefix to the first turn-start persistence stack, retain the independent session/first-user timestamps, and report pre-attach and unsampled intervals separately. Count nested discovery/identify stacks once; total identify time is not the removable second-query cost. Two diagnostic traces rank observed residuals but never replace the required real-session acceptance cohort.
+
 Before superseding a duplicate transcript row, inspect whether its carrier already folded unrelated input. A retained notice ID identifies the original row, not necessarily all current content. Exercise interleaved A/B/A rows and both sidecar orders; guard differing composite content from wholesale retirement, and verify unrelated text and durable row identities survive.
 
 ### 3. Branch where causes split
