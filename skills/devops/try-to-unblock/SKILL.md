@@ -1,6 +1,6 @@
 ---
 name: try-to-unblock
-description: "Use before blocking a Kanban card on David, filing a human_request, or relaying a blocked card's ask."
+description: "Use when a card seems to need David. Try agent fixes first."
 version: 1.0.0
 author: daveey
 license: MIT
