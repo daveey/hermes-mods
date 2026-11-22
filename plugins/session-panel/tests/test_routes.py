@@ -76,7 +76,16 @@ def test_a_plugin_reload_resumes_on_register_not_on_the_request(monkeypatch):
         app.include_router(api.router, prefix='/api/plugins/session-panel')
         c = TestClient(app)
         api.feed()  # lifecycle producer starts before interactive reads
-        first = c.post('/api/plugins/session-panel/changes', json={'sessions': ['S1', 'S2']}).json()
+        # The read is deliberately compute-free: await both background publications
+        # before testing that unload preserves an already-held revision.
+        import time
+        deadline = time.monotonic() + 5
+        while True:
+            first = c.post('/api/plugins/session-panel/changes', json={'sessions': ['S1', 'S2']}).json()
+            if set(first['bundles']) == {'S1', 'S2'} or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        assert set(first['bundles']) == {'S1', 'S2'}
         # Unload: reads keep the held publication; register owns restart work.
         plugin.stop()
         again = c.post('/api/plugins/session-panel/changes',

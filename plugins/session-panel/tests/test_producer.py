@@ -557,7 +557,7 @@ def test_the_event_loop_stays_idle_after_failure_until_a_write(tmp_path, monkeyp
     assert not any(t.is_alive() for t in threads)
 
 
-def test_a_refused_inotify_watch_raises_and_the_feed_goes_back_to_the_timed_loop(tmp_path, monkeypatch):
+def test_a_refused_inotify_watch_raises_and_never_starts_polling(tmp_path, monkeypatch):
     import ctypes
     import errno
     api = load('_spf_refused_api', API)
@@ -584,7 +584,7 @@ def test_a_refused_inotify_watch_raises_and_the_feed_goes_back_to_the_timed_loop
         assert e.value.errno == errno.ENOSPC
     finally:
         w.close()
-    # The feed: a watch refused on its first listing is not believed; the timed loop takes over and sees the write.
+    # No notification coverage: keep the held model, never silently enable polling.
     real_watch = api.FileWatch
 
     def refusing_watch():
@@ -604,13 +604,12 @@ def test_a_refused_inotify_watch_raises_and_the_feed_goes_back_to_the_timed_loop
         while getattr(f, '_watching', None) is not False and time.monotonic() < deadline:
             time.sleep(0.01)
         assert f._watching is False
+        time.sleep(0.6)  # initial hydration finishes before the unobserved write
         r.files += 1
         r.rows['S1'] = {'kind': 'done'}
         r.db.write_bytes(b'1')
-        deadline = time.monotonic() + 3
-        while f.bundles['S1']['bundle']['outcome_json'] != {'kind': 'done'} and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert f.bundles['S1']['bundle']['outcome_json'] == {'kind': 'done'}
+        time.sleep(0.6)
+        assert f.bundles['S1']['bundle']['outcome_json'] != {'kind': 'done'}
     finally:
         f.stopped.set()
         for t in threads:

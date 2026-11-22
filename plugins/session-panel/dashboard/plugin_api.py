@@ -968,7 +968,7 @@ WATCH_REFRESH_S = 20.0   # the watcher re-lists the files it watches (a new boar
 class FileWatch:
     """Kernel notification of writes to a set of files: Linux inotify on their directories, kqueue elsewhere.
     Nothing here polls: `wait` sleeps in select until the kernel reports a write (or `timeout`). `ok` is False
-    where neither exists; the feed then keeps its timed loop."""
+    where neither exists; the feed then remains unvouched, without database polling."""
     _IN = 0x2 | 0x40 | 0x80 | 0x100 | 0x200  # MODIFY | MOVED_FROM | MOVED_TO | CREATE | DELETE
     _Q_OVERFLOW, _IGNORED = 0x4000, 0x8000   # the kernel dropped events | a watch ended (its directory is gone)
 
@@ -1029,7 +1029,7 @@ class FileWatch:
                 if err in (errno.ENOENT, errno.ENOTDIR):
                     continue  # no such directory yet: taken up by a later set_paths
                 # Refused (ENOSPC: fs.inotify.max_user_watches; EACCES...): a feed that believed it was watching
-                # would never hear a write. The owner logs this and goes back to the timed loop.
+                # would never hear a write. The owner logs this and withdraws its freshness vouch.
                 raise OSError(err, f'inotify_add_watch refused: {os.strerror(err)}', d)
             if old is not None and old != wd:
                 self._names.pop(old, None)
@@ -1120,17 +1120,14 @@ def _watch(f, watch: FileWatch, paths) -> None:
                 f._decide.set()
                 f.stopped.wait(DEBOUNCE_S)  # one wake per burst; what is written meanwhile wakes the next round
     except Exception:
-        log.warning('session-panel feed: file watch failed; back to the timed loop', exc_info=True)
+        log.warning('session-panel feed: file watch failed; source freshness unavailable (no polling)', exc_info=True)
         f._watching = False
-        f._wake.set()
-        f._decide.set()
     finally:
         watch.close()
 
 
 def _event_driven(f) -> bool:
-    """Start (once per feed) the file watch that replaces the timed loops; False when this feed, its readers or
-    this platform cannot be event-driven (the timed loop stays)."""
+    """Start once per feed. False means unavailable notification coverage, never timed database fallback."""
     with _LOADER.lock:
         state = getattr(f, '_watching', None)
         if state is not None:
@@ -1140,6 +1137,10 @@ def _event_driven(f) -> bool:
         f._watching = bool(watch is not None and watch.ok)
         if f._watching:
             threading.Thread(target=_watch, args=(f, watch, paths), name='session-panel-watch', daemon=True).start()
+        else:
+            if watch is not None:
+                watch.close()
+            log.warning('session-panel feed: file watch unavailable; source freshness unavailable (no polling)')
         return f._watching
 
 
@@ -1157,14 +1158,15 @@ def _run_decisions(f) -> None:
         first = True
         while not f.stopped.is_set():
             started = time.monotonic()
-            if _event_driven(f):
-                # No timer: sleeps until a source file is written (the watcher) or the feed stops.
-                if not first:
-                    f._decide.wait()  # a source file was written, or the idle check found a failed read to retry
-                    f.stopped.wait(max(DEBOUNCE_S, MIN_GAP_S - (time.monotonic() - started)))
-                if f.stopped.is_set():
-                    break
-                f._decide.clear()
+            _event_driven(f)
+            # Notification failure is not permission to poll. Startup and explicit
+            # source/registration signals remain the only database-work triggers.
+            if not first:
+                f._decide.wait()
+                f.stopped.wait(max(DEBOUNCE_S, MIN_GAP_S - (time.monotonic() - started)))
+            if f.stopped.is_set():
+                break
+            f._decide.clear()
             first = False
             started = time.monotonic()
             try:
@@ -1172,8 +1174,6 @@ def _run_decisions(f) -> None:
             except Exception:
                 log.warning('session-panel decision refresh failed', exc_info=True)
             readers.release()  # no connection outlives one pass
-            if not getattr(f, '_watching', False):
-                f.stopped.wait(_pause(time.monotonic() - started))
     finally:
         readers.release()
 
@@ -1183,25 +1183,24 @@ def _run(f) -> None:
     saved_at = 0.0
     try:
         last = 0.0
-        if _event_driven(f):
-            f._cold.set()  # the first pass is due now: whatever was written before this thread started
-            f._wake.set()
+        _event_driven(f)
+        f._cold.set()  # startup hydration, even if notification coverage is unavailable
+        f._wake.set()
         while not f.stopped.is_set():
-            if _event_driven(f):
-                # No timer drives a recompute: this sleeps until a source file is written or a read finds no bundle.
-                # With neither, it wakes for the liveness heartbeat only (no database, nothing computed).
-                idle = getattr(f, 'idle_wait', None)
-                if not f._wake.wait(idle() if callable(idle) else getattr(f, 'heartbeat_s', 20.0)):
-                    try:
-                        f.beat()
-                    except Exception:
-                        log.warning('session-panel feed heartbeat failed', exc_info=True)
-                    continue
-                if f.stopped.is_set():
-                    break
-                _settle(f, last)
-                if f.stopped.is_set():
-                    break
+            # A timeout only ages held inputs. A broken/unsupported watcher leaves
+            # publications unvouched, not a periodically recomputed approximation.
+            idle = getattr(f, 'idle_wait', None)
+            if not f._wake.wait(idle() if callable(idle) else getattr(f, 'heartbeat_s', 20.0)):
+                try:
+                    f.beat()
+                except Exception:
+                    log.warning('session-panel feed heartbeat failed', exc_info=True)
+                continue
+            if f.stopped.is_set():
+                break
+            _settle(f, last)
+            if f.stopped.is_set():
+                break
             started = last = time.monotonic()
             try:
                 f.tick()
@@ -1214,19 +1213,6 @@ def _run(f) -> None:
                 saved_at = time.monotonic()
                 if save_snapshot(f):
                     saved = state
-            if getattr(f, '_watching', False):
-                continue
-            # Timed fallback (no kernel file notification here, or readers that name no files).
-            # A read that found no bundle for its chat sets `_wake`: the next pass starts at once.
-            wake = getattr(f, '_wake', None)
-            pause = _pause(time.monotonic() - started)
-            if wake is None:
-                f.stopped.wait(pause)
-                continue
-            until = time.monotonic() + pause
-            f.stopped.wait(MIN_PAUSE_S)  # never back to back, even for a queue of cold reads
-            while not f.stopped.is_set() and not wake.is_set() and time.monotonic() < until:
-                wake.wait(min(MIN_PAUSE_S, max(0.0, until - time.monotonic())))  # a stop is seen within MIN_PAUSE_S
     finally:
         # A plugin reload's successor owns the revision space now (and saves it); a plain stop saves the last state.
         if getattr(f, '_successor', None) is None:

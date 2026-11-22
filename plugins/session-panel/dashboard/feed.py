@@ -596,7 +596,8 @@ class Feed:
                 with self.lock:
                     # The chats this push vouches for: held, watched, and last computed without a failure. Clients
                     # re-stamp only these (a dropped or failing chat is never confirmed by a heartbeat).
-                    fresh = sorted(s for s in self.interest if s in self.bundles and s not in self.failures
+                    fresh = sorted(s for s in self.interest if getattr(self, '_watching', True)
+                                   and s in self.bundles and s not in self.failures
                                    and s not in self._retry and s not in self._carried
                                    and s not in self._decision_failures
                                    and not self.bundles[s].get('source_stale')
