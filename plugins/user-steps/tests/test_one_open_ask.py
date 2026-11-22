@@ -171,6 +171,45 @@ def test_same_turn_matcher_uses_provenance_not_words(kind, canonical):
                               turn_requests={'producer', 'second'}) is None
 
 
+@pytest.mark.parametrize('mirrored', [False, True])
+def test_exact_older_action_wins_over_same_turn_singleton(tmp_path, mirrored):
+    store, ledger = env(tmp_path)
+    span = 'Pick the deployment region for the service.'
+    candidate = {'kind': 'choose', 'text': span, 'verbatim_span': span, 'options': ['East', 'West']}
+    first = reply(store, ledger, span, [candidate])['steps'][0]
+    if mirrored:
+        title = 'Approve the separate layout plan?'
+        producer_step = reply(store, ledger, title, [
+            {'kind': 'approve', 'text': title, 'verbatim_span': title, 'options': []}])['steps'][0]
+        producer_id = producer_step['requestId']
+    else:
+        producer_id = store.create(OWNER, approval('Approve the separate layout plan?'))['requestId']
+    asks = core.open_asks(store, OWNER, ledger.read('session-a')['steps'])
+    match = core.same_open_ask(candidate, asks, turn_requests={producer_id}, reply=span)
+    assert match is not None and match['id'] == first['requestId']
+    out = reply(store, ledger, span, [candidate], turn={producer_id})
+    assert len(live(store)) == 2
+    assert [s['id'] for s in out['steps']] == [first['id']]
+    assert first['id'] in out['text']
+
+
+def test_mixed_kind_turn_publications_remain_ambiguous():
+    asks = [{'id': 'one', 'kind': 'approval', 'title': 'Separate plan', 'step': None},
+            {'id': 'two', 'kind': 'input', 'title': 'Separate input', 'step': None}]
+    candidate = {'kind': 'approve', 'text': 'Authorize implementation',
+                 'verbatim_span': 'Please give your go before I build.'}
+    assert core.same_open_ask(candidate, asks, turn_requests={'one', 'two'}) is None
+    assert core.same_turn_ask(candidate, asks, {'one', 'two'}) is None
+
+
+def test_approval_cannot_bind_to_same_turn_choice():
+    ask = {'id': 'one', 'kind': 'choice', 'title': 'Choose a region', 'step': None}
+    candidate = {'kind': 'approve', 'text': 'Authorize implementation',
+                 'verbatim_span': 'Please give your go before I build.'}
+    assert core.same_open_ask(candidate, [ask], turn_requests={'one'}) is None
+    assert core.same_turn_ask(candidate, [ask], {'one'}) is None
+
+
 def test_transform_backstop_suppresses_unmapped_producer_without_legacy_step(tmp_path, monkeypatch):
     store, ledger = env(tmp_path)
     r = store.create(OWNER, approval('Approve the revised plan?'))

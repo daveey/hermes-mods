@@ -2164,6 +2164,12 @@ def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optiona
                                             _paragraph(reply, candidate.get('verbatim_span')), tile_texts(ids[r['id']])):
                 return ids[r['id']]
     mine = [a for a in asks if a['id'] in turn]
+    # An exact ledger action already has identity. Preserve it before applying
+    # the weaker same-turn singleton fallback (also used by publication_buffer).
+    exact = next((a for a in asks if a.get('step') is not None
+                  and action_identity(a['step']) == action_identity(candidate)), None)
+    if exact is not None:
+        return exact
     singleton = same_turn_ask(candidate, asks, turn)
     if singleton is not None:
         return singleton
