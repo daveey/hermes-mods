@@ -207,6 +207,27 @@ def test_wait_names_hydrated_parent_and_opens_exact_owner(source, owner, gateway
     assert not any(a['label'] == 'Open parent card' for a in r['actions'])
 
 
+@pytest.mark.parametrize('on', ['the clock until 2026-11-21 00:00 UTC', 'ci https://example.com/run', 'deploy release', 'an agent to release it: authority t_0123456789abcdef is archived'])
+def test_parent_metadata_does_not_replace_unrelated_waits(on):
+    cid = 't_0123456789abcdef'
+    row = task(status='scheduled', upstream={'id': cid, 'title': 'Other work', 'gateway': 'remote', 'profile': 'default'}, wait={'wait_state': 'waiting', 'waiting_on': on})
+    r = model.reduce_panel(bundle(row), now=NOW)['sections']['waiting'][0]
+    assert r['detail'] == model.wait_phrase(row, NOW)
+    assert not any(a['label'] == 'Open parent card' for a in r['actions'])
+
+
+def test_own_wait_and_unhydrated_primary_never_link_to_self_or_secondary():
+    cid, other = 't_0123456789abcdef', 't_abcdef0123456789'
+    cards = {cid: {'detail': {'source': 'live', 'task': {'id': cid, 'title': 'Own work'}}}}
+    for own, on in ((cid, f'card {cid}'), ('t_aaaaaaaa', f'external comments on {other} from source owner {cid}')):
+        row = task(own, status='scheduled', wait={'wait_state': 'waiting', 'waiting_on': on})
+        b = bundle(row, cards=cards)
+        b.update(gateway='hub', profile='default')
+        r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+        assert 'Own work' not in r['detail']
+        assert not any(a['label'] == 'Open parent card' for a in r['actions'])
+
+
 def test_parent_wait_keeps_identity_in_details_not_status():
     upstream = {'id': 't_0123456789abcdef', 'status': 'blocked'}
     r = model.reduce_panel(bundle(task(status='todo', blocked_upstream=upstream)), now=NOW)['sections']['waiting'][0]
