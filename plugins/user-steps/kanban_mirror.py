@@ -217,6 +217,8 @@ def encoded(value):
 
 
 class Mirror:
+    exclusive_dispatch = True  # retirement and every card-delivery attempt share operation custody
+
     def __init__(
         self,
         core,
@@ -253,6 +255,9 @@ class Mirror:
                 "board TEXT NOT NULL, task TEXT NOT NULL, snapshot TEXT NOT NULL, request TEXT NOT NULL, "
                 "PRIMARY KEY(namespace,request_id))"
             )
+            c.execute('CREATE TABLE IF NOT EXISTS kanban_projection_display ('
+                      'namespace TEXT NOT NULL, request_id TEXT NOT NULL, body TEXT NOT NULL, '
+                      'PRIMARY KEY(namespace,request_id))')
         if ready is not None:
             _SCHEMA_READY.add(ready)
 
@@ -430,7 +435,8 @@ class Mirror:
         # A later incarnation re-projects the same ask after an earlier projection was
         # withdrawn/retired; incarnation 0 keeps the original identity byte for byte.
         identity = encoded(
-            [owner, board, snap] + ([incarnation] if incarnation else [])
+            [owner, board, snap['remote']['target'] if snap.get('remote') else snap]
+            + ([incarnation] if incarnation else [])
         )
         rid = str(uuid.uuid5(uuid.NAMESPACE_URL, "hermes:kanban-ask:" + identity))
         hr = snap["ask"]
@@ -487,6 +493,14 @@ class Mirror:
         )
 
     def present(self, request):
+        """A corrupt optional binding must never poison healthy requests."""
+        try:
+            return self._present(request)
+        except (ValueError, TypeError, KeyError, StopIteration, sqlite3.Error, self.core.ActionError) as exc:
+            logging.getLogger('user-steps').warning('Card presentation unavailable: %s', exc)
+            return request
+
+    def _present(self, request):
         """Display-only metadata; never rewrite a frozen request or mint a new tile."""
         binding = self.binding(request['owner'], request['requestId'])
         if not binding:
@@ -497,6 +511,15 @@ class Mirror:
         if encoded(frozen) != binding['request']:
             return request
         snap = json.loads(binding['snapshot'])
+        if snap.get('remote'):
+            with self.store._read() as c:
+                display = c.execute('SELECT body FROM kanban_projection_display WHERE namespace=? AND request_id=?',
+                                    (self.store._ns(request['owner']), request['requestId'])).fetchone()
+            if display is not None:
+                shown = json.loads(display['body'])
+                if shown['remote']['target'] == snap['remote']['target']:
+                    snap = shown
+                    request = dict(request, title=shown['title'])
         hr = snap['ask']
         if snap.get('cited_id'):
             cited = next(r for r in snap['cited_set'] if r['requestId'] == snap['cited_id'])

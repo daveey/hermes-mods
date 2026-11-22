@@ -203,6 +203,24 @@ Answers use the authenticated `card-answer` courier: the owner independently rea
 the recorded source operation, then atomically fences the generation, records the
 comment and transitions the card. Retry/readback retains the same operation and
 courier request ID; queued or unverifiable responses are never success receipts.
+Display-only updates reuse that target identity and update the existing tile, not
+its frozen operation. A pending operation prevents another decision-capable tile
+for the same target. Invalid title/action/choice types preserve that row's prior
+binding; per-row presentation failures do not break healthy requests.
+
+Dispatch holds a process-safe operation lease through receiver I/O and settlement
+(exclusive for card mirrors, shared for generic idempotent receivers).
+Retirement requires the exclusive lease and defers while any dispatch
+is active. For departed or changed generations it reads the exact authenticated
+owner receipt without submitting another answer: committed success is delivered;
+only a known absent receipt or terminal refusal permits retirement. An unavailable
+or unverifiable read preserves the operation and suppresses fresh answers. Lease
+files must not be deleted while processes may hold them (kernel release handles
+crashes). These races, display refreshes and real FastAPI feed isolation are covered
+by `tests/test_remote_card_review_{race,edges}.py`,
+`tests/test_remote_card_receipt_retirement.py` and
+`tests/test_remote_card_projection_refresh.py`.
+
 **Other** uses `mode: comment`: record a user-relayed comment, leave the human ask
 and lifecycle untouched, even when the text is a named choice or `archive`.
 The session panel no longer drafts answers into the chat composer. A missing

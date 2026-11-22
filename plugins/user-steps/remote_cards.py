@@ -79,6 +79,23 @@ class Courier:
     def __init__(self):
         self.view = load_file(Path(__file__).resolve().parents[1] / 'hub-sync' / 'hubview.py')
 
+    def read(self, envelope, rid):
+        """Authenticated read-only receipt observation; never queue an answer."""
+        client = self.view.load_client()
+        if client is None:
+            raise OSError('Authenticated card-answer courier unavailable')
+        try:
+            cfg = client.load_config()
+            api = client.Api(cfg['hub_url'], client.read_key())
+            status, data = api.call('GET', '/v2/sync/requests/' + rid)
+        except (Exception, SystemExit) as exc:
+            raise OSError('Card-answer receipt unavailable') from exc
+        if status == 404:
+            return None
+        if status != 200 or not isinstance(data, dict) or not isinstance(data.get('request'), dict):
+            raise OSError('Card-answer receipt unavailable')
+        return data['request']
+
     def exchange(self, envelope, rid):
         client = self.view.load_client()
         if client is None:
@@ -128,7 +145,8 @@ class Remote:
         if row.get('status') not in ('blocked', 'triage'):
             return
         hr, generation = row.get('human_request'), row.get('card_answer_generation')
-        if (not isinstance(hr, dict) or not hr.get('action')
+        if (not isinstance(hr, dict) or not isinstance(hr.get('action'), str) or not hr['action'].strip()
+                or not isinstance(row.get('title'), str) or not row['title'].strip()
                 or hr.get('interaction') not in ('reply', 'approval', 'user_terminal', 'physical', 'external')
                 or not isinstance(generation, str) or not re.fullmatch('[0-9a-f]{64}', generation)):
             raise OSError('Remote ask incomplete; retain prior request')
@@ -158,44 +176,92 @@ class Remote:
         valid = [snap for snap in snapshots if 'unknown' not in snap]
         unknown = {snap['unknown'] for snap in snapshots if 'unknown' in snap}
         current = {self._target(snap['remote']['target']): snap for snap in valid}
+        display_current = dict(current)
         with m.store._read() as c:
             bindings = [dict(r) for r in c.execute(
                 "SELECT * FROM kanban_projections WHERE namespace=? AND session=? AND json_type(snapshot,'$.remote')='object'",
                 (m.store._ns(owner), owner['storedSessionId']))]
         # Retire old intent before minting the current generation. Unknown rows
         # deliberately preserve their own binding, not everybody else's.
+        held_targets = set()
         for binding in bindings:
             frozen = json.loads(binding['snapshot'])
             target = self._target(frozen['remote']['target'])
             if target in unknown:
+                held_targets.add(target)
                 continue
             request = m.store.get(owner, binding['request_id'])
             snap = current.get(target)
             if snap is not None and snap['generation'] == frozen['generation']:
+                self._display(owner, request['requestId'], display_current[target])
+                # The immutable projection/operation keeps its original bytes.
+                # Display refreshes never mint another decision-capable binding.
+                if request['state'] in ('open', 'needs_context'):
+                    held_targets.add(target)
+                else:
+                    current[target] = frozen
                 continue
             if request.get('resolution'):
-                self._retire(owner, request['resolution']['operationId'], 'Source card ask changed before delivery')
+                if not self._retire(owner, request['resolution']['operationId'], 'Source card ask changed before delivery'):
+                    held_targets.add(target)
             elif request['state'] in ('open', 'needs_context'):
                 m._withdraw(owner, request)
-        for snap in valid:
+        for target, snap in current.items():
+            if target in held_targets:
+                continue
             board = snap['remote']['target']['board']
             request = m._current_request(owner, board, snap)
             if request is not None:
                 m._publish(owner, board, snap, request)
+                self._display(owner, request['requestId'], display_current[target])
+
+    def _display(self, owner, rid, snap):
+        with self.mirror.store._tx() as c:
+            c.execute('INSERT INTO kanban_projection_display VALUES (?,?,?) '
+                      'ON CONFLICT(namespace,request_id) DO UPDATE SET body=excluded.body '
+                      'WHERE body!=excluded.body',
+                      (self.mirror.store._ns(owner), rid, json.dumps(snap, sort_keys=True)))
 
     @staticmethod
     def _target(target):
         return tuple(target.get(k) for k in ('ownerGateway', 'ownerProfile', 'board', 'task'))
 
     def _retire(self, owner, oid, reason):
+        """Receipt reconciliation owns the same lease as ordinary dispatch."""
+        from types import SimpleNamespace
         store = self.mirror.store
-        if store.operation(owner, oid)['operation']['dispatchState'] in ('delivered', 'cancelled'):
-            return
-        try:
-            store.retire_operation(owner, oid, by='system', reason='Remote card answer retired', evidence=reason)
-        except self.mirror.core.ActionError:
-            if store.operation(owner, oid)['operation']['dispatchState'] not in ('delivered', 'cancelled'):
-                raise
+        with store.delivery_lease(owner, oid) as held:
+            if not held:
+                return False
+            op = store.operation(owner, oid)['operation']
+            if op['dispatchState'] in ('delivered', 'cancelled'):
+                return True
+            binding = self.mirror._bound(op)
+            try:
+                record, receipt = self._observe(op, binding)
+                if receipt is not None:
+                    receiver = SimpleNamespace(deliver=lambda operation: receipt,
+                        readback=lambda operation, value: self._observe(operation, binding)[1] == value)
+                    result = store._dispatch(owner, oid, receiver)
+                    return result['operation']['dispatchState'] == 'delivered'
+                if record is not None and record['state'] not in ('rejected', 'expired', 'failed'):
+                    return False  # queued/in-flight/unknown is not proof of no owner commit
+            except (OSError, AttributeError, self.mirror.core.ActionError):
+                return False  # unverifiable preserves intent and blocks a fresh tile
+            with store._tx() as c:
+                store._retire_operation(c, owner, oid, by='system', reason='Remote card answer retired', evidence=reason)
+            return True
+
+    @staticmethod
+    def _rid(op):
+        return 'hr-card-answer-' + hashlib.sha256(json.dumps([op['owner'], op['operationId']], sort_keys=True).encode()).hexdigest()
+
+    def _observe(self, op, binding):
+        envelope = self.envelope(op, binding)
+        record = (self.courier or Courier()).read(envelope, self._rid(op))
+        if record is None:
+            return None, None
+        return record, self._receipt(envelope, self._rid(op), record)
 
     def envelope(self, op, binding):
         snap = json.loads(binding['snapshot'])
@@ -221,17 +287,24 @@ class Remote:
 
     def deliver(self, op, binding):
         envelope = self.envelope(op, binding)
-        rid = 'hr-card-answer-' + hashlib.sha256(json.dumps([op['owner'], op['operationId']], sort_keys=True).encode()).hexdigest()
+        rid = self._rid(op)
         record = (self.courier or Courier()).exchange(envelope, rid)
+        receipt = self._receipt(envelope, rid, record)
+        if record.get('state') in ('rejected', 'expired', 'failed'):
+            raise self.mirror.core.DeliveryRefused(
+                'Remote owner refused or terminated the exact card answer: ' + record['state'], 409)
+        if receipt is None:
+            raise OSError('Remote answer pending; check status or retry this operation')
+        return receipt
+
+    @staticmethod
+    def _receipt(envelope, rid, record):
         if (not isinstance(record, dict) or record.get('id') != rid
                 or any(record.get(k) != v for k, v in envelope.items())
                 or record.get('from') != 'gw:' + envelope['args']['source']['gateway']):
             raise OSError('Card-answer courier envelope mismatch')
-        if record.get('state') in ('rejected', 'expired', 'failed'):
-            self._retire(op['owner'], op['operationId'], 'Authenticated owner terminal: ' + record['state'])
-            raise self.mirror.core.ActionError('Remote owner refused or terminated the exact card answer: ' + record['state'], 409)
         if record.get('state') != 'done':
-            raise OSError('Remote answer pending; check status or retry this operation')
+            return None
         receipt = record.get('result')
         answer = envelope['args']['answer']
         if (not isinstance(receipt, dict) or any(receipt.get(k) != v for k, v in answer.items())
