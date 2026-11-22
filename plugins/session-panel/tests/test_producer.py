@@ -443,27 +443,22 @@ def test_board_events_are_read_only_when_a_board_file_moved():
 
 # --- review 6010587797: what time alone makes due, a refused watch, a directory made again ---
 
-def test_a_quiet_backend_still_ages_open_work_and_retries_and_an_idle_one_does_nothing():
+def test_quiet_open_work_ages_in_memory_without_database_admission():
     f, r, pushed, t = make()
-    f.changes(['S1'])  # the test readers give every chat a running card
+    f.changes(['S1'])
     f.tick()
+    before = f.bundles['S1']['bundle']['computed_at']
     assert f.bundles['S1']['bundle'].get('tasks')
-    assert f._due(t['now'])[0] == pytest.approx(f.full_every_s), 'due when its run evidence and counted time age'
+    assert f._due(t['now']) == (None, None)
     assert f.idle_wait() == f.heartbeat_s
-    t['now'] += f.full_every_s - 5
-    assert f.idle_wait() == pytest.approx(5), 'the loop sleeps to that moment, not to the next heartbeat after it'
+    t['now'] += f.full_every_s * 2
     f.beat()
     assert not f._wake.is_set()
-    t['now'] += 5
-    before = f.bundles['S1']['bundle']['computed_at']
-    f.beat()
-    assert f._wake.is_set(), 'no write for full_every_s: the safety-net pass is woken'
-    f.tick()
-    assert f.bundles['S1']['bundle']['computed_at'] > before and not f._wake.is_set()
-    assert f._due(t['now'])[0] == pytest.approx(f.full_every_s)
+    assert f.bundles['S1']['bundle']['computed_at'] == before
+    assert 'S1' not in pushed[-1]['fresh'], 'held evidence was not renewed'
 
 
-def test_a_chat_with_no_open_work_is_not_due_before_the_quiet_period():
+def test_a_chat_with_no_open_work_is_not_due_after_the_quiet_period():
     f, r, pushed, t = make()
     f.changes(['Q1'])  # no card linked to it
     f.tick()
@@ -475,25 +470,27 @@ def test_a_chat_with_no_open_work_is_not_due_before_the_quiet_period():
     assert not f._wake.is_set() and not f._decide.is_set(), 'idle: nothing woken, nothing read'
     t['now'] = b['computed_at'] + feedmod.QUIET_FULL_EVERY_S
     f.beat()
-    assert f._wake.is_set()
+    assert not f._wake.is_set() and not f._decide.is_set()
+    assert f.bundles['Q1']['bundle']['computed_at'] == b['computed_at']
 
 
-def test_a_pending_retry_wakes_a_pass_without_a_write():
+def test_pending_retry_is_unvouched_until_a_source_event():
     f, r, pushed, t = make()
     f.changes(['S1'])
     f.tick()
-    f._retry.add('S1')  # a read that raced its change cursor (or a stale source row)
-    assert f.idle_wait() == pytest.approx(feedmod.RETRY_EVERY_S)
+    f._retry.add('S1')
+    assert f.idle_wait() == f.heartbeat_s
+    t['now'] += feedmod.RETRY_EVERY_S * 2
+    f.last_emit = 0
     f.beat()
-    assert not f._wake.is_set(), 'not back to back'
-    t['now'] += feedmod.RETRY_EVERY_S
-    f.beat()
-    assert f._wake.is_set()
+    assert not f._wake.is_set() and 'S1' not in pushed[-1]['fresh']
+    r.stamp += 1
+    r.events = [('t_aaaaaa1', 'S1')]
     f.tick()
     assert 'S1' not in f._retry
 
 
-def test_a_failed_decision_read_wakes_the_decision_lane_without_a_write():
+def test_failed_decision_read_stays_unvouched_until_source_event():
     f, r, pushed, t = make(Stamped())
     f.changes(['S1'])
     f.refresh_decisions()
@@ -503,11 +500,12 @@ def test_a_failed_decision_read_wakes_the_decision_lane_without_a_write():
     f.refresh_decisions()
     assert f._decision_failures == {'S1'}
     f.tick()
-    assert f.idle_wait() == pytest.approx(feedmod.RETRY_EVERY_S)
-    t['now'] += feedmod.RETRY_EVERY_S
+    assert f.idle_wait() == f.heartbeat_s
+    t['now'] += feedmod.RETRY_EVERY_S * 2
     r.decision_inputs = real
     f.beat()
-    assert f._decide.is_set()
+    assert not f._decide.is_set() and f._decision_failures == {'S1'}
+    r.store += 1  # a real source event admits recovery, not the passage of time
     f.refresh_decisions()
     assert not f._decision_failures
     f._decide.clear()
@@ -516,7 +514,7 @@ def test_a_failed_decision_read_wakes_the_decision_lane_without_a_write():
     assert not f._decide.is_set()
 
 
-def test_the_event_loop_runs_the_due_pass_and_the_retries_with_no_write(tmp_path, monkeypatch):
+def test_event_loop_keeps_failed_sources_unvouched_without_idle_reads(tmp_path, monkeypatch):
     api = load('_spf_due_api', API)
     if not api.FileWatch().ok:
         pytest.skip('no kernel file notification on this platform')
@@ -549,9 +547,15 @@ def test_the_event_loop_runs_the_due_pass_and_the_retries_with_no_write(tmp_path
             time.sleep(0.01)
         assert f._decision_failures == {'S1'}
         computed.clear()
-        time.sleep(4.2)  # no write at all
-        assert len(computed) >= 3, f'{len(computed)} recomputes of an open-card chat in 4 s at full_every_s=1'
-        assert not f._decision_failures, 'the failed decision read was retried'
+        time.sleep(4.2)  # beyond the old full and retry periods; no write at all
+        assert computed == [], 'elapsed time cannot authorize a board refresh'
+        assert f._decision_failures == {'S1'}, 'failed evidence remains unvouched'
+        r.store += 1
+        r.db.write_bytes(b'2')
+        deadline = time.monotonic() + 1
+        while f._decision_failures and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not f._decision_failures, 'the next source event recovers within one second'
     finally:
         f.stopped.set()
         for t in threads:
@@ -559,7 +563,7 @@ def test_the_event_loop_runs_the_due_pass_and_the_retries_with_no_write(tmp_path
     assert not any(t.is_alive() for t in threads)
 
 
-def test_a_refused_inotify_watch_raises_and_the_feed_goes_back_to_the_timed_loop(tmp_path, monkeypatch):
+def test_a_refused_inotify_watch_does_not_enable_database_polling(tmp_path, monkeypatch):
     import ctypes
     import errno
     api = load('_spf_refused_api', API)
@@ -598,17 +602,43 @@ def test_a_refused_inotify_watch_raises_and_the_feed_goes_back_to_the_timed_loop
     monkeypatch.setattr(api, 'CoreReaders', lambda: r)
     monkeypatch.setattr(api, 'TICK_S', 0.2)
     r = Watched(tmp_path)
-    f = Feed(r, emit=lambda p: None)
+    pushed = []
+    f = Feed(r, emit=pushed.append)
     f.changes(['S1'])
+    startup_tick, startup_decision = threading.Event(), threading.Event()
+    real_tick, real_decision = f.tick, f.refresh_decisions
+    def tick():
+        result = real_tick()
+        startup_tick.set()
+        return result
+    def decision(**kwargs):
+        result = real_decision(**kwargs)
+        startup_decision.set()
+        return result
+    f.tick, f.refresh_decisions = tick, decision
     threads = running(api, f)
     try:
+        assert startup_tick.wait(3) and startup_decision.wait(3)
         deadline = time.monotonic() + 3
         while getattr(f, '_watching', None) is not False and time.monotonic() < deadline:
             time.sleep(0.01)
         assert f._watching is False
+        deadline = time.monotonic() + 3
+        while f._stamps is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert f._stamps is not None
+        before = f.bundles['S1']['bundle']
         r.files += 1
         r.rows['S1'] = {'kind': 'done'}
         r.db.write_bytes(b'1')
+        time.sleep(0.8)  # > three old fallback periods, without notification coverage
+        assert f.bundles['S1']['bundle'] is before
+        f.last_emit = 0
+        f._publish({}, heartbeat=True)
+        assert pushed[-1]['fresh'] == []
+        # An explicit admission still works; watch failure is not permission to
+        # erase held rows or prevent startup/cold hydration.
+        f._wake.set()
         deadline = time.monotonic() + 3
         while f.bundles['S1']['bundle']['outcome_json'] != {'kind': 'done'} and time.monotonic() < deadline:
             time.sleep(0.01)
