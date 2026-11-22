@@ -1,6 +1,6 @@
 ---
 name: generate-unblock-card
-description: "Use when writing a human_request / blocked card for David, after try-to-unblock proved he is needed."
+description: "Use when writing a human_request card. Make the ask clear."
 version: 1.0.0
 author: daveey
 license: MIT
