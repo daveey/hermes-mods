@@ -2,6 +2,12 @@
 
 Reference for skill `five-whys`: its SKILL.md links this file from the step that needs it.
 
+## Evidence admission and lifecycle consumption
+
+- Exercise accepted terminal evidence after a nominal lease TTL while the system deliberately retains the same custody (offline/dark-holder grace), and contrast it with evidence arriving after actual lease loss/replacement. An ingress that admits evidence and a finalizer that rejects it on a different expiry boundary can fail open despite green ordinary expiry tests. Prove release, named-source release and expiry through real APIs; a rejected retry is not sufficient if a later alarm regrants the work.
+- Replay attribution sources before their dependent result exists, including identical full-row resync from another enrolled writer. Assert version/origin as well as payload: a no-content-change upsert can restamp provenance and invalidate later exact-run proof. Protect the admitted live binding before a result arrives, retain original metadata on exact replay, and test substantive rewrites separately.
+- When reusing an existing command-custody table for another operation kind, enumerate every raw reader, positional insert and attached-effect foreign key before approving the migration. A shared run key establishes custody, not a failure/quota/neutral-release outcome. Test migrated legacy rows, both conflict orders, acknowledged-outbox deletion and exact receipt recovery; make observer ownership checks distinct from operation-specific effect interpretation.
+
 ## Pitfalls
 
 - Prove updater-triggered interruption separately from SIGTERM recovery: soft child fanout can drop a trusted update reason even when hard backend-exit propagation preserves it, and the updater can wrap/truncate the tool's own JSON result. Exercise actual admission hold/pause requests and inspect persisted causes/results before broadening recovery; never recover candidates by arbitrary historical substring matching. An in-place released-window proof is not checkout apply or cold-boot proof. Inspect the actual RPC response schema before polling: a text status response has no implicit `running` boolean, and a missing-field default can manufacture a timeout despite a valid pause.
