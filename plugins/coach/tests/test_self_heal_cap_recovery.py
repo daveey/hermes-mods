@@ -3,7 +3,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from test_self_heal_one_card import sh, env, defect, fill, file, events, NOW, MIDNIGHT, OPEN
+from test_self_heal_one_card import sh, env, defect, fill, file, events, NOW, MIDNIGHT, OPEN, load, ROOT
 
 
 def legacy(env):
@@ -48,50 +48,31 @@ def test_existing_uncountable_schema_is_not_zero(env, column):
 
 
 def test_digest_memo_recovers_persisted_fingerprints(env):
-    # Store the fake CLI's actual comments in a fixture-owned board, as the real CLI does.
-    con = sqlite3.connect(env.board.db)
-    try:
-        con.execute("CREATE TABLE task_comments (task_id TEXT, body TEXT)")
-        con.commit()
-    finally:
-        con.close()
     fill(env.board, 40)
     d = defect()
     out = file(env, d)
-    con = sqlite3.connect(env.board.db)
-    try:
-        con.executemany("INSERT INTO task_comments VALUES (?, ?)", env.board.comments)
-        con.commit()
-    finally:
-        con.close()
-    (Path(env.store.root) / sh.DIGEST_STATE).unlink()
-    sh._over_cap(d, d["fingerprint"], None, env.store, env.board, NOW+1, {})
-    comments = [b for c,b in env.board.comments if c == out["digest"]]
-    assert len(comments) == 1
+    # A fresh process reads the canonical report, not a board comment or memo.
+    restarted = load("cap_recovery_restart", ROOT / "self_heal.py")
+    second = restarted._over_cap(d, d["fingerprint"], None, env.store, env.board, NOW+1, {})
+    assert second["digest_report"]["count"] == 1
+    assert second["digest_report"]["path"] == out["digest_report"]["path"]
+    assert env.board.calls == []
 
 
 def test_digest_unreadable_comments_after_memo_loss_fails_closed(env):
+    """Unreadable canonical report is visible, never replaced with an empty report."""
     fill(env.board, 40)
     d = defect()
     first = file(env, d)
-    before = list(env.board.comments)
-    assert len(before) == 1
-    (Path(env.store.root) / sh.DIGEST_STATE).unlink()
-    # The table exists, but its body column is unreadable by the recovery query.
-    # A missing table is deliberately supported as an old-board empty history.
-    con = sqlite3.connect(env.board.db)
-    try:
-        con.execute("CREATE TABLE task_comments (task_id TEXT)")
-        con.commit()
-    finally:
-        con.close()
+    path = Path(first["digest_report"]["path"])
+    path.write_text("not JSON")
     out = sh._over_cap(d, d["fingerprint"], None, env.store, env.board, NOW+1, {})
-    assert out["over_cap"] is True
-    assert out["digest"] is None
-    assert env.board.comments == before
-    assert "digest comments unreadable" in events(env.store, "selfheal_over_cap")[-1]["error"]
-    assert not (Path(env.store.root) / sh.DIGEST_STATE).exists()
-    assert len(env.board.rows("id = ?", (first["digest"],))) == 1
+    assert out["over_cap"] is True and out["digest"] is None and out["digest_report"] is None
+    assert "digest report unavailable" in out["error"]
+    assert "digest report unavailable" in events(env.store, "selfheal_over_cap")[-1]["error"]
+    assert path.read_text() == "not JSON" and env.board.calls == []
+    with sqlite3.connect(Path(env.store.root) / "selfheal_pending.sqlite") as db:
+        assert db.execute("SELECT fp FROM pending").fetchall() == [(d["fingerprint"],)]
 
 
 @pytest.mark.parametrize("kind", ["fix", "verify"])

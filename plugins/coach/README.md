@@ -1494,11 +1494,21 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   Tests: `test_self_heal_backlog.py`, `test_self_heal_ranked.py`, `test_self_heal_backlog_migration.py`,
   `test_self_heal_backlog_report.py`.
 - **Daily card cap** (`daily_card_cap`, default 40, env `COACH_SELFHEAL_DAILY_CAP`): cards created_by `self-heal` on
-  the board since 00:00Z. At the cap a new defect (or backport/deploy-check) files no card: the day's digest card
-  (key `selfheal-digest:<YYYY-MM-DD>`, title `self-heal digest <date>: defects over the daily cap`, not counted,
-  scheduled until the next 00:00Z) gets one comment per fingerprint (`<coach>/selfheal-digest.json`), and
-  `selfheal_over_cap` is logged. The defect stays in `selfheal_pending` until midnight, then files normally (the dedupe
-  still applies). An unreadable count refuses (`selfheal_cap_unavailable`). Tests: `tests/test_self_heal_one_card.py`.
+  the board since 00:00Z. At the cap a new defect (or backport/deploy-check) files no card and launches no agent.
+  Instead the producer maintains `<coach>/selfheal-digests/<sha256(board)>/<UTC-day>.json` and `.md`.
+  The version-1 JSON records the UTC day, exact board, unique fingerprints with existing occurrence evidence,
+  each first occurrence's kind/count/cap/time, latest count/cap provenance and update time. Board hashes avoid
+  traversal and lossy-slug collisions. JSON is authoritative; Markdown is its readable projection. A per-day
+  file lock serializes merges; each file is temp-written, fsynced, atomically replaced and read back. A failure
+  between the two replacements can leave old Markdown: that is a visible error, never a successful pair receipt;
+  retry regenerates Markdown from the retained JSON union. Corrupt/unreadable JSON is not overwritten as empty.
+  Pending custody is saved before report I/O, and `selfheal_over_cap` logs report location/count or an explicit
+  error. `digest_report` carries that receipt; legacy `digest` stays null (a report path is not a card ID).
+  `backlog_report` exposes today's location/count through the existing standing report, without a new watcher,
+  timer or counting card. Historical digest cards/memos and migration readers are left alone. The defect stays
+  pending and retries under the existing ranked drain or legacy next-midnight path; dedupe, cap and budget
+  still apply. An unreadable count refuses (`selfheal_cap_unavailable`). Tests: `tests/test_self_heal_one_card.py`,
+  `tests/test_self_heal_cap_recovery.py`, `tests/test_self_heal_ranked.py`, `tests/test_self_heal_backlog_report.py`.
 - **Auto-approve** (default; `auto_approve` in `selfheal-config.json`, env `COACH_SELFHEAL_AUTO_APPROVE`): the hub
   cron (every 5 min) runs `file_fix` for every `proposed` fingerprint of a split lane (also `self_heal.py fix <fp>` by hand): fix
   card `selfheal:<fp>:fix` whose acceptance is the regression test red before / green after, ship under the standing
