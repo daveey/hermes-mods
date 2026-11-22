@@ -639,13 +639,52 @@ class Mirror:
             ).fetchone()
             return dict(row) if row else None
 
+    @staticmethod
+    def _ask_scope(snap):
+        """Actionable source identity, independent of projection/presentation churn.
+
+        Evidence, rationale, title, lifecycle generation and compression owner do
+        not create new human work. Different action/scope/choices remain distinct.
+        Remote owner identity prevents collisions with a same-named local card.
+        """
+        target = snap.get('remote', {}).get('target', {})
+        ask = snap['ask']
+        cited = next((r for r in snap.get('cited_set', [])
+                      if r['requestId'] == snap.get('cited_id')), None)
+        return encoded([target.get('ownerGateway'), target.get('ownerProfile'),
+                        {k: ask.get(k) for k in ('action', 'scope', 'interaction', 'choices')},
+                        ({k: cited.get(k) for k in ('kind', 'scope', 'choices', 'outcomes')}
+                         if cited else None)])
+
+    def _withdrawn_scope(self, c, owner, board, snap):
+        rows = c.execute(
+            "SELECT p.snapshot,l.withdrawal FROM kanban_projections p "
+            "JOIN requests r ON r.namespace=p.namespace AND r.id=p.request_id "
+            "JOIN lifecycle l ON l.namespace=r.namespace AND l.id=r.id "
+            "WHERE p.namespace=? AND p.board=? AND p.task=? AND r.state='withdrawn'",
+            (self.store._ns(owner), board, snap['task']))
+        scope = self._ask_scope(snap)
+        for row in rows:
+            withdrawal = json.loads(row['withdrawal'] or '{}')
+            # Only our mechanical relocation/revision retirement permits another
+            # incarnation. Explicit withdrawal is durable across future closeouts.
+            if (withdrawal.get('by') == 'system' and withdrawal.get('reason') ==
+                    'Source card left this block or its ask changed'):
+                continue
+            if self._ask_scope(json.loads(row['snapshot'])) == scope:
+                return True
+        return False
+
     def _current_request(self, owner, board, snap):
         """The request to publish for this exact ask, or None when none may be shown.
 
-        Identity is deterministic, so a withdrawn (or mismatch-retired) projection can
-        never be reopened in place: returning to an owner mints the next incarnation.
+        Identity is deterministic; only mechanical relocation/revision retirement
+        may mint another incarnation. Explicit withdrawal retires the source scope.
         A recorded answer or an unproven mismatch fails closed (None).
         """
+        with self.store._read() as c:
+            if self._withdrawn_scope(c, owner, board, snap):
+                return None
         n = 0
         while True:
             request = self._request(owner, board, snap, n)
@@ -918,6 +957,11 @@ class Mirror:
         tip = self.tip(current["session"]) if current is not None else None
         if request["state"] not in ("open", "needs_context"):
             return
+        with self.store._read() as c:
+            withdrawn = self._withdrawn_scope(c, owner, binding['board'], json.loads(binding['snapshot']))
+        if withdrawn and not request.get('resolution'):
+            self._withdraw(owner, request)
+            return
         public = {k: v for k, v in request.items() if k != "resolution"}
         public["state"] = json.loads(binding["request"]).get("state")
         mismatch = encoded(public) != binding["request"]
@@ -1000,6 +1044,8 @@ class Mirror:
         )
 
         def bind(c, frozen):
+            if self._withdrawn_scope(c, owner, board, snap):
+                raise self.core.ActionError('Projection has a withdrawn source ask', 410)
             c.execute("INSERT INTO kanban_projections VALUES (?,?,?,?,?,?,?)", values)
 
         try:

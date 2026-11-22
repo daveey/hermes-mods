@@ -16,6 +16,24 @@ edit, `read_exact()` deliberately raises `ValueError`, so lifecycle consumers
 trusting an unversioned snapshot. Test:
 `tests/test_lifecycle_source.py::test_revision_new_migration_and_noop`.
 
+## Explicit withdrawal of a blocked-card ask
+
+An explicit withdrawal retires the actionable source scope, not just its current
+projection UUID. Reconciliation consults durable projection bindings and withdrawal
+records before choosing a UUID and again inside the publication transaction. The
+same board/card/action/scope/interaction/choices cannot return merely because its
+title, evidence, rationale, lifecycle generation or compression owner changed.
+A genuinely different action or scope can still publish. Mechanical system
+retirement for owner relocation or external revision retains its existing behavior.
+Existing undecided duplicate projections are retired by normal binding reconciliation;
+recorded decisions are preserved. No source-card status, hold, dependency, budget or
+acceptance field is changed by suppression. Retention/capability failure is not new
+authorization to repair, archive or execute anything.
+
+Regression: `tests/test_kanban_withdrawn_scope.py` covers publish → explicit
+withdrawal → owner disposition → update/retry, owner rotation, new actionable scope,
+existing duplicates, unchanged card/edges and withdrawal racing publication.
+
 ## Blocked-card question layout
 
 Server-bound Kanban asks use a compact clarify-style question with full-width
