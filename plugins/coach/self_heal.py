@@ -311,6 +311,8 @@ RESUME_NOTE_PREFIX = "[System note: Your previous turn was interrupted mid-run"
 # Core's update-pause note (tui_gateway/update_pause.py pause_note) shares that prefix but marks a PLANNED pause: the
 # turn stopped at a step boundary so a Hermes update could land, then continued by itself (gateway-9aaf151a15).
 PAUSE_NOTE_MARK = "paused at a step boundary for a Hermes update"
+# Core's live refused-turn timer shares the recovery prefix, but no backend died.
+PROVIDER_RETRY_NOTE_MARK = "the provider refused the turn with a retryable error; the backend did not stop."
 # The update's land target: a pause that continued within this is working as designed; a longer one failed.
 PAUSE_LAND_S = 30 * 60
 ERR_LINE_RE = re.compile(r"(?:<-|->)\s*ERROR\b\s*(.*)")
@@ -912,7 +914,7 @@ def owner_relevance(card: dict, d: dict, fp: Optional[str] = None) -> tuple:
 
 
 def is_resume_note(user_text) -> bool:
-    """Core's resume note (crash recovery or update pause): a machine-written turn, never a user complaint."""
+    """Core's resume note (crash, update pause or provider retry): machine-written, never a user complaint."""
     return clean_user(user_text).lstrip().startswith(RESUME_NOTE_PREFIX)
 
 
@@ -923,6 +925,8 @@ def resume_signal(user_text, gap_s: Optional[float] = None, stop: Optional[dict]
     t = clean_user(user_text)
     if not is_resume_note(t):
         return None
+    if PROVIDER_RETRY_NOTE_MARK in t[:400]:
+        return None  # a handled provider refusal, not a process interruption (even without gui.log)
     if PAUSE_NOTE_MARK in t[:400]:
         if gap_s is None or gap_s <= PAUSE_LAND_S:
             return None  # a planned update pause that continued in time

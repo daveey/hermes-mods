@@ -125,6 +125,25 @@ def test_a_known_stop_cause_wins_over_the_retry_evidence(tmp_path, on, monkeypat
     assert len(detect) == 1 and detect[0]["stop_cause"] == "gateway shutdown" and skip == []
 
 
+RETRY_NOTE = ("[System note: Your previous turn was interrupted mid-run — "
+              "the provider refused the turn with a retryable error; the backend did not stop. "
+              "Some of the work may already be complete; check the current state before redoing anything, then "
+              "finish the task. The interrupted request was:]\n\nfix the panel")
+
+
+@pytest.mark.parametrize("gap_s", [None, 45, 180, 7200])
+def test_explicit_provider_retry_note_never_signals_a_crash(gap_s):
+    assert sh.is_resume_note(RETRY_NOTE)
+    assert sh.resume_signal(RETRY_NOTE, gap_s=gap_s) is None
+
+
+def test_retry_mark_in_original_request_does_not_hide_real_crash():
+    # As with pause marks, classification is limited to the machine-written header.
+    text = CRASH_NOTE + "x" * 400 + "the provider refused the turn with a retryable error"
+    assert sh.resume_signal(text)["symptom"] == sh.CRASH_SYMPTOM
+    assert sh.resume_signal("User quoting: " + RETRY_NOTE) is None
+
+
 def test_missing_or_unreadable_gui_log_fails_open(tmp_path, on, monkeypatch):
     detect, skip = _run(tmp_path, monkeypatch, lambda h: None)
     assert len(detect) == 1 and skip == []
