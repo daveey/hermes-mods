@@ -69,7 +69,7 @@ A `py-spy dump` is one instant: enough to see what a hung process waits on, but 
 that isn't the hot path. To attribute CPU to code, record instead:
 `sudo -n py-spy record --nonblocking --pid <pid> --duration 15 --rate 40 --format raw -o <f>` (each line is
 `frame;frame;… count`), then rank functions by their inclusive share of samples (count each function once per stack).
-To measure time a thread spends blocked on a lock or event, add `--idle`: without it py-spy drops sleeping threads' samples, so lock waits never show up.
+To measure time a thread spends blocked on a lock or event, add `--idle`: without it py-spy drops sleeping threads' samples, so lock waits never show up. Never combine `--native` with `--nonblocking`: py-spy rejects that combination before sampling. If production may not be paused, retain nonblocking mode and mark native attribution unknown; do not drop nonblocking to obtain native frames. Under a bounded capture budget preserve failed attempts and correct options/privilege inside the original elapsed budget, never reset its admission time.
 For a bounded sync-loop profile, filter raw stacks to the exact sync thread before ranking: detached link-repair and watcher threads can share module names and otherwise dominate the wrong envelope. Preserve sampler error/lag counts and treat an offline one-pair query speedup as a candidate estimate, not a validated end-to-end forecast. Do not infer historical row-volume causes from aggregate counters without row identities.
 Use the profile to locate code, not to convert sample counts directly into CPU utilization: thread filtering,
 missed samples and nonblocking reads affect that estimate. Cross-check against the step 3 CPU-time delta.
