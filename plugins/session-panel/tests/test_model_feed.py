@@ -71,6 +71,58 @@ def test_interactive_failure_keeps_other_chats_earlier_retry_after_exhaustion():
     assert f._budgets['decision']['S2'] == 1
 
 
+def test_old_sweep_keeps_newly_watched_chat_retry():
+    import pytest
+    from types import SimpleNamespace
+    f, readers, pushed, clock = make()
+    f.changes(['S1'])
+    started, release = threading.Event(), threading.Event()
+    def slow(*args):
+        started.set()
+        assert release.wait(5)
+        return {'outcome_json': {}, 'requests': []}
+    worker = threading.Thread(target=lambda: f.refresh_decisions(
+        readers=SimpleNamespace(decision_inputs=slow)))
+    worker.start()
+    try:
+        assert started.wait(5)
+        f.changes(['S2'])
+        readers.decision_inputs = lambda *args: {'requests': []}
+        with pytest.raises(ValueError):
+            f.refresh_decision('S2', readers=readers)
+        due = f._decision_retry_at
+    finally:
+        release.set(); worker.join(5)
+    assert not worker.is_alive()
+    assert f._decision_failures == {'S2'}
+    assert f._budgets['decision'] == {'S2': 1}
+    assert f._decision_retry_at == due
+    clock['now'] = due
+    f.beat()
+    assert f._decide.is_set()
+
+
+def test_accepted_interactive_success_resets_only_own_exhausted_budget():
+    import pytest
+    f, readers, pushed, clock = make()
+    f.changes(['S1', 'S2'])
+    readers.decision_inputs = lambda *args: {'requests': []}
+    for session in ['S2'] + ['S1'] * 10:
+        with pytest.raises(ValueError):
+            f.refresh_decision(session, readers=readers)
+    due = f._decision_retry_at
+    readers.decision_inputs = lambda *args: {'outcome_json': {}, 'requests': []}
+    f.refresh_decision('S1', readers=readers)
+    assert f._budgets['decision'] == {'S2': 1}
+    assert f._decision_retry_at == due
+    readers.decision_inputs = lambda *args: {'requests': []}
+    with pytest.raises(ValueError):
+        f.refresh_decision('S1', readers=readers)
+    assert f._budgets['decision'] == {'S1': 1, 'S2': 1}
+    assert f._decision_retry_at is not None
+    assert f._decision_retry_at <= due
+
+
 def test_overlapping_decision_results_keep_newest_failure_status():
     from types import SimpleNamespace
     for older_fails in (False, True):
