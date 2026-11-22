@@ -82,7 +82,13 @@ def test_changed_cursor_with_identical_view_does_not_push(monkeypatch):
     app.include_router(api.router)
     with TestClient(app) as client:
         with client.websocket_connect('/v1/lanes/stream') as ws:
-            assert ws.receive_json()['version'] == 1
+            first = ws.receive_json()
+            # Under load the first projection can outlast HEARTBEAT_S, so a
+            # version-0 heartbeat may legitimately precede the first view.
+            while first.get('type') == 'heartbeat':
+                assert first['version'] == 0
+                first = ws.receive_json()
+            assert first['version'] == 1
             state['cursor'] += 1
             assert ws.receive_json() == {'type': 'heartbeat', 'version': 1}
 
