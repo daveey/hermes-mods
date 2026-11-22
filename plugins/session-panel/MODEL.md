@@ -63,17 +63,25 @@ known-empty sources; successful retries clear failure diagnostics and restore `f
 ## Interactive decision publication
 
 Canonical owner lookup, decision POST, and operation/receipt readback use a bounded
-four-worker decision budget separate from the shared AnyIO and feed read pools.
+four-worker owner-route budget separate from the shared AnyIO and feed read pools.
 The router's recovery dependency is asynchronous too: warm decisions do not wait
 for a synchronous dependency in the saturated default pool. Queue admission is
 bounded at 750 ms; an admitted worker retains capacity even after its caller is
-cancelled. Durable operation/idempotency semantics are unchanged.
+cancelled. Cold callers await one shielded recovery task per home/event loop, not
+four workers waiting on the same recovery lock. A definitive pre-admission 503
+(`Decision not started: capacity busy`) offers an explicit Retry decision with
+the identical frozen payload and idempotency key. Generic 503/timeouts stay
+unknown and can only check status; a failed GET never grants POST retry.
+Durable operation/idempotency semantics are unchanged.
 
 Desktop validates the canonical POST receipt immediately instead of discarding it
 and doing three sequential GETs. It then requests `POST /decision-refresh {session}`
 on the **source panel** connection/profile, not an ambient or foreign request
 owner. This endpoint reads current canonical requests/outcome only, independent
-of the sweep decision lock, and returns a compact backend-authored model. It does
+of the sweep decision lock, and returns a compact backend-authored model. It
+uses its own separately bounded four-worker refresh capacity (not the owner's
+four slots). Failed interactive reads arm the existing bounded canonical retry
+budget and stay unvouched until a successful canonical read. It does
 not hydrate boards, reconcile mirrors, infer running state, renew execution
 leases, or advance board clocks. The existing canonical sequence merge fences
 older reads. The scoped response carries feed/epoch/revision; per-chat revision

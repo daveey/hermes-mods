@@ -395,6 +395,7 @@ class Feed:
             with self.lock:
                 if session in self.interest:
                     self._decision_failures.add(session)
+                    self._decision_retry_at = self._spend('decision', {session}, keep=self._decision_failures - {session})
             raise
         with self.lock:
             self._decision_failures.discard(session)

@@ -478,7 +478,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
       row.only_you && jsx('div', { 'data-ask-only-you': '', style: { ...modelSmall, ...muted }, children: row.only_you }),
       row.source === 'card' && !row.request_id && decision && jsx('div', { role: 'status', style: { ...muted, fontSize: 11 }, children: 'Answer unavailable until the exact owner ask is mirrored. Open the card for details.' }),
       status?.text && jsx('div', { role: 'status', style: { ...modelSmall, color: status.locked ? 'var(--foreground)' : ALERT_TEXT }, children: status.text }),
-      status?.locked && onCheck && jsx('button', { type: 'button', style: { ...ghostBtn, justifySelf: 'start', cursor: 'pointer' }, onClick: () => onCheck(row), children: 'Check status' }),
+      status?.locked && onCheck && jsx('button', { type: 'button', style: { ...ghostBtn, justifySelf: 'start', cursor: 'pointer' }, onClick: () => onCheck(row), children: status.retry ? 'Retry decision' : 'Check status' }),
       (row.details?.length > 0 || row.actions.some(a => a.kind === 'open_card')) && jsxs('div', { style: { display: 'flex', alignItems: 'flex-start', gap: 12, minWidth: 0 }, children: [
         details(row), ...openLinks(row)
       ] })
@@ -553,7 +553,11 @@ const modelDecisionKey = row => JSON.stringify([row.actions.find(a => a.kind ===
 export function modelDecisionStatus(row) {
   const key = modelDecisionKey(row)
   if (modelDecisions.has(key)) return modelDecisions.get(key)
-  try { if (window.localStorage.getItem(MODEL_INTENT_PREFIX + key)) return { locked: true, text: 'Decision outcome unknown — check status before choosing again.' } } catch {}
+  try {
+    const intent = JSON.parse(window.localStorage.getItem(MODEL_INTENT_PREFIX + key) || 'null')
+    if (intent?.notStarted) return { locked: true, retry: true, text: 'Decision was not started. Retry the same decision.' }
+    if (intent) return { locked: true, text: 'Decision outcome unknown — check status before choosing again.' }
+  } catch {}
   return null
 }
 const sameModelOwner = (a, b) => !!a && !!b && a.gatewayId === b.gatewayId && a.profile === b.profile && a.storedSessionId === b.storedSessionId
@@ -613,10 +617,18 @@ export async function chooseModelOption(row, option, sourceRoute, { call = model
     if (applyDecisionReceipt(row, intent, data)) await refreshDecisionPanel(intent, call)
     else await checkModelDecision(row, { call }) // mixed-version owner
   } catch (e) {
-    const retained = window.localStorage.getItem(MODEL_INTENT_PREFIX + key)
-    modelDecisions.set(key, { locked: !!retained, text: retained ? `Outcome unknown: ${e.message}. Check status; do not choose again.` : e.message })
-    modelChanged()
+    decisionFailed(key, e, true)
   }
+}
+function decisionFailed(key, e, admission = false) {
+  const retained = JSON.parse(window.localStorage.getItem(MODEL_INTENT_PREFIX + key) || 'null')
+  const message = String(e?.message || e).replace(/^Error invoking remote method '[^']*':\s*/, '')
+  // This exact server refusal occurs BEFORE the work is admitted. Generic 503,
+  // transport failures and timeouts remain uncertain and can never repost.
+  const notStarted = admission && !!retained && /^503\b[^\n]*Decision not started: capacity busy/.test(message)
+  if (retained && notStarted) window.localStorage.setItem(MODEL_INTENT_PREFIX + key, JSON.stringify({ ...retained, notStarted: true }))
+  modelDecisions.set(key, { locked: !!retained, retry: notStarted, text: notStarted ? 'Decision was not started. Retry the same decision.' : retained ? `Outcome unknown: ${e.message}. Check status; do not choose again.` : e.message })
+  modelChanged()
 }
 function applyDecisionReceipt(row, intent, data) {
   const op = data?.operation, r = data?.request, id = op?.operationId || op?.id
@@ -650,8 +662,22 @@ export async function checkModelDecision(row, { call = modelApi } = {}) {
   const key = modelDecisionKey(row)
   const intent = JSON.parse(window.localStorage.getItem(MODEL_INTENT_PREFIX + key) || 'null')
   if (!intent) return
+  let retryPost = false
   try {
     const { route, request } = await modelRequestRoute({ request_id: intent.requestId, owner: intent.owner }, intent.route, call)
+    if (intent.notStarted) {
+      if (request.revision !== intent.decision.expectedRevision || request.state !== 'open' || request.resolution) throw Error('Request changed. Refresh the panel before retrying.')
+      // Explicit Retry only, and only the identical frozen choice/key. Clear the
+      // refusal before sending: a lost response is unknown, never auto-retried.
+      delete intent.notStarted
+      window.localStorage.setItem(MODEL_INTENT_PREFIX + key, JSON.stringify(intent))
+      modelDecisions.set(key, { locked: true, text: 'Submitting decision…' }); modelChanged()
+      retryPost = true
+      const data = await call(`/api/plugins/user-steps/requests/${encodeURIComponent(intent.requestId)}/decisions`, { ...route, method: 'POST', body: intent.decision })
+      if (!applyDecisionReceipt(row, intent, data)) throw Error('Invalid decision receipt')
+      await refreshDecisionPanel(intent, call)
+      return
+    }
     const query = `?session=${encodeURIComponent(route.session)}`
     const found = await call(`/api/plugins/user-steps/operations${query}&idempotencyKey=${encodeURIComponent(intent.decision.idempotencyKey)}`, route)
     const id = found?.operation?.operationId || found?.operation?.id
@@ -664,7 +690,7 @@ export async function checkModelDecision(row, { call = modelApi } = {}) {
     await refreshDecisionPanel(intent, call)
     // Keep intent even after confirmation: an old cached model must never offer the choice again.
     void request
-  } catch (e) { modelDecisions.set(key, { locked: true, text: `Outcome unknown: ${e.message}. Check status.` }) }
+  } catch (e) { decisionFailed(key, e, retryPost) }
   modelChanged()
 }
 /** Open an http(s) link from a row (CI run, PR) with the OS handler; never a navigation of the Desktop window. */
