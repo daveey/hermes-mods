@@ -323,7 +323,8 @@ def wait_leaf(dependency, bundle):
             owner = detail.get('owner')
             task.update(id=pid, board=task.get('board') or rec.get('board') or dep.get('board'),
                         gateway=task.get('home_gateway') or task.get('gateway') or
-                        (owner if isinstance(owner, str) else None),
+                        (owner if isinstance(owner, str) else None) or
+                        (bundle.get('gateway') if detail.get('source') == 'live' else None),
                         profile=task.get('profile') or dep.get('profile'))
             if task.get('gateway') and task.get('profile'):
                 pending.append((task, depth + 1, visited | {identity}))
@@ -566,7 +567,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         wi = wait_info(row, now)
         dependency = wait_target(row, bundle, detail)
         dependency = wait_leaf(dependency, bundle) if dependency else None
-        if state in ('scheduled', 'todo', 'blocked', 'triage') and not wi['raw'] and obj(detail.get('links')).get('parents'):
+        if state in ('scheduled', 'todo', 'blocked', 'triage') and not text(obj(row.get('wait')).get('waiting_on')) and obj(detail.get('links')).get('parents'):
             leaf = wait_leaf(row, bundle)
             if leaf.get('id') != row['id']:
                 dependency = leaf

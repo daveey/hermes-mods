@@ -316,6 +316,35 @@ def test_primary_and_unpublished_graph_wait_resolve_intended_card(on):
     assert next(a for a in r['actions'] if a['label'] == 'Open parent card')['target']['id'] == primary
 
 
+@pytest.mark.parametrize('on', ['the clock until 2026-11-23 12:00 UTC', 'the clock until 2026-11-21 00:00 UTC', 'ci https://example.com/run', 'deploy release'])
+def test_hydrated_graph_never_replaces_explicit_noncard_wait(on):
+    row = task('t_aaaaaaaaaaaaaaaa', status='scheduled', wait={'wait_state': 'waiting', 'waiting_on': on})
+    cid = 't_bbbbbbbbbbbbbbbb'
+    b = bundle(row, cards={row['id']: {'detail': {'links': {'parents': [cid]}}},
+                           cid: {'detail': {'owner': 'remote', 'task': {'id': cid, 'title': 'Unrelated work', 'status': 'blocked', 'profile': 'default'}}}})
+    r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert r['detail'] == model.wait_phrase(row, NOW) + ' on remote'
+    assert 'Unrelated work' not in str(r)
+    assert not any(a['label'] == 'Open parent card' for a in r['actions'])
+
+
+@pytest.mark.parametrize('source, expected', [('live', True), ('replica', False)])
+def test_graph_leaf_inherits_serving_gateway_only_for_live_sources(source, expected):
+    row = task('t_aaaaaaaaaaaaaaaa', status='blocked')
+    cid = 't_bbbbbbbbbbbbbbbb'
+    b = bundle(row, cards={row['id']: {'detail': {'links': {'parents': [cid]}}},
+                           cid: {'board': 'other', 'detail': {'source': source, 'task': {'id': cid, 'title': 'Local leaf', 'status': 'scheduled'},
+                                'events': [{'kind': 'scheduled', 'payload': {'awaiting': {'kind': 'clock', 'why': 'Cooldown window'}}}]}}})
+    b.update(gateway='hub', profile='default')
+    r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert ('Local leaf' in r['detail']) is expected
+    actions = [a for a in r['actions'] if a['label'] == 'Open parent card']
+    assert bool(actions) is expected
+    if expected:
+        assert 'Cooldown window' in r['detail'] and 'on hub' in r['detail']
+        assert actions[0]['target'] == {'id': cid, 'gateway': 'hub', 'profile': 'default', 'board': 'other'}
+
+
 def test_parent_wait_keeps_identity_in_details_not_status():
     upstream = {'id': 't_0123456789abcdef', 'status': 'blocked'}
     r = model.reduce_panel(bundle(task(status='todo', blocked_upstream=upstream)), now=NOW)['sections']['waiting'][0]
