@@ -11,6 +11,14 @@ import logging
 import threading
 import time
 
+# Display-only data: each PR costs ~4 GitHub GraphQL requests per read, and the
+# 5000/h bucket is shared per GitHub user. An entry is re-read only after it
+# is older than TTL_S; a failed/rate-limited batch backs off BACKOFF_MIN_S
+# doubling to BACKOFF_MAX_S.
+TTL_S = 300
+BACKOFF_MIN_S = 60
+BACKOFF_MAX_S = 900
+
 
 class Published:
     def __init__(self, store, contexts, values, cursor):
@@ -24,7 +32,7 @@ class Published:
 
 
 class Observations:
-    def __init__(self, factory, ttl=60., clock=time.monotonic):
+    def __init__(self, factory, ttl=TTL_S, clock=time.monotonic):
         self.factory, self.ttl, self.clock = factory, ttl, clock
         self.lock = threading.Lock()
         self.contexts = {}
@@ -33,6 +41,8 @@ class Observations:
         self.active = {}
         self.thread = None
         self.revision = 0
+        self.backoff_until = 0.
+        self.backoff_delay = 0.
 
     def _fresh_values(self):
         now = self.clock()
@@ -41,8 +51,9 @@ class Observations:
 
     def _cursor(self):
         fresh = self._fresh_values()
-        due = tuple(sorted(u for u in fresh if self.clock() - self.values[u][1] >= self.ttl / 2))
-        return self.revision, tuple(sorted(fresh)), due
+        # Refresh is due only at expiry (fresh set shrinks), so nothing is ever
+        # fresh-and-due; the stream wakes when an entry expires.
+        return self.revision, tuple(sorted(fresh)), ()
 
     def reader(self, contexts):
         with self.lock:
@@ -60,13 +71,15 @@ class Observations:
     def request(self, contexts, urls):
         with self.lock:
             now = self.clock()
+            if now < self.backoff_until:
+                return  # rate-limited/failing: serve existing values until ttl
             # Replace/coalesce by URL; space is bounded by the current board, not requests.
             for url in urls:
                 ctx = contexts.get(url)
                 if ctx is None or self.contexts.get(url) != ctx or self.active.get(url) == ctx:
                     continue
                 old = self.values.get(url)
-                if old is not None and old[0] == ctx and now - old[1] < self.ttl / 2:
+                if old is not None and old[0] == ctx and old[2] and now - old[1] < self.ttl:  # empty = failed read: retry (paced by backoff)
                     continue
                 self.pending[url] = ctx
             if self.pending and self.thread is None:
@@ -83,14 +96,21 @@ class Observations:
                 self.active = job
             started = self.clock()
             values = {}
+            failed = False
             try:
                 reader = self.factory()  # core's whole-batch 30s network budget
                 reader.prefetch(job)
                 values = {url: copy.deepcopy(reader.get(url)) for url in job}
             except Exception:
+                failed = True
                 logging.getLogger(__name__).exception('Lanes PR observation failed')
             with self.lock:
                 self.active = {}
+                if failed or not any(values.get(u) for u in job):
+                    self.backoff_delay = min(self.backoff_delay * 2 or BACKOFF_MIN_S, BACKOFF_MAX_S)
+                    self.backoff_until = self.clock() + self.backoff_delay
+                else:
+                    self.backoff_delay = self.backoff_until = 0.
                 before = self._fresh_values()
                 for url, ctx in job.items():
                     if self.contexts.get(url) == ctx:
