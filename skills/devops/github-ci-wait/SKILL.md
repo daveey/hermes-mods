@@ -173,6 +173,8 @@ A user-approved batch through ONE full suite: acceptance is the batch's evidence
 
 ## Notes
 
+For GraphQL exhaustion, measure the GraphQL bucket itself (`gh api graphql -f 'query={rateLimit{limit remaining used resetAt cost}}'`). REST `/rate_limit` top-level `rate`/`core` remaining is not GraphQL capacity. Attribute offered requests by shared token fingerprint, host and producer before retrying; error attempts are not charged GraphQL points, and vend-start aggregates need not equal request-timestamp aggregates. Display-only PR pollers must have an explicit refresh budget and failure backoff rather than sharing acceptance's quota without pacing.
+
 Read `references/notes.md` before acting on this skill's steps (moved verbatim from SKILL.md).
 
 ## CI refused for billing (account-wide outage)
