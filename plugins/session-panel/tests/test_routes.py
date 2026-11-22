@@ -80,8 +80,12 @@ def test_a_plugin_reload_resumes_on_register_not_on_the_request(monkeypatch):
         first = c.post('/api/plugins/session-panel/changes', json={'sessions': ['S1', 'S2']}).json()
         # Unload: reads keep the held publication; register owns restart work.
         plugin.stop()
+        # Startup hydration may publish between the first response and unload.
+        # Compare against the stopped publication, not that racing earlier rev.
+        held = c.post('/api/plugins/session-panel/changes', json={'sessions': ['S1', 'S2']}).json()
+        assert held['epoch'] == first['epoch']
         again = c.post('/api/plugins/session-panel/changes',
-                       json={'sessions': ['S1', 'S2'], 'since': first['rev'], 'epoch': first['epoch']}).json()
+                       json={'sessions': ['S1', 'S2'], 'since': held['rev'], 'epoch': held['epoch']}).json()
         assert again['epoch'] == first['epoch'] and again['reset'] is False and again['bundles'] == {}
         assert core.PROCESS_FEED.stopped.is_set() is True
         # Unload then register again: register resumes it at once, before any request.

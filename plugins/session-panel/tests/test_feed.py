@@ -225,31 +225,33 @@ def test_a_new_card_of_a_watched_chat_marks_it_dirty_through_its_session():
     assert [x['id'] for x in pushed[-1]['bundles']['S2']['tasks']] == ['t_dddddd4', 't_7777777']
 
 
-def test_full_refresh_recomputes_every_watched_chat_and_catches_unevented_changes():
+def test_semantic_source_change_catches_unevented_projection_rebuild():
+    from types import SimpleNamespace
     f, r, pushed, t = make()
     f.changes(['S1', 'S2'])
     f.tick()
-    r.finished['S2'] = [{'id': 't_8888888', 'status': 'done'}]  # no event seen (a projection rebuild)
+    r.finished['S2'] = [{'id': 't_8888888', 'status': 'done'}]  # no task event
+    r.board_changes = lambda cursor: (SimpleNamespace(affects=lambda held: 'S2' in held['lineage']), cursor)
+    r.stamp += 1  # the source commit, NOT a timer, authorizes the semantic capture
     t['now'] += feedmod.FULL_EVERY_S + 1
     assert f.tick() == 1 and set(pushed[-1]['bundles']) == {'S2'}
 
 
-def test_a_chat_with_no_open_cards_is_fully_refreshed_only_every_quiet_interval():
+def test_quiet_chats_stay_held_until_source_change_not_a_quiet_interval():
     f, r, pushed, t = make()
     r.links['S3'] = []
     r.lineages['S3'] = ['S3']
     f.changes(['S2', 'S3'])
+    f.tick()  # bootstrap the source cursor
     computed = []
     real = f.compute
     f.compute = lambda s, **kwargs: (computed.append(s), real(s, **kwargs))[1]
     t['now'] += feedmod.FULL_EVERY_S + 1
     f.tick()
-    assert computed == ['S2'], 'S3 has no open cards: not every minute'
-    computed.clear()
+    assert computed == [], 'neither open nor quiet chats read sources on a timer'
     t['now'] += feedmod.QUIET_FULL_EVERY_S
     f.tick()
-    assert 'S3' in computed, 'but within QUIET_FULL_EVERY_S'
-    computed.clear()
+    assert computed == [], 'the old quiet safety sweep is not DB admission'
     r.events = [('t_newcard', 'S3')]  # a card created in S3: recomputed at once
     r.stamp = 77
     t['now'] += 1
@@ -489,7 +491,9 @@ def test_a_plugin_reload_resumes_the_feed_so_clients_see_no_reset():
     # with a new epoch and no bundles.
     old, r, pushed, t = make()
     first = old.changes(['S1', 'S2'])
-    for _ in range(3):  # later passes: carried sequence numbers run well past 1
+    for _ in range(3):  # genuine commits advance the carried sequence numbers
+        r.stamp += 1
+        r.events = [('t_aaaaaa1', 'S1')]
         t['now'] += 61
         old.tick()
     top = max(b['bundle']['computed_seq'] for b in old.bundles.values())

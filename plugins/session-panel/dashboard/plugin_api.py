@@ -181,14 +181,22 @@ class CoreReaders:
     # files
     def boards(self) -> list[tuple[str, Path]]:
         with self._boards_lock:
-            if time.monotonic() - self._boards_at > 60 or not self._boards:
+            if not self._boards_at:
                 self._boards = list(self.ksc.board_paths())
                 self._boards_at = time.monotonic()
             return list(self._boards)
 
+    def invalidate_inventory(self):
+        with self._boards_lock:
+            self._boards_at = 0.0
+
+    def board_paths(self) -> list[Path]:
+        boards = self.boards()
+        return list(dict.fromkeys([Path(p) for _, p in boards] +
+                                  [Path(self.ksc.shadow_path(s)) for s, _ in boards]))
+
     def files(self) -> list[Path]:
-        out = [p for _, p in self.boards()] + [self.ksc.shadow_path(s) for s, _ in self.boards()]
-        return [Path(p) for p in out if Path(p).exists()]
+        return [p for p in self.board_paths() if p.exists()]
 
     def state_db(self) -> Path:
         return self._state_db
@@ -246,7 +254,10 @@ class CoreReaders:
                 except OSError:
                     out.append(None)
             return tuple(out)
-        return tuple(data_stamp(p) or stat(p) for p in self.files() + [self.state_db()])
+        return tuple((str(p), data_stamp(p) or stat(p)) for p in self.files() + [self.state_db()]) + self.external_stamps()
+
+    def external_stamps(self):
+        return tuple((str(p), self._stat(p)) for p in self.external_paths())
 
     def _stamps_of(self, paths):
         from hermes_cli.session_list_flight import data_stamp
@@ -562,7 +573,27 @@ class CoreReaders:
 
     def watch_paths(self) -> list[Path]:
         """Every file a bundle is computed from: a write to any of them is what makes a pass due."""
-        return self.files() + [self.state_db(), self.state_db().parent / 'user-steps' / 'actions.sqlite3']
+        return self.board_paths() + [self.state_db(), self.state_db().parent / 'user-steps' / 'actions.sqlite3'] + self.external_paths()
+
+    def external_paths(self) -> list[Path]:
+        """Origin receipts and hub replicas are inputs, not task-event boards."""
+        from hermes_constants import get_hermes_home
+        from hermes_cli.kanban_db import kanban_home
+        from hermes_cli.kanban_capability_registry import hub_db_path
+        return [hub_db_path(), Path(get_hermes_home()) / 'kanban' / 'origin-ledger.db',
+                kanban_home() / 'origin-work.db']
+
+    def watch_directories(self):
+        from hermes_cli import kanban_db, kanban_db_sync
+        root = kanban_db.kanban_home()
+        # Directory-entry events discover new named/link-only boards. Their
+        # writes are then watched by exact file name; unrelated logs don't wake us.
+        boards = kanban_db.boards_root()
+        roots = [root, boards, root / 'kanban' / kanban_db_sync.LINKS_DIR,
+                 root / 'kanban' / kanban_db_sync.SHADOW_DIR]
+        if boards.is_dir():
+            roots.extend(p for p in boards.iterdir() if p.is_dir())
+        return roots
 
     def panel_files_stamp(self):
         """Moves with every committed write to either file `panel_stamps` reads (stat only, nothing opened)."""
@@ -1055,7 +1086,7 @@ WATCH_REFRESH_S = 20.0   # the watcher re-lists the files it watches (a new boar
 class FileWatch:
     """Kernel notification of writes to a set of files: Linux inotify on their directories, kqueue elsewhere.
     Nothing here polls: `wait` sleeps in select until the kernel reports a write (or `timeout`). `ok` is False
-    where neither exists; the feed then keeps its timed loop."""
+    where neither exists; source freshness then remains unavailable, without a DB polling fallback."""
     _IN = 0x2 | 0x40 | 0x80 | 0x100 | 0x200  # MODIFY | MOVED_FROM | MOVED_TO | CREATE | DELETE
     _Q_OVERFLOW, _IGNORED = 0x4000, 0x8000   # the kernel dropped events | a watch ended (its directory is gone)
 
@@ -1087,16 +1118,39 @@ class FileWatch:
             out += [str(p), f'{p}-wal']
         return list(dict.fromkeys(out))
 
-    def set_paths(self, paths) -> None:
-        """Watch exactly these database files (and their -wal). Idempotent."""
+    def set_paths(self, paths, *, directories=()) -> None:
+        """Watch source files, and entry changes in inventory directories.
+
+        Missing parents are watched through the nearest existing ancestor. The
+        next path component's creation immediately rearms coverage; no 20-second
+        discovery gap is allowed for a newly created profile or source store.
+        """
         files = self._files(paths)
+        self._inventory_dirs = {str(p) for p in directories}
         if self._kq is not None:
             self._wanted = files
             self._arm()
             return
         want: dict[str, set] = {}
+        rearm: dict[str, set] = {}
         for f in files:
-            want.setdefault(os.path.dirname(f), set()).add(os.path.basename(f))
+            parent, name = Path(f).parent, Path(f).name
+            while not parent.is_dir() and parent != parent.parent:
+                name, parent = parent.name, parent.parent
+                rearm.setdefault(str(parent), set()).add(name)
+            want.setdefault(str(parent), set()).add(name)
+        for directory in self._inventory_dirs:
+            parent = Path(directory)
+            if parent.is_dir():
+                want.setdefault(str(parent), set()).add('*')
+            else:
+                name = parent.name
+                parent = parent.parent
+                while not parent.is_dir() and parent != parent.parent:
+                    name, parent = parent.name, parent.parent
+                want.setdefault(str(parent), set()).add(name)
+                rearm.setdefault(str(parent), set()).add(name)
+        self._rearm = rearm
         for d in [d for d in self._dirs if d not in want]:
             wd = self._dirs.pop(d)
             self._names.pop(wd, None)
@@ -1126,7 +1180,15 @@ class FileWatch:
     def _arm(self) -> None:
         import select
         flags = select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME
-        dirs = list(dict.fromkeys(os.path.dirname(f) for f in self._wanted))
+        dirs = list(dict.fromkeys([os.path.dirname(f) for f in self._wanted] +
+                                  list(getattr(self, '_inventory_dirs', ()))))
+        for directory in list(dirs):
+            parent = Path(directory)
+            while not parent.is_dir() and parent != parent.parent:
+                parent = parent.parent
+            if str(parent) not in dirs:
+                dirs.append(str(parent))
+        self._directory_fds = set(dirs)
         for p in [p for p in self._fds if p not in self._wanted and p not in dirs]:
             os.close(self._fds.pop(p))
         for p in self._wanted + dirs:  # a directory reports a file created or removed in it (a new -wal)
@@ -1151,6 +1213,8 @@ class FileWatch:
                 if not events:
                     return False
                 by_fd = {fd: p for p, fd in self._fds.items()}
+                if any(by_fd.get(e.ident) in self._directory_fds for e in events):
+                    self.stale = True
                 gone = [by_fd[e.ident] for e in events if e.ident in by_fd
                         and e.fflags & (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME)]
                 for p in gone:
@@ -1176,7 +1240,14 @@ class FileWatch:
                         self._dirs = {d: w for d, w in self._dirs.items() if w != wd}
                         self.stale = hit = True
                 else:
-                    hit = hit or os.fsdecode(name) in self._names.get(wd, ())
+                    decoded = os.fsdecode(name)
+                    names = self._names.get(wd, ())
+                    entry = mask & (0x40 | 0x80 | 0x100 | 0x200)
+                    inventory = '*' in names and entry
+                    parent = next((d for d, w in self._dirs.items() if w == wd), None)
+                    if inventory or decoded in getattr(self, '_rearm', {}).get(parent, ()):
+                        self.stale = True
+                    hit = hit or decoded in names or bool(inventory)
             if hit:
                 return True  # anything else in those directories (logs, locks) is not ours
 
@@ -1196,21 +1267,34 @@ def _watch(f, watch: FileWatch, paths) -> None:
     """The feed's one watcher thread: a write to a source file makes a pass due on both lanes."""
     try:
         listed = None
-        while not f.stopped.is_set():
-            # The file list is read every WATCH_REFRESH_S (and when a watch ended), never once per write: on a
-            # busy backend writes arrive many times a second.
-            if listed is None or watch.stale or time.monotonic() - listed >= WATCH_REFRESH_S:
+
+        def rearm():
+            readers = f.readers
+            invalidate = getattr(readers, 'invalidate_inventory', None)
+            if callable(invalidate):
+                invalidate()
+            roots = getattr(readers, 'watch_directories', None)
+            if callable(roots):
+                watch.set_paths(paths(), directories=roots())
+            else:
                 watch.set_paths(paths())
+
+        while not f.stopped.is_set():
+            # Periodic maintenance is filesystem-only; it never admits a DB pass.
+            # Inventory events rearm immediately, before waking either producer.
+            if listed is None or watch.stale or time.monotonic() - listed >= WATCH_REFRESH_S:
+                rearm()
                 listed = time.monotonic()
             if watch.wait(max(0.0, listed + WATCH_REFRESH_S - time.monotonic())) and not f.stopped.is_set():
+                if watch.stale:
+                    rearm()
+                    listed = time.monotonic()
                 f._wake.set()
                 f._decide.set()
                 f.stopped.wait(DEBOUNCE_S)  # one wake per burst; what is written meanwhile wakes the next round
     except Exception:
-        log.warning('session-panel feed: file watch failed; back to the timed loop', exc_info=True)
+        log.warning('session-panel feed: file watch failed; source freshness unavailable (no polling)', exc_info=True)
         f._watching = False
-        f._wake.set()
-        f._decide.set()
     finally:
         watch.close()
 
@@ -1244,14 +1328,15 @@ def _run_decisions(f) -> None:
         first = True
         while not f.stopped.is_set():
             started = time.monotonic()
-            if _event_driven(f):
-                # No timer: sleeps until a source file is written (the watcher) or the feed stops.
-                if not first:
-                    f._decide.wait()  # a source file was written, or the idle check found a failed read to retry
-                    f.stopped.wait(max(DEBOUNCE_S, MIN_GAP_S - (time.monotonic() - started)))
-                if f.stopped.is_set():
-                    break
-                f._decide.clear()
+            _event_driven(f)
+            if not first:
+                # Startup, explicit registration and source events only. A
+                # refused watcher must never turn this lane into a poller.
+                f._decide.wait()
+                f.stopped.wait(max(DEBOUNCE_S, MIN_GAP_S - (time.monotonic() - started)))
+            if f.stopped.is_set():
+                break
+            f._decide.clear()
             first = False
             started = time.monotonic()
             try:
@@ -1259,8 +1344,6 @@ def _run_decisions(f) -> None:
             except Exception:
                 log.warning('session-panel decision refresh failed', exc_info=True)
             readers.release()  # no connection outlives one pass
-            if not getattr(f, '_watching', False):
-                f.stopped.wait(_pause(time.monotonic() - started))
     finally:
         readers.release()
 
@@ -1270,25 +1353,23 @@ def _run(f) -> None:
     saved_at = 0.0
     try:
         last = 0.0
-        if _event_driven(f):
-            f._cold.set()  # the first pass is due now: whatever was written before this thread started
-            f._wake.set()
+        _event_driven(f)
+        f._cold.set()  # one startup pass, including when notifications are unavailable
+        f._wake.set()
         while not f.stopped.is_set():
-            if _event_driven(f):
-                # No timer drives a recompute: this sleeps until a source file is written or a read finds no bundle.
-                # With neither, it wakes for the liveness heartbeat only (no database, nothing computed).
-                idle = getattr(f, 'idle_wait', None)
-                if not f._wake.wait(idle() if callable(idle) else getattr(f, 'heartbeat_s', 20.0)):
-                    try:
-                        f.beat()
-                    except Exception:
-                        log.warning('session-panel feed heartbeat failed', exc_info=True)
-                    continue
-                if f.stopped.is_set():
-                    break
-                _settle(f, last)
-                if f.stopped.is_set():
-                    break
+            # A timeout admits memory-only ageing, never database reads.
+            idle = getattr(f, 'idle_wait', None)
+            if not f._wake.wait(idle() if callable(idle) else getattr(f, 'heartbeat_s', 20.0)):
+                try:
+                    f.beat()
+                except Exception:
+                    log.warning('session-panel feed heartbeat failed', exc_info=True)
+                continue
+            if f.stopped.is_set():
+                break
+            _settle(f, last)
+            if f.stopped.is_set():
+                break
             started = last = time.monotonic()
             try:
                 f.tick()
@@ -1301,19 +1382,6 @@ def _run(f) -> None:
                 saved_at = time.monotonic()
                 if save_snapshot(f):
                     saved = state
-            if getattr(f, '_watching', False):
-                continue
-            # Timed fallback (no kernel file notification here, or readers that name no files).
-            # A read that found no bundle for its chat sets `_wake`: the next pass starts at once.
-            wake = getattr(f, '_wake', None)
-            pause = _pause(time.monotonic() - started)
-            if wake is None:
-                f.stopped.wait(pause)
-                continue
-            until = time.monotonic() + pause
-            f.stopped.wait(MIN_PAUSE_S)  # never back to back, even for a queue of cold reads
-            while not f.stopped.is_set() and not wake.is_set() and time.monotonic() < until:
-                wake.wait(min(MIN_PAUSE_S, max(0.0, until - time.monotonic())))  # a stop is seen within MIN_PAUSE_S
     finally:
         # A plugin reload's successor owns the revision space now (and saves it); a plain stop saves the last state.
         if getattr(f, '_successor', None) is None:
