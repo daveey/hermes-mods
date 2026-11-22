@@ -39,6 +39,15 @@ const paint = tree => React.act(async () => root.render(tree))
 const publicCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./hub-model-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
 const privateCases = process.env.HERMES_PANEL_GOLDENS ? JSON.parse(readFileSync(process.env.HERMES_PANEL_GOLDENS, 'utf8')) : {}
 const cases = { ...publicCases, ...privateCases }
+test('named dependency paints human title and a parent-card action', async () => {
+ const model = cases.named_parent.model
+ await paint(m.renderModel(model))
+ const row = document.querySelector('[data-panel-row]')
+ assert.ok(row.textContent.includes('waiting on: Publish the release · 2m'))
+ assert.ok([...row.querySelectorAll('button')].some(b => b.textContent === 'Open parent card'))
+ assert.equal(row.querySelector('[data-row-detail]').textContent, 'waiting on: Publish the release · 2m')
+})
+
 for (const [name, fixture] of Object.entries(cases)) {
  test(`hub model golden: ${name}`, async () => {
   const model = fixture.model || fixture.expected

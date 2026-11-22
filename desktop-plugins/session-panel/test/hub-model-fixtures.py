@@ -14,6 +14,8 @@ cases = {
     'remote_card': f.bundle(f.task(human_request=f.human(), wait={'wait_state': 'human'})),
     'triage': f.bundle(f.task(status='triage', human_request=f.human(), block_kind='needs_input')),
     'blocked_no_request': f.bundle(f.task(block_kind='needs_input')),
+    'named_parent': f.bundle(f.task(status='scheduled', wait={'wait_state': 'waiting', 'waiting_on': 'card t_0123456789abcdef', 'waiting_since': f.NOW - 120}),
+                             gateway='origin', profile='default', cards={'t_0123456789abcdef': {'board': 'default', 'detail': {'source': 'replica', 'owner': 'remote', 'task': {'id': 't_0123456789abcdef', 'title': 'Publish the release'}}}}),
     'external_watch': f.bundle(f.task(status='scheduled', block_kind='needs_input', human_request=None, wait={'wait_state': 'external_running', 'waiting_on': 'external device log'})),
     'stuck': f.bundle(f.observed(f.task(status='running', activity_at=f.NOW - 8000))),
     'subagents': f.bundle(subagents=[f.observed({'id': 'child', 'title': 'Research'}, 'subagent')]),

@@ -168,6 +168,59 @@ def test_generic_wait_drops_urls_and_hashes_and_stays_short():
     assert 'http' not in r['detail'] and '0123abcd' not in r['detail'] and len(r['detail']) < 120
 
 
+@pytest.mark.parametrize('on', [
+    'external local:worker-a1:123456',
+    'external service example-agent.service PID 12345',
+    'external service PID12345',
+    'external card t_0123456789abcdef on worker-a1',
+])
+def test_external_wait_uses_category_not_executor_identifiers(on):
+    r = waiting(on)
+    assert r['detail'] == 'waiting on external work · 2m'
+    assert f'Waiting on: {on}' in r['details']
+
+
+@pytest.mark.parametrize('on, expected', [
+    ('card t_0123456789abcdef on remote', 'waiting on parent card'),
+    ('producer card t_0123456789abcdef (scheduled), then its release', 'waiting on parent card'),
+    ('an agent to release it: authority t_0123456789abcdef is archived', 'waiting on agent work'),
+])
+def test_generic_dependency_identifiers_stay_in_details(on, expected):
+    r = waiting(on)
+    assert r['detail'] == expected + ' · 2m'
+    assert f'Waiting on: {on}' in r['details']
+
+
+@pytest.mark.parametrize('source, owner, gateway', [('live', None, 'hub'), ('replica', 'remote', 'remote')])
+def test_wait_names_hydrated_parent_and_opens_exact_owner(source, owner, gateway):
+    cid = 't_0123456789abcdef'
+    row = task(status='scheduled', wait={'wait_state': 'waiting', 'waiting_on': f'producer card {cid} (scheduled), then its release', 'waiting_since': NOW - 120})
+    b = bundle(row, cards={cid: {'board': 'other', 'detail': {'source': source, 'owner': owner, 'task': {'id': cid, 'title': 'Publish the release'}}}})
+    b.update(gateway='hub', profile='default')
+    r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert r['detail'] == 'waiting on: Publish the release · 2m'
+    action = next(a for a in r['actions'] if a['label'] == 'Open parent card')
+    assert action['target'] == {'id': cid, 'gateway': gateway, 'profile': 'default', 'board': 'other'}
+    assert any(cid in d for d in r['details'])
+    b['cards'][cid]['detail'].update(source='replica', owner=None)
+    r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert not any(a['label'] == 'Open parent card' for a in r['actions'])
+
+
+def test_parent_wait_keeps_identity_in_details_not_status():
+    upstream = {'id': 't_0123456789abcdef', 'status': 'blocked'}
+    r = model.reduce_panel(bundle(task(status='todo', blocked_upstream=upstream)), now=NOW)['sections']['waiting'][0]
+    assert r['detail'] == 'waiting on blocked parent card'
+    assert any(upstream['id'] in d for d in r['details'])
+    upstream['contained'] = {'authority': {'id': 't_release'}}
+    r = model.reduce_panel(bundle(task(status='todo', blocked_upstream=upstream)), now=NOW)['sections']['waiting'][0]
+    assert r['detail'] == 'waiting on contained parent card'
+    assert any('t_release' in d for d in r['details'])
+    r = model.reduce_panel(bundle(task(status='todo', upstream={'id': 't_parent', 'status': 'running'})), now=NOW)['sections']['waiting'][0]
+    assert r['detail'] == 'waiting on parent card'
+    assert 'Parent card: t_parent (running)' in r['details']
+
+
 def test_no_row_ends_with_a_board_status_provenance_tail():
     for status in ('blocked', 'scheduled', 'triage', 'todo', 'ready', 'review'):
         for remote in (False, True):
