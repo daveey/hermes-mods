@@ -380,22 +380,17 @@ def test_fortieth_card_files_and_the_fortyfirst_goes_to_the_digest(env):
     assert sh.cards_created_today(None, NOW) == 40
     out = file(env, defect(symptom="forty-first"))
     assert out["action"] == "deferred" and out["over_cap"] is True and out["retry_at"] == "2026-11-14T00:00:00Z"
-    creates = env.board.creates()
-    assert len(creates) == 2
-    digest = creates[1]
-    assert digest[digest.index("create") + 1] == f"self-heal digest {DAY}: defects over the daily cap"
-    assert digest[digest.index("--idempotency-key") + 1] == f"selfheal-digest:{DAY}"
-    (did,) = [r[0] for r in env.board.rows("idempotency_key = ?", (f"selfheal-digest:{DAY}",))]
-    assert out["digest"] == did
-    ((card, body),) = env.board.comments
+    assert len(env.board.creates()) == 1  # only the fortieth defect
+    assert out["digest"] is None
+    report = json.loads(Path(out["digest_report"]["path"]).read_text())
     fp41 = defect(symptom="forty-first")["fingerprint"]
-    d41 = defect(symptom="forty-first")
-    assert card == did and fp41 in body and "forty-first" in body and d41["session_id"] in body
-    (sched,) = env.board.schedules
-    assert sched[0] == did and "--clock-only" in sched and "SCHEDULED_UNTIL=2026-11-14T00:00:00Z" in " ".join(sched)
+    entry = report["fingerprints"][fp41]
+    assert "forty-first" in entry["occurrence"] and defect(symptom="forty-first")["session_id"] in entry["occurrence"]
+    assert env.board.comments == env.board.schedules == []
     (e,) = events(env.store, "selfheal_over_cap")
-    assert e["fingerprint"] == fp41 and e["count"] == 40 and e["cap"] == 40 and e["digest"] == did
-    assert sh.cards_created_today(None, NOW) == 40  # the digest is not counted
+    assert e["fingerprint"] == fp41 and e["count"] == e["cap"] == 40
+    assert e["digest_report"] == out["digest_report"]
+    assert sh.cards_created_today(None, NOW) == 40
 
 
 def test_digest_is_created_once_per_day_and_reused(env):
@@ -403,41 +398,61 @@ def test_digest_is_created_once_per_day_and_reused(env):
     for i in range(3):
         file(env, defect(symptom=f"over {('alpha', 'bravo', 'charlie')[i]}"), now=NOW + i)
     file(env, defect(symptom="over alpha"), now=NOW + 10)  # same fingerprint again: no second digest comment
-    digests = [a for a in env.board.creates() if f"selfheal-digest:{DAY}" in a]
-    assert len(digests) == 1 and len(env.board.creates()) == 1
-    assert len(env.board.comments) == 3 and len({c for c, _ in env.board.comments}) == 1
+    assert env.board.calls == []  # no create, schedule, comment, or agent launch
+    reports = list((Path(env.store.root) / "selfheal-digests").rglob("*.json"))
+    assert len(reports) == 1
+    report = json.loads(reports[0].read_text())
+    assert report["version"] == 1 and report["utc_day"] == DAY and report["board"] == "default"
+    expected = {defect(symptom=f"over {word}")["fingerprint"] for word in ("alpha", "bravo", "charlie")}
+    assert set(report["fingerprints"]) == expected
+    assert report["unique_count"] == 3
+    assert report["provenance"] == {"count": 40, "cap": 40, "source": "cards_created_today"}
+    assert report["last_updated"] == sh._iso(NOW + 10)
+    markdown = reports[0].with_suffix(".md").read_text()
+    for fp, entry in report["fingerprints"].items():
+        assert fp in markdown and "sort is broken" in entry["occurrence"]
+        assert entry["kind"] == "defect"
     assert len(events(env.store, "selfheal_over_cap")) == 4
 
 
 def test_digest_closed_mid_day_is_replaced_not_reused(env):
+    """Historical closed/open digest cards are inert: do not replace, comment or edit them."""
     fill(env.board, 40)
-    file(env, defect(symptom="over delta"))
-    (did,) = [r[0] for r in env.board.rows("idempotency_key = ?", (f"selfheal-digest:{DAY}",))]
-    con = sqlite3.connect(env.board.db)
-    with con:
-        con.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (did,))
-    con.close()
-    out = file(env, defect(symptom="over echo"))
-    assert out["digest"] != did and env.board.comments[-1][0] == out["digest"]
-    assert env.board.rows("idempotency_key = ?", (f"selfheal-digest:{DAY}:2",))
-    (Path(env.store.root) / sh.DIGEST_STATE).unlink()  # state lost: the closed key is skipped, the open :2 reused
-    out3 = file(env, defect(symptom="over foxtrot"))
-    assert out3["digest"] == out["digest"]
+    env.board.add("t_history", key=f"selfheal-digest:{DAY}", status="done")
+    env.board.add("t_history2", key=f"selfheal-digest:{DAY}:2", status="scheduled")
+    memo = Path(env.store.root) / sh.DIGEST_STATE
+    memo.parent.mkdir(parents=True, exist_ok=True)
+    memo.write_text(json.dumps({"day": DAY, "boards": {"default": {"card": "t_history2", "fps": []}}}))
+    original = memo.read_bytes()
+    out = file(env, defect(symptom="over delta"))
+    out2 = file(env, defect(symptom="over echo"))
+    assert out["digest_report"]["path"] == out2["digest_report"]["path"]
+    assert out2["digest_report"]["count"] == 2
+    assert memo.read_bytes() == original and env.board.calls == []
+    assert len(env.board.rows("idempotency_key LIKE 'selfheal-digest:%'")) == 2
 
 
 def test_digest_reused_when_its_state_file_is_lost(env):
-    """The idempotency key holds the one-per-day promise even if <coach>/selfheal-digest.json is gone."""
+    """Report is canonical across process restarts and loss of the obsolete card memo."""
     fill(env.board, 40)
-    file(env, defect(symptom="over delta"))
+    d = defect(symptom="over delta")
+    first = file(env, d)
+    (Path(env.store.root) / sh.DIGEST_STATE).write_text("obsolete")
     (Path(env.store.root) / sh.DIGEST_STATE).unlink()
-    file(env, defect(symptom="over echo"))
-    assert len(env.board.rows("idempotency_key = ?", (f"selfheal-digest:{DAY}",))) == 1
+    restarted = load("coach_digest_restart_test", ROOT / "self_heal.py")
+    second = restarted._over_cap(d, d["fingerprint"], None, env.store, env.board, NOW + 1, {})
+    assert second["digest_report"]["path"] == first["digest_report"]["path"]
+    assert second["digest_report"]["count"] == 1 and env.board.calls == []
+    third = file(env, defect(symptom="over echo"))
+    assert third["digest_report"]["count"] == 2
 
 
 def test_day_rollover_files_the_capped_defect_and_opens_a_new_digest(env):
     fill(env.board, 40)
     d = defect(symptom="waits for tomorrow")
-    assert file(env, d)["action"] == "deferred"
+    first = file(env, d)
+    assert first["action"] == "deferred"
+    first_bytes = Path(first["digest_report"]["path"]).read_bytes()
     nxt = MIDNIGHT + 300
     out = file(env, {**d, "at": nxt - 60}, now=nxt)
     assert out["action"] == "filed"
@@ -447,7 +462,122 @@ def test_day_rollover_files_the_capped_defect_and_opens_a_new_digest(env):
         env.board.add(tid, key=f"selfheal:{tid}", created_at=nxt)
     out = file(env, defect(symptom="next day over", at=nxt - 60), now=nxt + 1)
     assert out["action"] == "deferred"
-    assert env.board.rows("idempotency_key = ?", ("selfheal-digest:2026-11-14",))
+    assert out["digest_report"]["path"] != first["digest_report"]["path"]
+    assert json.loads(Path(out["digest_report"]["path"]).read_text())["utc_day"] == "2026-11-14"
+    assert Path(first["digest_report"]["path"]).read_bytes() == first_bytes
+    assert len(env.board.creates()) == 1
+
+
+def test_backlog_reader_exposes_durable_digest_without_board_writes(env):
+    fill(env.board, 40)
+    first = file(env, defect())
+    report = sh.backlog_report(env.store, NOW, filed_today=40, cap=40)
+    assert report["digest_report"] == first["digest_report"]
+    assert first["digest_report"]["markdown"] in report["body"]
+    assert "Unique over-cap fingerprints: 1" in report["body"]
+    assert env.board.calls == []
+
+
+@pytest.mark.parametrize("damage", ["json", "markdown", "missing_json"])
+def test_backlog_reader_exposes_report_damage_without_claiming_durability(env, damage):
+    fill(env.board, 40)
+    first = file(env, defect())
+    path = Path(first["digest_report"]["path"])
+    if damage == "missing_json":
+        path.unlink()
+    else:
+        (path if damage == "json" else path.with_suffix(".md")).write_text("damaged")
+    report = sh.backlog_report(env.store, NOW, filed_today=40, cap=40)
+    assert report["digest_report"] is None
+    assert "digest report unavailable" in report["digest_error"]
+    assert report["digest_error"] in report["body"]
+    assert env.board.calls == []
+
+
+@pytest.mark.parametrize("ranked", [False, True])
+@pytest.mark.parametrize("failure", ["json", "markdown", "read"])
+def test_digest_io_failure_keeps_pending_and_reports_no_durability(env, monkeypatch, ranked, failure):
+    fill(env.board, 40)
+    original = sh._write_digest_file
+    path = sh._digest_path(env.store, None, NOW)
+    if failure == "read":
+        path.parent.mkdir(parents=True)
+        path.write_text("invalid JSON")
+    else:
+        def fail(path, text):
+            if path.suffix == (".json" if failure == "json" else ".md"):
+                raise OSError("fixture disk failure")
+            original(path, text)
+        monkeypatch.setattr(sh, "_write_digest_file", fail)
+    d = defect()
+    out = sh._over_cap(d, d["fingerprint"], None, env.store, env.board, NOW, {"backlog_ranked": ranked})
+    assert out["over_cap"] and out["digest_report"] is None and out["digest"] is None
+    assert "digest report unavailable" in out["error"]
+    assert events(env.store, "selfheal_over_cap")[-1]["error"] == out["error"]
+    with sqlite3.connect(Path(env.store.root) / "selfheal_pending.sqlite") as db:
+        rows = db.execute("SELECT fp, retry FROM pending").fetchall()
+    assert len(rows) == 1 and rows[0][0] == d["fingerprint"] and rows[0][1] >= NOW
+    assert env.board.calls == [] and sh.cards_created_today(None, NOW) == 40
+    # Remove the failure, then retry: retained JSON survives a failed Markdown write.
+    monkeypatch.setattr(sh, "_write_digest_file", original)
+    if failure == "read":
+        assert path.read_text() == "invalid JSON"
+        return
+    retry = sh._over_cap(d, d["fingerprint"], None, env.store, env.board, NOW+1, {"backlog_ranked": ranked})
+    assert retry["digest_report"]["count"] == 1 and "error" not in retry
+
+
+def test_digest_reports_are_board_isolated_with_safe_collision_free_names(env):
+    fill(env.board, 40)
+    default = file(env, defect(symptom="default board"))
+    other = Board(env.root / "kanban" / "boards" / "elsewhere" / "kanban.db", NOW)
+    fill(other, 40)
+    d = defect(symptom="other board", board="elsewhere")
+    result = sh._over_cap(d, d["fingerprint"], "elsewhere", env.store, other, NOW, {})
+    paths = [Path(r["digest_report"]["path"]) for r in (default, result)]
+    assert paths[0] != paths[1]
+    assert [json.loads(p.read_text())["board"] for p in paths] == ["default", "elsewhere"]
+    assert all(json.loads(p.read_text())["unique_count"] == 1 for p in paths)
+    unsafe = sh._digest_path(env.store, "../../a/b", NOW)
+    collision = sh._digest_path(env.store, ".._.._a_b", NOW)
+    assert unsafe != collision and unsafe.is_relative_to(Path(env.store.root) / "selfheal-digests")
+    assert env.board.calls == other.calls == []
+
+
+def test_digest_concurrent_merges_retain_all_unique_fingerprints(env):
+    from concurrent.futures import ThreadPoolExecutor
+    ds = [defect(symptom=f"concurrent {word}") for word in ("alpha", "bravo", "charlie", "delta")]
+    def record(d):
+        return sh._record_digest(env.store, None, NOW, 40, 40, d, d["fingerprint"], "defect")
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(record, ds))
+    path = Path(results[0]["path"])
+    report = json.loads(path.read_text())
+    assert set(report["fingerprints"]) == {d["fingerprint"] for d in ds}
+    assert report["unique_count"] == 4
+    assert path.with_suffix(".md").read_text() == sh._digest_markdown(report)
+    assert list(path.parent.glob(".digest-*")) == []
+
+
+def test_atomic_report_replace_failure_preserves_previous_json_and_pending(env, monkeypatch):
+    fill(env.board, 40)
+    first = file(env, defect(symptom="before disk failure"))
+    path = Path(first["digest_report"]["path"])
+    before = path.read_bytes(), path.with_suffix(".md").read_bytes()
+    replace = sh.os.replace
+    def fail(src, dst):
+        if Path(dst) == path:
+            raise OSError("fixture replace failure")
+        return replace(src, dst)
+    monkeypatch.setattr(sh.os, "replace", fail)
+    d = defect(symptom="after disk failure")
+    result = file(env, d)
+    assert result["digest_report"] is None and "replace failure" in result["error"]
+    assert (path.read_bytes(), path.with_suffix(".md").read_bytes()) == before
+    with sqlite3.connect(Path(env.store.root) / "selfheal_pending.sqlite") as db:
+        assert {fp for fp, in db.execute("SELECT fp FROM pending")} == {
+            defect(symptom="before disk failure")["fingerprint"], d["fingerprint"]}
+    assert env.board.calls == [] and list(path.parent.glob(".digest-*")) == []
 
 
 def test_dedupe_still_applies_over_the_cap(env):
@@ -497,15 +627,15 @@ def test_receipt_verifier_obeys_daily_card_cap(env, monkeypatch, count):
     assert not [row for row in env.board.rows() if row[1].startswith(sh.VERIFY_TITLE)]
     (cap,) = events(env.store, "selfheal_over_cap")
     assert (cap["kind"], cap["fingerprint"], cap["count"], cap["cap"]) == ("receipt", fp, count, 40)
-    (digest,) = env.board.creates()
-    assert f"selfheal-digest:{DAY}" in digest
-    assert len(env.board.comments) == 1
-    assert "not filed (receipt)" in env.board.comments[0][1]
+    assert env.board.calls == []
+    report = json.loads(Path(cap["digest_report"]["path"]).read_text())
+    assert report["fingerprints"][fp]["kind"] == "receipt"
     assert sh.cards_created_today(None, NOW) == count
 
     # Still capped: no verifier and no duplicate digest/comment across retries.
     assert sh._recover_completion_receipt(fp, env.store, env.board, NOW + 60) is None
-    assert len(env.board.creates()) == len(env.board.comments) == 1
+    assert env.board.calls == []
+    assert json.loads(Path(cap["digest_report"]["path"]).read_text())["unique_count"] == 1
     # Tomorrow's real count releases the same approved lane, without a receipt inferred from the cap.
     env.board.now = MIDNIGHT + 60
     verifier = sh._recover_completion_receipt(fp, env.store, env.board, MIDNIGHT + 60)
@@ -541,13 +671,12 @@ def test_undeployed_card_obeys_daily_cap(env, count):
         assert out["not_deployed"] is True
         assert env.board.rows("idempotency_key = ?", (key,)) == []
         assert lane.get(fp) == before  # no poisoned dedup state: next occurrence may retry
-        (digest,) = env.board.creates()
-        assert digest[digest.index("--idempotency-key") + 1] == f"selfheal-digest:{DAY}"
-        ((card, body),) = env.board.comments
-        assert card == out["digest"] and fp in body and "not filed (undeployed)" in body
+        assert env.board.calls == [] and out["digest"] is None
+        report = json.loads(Path(out["digest_report"]["path"]).read_text())
+        assert report["fingerprints"][fp]["kind"] == "undeployed"
         (event,) = events(env.store, "selfheal_over_cap")
         assert event["kind"] == "undeployed" and event["count"] == event["cap"] == 40
-        assert event["digest"] == card
+        assert event["digest_report"] == out["digest_report"]
         assert sh.cards_created_today(None, NOW) == 40
 
 

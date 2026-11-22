@@ -2011,12 +2011,11 @@ FIX_TITLE = "self-heal fix:"
 # Off switch: `one_card_per_defect: false` in selfheal-config.json or COACH_SELFHEAL_ONE_CARD=0.
 DEFECT_BUDGET = FIX_BUDGET  # the one card does the fix's work; triage and verify ride inside it
 DAILY_CARD_CAP = 40  # self-heal-created cards per board per UTC day (cfg daily_card_cap, env COACH_SELFHEAL_DAILY_CAP)
-DIGEST_KEY = "selfheal-digest:"  # + YYYY-MM-DD: the day's over-cap digest card; never counted against the cap
+DIGEST_KEY = "selfheal-digest:"  # historical card keys: still excluded from cap/owner reads, never produced
 BACKLOG_KEY = "selfheal-backlog:"
 BACKLOG_REPORT_STATE = "selfheal-backlog-report.json"
-DIGEST_BUDGET = 2
 DIGEST_RUNTIME = 1800
-DIGEST_STATE = "selfheal-digest.json"  # <coach>/: {day, boards: {board: {card, fps}}}: one comment per fp per day
+DIGEST_STATE = "selfheal-digest.json"  # obsolete historical card memo; never read or changed by report production
 DEDUP_COMMENT_S = 3600  # a repeat occurrence on an open owner comments again after this long (or from a new session)
 FP_LINE = "fingerprint: {fp}"  # every self-heal card body carries this line: the dedupe's body match
 SNOOZE_DAYS = 14
@@ -3895,7 +3894,25 @@ def backlog_report(store, now: float, board: str = "default", *, filed_today=Non
                      f"{' [URGENT]' if item['urgent'] else ''}: {symptom}")
     if not top:
         lines.append("No pending fingerprints.")
-    return {"board": board, "counts": counts, "top": top, "body": "\n".join(lines)}
+    digest, digest_error = None, None
+    digest_path = _digest_path(store, board, now)
+    if digest_path.exists() or digest_path.with_suffix(".md").exists():
+        try:
+            import fcntl
+            with digest_path.with_suffix(".lock").open("r") as lock:
+                fcntl.flock(lock, fcntl.LOCK_SH)
+                data = _read_digest(digest_path, board, _utc_day(now))
+                if digest_path.with_suffix(".md").read_text() != _digest_markdown(data):
+                    raise OSError("digest Markdown is not the current JSON view")
+                digest = {"path": str(digest_path), "markdown": str(digest_path.with_suffix(".md")),
+                          "count": data["unique_count"]}
+            lines.append(f"Unique over-cap fingerprints: {digest['count']}; digest: {digest['markdown']} "
+                         f"(JSON: {digest['path']}).")
+        except Exception as exc:  # health: allow BLE001 -- read-only report must expose digest failure, not an empty count
+            digest_error = f"digest report unavailable: {type(exc).__name__}: {str(exc)[:300]}"
+            lines.append(digest_error)
+    return {"board": board, "counts": counts, "top": top, "body": "\n".join(lines),
+            "digest_report": digest, **({"digest_error": digest_error} if digest_error else {})}
 
 
 def refresh_backlog_report(store, now: float, board: str = "default", runner=None) -> dict:
@@ -6191,28 +6208,6 @@ def _save_json_state(store, name: str, state: dict) -> None:
     os.replace(tmp, path)
 
 
-def _digest_state(store) -> dict:
-    return _json_state(store, DIGEST_STATE)
-
-
-def _save_digest_state(store, state: dict) -> None:
-    _save_json_state(store, DIGEST_STATE, state)
-
-
-def digest_brief(day: str, cap: int, wake: str) -> str:
-    return f"""Self-heal daily digest for {day} (UTC). The self-heal lane reached its daily card cap ({cap} cards created
-by self-heal on this board today) and filed no card for each defect commented below. Each one stays queued and
-refiles on its own after 00:00Z (the open-owner dedupe and the next day's cap still apply), so nothing here needs a
-fix from you. Post nothing to the Inbox. Budget for this card <= ${DIGEST_BUDGET}.
-
-When this card runs:
-1. Before {wake}: `kanban_schedule` it with reason `SCHEDULED_UNTIL={wake}`, `clock_only=true` and
-   awaiting={{kind:'clock', why:'the {day} self-heal cap window closes at {wake}'}}, then stop.
-2. After that: count the comments and complete with the summary
-   "<n> self-heal defects over the cap on {day}: <fingerprints>". Do not file or fix anything from this card.
-"""
-
-
 def _card_ended(board: Optional[str], tid: str) -> bool:
     """True when ``tid`` is done/archived on the board's DB; unknown (no DB, unreadable, absent) is False."""
     try:
@@ -6229,77 +6224,87 @@ def _card_ended(board: Optional[str], tid: str) -> bool:
     return bool(row) and row[0] in ("done", "archived")
 
 
-def _digest_fingerprints(board: Optional[str], card: str) -> list:
-    """Recover the comment memo from the board after local digest state was lost."""
-    path = board_db_path(board)
-    if path is None or not path.exists():
-        return []
-    con = _ro_state(path)
+def _digest_path(store, board: Optional[str], now: float) -> Path:
+    # Hash the entire board, not a lossy slug: traversal and slug collisions are impossible.
+    name = hashlib.sha256((board or "default").encode()).hexdigest()
+    return Path(store.root) / "selfheal-digests" / name / (_utc_day(now) + ".json")
+
+
+def _read_digest(path: Path, board: str, day: str) -> dict:
     try:
-        if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_comments'").fetchone():
-            return []  # old boards and minimal fixtures have no comments table
-        rows = con.execute("SELECT body FROM task_comments WHERE task_id = ?", (card,)).fetchall()
-    finally:
-        con.close()
-    pattern = re.compile(r"(?m)^- fingerprint: ([a-z0-9_-]+)(?: ·|$)")
-    return sorted({fp for (body,) in rows for fp in pattern.findall(body or "")})
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        if path.with_suffix(".md").exists():
+            raise OSError("digest JSON missing while Markdown exists")
+        return {"version": 1, "utc_day": day, "board": board, "fingerprints": {}}
+    if (not isinstance(data, dict) or data.get("version") != 1 or data.get("utc_day") != day
+            or data.get("board") != board or not isinstance(data.get("fingerprints"), dict)
+            or data.get("unique_count") != len(data["fingerprints"])
+            or any(not isinstance(v, dict) or not isinstance(v.get("occurrence"), str)
+                   for v in data["fingerprints"].values())):
+        raise ValueError("invalid self-heal digest report")
+    return data
 
 
-def _get_digest(store, board: Optional[str], now: float, cap: int, runner) -> tuple:
-    """The day's digest card, created once per UTC day and board (idempotency key `selfheal-digest:<day>`), parked
-    until the next midnight. One closed by hand mid-day is replaced by `selfheal-digest:<day>:<n>` (the key alone
-    would hand the closed card back). -> (card id | None, error | None)."""
-    day = _utc_day(now)
-    state = _digest_state(store)
-    slot = ((state.get("boards") or {}) if state.get("day") == day else {}).get(board or "default") or {}
-    gen = int(slot.get("gen") or 1)
-    if slot.get("card"):
-        if not _card_ended(board, slot["card"]):
-            return slot["card"], None
-        gen += 1
-    wake = _next_utc_midnight(now)
-    tid, out, err, rc, args = None, "", "", 1, {}
-    for _ in range(3):  # a key that hands back a closed card (state file lost) moves to the next generation
-        key = f"{DIGEST_KEY}{day}" + (f":{gen}" if gen > 1 else "")
-        args = {"title": f"self-heal digest {day}: defects over the daily cap", "body": digest_brief(day, cap, wake),
-                "idempotency_key": key, "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
-                "max_runtime": DIGEST_RUNTIME, "skills": [], "board": board, "assignee": "default",
-                "created_by": CREATED_BY, "requires": [], "home_pin": False, "runs_on": []}  # portable: reads nothing
+def _digest_markdown(data: dict) -> str:
+    lines = [f"# Self-heal digest — {data['board']} — {data['utc_day']} (UTC)",
+             f"Updated {data['last_updated']}. Unique fingerprints: {data['unique_count']}.",
+             f"Daily count/cap: {data['provenance']['count']}/{data['provenance']['cap']} "
+             "(cards_created_today). Report only; pending defects retry under the normal cap and budget."]
+    for fp, entry in sorted(data["fingerprints"].items()):
+        lines.extend(["", f"## {fp} ({entry['kind']})", entry["occurrence"]])
+    return "\n".join(lines) + "\n"
+
+
+def _write_digest_file(path: Path, text: str) -> None:
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=".digest-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            rc, out, err = _run_card(args, runner)
-        except Exception as exc:  # health: allow BLE001 -- reported; the defect stays queued either way
-            rc, out, err = 1, "", f"{type(exc).__name__}: {exc}"
-        tid = _task_id(out) if rc == 0 else None
-        if not tid or not _card_ended(board, tid):
-            break
-        gen, tid = gen + 1, None
-    if not tid:
-        return None, (err or out).strip()[-300:] or f"kanban create exited {rc} with no open digest card"
-    try:  # not dispatchable until the day is over; its brief re-parks it if a worker claims it first
-        src, sout, serr = _run(_kanban_board_argv(board) + ["schedule", tid, f"SCHEDULED_UNTIL={wake} self-heal digest "
-                                                    f"collects over-cap defects until the UTC day ends",
-                                                    "--clock-only"], runner)
-        if src:
-            store.log({"event": "selfheal_digest_schedule_error", "card": tid, "rc": src,
-                       "error": (serr or sout).strip()[-200:]})
-    except Exception as exc:  # health: allow BLE001 -- the brief parks it itself
-        store.log({"event": "selfheal_digest_schedule_error", "card": tid, "error": str(exc)[:200]})
-    boards = dict(state.get("boards") or {}) if state.get("day") == day else {}
-    try:
-        fps = _digest_fingerprints(board, tid)
-    except Exception as exc:  # health: allow BLE001 -- retain the cap, retry comment recovery next pass
-        return None, f"digest comments unreadable: {str(exc)[:200]}"
-    boards[board or "default"] = {"card": tid, "fps": fps, "gen": gen}
-    _save_digest_state(store, {"day": day, "boards": boards})
-    store.log({"event": "selfheal_digest_filed", "card": tid, "utc_day": day, "board": board,
-               "key": args["idempotency_key"]})
-    return tid, None
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _record_digest(store, board: Optional[str], now: float, cap: int, count: int,
+                   d: dict, fp: str, kind: str) -> dict:
+    """Locked read/merge/atomic-file publication. JSON is authoritative; MD is a derived view.
+
+    A partial pair publication is an error, never a durability receipt. The JSON union
+    remains available for retry after an MD failure. Historical card memos are untouched.
+    """
+    import fcntl
+    path = _digest_path(store, board, now)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = _read_digest(path, board or "default", _utc_day(now))
+        data["fingerprints"].setdefault(fp, {"kind": kind, "occurrence": _occurrence_text(d, now),
+                                           "count": count, "cap": cap, "recorded_at": _iso(now)})
+        data.update(unique_count=len(data["fingerprints"]), last_updated=_iso(now),
+                    provenance={"count": count, "cap": cap, "source": "cards_created_today"})
+        _write_digest_file(path, json.dumps(data, indent=2) + "\n")
+        _write_digest_file(path.with_suffix(".md"), _digest_markdown(data))
+        # Read the actual published files before returning a durability receipt.
+        actual = _read_digest(path, board or "default", _utc_day(now))
+        if actual != data or path.with_suffix(".md").read_text() != _digest_markdown(actual):
+            raise OSError("self-heal digest publication readback mismatch")
+    return {"path": str(path), "markdown": str(path.with_suffix(".md")), "count": data["unique_count"]}
 
 
 def _over_cap(d: dict, fp: str, board: Optional[str], store, runner, now: float, cfg: Optional[dict],
               kind: str = "defect") -> Optional[dict]:
     """Daily card cap: at or over `daily_card_cap` self-heal cards created on ``board`` today, no new card. The
-    defect goes to the day's digest card as one comment (once per fingerprint per day) and logs `selfheal_over_cap`.
+    defect goes to the day's durable JSON/Markdown report (once per fingerprint per day) and logs `selfheal_over_cap`.
     kind "defect" queues it in selfheal_pending until the next 00:00Z (-> deferred); other kinds (backport, undeployed)
     return skip, and their next occurrence retries. -> None under the cap."""
     cap = daily_card_cap(cfg)
@@ -6311,35 +6316,24 @@ def _over_cap(d: dict, fp: str, board: Optional[str], store, runner, now: float,
         return {"action": "error", "why": why}
     if n < cap:
         return None
+    why = f"daily card cap: {n} self-heal cards today >= {cap}"
+    # Preserve retry custody before any report read/write can fail.
     if kind == "defect" and (cfg or lane_config()).get("backlog_ranked", False):
-        return _backlog_queue(d, store, now, why=f"daily card cap: {n} >= {cap}", over_cap=True)
-    card, error = _get_digest(store, board, now, cap, runner)
-    commented = False
-    if card:
-        state = _digest_state(store)
-        slot = state.setdefault("boards", {}).setdefault(board or "default", {"card": card, "fps": []})
-        if fp in (slot.get("fps") or []):
-            commented = None  # already on today's digest
-        else:
-            body = f"Over the daily cap ({n} >= {cap}), not filed ({kind}):\n{_occurrence_text(d, now)}"
-            try:
-                rc, out, err = _run(_kanban_board_argv(board) + ["comment", card, body], runner)
-            except Exception as exc:  # health: allow BLE001 -- logged below
-                rc, out, err = 1, "", str(exc)
-            commented = rc == 0
-            if commented:
-                slot["fps"] = (slot.get("fps") or []) + [fp]
-                _save_digest_state(store, state)
-            else:
-                error = (err or out).strip()[-200:] or "comment failed"
+        result = _backlog_queue(d, store, now, why=why, over_cap=True)
+    elif kind == "defect":
+        result = _defer_investigation(d, {"action": "deferred", "retry_at": _next_utc_midnight(now),
+                                        "why": why, "over_cap": True, "stop_pass": False}, store)
+    else:
+        result = {"action": "skip", "why": why, "over_cap": True}
+    report, error = None, None
+    try:
+        report = _record_digest(store, board, now, cap, n, d, fp, kind)
+    except Exception as exc:  # health: allow BLE001 -- report failure is visible; retry custody is already durable
+        error = f"digest report unavailable: {type(exc).__name__}: {str(exc)[:300]}"
+    receipt = {"digest": None, "digest_report": report, **({"error": error} if error else {})}
     store.log({"event": "selfheal_over_cap", "fingerprint": fp, "kind": kind, "board": board, "count": n, "cap": cap,
-               "digest": card, "commented": commented, "session_id": d.get("session_id"),
-               "symptom": str(d.get("symptom") or "")[:200], **({"error": error} if error else {})})
-    why = f"daily card cap: {n} self-heal cards today >= {cap}; on digest {card or '(not filed)'}"
-    if kind != "defect":
-        return {"action": "skip", "why": why, "over_cap": True, "digest": card}
-    return _defer_investigation(d, {"action": "deferred", "retry_at": _next_utc_midnight(now), "why": why,
-                                    "over_cap": True, "digest": card, "stop_pass": False}, store)
+               **receipt, "session_id": d.get("session_id"), "symptom": str(d.get("symptom") or "")[:200]})
+    return {**result, **receipt}
 
 
 def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: Optional[float] = None,
