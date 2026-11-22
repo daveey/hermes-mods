@@ -53,7 +53,10 @@ class Observations:
         fresh = self._fresh_values()
         # Refresh is due only at expiry (fresh set shrinks), so nothing is ever
         # fresh-and-due; the stream wakes when an entry expires.
-        return self.revision, tuple(sorted(fresh)), ()
+        # One transition at cooldown expiry wakes a quiet stream even when all
+        # cached observations expired earlier. No periodic timer/network loop.
+        retry_ready = bool(self.backoff_until and self.clock() >= self.backoff_until)
+        return self.revision, tuple(sorted(fresh)), retry_ready
 
     def reader(self, contexts):
         with self.lock:
@@ -89,7 +92,7 @@ class Observations:
     def _run(self):
         while True:
             with self.lock:
-                if not self.pending:
+                if not self.pending or self.clock() < self.backoff_until:
                     self.thread = None
                     return
                 job, self.pending = self.pending, {}
