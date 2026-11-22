@@ -1,6 +1,7 @@
 """The producer side of the click path: cold reads wake it, it publishes what a reader waits for first, it does not
 re-read unchanged decision inputs, and it is started by the backend's import of the plugin API, not by a request."""
 import importlib.util
+import os
 import sys
 import threading
 import time
@@ -353,7 +354,26 @@ def test_idle_means_idle_and_a_write_is_pushed_within_a_second(tmp_path, monkeyp
         assert len(ticks) == 1 and len(decisions) == 1, 'one pass each at start'
         time.sleep(0.3)
         base = (len(ticks), len(decisions), r.batches, len(r.decisions))
-        time.sleep(2.5)  # well past the old 1 s tick
+        # Opt-in long proof uses the same real kernel watcher and producer loops.
+        # Readers remain a controlled fixture; this is not deployed-core proof.
+        idle_seconds = float(os.environ.get('SESSION_PANEL_IDLE_PROOF_SECONDS', '2.5'))
+        def switches(thread):
+            status = Path(f'/proc/self/task/{thread.native_id}/status')
+            if not status.exists():
+                return None
+            return sum(int(line.split(':', 1)[1]) for line in status.read_text().splitlines()
+                       if line.startswith(('voluntary_ctxt_switches:', 'nonvoluntary_ctxt_switches:')))
+        before_switches = [switches(t) for t in threads]
+        started_idle = time.monotonic()
+        print(f'idle proof start={started_idle} tids={[t.native_id for t in threads]}', flush=True)
+        time.sleep(idle_seconds)  # well past the old 1 s tick
+        elapsed_idle = time.monotonic() - started_idle
+        for thread, before in zip(threads, before_switches):
+            after = switches(thread)
+            if before is not None and after is not None:
+                rate = (after - before) / elapsed_idle
+                print(f'idle proof tid={thread.native_id} seconds={elapsed_idle:.3f} cs_per_s={rate:.3f}', flush=True)
+                assert rate < 500
         assert (len(ticks), len(decisions), r.batches, len(r.decisions)) == base, 'no write: no pass, no read'
         # A write: the changed chat's model is pushed inside a second.
         r.files += 1
