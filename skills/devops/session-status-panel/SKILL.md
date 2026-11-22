@@ -93,6 +93,11 @@ Before the Node command, provision dependencies exactly as `.github/workflows/de
 
 For a private historical golden, retain raw input, observation time, source revision and expected output in private task attachments. Pin `now` and source clocks to the recorded snapshot; distinguish historical replay from current production. Never publish personal/employer/network details or normalize source identifiers/timestamps just to make a replay pass. Include local, remote, triage, C/A ordering, stale human block kind, retired requests, canonical header and consent boundaries. Inspect every resulting assertion and test exit code; missing dependencies or a timeout are not behavioral proof.
 
+## Latency and producer contention
+
+- Prefer one short-lived read-only connection per source DB per producer pass, with set-based reads for all relevant sessions/cards; fetch results and close before Python processing. Do not introduce persistent reader connections as a latency optimization. Cache board projections until their source changes and make producer wakeups change-driven.
+- Measure the authenticated Desktop listener separately from the always-on proxy. Retain process birth identity, summed per-thread context-switch deltas and process CPU alongside route latency. A warm hub-local `/changes` response below 500 ms does not prove installed Desktop click-to-render, cold hydration or restart recovery. Preserve raw samples and label those acceptance gaps explicitly.
+
 ## Live proof
 
 1. Read deployed hermes-mods SHA on the target Mac after normal sync; verify the change is in its ancestry. Read the live plugin version and exact painted connection/profile/session as well: checkout HEAD alone does not prove a backend imported new routes.
