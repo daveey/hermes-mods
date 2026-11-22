@@ -70,7 +70,10 @@ _LOADER.__dict__.setdefault('generation', 0)
 def _feed_stamp() -> tuple:
     try:
         st = os.stat(_FEED_PATH)
-        return (st.st_ino, st.st_mtime_ns, st.st_size)
+        lane = _FEED_PATH.with_name('board_lane.py')
+        extra = lane.stat() if lane.exists() else None
+        return (st.st_ino, st.st_mtime_ns, st.st_size,
+                (extra.st_ino, extra.st_mtime_ns, extra.st_size) if extra else None)
     except OSError:
         return ()
 
@@ -97,7 +100,8 @@ def _load_feed():
             if old is not None:
                 return old
             raise
-        digest = hashlib.sha256(source).hexdigest()
+        lane = _FEED_PATH.with_name('board_lane.py')
+        digest = hashlib.sha256(source + (lane.read_bytes() if lane.exists() else b'')).hexdigest()
         if old is not None and getattr(old, 'SOURCE_SHA', None) == digest:
             old.SOURCE_STAMP = stamp  # touched or rewritten with the same bytes: nothing to load
             return old
@@ -390,6 +394,23 @@ class CoreReaders:
                 c.execute('PRAGMA query_only=ON')
                 c.row_factory = sqlite3.Row
                 c.execute('BEGIN')
+                tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                # This canonical parent-evidence table is not in core's task
+                # revision trigger set. Capture it in the SAME transaction and
+                # invalidate children even when no hydrated parent row exists.
+                remote = {r[0]: tuple(r[1:]) for r in c.execute(
+                    'SELECT parent_id,status,refreshed_at FROM kanban_sync_remote_parents')} if 'kanban_sync_remote_parents' in tables else {}
+                old_remote = old[2] if old and len(old) > 2 else {}
+                remote_ids = {pid for pid in set(remote) | set(old_remote) if remote.get(pid) != old_remote.get(pid)}
+                if remote_ids:
+                    affected = set(remote_ids)
+                    ordered_parents = sorted(remote_ids)
+                    for at in range(0, len(ordered_parents), 400):
+                        part = ordered_parents[at:at + 400]
+                        marks = ','.join('?' for _ in part)
+                        affected.update(r[0] for r in c.execute(
+                            f'SELECT child_id FROM task_links WHERE parent_id IN ({marks})', part))
+                    out.sources.setdefault((key, paths.get(key, path.stem)), set()).update(affected)
                 ids, next_cursor = changes.changed_since(c, old[1] if old else None)
                 if ids is changes.FULL:
                     out.full = True
@@ -399,7 +420,6 @@ class CoreReaders:
                     # old membership is represented by the held bundle's refs.
                     # Chunk for SQLite parameter limits, not a truncated event page.
                     ordered = sorted(ids)
-                    tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                     for at in range(0, len(ordered), 400):
                         part = ordered[at:at + 400]
                         marks = ','.join('?' for _ in part)
@@ -419,7 +439,7 @@ class CoreReaders:
                 c.rollback()
             # Do not swallow a concurrent write by adopting an after-read stamp.
             # Retaining the before-read stamp guarantees another pass sees it.
-            fresh[key] = (stamp, next_cursor)
+            fresh[key] = (stamp, next_cursor, remote)
         return out, fresh
 
     def changed_cards(self, cursor):
@@ -740,16 +760,21 @@ class CoreReaders:
         """
         api = self._user_step_api()
         deferred = set()
+        timings = []
         for session in sessions:
             # One chat's unavailable source must not fail every other chat's pass (this phase runs
             # before all hydration). The feed retries what is returned here; it is never certified.
+            began = time.monotonic()
             try:
                 left = api.panel_reconcile(self.state_db().parent, session, self.lineage(session))
             except Exception as exc:
                 left = [f'{type(exc).__name__}: {exc}']
+            timings.append({'session': session, 'reconcile_s': round(time.monotonic() - began, 4),
+                            'deferred': bool(left)})
             if left:
                 deferred.add(session)
                 log.debug('session-panel source reconciliation deferred: %s: %s', session, left)
+        self.reconcile_timings = timings
         return deferred
 
     def reconcile_user_steps(self, session, lineage):
@@ -1053,7 +1078,7 @@ def write_timing(f, path: Optional[Path] = None) -> bool:
             body = {'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'pid': os.getpid(), 'written_at': time.time(),
                     'rev': f.rev, 'watched': len(f.interest), **dict(getattr(f, 'timing', {}))}
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + f'.{os.getpid()}.tmp')
+        tmp = path.with_name(path.name + f'.{os.getpid()}.{threading.get_ident()}.tmp')
         tmp.write_text(json.dumps(json_safe(body)), encoding='utf-8')
         os.replace(tmp, path)
         return True
@@ -1234,6 +1259,12 @@ def feed():
                 lane = threading.Thread(target=_run_decisions, args=(core.PROCESS_FEED,),
                                         name='session-panel-decisions', daemon=True)
                 core.PROCESS_FEED._decision_thread = lane
+                lane.start()
+            lane = getattr(core.PROCESS_FEED, '_board_thread', None)
+            if lane is None or not lane.is_alive():
+                lane = threading.Thread(target=_run_board, args=(core.PROCESS_FEED, core.BoardLane),
+                                        name='session-panel-board', daemon=True)
+                core.PROCESS_FEED._board_thread = lane
                 lane.start()
             return core.PROCESS_FEED
 
@@ -1470,6 +1501,9 @@ def _watch(f, watch: FileWatch, paths) -> None:
                     listed = time.monotonic()
                 f._wake.set()
                 f._decide.set()
+                board = getattr(f, '_board', None)
+                if board is not None:
+                    board.set()
                 f.stopped.wait(DEBOUNCE_S)  # one wake per burst; what is written meanwhile wakes the next round
     except Exception:
         log.warning('session-panel feed: file watch failed; source freshness unavailable (no polling)', exc_info=True)
@@ -1531,6 +1565,25 @@ def _run_decisions(f) -> None:
             readers.release()  # no connection outlives one pass
     finally:
         readers.release()
+
+
+def _run_board(f, lane_type) -> None:
+    """Source admission stays responsive while reconciliation or another chat blocks."""
+    lane = lane_type(f, CoreReaders)
+    first = True
+    try:
+        while not f.stopped.is_set():
+            if not first:
+                at = lane.retry_at()
+                f._board.wait(None if at is None else max(0, at - f.clock()))
+                f.stopped.wait(DEBOUNCE_S)
+            if f.stopped.is_set():
+                break
+            first = False
+            lane.step()
+            write_timing(f)
+    finally:
+        lane.close()
 
 
 def _run(f) -> None:

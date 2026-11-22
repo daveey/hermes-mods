@@ -23,6 +23,26 @@ existing offline consumers; every feed publication path uses wire mode.
 all existing bundle fields and add `bundle.model`. P1 does not change Desktop.
 The model is a presentation snapshot, not authorization or execution authority.
 
+## Board-source freshness
+
+A separate change-driven board lane observes the canonical task-change index and
+publishes affected watched chats independently of full-sweep mirror reconciliation.
+Four bounded workers hydrate one chat each; a blocked reader does not hold the
+coordinator or another chat's publication. Writes during an in-flight read coalesce
+into one subsequent read. Source cursors are separate from the full sweep and only
+commit after complete capture/admission. Failed captures and stale reads have finite
+backoff, then await a real source write; there is no idle database polling.
+
+Board-only reads retain the held canonical outcome/request component and its
+`canonical_seq`, and never invoke mirror reconciliation or canonical request reads.
+They share `computed_seq` ordering with sweeps, so a slow older sweep cannot replace
+a newer task snapshot. Membership tokens reject forgotten/re-watched work; lineage
+changes require full hydration rather than reusing another lineage's decisions.
+Readers own and close their connections per invocation. `timing.board_recent`
+records admission, first read, publication, per-reader durations and whether a
+publication changed the model; `producer_readers` records per-chat reconciliation.
+These are producer timings, not installed Desktop click-to-render measurements.
+
 ## Canonical decision freshness
 
 A separate backend lane reads canonical request lifecycle/resolution and session outcome

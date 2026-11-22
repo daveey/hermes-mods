@@ -92,6 +92,12 @@ def _model():
 
 
 
+_board_spec = importlib.util.spec_from_file_location('_session_panel_board_lane', Path(__file__).with_name('board_lane.py'))
+_board_module = importlib.util.module_from_spec(_board_spec)
+_board_spec.loader.exec_module(_board_module)
+BoardLane = _board_module.BoardLane
+
+
 def _hash(bundle: dict) -> str:
     body = {k: v for k, v in bundle.items() if k not in ('computed_at', 'computed_seq', 'canonical_seq')}
     return hashlib.sha1(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
@@ -132,7 +138,7 @@ class _Stop(threading.Event):
 
     def set(self):
         super().set()
-        for name in ('_wake', '_cold', '_decide'):
+        for name in ('_wake', '_cold', '_decide', '_board'):
             e = getattr(self._feed, name, None)
             if e is not None:
                 e.set()
@@ -154,6 +160,9 @@ class Feed:
         self.rev = 0
         self.bundles: dict[str, dict] = {}   # session -> {rev, hash, bundle, refs, lineage}
         self.interest: dict[str, float] = {} # session -> expires at
+        self._watch_tokens = {}             # rejects reads from forgotten/re-watched membership
+        self._board_failures = set()
+        self._board = threading.Event()
         self.failures: dict[str, dict] = {}  # session -> {count, error, at}: shown by /status
         self.lock = threading.RLock()        # interest / bundles / failures
         self.compute_lock = threading.Lock() # store + revision + emit, in order
@@ -275,8 +284,9 @@ class Feed:
             bundles = getattr(prev, 'bundles', {})
             self.bundles = {s: dict(b) for s, b in bundles.items()}
             self.interest = dict(getattr(prev, 'interest', {}))
+            self._watch_tokens = {s: object() for s in self.interest}
             self._registrations = getattr(prev, '_registrations', self._registrations)
-            for name in ('_wake', '_cold', '_decide'):
+            for name in ('_wake', '_cold', '_decide', '_board'):
                 setattr(self, name, getattr(prev, name, getattr(self, name)))
             self.failures = {s: dict(f) for s, f in getattr(prev, 'failures', {}).items()}
             self._retry = set(getattr(prev, '_retry', ())) | set(bundles)  # recompute every carried chat next pass
@@ -291,7 +301,7 @@ class Feed:
             # Older feed code (a hot reload) reads neither `stopped` in its publish nor `_successor`: its entry points
             # are routed here as instance attributes (found before the class's), so a request still on it neither
             # moves its revision nor answers with one this feed never issued.
-            prev._publish = lambda computed, heartbeat=False, canonical_only=False, age_only=False, observations=None: {}
+            prev._publish = lambda computed, **kwargs: {}
             prev.watch = self.watch
             prev.changes = self.changes
         return self
@@ -309,6 +319,7 @@ class Feed:
         wanted = [s for s in dict.fromkeys(str(s) for s in sessions if s)][:MAX_REQUEST]
         with self.lock:
             for s in wanted:
+                self._watch_tokens.setdefault(s, object())
                 self.interest[s] = now + self.interest_ttl_s
             self._expire(now)
             while len(self.interest) > MAX_WATCHED:  # oldest registration first
@@ -322,6 +333,8 @@ class Feed:
                 self._forget(s)
 
     def _forget(self, s: str) -> None:
+        self._watch_tokens.pop(s, None)
+        self._board_failures.discard(s)
         self._decision_failures.discard(s)
         self._decision_seen.pop(s, None)
         self.interest.pop(s, None)
@@ -342,12 +355,23 @@ class Feed:
             lane.pop(s, None)
 
     # ── computing ───────────────────────────────────────────────────────────
-    def compute(self, session: str, *, seq: Optional[int] = None) -> dict:
+    def compute(self, session: str, *, seq: Optional[int] = None, readers=None, base=None, stages=None) -> dict:
         seq = next(self._seq) if seq is None else seq  # assigned before the pass's first shared read
-        r = self.readers
-        lineage = list(r.lineage(session)) or [session]
-        tasks = list(r.linked(lineage))
-        done = list(r.done(lineage))
+        read_at = self.clock()
+        r = self.readers if readers is None else readers
+        stages = {} if stages is None else stages
+        def timed(name, fn, *args):
+            began = time.monotonic()
+            try:
+                return fn(*args)
+            finally:
+                stages[name] = round(stages.get(name, 0) + time.monotonic() - began, 4)
+        lineage = list(timed('lineage_s', r.lineage, session)) or [session]
+        if base is not None and lineage != base['lineage']:
+            self._wake.set()
+            raise RuntimeError('board-only read changed lineage; full hydration required')
+        tasks = list(timed('linked_s', r.linked, lineage))
+        done = list(timed('done_s', r.done, lineage))
         cards: dict[str, dict] = {}
         queue = [(str(t.get('id')), str(t.get('board') or 'default'), t, 0) for t in tasks if t.get('id')]
         seen: set[str] = set()
@@ -356,7 +380,7 @@ class Feed:
             if cid in seen:
                 continue
             seen.add(cid)
-            rec = r.card(cid, board)
+            rec = timed('cards_s', r.card, cid, board)
             if rec is None:
                 continue
             cards[cid] = rec
@@ -366,12 +390,12 @@ class Feed:
             for ref in chain_refs(row, rec.get('detail')):
                 if ref not in seen:
                     queue.append((ref, rec.get('board') or board, None, depth + 1))
-        bundle = {'session': session, 'lineage': lineage, 'tasks': tasks, 'done': done, 'cards': cards,
-                  'computed_at': self.clock(), 'computed_seq': seq}
+        bundle = {**(base or {}), 'session': session, 'lineage': lineage, 'tasks': tasks, 'done': done, 'cards': cards,
+                  'computed_at': read_at, 'computed_seq': seq}
         panel_inputs = getattr(r, 'panel_inputs', None)
-        if callable(panel_inputs):
+        if base is None and callable(panel_inputs):
             bundle['canonical_seq'] = next(self._seq)
-            bundle.update(panel_inputs(session, lineage))
+            bundle.update(timed('panel_inputs_s', panel_inputs, session, lineage))
         bundle['model'] = _model().reduce_panel(bundle, now=bundle['computed_at'], wire=True)
         return bundle
 
@@ -562,6 +586,7 @@ class Feed:
             self.rev = int(snap['rev']) + RESTORE_REV_GAP
             self.bundles = bundles
             self.interest = interest
+            self._watch_tokens = {s: object() for s in interest}
             self._retry = set(bundles)
             self._carried = set(bundles)
             self._reissue = set(bundles)
@@ -622,13 +647,17 @@ class Feed:
         return True
 
     def _publish(self, computed: dict[str, dict], *, heartbeat: bool = False, canonical_only: bool = False,
-                 age_only: bool = False, observations: Optional[dict] = None) -> dict[str, dict]:
+                 age_only: bool = False, observations: Optional[dict] = None, watch_tokens=None) -> dict[str, dict]:
         """Store what was computed and push one batch (or a heartbeat when nothing changed and one is due)."""
         with self.compute_lock:
             if self.stopped.is_set():
                 return {}  # stopped (and possibly resumed by a successor): its revision space is no longer ours
             prev = self.rev
             with self.lock:
+                if watch_tokens is not None:
+                    computed = {s: b for s, b in computed.items()
+                                if self._watch_tokens.get(s) is watch_tokens.get(s)
+                                and s in self.bundles and self.bundles[s]['bundle']['lineage'] == b['lineage']}
                 if age_only:
                     # Reduce exactly the current publication while holding the writer
                     # lock. An age pass cannot race/replace a newer decision or change
@@ -667,6 +696,7 @@ class Feed:
                                    and s in self.bundles and s not in self.failures
                                    and s not in self._retry and s not in self._carried
                                    and s not in self._decision_failures
+                                   and s not in self._board_failures
                                    and not self.bundles[s].get('source_stale')
                                    and now - self.bundles[s]['bundle']['computed_at'] <= (
                                        self.full_every_s if self.bundles[s]['bundle'].get('tasks')
@@ -831,7 +861,8 @@ class Feed:
                 self._reconcile_retry_at = retry_at
         self._producer_seen = source_seen
         self.__dict__.setdefault('timing', {}).update(producer_s=round(time.monotonic() - began, 4),
-                                                      producer_chats=len(todo))
+                                                      producer_chats=len(todo),
+                                                      producer_readers=getattr(self.readers, 'reconcile_timings', []))
 
     def tick(self) -> int:
         """Settle a source pass atomically, with finite recovery of unread changes."""
