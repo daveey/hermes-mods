@@ -8,7 +8,7 @@ from test_kanban_mirror import OWNER, decide, fixture
 from test_withdrawal import ROOT, load_module
 
 
-@pytest.mark.parametrize('source_phase', [False, True])
+@pytest.mark.parametrize('source_phase', [False, True, 'remote-unavailable'])
 def test_panel_read_produces_canonical_request_without_legacy_poll(tmp_path, monkeypatch, source_phase):
     monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
     mirror, store, path, _ = fixture(tmp_path)
@@ -27,8 +27,15 @@ def test_panel_read_produces_canonical_request_without_legacy_poll(tmp_path, mon
     # presentation and decision delivery all use the real producer/store.
     store_type = core.ActionStore
     monkeypatch.setattr(core, 'ActionStore', lambda **kwargs: store_type(store.path, **kwargs))
+    if source_phase == 'remote-unavailable':
+        # A host with core but no hub projection: local cards are still produced, the rest is reported.
+        def gone(owner):
+            raise OSError('Remote ask owner projection unavailable')
+        monkeypatch.setattr(mirror.remote, 'snapshots', gone)
     if source_phase:
-        api.panel_reconcile(tmp_path, OWNER['storedSessionId'], [OWNER['storedSessionId']])
+        left = api.panel_reconcile(tmp_path, OWNER['storedSessionId'], [OWNER['storedSessionId']])
+        if source_phase == 'remote-unavailable':
+            assert len(left) == 1 and 'projection unavailable' in left[0]
     requests = api.panel_requests(tmp_path, OWNER['storedSessionId'], [OWNER['storedSessionId']],
                                   reconcile=not source_phase)
     assert len(requests) == 1

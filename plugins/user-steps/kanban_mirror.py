@@ -704,14 +704,20 @@ class Mirror:
 
     def reconcile(self, owner, *, strict=False):
         self.core.validate_owner(owner)
+        deferred = None
         try:
-            remote_clean = self.remote.reconcile(owner)
-            if strict and remote_clean is False:
-                raise RuntimeError('Remote card reconciliation deferred')
+            if self.remote.reconcile(owner) is False:
+                deferred = RuntimeError('Remote card reconciliation deferred')
         except Exception as exc:  # optional remote projection must not suppress local cards
-            if strict:
-                raise
+            deferred = exc
             logging.getLogger('user-steps').warning('Remote card reconciliation unavailable: %s', exc)
+        # Local cards are mirrored whether or not the remote projection answered. A strict caller
+        # learns of the deferred remote work afterwards, never instead of the local pass.
+        self._reconcile_local(owner, strict)
+        if strict and deferred is not None:
+            raise deferred
+
+    def _reconcile_local(self, owner, strict):
         with _accounted_pass("user_steps.mirror_reconcile") as acct:
             fenced = self._fenced_core()
             key = self._key(owner, fenced)
