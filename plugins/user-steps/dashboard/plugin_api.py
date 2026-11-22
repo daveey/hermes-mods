@@ -5,6 +5,7 @@ from server configuration, never a payload. The optional owner_resolver is a ser
 integration seam for authenticated connection principals, not an HTTP parameter.
 Legacy reads remain passive; generic resolve is intentionally gone (410).
 """
+import contextlib
 import contextvars
 import functools
 import importlib.util
@@ -227,6 +228,24 @@ def panel_requests_many(home: Path, lineages) -> dict:
     return {sid: group if isinstance(group, Exception) else
             copy.deepcopy([row for own in group for row in by_session[own['storedSessionId']]])
             for sid, group in scopes.items()}
+
+
+@contextlib.contextmanager
+def panel_pass():
+    """One producer pass over many chats (this thread): they share one strict origin-links projection and
+    check each other-owner binding once, instead of once per chat. Nothing outlives the block."""
+    with contextlib.ExitStack() as stack:
+        scope = getattr(_load('kanban_mirror'), 'reconcile_pass', None)
+        if callable(scope):
+            stack.enter_context(scope())  # type: ignore[arg-type]
+        try:
+            from hermes_cli import kanban_session_activity as ksa
+            pin = getattr(ksa, 'one_annotation_snapshot', None)
+        except ImportError:
+            pin = None  # core-free installation: nothing to share
+        if callable(pin):
+            stack.enter_context(pin())  # type: ignore[arg-type]
+        yield
 
 
 def panel_reconcile(home: Path, session: str, lineage) -> list:

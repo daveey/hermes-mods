@@ -39,6 +39,30 @@ _EVENT_KINDS = ("created", "blocked", "block_loop_detected", "unblocked", "archi
 _MEMO: dict = {}  # owner key -> (inputs key, monotonic time of the full pass that produced it)
 _MEMO_LOCK = threading.Lock()
 _MEMO_MAX = 256
+_PASS = threading.local()  # set by reconcile_pass(): bindings already checked by an earlier owner of the same pass
+
+
+def _binding_key(binding, scope):
+    return (scope, binding["namespace"], binding["request_id"], binding["request"], binding["snapshot"])
+
+
+@contextmanager
+def reconcile_pass():
+    """Owners reconciled inside one block (one feed producer pass, this thread) check each binding once.
+
+    Every owner's pass also re-checks every OTHER owner's bindings of the namespace, so N owners re-checked
+    each binding N times. A binding whose check failed is not recorded, so the next owner retries it,
+    as before. Nothing survives the block."""
+    if getattr(_PASS, "done", None) is not None:
+        yield
+        return
+    _PASS.done = set()
+    try:
+        yield
+    finally:
+        _PASS.done = None
+
+
 _POOL: dict = {}
 _POOL_LOCK = threading.Lock()
 _POOL_MAX = 64
@@ -231,6 +255,8 @@ class Mirror:
         session_present=None,
     ):
         self.core, self.store, self.backend = core, store, backend
+        self._pass_source = object() if any(v is not None for v in
+            (backend, session_exists, tip, session_present)) else core
         path = Path(__file__).with_name('remote_cards.py')
         spec = importlib.util.spec_from_file_location('_user_steps_remote_cards', path)
         remote = importlib.util.module_from_spec(spec)
@@ -913,10 +939,20 @@ class Mirror:
                     (self.store._ns(owner), owner["storedSessionId"]),
                 )
             ]
+        done = getattr(_PASS, "done", None)
+        # Resolve backing coordinates once per owner, not for every binding.
+        # Equal binding bytes from another store/source are not checked evidence.
+        scope = (str(Path(self.store.path).resolve()),
+                 tuple(sorted((board, str(Path(path).resolve())) for board, path in self.boards.items())),
+                 self._pass_source) if done is not None else None
         for binding in bindings:
             try:
                 self._reconcile_binding(owner, binding)
+                if done is not None:
+                    done.add(_binding_key(binding, scope))
             except (ValueError, sqlite3.Error, OSError) as exc:
+                if done is not None:
+                    done.discard(_binding_key(binding, scope))
                 clean = False
                 logging.getLogger("user-steps").warning(
                     "Card binding reconciliation deferred request=%s: %s",
@@ -934,10 +970,16 @@ class Mirror:
                 )
             ]
         for binding in older:
+            if done is not None and _binding_key(binding, scope) in done:
+                continue  # this feed pass already checked exactly this binding (see reconcile_pass)
             previous = dict(owner, storedSessionId=binding["session"])
             try:
                 self._reconcile_binding(previous, binding)
+                if done is not None:
+                    done.add(_binding_key(binding, scope))
             except (ValueError, sqlite3.Error, OSError) as exc:
+                if done is not None:
+                    done.discard(_binding_key(binding, scope))
                 clean = False
                 logging.getLogger("user-steps").warning(
                     "Older card binding reconciliation deferred request=%s: %s",
