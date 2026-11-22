@@ -7,6 +7,7 @@ triggers:
     - "add a field to the session panel"
     - "how does an unblock card render"
     - "blocked section shows cards but no session is red"
+    - "the status panel asked me the same question twice"
   not_for: "writing a human ask (use generate-unblock-card); deciding whether a human is needed (use try-to-unblock)"
 version: 0.1.0
 author: David Bloom (daveey), Hermes Agent
@@ -106,6 +107,7 @@ For a private historical golden, retain raw input, observation time, source revi
 - The left-pane **Blocked** sidebar section and the red row stripe have different inputs and different owners. Look for the Blocked section in core (`apps/desktop/src/plugins/kanban/blocked-section.tsx`, `fetchBlockedTasks` in `api.ts`), not in hermes-mods `desktop-plugins`. It lists every blocked card on every gateway and board. It groups each card by `managing_session_id` (the latest `tui` notify subscriber), else by the card's `session_id`, and gets group titles from `/session-labels` on the backend's own profile. The stripe turns red only from a visible row's `kanban_blocked`. When the section shows a card but no row is red, check the card's owner session on its home gateway (`home_gateway`; the local replica can be empty, so read the owner's DB through `tailnet_exec`). Cards created by background profiles have sessions the user's chats never show.
 - A card the chat is waiting on is often not linked to that chat (for example, a worker created a review card). It then gets no row of its own, so the waiting row's line must carry that card's live status, not just its title. Otherwise running work looks idle. When the user asks "why isn't that card shown?", check `wait_target` and the hydrated `cards[id]` before you look at session linkage.
 - Row UI preference: open a line row's own card by double-clicking its state square, not with an "Open card" button. Keep text buttons for other targets (parent card, CI, links).
+- "The panel asked me the same question twice" means duplicate user-steps requests, not a renderer bug. List the session's requests in the owner's `~/.hermes/user-steps/actions.sqlite3`: `requests` (namespace, id, session, state, resolution) joined to `revisions.body` (JSON title/kind/choices) and `lifecycle` (created_at, withdrawal). Then read `~/.hermes/cache/user-steps/trace.jsonl` for that session around the second request's created_at. An `open_ask_hold` → `publication_buffer verdict=pass attempt=<budget>` with the sentence in `unmapped`, followed by `transform new:[us_…]`, means the reply's prose restatement of a card the producer tool published that turn was minted as a second tile (`core.same_open_ask` maps only exact titles or corroborated repeats). Fix that in user-steps, not in the panel.
 - A push heartbeat proves transport freshness, not executor liveness. Do not reinterpret the cached model.
 - An ask for an unfocused chat can exist in the backend without being painted; inspect both independently.
 - After a hierarchy-to-flat migration, verify the actual flat rendering; absence of nesting is not proof that the old nested dedup case passed. Do not restore hierarchy merely to reproduce that test.
