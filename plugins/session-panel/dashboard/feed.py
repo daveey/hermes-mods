@@ -31,6 +31,8 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 import itertools
 import json
+import queue
+from types import MappingProxyType
 import logging
 import re
 import threading
@@ -130,6 +132,60 @@ class Feed:
         self._successor: Optional['Feed'] = None  # the feed that resumed this one (requests still here move on)
         self._decision_failures: set[str] = set()
         self._decision_lock = threading.Lock()  # cheap read lane, never board computation
+        self._registrations = queue.SimpleQueue()
+        self._wire_sources = {}
+        self._wire = (self.epoch, self.rev, MappingProxyType({}), b'')
+        self._publish_wire()
+
+    def _publish_wire(self):
+        """Writer-only: freeze JSON bytes before swapping the complete revision view.
+
+        Entries are immutable and old publications remain valid while a reader uses
+        them. Serialize even unchanged revisions: computed_at can still advance.
+        """
+        entries = {}
+        old_entries = self._wire[2]
+        for s, held in self.bundles.items():
+            old = old_entries.get(s)
+            if old and self._wire_sources.get(s) is held['bundle'] and old[0] == held['rev']:
+                entries[s] = old
+            else:
+                entries[s] = (held['rev'], self._encode(s), self._encode(held['bundle']))
+        self._wire_sources = {s: b['bundle'] for s, b in self.bundles.items()}
+        header = b'{"epoch":' + self._encode(self.epoch) + b',"rev":' + str(self.rev).encode()
+        self._wire = (self.epoch, self.rev, MappingProxyType(entries), header)
+
+    @staticmethod
+    def _encode(value):
+        # Match the route's historical json_safe + Starlette JSONResponse bytes.
+        def safe(v):
+            if isinstance(v, float):
+                return v if v == v and v not in (float('inf'), float('-inf')) else None
+            if v is None or isinstance(v, (bool, int, str)):
+                return v
+            if isinstance(v, dict):
+                return {str(k): safe(x) for k, x in v.items()}
+            if isinstance(v, (list, tuple, set)):
+                return [safe(x) for x in v]
+            return str(v)
+        return json.dumps(safe(value), ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode()
+
+    def changes_bytes(self, sessions, *, since=0, epoch=None):
+        """No locks, readers, computation or JSON conversion on the HTTP path.
+
+        Cold sessions return no bundle until a background tick publishes one.
+        Registration is an enqueue, not a synchronous interest-lock acquisition.
+        """
+        if self._successor is not None:
+            return self._current().changes_bytes(sessions, since=since, epoch=epoch)
+        wanted = tuple(dict.fromkeys(sessions))[:MAX_WATCHED]
+        self._registrations.put(wanted)
+        current, rev, entries, header = self._wire
+        reset = epoch != current
+        parts = [entries[s][1] + b':' + entries[s][2] for s in wanted
+                 if s in entries and (reset or entries[s][0] > since)]
+        return (header + b',"reset":' + (b'true' if reset else b'false')
+                + b',"bundles":{' + b','.join(parts) + b'}}')
 
     def resume(self, prev: 'Feed') -> 'Feed':
         """Carry a stopped feed of this process into this one, so clients see no reset.
@@ -147,6 +203,7 @@ class Feed:
             bundles = getattr(prev, 'bundles', {})
             self.bundles = {s: dict(b) for s, b in bundles.items()}
             self.interest = dict(getattr(prev, 'interest', {}))
+            self._registrations = getattr(prev, '_registrations', self._registrations)
             self.failures = {s: dict(f) for s, f in getattr(prev, 'failures', {}).items()}
             self._retry = set(getattr(prev, '_retry', ())) | set(bundles)  # recompute every carried chat next pass
             self._carried = set(bundles)  # ...and vouch for none of them until its new bundle is stored
@@ -156,6 +213,7 @@ class Feed:
             top = max((max(int(b['bundle'].get(k) or 0) for k in ('computed_seq', 'canonical_seq')) for b in bundles.values()), default=0)
             self._seq = itertools.count(top + 1)
             prev._successor = self
+            self._publish_wire()
             # Older feed code (a hot reload) reads neither `stopped` in its publish nor `_successor`: its entry points
             # are routed here as instance attributes (found before the class's), so a request still on it neither
             # moves its revision nor answers with one this feed never issued.
@@ -386,6 +444,7 @@ class Feed:
             self._reissue = set(bundles)
             top = max((max(int(b['bundle'].get(k) or 0) for k in ('computed_seq', 'canonical_seq')) for b in bundles.values()), default=0)
             self._seq = itertools.count(top + 1)
+            self._publish_wire()
         return self
 
     def _store(self, session: str, bundle: dict, *, canonical_only: bool = False) -> bool:
@@ -447,6 +506,7 @@ class Feed:
                     if flight is not None and flight.bundle is b:
                         self._flights.pop(s)
                 changed = {s: self.bundles[s]['bundle'] for s, b in computed.items() if s in self.interest and self._store(s, b, canonical_only=canonical_only)}
+                self._publish_wire()
             now = self.clock()
             if changed or (heartbeat and now - self.last_emit >= self.heartbeat_s):
                 with self.lock:
@@ -473,6 +533,16 @@ class Feed:
         with self.lock:
             self._expire(now)
             watched = list(self.interest)
+        # Drain a bounded batch; requests arriving during this sweep wait for the
+        # next tick, never the other way round.
+        for _ in range(MAX_WATCHED):
+            try:
+                self.watch(self._registrations.get_nowait())
+            except queue.Empty:
+                break
+        with self.lock:
+            watched = list(self.interest)
+            self._publish_wire()
         if not watched:
             return 0
         panel_dirty = set()
@@ -487,7 +557,8 @@ class Feed:
         full = now - self._last_full >= self.full_every_s
         with self.lock:
             retry = self._retry.intersection(watched)
-        if stamps == self._stamps and not full and not retry and not panel_dirty:
+            missing = any(s not in self.bundles for s in watched)
+        if stamps == self._stamps and not full and not retry and not panel_dirty and not missing:
             self._publish({}, heartbeat=True)
             return 0
         changed_cards, self._cursor = self.readers.changed_cards(self._cursor)
