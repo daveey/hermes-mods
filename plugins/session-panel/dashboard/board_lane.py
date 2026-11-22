@@ -193,6 +193,7 @@ class BoardLane:
                 self._admit(external_dirty, at)
                 capture_timing.update(external_admitted_at=time.time(), external_sessions=sorted(external_dirty))
                 self.external_captures = captured
+                f._board_capture_failures.difference_update(held)
                 self.cursor, self.stamp = cursor, stamp
                 self.capture_failures, self.capture_retry_at = 0, None
         except Exception:
@@ -201,7 +202,9 @@ class BoardLane:
             self.capture_failures += 1
             self.capture_retry_at = f._backoff(self.capture_failures)
             with f.lock:
-                f._board_failures.update(f.interest)
+                # Hydration can already be running from the local delta. Its
+                # success cannot vouch for a strict capture that failed later.
+                f._board_capture_failures.update(f.interest)
             log.warning('session-panel board capture failed', exc_info=True)
         finally:
             rd.release()

@@ -359,6 +359,84 @@ def test_local_admission_keeps_external_failure_retry_and_later_successor():
         lane.close()
 
 
+def test_failed_capture_cannot_be_vouched_by_earlier_local_read():
+    r = Readers()
+    now = [1000.0]
+    pushes = []
+    f = feedmod.Feed(r, emit=pushes.append, clock=lambda: now[0])
+    f.changes(['S1', 'S2'])
+    r.external_stamps = lambda: 0
+    r.external_capture = lambda held: {s: 0 for s in held}
+    lane = feedmod.BoardLane(f, lambda: r)
+    settle(lane)
+    entered, release = threading.Event(), threading.Event()
+    original = r.linked
+    def paused(ids):
+        rows = original(ids)
+        if 'S2' in ids:
+            entered.set()
+            assert release.wait(5)
+        return rows
+    def unavailable(held):
+        assert entered.wait(1)
+        raise RuntimeError('fixture external source unavailable')
+    r.linked = paused
+    r.external_capture = unavailable
+    r.links['S2'] = [{**r.links['S2'][0], 'status': 'ready'}]
+    r.events = [('t_dddddd4', 'S2')]
+    r.stamp += 1
+    try:
+        lane.step()
+        assert lane.capture_failures == 1
+        release.set()
+        for worker in list(lane.active.values()):
+            worker.join(1)
+        lane.service()
+        assert f.bundles['S2']['bundle']['tasks'][0]['status'] == 'ready'
+        now[0] += f.heartbeat_s + 1
+        f._publish({}, heartbeat=True)
+        assert 'S2' not in pushes[-1]['fresh'], 'early hydration erased a later capture failure'
+        assert 'S1' not in pushes[-1]['fresh'], 'unaffected held chat vouched during capture outage'
+        f._publish(f._compute_all(['S1', 'S2']))
+        now[0] += f.heartbeat_s + 1
+        f._publish({}, heartbeat=True)
+        assert not {'S1', 'S2'} & set(pushes[-1]['fresh']), 'full sweep cleared capture custody'
+        # A successful same-source recapture restores only the capture fence;
+        # no extra source write is required and no board clocks are fabricated.
+        r.linked = original
+        r.external_capture = lambda held: {s: 0 for s in held}
+        before = f.bundles['S1']['bundle']['computed_at']
+        lane.step()
+        assert lane.capture_failures == 0
+        now[0] += f.heartbeat_s + 1
+        f._publish({}, heartbeat=True)
+        assert {'S1', 'S2'} <= set(pushes[-1]['fresh'])
+        assert f.bundles['S1']['bundle']['computed_at'] == before
+    finally:
+        release.set()
+        lane.close()
+
+
+def test_capture_failure_custody_survives_resume_and_ends_at_forget():
+    r = Readers()
+    now = [1000.0]
+    pushes = []
+    old = feedmod.Feed(r, emit=pushes.append, clock=lambda: now[0])
+    old.changes(['S2'])
+    old._board_capture_failures.add('S2')
+    old.stopped.set()
+    f = feedmod.Feed(r, emit=pushes.append, clock=lambda: now[0]).resume(old)
+    f.tick()
+    now[0] += f.heartbeat_s + 1
+    f._publish({}, heartbeat=True)
+    assert 'S2' not in pushes[-1]['fresh']
+    assert f._board_capture_failures == {'S2'}
+    with f.lock:
+        f._forget('S2')
+    assert not f._board_capture_failures
+    f.stopped.set()
+
+
 def test_emit_timing_names_exact_model_and_omits_failed_transport():
     pushed = []
     r = Readers()
@@ -551,7 +629,7 @@ def test_capture_failure_has_finite_retry_and_new_source_recovers():
             lane.step()
         assert len(calls) == 4 and lane.retry_at() is None
         assert lane.cursor is None
-        assert 'S2' in f._board_failures
+        assert 'S2' in f._board_capture_failures
         for _ in range(10):
             now[0] += 100
             lane.step()
@@ -563,6 +641,7 @@ def test_capture_failure_has_finite_retry_and_new_source_recovers():
         settle(lane)
         assert lane.cursor is not None
         assert 'S2' not in f._board_failures
+        assert 'S2' not in f._board_capture_failures
         assert f.bundles['S2']['bundle']['tasks'][0]['status'] == 'ready'
     finally:
         lane.close()
