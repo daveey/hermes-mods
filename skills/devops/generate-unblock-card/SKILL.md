@@ -61,6 +61,17 @@ Answer each in your notes first:
 
 Inside a Kanban worker, an `action_request` question is visible to David only through the card it is cited on. Cite each request id in the block's `human_request`, or better, use `human_request.choices`.
 
+**`action_request` asks and chat decision lists follow the same rules.** A For-you ask (`action_request`), or a
+numbered decision list in a chat reply (Hermes turns each item into an ask automatically), reaches David as a
+bare title plus its choices. So:
+- The title is the plain question with its outcome in it ("Flaky Hermes CI tests: ship 3 fixes (~$20), or drop
+  the work?"). Never write "Decide <card name> <id>: ...".
+- `scope.markdown` holds the same `Situation:` / `Options:` / `Recommend:` brief, plus one line saying what happens
+  if he does nothing. No commit SHAs, run numbers or branch names.
+- `choices` are real lettered buttons with `explain`. Never send only "Answer in your own words".
+- Before asking, check his standing approvals (for example re-runs under $20). If they cover the pick, do it and
+  don't ask.
+
 A physical or terminal step with no real alternatives still gets `Situation:` and `Recommend:` (what to do and
 when); `Options:` may be the single step plus "Archive = drop it".
 
