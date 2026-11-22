@@ -241,6 +241,10 @@ def wait_info(row, now):
         phrase = 'waiting on CI' + (f' · PR #{pr}' if pr else '')
     elif head:
         phrase = 'waiting on hub deploy' if re.search(r'\bhub\b', on, re.I) else 'waiting on deploy'
+    elif re.match(r'(?:producer\s+)?card\s+t_[0-9a-f]+\b', on, re.I):
+        phrase = 'waiting on parent card'
+    elif re.search(r'\bt_[0-9a-f]+\b|\blocal:|\bPID\s*\d+|\S+\.service\b', on, re.I):
+        phrase = 'waiting on external work' if re.match(r'external\b', on, re.I) else 'waiting on agent work'
     else:
         body = flat(_HASHY.sub('', _URL.sub('', on)))
         body = re.sub(r'\s+(?:for|and|/|·)\s*$', '', re.sub(r'\s{2,}', ' ', body)).strip()
@@ -248,6 +252,32 @@ def wait_info(row, now):
             body = body[:WAIT_MAX - 1].rstrip() + '…'
         phrase = f'waiting on {body}' if body else 'waiting'
     return {'text': phrase + age, 'raw': on, 'urls': urls[:1]}
+
+
+def wait_target(row, bundle, detail):
+    """Resolve the named dependency from already-hydrated evidence, never a new read."""
+    refs = [obj(row.get(k)) for k in ('blocked_upstream', 'upstream')]
+    refs += [{'id': cid} for cid in re.findall(r'\bt_[0-9a-f]+\b', text(obj(row.get('wait')).get('waiting_on')))]
+    for ref in refs:
+        cid = text(ref.get('id'))
+        if not cid:
+            continue
+        rec = obj(obj(bundle.get('cards')).get(cid))
+        hydration = obj(rec.get('detail'))
+        task = obj(hydration.get('task'))
+        linked = next((t for t in detail.get('link_tasks') or [] if isinstance(t, dict) and t.get('id') == cid), {})
+        dep = {**linked, **task, **ref}
+        if not dep.get('title'):
+            continue
+        dep['board'] = dep.get('board') or rec.get('board') or row.get('board') or 'default'
+        owner = hydration.get('owner')
+        dep['gateway'] = (dep.get('home_gateway') or dep.get('gateway') or
+                          (owner if isinstance(owner, str) else None) or
+                          (bundle.get('gateway') if hydration.get('source') == 'live' else None))
+        dep['profile'] = dep.get('profile') or bundle.get('profile')
+        if dep.get('gateway') and dep.get('profile'):
+            return dep
+    return None
 
 
 def wait_phrase(row, now):
@@ -358,7 +388,7 @@ def _parked(row, on):
     if state == 'review':
         return 'waiting for review'
     if up.get('id'):
-        return f'{state} · waiting on card {up["id"]} ({up.get("status") or "status unknown"})'
+        return 'waiting on parent card'
     return {'todo': 'waiting on its parent cards', 'scheduled': 'scheduled · its owner has not published what wakes it',
             'blocked': 'blocked · no reason published'}.get(state, state or 'status unknown')
 
@@ -451,8 +481,22 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             continue
         seen.add(k)
         v = row_view(row)
+        parent = obj(row.get('upstream'))
+        if parent.get('id'):
+            v['details'].append(f'Parent card: {parent["id"]} ({parent.get("status") or "status unknown"})')
         progress = number(row.get('activity_at')) or number(row.get('current_run_started_at'))
         wi = wait_info(row, now)
+        dependency = wait_target(row, bundle, detail)
+        dependency_text = ''
+        if dependency:
+            title = clean(dependency['title'])
+            title = title if len(title) <= WAIT_MAX else title[:WAIT_MAX - 1].rstrip() + '…'
+            since = number(obj(row.get('wait')).get('waiting_since'))
+            age = f' · {short_dur(now - since)}' if 0 < since <= now else ''
+            dependency_text = f'waiting on: {title}{age}'
+            if not wi['text'].startswith(('waiting on CI', 'waiting on hub deploy', 'waiting on deploy')):
+                wi['text'] = dependency_text
+            v['actions'].append({'kind': 'open_card', 'label': 'Open parent card', 'target': target(dependency)})
         on = wi['text']
         if wi['raw'] and wi['raw'] != on:
             v['details'].append(f'Waiting on: {wi["raw"]}')
@@ -488,8 +532,10 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         upstream = obj(row.get('blocked_upstream'))
         if upstream and look != 'stalled':
             contained = obj(upstream.get('contained'))
-            v['detail'] = (f'waiting on contained card {upstream.get("id")} · release by card {obj(contained.get("authority")).get("id") or "unknown"}'
-                           if contained else f'waiting on blocked parent card {upstream.get("id")} ({upstream.get("status")})')
+            v['details'].append(f'Parent card: {upstream.get("id")} ({upstream.get("status") or "status unknown"})')
+            if contained:
+                v['details'].append(f'Release by card: {obj(contained.get("authority")).get("id") or "unknown"}')
+            v['detail'] = dependency_text or ('waiting on contained parent card' if contained else 'waiting on blocked parent card')
             sections['waiting'].append(v); continue
         if look == 'stalled':
             v.update(reason='stalled', detail=f'stalled: {on or "agent-owned wait over 2 h"}')
