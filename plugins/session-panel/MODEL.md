@@ -26,7 +26,9 @@ The API idempotently ensures the canonical lane even if a previous API generatio
 already resumed the current Feed. That lane owns current-generation readers rather
 than borrowing obsolete readers from the board lane. A successfully queried missing
 session row (a deleted chat retained in Desktop recents) yields an empty/unknown
-outcome, while canonical requests are still read with their exact owner/lineage.
+outcome and no requests: user-steps cannot establish that session's request owner
+without its own stored row, so the adapter must not call its guarded panel_requests
+or infer an ancestor's owner. Existing sessions still read exact owner/lineage requests.
 Unavailable databases or canonical-request readers remain retryable failures, not
 known-empty sources; successful retries clear failure diagnostics and restore `fresh`.
 

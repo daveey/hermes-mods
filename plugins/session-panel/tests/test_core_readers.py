@@ -94,9 +94,9 @@ def test_cheap_decision_inputs_match_outcome_normalization_without_board_reads(a
     assert r.decision_inputs('S1', ['S1']) == {'outcome_json': expected, 'requests': []}
     assert calls == [('S1', ['S1'], False)]
     # A deleted recent chat is a known absent row, not an unavailable database.
-    # Keep canonical request lookup scoped to that exact session/lineage.
+    # Without its own stored row no request owner can be established.
     assert r.decision_inputs('foreign', ['foreign']) == {'outcome_json': {}, 'requests': []}
-    assert calls[-1] == ('foreign', ['foreign'], False)
+    assert calls == [('S1', ['S1'], False)], 'never infer an owner for the deleted session'
     r.release()
 
 
@@ -106,11 +106,9 @@ def test_absent_recent_session_refreshes_without_poisoning_freshness(api, tmp_pa
     with sqlite3.connect(path) as c:
         c.execute('CREATE TABLE sessions(id TEXT, outcome_json TEXT)')
     r = api.CoreReaders(state_db=path)
-    # Request authority is independent of whether the transcript row still exists.
-    requests = [{'id': 'exact-owner-request'}]
-    monkeypatch.setattr(r, '_user_step_requests', lambda session, lineage, **kw: requests)
-    assert r.decision_inputs('S1', ['S1'])['requests'] is requests
-    monkeypatch.setattr(r, '_user_step_requests', lambda *a, **kw: [])
+    def forbidden(*a, **kw):
+        raise AssertionError('absent stored row cannot establish a request owner')
+    monkeypatch.setattr(r, '_user_step_requests', forbidden)
     f, readers, pushed, clock = make()
     readers.panel_inputs = lambda *a: {'outcome_json': {'kind': 'done'}, 'requests': []}
     f.changes(['S1'])
@@ -120,6 +118,27 @@ def test_absent_recent_session_refreshes_without_poisoning_freshness(api, tmp_pa
     r.release()
 
 
+def test_absent_recent_session_through_real_user_steps_does_not_fail_refresh(api, tmp_path):
+    from hermes_state import SessionDB
+    from test_feed import make
+    db = SessionDB(db_path=tmp_path / 'state.db')
+    r = api.CoreReaders(state_db=tmp_path / 'state.db')
+    try:
+        # Exercise the genuine user-steps guard, not a patched request adapter.
+        with pytest.raises(Exception, match='Unknown stored session on this profile'):
+            r._user_step_requests('deleted-recent', ['deleted-recent'], reconcile=False)
+        f, readers, pushed, clock = make()
+        f.changes(['deleted-recent'])
+        assert f.refresh_decisions(readers=r) == 1
+        assert 'deleted-recent' not in f._decision_failures
+        assert 'deleted-recent' in pushed[-1]['fresh']
+        assert f.bundles['deleted-recent']['bundle']['requests'] == []
+        assert f.bundles['deleted-recent']['bundle']['outcome_json'] == {}
+    finally:
+        r.release()
+        db.close()
+
+
 def test_unavailable_decision_sources_raise_instead_of_vouching(api, tmp_path, monkeypatch):
     path = tmp_path / 'state.db'
     r = api.CoreReaders(state_db=path)
@@ -127,6 +146,7 @@ def test_unavailable_decision_sources_raise_instead_of_vouching(api, tmp_path, m
         r.decision_inputs('S1', ['S1'])
     with sqlite3.connect(path) as c:
         c.execute('CREATE TABLE sessions(id TEXT, outcome_json TEXT)')
+        c.execute('INSERT INTO sessions VALUES (?,?)', ('S1', '{}'))
     def broken(*args, **kwargs):
         raise RuntimeError('canonical request store unreadable')
     monkeypatch.setattr(r, '_user_step_requests', broken)
