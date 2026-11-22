@@ -1938,11 +1938,11 @@ def handle(hit: Optional[dict], session_id: str, store, evidence: str = "", m: O
 # selfheal_fixed, selfheal_reverted, selfheal_not_defect, selfheal_declined.
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════════
 
-MODEL = "claude-opus-5-5"  # fix, backport and lane-defect cards (they write and ship code)
-PROVIDER = "anthropic"  # pinned with MODEL: a host whose default provider is another (hub: openai-codex) refuses the bare model (model_provider_mismatch)
+MODEL = "class:deep"  # fix, backport and lane-defect cards (they write and ship code): class routing, never a concrete model
+PROVIDER: Optional[str] = None  # never a provider pin: the class router picks provider/model per session; never --pin-mandatory
 # Investigation, verify and "host hasn't synced" cards carry no model pin: the board's model tier decides
 # (kanban.default_model first; kanban.strong_model after a failed run or a reviewer's change request), so the
-# lane's largest card class no longer queues behind one provider's wall. Set both to MODEL/PROVIDER to restore the pin.
+# lane's largest card class no longer queues behind one provider's wall. Only `class:*` routing is ever emitted (kanban_argv).
 TRIAGE_MODEL: Optional[str] = None
 TRIAGE_PROVIDER: Optional[str] = None
 INVESTIGATION_RUNTIME = 3600
@@ -4392,10 +4392,9 @@ def kanban_argv(args: dict, hermes: str = "hermes") -> list:
         "create", args["title"], "--body", args["body"], "--assignee", args["assignee"],
         "--idempotency-key", args["idempotency_key"],
         "--max-runtime", str(args["max_runtime"]), "--created-by", args["created_by"], "--json"]
-    if args.get("model"):
-        argv += ["--model", args["model"]]
-    if args.get("model") and args.get("provider"):
-        argv += ["--provider", args["provider"]]
+    model = str(args.get("model") or "")
+    if model.startswith("class:"):  # class routing only: a legacy concrete model/provider override is dropped, never a pin
+        argv += ["--model", model]
     for s in args.get("skills") or []:
         argv += ["--skill", s]
     req = args.get("requires", SELFHEAL_REQUIRES)

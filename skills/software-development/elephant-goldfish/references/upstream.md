@@ -43,5 +43,8 @@ All text was rewritten for Hermes; no upstream file is copied verbatim except th
 - Added: explicit allowed-input set per reviewer, isolation-boundary disclosure, refutation pass for
   consequential findings, model pinning for design/refutation reviewers, spec digest and source revision
   in every report, citations by heading instead of line ranges.
+- Subsequent routing policy: the original model-pinning adaptation above is historical. Current design and
+  refutation reviews use optional capability-class preferences or no selector, with provider omitted and
+  never mandatory; independence is established by fresh run/session custody and the supported review handoff.
 - Drift is on demand only (upstream suggests periodic runs); no scheduled job.
 - Brainstorm, draft, bootstrap and the structural/style personas were not adapted.

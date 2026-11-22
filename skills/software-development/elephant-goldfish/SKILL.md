@@ -89,9 +89,11 @@ Prompt to trace and report, never "find the bugs": a directive to find something
 is not an OS sandbox. It still inherits global instructions, memory and skills of its profile, and it can read
 any file it can reach. Say "conversation-isolated" in the report, never "zero-context" or "sandboxed".
 
-**Models:** architecture, design-assessment and refutation reviewers are pinned to the strongest model under the
-current user policy (here: `model: claude-opus-5-5`, `provider: anthropic` on the `tasks[]` entry). Other lenses
-may use the default tier.
+**Routing:** architecture, design-assessment and refutation reviewers may request `model: class:deep`
+on the `tasks[]` entry, with provider omitted and never mandatory. Other lenses may use `class:standard`,
+`class:fast` or no selector as their capability needs warrant. Do not select an exact model/provider for
+Kanban or delegate review, including recovery from a quota hold. Independence comes from fresh run/session custody,
+neutral inputs and the supported review handoff, not a different model identity; never bypass quota or billing gates.
 
 ### 3. Stages
 
@@ -111,9 +113,9 @@ review of an already approved design: run 5 (plus 2 if the plan is new to reader
 
 **Refutation:** for each blocker/major finding that would change the design (a consequential design claim),
 dispatch one independent refutation reviewer with the spec, the reading list, the finding text and the
-`Refutation` rubric. Keep a finding only if it survives; record the refuter's verdict either way. Pin
-`model`/`provider` on **every** refutation task, including one you add later for a minor-looking finding (a live
-run left one refuter on the default tier).
+`Refutation` rubric. Keep a finding only if it survives; record the refuter's verdict either way. Apply the
+same capability-only routing to later refutation tasks; `class:deep` is an optional preference, not an
+exact-model requirement or proof of independence. Record each fresh reviewer's custody and inputs.
 
 ### 4. Collect and record findings
 

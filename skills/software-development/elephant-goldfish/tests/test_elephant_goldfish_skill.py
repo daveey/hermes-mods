@@ -123,8 +123,12 @@ class PolicyTest(unittest.TestCase):
         self.assertIn("any edit touched its scope headings", self.text)
         self.assertIn("do not skip that stage on your own judgement", self.text)
 
-    def test_every_refuter_pinned(self):
-        self.assertIn("`model`/`provider` on **every** refutation task", self.text)
+    def test_refuters_use_optional_capability_routing(self):
+        self.assertIn("same capability-only routing to later refutation tasks", self.text)
+        self.assertIn("`class:deep` is an optional preference", self.text)
+        self.assertIn("with provider omitted and never mandatory", self.text)
+        self.assertIn("run/session custody", self.text)
+        self.assertNotIn("`model`/`provider` on **every** refutation task", self.text)
 
     def test_drift_is_read_only_and_unscheduled(self):
         self.assertIn("Drift mode (on demand, read-only)", self.text)

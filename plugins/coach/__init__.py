@@ -752,7 +752,7 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             return None
 
     def _fixloop_card(session_id, st, hit, user_message, turn):
-        """2nd confirmed failure in the window -> one read-only review card pinned to the strong model."""
+        """2nd confirmed failure in the window -> one read-only class:deep review card."""
         try:
             so = _load("second_opinion")
             created = []
