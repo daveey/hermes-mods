@@ -41,6 +41,19 @@ or infer an ancestor's owner. Existing sessions still read exact owner/lineage r
 Unavailable databases or canonical-request readers remain retryable failures, not
 known-empty sources; successful retries clear failure diagnostics and restore `fresh`.
 
+## Header fallback
+
+A validated published `outcome_json.status` remains authoritative, unchanged, with
+`header.source="canonical"`. Otherwise `header.status` is null and `source="derived"`:
+the hub derives presentation from sections, in priority order `needs-you`, `stuck`,
+`running`, `waiting`, then `idle`. Ready/not-started cards count as waiting, not
+settled. Empty readable bundles and done-only history are idle. Legacy outcome
+kinds are never accepted as the status protocol. Row-source `input_errors` retain
+`unknown`; an unavailable session outcome alone does not make readable rows unknown.
+This fallback neither asserts canonical coverage nor authorizes execution or green.
+Desktop renders the backend state/label only for canonical or explicitly derived
+headers; older unmarked missing-status models retain the conservative unknown label.
+
 ## Contract
 
 ```json
@@ -54,8 +67,9 @@ known-empty sources; successful retries clear failure diagnostics and restore `f
     "revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "diagnostics": {"type": "array", "items": {"type": "string"}},
     "header": {
-      "type": "object", "required": ["state", "status", "counts", "pips"],
+      "type": "object", "required": ["state", "status", "source", "counts", "pips"],
       "properties": {
+        "source": {"enum": ["canonical", "derived"]},
         "state": {"type": "string"},
         "status": {"type": ["object", "null"], "description": "Validated core status_version=1 envelope, preserved with identity, revision, generation, coverage and presentation."},
         "counts": {

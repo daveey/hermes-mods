@@ -50,12 +50,21 @@ test('panel status pip consumes the published stripe and revision, never row-cou
  assert.ok(document.body.textContent.includes('done'))
 })
 
-test('panel legacy done is unknown despite completed history', async () => {
- await paint(m.renderModel(cases.canonical_unknown_with_done_history.model))
+test('panel legacy done yields explicitly derived idle, not a canonical status', async () => {
+ const model = cases.derived_idle_with_done_history.model
+ assert.equal(model.header.source, 'derived')
+ assert.equal(model.header.status, null)
+ await paint(m.renderModel(model))
+ assert.equal(document.querySelector('[data-session-status]')?.textContent, 'idle')
  const pip = document.querySelector('[data-panel-status-stripe]')
  assert.equal(pip?.getAttribute('data-panel-status-stripe'), 'attention')
  assert.equal(pip?.style.background, 'var(--color-amber-500)')
  assert.ok(!pip?.hasAttribute('data-panel-status-revision'))
+})
+
+test('unreadable panel row inputs keep derived unknown', async () => {
+ await paint(m.renderModel(cases.derived_unknown_with_done_history.model))
+ assert.equal(document.querySelector('[data-session-status]')?.textContent, 'unknown')
 })
 
 test('mixed-version backend cannot publish a legacy done label without status', async () => {

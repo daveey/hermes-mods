@@ -72,7 +72,55 @@ def test_canonical_header_never_rederived_from_rows():
     m = model.reduce_panel(bundle(task(status='running'), outcome_json=canonical_outcome('decision')), now=NOW)
     assert m['header']['state'] == 'decision'
     assert not m['sections']['needs_you']
-    assert model.reduce_panel(bundle(), now=NOW)['header']['state'] == 'unknown'
+    assert model.reduce_panel(bundle(), now=NOW)['header']['state'] == 'idle'
+
+
+def assert_derived(b, state):
+    m = model.reduce_panel(b, now=NOW, projector=project)
+    assert m['header']['state'] == state
+    assert m['header']['source'] == 'derived'
+    assert m['header']['status'] is None
+    assert m == model.reduce_panel(b, now=NOW, projector=project)
+    return m
+
+
+def test_derived_needs_you_precedes_stuck_running_and_waiting():
+    b = bundle(task(human_request=human(), wait={'wait_state': 'human'}),
+               observed(task('t_run', status='running')),
+               task('t_stuck', status='scheduled', wait={'wait_state': 'stalled'}),
+               task('t_wait', status='scheduled'))
+    assert assert_derived(b, 'needs-you')['header']['label'] == 'needs you'
+
+
+def test_derived_stuck_precedes_running_and_waiting():
+    assert_derived(bundle(task(status='scheduled', wait={'wait_state': 'stalled'}),
+                          observed(task('t_run', status='running')), task('t_wait', status='scheduled')), 'stuck')
+
+
+def test_derived_running_precedes_waiting():
+    assert_derived(bundle(observed(task(status='running')), task('t_wait', status='scheduled')), 'running')
+
+
+def test_derived_waiting_includes_ready_work_not_idle():
+    assert_derived(bundle(task(status='scheduled')), 'waiting')
+    assert_derived(bundle(task(status='ready')), 'waiting')
+    assert_derived(bundle(task(status='todo')), 'waiting')
+
+
+def test_derived_idle_empty_and_all_cards_settled():
+    assert_derived(bundle(), 'idle')
+    assert_derived(bundle(done=[task(status='done')]), 'idle')
+    assert_derived(bundle(outcome_json={'kind': 'running'}), 'idle')
+    assert_derived(bundle(input_errors=['session outcome unavailable']), 'idle')
+
+
+def test_derived_unknown_only_for_unreadable_row_sources():
+    for error in ('user-steps requests unavailable', 'rentals unavailable', 'process inventory unknown: missing identity'):
+        assert_derived(bundle(input_errors=[error]), 'unknown')
+        assert_derived(bundle(task(human_request=human(), wait={'wait_state': 'human'}), input_errors=[error]), 'unknown')
+    # An unreadable source cannot override a valid canonical status.
+    m = model.reduce_panel(bundle(outcome_json=canonical_outcome(), input_errors=['rentals unavailable']), now=NOW)
+    assert m['header']['source'] == 'canonical' and m['header']['state'] == 'done'
 
 
 def test_remote_retiring_delivery_is_not_terminal_even_after_card_departure():
