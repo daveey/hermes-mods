@@ -76,7 +76,10 @@ select id,status,coalesce(block_kind,''),title,session_id,created_by from tasks
 Per card, its chat ownership:
 `select chat_gateway,chat_session,kind,released from task_chat_links where task_id=?`.
 Live owner = an unreleased link whose session exists in that gateway's `state.db` `sessions`, is not `archived`, and
-did not end with `end_reason='startup_orphan_reap'`. Report **unlinked** (no links, or all released) and
+did not end with `end_reason='startup_orphan_reap'`. Any link kind counts (`created` too). `ended_at` alone doesn't mean
+dead: `ws_orphan_reap` leaves it set on chats still in use, so read `last_activity_at`. When the card has a live owner,
+or its newest comments name a decision card the owner already filed, file no ask of your own: name that chat or card
+in the report. Report **unlinked** (no links, or all released) and
 **reaped-only** cards separately: no chat will ever pick them up.
 
 Then for each card read the latest ~6 `task_events` and the last 2 `task_comments`. The latest comment often
