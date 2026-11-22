@@ -49,6 +49,9 @@ MAX_REQUEST = 200            # chats one request may register
 FIRST_CHUNK = 4              # a pass stores and pushes the chats asked for most recently first, this many...
 CHUNK = 16                   # ...then the rest this many at a time, so a click never waits for a whole sweep
 DECISION_FULL_EVERY_S = 30.0 # a chat whose decision inputs did not move is still re-read this often
+RETRY_EVERY_S = 2.0          # with no write to wake a pass: a read that failed or raced is tried again this often
+MIN_IDLE_WAIT_S = 0.2        # the event-driven loop never sleeps less than this between idle checks
+OPEN_KEYS = ('tasks', 'requests', 'subagents', 'processes', 'rentals')  # a bundle with any of these ages
 SNAPSHOT_VERSION = 1         # the on-disk shape of Feed.snapshot()
 RESTORE_REV_GAP = 1_000_000  # a restored feed's revisions start this far past the snapshot's (see Feed.restore)
 CHAIN_DEPTH = 6              # hops per chain (session-panel walks at most six cards)
@@ -146,12 +149,14 @@ class Feed:
         self._decision_files: Any = None     # the same for the decision lane's last complete pass
         self._cursor: Any = None
         self._last_full = 0.0
+        self._last_pass = 0.0   # clock of the last tick (the idle retry is measured from it)
         self._flights: dict[str, _Flight] = {}
         self._retry: set[str] = set()  # a tick joined reads that may predate its change cursor
         self._carried: set[str] = set()  # bundles resumed from a stopped feed: never vouched for until restored
         self._reissue: set[str] = set()  # restored from another process: their recompute takes a new revision
         self._successor: Optional['Feed'] = None  # the feed that resumed this one (requests still here move on)
         self._decision_failures: set[str] = set()
+        self._last_decision = 0.0  # clock of the last decision pass
         self._decision_lock = threading.Lock()  # cheap read lane, never board computation
         self._registrations = queue.SimpleQueue()
         # [daveey 2026-11-22] "no polling. Update only when the data changes": the producer threads sleep on these.
@@ -343,7 +348,7 @@ class Feed:
             # after it is seen by the next pass). A chat whose stamp did not move is not re-read every pass: on
             # the hub that was one user-steps read per watched chat per second, most of the serve's lock traffic.
             rd = self.readers if readers is None else readers
-            now = self.clock()
+            now = self._last_decision = self.clock()
             files = getattr(rd, 'panel_files_stamp', None)
             moved = files() if callable(files) else None
             if (moved is not None and moved == self._decision_files and not failed
@@ -636,16 +641,55 @@ class Feed:
             self._panel_stamps[s] = stamp
         return dirty
 
-    def beat(self) -> int:
-        """Liveness only, between data changes: registrations are renewed, expired interest dropped and a heartbeat
-        pushed when due. Reads no database and computes nothing (a chat that turns out to need a bundle wakes a
-        pass)."""
-        self._drain()
+    def _full_dirty(self, watched, now: float) -> set:
+        """(lock held) The chats the safety-net pass recomputes with no event behind them. Open cards carry run
+        evidence that expires and lines that count time: those chats every FULL_EVERY_S. A chat with none changes
+        only through card events or a link adopted with no event: every QUIET_FULL_EVERY_S."""
+        return {s for s in watched if s not in self.bundles
+                or any(self.bundles[s]['bundle'].get(k) for k in OPEN_KEYS)
+                or now - self.bundles[s]['bundle'].get('computed_at', 0) >= QUIET_FULL_EVERY_S}
+
+    def _due(self, now: float) -> tuple:
+        """(seconds until a pass is due with no write behind it or None, the same for the decision lane). Memory
+        only. What the passing of time alone makes due: the safety-net pass for a held chat that ages (its
+        time-derived lines, evidence expiry and vouch), and the retry of a read that failed or raced. A backend
+        whose watched chats have no open work and no failure has nothing due before QUIET_FULL_EVERY_S."""
         with self.lock:
-            self._expire(self.clock())
+            watched = [s for s in self.interest if s in self.bundles]
+            due = None
+            if len(watched) < len(self.interest) or self._retry.intersection(self.interest):
+                due = self._last_pass + RETRY_EVERY_S
+            full_at = self._last_full + self.full_every_s
+            for s in watched:
+                b = self.bundles[s]['bundle']
+                at = full_at if any(b.get(k) for k in OPEN_KEYS) else max(
+                    full_at, b.get('computed_at', 0) + QUIET_FULL_EVERY_S)
+                due = at if due is None else min(due, at)
+                if due <= now:
+                    break
+            decide = self._last_decision + RETRY_EVERY_S if self._decision_failures.intersection(self.interest) else None
+        return (None if due is None else due - now, None if decide is None else decide - now)
+
+    def idle_wait(self) -> float:
+        """How long the event-driven loop sleeps when no file is written: to the liveness heartbeat, or sooner when
+        `_due` says a pass will be due before it."""
+        waits = [w for w in self._due(self.clock()) if w is not None]
+        return max(MIN_IDLE_WAIT_S, min([self.heartbeat_s, *waits]))
+
+    def beat(self) -> int:
+        """Between data changes: registrations are renewed, expired interest dropped and a heartbeat pushed when
+        due. Reads no database and computes nothing: a chat that needs a bundle, a held chat whose time-derived
+        state is due (`_due`) or a pending retry wakes a pass instead."""
+        self._drain()
+        now = self.clock()
+        with self.lock:
+            self._expire(now)
             self._publish_wire()
-            if any(s not in self.bundles for s in self.interest):
-                self._wake.set()
+        due, decide = self._due(now)
+        if due is not None and due <= 0:
+            self._wake.set()
+        if decide is not None and decide <= 0:
+            self._decide.set()
         return len(self._publish({}, heartbeat=True))
 
     def tick(self) -> int:
@@ -653,7 +697,7 @@ class Feed:
         Stored and pushed in chunks, the chats a reader is waiting for first: a click on a chat with no bundle is
         answered after its own compute, not after a whole sweep (requests arriving mid-pass are taken in between
         chunks)."""
-        now = self.clock()
+        now = self._last_pass = self.clock()
         self._wake.clear()  # before the drain: a request or write after this point wakes the next pass
         self._cold.clear()
         with self.lock:
@@ -685,11 +729,8 @@ class Feed:
         self._stamps = stamps
         if full:
             self._last_full = now
-            # Open cards carry run evidence that expires: those chats every FULL_EVERY_S. A chat with none changes
-            # only through card events (handled below) or a link adopted with no event: every QUIET_FULL_EVERY_S.
             with self.lock:
-                dirty = {s for s in watched if s not in self.bundles or any(self.bundles[s]['bundle'].get(k) for k in ('tasks', 'requests', 'subagents', 'processes', 'rentals'))
-                         or now - self.bundles[s]['bundle'].get('computed_at', 0) >= QUIET_FULL_EVERY_S}
+                dirty = self._full_dirty(watched, now)
             touched = {v for v in changed_cards.values() if v}
             with self.lock:
                 for s in watched:

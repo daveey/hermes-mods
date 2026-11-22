@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import functools
 import hashlib
 import copy
@@ -945,9 +946,11 @@ class FileWatch:
     Nothing here polls: `wait` sleeps in select until the kernel reports a write (or `timeout`). `ok` is False
     where neither exists; the feed then keeps its timed loop."""
     _IN = 0x2 | 0x40 | 0x80 | 0x100 | 0x200  # MODIFY | MOVED_FROM | MOVED_TO | CREATE | DELETE
+    _Q_OVERFLOW, _IGNORED = 0x4000, 0x8000   # the kernel dropped events | a watch ended (its directory is gone)
 
     def __init__(self):
         self.ok, self._fd, self._kq, self._libc = False, -1, None, None
+        self.stale = False  # a watch ended under us: the owner re-lists (set_paths) before it sleeps again
         self._dirs: dict[str, int] = {}      # inotify: directory -> watch descriptor
         self._names: dict[int, set] = {}     # inotify: watch descriptor -> file names wanted in it
         self._fds: dict[str, int] = {}       # kqueue: path -> descriptor
@@ -987,13 +990,26 @@ class FileWatch:
             wd = self._dirs.pop(d)
             self._names.pop(wd, None)
             self._libc.inotify_rm_watch(self._fd, wd)
+        self.stale = False
+        import ctypes
         for d, names in want.items():
-            wd = self._dirs.get(d)
-            if wd is None:
-                wd = self._libc.inotify_add_watch(self._fd, os.fsencode(d), self._IN)
-                if wd < 0:
+            # Asked every time: the kernel answers with the watch it already has for this directory, or a new one
+            # when the directory was removed and made again (the old watch died with it).
+            wd = self._libc.inotify_add_watch(self._fd, os.fsencode(d), self._IN)
+            old = self._dirs.get(d)
+            if wd < 0:
+                err = ctypes.get_errno()
+                if old is not None:
+                    self._dirs.pop(d)
+                    self._names.pop(old, None)
+                if err in (errno.ENOENT, errno.ENOTDIR):
                     continue  # no such directory yet: taken up by a later set_paths
-                self._dirs[d] = wd
+                # Refused (ENOSPC: fs.inotify.max_user_watches; EACCES...): a feed that believed it was watching
+                # would never hear a write. The owner logs this and goes back to the timed loop.
+                raise OSError(err, f'inotify_add_watch refused: {os.strerror(err)}', d)
+            if old is not None and old != wd:
+                self._names.pop(old, None)
+            self._dirs[d] = wd
             self._names[wd] = names
 
     def _arm(self) -> None:
@@ -1038,10 +1054,18 @@ class FileWatch:
                 continue
             hit, at = False, 0
             while at + 16 <= len(data):
-                wd, _mask, _cookie, size = struct.unpack_from('iIII', data, at)
+                wd, mask, _cookie, size = struct.unpack_from('iIII', data, at)
                 name = data[at + 16:at + 16 + size].split(b'\0', 1)[0]
                 at += 16 + size
-                hit = hit or os.fsdecode(name) in self._names.get(wd, ())
+                if mask & self._Q_OVERFLOW:
+                    hit = True  # events were dropped: any of ours may be among them
+                elif mask & self._IGNORED:
+                    if wd in self._names:  # a watched directory went away (not our own rm_watch): its files with it
+                        self._names.pop(wd)
+                        self._dirs = {d: w for d, w in self._dirs.items() if w != wd}
+                        self.stale = hit = True
+                else:
+                    hit = hit or os.fsdecode(name) in self._names.get(wd, ())
             if hit:
                 return True  # anything else in those directories (logs, locks) is not ours
 
@@ -1060,11 +1084,17 @@ class FileWatch:
 def _watch(f, watch: FileWatch, paths) -> None:
     """The feed's one watcher thread: a write to a source file makes a pass due on both lanes."""
     try:
+        listed = None
         while not f.stopped.is_set():
-            watch.set_paths(paths())
-            if watch.wait(WATCH_REFRESH_S) and not f.stopped.is_set():
+            # The file list is read every WATCH_REFRESH_S (and when a watch ended), never once per write: on a
+            # busy backend writes arrive many times a second.
+            if listed is None or watch.stale or time.monotonic() - listed >= WATCH_REFRESH_S:
+                watch.set_paths(paths())
+                listed = time.monotonic()
+            if watch.wait(max(0.0, listed + WATCH_REFRESH_S - time.monotonic())) and not f.stopped.is_set():
                 f._wake.set()
                 f._decide.set()
+                f.stopped.wait(DEBOUNCE_S)  # one wake per burst; what is written meanwhile wakes the next round
     except Exception:
         log.warning('session-panel feed: file watch failed; back to the timed loop', exc_info=True)
         f._watching = False
@@ -1106,7 +1136,7 @@ def _run_decisions(f) -> None:
             if _event_driven(f):
                 # No timer: sleeps until a source file is written (the watcher) or the feed stops.
                 if not first:
-                    f._decide.wait()
+                    f._decide.wait()  # a source file was written, or the idle check found a failed read to retry
                     f.stopped.wait(max(DEBOUNCE_S, MIN_GAP_S - (time.monotonic() - started)))
                 if f.stopped.is_set():
                     break
@@ -1136,7 +1166,8 @@ def _run(f) -> None:
             if _event_driven(f):
                 # No timer drives a recompute: this sleeps until a source file is written or a read finds no bundle.
                 # With neither, it wakes for the liveness heartbeat only (no database, nothing computed).
-                if not f._wake.wait(getattr(f, 'heartbeat_s', 20.0)):
+                idle = getattr(f, 'idle_wait', None)
+                if not f._wake.wait(idle() if callable(idle) else getattr(f, 'heartbeat_s', 20.0)):
                     try:
                         f.beat()
                     except Exception:

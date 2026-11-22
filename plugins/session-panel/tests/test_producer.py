@@ -224,6 +224,7 @@ def test_only_the_backend_import_of_the_plugin_api_starts_the_producer():
 
 def test_the_backend_import_starts_the_feed_before_any_request(monkeypatch):
     # Core's app runs a lifespan (router startup hooks never fire) and may mount plugin routes long after startup.
+    pytest.importorskip('hermes_cli.kanban_db')  # the import starts the real feed, whose readers are core's
     monkeypatch.setattr(sys, 'argv', ['hermes', 'serve', '--port', '1'])
     loader = sys.modules.get('_session_panel_feed_loader')
     core = sys.modules.get('_session_panel_feed_core')
@@ -433,3 +434,243 @@ def test_board_events_are_read_only_when_a_board_file_moved():
     r.board += 1
     f.tick()
     assert r.cards == base + 1
+
+
+# --- review 6010587797: what time alone makes due, a refused watch, a directory made again ---
+
+def test_a_quiet_backend_still_ages_open_work_and_retries_and_an_idle_one_does_nothing():
+    f, r, pushed, t = make()
+    f.changes(['S1'])  # the test readers give every chat a running card
+    f.tick()
+    assert f.bundles['S1']['bundle'].get('tasks')
+    assert f._due(t['now'])[0] == pytest.approx(f.full_every_s), 'due when its run evidence and counted time age'
+    assert f.idle_wait() == f.heartbeat_s
+    t['now'] += f.full_every_s - 5
+    assert f.idle_wait() == pytest.approx(5), 'the loop sleeps to that moment, not to the next heartbeat after it'
+    f.beat()
+    assert not f._wake.is_set()
+    t['now'] += 5
+    before = f.bundles['S1']['bundle']['computed_at']
+    f.beat()
+    assert f._wake.is_set(), 'no write for full_every_s: the safety-net pass is woken'
+    f.tick()
+    assert f.bundles['S1']['bundle']['computed_at'] > before and not f._wake.is_set()
+    assert f._due(t['now'])[0] == pytest.approx(f.full_every_s)
+
+
+def test_a_chat_with_no_open_work_is_not_due_before_the_quiet_period():
+    f, r, pushed, t = make()
+    f.changes(['Q1'])  # no card linked to it
+    f.tick()
+    b = f.bundles['Q1']['bundle']
+    assert not any(b.get(k) for k in feedmod.OPEN_KEYS)
+    t['now'] += f.full_every_s * 2
+    assert f.idle_wait() == f.heartbeat_s
+    f.beat()
+    assert not f._wake.is_set() and not f._decide.is_set(), 'idle: nothing woken, nothing read'
+    t['now'] = b['computed_at'] + feedmod.QUIET_FULL_EVERY_S
+    f.beat()
+    assert f._wake.is_set()
+
+
+def test_a_pending_retry_wakes_a_pass_without_a_write():
+    f, r, pushed, t = make()
+    f.changes(['S1'])
+    f.tick()
+    f._retry.add('S1')  # a read that raced its change cursor (or a stale source row)
+    assert f.idle_wait() == pytest.approx(feedmod.RETRY_EVERY_S)
+    f.beat()
+    assert not f._wake.is_set(), 'not back to back'
+    t['now'] += feedmod.RETRY_EVERY_S
+    f.beat()
+    assert f._wake.is_set()
+    f.tick()
+    assert 'S1' not in f._retry
+
+
+def test_a_failed_decision_read_wakes_the_decision_lane_without_a_write():
+    f, r, pushed, t = make(Stamped())
+    f.changes(['S1'])
+    f.refresh_decisions()
+    real = r.decision_inputs
+    r.store += 1
+    r.decision_inputs = lambda s, lineage: (_ for _ in ()).throw(RuntimeError('database is locked'))
+    f.refresh_decisions()
+    assert f._decision_failures == {'S1'}
+    f.tick()
+    assert f.idle_wait() == pytest.approx(feedmod.RETRY_EVERY_S)
+    t['now'] += feedmod.RETRY_EVERY_S
+    r.decision_inputs = real
+    f.beat()
+    assert f._decide.is_set()
+    f.refresh_decisions()
+    assert not f._decision_failures
+    f._decide.clear()
+    t['now'] += feedmod.RETRY_EVERY_S
+    f.beat()
+    assert not f._decide.is_set()
+
+
+def test_the_event_loop_runs_the_due_pass_and_the_retries_with_no_write(tmp_path, monkeypatch):
+    api = load('_spf_due_api', API)
+    if not api.FileWatch().ok:
+        pytest.skip('no kernel file notification on this platform')
+    monkeypatch.setattr(api, 'save_snapshot', lambda f: True)
+    monkeypatch.setattr(api, 'CoreReaders', lambda: r)
+    r = Watched(tmp_path)
+    f = Feed(r, emit=lambda p: None, full_every_s=1.0)
+    computed = []
+    real = f.compute
+    f.compute = lambda s, **k: (computed.append(s), real(s, **k))[1]
+    f.changes(['S1'])
+    computed.clear()
+    threads = running(api, f)
+    try:
+        time.sleep(0.6)
+        # A decision read fails once after a store write, then nothing is written again.
+        fail = {'left': 1}
+        real_inputs = r.decision_inputs
+
+        def inputs(s, lineage):
+            if fail['left']:
+                fail['left'] -= 1
+                raise RuntimeError('database is locked')
+            return real_inputs(s, lineage)
+        r.decision_inputs = inputs
+        r.store += 1
+        r.db.write_bytes(b'1')
+        deadline = time.monotonic() + 3
+        while not f._decision_failures and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert f._decision_failures == {'S1'}
+        computed.clear()
+        time.sleep(4.2)  # no write at all
+        assert len(computed) >= 3, f'{len(computed)} recomputes of an open-card chat in 4 s at full_every_s=1'
+        assert not f._decision_failures, 'the failed decision read was retried'
+    finally:
+        f.stopped.set()
+        for t in threads:
+            t.join(5)
+    assert not any(t.is_alive() for t in threads)
+
+
+def test_a_refused_inotify_watch_raises_and_the_feed_goes_back_to_the_timed_loop(tmp_path, monkeypatch):
+    import ctypes
+    import errno
+    api = load('_spf_refused_api', API)
+    w = api.FileWatch()
+    if not w.ok or w._libc is None:
+        pytest.skip('inotify only')
+
+    class Refusing:
+        def __init__(self, libc):
+            self._libc = libc
+
+        def inotify_add_watch(self, fd, path, mask):
+            ctypes.set_errno(errno.ENOSPC)
+            return -1
+
+        def __getattr__(self, name):
+            return getattr(self._libc, name)
+    db = tmp_path / 'state.db'
+    db.write_bytes(b'0')
+    w._libc = Refusing(w._libc)
+    try:
+        with pytest.raises(OSError) as e:
+            w.set_paths([db])
+        assert e.value.errno == errno.ENOSPC
+    finally:
+        w.close()
+    # The feed: a watch refused on its first listing is not believed; the timed loop takes over and sees the write.
+    real_watch = api.FileWatch
+
+    def refusing_watch():
+        made = real_watch()
+        made._libc = Refusing(made._libc)
+        return made
+    monkeypatch.setattr(api, 'FileWatch', refusing_watch)
+    monkeypatch.setattr(api, 'save_snapshot', lambda f: True)
+    monkeypatch.setattr(api, 'CoreReaders', lambda: r)
+    monkeypatch.setattr(api, 'TICK_S', 0.2)
+    r = Watched(tmp_path)
+    f = Feed(r, emit=lambda p: None)
+    f.changes(['S1'])
+    threads = running(api, f)
+    try:
+        deadline = time.monotonic() + 3
+        while getattr(f, '_watching', None) is not False and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert f._watching is False
+        r.files += 1
+        r.rows['S1'] = {'kind': 'done'}
+        r.db.write_bytes(b'1')
+        deadline = time.monotonic() + 3
+        while f.bundles['S1']['bundle']['outcome_json'] != {'kind': 'done'} and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert f.bundles['S1']['bundle']['outcome_json'] == {'kind': 'done'}
+    finally:
+        f.stopped.set()
+        for t in threads:
+            t.join(5)
+
+
+def test_a_watched_directory_removed_and_made_again_is_watched_again(tmp_path):
+    import shutil
+    api = load('_spf_rewatch_api', API)
+    w = api.FileWatch()
+    if not w.ok or w._libc is None:
+        pytest.skip('inotify only')
+    board = tmp_path / 'boards' / 'b1'
+    board.mkdir(parents=True)
+    db = board / 'kanban.db'
+    db.write_bytes(b'0')
+    try:
+        w.set_paths([db])
+        assert w.wait(0.2) is False
+        shutil.rmtree(board)
+        board.mkdir()
+        w.set_paths([db])  # before the kernel's "watch ended" is read
+        while w.wait(0.2):
+            pass
+        db.write_bytes(b'1')
+        assert w.wait(2) is True
+        # And when the ended watch is read first: it counts as a change and asks for a re-list.
+        while w.wait(0.1):
+            pass
+        shutil.rmtree(board)
+        assert w.wait(2) is True and w.stale
+        board.mkdir()
+        w.set_paths([db])
+        assert not w.stale
+        while w.wait(0.1):
+            pass
+        db.write_bytes(b'2')
+        assert w.wait(2) is True
+    finally:
+        w.close()
+
+
+def test_the_watcher_lists_the_files_on_a_period_not_once_per_write(tmp_path, monkeypatch):
+    api = load('_spf_listing_api', API)
+    if not api.FileWatch().ok:
+        pytest.skip('no kernel file notification on this platform')
+    r = Watched(tmp_path)
+    f = Feed(r, emit=lambda p: None)
+    listings = []
+    paths = lambda: (listings.append(1), [r.db])[1]
+    watch = api.FileWatch()
+    t = threading.Thread(target=api._watch, args=(f, watch, paths), daemon=True)
+    t.start()
+    try:
+        time.sleep(0.2)
+        for i in range(60):
+            r.db.write_bytes(b'%d' % i)
+            time.sleep(0.01)
+        time.sleep(0.3)
+        assert f._wake.is_set() and f._decide.is_set()
+        assert len(listings) == 1, len(listings)
+    finally:
+        f.stopped.set()
+        r.db.write_bytes(b'stop')
+        t.join(5)
+    assert not t.is_alive()
