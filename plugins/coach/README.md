@@ -1111,8 +1111,12 @@ config turns them on.
 Settings (env wins, then config `plugins.entries.coach.settings.<key>`): `fixloop_review` / `COACH_FIXLOOP_REVIEW`,
 `fixloop_review_assignee` (default
 `default`), `diff_review` / `COACH_DIFF_REVIEW`, `diff_review_max_chars` (60000), `diff_review_timeout_s` (120), and
-`diff_review_threshold` (default: the reply threshold). The reviewer model is `auxiliary.coach_diff_review.{provider,model}`
-Without that key the auxiliary requests `class:deep`. Legacy `fixloop_review_model` and
+`diff_review_threshold` (default: the reply threshold). The reviewer model is `auxiliary.coach_diff_review.{provider,model}`.
+Without a model or specialized provider/transport config the auxiliary requests `class:deep`.
+Provider/transport-only config is left to the auxiliary resolver, without an injected class.
+A routing failure is not retried through another path: it emits a warning and a `diff_review`
+record with `ok: false` and `error_type` (exception class only, not potentially sensitive exception text).
+The existing next-rule fallback remains; an unavailable review is not a clean review. Legacy `fixloop_review_model` and
 `fixloop_review_provider` keys (including environment overrides) are ignored; shared config cannot
 reintroduce an exact Kanban pin. Genuine review independence remains a separate run/session with
 authentic author/reviewer custody through the supported review handoff, never a concrete pin.

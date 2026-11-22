@@ -154,6 +154,23 @@ def _reply_hooks(tmp_path, env, unverified=0.9, on=True):
 REPLY = "Done: add() is fixed."
 
 
+def test_diff_review_failure_is_visible(tmp_path, env, repo, caplog):
+    hooks, judged, reviewed, store = _reply_hooks(tmp_path, env)
+    so = _mod("coach_init_so_rc")._load("second_opinion")
+    def fail(*args, **kwargs):
+        raise RuntimeError('Model class routing is disabled')
+    env.setattr(so, 'aux_review', fail)
+    hooks['pre_llm_call'](session_id='s1', user_message='fix add()')
+    (repo / 'calc.py').write_text('def add(a, b):\n    return a - b\n')
+    hooks['pre_verify'](session_id='s1', attempt=0, final_response=REPLY,
+                        changed_paths=[str(repo / 'calc.py')])
+    assert 'coach diff_review failed' in caplog.text
+    records = list(store.read_log())
+    failed = [r for r in records if r.get('event') == 'diff_review']
+    assert len(failed) == 1 and not failed[0]['ok']
+    assert failed[0]['error_type'] == 'RuntimeError'
+
+
 def test_unverified_with_repo_change_runs_one_diff_review(tmp_path, env, repo):
     hooks, judged, reviewed, store = _reply_hooks(tmp_path, env)
     hooks["pre_llm_call"](session_id="s1", user_message="fix add()")

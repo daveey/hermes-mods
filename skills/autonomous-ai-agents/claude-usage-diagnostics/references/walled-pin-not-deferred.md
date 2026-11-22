@@ -16,7 +16,8 @@ not, the gateway logs once per wall episode and reason:
 
 Legacy Kanban exact pins can also produce `explicit`; that is diagnostic history, not a policy to retain
 them. For Kanban and delegate reviews, clear exact-model/provider and mandatory restrictions through the
-supported routing interface. Use no selector or an optional `class:deep`, `class:standard` or `class:fast`
+supported routing interface: `hermes kanban set-model <id> none`, or
+`hermes kanban set-model <id> class:<level> --no-mandatory`. Use no selector or an optional `class:deep`, `class:standard` or `class:fast`
 preference, with provider omitted and never mandatory. Keep real quota/pacing and billing gates intact;
 review independence requires fresh run/session custody and the supported review handoff, not model identity.
 

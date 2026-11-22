@@ -16,7 +16,6 @@ Both are OFF by default (current behaviour). Settings: env first, then config.ya
 | key | env | default |
 |---|---|---|
 | fixloop_review | COACH_FIXLOOP_REVIEW | false |
-
 | fixloop_review_assignee | COACH_FIXLOOP_REVIEW_ASSIGNEE | default |
 | diff_review | COACH_DIFF_REVIEW | false |
 | diff_review_max_chars | COACH_DIFF_REVIEW_MAX_CHARS | 60000 |
@@ -24,7 +23,9 @@ Both are OFF by default (current behaviour). Settings: env first, then config.ya
 | diff_review_threshold | COACH_DIFF_REVIEW_THRESHOLD | reply threshold (0.7) |
 
 The diff reviewer's model is the aux task's: `auxiliary.coach_diff_review.{provider,model}`.
-With no aux config it requests class:deep. Legacy fixloop_review_model/provider config and environment
+With no aux model or specialized provider/transport config it requests class:deep.
+Routing failures are surfaced by the caller, without an unconstrained retry.
+Legacy fixloop_review_model/provider config and environment
 values are ignored; they cannot constrain Kanban routing.
 """
 from __future__ import annotations
@@ -62,7 +63,6 @@ _FALSE = ("0", "off", "false", "no", "")
 
 DEFAULTS = {
     "fixloop_review": False,
-
     "fixloop_review_assignee": "default",
     "diff_review": False,
     "diff_review_max_chars": 60000,
@@ -338,7 +338,12 @@ def aux_review(system: str, prompt: str, timeout: float = 120, settings: Optiona
         aux = ((load_config_readonly() or {}).get("auxiliary") or {}).get("coach_diff_review") or {}
     except Exception:
         aux = {}
-    if not aux.get("model"):
+    # Do not combine our class default with a specialized provider/transport.
+    # Let the auxiliary resolver honor that config; never retry a routing refusal
+    # through a less constrained path.
+    specialized = aux.get("provider") not in (None, "", "auto") or any(
+        aux.get(key) for key in ("base_url", "api_key", "api_mode", "key_env", "api_key_env"))
+    if not aux.get("model") and not specialized:
         kw["model"] = "class:deep"
     resp = call_llm(task="coach_diff_review", messages=[{"role": "system", "content": system},
                                                        {"role": "user", "content": prompt}],

@@ -9,7 +9,7 @@ Retrying or unblocking unchanged repeats the error. Do not recover by selecting 
 Fix it on the card's home gateway (for a worker, via `hub-worker-exec <worker> -- '...'`):
 1. Inspect installed review admission and the actual implementer run/session custody. Use the supported
    review handoff to a genuinely separate reviewer; do not erase or fabricate authorship evidence.
-2. Remove legacy exact-model/provider and mandatory restrictions through the supported routing interface.
+2. Remove legacy exact-model/provider and mandatory restrictions with `hermes kanban set-model <id> none`, or `hermes kanban set-model <id> class:<level> --no-mandatory` (deep, standard or fast).
    Leave routing unselected or request an optional `class:deep` / `class:standard` capability preference,
    with provider omitted and never mandatory. Do not lower review acceptance to obtain a route.
 3. Comment the custody evidence and routing change. Keep quota, pacing, funding and billing gates intact.

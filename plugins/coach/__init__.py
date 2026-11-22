@@ -778,15 +778,18 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         coach.loop_state(session_id)["diff_reviewed"] = coach.turn_number(session_id)
         t0 = time.time()
         since = getattr(coach, "turn_started", lambda _s: None)(session_id)
+        error_type = None
         try:
             rc = _load("reply_check")
             v = so.diff_review(ask, final_response, log_lines, changed_paths, since, repos=repos,
                                llm=lambda s, p: so.aux_review(
                                    s, p, timeout=rc.call_timeout(so.setting("diff_review_timeout_s"))))
         except Exception as exc:
-            log.debug("coach diff_review: %s", exc)
+            error_type = type(exc).__name__
+            log.warning("coach diff_review failed (%s); review not performed", error_type)
             v = None
         store.log({"event": "diff_review", "session_id": session_id, "p": hit["p"], "ok": bool(v),
+                   "error_type": error_type,
                    "repos": (v or {}).get("repos") or list(repos), "findings": len((v or {}).get("findings") or []),
                    "supported": (v or {}).get("supported"), "diff_chars": (v or {}).get("diff_chars"),
                    "secs": round(time.time() - t0, 1)})
