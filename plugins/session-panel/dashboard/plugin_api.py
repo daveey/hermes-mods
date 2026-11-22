@@ -275,14 +275,41 @@ class CoreReaders:
                 stale_ok=False, origin_cards=cards, unreadable_out=unreadable))
             if unreadable:
                 raise RuntimeError('session-panel external replica capture unavailable')
+        # Held parents can belong to a different chat. Match their known owner
+        # coordinates, not a bare ID shared by unrelated gateways/boards.
+        refs = {s: self._external_refs(value) for s, value in held.items()}
+        def refers(session, row):
+            return any(all(not coordinate or not row.get(key) or row[key] == coordinate
+                           for key, coordinate in scope.items())
+                       for scope in refs[session].get(row.get('id'), ()))
         # Retain every field, including evidence timestamps: they affect lease
         # validity. No presentation classifier or guessed volatile-field filter.
         return {s: tuple(sorted(json.dumps(row, sort_keys=True, separators=(',', ':'))
                                 for row in rows
                                 if set(value['lineage']).intersection(
                                     (row.get('session'), row.get('origin_session'), row.get('resolved_session')))
-                                or row.get('id') in value['refs']))
+                                or refers(s, row)))
                 for s, value in held.items()}
+
+    @staticmethod
+    def _external_refs(held):
+        bundle = held.get('bundle') or {}
+        rows = list(bundle.get('tasks', ())) + list(bundle.get('done', ()))
+        for card_id, record in bundle.get('cards', {}).items():
+            task = record.get('detail', {}).get('task', {})
+            rows.append({**task, 'id': task.get('id') or card_id,
+                         **{key: record[key] for key in ('gateway', 'profile', 'board')
+                            if record.get(key)}})
+        refs = {}
+        for row in rows:
+            if row.get('id') in held['refs']:
+                refs.setdefault(row['id'], []).append(
+                    {key: row.get(key) for key in ('gateway', 'profile', 'board')})
+        # Old/restored bundles may lack hydrated scope. Preserve invalidation
+        # until hydration supplies it; absence is not proof of another owner.
+        for card_id in held['refs']:
+            refs.setdefault(card_id, [{}])
+        return refs
 
     @staticmethod
     def _pull_observation(row):
