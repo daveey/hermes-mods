@@ -57,7 +57,11 @@ Before writing an ask, look for one that already exists. A decision card the own
 comments, or a blocked card whose evidence cites this card) is the ask: point at it and never file a second one,
 because two asks split David's answer. A live owner chat holds release: message it instead of asking David. Live
 means an unreleased link of any kind (`created` counts) to a session with recent `last_activity_at`. Don't go by
-`ended_at`: `ws_orphan_reap` leaves it set on chats still in use. Test each option you would offer against the card
+`ended_at`: `ws_orphan_reap` leaves it set on chats still in use. A `scope_stopped` hold is released only by
+`hermes kanban renew-scope` (then `promote`) run by the card's owning chat, a human terminal, or its creator task.
+The owning chat is an unreleased `created` link, even an archived chat: wake it with cross_session. A shepherd or
+desk chat never qualifies, and `origin_session=None` does not mean the card has no owner: read `task_chat_links`.
+Never file a core card for an "orphan" release; if renew-scope is not installed yet, wait on the card shipping it. Test each option you would offer against the card
 first. Archiving or completing it promotes its waiting children, and re-scoping or promoting a safety-refused card
 is refused.
 
