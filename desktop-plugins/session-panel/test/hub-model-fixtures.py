@@ -21,6 +21,16 @@ cases = {
     'subagents': f.bundle(subagents=[f.observed({'id': 'child', 'title': 'Research'}, 'subagent')]),
     'all_sections': f.bundle(f.task(human_request=f.human(), wait={'wait_state': 'human'}), f.task('t_stuck', status='scheduled', wait={'wait_state': 'stalled'}), f.task('t_ready', status='ready'), f.task('t_wait', status='blocked'), rentals=[{'id': 'box', 'name': 'Machine'}], done=[f.task('t_done', status='done')], outcome_json={'state': 'needs_user'}),
 }
+parent, leaf = 't_1111111111111111', 't_2222222222222222'
+cases['leaf_wait_with_running'] = f.bundle(
+    f.task(status='todo', upstream={'id': parent, 'title': 'Intermediate', 'gateway': 'remote', 'profile': 'default'}),
+    f.observed(f.task('t_running', status='running', title='Active portable work')),
+    cards={parent: {'detail': {'owner': 'remote', 'task': {'id': parent, 'title': 'Intermediate', 'status': 'todo'},
+                              'links': {'parents': [leaf]}}},
+           leaf: {'detail': {'owner': 'worker-one', 'task': {'id': leaf, 'title': 'Reconcile cutover', 'status': 'scheduled',
+                                                           'hostname': 'worker-one-host'},
+                             'events': [{'kind': 'scheduled', 'payload': {'awaiting': {
+                                 'kind': 'chat', 'why': 'Choose which premise to retain'}}}]}}})
 approval = f.request()
 approval.update(kind='approval', limits=[{'key': 'Runtime', 'value': 'LIMIT-4-HOURS', 'permissionRequired': True}],
                 exclusions=['EXCLUDED-SPEND'], outcomes={'approve': 'Stage A only', 'decline': 'No execution'})

@@ -146,7 +146,7 @@ def waiting(on, **kw):
 
 def test_ci_wait_is_short_with_pr_and_a_link_action():
     r = waiting('ci https://github.com/softmax-universe/hermes/actions/runs/44951903463', pr_url='https://github.com/softmax-universe/hermes/pull/3881')
-    assert r['detail'] == 'waiting on CI · PR #3881 · 2m'
+    assert r['detail'] == 'waiting on CI · PR #3881 · 2m on remote'
     assert [a['url'] for a in r['actions'] if a['kind'] == 'open_url'] == ['https://github.com/softmax-universe/hermes/actions/runs/44951903463']
     assert 'Waiting on: ci https://github.com/softmax-universe/hermes/actions/runs/44951903463' in r['details']
     assert 'http' not in r['detail']
@@ -154,12 +154,12 @@ def test_ci_wait_is_short_with_pr_and_a_link_action():
 
 def test_ci_wait_without_a_pr_or_url():
     r = waiting('ci local:worker-a4:2658784')
-    assert r['detail'] == 'waiting on CI · 2m' and not [a for a in r['actions'] if a['kind'] == 'open_url']
+    assert r['detail'] == 'waiting on CI · 2m on remote' and not [a for a in r['actions'] if a['kind'] == 'open_url']
 
 
 def test_deploy_wait_hides_hashes():
     r = waiting('deploy hermes-hub scheduled hub-core-update / mods-pull for core106bf5b0abcdef12…and mods10902a1a99aa…')
-    assert r['detail'] == 'waiting on hub deploy · 2m'
+    assert r['detail'] == 'waiting on hub deploy · 2m on remote'
     assert any('106bf5b0' in d for d in r['details'])
 
 
@@ -176,7 +176,7 @@ def test_generic_wait_drops_urls_and_hashes_and_stays_short():
 ])
 def test_external_wait_uses_category_not_executor_identifiers(on):
     r = waiting(on)
-    assert r['detail'] == 'waiting on external work · 2m'
+    assert r['detail'] == 'waiting on external work · 2m on remote'
     assert f'Waiting on: {on}' in r['details']
 
 
@@ -187,8 +187,46 @@ def test_external_wait_uses_category_not_executor_identifiers(on):
 ])
 def test_generic_dependency_identifiers_stay_in_details(on, expected):
     r = waiting(on)
-    assert r['detail'] == expected + ' · 2m'
+    assert r['detail'] == expected + ' · 2m on remote'
     assert f'Waiting on: {on}' in r['details']
+
+
+def test_wait_chain_shows_deepest_parent_location_and_reason():
+    parent, leaf = 't_1111111111111111', 't_2222222222222222'
+    row = task(status='todo', upstream={'id': parent, 'title': 'Intermediate', 'gateway': 'remote', 'profile': 'default'})
+    b = bundle(row, cards={
+        parent: {'detail': {'owner': 'remote', 'task': {'id': parent, 'title': 'Intermediate', 'status': 'todo'},
+                           'links': {'parents': [leaf]}}},
+        leaf: {'detail': {'owner': 'worker-one', 'task': {'id': leaf, 'title': 'Reconcile cutover',
+                            'status': 'scheduled', 'hostname': 'worker-one-host'},
+                          'events': [{'kind': 'scheduled', 'payload': {'awaiting': {
+                              'kind': 'chat', 'why': 'Choose which cutover premise to retain'}}}]}}
+    })
+    r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert 'Reconcile cutover' in r['detail']
+    assert 'on worker-one (worker-one-host)' in r['detail']
+    assert 'asks origin: Choose which cutover premise to retain' in r['detail']
+    assert next(a for a in r['actions'] if a['label'] == 'Open parent card')['target']['id'] == leaf
+    # An unrelated completed branch cannot replace the deepest unfinished parent.
+    b['cards'][parent]['detail']['links']['parents'].append('t_3333333333333333')
+    b['cards']['t_3333333333333333'] = {'detail': {'task': {'id': 't_3333333333333333', 'title': 'Finished', 'status': 'done'}}}
+    assert model.reduce_panel(b, now=NOW)['sections']['waiting'][0]['detail'] == r['detail']
+    # A cycle is bounded and cannot hide the original leaf reason.
+    b['cards'][leaf]['detail']['links'] = {'parents': [parent]}
+    assert model.reduce_panel(b, now=NOW)['sections']['waiting'][0]['detail'] == r['detail']
+    # Actual graph evidence also works without an upstream summary, across all root parents.
+    row.pop('upstream')
+    b['cards'][row['id']] = {'detail': {'task': row, 'links': {'parents': ['t_3333333333333333', parent]}}}
+    assert model.reduce_panel(b, now=NOW)['sections']['waiting'][0]['detail'] == r['detail']
+    # Full owner text stays inspectable; inline location/reason remains short and excludes hashes/URLs.
+    why = b['cards'][leaf]['detail']['events'][0]['payload']['awaiting']
+    why['why'] += ' ' + 'a' * 40 + ' https://example.com/build ' + 'long reason ' * 40
+    compact = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert 'a' * 40 not in compact['detail'] and 'https://' not in compact['detail']
+    assert 'https://example.com/build' in ' '.join(compact['details'])
+    b['cards'][leaf]['detail']['task']['status'] = 'running'
+    live = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert '(running)' in live['detail'] and 'Choose which' not in live['detail']
 
 
 @pytest.mark.parametrize('source, owner, gateway', [('live', None, 'hub'), ('replica', 'remote', 'remote')])
@@ -198,7 +236,7 @@ def test_wait_names_hydrated_parent_and_opens_exact_owner(source, owner, gateway
     b = bundle(row, cards={cid: {'board': 'other', 'detail': {'source': source, 'owner': owner, 'task': {'id': cid, 'title': 'Publish the release'}}}})
     b.update(gateway='hub', profile='default')
     r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
-    assert r['detail'] == 'waiting on: Publish the release · 2m'
+    assert r['detail'] == f'waiting on: Publish the release on {gateway} · 2m'
     action = next(a for a in r['actions'] if a['label'] == 'Open parent card')
     assert action['target'] == {'id': cid, 'gateway': gateway, 'profile': 'default', 'board': 'other'}
     assert any(cid in d for d in r['details'])
@@ -214,11 +252,11 @@ def test_awaited_card_outside_this_chat_shows_its_live_status():
     b = bundle(row, cards={cid: {'detail': {'source': 'live', 'task': {'id': cid, 'title': 'Review PR', 'status': 'running'}}}})
     b.update(gateway='hub', profile='default')
     r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
-    assert r['detail'] == 'waiting on: Review PR (running) · 2m'
+    assert r['detail'] == 'waiting on: Review PR (running) on hub · 2m'
     assert f'Blocking card: {cid} (running)' in r['details']
     b['cards'][cid]['detail']['task'].pop('status')
     r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
-    assert r['detail'] == 'waiting on: Review PR · 2m'
+    assert r['detail'] == 'waiting on: Review PR on hub · 2m'
     assert f'Blocking card: {cid} (status unknown)' in r['details']
 
 
@@ -227,7 +265,7 @@ def test_parent_metadata_does_not_replace_unrelated_waits(on):
     cid = 't_0123456789abcdef'
     row = task(status='scheduled', upstream={'id': cid, 'title': 'Other work', 'gateway': 'remote', 'profile': 'default'}, wait={'wait_state': 'waiting', 'waiting_on': on})
     r = model.reduce_panel(bundle(row), now=NOW)['sections']['waiting'][0]
-    assert r['detail'] == model.wait_phrase(row, NOW)
+    assert r['detail'] == model.wait_phrase(row, NOW) + ' on remote'
     assert not any(a['label'] == 'Open parent card' for a in r['actions'])
 
 
@@ -259,7 +297,7 @@ def test_explicit_primary_never_loses_to_unrelated_graph(graph_key, on):
     b.update(gateway='hub', profile='default')
     r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
     if on == 'card t_aaaaaaaaaaaaaaaa':
-        assert r['detail'] == 'waiting on an update · 2m'
+        assert r['detail'] == 'waiting on an update · 2m on remote'
     assert 'Unrelated work' not in r['detail']
     assert not any(a['label'] == 'Open parent card' for a in r['actions'])
 
