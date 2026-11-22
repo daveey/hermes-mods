@@ -32,7 +32,11 @@ class BoardLane:
         # new service. Expose the fully initialized owner for current API repair.
         with feed.lock:
             feed._board_lane = self
-            if getattr(feed, '_board_service_required', False):
+            # Natural hot reload can run only the saved predecessor entry: no
+            # current API call is guaranteed. The registered capture owner itself
+            # therefore establishes service, while manually driven lanes stay inert.
+            if (getattr(feed, '_board_service_required', False)
+                    or getattr(feed, '_board_thread', None) is threading.current_thread()):
                 self.start_service()
 
     def start_service(self):

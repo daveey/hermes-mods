@@ -279,7 +279,7 @@ def test_current_api_adds_one_canonical_lane_to_feed_resumed_by_older_api(monkey
         _restore(api, core)
 
 
-@pytest.mark.parametrize('before_registration', [False, True])
+@pytest.mark.parametrize('before_registration', [False, True, None])
 def test_saved_predecessor_board_entry_gets_completion_service(monkeypatch, before_registration):
     import threading
     import time
@@ -326,8 +326,10 @@ def test_saved_predecessor_board_entry_gets_completion_service(monkeypatch, befo
             assert entered.wait(1)
         else:
             assert entered.wait(1)
-            assert api.feed() is f
-            assert api.feed() is f and f._board_thread is board_thread
+            # None is natural reload: only the saved predecessor closure runs.
+            if before_registration is not None:
+                assert api.feed() is f
+                assert api.feed() is f and f._board_thread is board_thread
         end = time.monotonic() + 1
         while time.monotonic() < end:
             if all(f.bundles[s]['bundle']['tasks'][0]['status'] == 'ready' for s in ('S1', 'S2')):
