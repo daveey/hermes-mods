@@ -218,3 +218,57 @@ def test_refresh_storm_is_bounded():
         poke(store, ctx)
         clock[0] += 5
     assert sum(len(c) for c in f.calls) <= 40 * (3600 // 300 + 1)
+
+
+def test_queued_batch_waits_for_cooldown_and_preserves_intent():
+    module = load()
+    clock, calls = [0.], []
+    started, release = threading.Event(), threading.Event()
+    class Reader:
+        def prefetch(self, urls):
+            calls.append(set(urls))
+            started.set()
+            assert release.wait(3)
+        def get(self, url):
+            return {}
+    store = module.Observations(Reader, clock=lambda: clock[0])
+    ctx = {'a': '1', 'b': '1'}
+    try:
+        store.reader(ctx).prefetch(['a'])
+        assert started.wait(1)
+        store.reader(ctx).prefetch(['b'])
+        release.set()
+        store.join(2)
+        assert calls == [{'a'}]
+        assert store.pending == {'b': '1'}
+        clock[0] = 60
+        poke(store, ctx, ['a'])
+        assert calls == [{'a'}, {'a', 'b'}]
+    finally:
+        release.set()
+        store.join(3)
+
+
+def test_quiet_cursor_wakes_once_when_backoff_exceeds_ttl():
+    module = load()
+    clock, factory = [0.], Counting(fail=True)
+    store = module.Observations(factory, clock=lambda: clock[0])
+    ctx = {'a': '1'}
+    for now in (0, 300, 600, 900):
+        clock[0] = now
+        poke(store, ctx)
+    assert store.backoff_until == 1380
+    clock[0] = 1200
+    poke(store, ctx)
+    before = store.cursor()
+    clock[0] = 1379
+    assert store.cursor() == before
+    clock[0] = 1380
+    assert store.cursor() != before
+    ready = store.cursor()
+    clock[0] = 1381
+    assert store.cursor() == ready
+    factory.fail = False
+    poke(store, ctx)
+    assert len(factory.calls) == 5
+    assert store.reader(ctx).get('a')['approved']
