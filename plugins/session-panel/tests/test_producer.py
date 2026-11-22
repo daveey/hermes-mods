@@ -235,11 +235,12 @@ def test_the_backend_import_starts_the_feed_before_any_request(monkeypatch):
     try:
         core = api._load_feed()
         deadline = time.monotonic() + 10
-        while core.PROCESS_FEED is None and time.monotonic() < deadline:
+        alive = lambda: any(t.name == 'session-panel-feed' and t.is_alive() for t in threading.enumerate())
+        while not (core.PROCESS_FEED is not None and alive()) and time.monotonic() < deadline:
             time.sleep(0.02)
         f = core.PROCESS_FEED
         assert f is not None and not f.stopped.is_set(), 'running with no request made'
-        assert any(t.name == 'session-panel-feed' and t.is_alive() for t in threading.enumerate())
+        assert alive()
     finally:
         sys.modules.pop('hermes_dashboard_plugin_session-panel', None)
         if core.PROCESS_FEED is not None:
@@ -269,3 +270,166 @@ def test_a_request_before_the_feed_exists_starts_it_off_the_request_and_says_ret
     finally:
         gate.set()
         api._LOADER.starting.join(5)
+
+
+# --- [daveey 2026-11-22] "no polling. Update only when the data changes." ---
+
+def test_file_watch_reports_writes_to_the_watched_databases_and_nothing_else(tmp_path):
+    api = load('_spf_watch_api', API)
+    db, other = tmp_path / 'state.db', tmp_path / 'agent.log'
+    db.write_bytes(b'x')
+    w = api.FileWatch()
+    if not w.ok:
+        pytest.skip('no kernel file notification on this platform')
+    try:
+        w.set_paths([db, tmp_path / 'boards' / 'late' / 'kanban.db'])  # the second does not exist yet
+        assert w.wait(0.2) is False, 'idle: nothing reported'
+        other.write_bytes(b'noise')
+        assert w.wait(0.2) is False, 'another file in the same directory is not ours'
+        db.write_bytes(b'xy')
+        assert w.wait(2) is True
+        while w.wait(0.1):
+            pass
+        (tmp_path / 'state.db-wal').write_bytes(b'frame')
+        assert w.wait(2) is True, 'a WAL created after the watch started counts'
+        while w.wait(0.1):
+            pass
+        late = tmp_path / 'boards' / 'late'
+        late.mkdir(parents=True)
+        w.set_paths([db, late / 'kanban.db'])
+        (late / 'kanban.db').write_bytes(b'new board')
+        assert w.wait(2) is True
+    finally:
+        w.close()
+
+
+class Watched(Stamped):
+    def __init__(self, tmp):
+        super().__init__()
+        self.db = tmp / 'state.db'
+        self.db.write_bytes(b'0')
+        self.released = 0
+
+    def watch_paths(self):
+        return [self.db]
+
+    def release(self):
+        self.released += 1
+
+
+def running(api, f):
+    threads = [threading.Thread(target=api._run, args=(f,), daemon=True),
+               threading.Thread(target=api._run_decisions, args=(f,), daemon=True)]
+    for t in threads:
+        t.start()
+    return threads
+
+
+def test_idle_means_idle_and_a_write_is_pushed_within_a_second(tmp_path, monkeypatch):
+    api = load('_spf_event_api', API)
+    if not api.FileWatch().ok:
+        pytest.skip('no kernel file notification on this platform')
+    monkeypatch.setattr(api, 'save_snapshot', lambda f: True)
+    monkeypatch.setattr(api, 'CoreReaders', lambda: r)
+    r = Watched(tmp_path)
+    pushed = []
+    f = Feed(r, emit=pushed.append)
+    ticks, decisions = [], []
+    tick, refresh = f.tick, f.refresh_decisions
+    f.tick = lambda: (ticks.append(time.monotonic()), tick())[1]
+    f.refresh_decisions = lambda **k: (decisions.append(time.monotonic()), refresh(**k))[1]
+    f.changes(['S1'])
+    threads = running(api, f)
+    try:
+        deadline = time.monotonic() + 5
+        while (not ticks or not decisions) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(ticks) == 1 and len(decisions) == 1, 'one pass each at start'
+        time.sleep(0.3)
+        base = (len(ticks), len(decisions), r.batches, len(r.decisions))
+        time.sleep(2.5)  # well past the old 1 s tick
+        assert (len(ticks), len(decisions), r.batches, len(r.decisions)) == base, 'no write: no pass, no read'
+        # A write: the changed chat's model is pushed inside a second.
+        r.files += 1
+        r.rows['S1'] = {'kind': 'done'}
+        wrote = time.monotonic()
+        r.db.write_bytes(b'1')
+        while time.monotonic() - wrote < 3 and f.bundles['S1']['bundle']['outcome_json'] != {'kind': 'done'}:
+            time.sleep(0.01)
+        took = time.monotonic() - wrote
+        assert f.bundles['S1']['bundle']['outcome_json'] == {'kind': 'done'} and took < 1.0, took
+        assert any('S1' in (p.get('bundles') or {}) for p in pushed)
+        # A burst of writes is coalesced, not one pass per write.
+        time.sleep(0.8)
+        before = len(ticks)
+        for i in range(40):
+            r.db.write_bytes(b'%d' % i)
+            time.sleep(0.005)
+        time.sleep(1.2)
+        assert 1 <= len(ticks) - before <= 3, len(ticks) - before
+        # A cold read needs no write and skips the debounce.
+        asked = time.monotonic()
+        f.changes_bytes(['COLD'])
+        while time.monotonic() - asked < 2 and b'"COLD":' not in f.changes_bytes(['COLD']):
+            time.sleep(0.005)
+        assert b'"COLD":' in f.changes_bytes(['COLD']) and time.monotonic() - asked < 0.5
+    finally:
+        f.stopped.set()
+        for t in threads:
+            t.join(5)
+    assert not any(t.is_alive() for t in threads), 'a stop wakes the sleeping producers'
+
+
+def test_the_idle_heartbeat_reads_no_database(tmp_path):
+    class Untouchable(Watched):
+        def __getattribute__(self, name):
+            if name in ('stamps', 'panel_stamps', 'panel_stamp', 'changed_cards', 'lineage', 'decision_inputs',
+                        'panel_inputs', 'panel_files_stamp', 'board_stamps') and object.__getattribute__(self, 'armed'):
+                raise AssertionError(f'the heartbeat read {name}')
+            return object.__getattribute__(self, name)
+    r = Untouchable.__new__(Untouchable)
+    object.__setattr__(r, 'armed', False)
+    Watched.__init__(r, tmp_path)
+    pushed, t = [], {'now': 1000.0}
+    f = Feed(r, emit=pushed.append, clock=lambda: t['now'])
+    f.changes(['S1'])
+    f.tick()
+    pushed.clear()
+    r.armed = True
+    assert f.beat() == 0 and pushed == [], 'not due yet'
+    t['now'] += feedmod.HEARTBEAT_S + 1
+    f.beat()
+    assert len(pushed) == 1 and pushed[0].get('heartbeat') and not pushed[0].get('bundles')
+    assert not f._wake.is_set()
+    f.watch(['S9'])  # registered, no bundle: the heartbeat hands it to a pass instead of computing it
+    f.beat()
+    assert f._wake.is_set() and 'S9' not in f.bundles
+
+
+def test_board_events_are_read_only_when_a_board_file_moved():
+    class Boards(Stamped):
+        def __init__(self):
+            super().__init__()
+            self.board, self.state, self.cards = 1, 1, 0
+
+        def stamps(self):
+            return (self.board, self.state)
+
+        def board_stamps(self):
+            return (self.board,)
+
+        def changed_cards(self, cursor):
+            self.cards += 1
+            return {}, (cursor or 0) + 1
+    f, r, pushed, t = make(Boards())
+    f.changes(['S1'])
+    f.tick()
+    base = r.cards
+    for _ in range(5):
+        r.state += 1  # a chat wrote a message
+        t['now'] += 0.5
+        f.tick()
+    assert r.cards == base, 'state.db traffic opens no board'
+    r.board += 1
+    f.tick()
+    assert r.cards == base + 1

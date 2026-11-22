@@ -226,6 +226,10 @@ class CoreReaders:
             return tuple(out)
         return tuple(data_stamp(p) or stat(p) for p in self.files() + [self.state_db()])
 
+    def _stamps_of(self, paths):
+        from hermes_cli.session_list_flight import data_stamp
+        return tuple(data_stamp(p) or self._stat(p) for p in paths)
+
     def changed_cards(self, cursor):
         """({card id: its chat or None} with an event since `cursor`, new cursor). The first call only sets it.
         A file whose events went backwards (replaced) restarts its cursor."""
@@ -444,6 +448,14 @@ class CoreReaders:
                 for s in part:
                     requests[s] = None
         return {s: (outcomes.get(s), None if requests[s] is None else tuple(requests[s])) for s in ids}
+
+    def board_stamps(self):
+        """`stamps()` for the board files alone (no state.db)."""
+        return self._stamps_of(self.files())
+
+    def watch_paths(self) -> list[Path]:
+        """Every file a bundle is computed from: a write to any of them is what makes a pass due."""
+        return self.files() + [self.state_db(), self.state_db().parent / 'user-steps' / 'actions.sqlite3']
 
     def panel_files_stamp(self):
         """Moves with every committed write to either file `panel_stamps` reads (stat only, nothing opened)."""
@@ -923,20 +935,191 @@ def _pause(elapsed: float, tick_s: Optional[float] = None) -> float:
     return max(MIN_PAUSE_S, tick_s - elapsed, min(elapsed, MAX_PAUSE_S))
 
 
+DEBOUNCE_S = 0.15        # a write burst is one pass
+MIN_GAP_S = 0.5          # under continuous writes, passes start at least this far apart (a waiting reader skips it)
+WATCH_REFRESH_S = 20.0   # the watcher re-lists the files it watches (a new board) and notices a stop; no database
+
+
+class FileWatch:
+    """Kernel notification of writes to a set of files: Linux inotify on their directories, kqueue elsewhere.
+    Nothing here polls: `wait` sleeps in select until the kernel reports a write (or `timeout`). `ok` is False
+    where neither exists; the feed then keeps its timed loop."""
+    _IN = 0x2 | 0x40 | 0x80 | 0x100 | 0x200  # MODIFY | MOVED_FROM | MOVED_TO | CREATE | DELETE
+
+    def __init__(self):
+        self.ok, self._fd, self._kq, self._libc = False, -1, None, None
+        self._dirs: dict[str, int] = {}      # inotify: directory -> watch descriptor
+        self._names: dict[int, set] = {}     # inotify: watch descriptor -> file names wanted in it
+        self._fds: dict[str, int] = {}       # kqueue: path -> descriptor
+        self._wanted: list[str] = []
+        try:
+            if sys.platform.startswith('linux'):
+                import ctypes
+                self._libc = ctypes.CDLL(None, use_errno=True)
+                self._fd = self._libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+                self.ok = self._fd >= 0
+            else:
+                import select
+                if hasattr(select, 'kqueue'):
+                    self._kq = select.kqueue()
+                    self.ok = True
+        except Exception:
+            self.ok = False
+
+    @staticmethod
+    def _files(paths) -> list[str]:
+        out = []
+        for p in paths:
+            out += [str(p), f'{p}-wal']
+        return list(dict.fromkeys(out))
+
+    def set_paths(self, paths) -> None:
+        """Watch exactly these database files (and their -wal). Idempotent."""
+        files = self._files(paths)
+        if self._kq is not None:
+            self._wanted = files
+            self._arm()
+            return
+        want: dict[str, set] = {}
+        for f in files:
+            want.setdefault(os.path.dirname(f), set()).add(os.path.basename(f))
+        for d in [d for d in self._dirs if d not in want]:
+            wd = self._dirs.pop(d)
+            self._names.pop(wd, None)
+            self._libc.inotify_rm_watch(self._fd, wd)
+        for d, names in want.items():
+            wd = self._dirs.get(d)
+            if wd is None:
+                wd = self._libc.inotify_add_watch(self._fd, os.fsencode(d), self._IN)
+                if wd < 0:
+                    continue  # no such directory yet: taken up by a later set_paths
+                self._dirs[d] = wd
+            self._names[wd] = names
+
+    def _arm(self) -> None:
+        import select
+        flags = select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME
+        dirs = list(dict.fromkeys(os.path.dirname(f) for f in self._wanted))
+        for p in [p for p in self._fds if p not in self._wanted and p not in dirs]:
+            os.close(self._fds.pop(p))
+        for p in self._wanted + dirs:  # a directory reports a file created or removed in it (a new -wal)
+            if p in self._fds:
+                continue
+            try:
+                fd = os.open(p, getattr(os, 'O_EVTONLY', os.O_RDONLY))
+            except OSError:
+                continue
+            self._fds[p] = fd
+            self._kq.control([select.kevent(fd, select.KQ_FILTER_VNODE, select.KQ_EV_ADD | select.KQ_EV_CLEAR, flags)], 0, 0)
+
+    def wait(self, timeout: float) -> bool:
+        """Sleep until a watched file is written; False after `timeout` seconds without one."""
+        import select
+        import struct
+        until = time.monotonic() + timeout
+        while True:
+            left = max(0.0, until - time.monotonic())
+            if self._kq is not None:
+                events = self._kq.control(None, 8, left)
+                if not events:
+                    return False
+                by_fd = {fd: p for p, fd in self._fds.items()}
+                gone = [by_fd[e.ident] for e in events if e.ident in by_fd
+                        and e.fflags & (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME)]
+                for p in gone:
+                    os.close(self._fds.pop(p))
+                self._arm()  # a replaced or newly created file is watched from here on
+                return True
+            if not select.select([self._fd], [], [], left)[0]:
+                return False
+            try:
+                data = os.read(self._fd, 65536)
+            except BlockingIOError:
+                continue
+            hit, at = False, 0
+            while at + 16 <= len(data):
+                wd, _mask, _cookie, size = struct.unpack_from('iIII', data, at)
+                name = data[at + 16:at + 16 + size].split(b'\0', 1)[0]
+                at += 16 + size
+                hit = hit or os.fsdecode(name) in self._names.get(wd, ())
+            if hit:
+                return True  # anything else in those directories (logs, locks) is not ours
+
+    def close(self) -> None:
+        for fd in [self._fd, *self._fds.values()]:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        if self._kq is not None:
+            self._kq.close()
+        self._fd, self._fds, self.ok = -1, {}, False
+
+
+def _watch(f, watch: FileWatch, paths) -> None:
+    """The feed's one watcher thread: a write to a source file makes a pass due on both lanes."""
+    try:
+        while not f.stopped.is_set():
+            watch.set_paths(paths())
+            if watch.wait(WATCH_REFRESH_S) and not f.stopped.is_set():
+                f._wake.set()
+                f._decide.set()
+    except Exception:
+        log.warning('session-panel feed: file watch failed; back to the timed loop', exc_info=True)
+        f._watching = False
+        f._wake.set()
+        f._decide.set()
+    finally:
+        watch.close()
+
+
+def _event_driven(f) -> bool:
+    """Start (once per feed) the file watch that replaces the timed loops; False when this feed, its readers or
+    this platform cannot be event-driven (the timed loop stays)."""
+    with _LOADER.lock:
+        state = getattr(f, '_watching', None)
+        if state is not None:
+            return state
+        paths = getattr(f.readers, 'watch_paths', None)
+        watch = FileWatch() if callable(paths) and all(hasattr(f, n) for n in ('_wake', '_cold', '_decide', 'beat')) else None
+        f._watching = bool(watch is not None and watch.ok)
+        if f._watching:
+            threading.Thread(target=_watch, args=(f, watch, paths), name='session-panel-watch', daemon=True).start()
+        return f._watching
+
+
+def _settle(f, last_start: float) -> None:
+    """Before a pass: let a write burst finish and keep passes MIN_GAP_S apart. A waiting reader cuts it short."""
+    f._cold.wait(max(DEBOUNCE_S, MIN_GAP_S - (time.monotonic() - last_start)))
+
+
 def _run_decisions(f) -> None:
     """A blocked board sweep must not delay a recorded decision's status line."""
     # Own current-generation readers: the existing Feed may have been constructed
     # through an older API whose readers do not implement the cheap decision path.
     readers = CoreReaders()
     try:
+        first = True
         while not f.stopped.is_set():
+            started = time.monotonic()
+            if _event_driven(f):
+                # No timer: sleeps until a source file is written (the watcher) or the feed stops.
+                if not first:
+                    f._decide.wait()
+                    f.stopped.wait(max(DEBOUNCE_S, MIN_GAP_S - (time.monotonic() - started)))
+                if f.stopped.is_set():
+                    break
+                f._decide.clear()
+            first = False
             started = time.monotonic()
             try:
                 f.refresh_decisions(readers=readers)
             except Exception:
                 log.warning('session-panel decision refresh failed', exc_info=True)
             readers.release()  # no connection outlives one pass
-            f.stopped.wait(_pause(time.monotonic() - started))
+            if not getattr(f, '_watching', False):
+                f.stopped.wait(_pause(time.monotonic() - started))
     finally:
         readers.release()
 
@@ -945,8 +1128,26 @@ def _run(f) -> None:
     saved = (None, None)  # (rev, watched chats) last written
     saved_at = 0.0
     try:
+        last = 0.0
+        if _event_driven(f):
+            f._cold.set()  # the first pass is due now: whatever was written before this thread started
+            f._wake.set()
         while not f.stopped.is_set():
-            started = time.monotonic()
+            if _event_driven(f):
+                # No timer drives a recompute: this sleeps until a source file is written or a read finds no bundle.
+                # With neither, it wakes for the liveness heartbeat only (no database, nothing computed).
+                if not f._wake.wait(getattr(f, 'heartbeat_s', 20.0)):
+                    try:
+                        f.beat()
+                    except Exception:
+                        log.warning('session-panel feed heartbeat failed', exc_info=True)
+                    continue
+                if f.stopped.is_set():
+                    break
+                _settle(f, last)
+                if f.stopped.is_set():
+                    break
+            started = last = time.monotonic()
             try:
                 f.tick()
             except Exception:
@@ -958,6 +1159,9 @@ def _run(f) -> None:
                 saved_at = time.monotonic()
                 if save_snapshot(f):
                     saved = state
+            if getattr(f, '_watching', False):
+                continue
+            # Timed fallback (no kernel file notification here, or readers that name no files).
             # A read that found no bundle for its chat sets `_wake`: the next pass starts at once.
             wake = getattr(f, '_wake', None)
             pause = _pause(time.monotonic() - started)
