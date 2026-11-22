@@ -312,6 +312,12 @@ def wait_leaf(dependency, bundle):
         if depth > best_depth:
             best, best_depth = dep, depth
         hydration = obj(obj(obj(bundle.get('cards')).get(dep['id'])).get('detail'))
+        if text(obj(dep.get('wait')).get('waiting_on')):
+            # Each producer owns its own current wait, not merely the root row.
+            primary = wait_target(dep, bundle, hydration)
+            if primary:
+                pending.append((primary, depth + 1, visited | {identity}))
+            continue
         parents = obj(hydration.get('links')).get('parents') or []
         linked = {t.get('id'): t for t in hydration.get('link_tasks') or [] if isinstance(t, dict)}
         for pid in parents:
@@ -582,7 +588,8 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         hostname = text(blocker.get('hostname'))
         location = f' on {gateway}' + (f' ({hostname})' if hostname else '') if gateway else ''
         if state in ('scheduled', 'todo', 'blocked', 'triage') and not dependency and (why or wi['text']):
-            base = why or wi['text']
+            canonical = re.match(r'(?:the clock until|ci\b|deploy\b)', text(obj(row.get('wait')).get('waiting_on')), re.I)
+            base = wi['text'] if canonical else why or wi['text']
             cap = max(24, WAIT_MAX - len(location))
             wi['text'] = (base if len(base) <= cap else base[:cap - 1].rstrip() + '…') + location
         if dependency:
