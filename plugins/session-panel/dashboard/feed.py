@@ -133,6 +133,27 @@ def decision_projection(bundle):
     return result
 
 
+_NO_PANEL_INPUTS = object()
+
+
+def panel_bundle(session, lineage, tasks, done, cards, *, computed_at, computed_seq,
+                 inputs=_NO_PANEL_INPUTS, canonical_seq=None, base=None, reducer=None):
+    """Canonical pure assembly from captured inputs, shared with owner adapters.
+
+    Source capture and reconciliation are deliberately outside this function.
+    Inject the loaded reducer at owner registration to avoid module/file discovery
+    during projection. The legacy caller retains its existing loader fallback.
+    """
+    bundle = {**(base or {}), 'session': session, 'lineage': lineage, 'tasks': tasks,
+              'done': done, 'cards': cards, 'computed_at': computed_at,
+              'computed_seq': computed_seq}
+    if inputs is not _NO_PANEL_INPUTS:
+        bundle['canonical_seq'] = canonical_seq
+        bundle.update(inputs)
+    bundle['model'] = (reducer or _model().reduce_panel)(bundle, now=bundle['computed_at'], wire=True)
+    return bundle
+
+
 def _hash(bundle: dict) -> str:
     body = {k: v for k, v in bundle.items() if k not in ('computed_at', 'computed_seq', 'canonical_seq')}
     return hashlib.sha1(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
@@ -486,14 +507,13 @@ class Feed:
                     parent = (next((p for p in (rec.get('detail') or {}).get('link_tasks', ())
                                    if p.get('id') == ref), None) if callable(qualified) else None)
                     queue.append((ref, rec.get('board') or board, parent, depth + 1))
-        bundle = {**(base or {}), 'session': session, 'lineage': lineage, 'tasks': tasks, 'done': done, 'cards': cards,
-                  'computed_at': read_at, 'computed_seq': seq}
-        panel_inputs = getattr(r, 'panel_inputs', None)
-        if base is None and callable(panel_inputs):
-            bundle['canonical_seq'] = next(self._seq)
-            bundle.update(timed('panel_inputs_s', panel_inputs, session, lineage))
-        bundle['model'] = _model().reduce_panel(bundle, now=bundle['computed_at'], wire=True)
-        return bundle
+        read_inputs = getattr(r, 'panel_inputs', None)
+        inputs, canonical_seq = _NO_PANEL_INPUTS, None
+        if base is None and callable(read_inputs):
+            canonical_seq = next(self._seq)
+            inputs = timed('panel_inputs_s', read_inputs, session, lineage)
+        return panel_bundle(session, lineage, tasks, done, cards, computed_at=read_at,
+                            computed_seq=seq, inputs=inputs, canonical_seq=canonical_seq, base=base)
 
     def _decision_result(self, session, base, seq, *, failed):
         """Set read availability only from the newest completed scoped attempt."""
