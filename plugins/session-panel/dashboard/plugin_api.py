@@ -128,6 +128,9 @@ def _load_feed():
             old.SOURCE_STAMP = stamp  # not retried on every call; the next change on disk is
             return old
         mod.SOURCE_STAMP, mod.SOURCE_SHA, mod.RESTART = stamp, digest, feed
+        for hook in ('INSTALL_FACTS', 'STOP_FACTS'):
+            if old is not None and hasattr(old, hook):
+                setattr(mod, hook, getattr(old, hook))
         if old is None:
             sys.modules[_FEED_KEY] = mod
             return mod
@@ -1320,7 +1323,8 @@ def feed():
                 continue  # a reload swapped the module (under this same lock) after we loaded it: use the new one
             # Startup/reload callers cannot replace a predecessor still owned by
             # a cutover. Failed joins retain this fence until a later join succeeds.
-            if getattr(_LOADER, 'facts_transition_pending', False):
+            if (getattr(_LOADER, 'facts_transition_pending', False)
+                    or getattr(_LOADER, 'facts_unloading', False)):
                 return core.PROCESS_FEED
             if core.PROCESS_FEED is None or core.PROCESS_FEED.stopped.is_set():
                 readers = None if getattr(_LOADER, 'facts_mode', 'legacy') == 'facts' else CoreReaders()
@@ -1395,17 +1399,58 @@ def install_facts(v1, scope, handle):
     previous = getattr(_LOADER, 'facts_registration', None)
     if previous is not None:
         previous.close()
+    token = object()
     with core.PROCESS_LOCK:
+        if getattr(_LOADER, 'facts_unloading', False):
+            raise RuntimeError('panel unload in progress; registration refused')
+        _LOADER.facts_binding_token = token
         _LOADER.facts_v1, _LOADER.facts_scope = v1, scope
         _LOADER.facts_handle = handle
         _LOADER.facts_ready = None
-    registration = v1.bind_consumer('panel', scope, _facts_mode_changed)
+    registration = v1.bind_consumer('panel', scope,
+                                   lambda mode, generation: _facts_mode_changed(mode, generation, token=token))
     readiness = core.PanelReadiness(v1, scope, _warm_facts)
     readiness.registration = registration
-    _LOADER.facts_registration = readiness
+    with core.PROCESS_LOCK:
+        accepted = (getattr(_LOADER, 'facts_binding_token', None) is token
+                    and not getattr(_LOADER, 'facts_unloading', False))
+        if accepted:
+            _LOADER.facts_registration = readiness
+    if not accepted:
+        readiness.close()
+        raise RuntimeError('panel registration superseded by unload or replacement')
     if core.PROCESS_FEED is not None:
         core.PROCESS_FEED._facts_readiness = readiness.wake
     return readiness
+
+
+def stop_facts():
+    """Unload without releasing predecessor custody before every lane exits."""
+    core = _load_feed()
+    with core.PROCESS_LOCK:
+        _LOADER.facts_unloading = True
+        _LOADER.facts_binding_token = None
+        _LOADER.facts_transition_pending = True
+    # Closing a binding can call back into the lifecycle, so never hold its
+    # transition lock while closing. The pending fence already blocks startup.
+    previous = getattr(_LOADER, 'facts_registration', None)
+    if previous is not None:
+        previous.close()
+        _LOADER.facts_registration = None
+    _LOADER.__dict__.setdefault('facts_transition_lock', threading.Lock())
+    with _LOADER.facts_transition_lock:
+        f = core.PROCESS_FEED
+        if f is not None and not _quiesce(f):
+            raise RuntimeError('panel reader did not quiesce; unload refused')
+        adapter = getattr(f, '_fact_subscription', None)
+        if adapter is not None:
+            adapter.close()
+        with core.PROCESS_LOCK:
+            _LOADER.facts_mode = 'legacy'
+            _LOADER.facts_generation = -1
+            for name in ('facts_v1', 'facts_scope', 'facts_handle'):
+                _LOADER.__dict__.pop(name, None)
+            _LOADER.facts_transition_pending = False
 
 
 def _warm_facts():
@@ -1455,7 +1500,7 @@ def _quiesce(f, timeout=25.0):
     return not any(t is not None and t.is_alive() for t in threads)
 
 
-def _facts_mode_changed(mode, generation):
+def _facts_mode_changed(mode, generation, *, token=None):
     """Off-request latch callback; repeated generations never duplicate lanes."""
     if mode not in ('legacy', 'facts'):
         raise ValueError('unsupported facts mode')
@@ -1463,6 +1508,10 @@ def _facts_mode_changed(mode, generation):
     _LOADER.__dict__.setdefault('facts_transition_lock', threading.Lock())
     with _LOADER.facts_transition_lock:
         with core.PROCESS_LOCK:
+            if token is not None and token is not getattr(_LOADER, 'facts_binding_token', None):
+                return  # delayed callback from a closed binding
+            if getattr(_LOADER, 'facts_unloading', False):
+                return  # stop_facts owns the final drain; close must not restart
             if generation < getattr(_LOADER, 'facts_generation', -1):
                 return
             current_mode = getattr(_LOADER, 'facts_mode', 'legacy')
@@ -1937,6 +1986,7 @@ def _save_running() -> bool:
 # register only after both lane targets and snapshot helpers are defined.
 _load_feed().RESTART = feed
 _load_feed().INSTALL_FACTS = install_facts
+_load_feed().STOP_FACTS = stop_facts
 _binding = sys.modules.get('_session_panel_facts_binding')
 if _binding is not None:
     install_facts(_binding.v1, _binding.scope, _binding.handle)
