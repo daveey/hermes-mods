@@ -396,8 +396,9 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
   if (!validModel(model)) return null
   // Spec: hidden when there is neither open work nor finished history.
   if (!MODEL_SECTIONS.some(([section]) => model.sections[section].length)) return null
-  const state = str(model.header.state)
   const status = model.header.status
+  const state = status ? str(model.header.state) : 'unknown'
+  const label = status ? str(model.header.label) || state : 'unknown'
   const stripe = status?.presentation?.stripe || 'attention'
   // Presentation palette only: no local activity/count/kind classification.
   const statusColor = { done: 'var(--color-emerald-500)', stuck: 'var(--color-red-500)', attention: 'var(--color-amber-500)',
@@ -493,7 +494,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
           style: { width: 7, height: 7, borderRadius: '50%', background: statusColor } }),
         jsx('span', { children: 'This session' })
       ] }),
-      jsx('span', { 'data-session-status': '', title: STATE_LABEL[state] || state, style: { color: statusColor }, children: str(model.header.label) || model.header.state }),
+      jsx('span', { 'data-session-status': '', title: STATE_LABEL[state] || state, style: { color: statusColor }, children: label }),
       ...model.header.pips.map((pip, i) => jsxs('span', { 'data-model-pip': pip.section, style: { display: 'inline-flex', alignItems: 'center', gap: 5, color: pip.section === 'needs_you' ? ALERT_TEXT : pip.section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)', fontWeight: pip.section === 'needs_you' || pip.section === 'stuck' ? 600 : 400 }, children: [
         jsx('span', { 'aria-hidden': true, style: box(pip.section) }),
         `${pip.count} ${pip.label}`

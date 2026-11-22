@@ -58,6 +58,16 @@ test('panel legacy done is unknown despite completed history', async () => {
  assert.ok(!pip?.hasAttribute('data-panel-status-revision'))
 })
 
+test('mixed-version backend cannot publish a legacy done label without status', async () => {
+ const model = structuredClone(cases.canonical_done_with_open_rows.model)
+ delete model.header.status
+ model.header.state = 'done'; model.header.label = 'done'
+ await paint(m.renderModel(model))
+ assert.equal(document.querySelector('[data-session-status]')?.textContent, 'unknown')
+ assert.equal(document.querySelector('[data-panel-status-stripe]')?.getAttribute('data-panel-status-stripe'), 'attention')
+ assert.equal(document.querySelector('[data-model-count="needs_you"]')?.textContent, String(model.header.counts.needs_you))
+})
+
 test('mounted cold panel shows loading, retries the registered gap and removes the placeholder', async () => {
  await paint(null); m.resetFeedForTests()
  current = { connectionId: 'cold', profile: 'default', session: 'cold-chat' }
