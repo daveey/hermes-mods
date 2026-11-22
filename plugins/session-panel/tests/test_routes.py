@@ -223,7 +223,7 @@ def test_current_api_adds_one_canonical_lane_to_feed_resumed_by_older_api(monkey
                          _save_at_exit=lambda: None)
     source = (HERE.parent / 'fixtures' / 'feed_entry_before_decisions.py').read_text()
     exec(compile(source, 'feed_entry_before_decisions.py', 'exec'), old_namespace)
-    observed, released = threading.Event(), threading.Event()
+    observed, published, released = threading.Event(), threading.Event(), threading.Event()
     class CurrentReaders(fakes.Readers):
         def decision_inputs(self, session, lineage):
             observed.set()
@@ -240,12 +240,18 @@ def test_current_api_adds_one_canonical_lane_to_feed_resumed_by_older_api(monkey
         core.RESTART = old_namespace['feed']
         f = core.RESTART()
         f.changes(['S1'])
+        def delivered(payload):
+            model = payload.get('bundles', {}).get('S1', {}).get('model', {})
+            if model.get('header', {}).get('state') == 'done':
+                published.set()
+        f.emit = delivered
         assert not hasattr(f.readers, 'decision_inputs')
         assert not getattr(f, '_decision_thread', None)
         assert api.feed() is f
         assert observed.wait(2), 'current API must start decisions even for an existing current Feed'
         lane = f._decision_thread
         assert api.feed() is f and f._decision_thread is lane, 'idempotent under PROCESS_LOCK'
+        assert published.wait(2), 'stop only after publication, not merely the start of its input read'
         f.stopped.set()
         lane.join(2)
         assert not lane.is_alive() and released.is_set(), 'lane owns/releases its current-generation readers'
