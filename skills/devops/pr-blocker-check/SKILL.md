@@ -44,6 +44,8 @@ instead of blocking on it.
 
 daveey/hermes-hub lands only through push-guard's `land.py` (a bare `gh pr merge` there prints nothing and merges nothing): `python3 ~/code/hermes-mods/plugins/push-guard/land.py --repo daveey/hermes-hub --pr N --head <full sha> --review-task <approving review card> --implementation-task <author-model card>` under the GitHub credential vend. It refuses until every earlier review's non-blocking point is answered in ONE PR comment starting `<!-- hermes-review-reply -->` (fixed in <sha> / follow-up <card> / refuted) and every review thread is resolved; answering instead of pushing keeps the head, so the exact-head approval holds.
 
+push-guard `ast.parse`s any Python it sees in a command (execute_code, `python3 - <<EOF`). A snippet that does not parse (e.g. a jq object `{…}` inside an f-string: `f"gh api … --jq '{sha: .sha}'"`) is held fail-closed with the raw-merge deny ("raw PR merges for a reviewed-landing repository … lack the gate"), even for read-only `gh api` reads. That deny is about syntax, not your merge: build jq filters as plain strings (or run `gh` from the terminal) and `ast.parse` the snippet before retrying.
+
 An unanswered `hermes-ci-review-bot` "⚠️ Warnings" section on the PR's head (no later non-bot comment) blocks
 every merge path, including a bare `gh pr merge`: fix it or refute it in a PR comment first (`hermes-core-wt ship`
 enforces this; `--bot-reply "<why>"` posts the refutation).
