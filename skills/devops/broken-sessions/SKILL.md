@@ -46,6 +46,11 @@ nice ~/.hermes/hermes-agent/.venv/bin/python ~/.hermes/plugins/session-repair/sc
 curl -s localhost:<dashboard port>/api/plugins/session-repair/findings?chat=<session id>   # last cron scan
 ```
 
+For a shadow-to-live gate, use `$HERMES_HOME/session-repair/ticks.jsonl` plus its rotated `.1` segment, not
+cron output history (which can retain less than 24 hours). Require a full same-build shadow window with zero
+`error_count`, scanned ticks without unexplained gaps/skips, and adjudicate every would-act row from
+`actions-shadow.jsonl`. A missing journal or zero repair turns is not clean-shadow evidence.
+
 Every finding carries `id`, `variant`, `card`, `board`, `chat`, `evidence`, `fix {kind, action, commands, why}`,
 `area` and `fingerprint` (`<id>:<board>/<card>`, or `<id>:chat/<session>`); the cron adds `idempotency_key`.
 Fix kinds: `auto` = safe and reversible, the repair chat applies it; `card` = needs real work, file a fix card.
@@ -159,7 +164,12 @@ or holds a future wake.
 waiting card.
 
 **Detection** (`rule_unexplained_wait`), status `blocked` or `triage`, never a card on a valid ask
-(`needs_human` true: that is the user's move). The reason is the newest park event's (core
+(`needs_human` true: that is the user's move). Exclude canonical pending spend decisions in triage
+(`kanban_spend_decision.pending`), including an owner-retained HOLD: never treat these as generic unblock work
+or clear inherited `block_kind`. Core's projected `wait.waiting_since` can reuse an earlier scheduled episode
+because its generic park vocabulary omits spend triage. Check the latest run admission/end and current decision
+before trusting an age; the scanner fences ages at that run boundary and discards a generic park before admission.
+The reason is the current episode's newest park event's (core
 `kanban_wait_info.PARK_EVENT_KINDS`) `reason`, else its `error`:
 - a `human_request` core's `needs_human` rejects → `invalid_human_request` (the ask is invisible);
 - `blocked`, no `block_kind`, no reason, for >= 30 min → `no_reason`;
