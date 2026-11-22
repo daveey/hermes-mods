@@ -145,7 +145,11 @@ note names a real reason (pacing, quota, placement).
 **Safe automatic fix** (`clock_overdue` only): `hermes kanban [--board B] unblock <id>` (scheduled → ready, or todo
 while a parent is open). **Fix card:** `probe_overdue` (area hermes): run the probe command
 (`evidence.probe_cmd`, the first of `commands`) by hand first; exit 0 = its condition holds, then unblock; otherwise
-leave the park and fix the stuck probe runner. `no_wake` (area card): the owner re-parks with a real wake
+leave the park and fix the stuck probe runner. A probe that runs on time but can never pass because its premise is
+moot (e.g. a `capability-owner ... ssh:<host>` wait on a card whose home gateway is that host) is not overdue: read
+the park reason, then unblock on the card's home host (`tailnet_exec`). There, `hermes kanban unblock <id> --seen
+<newest comment id>` is the release; it refuses without `--seen` and prints the id to pass. `hermes kanban resume`
+only releases `active_pr` holds. `no_wake` (area card): the owner re-parks with a real wake
 (`kanban_schedule` with `awaiting`/`wake_at`/`wake_check`) or unblocks. **Done when:** the card left `scheduled`,
 or holds a future wake.
 
