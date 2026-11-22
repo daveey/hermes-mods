@@ -162,6 +162,7 @@ class Feed:
         self.interest: dict[str, float] = {} # session -> expires at
         self._watch_tokens = {}             # rejects reads from forgotten/re-watched membership
         self._board_failures = set()
+        self._board_capture_failures = set()  # only a successful strict recapture may clear these
         self._board = threading.Event()
         self.failures: dict[str, dict] = {}  # session -> {count, error, at}: shown by /status
         self.lock = threading.RLock()        # interest / bundles / failures
@@ -292,6 +293,7 @@ class Feed:
             self.failures = {s: dict(f) for s, f in getattr(prev, 'failures', {}).items()}
             self._retry = set(getattr(prev, '_retry', ())) | set(bundles)  # recompute every carried chat next pass
             self._carried = set(bundles)  # ...and vouch for none of them until its new bundle is stored
+            self._board_capture_failures = set(getattr(prev, '_board_capture_failures', ())) & set(self.interest)
             # Restored from another process and not recomputed yet: still re-issued on its recompute.
             self._reissue = set(getattr(prev, '_reissue', ())) & set(bundles)
             # A carried bundle never outranks a newer computation: sequence numbers continue past every held one.
@@ -336,6 +338,7 @@ class Feed:
     def _forget(self, s: str) -> None:
         self._watch_tokens.pop(s, None)
         self._board_failures.discard(s)
+        self._board_capture_failures.discard(s)
         self._decision_failures.discard(s)
         self._decision_result_seq.pop(s, None)
         self._decision_seen.pop(s, None)
@@ -753,6 +756,7 @@ class Feed:
                                    and s not in self._retry and s not in self._carried
                                    and s not in self._decision_failures
                                    and s not in self._board_failures
+                                   and s not in self._board_capture_failures
                                    and not self.bundles[s].get('source_stale')
                                    and now - self.bundles[s]['bundle']['computed_at'] <= (
                                        self.full_every_s if self.bundles[s]['bundle'].get('tasks')

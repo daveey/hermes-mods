@@ -34,7 +34,12 @@ Known local task-change deltas enter the pending queue and can publish **before*
 the same pass starts strict external capture. A later changed external snapshot
 admits its own successor, including for a chat already locally admitted; the first
 read may predate that external input. Capture failure leaves the source cursor and
-external baseline uncommitted for finite retry. This does not make a local event
+external baseline uncommitted for finite retry. Capture-failure custody is separate
+from per-chat hydration failures: neither an earlier local read finishing later nor
+a full hydration/heartbeat can vouch for held chats until successful strict recapture.
+This fence survives in-process Feed resume and is removed when membership is forgotten;
+recapture clears only its own fence, not pending or failed hydration/decision work.
+This does not make a local event
 arriving during an already-blocked capture independently observable: the capture
 coordinator remains shared, and that pre-admission interval must still be measured.
 Four bounded workers hydrate one chat each; a blocked reader does not hold the
