@@ -348,3 +348,153 @@ def test_register_done_check_with_core(monkeypatch):
     monkeypatch.setitem(sys.modules, "hermes_cli.kanban_session_activity", fake)
     assert plugin._register_done_check() is True
     assert got["kanban-honest-done"] is core.needs_attention
+
+
+def test_register_done_check_declares_the_files_it_reads(monkeypatch):
+    """An event-driven core reruns the check only when a declared file moves; with no declaration it reruns it on
+    every refresh (hub, 2026-11-22: 59% of the annotation thread)."""
+    import types
+    got = {}
+
+    def register_done_check(name, fn, *, watch_paths=None, next_deadline=None):
+        got[name] = (fn, watch_paths, next_deadline)
+
+    fake = types.ModuleType("hermes_cli.kanban_session_activity")
+    fake.register_done_check = register_done_check
+    pkg = types.ModuleType("hermes_cli")
+    pkg.kanban_session_activity = fake
+    monkeypatch.setitem(sys.modules, "hermes_cli", pkg)
+    monkeypatch.setitem(sys.modules, "hermes_cli.kanban_session_activity", fake)
+    assert plugin._register_done_check() is True
+    fn, watch_paths, next_deadline = got["kanban-honest-done"]
+    assert fn is core.needs_attention and fn.attention_pass is core.attention_pass
+    assert watch_paths is core.attention_watch_paths
+    assert next_deadline() is None  # the check reads no clock
+
+
+def test_attention_watch_paths_are_the_boards_and_their_replicas(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / "kanban" / "boards" / "work").mkdir(parents=True)
+    (home / "kanban" / "sync-shadow").mkdir(parents=True)
+    paths = [home / "kanban.db", home / "kanban" / "boards" / "work" / "kanban.db",
+             home / "kanban" / "sync-shadow" / "default.db"]
+    for p in paths:
+        sqlite3.connect(p).close()
+    monkeypatch.setattr(core, "board_paths", lambda env=None: paths[:2])
+    opened = []
+    monkeypatch.setattr(core, "ro_connect", lambda p: opened.append(p))
+    assert sorted(core.attention_watch_paths()) == sorted(paths)
+    assert opened == []  # a declaration callback lists files; it reads no database
+
+
+def _two_boards(tmp_path):
+    """Board a: OWN (follow-up t_aaaaaaaa lives on board b and records the creation there), t_bbbbbbbb (flagged,
+    nothing carries it), t_cccccccc (a linked follow-up), t_dddddddd (acked). Board b: the cross-board follow-up."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    a = make_board(tmp_path / "a", tasks=[(OWN, "one", "done"), ("t_bbbbbbbb", "two", "done"),
+                                          ("t_cccccccc", "three", "done"), ("t_cccc0001", "carry", "ready"),
+                                          ("t_dddddddd", "four", "done")],
+                   links=[("t_cccccccc", "t_cccc0001")])
+    b = make_board(tmp_path / "b", tasks=[("t_aaaaaaaa", "imac run", "ready")], created_by=[("t_aaaaaaaa", OWN)])
+    c = sqlite3.connect(a)
+    c.execute("CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, author TEXT, body TEXT)")
+    c.execute("INSERT INTO task_comments (task_id, author, body) VALUES ('t_dddddddd', 'me', 'honest-done: ack')")
+    c.commit()
+    c.close()
+    cards = [{"id": OWN, "title": "one", "summary": INCIDENT_SUMMARY + " Follow-up: t_aaaaaaaa."},
+             {"id": "t_bbbbbbbb", "title": "two", "summary": INCIDENT_SUMMARY + " Follow-up: t_aaaaaaaa."},
+             {"id": "t_cccccccc", "title": "three", "summary": INCIDENT_SUMMARY},
+             {"id": "t_dddddddd", "title": "four", "summary": INCIDENT_SUMMARY},
+             {"id": "t_eeeeeeee", "title": "five", "summary": "Shipped; verified live."}]
+    return [a, b], cards
+
+
+def _count_opens(monkeypatch):
+    opened, real = [], core.ro_connect
+
+    def ro_connect(path):
+        conn = real(path)
+        opened.append((str(path), conn))
+        return conn
+
+    monkeypatch.setattr(core, "ro_connect", ro_connect)
+    return opened
+
+
+def test_one_attention_pass_opens_each_database_once_and_closes_it(tmp_path, monkeypatch):
+    paths, cards = _two_boards(tmp_path)
+    opened = _count_opens(monkeypatch)
+    each = [core.needs_attention(card, paths) for card in cards]
+    assert each == [False, True, False, False, False]
+    per_card = len(opened)
+    del opened[:]
+    with core.attention_pass():
+        shared = [core.needs_attention(card, paths) for card in cards]
+        assert sorted(p for p, _ in opened) == sorted(str(p) for p in paths)  # one connection per database
+        assert per_card > len(paths)  # the per-card path opened the same boards again and again
+    assert shared == each  # the same answers
+    for _path, conn in opened:  # nothing outlives the pass
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+    assert getattr(core._pass, "state", None) is None
+
+
+def test_a_single_check_shares_its_reads_and_leaves_nothing_open(tmp_path, monkeypatch):
+    paths, cards = _two_boards(tmp_path)
+    opened = _count_opens(monkeypatch)
+    assert core.needs_attention(cards[0], paths) is False  # board a twice and board b three times before
+    assert sorted(p for p, _ in opened) == sorted(str(p) for p in paths)
+    for _path, conn in opened:
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+
+def test_a_pass_reads_the_created_events_once_per_database_and_the_next_pass_sees_a_write(tmp_path, monkeypatch):
+    paths, cards = _two_boards(tmp_path)
+    scans = []
+    real = core._created_by
+
+    def created_by(conn, task_id):
+        state = core._pass.state
+        before = len(state["creators"])
+        out = real(conn, task_id)
+        scans.extend([1] * (len(state["creators"]) - before))
+        return out
+
+    monkeypatch.setattr(core, "_created_by", created_by)
+    with core.attention_pass():
+        assert [core.needs_attention(card, paths) for card in cards][:2] == [False, True]
+    assert len(scans) == len(paths)  # not one scan per card and named follow-up
+    c = sqlite3.connect(paths[1])  # t_aaaaaaaa now also records t_bbbbbbbb as its creator
+    c.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,0)",
+              ("t_aaaaaaaa", "created", json.dumps({"creator_task_id": "t_bbbbbbbb"})))
+    c.commit()
+    c.close()
+    with core.attention_pass():
+        assert core.needs_attention(cards[1], paths) is False
+    assert core.needs_attention(cards[1], paths) is False
+
+
+def test_a_failed_open_inside_a_pass_is_not_remembered(tmp_path, monkeypatch):
+    paths, cards = _two_boards(tmp_path)
+    real, fail = core.ro_connect, [True]
+
+    def ro_connect(path):
+        if fail[0] and str(path) == str(paths[0]):
+            raise sqlite3.OperationalError("database is locked")
+        return real(path)
+
+    monkeypatch.setattr(core, "ro_connect", ro_connect)
+    with core.attention_pass():
+        assert core.needs_attention(cards[3], paths) is True  # the ack on board a could not be read
+        fail[0] = False
+        assert core.needs_attention(cards[3], paths) is False
+
+
+def test_find_task_leaves_a_shared_connection_returning_plain_rows(tmp_path):
+    paths, _cards = _two_boards(tmp_path)
+    with core.attention_pass():
+        assert core.find_task("t_aaaaaaaa", paths)[1]["status"] == "ready"
+        conn, _release = core._open(paths[1])
+        assert type(conn.execute("SELECT id FROM tasks").fetchone()) is tuple

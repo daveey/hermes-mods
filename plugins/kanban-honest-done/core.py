@@ -11,6 +11,8 @@ import os
 import re
 import shlex
 import sqlite3
+import threading
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -134,6 +136,72 @@ def ro_connect(path: Path) -> sqlite3.Connection:
         return conn
 
 
+# One attention pass (core's sidebar done checks, section C) asks about every recently completed card. Each
+# answer used to open its own connections: the card's board, every board again for the named follow-ups, then one
+# per named card. Inside ``attention_pass`` every reader below shares one connection per database, opened on first
+# use and closed when the pass ends, and the ``created`` events are read once per database. Per thread; nothing
+# outlives the pass. Outside a pass ``_open`` is a plain open + close, as before.
+_pass = threading.local()
+
+
+@contextmanager
+def attention_pass():
+    """One shared short-lived read per database for the calls made inside. Re-entrant; the outermost exit closes."""
+    state = getattr(_pass, "state", None)
+    if state is not None:
+        yield
+        return
+    state = _pass.state = {"conns": {}, "creators": {}}
+    try:
+        yield
+    finally:
+        _pass.state = None
+        for conn in state["conns"].values():
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+
+def _open(path: Path):
+    """``(connection, release)``: the pass's shared connection when one is open, else a new one ``release`` closes.
+    An open that fails raises ``sqlite3.Error`` and is not remembered."""
+    state = getattr(_pass, "state", None)
+    if state is None:
+        conn = ro_connect(path)
+        return conn, conn.close
+    key = str(path)
+    conn = state["conns"].get(key)
+    if conn is None:
+        conn = state["conns"][key] = ro_connect(path)
+    return conn, _keep
+
+
+def _keep() -> None:
+    return None
+
+
+def _created_by(conn: sqlite3.Connection, task_id: str) -> Optional[set[str]]:
+    """Inside a pass: the cards whose ``created`` event names ``task_id`` as creator, from one read of this
+    database's ``created`` events. None outside a pass or on a connection the pass does not own. The rows read
+    before a failure (no JSON1, a malformed payload) are kept, as the per-card query yields them in the same index
+    order before it fails."""
+    state = getattr(_pass, "state", None)
+    if state is None or not any(conn is c for c in state["conns"].values()):
+        return None
+    index = state["creators"].get(id(conn))
+    if index is None:
+        index = state["creators"][id(conn)] = {}
+        try:
+            for child, creator in conn.execute(
+                    "SELECT task_id, json_extract(payload,'$.creator_task_id') FROM task_events WHERE kind='created'"):
+                if isinstance(creator, str):
+                    index.setdefault(creator, set()).add(child)
+        except sqlite3.Error:
+            pass
+    return index.get(task_id, set())
+
+
 def board_paths(env=None) -> list[Path]:
     """Every board db: the worker's own (``HERMES_KANBAN_DB``) first, then the default + ``kanban/boards/*``."""
     env = os.environ if env is None else env
@@ -174,12 +242,16 @@ def related_task_ids(conn: sqlite3.Connection, task_id: str) -> set[str]:
             "SELECT child_id FROM task_links WHERE parent_id=? UNION SELECT parent_id FROM task_links WHERE child_id=?",
             (task_id, task_id)))
     if _has_table(conn, "task_events"):
-        try:
-            out.update(r[0] for r in conn.execute(
-                "SELECT task_id FROM task_events WHERE kind='created' AND json_extract(payload,'$.creator_task_id')=?",
-                (task_id,)))
-        except sqlite3.Error:  # no JSON1 / odd payloads
-            pass
+        indexed = _created_by(conn, task_id)
+        if indexed is not None:
+            out.update(indexed)
+        else:
+            try:
+                out.update(r[0] for r in conn.execute(
+                    "SELECT task_id FROM task_events WHERE kind='created' "
+                    "AND json_extract(payload,'$.creator_task_id')=?", (task_id,)))
+            except sqlite3.Error:  # no JSON1 / odd payloads
+                pass
     out.discard(task_id)
     return out
 
@@ -187,20 +259,21 @@ def related_task_ids(conn: sqlite3.Connection, task_id: str) -> set[str]:
 def find_task(task_id: str, paths: Iterable[Path]) -> Optional[tuple[Path, dict[str, Any]]]:
     for p in paths:
         try:
-            conn = ro_connect(p)
+            conn, release = _open(p)
         except sqlite3.Error:
             continue
         try:
-            conn.row_factory = sqlite3.Row
             if not _has_table(conn, "tasks"):
                 continue
-            row = conn.execute("SELECT id, title, status, body FROM tasks WHERE id=?", (task_id,)).fetchone()
+            cur = conn.cursor()  # rows by name on this cursor only: the connection may be a pass's shared one
+            cur.row_factory = sqlite3.Row
+            row = cur.execute("SELECT id, title, status, body FROM tasks WHERE id=?", (task_id,)).fetchone()
             if row:
                 return p, dict(row)
         except sqlite3.Error:
             continue
         finally:
-            conn.close()
+            release()
     return None
 
 
@@ -214,7 +287,7 @@ def valid_followups(task_id: str, text: str, paths: list[Path],
     related: set[str] = set()
     for p in paths:
         try:
-            conn = ro_connect(p)
+            conn, release = _open(p)
         except sqlite3.Error:
             continue
         try:
@@ -224,7 +297,7 @@ def valid_followups(task_id: str, text: str, paths: list[Path],
         except sqlite3.Error:
             pass
         finally:
-            conn.close()
+            release()
     ok = []
     for n in named:
         if n not in related:
@@ -260,7 +333,7 @@ def _replica_followup(task_id: str, n: str, paths: list[Path], statuses: tuple[s
     placed on another gateway reads as missing and gate B refuses an honest handoff."""
     for p in replica_paths(paths):
         try:
-            conn = ro_connect(p)
+            conn, release = _open(p)
         except sqlite3.Error:
             continue
         try:
@@ -285,7 +358,7 @@ def _replica_followup(task_id: str, n: str, paths: list[Path], statuses: tuple[s
         except sqlite3.Error:
             continue
         finally:
-            conn.close()
+            release()
     return False
 
 
@@ -931,17 +1004,44 @@ def needs_attention(card: dict[str, Any], paths: Optional[list[Path]] = None) ->
     """True when a completed card's handoff admits dropped work and no follow-up card carries it.
 
     Follow-up = any non-archived card it created / links to, or a named one passing ``valid_followups``. A
-    ``honest-done: ack`` comment on the card (the human accepted the narrower result) clears it."""
+    ``honest-done: ack`` comment on the card (the human accepted the narrower result) clears it.
+
+    One call shares one connection per database (``attention_pass``); core opens the pass around all its calls
+    when it knows ``needs_attention.attention_pass``."""
+    with attention_pass():
+        return _needs_attention(card, paths)
+
+
+def attention_watch_paths() -> list[Path]:
+    """Every file ``needs_attention`` reads, for core's event-driven holder: the boards and their Board replicas.
+    Lists files only; opens no database."""
+    boards = board_paths()
+    return boards + replica_paths(boards)
+
+
+def attention_next_deadline() -> None:
+    """``needs_attention`` reads no clock: its answer moves only when a watched file does."""
+    return None
+
+
+needs_attention.attention_pass = attention_pass  # type: ignore[attr-defined]
+
+
+def _needs_attention(card: dict[str, Any], paths: Optional[list[Path]]) -> bool:
     tid = str(card.get("id") or "")
     summary, title = str(card.get("summary") or ""), str(card.get("title") or "")
     if not tid or not dropped_work_in_handoff(summary, title):
         return False
     if paths is None:
+        state = _pass.state
+        boards = state.get("boards")
+        if boards is None:
+            boards = state["boards"] = board_paths()
         own = [Path(card["board_path"])] if card.get("board_path") else []
-        paths = own + [p for p in board_paths() if str(p) not in {str(x) for x in own}]
+        paths = own + [p for p in boards if str(p) not in {str(x) for x in own}]
     for p in paths[:1]:
         try:
-            conn = ro_connect(p)
+            conn, release = _open(p)
         except sqlite3.Error:
             break
         try:
@@ -957,7 +1057,7 @@ def needs_attention(card: dict[str, Any], paths: Optional[list[Path]] = None) ->
         except sqlite3.Error:
             return False
         finally:
-            conn.close()
+            release()
     return not valid_followups(tid, summary, paths)
 
 
