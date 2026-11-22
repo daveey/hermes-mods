@@ -1,5 +1,6 @@
 """Contract: PanelModel consumes the published envelope, not surrounding prose or counts."""
 import importlib.util
+import json
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location('panel_status_contract', Path(__file__).resolve().parents[1] / 'model.py')
@@ -53,3 +54,12 @@ def test_status_revision_changes_panel_revision_without_touching_counts_or_actio
     assert first['revision'] != second['revision']
     assert first['sections'] == second['sections']
     assert first['header']['counts'] == second['header']['counts']
+
+
+def test_nested_wire_objects_are_not_decoded_from_strings_into_canonical_status():
+    for field in ('identity', 'coverage', 'presentation'):
+        value = outcome()
+        value['status'][field] = json.dumps(value['status'][field])
+        header = reduce(value)['header']
+        assert header['state'] == 'unknown', field
+        assert header['status'] is None, field
