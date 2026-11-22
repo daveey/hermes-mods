@@ -27,8 +27,10 @@ def read(reader, session, lineage):
     out = {'outcome_json': {}, 'requests': [], 'subagents': [], 'processes': [], 'rentals': [], 'input_errors': []}
     db = reader.conn(reader.state_db())
     home = reader.state_db().parent
+    known_absent = False
     try:
         row = db.execute('SELECT outcome_json FROM sessions WHERE id=?', (session,)).fetchone() if db else None
+        known_absent = db is not None and row is None
         out['outcome_json'] = _obj(row['outcome_json']) if row else {}
     except Exception:
         out['input_errors'].append('session outcome unavailable')
@@ -36,8 +38,10 @@ def read(reader, session, lineage):
     # Read the current frozen revision, but overlay its CURRENT lifecycle. A revision
     # body still says open after withdrawal; reading body alone resurrects old asks.
     profile = home.name if home.parent.name == 'profiles' else 'default'
-    canonical = None
-    if hasattr(reader, 'reconcile_user_steps'):
+    # Like the fast lane, a successfully queried absent own row has no
+    # request authority. Do not resurrect surviving store rows for deleted chats.
+    canonical = [] if known_absent else None
+    if not known_absent and hasattr(reader, 'reconcile_user_steps'):
         try:
             canonical = reader.reconcile_user_steps(session, lineage)
         except Exception:
