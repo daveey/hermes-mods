@@ -70,6 +70,28 @@ def test_failed_source_stays_unvouched_without_idle_retry_and_recovers_on_event(
     assert 'S1' in pushed[-1]['fresh']
 
 
+def test_feed_uses_semantic_membership_changes_instead_of_event_ids():
+    from types import SimpleNamespace
+    f, r, pushed, t = make()
+    f.watch(['S1', 'S2'])
+    f.tick()
+    other = f.bundles['S1']['bundle']
+    # Only the newly subscribed session is dirty. There is no task event.
+    r.links['S2'] = [{'id': 't_sub0001', 'title': 'New subscription', 'status': 'running', 'board': 'default'}]
+    changes = SimpleNamespace(affects=lambda held: 'S2' in held['lineage'])
+    calls = []
+    def semantic(cursor):
+        calls.append(cursor)
+        return changes, {'source': 'new revision'}
+    r.board_changes = semantic
+    r.events = []
+    r.stamp += 1
+    f.tick()
+    assert calls, 'the canonical semantic cursor, not max(event.id), must be consulted'
+    assert f.bundles['S1']['bundle'] is other
+    assert f.bundles['S2']['bundle']['tasks'][0]['id'] == 't_sub0001'
+
+
 def test_source_event_after_long_idle_recomputes_only_affected_chat():
     import json
     f, r, pushed, t = make()

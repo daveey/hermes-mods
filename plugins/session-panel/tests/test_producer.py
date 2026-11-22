@@ -148,11 +148,16 @@ def test_unchanged_decision_inputs_are_not_re_read_every_pass():
     t['now'] += 1
     f.refresh_decisions()
     assert sorted(r.decisions) == ['S1', 'S2']
-    # The safety net: every chat again after DECISION_FULL_EVERY_S with nothing moved.
+    # Elapsed time never re-authorizes a read. Operations/deliveries above are
+    # still event-invalidated; the old 60s safety sweep was polling.
     r.decisions.clear()
+    before = r.batches
     t['now'] += feedmod.DECISION_FULL_EVERY_S + 1
     f.refresh_decisions()
-    assert sorted(r.decisions) == ['S1', 'S2']
+    assert r.decisions == [] and r.batches == before
+    r.files += 1  # unrelated state write after a long idle must not expand work
+    f.refresh_decisions()
+    assert r.decisions == [] and r.batches == before + 1
 
 
 def test_a_failed_decision_read_is_retried_even_when_nothing_moved():

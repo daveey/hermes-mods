@@ -352,8 +352,7 @@ class Feed:
             files = getattr(rd, 'panel_files_stamp', None)
             moved = files() if callable(files) else None
             if (moved is not None and moved == self._decision_files and not failed
-                    and all(s in self._decision_seen and 0 <= now - self._decision_seen[s][1] < DECISION_FULL_EVERY_S
-                            for s in held)):
+                    and all(s in self._decision_seen for s in held)):
                 return 0  # nothing behind any held chat's decisions moved: no database opened this pass
             stamps = self._decision_stamps(rd, held)
             count = 0
@@ -362,8 +361,7 @@ class Feed:
                     break
                 stamp = stamps.get(s)
                 seen = self._decision_seen.get(s)
-                if (stamp is not None and seen is not None and seen[0] == stamp and s not in failed
-                        and 0 <= now - seen[1] < DECISION_FULL_EVERY_S):
+                if stamp is not None and seen is not None and seen[0] == stamp and s not in failed:
                     continue
                 seq = next(self._seq)
                 try:
@@ -732,8 +730,14 @@ class Feed:
         # day by every chat, and each of those writes must not open every board.
         boards = getattr(self.readers, 'board_stamps', None)
         seen = boards() if callable(boards) else None
+        semantic = getattr(self.readers, 'board_changes', None)
+        board_changes = None
         if seen is None or seen != self._board_stamps or full or self._cursor is None:
-            changed_cards, self._cursor = self.readers.changed_cards(self._cursor)
+            if callable(semantic):
+                board_changes, self._cursor = semantic(self._cursor)
+                changed_cards = {}
+            else:  # injectable/older readers retain their event-only contract
+                changed_cards, self._cursor = self.readers.changed_cards(self._cursor)
         else:
             changed_cards = {}
         self._board_stamps = seen
@@ -756,6 +760,9 @@ class Feed:
                     b = self.bundles.get(s)
                     if b and (b['refs'] & set(changed_cards) or b['lineage'] & touched):
                         dirty.add(s)
+        if board_changes is not None:
+            with self.lock:
+                dirty.update(s for s in watched if s in self.bundles and board_changes.affects(self.bundles[s]))
         dirty.update(retry)
         dirty.update(panel_dirty)
         if not dirty:

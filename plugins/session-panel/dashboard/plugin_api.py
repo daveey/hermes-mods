@@ -140,6 +140,27 @@ def _load_feed():
     return mod
 
 
+@dataclasses.dataclass
+class BoardChanges:
+    """Semantic invalidation, preserving each source's board coordinate."""
+    sources: dict[tuple[str, str], set[str]] = dataclasses.field(default_factory=dict)
+    sessions: set[str] = dataclasses.field(default_factory=set)
+    full: bool = False
+
+    def affects(self, held):
+        if self.full or held['lineage'] & self.sessions:
+            return True
+        bundle = held['bundle']
+        rows = list(bundle.get('tasks', [])) + list(bundle.get('done', []))
+        rows += [dict(rec.get('detail', {}).get('task', {}), board=rec.get('board', 'default'))
+                 for rec in bundle.get('cards', {}).values() if isinstance(rec, dict)]
+        # Local and replica sources may share a board slug. Keep their cursors
+        # and changed IDs separate; conservatively match both against that board's
+        # held inputs (legacy chain records don't always retain gateway scope).
+        return any(str(row.get('id')) in ids and (row.get('board') or 'default') == board
+                   for row in rows for (_path, board), ids in self.sources.items())
+
+
 class CoreReaders:
     """Feed reads against this gateway's own boards, board replicas and state.db, read-only (query_only). Each thread has its own
     connections (the feed thread and catch-up request threads read concurrently); a connection is reopened when its
@@ -230,6 +251,67 @@ class CoreReaders:
     def _stamps_of(self, paths):
         from hermes_cli.session_list_flight import data_stamp
         return tuple(data_stamp(p) or self._stat(p) for p in paths)
+
+    def board_changes(self, cursor):
+        """Per-source semantic changes, not an event-id high-water mark.
+
+        Never commit a cursor or file stamp after failed capture. Each source is
+        read in one owned query-only transaction and closed before invalidation.
+        FULL (coverage loss, reset, replacement) conservatively invalidates all
+        watched sessions, including sessions gaining their first membership.
+        """
+        from hermes_cli import kanban_task_change as changes
+        from hermes_cli.kanban_session_activity import _counted_sub_clause
+        previous = cursor or {}
+        fresh = {}
+        out = BoardChanges()
+        paths = {str(p): slug for slug, p in self.boards()}
+        paths.update({str(self.ksc.shadow_path(slug)): slug for slug, _ in self.boards()})
+        present = {str(p) for p in self.files()}
+        if set(previous) - present:
+            out.full = True  # removal can retract rows; never retain a vanished source cursor
+        for key in sorted(present):
+            path = Path(key)
+            stamp = self._stat(path)
+            old = previous.get(key)
+            if old is not None and old[0] == stamp:
+                fresh[key] = old
+                continue
+            with contextlib.closing(sqlite3.connect(f'file:{path}?mode=rw', uri=True, timeout=0.5)) as c:
+                c.execute('PRAGMA query_only=ON')
+                c.row_factory = sqlite3.Row
+                c.execute('BEGIN')
+                ids, next_cursor = changes.changed_since(c, old[1] if old else None)
+                if ids is changes.FULL:
+                    out.full = True
+                elif isinstance(ids, frozenset) and ids:
+                    out.sources.setdefault((key, paths.get(key, path.stem)), set()).update(ids)
+                    # Current membership discovers brand-new subscribers/creators;
+                    # old membership is represented by the held bundle's refs.
+                    # Chunk for SQLite parameter limits, not a truncated event page.
+                    ordered = sorted(ids)
+                    tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    for at in range(0, len(ordered), 400):
+                        part = ordered[at:at + 400]
+                        marks = ','.join('?' for _ in part)
+                        out.sessions.update(r[0] for r in c.execute(
+                            f'SELECT session_id FROM tasks WHERE id IN ({marks})', part) if r[0])
+                        if 'kanban_notify_subs' in tables:
+                            out.sessions.update(r[0] for r in c.execute(
+                                "SELECT s.chat_id FROM kanban_notify_subs s JOIN tasks t ON t.id=s.task_id "
+                                "WHERE s.platform='tui' AND "
+                                f'{_counted_sub_clause(c)} AND s.task_id IN ({marks})', part) if r[0])
+                        if 'task_chat_links' in tables:
+                            # Invalidation is deliberately a superset of the
+                            # canonical remote membership selector: never miss a
+                            # new origin/shepherd with no held reference yet.
+                            out.sessions.update(r[0] for r in c.execute(
+                                f'SELECT chat_session FROM task_chat_links WHERE task_id IN ({marks})', part) if r[0])
+                c.rollback()
+            # Do not swallow a concurrent write by adopting an after-read stamp.
+            # Retaining the before-read stamp guarantees another pass sees it.
+            fresh[key] = (stamp, next_cursor)
+        return out, fresh
 
     def changed_cards(self, cursor):
         """({card id: its chat or None} with an event since `cursor`, new cursor). The first call only sets it.
