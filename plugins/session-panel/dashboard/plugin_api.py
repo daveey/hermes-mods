@@ -1024,7 +1024,6 @@ FEED_ROLE = _feed_role()
 # Stable across restarts (not the pid): clients match pushes by it, so a restarted backend's pushes count at once.
 FEED_ID = f'{socket.gethostname()}:{FEED_ROLE}'
 LAUNCH_PROFILE = _launch_profile()
-TIMING_EVERY_S = 1.0           # the timing file is rewritten at most this often
 SNAPSHOT_EVERY_S = 30.0        # a changed feed is saved at most this often (and on stop / exit)
 RESTORE_MAX_AGE_S = 15 * 60.0  # an older snapshot starts a new revision space instead
 SNAPSHOT_PRUNE_S = 7 * 86400.0  # snapshots of backends not seen for this long are deleted
@@ -1536,7 +1535,7 @@ def _run_decisions(f) -> None:
 
 def _run(f) -> None:
     saved = (None, None)  # (rev, watched chats) last written
-    saved_at = timing_at = 0.0
+    saved_at = 0.0
     try:
         last = 0.0
         _event_driven(f)
@@ -1562,9 +1561,7 @@ def _run(f) -> None:
             except Exception:
                 log.warning('session-panel feed tick failed', exc_info=True)
             f.readers.release()  # no connection outlives one pass
-            if time.monotonic() - timing_at >= TIMING_EVERY_S:
-                timing_at = time.monotonic()
-                write_timing(f)
+            write_timing(f)  # after every pass (at most one per MIN_GAP_S): the 1 s freshness target is read from it
             with f.lock:
                 state = (f.rev, frozenset(f.interest))
             if state != saved and time.monotonic() - saved_at >= SNAPSHOT_EVERY_S:

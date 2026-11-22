@@ -51,6 +51,7 @@ CHUNK = 16                   # ...then the rest this many at a time, so a click 
 DECISION_FULL_EVERY_S = 30.0 # a chat whose decision inputs did not move is still re-read this often
 RETRY_EVERY_S = 2.0          # with no write to wake a pass: a read that failed or raced is tried again this often
 MIN_IDLE_WAIT_S = 0.2        # the event-driven loop never sleeps less than this between idle checks
+RECENT_PUBLISHES = 32        # pushes kept in `Feed.timing['recent']` (rev, time, chats, pass start)
 RETRY_STEPS = 3              # failed work is retried this many times without a source event (0.1, 0.2, 0.4 s)
 OPEN_KEYS = ('tasks', 'requests', 'subagents', 'processes', 'rentals')  # a bundle with any of these ages
 SNAPSHOT_VERSION = 1         # the on-disk shape of Feed.snapshot()
@@ -146,8 +147,11 @@ class Feed:
         # Wall-clock timing readable without the session token (/status, and the timing file the run loop writes).
         self.timing: dict[str, Any] = {'ticks': 0, 'tick_started_at': None, 'tick_duration_s': None,
                                        'producer_s': None, 'producer_chats': 0, 'last_publish_at': None,
-                                       'last_publish_rev': None}
+                                       'last_publish_rev': None, 'recent': []}
         self._producer_seen: Any = None      # global source stamp the producer last settled (admission only)
+        self._producer_lineage: dict[str, tuple] = {}  # lineage each chat was last reconciled under
+        self._producer_owed: set[str] = set()  # outcome/request stamp moved under a stamp that predated it
+        self._pass: Optional[tuple] = None   # (thread ident, wall start) of the pass in flight
         self._seq = itertools.count(1)       # compute order: a bundle computed earlier never replaces a later one
         self._stamps: Any = None
         self._panel_stamps: dict[str, Any] = {}
@@ -306,6 +310,8 @@ class Feed:
         self.interest.pop(s, None)
         self._panel_stamps.pop(s, None)
         self._reconcile_stamps.pop(s, None)
+        self.__dict__.setdefault('_producer_lineage', {}).pop(s, None)
+        self.__dict__.setdefault('_producer_owed', set()).discard(s)
         getattr(self, '_reconcile_deferred', set()).discard(s)
         (getattr(self, '_external_observations', None) or {}).pop(s, None)
         (getattr(self, '_external_captures', None) or {}).pop(s, None)
@@ -652,10 +658,21 @@ class Feed:
                                **({} if changed else {'heartbeat': True})})
                     self.last_emit = now
                     if changed:
-                        self.__dict__.setdefault('timing', {}).update(last_publish_at=time.time(), last_publish_rev=self.rev)
+                        self._note_publish(changed)
                 except Exception:  # no client / transport down: clients catch up, and see no heartbeat meanwhile
                     log.debug('session-panel feed: push failed', exc_info=True)
             return changed
+
+    def _note_publish(self, changed: dict) -> None:
+        """Wall-clock record of a push that carried bundles: the latest, and the last RECENT_PUBLISHES with the
+        chats each carried and the start of the pass that read them (None for a push outside a pass)."""
+        timing = self.__dict__.setdefault('timing', {})
+        at = time.time()
+        current = getattr(self, '_pass', None)
+        entry = {'rev': self.rev, 'at': at, 'sessions': sorted(changed),
+                 'pass_started_at': current[1] if current and current[0] == threading.get_ident() else None}
+        timing.update(last_publish_at=at, last_publish_rev=self.rev,
+                      recent=(list(timing.get('recent') or []) + [entry])[-RECENT_PUBLISHES:])
 
     def _drain(self) -> None:
         """Tick thread: take in what readers registered since the last look. A chat with no bundle goes to the head
@@ -800,15 +817,18 @@ class Feed:
         """Settle a source pass atomically, with finite recovery of unread changes."""
         import copy
         names = ('_panel_stamps', '_panel_files', '_stamps', '_board_stamps',
-                 '_external_stamps', '_external_captures', '_external_observations', '_cursor', '_reconcile_stamps', '_producer_seen')
+                 '_external_stamps', '_external_captures', '_external_observations', '_cursor', '_reconcile_stamps', '_producer_seen',
+                 '_producer_lineage', '_producer_owed')
         saved = {name: copy.deepcopy(getattr(self, name, None)) for name in names}
         self._admission_retry_at = None
         self._hydrate_retry_at = None  # this pass is the retry; it re-arms below when a chat still fails
         self._attempted = set()
         began, began_wall = time.monotonic(), time.time()
+        self._pass = (threading.get_ident(), began_wall)
         try:
             result = self._tick()
         except Exception:
+            self._pass = None
             # A later reader can fail after an earlier one captured its stamp.
             # Never consume that event, or keep vouching for the held old bundle.
             for name, value in saved.items():
@@ -823,6 +843,7 @@ class Feed:
             self._admission_failures = attempt
             self._admission_retry_at = self._backoff(attempt)
             raise
+        self._pass = None
         self._admission_failures = 0
         self.__dict__.setdefault('timing', {}).update(
             ticks=self.timing.get('ticks', 0) + 1, tick_started_at=began_wall,
@@ -953,20 +974,39 @@ class Feed:
                 self._external_captures = captured
             elif external_dirty:  # Older readers cannot attest unchanged external inputs.
                 dirty.update(watched)
+        source_dirty = set(dirty)  # chats whose own source inputs this pass read as changed
         dirty.update(retry)
         dirty.update(panel_dirty)
         if scoped:
-            # Only chats whose own inputs moved are reconciled. Lineage changes (compression/membership) have
-            # no held-input signal, so compare them here.
+            # Only chats whose own inputs moved are reconciled. `source_seen` was captured before the reads
+            # above, so a write that landed in between is already consumed into `source_dirty` although the
+            # stamp this pass holds predates it: those chats are admitted whether or not the stamp had moved.
             moved = source_seen != self._producer_seen
-            admitted = set(redo) | {s for s in watched if s not in self._reconcile_stamps}
+            known = self.__dict__.setdefault('_producer_lineage', {})
+            admitted = set(redo) | source_dirty | {s for s in watched if s not in self._reconcile_stamps}
+            # A chat whose outcome/request stamp moved is reconciled with the source write behind it. When
+            # the stamp this pass holds predates that write, it is owed to the pass that sees the stamp move
+            # (a request-store write alone is not a source event and never runs the producer).
+            owed = self.__dict__.setdefault('_producer_owed', set())
+            owed.update(panel_dirty)
+            lineages = {}
             if moved:
-                admitted |= dirty
+                # Any source write re-admits producer work still owed after its retries ran out.
                 with self.lock:
-                    held_lineage = {s: set(self.bundles[s]['lineage']) for s in watched if s in self.bundles}
-                admitted |= {s for s, ids in held_lineage.items() if set(self.readers.lineage(s) or [s]) != ids}
+                    admitted |= self._reconcile_deferred
+                    admitted |= {s for s in owed if s in self.interest}
+                # Lineage changes (compression/membership) have no held-input signal. Compared with the
+                # lineage each chat was last reconciled under, not the held bundle's: a recompute may have
+                # adopted the new lineage in a pass whose stamp predated the write.
+                lineages = {s: tuple(self.readers.lineage(s) or [s]) for s in watched}
+                admitted |= {s for s, ids in lineages.items() if known.get(s) != ids}
+            else:
+                lineages = {s: tuple(self.readers.lineage(s) or [s]) for s in admitted if s not in known}
             if admitted or moved:
                 self._produce(watched, source_seen, admitted)
+                owed.difference_update(admitted)
+                with self.lock:
+                    known.update((s, ids) for s, ids in lineages.items() if s in self.interest)
                 # The producer's own request writes must reach the presentation of the chats it reconciled.
                 dirty.update(self._panel_dirty(watched))
         if not dirty:
