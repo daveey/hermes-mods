@@ -1,6 +1,12 @@
 ---
 name: lanes
-description: "Use when the user asks what the fleet is working on, wants more or less of a project (a lane), or when running the lane planner."
+description: "Use when asked what the fleet works on or to shift shares."
+triggers:
+  asks:
+    - "what is the fleet working on?"
+    - "give this project more worker time"
+    - "run the lane planner"
+  not_for: "auditing blocked cards (use kanban-hands-digest)"
 version: 1.0.0
 author: Hermes Agent
 license: MIT
