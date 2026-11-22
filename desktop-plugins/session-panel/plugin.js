@@ -97,7 +97,7 @@ export function feedVouches(route, nowMs = Date.now()) {
   return feedIsLive(route, nowMs) && !!st?.fresh?.includes(route.session)
 }
 const modelVersions = new Map()
-export const resetFeedForTests = () => { feeds.clear(); feedFlights.clear(); feedQueued.clear(); modelCache.clear(); modelVersions.clear() }
+export const resetFeedForTests = () => { feeds.clear(); feedFlights.clear(); feedQueued.clear(); modelCache.clear(); modelVersions.clear(); decisionTimings.clear() }
 
 /** Cache only the model. Missing/unsupported models invalidate this exact scope; raw cards are never a fallback. */
 export function ingestBundle(connectionId, profile, b, version = null) {
@@ -610,11 +610,12 @@ export async function chooseModelOption(row, option, sourceRoute, { call = model
     modelDecisions.set(key, { locked: true, text: 'Submitting decision…' }); modelChanged()
     const posted = performance.now()
     const data = await call(`/api/plugins/user-steps/requests/${encodeURIComponent(action.request_id)}/decisions`, { ...route, method: 'POST', body: decision })
+    const responded = performance.now()
     feedLog(`decision response operation=${data?.operation?.operationId || 'unknown'} post_ms=${(performance.now()-posted).toFixed(1)} elapsed_ms=${(performance.now()-clicked).toFixed(1)}`)
     const intent = { route, sourceRoute, owner: action.owner, requestId: action.request_id, decision }
     // Modern owners return the durable canonical operation. Do not throw that
     // receipt away and wait on three redundant GETs before repainting.
-    if (applyDecisionReceipt(row, intent, data)) await refreshDecisionPanel(intent, call)
+    if (applyDecisionReceipt(row, intent, data)) await refreshDecisionPanel(intent, call, { clicked, posted, responded, operationId: data?.operation?.operationId || data?.operation?.id })
     else await checkModelDecision(row, { call }) // mixed-version owner
   } catch (e) {
     decisionFailed(key, e, true)
@@ -640,11 +641,40 @@ function applyDecisionReceipt(row, intent, data) {
   modelChanged()
   return true
 }
-async function refreshDecisionPanel(intent, call) {
+// One compact client-side timing record per real decision click, joined to the
+// server's "Decision timing" line by operationId. Fire-and-forget: it never
+// blocks, retries or alters the decision result.
+const decisionTimings = new Map()
+export function reportDecisionTiming(call, route, t) {
+  try {
+    if (!t?.operationId) return
+    const r = n => Math.round(n * 10) / 10
+    const body = { session: route.session, operation: String(t.operationId),
+      posted_ms: r(t.posted - t.clicked), responded_ms: r(t.responded - t.clicked),
+      refreshed_ms: r(t.refreshed - t.clicked), painted_ms: r(t.painted - t.clicked) }
+    Promise.resolve(call('/api/plugins/user-steps/client-timing', { ...route, method: 'POST', body })).catch(() => {})
+  } catch {}
+}
+// Observe the model actually committed by a mounted Panel, not a response bundle
+// or a speculative render. No record if the chat is unfocused/unmounted. Bounded,
+// ephemeral tracking only; no retries or persistent telemetry queue.
+function observeDecisionRender(route, model) {
+  const now = performance.now()
+  for (const [id, t] of decisionTimings) {
+    if (now - t.clicked > 600_000) { decisionTimings.delete(id); continue }
+    if (routeKey(route) !== routeKey(t.sourceRoute) || !model) continue
+    if (model.sections.needs_you.some(row => row.request_id === t.requestId &&
+        row.actions.some(a => a.kind === 'decide' && sameModelOwner(a.owner, t.owner)))) continue
+    decisionTimings.delete(id) // consume before calling arbitrary transport code
+    reportDecisionTiming(t.call, t.route, { ...t, painted: now })
+  }
+}
+async function refreshDecisionPanel(intent, call, timing = null) {
   const route = intent.sourceRoute || intent.route
   const started = performance.now()
   try {
     const data = await call('/api/plugins/session-panel/decision-refresh', { ...route, method: 'POST', body: { session: route.session } })
+    const refreshed = performance.now()
     if (data?.bundle?.session !== route.session || !validModel(data.bundle.model) || typeof data.epoch !== 'string' || !Number.isSafeInteger(data.rev)) throw Error('Panel refresh unavailable')
     const cur = feeds.get(connKey(route.connectionId, route.profile))
     if (cur && (cur.feed !== data.feed || cur.epoch !== data.epoch)) return
@@ -652,6 +682,10 @@ async function refreshDecisionPanel(intent, call) {
     // version fence below, not that global cursor, owns this model's freshness.
     // Only backend-authored classification/counts; never move a row locally on
     // the assumption that recording a choice means a worker is running.
+    if (timing?.operationId) {
+      if (decisionTimings.size >= 100) decisionTimings.delete(decisionTimings.keys().next().value)
+      decisionTimings.set(timing.operationId, { ...timing, ...intent, sourceRoute: route, call, refreshed })
+    }
     ingestBundle(route.connectionId, route.profile, data.bundle, data)
     feedLog(`decision model-applied refresh_ms=${(performance.now()-started).toFixed(1)} rev=${data.rev}`)
   } catch (e) {
@@ -738,6 +772,7 @@ export function Panel() {
     return () => { active = false }
   }, [scope, retry])
   const model = cachedModel(route)
+  useEffect(() => { observeDecisionRender(route, model) })
   if (!route.session) return null
   if (!model) return jsx(PendingModel, { waiting: pending?.scope !== scope || pending.waiting, onRetry: () => setRetry(v => v + 1) })
   const collapsed = isCollapsed(model, readCollapsed(scope))

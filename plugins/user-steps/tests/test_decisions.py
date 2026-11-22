@@ -510,3 +510,30 @@ def test_closed_owner_chat_is_a_wait_not_a_counted_failure(tmp_path, message):
     ok = DurableReceiver(tmp_path / 'receiver.json'); ok.fail = False
     # attempts stayed 0, so the capped background retrier still picks it up once the chat is open
     assert s.reconcile(OWNER, ok, max_attempts=1)[0]['operation']['dispatchState'] == 'delivered'
+
+
+def test_client_timing_endpoint_logs_one_joinable_line(tmp_path, caplog):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    api = load_module('timing_api', ROOT / 'dashboard' / 'plugin_api.py')
+    s = store(tmp_path); r = s.create(OWNER, request())
+    op = s.decide(OWNER, decision(r))['operation']['operationId']
+    receiver = DurableReceiver(tmp_path / 'receiver.json'); receiver.fail = False
+    before = s.dispatch(OWNER, op, receiver)
+    app = FastAPI(); app.include_router(api.create_router(
+        ledger_dir=tmp_path / 'ledger', action_store=s,
+        owner_resolver=lambda session: dict(OWNER, storedSessionId=session)))
+    client = TestClient(app)
+    body = dict(session='session-a', operation=op, posted_ms=13.0, responded_ms=53.5,
+                refreshed_ms=173.5, painted_ms=190.2)
+    with caplog.at_level('INFO', logger='user-steps'):
+        assert client.post('/client-timing', json=body).json() == {'ok': True}
+        for change in [dict(painted_ms=-1), dict(x=1), dict(posted_ms=54),
+                       dict(responded_ms=True), dict(refreshed_ms='174'),
+                       dict(painted_ms=600001), dict(operation='line\nbreak')]:
+            assert client.post('/client-timing', json={**body, **change}).status_code == 422
+        assert client.post('/client-timing', json={**body, 'operation': 'unknown'}).status_code == 404
+        assert client.post('/client-timing', json={**body, 'session': 'other'}).status_code == 404
+    lines = [r.getMessage() for r in caplog.records if 'Decision client timing' in r.getMessage()]
+    assert lines == [f'Decision client timing operation={op} owner_ms=13.0 post_ms=40.5 refresh_ms=120.0 paint_ms=16.7 total_ms=190.2']
+    assert s.operation(OWNER, op) == before

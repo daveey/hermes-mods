@@ -304,6 +304,28 @@ Profile-scoped storage is under `<Hermes home>/user-steps/`:
 - Delivery records retain frozen payloads and destination receipts. A passive inbox
   write is not a successful execution handoff.
 
+## Decision client timing
+
+The session panel sends one best-effort `POST /api/plugins/user-steps/client-timing`
+after a modern decision receipt, decision-refresh response, and a mounted Panel
+commit where the exact owner/request has left Needs you. It joins the server's
+`Decision timing` log by operation ID and contains no question, choice or scope text.
+The endpoint verifies operation ownership and finite, monotonic click-relative
+offsets bounded to ten minutes; it does not dispatch or retry anything.
+
+`Decision client timing operation=... owner_ms=... post_ms=... refresh_ms=...
+paint_ms=... total_ms=...` splits owner lookup, POST roundtrip, response-to-refresh,
+and refresh-to-committed-render time. `paint_ms` observes a React commit, not GPU
+presentation. `total_ms` includes all four hops. No record means no observed
+completion, not zero latency: failed refreshes, unfocused/unmounted panels,
+reloads and dropped telemetry can omit records. Tracking is ephemeral, expires
+after ten minutes, and is capped at 100 pending clicks. Neither decision nor
+telemetry is retried by this instrumentation. Older servers may reject the route.
+
+Coverage: `tests/test_decisions.py` checks logging, owner isolation and invalid
+payload rejection; the session-panel `hub-model.test.mjs` checks committed-render
+gating, monotonic offsets, exactly-once emission and failed telemetry.
+
 ## Buffered publication (core-first rollout)
 
 A no-op `pre_final_gate` callback declares `needs_buffer=True`, independently of

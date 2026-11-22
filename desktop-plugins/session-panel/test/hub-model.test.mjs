@@ -403,6 +403,51 @@ test('2xx receipt repaints authoritative panel within 1s without polling', async
  delete window.hermesDesktop
  m.resetFeedForTests()
 })
+test('a real decision click emits exactly one monotonic client timing record; a failing timing POST changes nothing', async () => {
+ for (const failTiming of [false, true]) {
+  m.resetFeedForTests()
+  const q = structuredClone(publicCases.own_letters.model.sections.needs_you[0]); q.request_revision += failTiming ? 91 : 81
+  const action = q.actions.find(a => a.kind === 'decide'); action.revision = q.request_revision
+  const route = { connectionId: 'timing' + failTiming, profile: 'default', session: 'timing-chat' }
+  const request = { requestId: q.request_id, revision: q.request_revision, state: 'open', owner: action.owner,
+    scope: { complete: true, markdown: 'Exact scope' }, choices: [{ id: q.options[0].choice_id, effect: 'answer', label: 'Pick' }] }
+  const timings = []
+  const before = structuredClone(publicCases.own_letters.model); before.sections.needs_you = [q]
+  window.hermesDesktop = { api: async (opts) => {
+    const path = opts.path
+    if (path.endsWith('/client-timing')) { timings.push(opts); if (failTiming) throw Error('timing hub down'); return { ok: true } }
+    // A successful refresh that still contains the ask is not a successful repaint.
+    if (path.endsWith('/decision-refresh')) return { feed: 'f', epoch: 'e', rev: 5, bundle: { session: route.session, model: before } }
+    if (path.endsWith('/decisions')) return { operation: { operationId: 'timed-op', dispatchState: 'delivered', idempotencyKey: opts.body.idempotencyKey },
+      request: { ...request, resolution: { operationId: 'timed-op' } } }
+    if (path.includes('/requests/')) return { request }
+    return { feed: 'f', epoch: 'e', rev: 5, bundles: {} }
+  } }
+  await m.feedCatchUp({ ...route, sessions: [route.session] })
+  await m.chooseModelOption(q, q.options[0], route)
+  assert.equal(timings.length, 0, 'response alone is not a committed render')
+  current = route
+  await paint(React.createElement(m.Panel))
+  assert.equal(timings.length, 0, 'mounted old ask is not completion')
+  await paint(null)
+  m.ingestBundle(route.connectionId, route.profile, { session: route.session, model: publicCases.instant_decision.model })
+  await paint(React.createElement(m.Panel))
+  await paint(React.createElement(m.Panel))
+  assert.equal(timings.length, 1)
+  const t = timings[0].body
+  assert.equal(t.operation, 'timed-op')
+  assert.equal(t.session, action.owner.storedSessionId)
+  assert.equal(timings[0].profile, action.owner.profile)
+  let previous = 0
+  for (const k of ['posted_ms', 'responded_ms', 'refreshed_ms', 'painted_ms']) {
+    assert.ok(Number.isFinite(t[k]) && t[k] >= previous, k); previous = t[k]
+  }
+  assert.equal(m.modelDecisionStatus(q).text, 'Decision delivered.')
+  await paint(null)
+  delete window.hermesDesktop
+ }
+ m.resetFeedForTests()
+})
 test('never-started admission refusal offers explicit same-key retry without unlocking choices', async () => {
  const q = structuredClone(publicCases.own_letters.model.sections.needs_you[0]); q.request_revision += 51
  const action = q.actions.find(a => a.kind === 'decide'); action.revision = q.request_revision

@@ -40,7 +40,7 @@ async def _on_lane(lane, fn, *args, request=None, deadline=None, **kwargs):
     if _run_in_lane is None:
         return await run_in_threadpool(functools.partial(fn, *args, **kwargs))
     return await _run_in_lane(lane, fn, *args, request=request, deadline=deadline, **kwargs)
-from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, model_validator
 
 API_VERSION = 2
 # Separate capacity from both feed reads and the default AnyIO read pool.
@@ -98,6 +98,23 @@ class DecisionBody(BaseModel):
     choiceId: StrictStr
     revisionText: Optional[StrictStr] = None
     idempotencyKey: StrictStr
+
+
+class ClientTimingBody(BaseModel):
+    """Desktop's per-hop timing for one real decision click; joins the server 'Decision timing' line by operation."""
+    model_config = ConfigDict(extra='forbid')
+    session: StrictStr
+    operation: StrictStr = Field(min_length=1, max_length=200, pattern=r'^[A-Za-z0-9_-]+$')
+    posted_ms: float = Field(strict=True, ge=0, le=600_000, allow_inf_nan=False)
+    responded_ms: float = Field(strict=True, ge=0, le=600_000, allow_inf_nan=False)
+    refreshed_ms: float = Field(strict=True, ge=0, le=600_000, allow_inf_nan=False)
+    painted_ms: float = Field(strict=True, ge=0, le=600_000, allow_inf_nan=False)
+
+    @model_validator(mode='after')
+    def monotonic(self):
+        if not self.posted_ms <= self.responded_ms <= self.refreshed_ms <= self.painted_ms:
+            raise ValueError('Timing offsets must be monotonic')
+        return self
 
 
 class ListAnswerBody(BaseModel):
@@ -475,6 +492,18 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
                 (committed-started)*1000, (time.monotonic()-committed)*1000)
             return result
         return await _on_decision(run, action)
+
+    @router.post('/client-timing')
+    def client_timing(body: ClientTimingBody):
+        def action():
+            # Telemetry is read-only and can name only an operation of this owner.
+            store().operation(owner(body.session), body.operation)
+            logging.getLogger('user-steps').info(
+                'Decision client timing operation=%s owner_ms=%.1f post_ms=%.1f refresh_ms=%.1f paint_ms=%.1f total_ms=%.1f',
+                body.operation, body.posted_ms, body.responded_ms-body.posted_ms,
+                body.refreshed_ms-body.responded_ms, body.painted_ms-body.refreshed_ms, body.painted_ms)
+            return {'ok': True}
+        return run(action)
 
     @router.post('/requests/{request_id}/reconcile-chat')
     def reconcile_chat(request_id: str, body: ChatReconcileBody):
