@@ -333,6 +333,7 @@ def running(api, f):
 
 
 def test_idle_means_idle_and_a_write_is_pushed_within_a_second(tmp_path, monkeypatch):
+    monkeypatch.setenv('HERMES_PANEL_COALESCE', '0')  # legacy subsecond contract
     api = load('_spf_event_api', API)
     if not api.FileWatch().ok:
         pytest.skip('no kernel file notification on this platform')
@@ -541,6 +542,7 @@ def test_failed_decision_read_is_retried_a_bounded_number_of_times_then_waits_fo
 
 
 def test_event_loop_recovers_a_failed_decision_read_without_board_reads_or_idle_polling(tmp_path, monkeypatch):
+    monkeypatch.setenv('HERMES_PANEL_COALESCE', '0')  # legacy retry cadence
     api = load('_spf_due_api', API)
     if not api.FileWatch().ok:
         pytest.skip('no kernel file notification on this platform')

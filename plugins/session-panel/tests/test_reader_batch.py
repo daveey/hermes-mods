@@ -68,6 +68,7 @@ def stable(value):
 
 
 def test_batch_reuses_real_local_replica_and_queue_reads_without_losing_associations(graph, api, monkeypatch):
+    monkeypatch.setenv('HERMES_PANEL_SKIP_QUEUE_POSITION', '0')  # legacy queue enrichment
     from hermes_cli import kanban_queue_position as kqp, kanban_chat_links as links
     r, local, remote, ksa = graph
     sessions = [f'S{i}' for i in range(23)]

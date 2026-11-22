@@ -309,6 +309,7 @@ def test_recent_publishes_are_bounded():
 
 
 def test_run_loop_writes_the_timing_file_after_every_pass_and_a_write_is_published_within_a_second(monkeypatch):
+    monkeypatch.setenv('HERMES_PANEL_COALESCE', '0')  # legacy subsecond contract
     """Through the real run loop: the token-free timing file shows a source write published in under 1 s."""
     api = load_api()
     f, r, source, calls = setup()

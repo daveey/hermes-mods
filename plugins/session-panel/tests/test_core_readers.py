@@ -394,7 +394,20 @@ def test_heartbeats_change_nothing_in_a_card_record(api, board, monkeypatch):
     assert 'ready_since' in after['detail']['task']
 
 
+def test_card_omits_queue_scoring_by_default(api, board, monkeypatch):
+    from hermes_cli import kanban_queue_position as kqp
+    monkeypatch.delenv('HERMES_PANEL_SKIP_QUEUE_POSITION', raising=False)
+    monkeypatch.setattr(kqp, 'detail_fields', lambda *_: pytest.fail('whole-board queue scoring invoked'))
+    path, conn = board
+    task = kanban_db.create_task(conn, title='No scoring', initial_status='running', session_id='S1')
+    r = readers_for(api, path, monkeypatch)
+    detail = r.card(task, 'default')['detail']
+    assert 'queue' not in detail
+    r.release()
+
+
 def test_card_keeps_queue_changes_and_recorded_evidence(api, board, monkeypatch):
+    monkeypatch.setenv('HERMES_PANEL_SKIP_QUEUE_POSITION', '0')
     from hermes_cli import kanban_queue_position as kqp
 
     path, conn = board

@@ -941,7 +941,7 @@ class CoreReaders:
                 out['owner'] = None if owner is kfc._UNSET else owner
             except Exception:
                 out['owner'] = None
-        else:
+        elif not _mitigation('HERMES_PANEL_SKIP_QUEUE_POSITION'):
             try:
                 from hermes_cli import kanban_queue_position as kqp
                 extra = kqp.detail_fields(c, task, board)
@@ -1536,9 +1536,24 @@ def _event_driven(f) -> bool:
         return f._watching
 
 
+def _mitigation(name: str) -> bool:
+    """Reversible urgent mitigation; unset means enabled."""
+    return os.environ.get(name, '1').lower() not in ('0', 'false', 'off', 'no')
+
+
+def _coalesce(f, last_start: float | None) -> None:
+    # Called only after demand/events (or an existing retry), never on an idle timer.
+    # Do not clear the wake here: arrivals during the run remain a trailing pass.
+    if last_start is not None:
+        f.stopped.wait(max(0.0, 3.0 - (time.monotonic() - last_start)))
+
+
 def _settle(f, last_start: float) -> None:
-    """Before a pass: let a write burst finish and keep passes MIN_GAP_S apart. A waiting reader cuts it short."""
-    f._cold.wait(max(DEBOUNCE_S, MIN_GAP_S - (time.monotonic() - last_start)))
+    """Before a pass: coalesce demand, without allowing cold readers to bypass the floor."""
+    if _mitigation('HERMES_PANEL_COALESCE'):
+        _coalesce(f, last_start or None)
+    else:
+        f._cold.wait(max(DEBOUNCE_S, MIN_GAP_S - (time.monotonic() - last_start)))
 
 
 def _run_decisions(f) -> None:
@@ -1548,6 +1563,7 @@ def _run_decisions(f) -> None:
     readers = CoreReaders()
     try:
         first = True
+        last = None
         while not f.stopped.is_set():
             started = time.monotonic()
             _event_driven(f)
@@ -1561,12 +1577,15 @@ def _run_decisions(f) -> None:
                 else:
                     f._decide.wait(max(0.0, retry_at - f.clock()))
                     f._decision_retry_at = None  # consumed: the pass re-arms it while a read still fails
-                f.stopped.wait(max(DEBOUNCE_S, MIN_GAP_S - (time.monotonic() - started)))
+                if _mitigation('HERMES_PANEL_COALESCE'):
+                    _coalesce(f, last)
+                else:
+                    f.stopped.wait(max(DEBOUNCE_S, MIN_GAP_S - (time.monotonic() - started)))
             if f.stopped.is_set():
                 break
             f._decide.clear()
             first = False
-            started = time.monotonic()
+            started = last = time.monotonic()
             try:
                 f.refresh_decisions(readers=readers)
             except Exception:
@@ -1581,15 +1600,20 @@ def _run_board(f, lane_type) -> None:
     lane = lane_type(f, CoreReaders)
     lane.start_service()
     first = True
+    last = None
     try:
         while not f.stopped.is_set():
             if not first:
                 at = lane.retry_at()
                 f._board.wait(None if at is None else max(0, at - f.clock()))
-                f.stopped.wait(DEBOUNCE_S)
+                if _mitigation('HERMES_PANEL_COALESCE'):
+                    _coalesce(f, last)
+                else:
+                    f.stopped.wait(DEBOUNCE_S)
             if f.stopped.is_set():
                 break
             first = False
+            last = time.monotonic()
             lane.step()
             write_timing(f)
     finally:
