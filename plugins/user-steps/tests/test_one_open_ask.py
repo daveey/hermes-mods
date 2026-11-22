@@ -119,6 +119,70 @@ def test_extractor_same_evidence_sentence_without_explicit_repeat_is_a_new_tile(
     assert len(live(store)) == 2
 
 
+@pytest.mark.parametrize('kind,title,span,options', [
+    ('choose', 'Which lane strip design should I build?',
+     "Pick A, B or C (the buttons in the widget work too) and I'll build it.", ['A', 'B', 'C']),
+    ('approve', 'Approve the revised lane strip plan?',
+     'Nothing is built yet, so I want your go on this plan first.', []),
+])
+def test_same_turn_producer_prose_frames_existing_step(tmp_path, kind, title, span, options):
+    store, ledger = env(tmp_path)
+    first = reply(store, ledger, title, [{'text': title, 'kind': kind,
+                                        'verbatim_span': title, 'options': options}])
+    step = first['steps'][0]
+    request = store.get(OWNER, step['requestId'])
+    # Producer revision, with the existing session_outcome/user_step alias retained.
+    revised = dict(request, revision=request['revision'] + 1)
+    store.revise(OWNER, request['requestId'], request['revision'], revised)
+    out = reply(store, ledger, span, [{'text': 'Pick lane strip design A, B or C to build'
+                                     if kind == 'choose' else 'Approve this plan before building',
+                                     'kind': kind, 'verbatim_span': span, 'options': options}],
+                turn={request['requestId']}, repeats=[{'id': step['id'], 'verbatim_span': span}]
+                if kind == 'choose' else [])
+    assert len(live(store)) == 1
+    assert [s['id'] for s in out['steps']] == [step['id']]
+    assert out['steps'][0]['verbatim_span'] == span
+    assert '::user-step' in out['text'] and step['id'] in out['text']
+    assert len(ledger.read('session-a')['steps']) == 1
+
+
+@pytest.mark.parametrize('multiple', [False, True])
+def test_same_turn_different_kind_or_ambiguous_requests_still_mint(tmp_path, multiple):
+    store, ledger = env(tmp_path)
+    r = store.create(OWNER, approval('Approve the layout plan?'))
+    turn = {r['requestId']}
+    if multiple:
+        turn.add(store.create(OWNER, approval('Approve the separate server plan?'))['requestId'])
+    span = 'Also, please provide the target directory.' if not multiple else 'Please approve the new test plan.'
+    out = reply(store, ledger, span, [{'text': span, 'kind': 'approve' if multiple else 'input',
+                                      'verbatim_span': span, 'options': []}], turn=turn)
+    assert len(live(store)) == (3 if multiple else 2)
+    assert len(out['steps']) == 1 and out['steps'][0]['requestId'] not in turn
+
+
+@pytest.mark.parametrize('kind,canonical', [('approve', 'approval'), ('choose', 'choice'),
+                                             ('choose', 'approval'), ('input', 'input')])
+def test_same_turn_matcher_uses_provenance_not_words(kind, canonical):
+    ask = {'id': 'producer', 'kind': canonical, 'title': 'Unrelated title', 'step': None}
+    candidate = {'kind': kind, 'text': 'Different words', 'verbatim_span': 'An entirely different sentence.'}
+    assert core.same_open_ask(candidate, [ask], turn_requests={'producer'}) is ask
+    assert core.same_open_ask(candidate, [ask]) is None
+    assert core.same_open_ask(candidate, [ask, dict(ask, id='second')],
+                              turn_requests={'producer', 'second'}) is None
+
+
+def test_transform_backstop_suppresses_unmapped_producer_without_legacy_step(tmp_path, monkeypatch):
+    store, ledger = env(tmp_path)
+    r = store.create(OWNER, approval('Approve the revised plan?'))
+    monkeypatch.setattr(core, 'same_open_ask', lambda *a, **kw: None)
+    span = 'Nothing is built yet, so I want your go on this plan first.'
+    out = reply(store, ledger, span, [{'kind': 'approve', 'text': 'Approve the implementation',
+                                      'verbatim_span': span, 'options': []}], turn={r['requestId']})
+    assert len(live(store)) == 1 and out['steps'] == [] and out['text'] is None
+    assert ledger.read('session-a')['steps'] == []
+    assert store.get(OWNER, r['requestId']) == r
+
+
 def test_extractor_restating_this_turns_published_title_does_not_mint_a_second_tile(tmp_path):
     # Hub chat ..67cb2d: the reply bolded the producer request's own title; the model paraphrased it. The
     # producer published it in this turn (server-recorded), so the reply relays it.
