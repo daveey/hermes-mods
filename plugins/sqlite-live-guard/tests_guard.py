@@ -1253,3 +1253,73 @@ def test_real_claude_context_verdicts(tmp_path, command, blocked):
         capture_output=True, text=True, check=False,
     )
     assert result.returncode == (2 if blocked else 0), result.stderr
+
+
+# ---- 2026-11-22: sqlite3 run on an ssh host against its live databases
+# A session read the hub's live kanban.db/state.db through `ssh hub 'sqlite3 -readonly ~/.hermes/kanban.db ...'` with
+# the hub's /usr/bin/sqlite3 3.45.1 (affected). The remote build cannot be probed, so it is assumed affected.
+
+REMOTE_SQLITE_REFUSED = [
+    "ssh hub 'sqlite3 ~/.hermes/kanban.db \"select count(*) from tasks\"'",
+    "ssh hub \"sqlite3 ~/.hermes/state.db 'select 1'\"",
+    "ssh hub bash -lc 'sqlite3 ~/.hermes/state.db \"select 1\"'",
+    "ssh hub \"bash -lc 'sqlite3 ~/.hermes/state.db .tables'\"",
+    "ssh hub 'sqlite3 -readonly ~/.hermes/kanban.db \"pragma quick_check\"'",
+    "ssh -o BatchMode=yes hub 'sqlite3 -readonly ~/.hermes/kanban.db \"select 1\"'",
+    "ssh hub sqlite3 -readonly '~/.hermes/sync-shadow/default.db' .tables",
+    "ssh hub '/usr/bin/sqlite3 /home/ubuntu/.hermes/worker-scaler.db \"select 1\"'",
+    "ssh hub 'sqlite3 $HOME/.hermes/kanban.db \"select 1\"'",
+    "ssh hub 'sqlite3 $HERMES_HOME/state.db \"select 1\"'",
+    "ssh hub 'sqlite3 \"file:/home/ubuntu/.hermes/state.db?mode=ro\" \"select 1\"'",
+    "ssh hub 'cd ~/.hermes && sqlite3 kanban.db \"select 1\"'",
+    "ssh hub 'sudo -u ubuntu sqlite3 ~/.hermes/kanban.db \"select 1\"'",
+    "ssh hub bash -s <<'EOF'\nsqlite3 -readonly ~/.hermes/kanban.db 'select 1'\nEOF",
+]
+
+REMOTE_SQLITE_ALLOWED = [
+    "ssh hub '~/.hermes/bin/hermes-core-python -m sqlite3 ~/.hermes/kanban.db \"select 1\"'",
+    "ssh hub bash -lc '~/.hermes/bin/hermes-core-python -m sqlite3 ~/.hermes/state.db \"select 1\"'",
+    "ssh hub 'sqlite3 ~/.hermes/cache/x.db \"select 1\"'",
+    "ssh hub 'sqlite3 ~/.hermes/backups/state.db \"select 1\"'",
+    "ssh hub 'sqlite3 ~/.hermes/kanban.db.corrupt.abc.bak \"select 1\"'",
+    "ssh hub 'sqlite3 /tmp/x.db \"select 1\"'",
+    "ssh hub 'sqlite3 ~/work/app.db \"select 1\"'",
+    "ssh hub 'echo sqlite3 ~/.hermes/kanban.db'",
+]
+
+
+@pytest.mark.parametrize("cmd", REMOTE_SQLITE_REFUSED)
+def test_remote_sqlite3_on_a_live_database_is_refused(versions, cmd):
+    versions.update({("sqlite3", "cli"): (3, 54, 0)})  # a fixed local build decides nothing about the remote one
+    why = plugin.guard.check_shell(cmd)
+    assert why and "ssh host" in why and plugin.guard.WAL_RESET_MARK in why, (cmd, why)
+    assert "hermes-core-python -m sqlite3" in why
+    assert "WAL-reset" in plugin.guard.message(why)
+
+
+@pytest.mark.parametrize("cmd", REMOTE_SQLITE_ALLOWED)
+def test_remote_managed_cli_and_non_live_files_stay_allowed(versions, cmd):
+    versions.update({("sqlite3", "cli"): (3, 45, 1)})
+    assert plugin.guard.check_shell(cmd) is None, cmd
+
+
+def test_local_sqlite3_verdicts_are_unchanged(versions):
+    assert plugin.guard.check_shell("sqlite3 -readonly ~/.hermes/kanban.db 'select 1'") is None  # unknown build
+    versions[("sqlite3", "cli")] = (3, 45, 1)
+    why = plugin.guard.check_shell("sqlite3 -readonly ~/.hermes/kanban.db 'select 1'")
+    assert why and "uses SQLite 3.45.1" in why and "ssh host" not in why
+    versions[("sqlite3", "cli")] = (3, 54, 0)
+    assert plugin.guard.check_shell("sqlite3 -readonly ~/.hermes/kanban.db 'select 1'") is None
+
+
+def test_remote_sqlite3_terminal_tool_and_claude_hook_refuse():
+    cmd = "ssh hub 'sqlite3 -readonly ~/.hermes/kanban.db \"select count(*) from tasks\"'"
+    assert blocked("terminal", command=cmd)
+    import json
+    for command, code in ((cmd, 2), ("ssh hub 'sqlite3 /tmp/x.db \"select 1\"'", 0)):
+        result = subprocess.run(
+            [sys.executable, str(HERE / "claude_hook.py")],
+            input=json.dumps({"tool_input": {"command": command}, "cwd": "/"}),
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        assert result.returncode == code, (command, result.stdout + result.stderr)

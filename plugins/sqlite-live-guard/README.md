@@ -36,7 +36,18 @@ Unsupported forms include dynamic commands (`eval`, functions, sourced scripts,
 command substitution/backticks), computed/default-value parameter expansions,
 ANSI-C quoting, unquoted word-splitting/globbing, SSH wrappers, stdin pipelines or
 here-strings into interpreters, and remote relative working-directory inference.
-It does not add remote SQLite SQL/interpreter policy or remote version discovery.
+A remote `sqlite3` CLI (bare or a path ending in `/sqlite3`, reached through `ssh`,
+a remote `bash -c`/`-lc` or a shell reading an ssh heredoc) that opens a live Hermes
+database on that host (`~/.hermes/...`, `$HOME/.hermes/...`, `/home/<user>/.hermes/...`,
+`$HERMES_HOME/...`, outside the not-live cache/archive/backup/tmp paths) is refused,
+`-readonly` included: the remote SQLite version cannot be checked from here, so it is
+assumed to have the WAL-reset bug. The refusal names
+`~/.hermes/bin/hermes-core-python -m sqlite3` on the remote host, which is not refused.
+When ssh splits a remote `bash -lc 'script'` into several words (ssh joins its
+arguments with spaces, so the remote script is only the first word), the joined words
+are judged as the intended script as well (fail closed).
+There is no remote write/maintenance SQL policy, no remote `python -c` detection and
+no remote version discovery.
 Use explicit absolute paths and the guarded helper, not alternate syntax to evade
 checks. A passing lexical check is not authorization for a database replacement.
 

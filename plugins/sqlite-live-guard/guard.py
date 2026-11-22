@@ -15,7 +15,10 @@ home (``~/.hermes``, ``$HERMES_HOME``), outside scratch, cache, archive and back
 - Opening a live database at all (reads included) with a ``sqlite3`` CLI or a ``python -c`` / ``python -m sqlite3``
   whose SQLite has the WAL-reset bug (3.7.0-3.51.2, https://sqlite.org/wal.html#walresetbug). Hermes holds these
   files with SQLite 3.53.1; Ubuntu 24.04's ``/usr/bin/sqlite3`` and ``python3`` are 3.45.1, macOS's are 3.51.0. Only root-owned system
-  binaries are ever run to ask their version; anything else is unknown and not blocked.
+  binaries are ever run to ask their version; anything else is unknown and not blocked. A ``sqlite3`` CLI that an
+  ``ssh`` command runs on another host (directly, via ``bash -c``/``-lc`` or a shell reading a heredoc) against a live
+  Hermes database there (``~/.hermes/...``, ``$HOME/.hermes/...``, ``/home/<user>/.hermes/...``, ``$HERMES_HOME/...``)
+  is refused too: the remote build cannot be probed, so it is assumed affected.
   The refusal names ``~/.hermes/bin/hermes-core-python -m sqlite3`` (managed SQLite), which the write and
   maintenance rules above still judge like ``sqlite3``.
 - ``rm`` / ``mv`` / ``truncate`` of a live database's ``<db>.corrupt.*.bak`` quarantine: deleting it once
@@ -1278,9 +1281,8 @@ def is_quarantine(path: str, in_home: bool = False) -> bool:
     return is_live(live, in_home)
 
 
-def _check_sqlite3(args: list[str], seg: list[str], in_home: bool, program: Optional[tuple] = None) -> Optional[str]:
-    """``program``: (word, kind) of the binary that would open the database, for the WAL-reset check; None skips it."""
-    readonly = any(a in ("-readonly", "--readonly", "-safe") for a in args)
+def _sqlite3_argv(args: list[str]) -> tuple:
+    """(db, sql statements, fed) of a ``sqlite3`` CLI argv: the first operand is the database; ``fed``: SQL on stdin."""
     sql: list[str] = []
     db = None
     i = 0
@@ -1307,6 +1309,22 @@ def _check_sqlite3(args: list[str], seg: list[str], in_home: bool, program: Opti
         else:
             sql.append(a)
         i += 1
+    return db, sql, fed
+
+
+def remote_sqlite3_refusal(word: str, db: str) -> str:
+    """Refusal for a ``sqlite3`` CLI that an ssh command runs on another host against a live Hermes database there.
+    The remote build cannot be probed from here, so it is assumed affected (fail closed)."""
+    return (f"`{word}` on the ssh host runs a SQLite whose version cannot be checked from here; assume it {WAL_RESET_MARK} "
+            f"(3.7.0-3.51.2; Ubuntu 24.04's /usr/bin/sqlite3 is 3.45.1): it must not open live database {db}, which "
+            f"Hermes holds open with its managed SQLite (3.51.3 or later). On the remote host use "
+            f"`{MANAGED_SQLITE_CLI} {db} \"<sql>\"`")
+
+
+def _check_sqlite3(args: list[str], seg: list[str], in_home: bool, program: Optional[tuple] = None) -> Optional[str]:
+    """``program``: (word, kind) of the binary that would open the database, for the WAL-reset check; None skips it."""
+    readonly = any(a in ("-readonly", "--readonly", "-safe") for a in args)
+    db, sql, fed = _sqlite3_argv(args)
     text = "\n".join(sql)
     for stmt in _statements(text):  # `.backup [schema] FILE` / `.save FILE` write FILE, whatever db is open
         m = re.match(r"\s*\.(?:backup|save)\s+(?:(?!-)\S+\s+)?(?P<t>\S+)\s*$", stmt)

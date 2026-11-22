@@ -406,6 +406,11 @@ def _command(argv, guard, in_home, depth, local, inherited_names, bodies, remote
                     k += 1
                 why = check(args[k], guard, depth=depth + 1, inherited=child_env,
                             remote=remote, in_home=in_home, budget=budget)
+                if not why and remote and k + 1 < len(args):
+                    # `ssh h bash -lc 'sqlite3 DB ...'`: ssh joined the words, so the remote script is only the first
+                    # one. Judge the words the author meant as the script too (fail closed).
+                    why = check(" ".join(args[k:]), guard, depth=depth + 1, inherited=child_env,
+                                remote=remote, in_home=in_home, budget=budget)
                 if why:
                     return why, in_home
                 break
@@ -415,6 +420,11 @@ def _command(argv, guard, in_home, depth, local, inherited_names, bodies, remote
                             remote=remote, in_home=in_home, budget=budget)
                 if why:
                     return why, in_home
+    elif remote and word == "sqlite3":
+        # The remote SQLite build cannot be probed from here: assume the WAL-reset bug (fail closed).
+        db = guard._sqlite3_argv(args)[0]
+        if db is not None and guard.is_live(db, in_home):
+            return guard.remote_sqlite3_refusal(argv[0], db), in_home
     elif word == "cd":
         target = (guard._operands(args) or ["~"])[0]
         in_home = guard._HOME_PREFIX.sub("", target).rstrip("/") == "" or target.rstrip("/") == guard._home().rstrip("/")
