@@ -141,6 +141,7 @@ class Feed:
         self._registrations = queue.SimpleQueue()
         self._wake = threading.Event()       # a read asked for a chat with no published bundle: tick now
         self._urgent: list[str] = []         # tick thread only: chats with no bundle, most recently asked first
+        self._focus: list[str] = []          # ...and of those, the ones that led their request (a focused chat)
         self._decision_seen: dict[str, tuple] = {}  # decision lane only: session -> (inputs stamp, read at)
         self._wire_sources = {}
         self._wire = (self.epoch, self.rev, MappingProxyType({}), b'')
@@ -589,6 +590,8 @@ class Feed:
             with self.lock:
                 cold = [s for s in wanted if s in self.interest and s not in self.bundles]
             self._urgent = cold + [s for s in self._urgent if s not in cold]
+            if cold and cold[0] == wanted[0]:  # the chat its client is looking at leads the request
+                self._focus = [cold[0]] + [s for s in self._focus if s != cold[0]]
 
     def _panel_dirty(self, watched: list[str]) -> set[str]:
         """The watched chats whose outcome/request stamp moved: one batched read when the readers have one."""
@@ -676,7 +679,9 @@ class Feed:
             pending.update(cold)
             if not pending:
                 break
-            chunk = cold[:FIRST_CHUNK] or sorted(pending)[:CHUNK]
+            self._focus = [s for s in self._focus if s in cold]
+            # A focused chat alone (its reader waits for exactly it), then the rest asked for, then the sweep.
+            chunk = self._focus[:1] or cold[:FIRST_CHUNK] or sorted(pending)[:CHUNK]
             tried.update(chunk)
             pending.difference_update(chunk)
             pushed += len(self._publish(self._compute_all(chunk, refresh=True), heartbeat=True))
