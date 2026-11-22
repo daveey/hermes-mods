@@ -223,6 +223,26 @@ class PanelSubscription:
         self.cursor = (epoch, rev)
         return True
 
+    def _recover_snapshot(self):
+        # The transport has already assembled bounded pinned pages into its
+        # immutable local replica. Re-subscribing would deliver the same >4 MiB
+        # reset forever. Keep the subscription armed and consume one coherent
+        # generation off the request thread, without retaining an oversized inbox.
+        with self.lock:
+            self.pending.clear()
+            self.pending_bytes = 0
+            self.reset_needed = False
+        try:
+            snapshot = self.store.snapshot(self.scope)
+            facts = snapshot.get_many(self.key(self.scope, 'ChatWaitingFact', s) for s in self.members)
+            self._apply({'epoch': snapshot.epoch, 'rev': snapshot.rev, 'reset': True,
+                         'upserts': tuple(f for f in facts if f is not None), 'deletes': ()})
+        except Exception:
+            with self.lock:
+                self.reset_needed = True
+            self.feed._wake.set()
+            raise
+
     def step(self):
         """Drain interest and queued deltas; no source reads, including cold keys."""
         if self.closed or self.feed.stopped.is_set():
@@ -240,16 +260,24 @@ class PanelSubscription:
                 self.deadlines.pop(session, None)
         with self.lock:
             reset = self.reset_needed
-        if reset or members != self.members:
-            if reset:
-                self._unavailable(members, 'fact_subscription_overflow')
+        if members != self.members:
             self._subscribe(members)
+        elif reset:
+            self._unavailable(members, 'fact_subscription_overflow')
+            self._recover_snapshot()
         while True:
             with self.lock:
                 if not self.pending:
                     break
                 delta, size = self.pending.popleft()
                 self.pending_bytes -= size
+            if (field(delta, 'reset', False) and self.cursor is not None
+                    and field(delta, 'epoch') != self.cursor[0]):
+                # Epochs are opaque, not ordered. A reset callback formed before
+                # a newer snapshot may still be in flight; only the replica's
+                # current generation can settle which owner is authoritative.
+                self._recover_snapshot()
+                break
             if not self._apply(delta):
                 self._unavailable(members, 'fact_subscription_gap')
                 self._subscribe(members)

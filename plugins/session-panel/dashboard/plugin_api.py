@@ -1389,6 +1389,30 @@ def feed():
             return core.PROCESS_FEED
 
 
+class _FactsMount:
+    """Exact installation custody for the authorized dashboard mount registry."""
+    def __init__(self, installation):
+        self.installation = installation
+
+    def close(self):
+        lock = _LOADER.__dict__.setdefault('facts_binding_lock', threading.Lock())
+        with lock:
+            if getattr(_LOADER, 'facts_mount', None) is not self:
+                return  # replacement already drained this installation
+            _stop_facts()  # failure retains this handle for a retry
+            _LOADER.facts_mount = None
+
+
+def bind_facts(ctx):
+    """Published dashboard lifecycle hook; ctx is authorized by the core mount."""
+    lock = _LOADER.__dict__.setdefault('facts_binding_lock', threading.Lock())
+    with lock:
+        installation = _install_facts(ctx.facts.v1, ctx.facts.scope, ctx.facts.handle)
+        mounted = _FactsMount(installation)
+        _LOADER.facts_mount = mounted
+        return mounted
+
+
 def install_facts(v1, scope, handle):
     # Binding custody spans close, publication and start. Do not share the mode
     # transition lock: close/report_ready may synchronously invoke that callback.
@@ -1412,6 +1436,7 @@ def _install_facts(v1, scope, handle):
     if previous is not None:
         previous.close()
         _LOADER.facts_registration = None
+    _LOADER.facts_mount = None
     token = object()
     with core.PROCESS_LOCK:
         if getattr(_LOADER, 'facts_unloading', False):

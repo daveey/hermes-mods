@@ -26,6 +26,13 @@ class Transport:
     def __init__(self):
         self.calls = []
         self.closes = []
+        self.latest = None
+        self.facts = {}
+
+    def snapshot(self, scope):
+        delta, facts = self.latest, dict(self.facts)
+        return NS(epoch=delta.epoch, rev=delta.rev,
+                  get_many=lambda keys: tuple(facts.get(k) for k in keys))
 
     def subscribe(self, scope, kinds, keys, after, callback):
         self.calls.append((scope, kinds, keys, after, callback))
@@ -36,6 +43,12 @@ class Transport:
         facts = () if bundle is None else (NS(key=Key(scope, 'ChatWaitingFact', 'S1'),
             value={'panel': bundle}, health=health, error_code=None, valid_until=None),)
         delta = NS(epoch=epoch, prev=prev, rev=rev, reset=reset, upserts=facts, deletes=deletes)
+        self.latest = delta
+        if reset:
+            self.facts.clear()
+        self.facts.update((f.key, f) for f in facts)
+        for key in deletes:
+            self.facts.pop(key, None)
         self.calls[-1][-1](delta)
         return delta
 
@@ -248,11 +261,35 @@ def test_bounded_backpressure_resets_instead_of_dropping_silently(setup):
         transport.send(bundle, rev=rev)
     assert not adapter.pending and adapter.reset_needed
     adapter.step()
-    assert len(transport.calls) == 2
-    assert f.failures['S1']['error'] == 'fact_subscription_overflow'
+    assert len(transport.calls) == 1  # same armed subscription, memory-only catch-up
+    assert adapter.cursor == ('owner-a', 3) and not f.failures
+    assert f.bundles['S1']['bundle'] == bundle
     transport.send(bundle, rev=4)
     adapter.step()
     assert f.failures == {}
+
+
+def test_overflow_snapshot_does_not_accept_inflight_previous_epoch(setup, monkeypatch):
+    f, _, pushed, _, bundle, transport, adapter = setup
+    old = transport.send(bundle)
+    adapter.step()
+    replacement = {**bundle, 'tasks': [], 'computed_seq': 2}
+    transport.send(replacement, epoch='owner-b')
+    adapter.reset_needed = True
+    original = transport.snapshot
+    def snapshot(scope):
+        snap = original(scope)
+        monkeypatch.setattr(transport, 'snapshot', original)
+        # Prior owner callback was formed before B's replica publication but
+        # remained in flight until snapshot catch-up. It must never republish A.
+        transport.calls[-1][-1](old)
+        return snap
+    monkeypatch.setattr(transport, 'snapshot', snapshot)
+    before = len(pushed)
+    adapter.step()
+    assert adapter.cursor == ('owner-b', 1)
+    assert f.bundles['S1']['bundle'] == replacement
+    assert all(event['bundles'].get('S1', {}).get('tasks', []) == [] for event in pushed[before:])
 
 
 def test_watch_expiry_and_cap_use_existing_feed_rules(setup):

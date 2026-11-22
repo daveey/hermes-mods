@@ -64,9 +64,11 @@ including every CoreReaders detail/queue field supplied by each supported core.
   plugin.session-panel.changed and the existing prev chain. TTL/cap and heartbeat
   remain panel-owned. Heartbeat proves transport only, never source freshness.
 - Failure/missing/expiry retains last good data as unavailable, never fresh empty.
-- Current bounded inbox resets on overflow, but **large-reset paging and a single
-  oversized fact are not yet integrated**. Host owner must supply the shared pinned
-  snapshot protocol; do not bypass caps or invent panel-only paging.
+- Host transport owns bounded pinned reset paging. The panel's 64-envelope/4 MiB
+  inbox coalesces overflow to a memory-only coherent snapshot of that replica;
+  it does not repeatedly re-subscribe to an oversized reset or invent paging.
+  Cross-epoch reset callbacks are reconciled against the current replica so an
+  old callback in flight cannot rewind a snapshot catch-up.
 
 ## Verification boundary and remaining gates
 
@@ -75,10 +77,14 @@ inline implementation at a fixed clock, including nulls, ordering, model revisio
 wire and decision projections, with module discovery forbidden for the injected
 reducer. These are controlled captured inputs, not source-to-owner parity.
 Existing fact subscription/HTTP tests exercise transport and warmed no-I/O paths.
-Neither is proof of real owner capture or multiprocess integration.
+`tests/test_fact_transport.py` additionally spawns a real owner, feeds canonical
+controlled bundles through its scoped IPC replica into the panel publisher, and
+checks a 5 MiB reset, wire equality, no request I/O/encoding, source failure,
+quiet expiry, disconnect and new-owner recovery with the panel epoch preserved.
+This is real transport proof, **not** native source capture or production startup.
 
 Still required: exhaustive coordinator manifest; native source mutation fixtures
-through owner materializers; finite ViewFact expiry readiness; concurrent install/
-unload/report-ready ownership; bounded reset transport; complete two-core suites
-at final head; independent exact-head review and CI. Inert landing follows shared
-compatibility only. Combined live acceptance belongs to the coordinator.
+through owner materializers; finite ViewFact expiry readiness through authorized
+startup; final complete two-core suites; independent exact-head review and CI.
+Inert landing follows shared compatibility only. Combined live acceptance belongs
+to the coordinator.
