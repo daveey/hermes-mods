@@ -181,7 +181,7 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
   let r
   try {
     r = await bridge({ path: FEED_PATH, method: 'POST', connectionId: target.connectionId, profile, timeoutMs: 15_000,
-      body: { sessions: target.sessions.slice(0, 200), since: sameFeed && !full ? st.rev || 0 : 0, epoch: sameFeed ? st.epoch || null : null } })
+      body: { projection: 'display', sessions: target.sessions.slice(0, 200), since: sameFeed && !full ? st.rev || 0 : 0, epoch: sameFeed ? st.epoch || null : null } })
   } catch (e) {
     // The Desktop bridge rejects a 404 with "404: ...": this gateway has no backend half.
     if (/^404\b/.test(String(e?.message || ''))) return unsupported('404')
@@ -259,7 +259,7 @@ export async function feedPeek(target, { timeoutMs = 5_000 } = {}) {
   let r
   try {
     r = await bridge({ path: FEED_PATH, method: 'POST', connectionId: target.connectionId, profile, timeoutMs,
-      body: { sessions: target.sessions.slice(0, 200), since: 0, epoch: st.epoch } })
+      body: { projection: 'display', sessions: target.sessions.slice(0, 200), since: 0, epoch: st.epoch } })
   } catch (e) {
     log('feed peek failed', target.connectionId, e?.message || e)
     return false

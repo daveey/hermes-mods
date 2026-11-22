@@ -36,12 +36,31 @@ def test_changes_route_watches_and_catches_up(monkeypatch):
         first = c.post('/api/plugins/session-panel/changes', json={'sessions': ['S1', 'S2']}).json()
         assert set(first['bundles']) == {'S1', 'S2'}
         assert set(first['bundles']['S1']['cards']) == {'t_aaaaaa1', 't_bbbbbb2', 't_ccccccc3'}
+        display = c.post('/api/plugins/session-panel/changes',
+                         json={'sessions': ['S1', 'S2'], 'projection': 'display'}).json()
+        assert display['epoch'] == first['epoch'] and display['rev'] == first['rev']
+        for s, b in display['bundles'].items():
+            assert b == {k: v for k, v in first['bundles'][s].items()
+                         if k in ('session', 'lineage', 'tasks', 'model')}
         again = c.post('/api/plugins/session-panel/changes',
                        json={'sessions': ['S1', 'S2'], 'since': first['rev'], 'epoch': first['epoch']}).json()
         assert again['bundles'] == {} and again['reset'] is False
         st = c.get('/api/plugins/session-panel/status').json()
         assert st['running'] is True and st['watched'] == 2 and st['bundles'] == 2 and st['failures'] == {}
         assert first['profile'] == api.LAUNCH_PROFILE
+        # New router + old-class feed during asynchronous hot handover.
+        current = core.PROCESS_FEED
+        class OldFeed:
+            def changes_bytes(self, sessions, *, since=0, epoch=None):
+                return current.changes_bytes(sessions, since=since, epoch=epoch)
+        core.PROCESS_FEED = OldFeed()
+        try:
+            for extra in ({}, {'projection': 'display'}):
+                response = c.post('/api/plugins/session-panel/changes', json={'sessions': ['S1'], **extra})
+                assert response.status_code == 200
+                assert response.json()['bundles']['S1'] == first['bundles']['S1']
+        finally:
+            core.PROCESS_FEED = current
         assert c.post('/api/plugins/session-panel/changes', json={'sessions': ['x'] * 201}).status_code == 422
     finally:
         core.PROCESS_FEED.stopped.set()

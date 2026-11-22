@@ -1600,6 +1600,7 @@ class ChangesBody(BaseModel):
     sessions: list[str] = Field(default_factory=list, max_length=200)
     since: int = 0
     epoch: Optional[str] = None
+    projection: Optional[str] = None  # display: final model + chat/task identity only
 
 
 router = APIRouter()
@@ -1647,7 +1648,10 @@ async def changes(body: ChangesBody, request: Request):
         start_publication()
         return Response(b'{"detail":"Session panel starting"}', status_code=503,
                         media_type='application/json', headers={'Retry-After': '1'})
-    wire = f.changes_bytes(body.sessions, since=body.since, epoch=body.epoch)
+    # A new router can run before the producer hands its old-class Feed over.
+    # Older clients/feeds keep the complete wire; Desktop accepts either shape.
+    options = {'projection': body.projection} if getattr(f, 'DISPLAY_PROJECTION', False) else {}
+    wire = f.changes_bytes(body.sessions, since=body.since, epoch=body.epoch, **options)
     return Response(_WIRE_PREFIX + wire[1:], media_type='application/json')
 
 

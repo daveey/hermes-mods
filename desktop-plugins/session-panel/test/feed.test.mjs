@@ -41,6 +41,14 @@ test('catch-up caches only the supplied model, with no claim of live transport',
  assert.deepEqual(window.lastChipBundle.model, m.cachedModel(route()))
  assert.equal(window.lastChipBundle.connectionId, 'C1')
  assert.equal(window.lastChipBundle.session, 'S1')
+ assert.equal(calls[0].body.projection, 'display')
+})
+test('peek requests the same compact projection as catch-up', async () => {
+ reply = () => answer({ bundles: { S1: { session: 'S1', lineage: ['S1'], tasks: [], model: model('r1') } } })
+ await m.feedCatchUp(target())
+ assert.equal(await m.feedPeek(target()), true)
+ assert.equal(calls.at(-1).body.projection, 'display')
+ assert.deepEqual(m.cachedModel(route()), model('r1'))
 })
 test('cache is qualified by connection, profile and stored session', () => {
  for (const r of [route(), route('S2'), route('S1', 'C2'), route('S1', 'C1', 'work')]) {
@@ -128,7 +136,7 @@ test('cold focus reads only its chat and never advances the shared connection cu
  await m.feedCatchUp(target(['warm']))
  reply = req => answer({ rev: 5, bundles: Object.fromEntries(req.body.sessions.map(s => [s, bundle(s, s === 'warm' ? 'r4' : 'r5')])) })
  await m.feedFocus(route(), { wait: async () => {} })
- assert.deepEqual(calls.at(-1).body, { sessions: ['S1'], since: 0, epoch: 'E1' }, 'one chat, not the whole warm set')
+ assert.deepEqual(calls.at(-1).body, { projection: 'display', sessions: ['S1'], since: 0, epoch: 'E1' }, 'one chat, not the whole warm set')
  assert.equal(m.cachedModel(route())?.revision, 'r5')
  assert.equal(m.cachedModel(route('warm'))?.revision, 'r3')
  await m.feedCatchUp(target(['S1', 'warm']))
@@ -193,7 +201,7 @@ test('a pass reads chats that joined the watched set beside the cursor, once', a
   await m.feedPass()
   assert.equal(calls.length, 3)
   assert.equal(calls[1].body.since, 3)
-  assert.deepEqual(calls[2].body, { sessions: ['side-3', 'side-2'], since: 0, epoch: 'E1' })
+  assert.deepEqual(calls[2].body, { projection: 'display', sessions: ['side-3', 'side-2'], since: 0, epoch: 'E1' })
   assert.equal(m.cachedModel(route('side-3')).revision, 'joined'); assert.equal(m.cachedModel(route('side-0')).revision, 'first')
   await m.feedPass()
   assert.equal(calls.length, 4, 'already watched: no second peek')

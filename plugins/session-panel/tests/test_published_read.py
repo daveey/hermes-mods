@@ -77,3 +77,33 @@ def test_unchanged_entries_reuse_bytes_and_old_publication_remains_immutable():
     f.changes(['S2'])
     assert 'S2' not in old[2]
     assert 'S2' in f._wire[2]
+
+
+def test_display_projection_preserves_render_inputs_without_raw_histories():
+    f = Feed(Readers(), emit=lambda p: None)
+    f.changes(['S1'])
+    held = f.bundles['S1']
+    held['bundle'] = dict(held['bundle'], model={'version': 1, 'sections': {'needs': []}},
+                          cards={'big': {'body': 'x' * 1_000_000}}, done=[{'body': 'y' * 1_000_000}])
+    f._publish_wire()
+    full = json.loads(f.changes_bytes(['S1']))
+    # Request-side serialization remains forbidden for both projections.
+    f._encode = lambda *a: (_ for _ in ()).throw(AssertionError('request serialized'))
+    compact = json.loads(f.changes_bytes(['S1'], projection='display'))
+    wanted = {'session', 'lineage', 'tasks', 'model'}
+    assert compact['bundles']['S1'] == {k: v for k, v in full['bundles']['S1'].items() if k in wanted}
+    assert compact['epoch'] == full['epoch'] and compact['rev'] == full['rev']
+    assert len(json.dumps(compact)) < len(json.dumps(full)) / 100
+    assert json.loads(f.changes_bytes(['S1'], since=full['rev'], epoch=full['epoch'], projection='display'))['bundles'] == {}
+
+
+def test_display_projection_survives_restore_and_hot_handover():
+    old = Feed(Readers(), emit=lambda p: None)
+    old.changes(['S1'])
+    restored = Feed(Readers(), emit=lambda p: None).restore(old.snapshot())
+    successor = Feed(Readers(), emit=lambda p: None).resume(old)
+    for f in (old, restored, successor):
+        result = json.loads(f.changes_bytes(['S1'], projection='display'))
+        assert result['bundles']['S1']['session'] == 'S1'
+        assert 'cards' not in result['bundles']['S1']
+        assert 'done' not in result['bundles']['S1']

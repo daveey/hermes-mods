@@ -126,6 +126,8 @@ class _Stop(threading.Event):
 class Feed:
     """One feed per gateway process (one profile: the process's own)."""
 
+    DISPLAY_PROJECTION = True  # API may briefly hold an older Feed during hot handover
+
     def __init__(self, readers: Any, *, emit: Callable[[dict], None], clock: Callable[[], float] = time.time,
                  full_every_s: float = FULL_EVERY_S, interest_ttl_s: float = INTEREST_TTL_S,
                  heartbeat_s: float = HEARTBEAT_S):
@@ -203,7 +205,12 @@ class Feed:
             if old and self._wire_sources.get(s) is held['bundle'] and old[0] == held['rev']:
                 entries[s] = old
             else:
-                entries[s] = (held['rev'], self._encode(s), self._encode(held['bundle']))
+                # Desktop renders the final model; raw histories stay available only
+                # to legacy/diagnostic consumers, never copied across its SSH link.
+                display = {k: v for k, v in held['bundle'].items()
+                           if k in ('session', 'lineage', 'tasks', 'model')}
+                entries[s] = (held['rev'], self._encode(s), self._encode(held['bundle']),
+                              self._encode(display))
         self._wire_sources = {s: b['bundle'] for s, b in self.bundles.items()}
         header = b'{"epoch":' + self._encode(self.epoch) + b',"rev":' + str(self.rev).encode()
         self._wire = (self.epoch, self.rev, MappingProxyType(entries), header)
@@ -223,14 +230,14 @@ class Feed:
             return str(v)
         return json.dumps(safe(value), ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode()
 
-    def changes_bytes(self, sessions, *, since=0, epoch=None):
+    def changes_bytes(self, sessions, *, since=0, epoch=None, projection=None):
         """No locks, readers, computation or JSON conversion on the HTTP path.
 
         Cold sessions return no bundle until a background tick publishes one.
         Registration is an enqueue, not a synchronous interest-lock acquisition.
         """
         if self._successor is not None:
-            return self._current().changes_bytes(sessions, since=since, epoch=epoch)
+            return self._current().changes_bytes(sessions, since=since, epoch=epoch, projection=projection)
         wanted = tuple(dict.fromkeys(sessions))[:MAX_REQUEST]
         self._registrations.put(wanted)
         current, rev, entries, header = self._wire
@@ -238,7 +245,8 @@ class Feed:
         if any(s not in entries for s in wanted):
             self._cold.set()  # the producer computes it on its own thread, at once
             self._wake.set()
-        parts = [entries[s][1] + b':' + entries[s][2] for s in wanted
+        index = 3 if projection == 'display' else 2
+        parts = [entries[s][1] + b':' + entries[s][index] for s in wanted
                  if s in entries and (reset or entries[s][0] > since)]
         return (header + b',"reset":' + (b'true' if reset else b'false')
                 + b',"bundles":{' + b','.join(parts) + b'}}')
