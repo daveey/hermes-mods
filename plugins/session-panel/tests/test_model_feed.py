@@ -55,6 +55,22 @@ def test_interactive_refresh_refuses_partial_inputs_and_recovers():
         f.refresh_decision('never-watched', readers=readers)
 
 
+def test_interactive_failure_keeps_other_chats_earlier_retry_after_exhaustion():
+    import pytest
+    f, readers, pushed, clock = make()
+    f.changes(['S1', 'S2'])
+    readers.decision_inputs = lambda *args: {'requests': []}
+    with pytest.raises(ValueError):
+        f.refresh_decision('S2', readers=readers)
+    due = f._decision_retry_at
+    for _ in range(10):
+        with pytest.raises(ValueError):
+            f.refresh_decision('S1', readers=readers)
+        assert f._decision_retry_at is not None
+        assert f._decision_retry_at <= due
+    assert f._budgets['decision']['S2'] == 1
+
+
 def test_overlapping_decision_results_keep_newest_failure_status():
     from types import SimpleNamespace
     for older_fails in (False, True):
