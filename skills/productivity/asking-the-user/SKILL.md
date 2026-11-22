@@ -35,7 +35,9 @@ the step, so the live owner chat that got the notice runs it itself and comments
 deferring to it. A card's action never needs a chat id: the canonical owner-terminal action ("From your own Hermes
 chat open the owner-terminal flow for task <id>") puts chat refs in scope (ask-gate refuses one in the action). Duplicates
 split the user's answer, and the copy not consumed sits stale in For-you. Withdraw yours as soon as the card shows
-the ask was answered elsewhere or the card left `blocked`. Say an ask is withdrawn only once the withdraw result
+the ask was answered elsewhere or the card left `blocked`. A `session_outcome` wait (or done) never retires an open request: `hermes sessions outcome <session> --refresh
+--json` keeps deriving `decision` from it. Withdraw it with `action_request {"withdraw": ...}`, then rerun that
+command to confirm. Say an ask is withdrawn only once the withdraw result
 reads `withdrawn`; `withdraw.requestId` needs the full UUID (an 8-char prefix returns 404 "Unknown request").
 Every `::user-step` marker opens a For-you request, so wrap only a current ask, and only once. Never wrap a status
 headline or summary that asks nothing: it opens a request with nothing to answer, which reads as a duplicate of the
