@@ -30,28 +30,42 @@ def linked_cards(owner):
     # Missing core is unavailable, never evidence that a prior remote ask departed.
     from hermes_cli.kanban_session_activity import _remote_cards
     cards = _remote_cards([owner['storedSessionId']], ('blocked', 'triage'), False)
-    selected = {}
-    for card in cards:
-        if (card.get('session') != owner['storedSessionId']
-                and card.get('origin_session') != owner['storedSessionId']):
-            continue
-        if (card.get('origin_gateway', owner['gatewayId']) != owner['gatewayId']
-                or card.get('origin_profile', owner['profile']) != owner['profile']
-                or card.get('gateway') == owner['gatewayId']):
-            continue
-        target = tuple(card.get(k) for k in ('gateway', 'profile', 'board', 'id'))
-        if all(isinstance(x, str) and x for x in target):
-            selected[target] = card
-    if not selected:
-        return []
     view_module = load_file(Path(__file__).resolve().parents[1] / 'hub-sync' / 'hubview.py')
     view = view_module.open_view()
     if view is None:
         raise OSError('Remote ask owner projection unavailable')
     try:
+        gateway = view.gateway
+        selected = {}
+        for card in cards:
+            if (card.get('session') != owner['storedSessionId']
+                    and card.get('origin_session') != owner['storedSessionId']):
+                continue
+            if (card.get('origin_gateway', gateway) != gateway
+                    or card.get('origin_profile', owner['profile']) != owner['profile']
+                    or card.get('gateway') == gateway):
+                continue
+            target = tuple(card.get(k) for k in ('gateway', 'profile', 'board', 'id'))
+            if all(isinstance(x, str) and x for x in target):
+                selected[target] = card
+        if not selected:
+            return []
         rows = view.rows('tasks', pick=lambda candidates: [c for c in candidates
                          if (c[0], *c[1].split('/')) in selected])
         return [dict(r, session=owner['storedSessionId']) for r in rows]
+    finally:
+        view.conn.close()
+
+
+def source_gateway():
+    """Trusted transport identity, never the ActionStore install namespace."""
+    view = load_file(Path(__file__).resolve().parents[1] / 'hub-sync' / 'hubview.py').open_view()
+    if view is None:
+        raise OSError('Local courier identity unavailable')
+    try:
+        if not isinstance(view.gateway, str) or not re.fullmatch('[A-Za-z0-9_.-]+', view.gateway):
+            raise OSError('Local courier identity unavailable')
+        return view.gateway
     finally:
         view.conn.close()
 
@@ -78,22 +92,29 @@ class Courier:
             db.commit()
         finally:
             db.close()
-        self.view._send_now(client, self.view.db_path(), self.view.SEND_WAIT_S)
-        cfg = client.load_config()
-        api = client.Api(cfg['hub_url'], client.read_key())
-        status, data = api.call('GET', '/v2/sync/requests/' + rid)
+        try:
+            self.view._send_now(client, self.view.db_path(), self.view.SEND_WAIT_S)
+            cfg = client.load_config()
+            api = client.Api(cfg['hub_url'], client.read_key())
+            status, data = api.call('GET', '/v2/sync/requests/' + rid)
+        except (Exception, SystemExit) as exc:
+            # Optional transport/key failures must not terminate the Desktop backend.
+            raise OSError('Card-answer courier unavailable; check the same operation') from exc
         if status != 200 or not isinstance(data, dict):
             raise OSError('Card-answer receipt unavailable; retry the same operation')
         return data.get('request')
 
 
 class Remote:
-    def __init__(self, mirror, *, cards=linked_cards, courier=None):
+    def __init__(self, mirror, *, cards=linked_cards, courier=None, gateway=source_gateway):
         self.mirror, self.cards = mirror, cards
+        self.gateway = gateway
         self.courier = courier
 
     def snapshots(self, owner):
         for row in self.cards(owner):
+            if row.get('stale'):
+                raise OSError('Remote ask projection stale; retain prior request')
             hr, generation = row.get('human_request'), row.get('card_answer_generation')
             if (row.get('stale') or row.get('status') not in ('blocked', 'triage')
                     or not isinstance(hr, dict) or not hr.get('action')
@@ -103,10 +124,15 @@ class Remote:
             target = dict(zip(('ownerGateway', 'ownerProfile', 'board', 'task'),
                               (row.get(k) for k in ('gateway', 'profile', 'board', 'id'))))
             if (not all(isinstance(x, str) and re.fullmatch('[A-Za-z0-9_.-]+', x) for x in target.values())
-                    or target['ownerGateway'] == owner['gatewayId']):
+                    or target['ownerGateway'] == self.gateway()):
                 continue
             target['generation'] = generation
             options = hr.get('choices') or [dict(label='Unblock', value='unblock'), dict(label='Archive', value='archive')]
+            if (not isinstance(options, list) or any(not isinstance(ch, dict)
+                    or not isinstance(ch.get('label'), str) or not ch['label'].strip()
+                    or not isinstance(ch.get('value'), str) or not ch['value'].strip() for ch in options)
+                    or len({ch['value'] for ch in options}) != len(options)):
+                raise OSError('Remote ask choices malformed; retain prior request')
             yield dict(task=target['task'], session=owner['storedSessionId'], generation=generation,
                        ask=hr, title=row.get('title') or hr['action'],
                        remote=dict(version=1, target=target,
@@ -154,7 +180,7 @@ class Remote:
         owner = op['owner']
         return dict(to_gw=answer['ownerGateway'], coll='tasks',
                     key='/'.join(answer[k] for k in ('ownerProfile', 'board', 'task')), action='card-answer',
-                    args=dict(answer=answer, source=dict(gateway=owner['gatewayId'], profile=owner['profile'],
+                    args=dict(answer=answer, source=dict(gateway=self.gateway(), profile=owner['profile'],
                                                        session=owner['storedSessionId'])))
 
     def deliver(self, op, binding):
@@ -163,16 +189,16 @@ class Remote:
         record = (self.courier or Courier()).exchange(envelope, rid)
         if (not isinstance(record, dict) or record.get('id') != rid
                 or any(record.get(k) != v for k, v in envelope.items())
-                or record.get('from') != 'gw:' + op['owner']['gatewayId']):
+                or record.get('from') != 'gw:' + envelope['args']['source']['gateway']):
             raise OSError('Card-answer courier envelope mismatch')
-        if record.get('state') == 'rejected':
-            raise self.mirror.core.ActionError('Remote owner refused the exact card answer', 409)
+        if record.get('state') in ('rejected', 'expired', 'failed'):
+            raise self.mirror.core.ActionError('Remote owner refused or terminated the exact card answer: ' + record['state'], 409)
         if record.get('state') != 'done':
             raise OSError('Remote answer pending; check status or retry this operation')
         receipt = record.get('result')
         answer = envelope['args']['answer']
         if (not isinstance(receipt, dict) or any(receipt.get(k) != v for k, v in answer.items())
-                or receipt.get('originGateway') != op['owner']['gatewayId']
+                or receipt.get('originGateway') != envelope['args']['source']['gateway']
                 or receipt.get('destination') != 'kanban_ask' or receipt.get('executionStarted') is not False
                 or receipt.get('decisionProvenance') != 'recorded_desktop_operation'):
             raise OSError('Invalid remote answer receipt')

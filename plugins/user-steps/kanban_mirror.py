@@ -610,7 +610,7 @@ class Mirror:
         self.core.validate_owner(owner)
         try:
             self.remote.reconcile(owner)
-        except (OSError, sqlite3.Error, ImportError) as exc:
+        except Exception as exc:  # optional remote projection must not suppress local cards
             logging.getLogger('user-steps').warning('Remote card reconciliation unavailable: %s', exc)
         with _accounted_pass("user_steps.mirror_reconcile") as acct:
             fenced = self._fenced_core()
