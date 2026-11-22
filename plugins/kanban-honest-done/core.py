@@ -183,9 +183,12 @@ def _keep() -> None:
 
 def _created_by(conn: sqlite3.Connection, task_id: str) -> Optional[set[str]]:
     """Inside a pass: the cards whose ``created`` event names ``task_id`` as creator, from one read of this
-    database's ``created`` events. None outside a pass or on a connection the pass does not own. The rows read
-    before a failure (no JSON1, a malformed payload) are kept, as the per-card query yields them in the same index
-    order before it fails."""
+    database's ``created`` events. None outside a pass or on a connection the pass does not own. A failure midway
+    (no JSON1, a malformed payload) keeps the rows indexed before it. Those are not always the per-card query's
+    rows: sqlite3 steps to the next row before handing back the current one, so the index loses the last
+    ``created`` row before the bad payload where the per-card query loses its last matching row. On a board
+    holding invalid JSON in a ``created`` event (core does not write one) a pass can therefore keep a real creator
+    link the per-card query drops."""
     state = getattr(_pass, "state", None)
     if state is None or not any(conn is c for c in state["conns"].values()):
         return None
