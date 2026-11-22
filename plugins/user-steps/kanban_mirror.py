@@ -582,7 +582,14 @@ class Mirror:
                     if resolution
                     else None
                 )
-                if not op or (op.get("retired") or {}).get("reason") != MISMATCH:
+                remote_retired = (snap.get('remote') and op
+                                  and (op.get('retired') or {}).get('reason') == 'Remote card answer retired')
+                if not remote_retired and (not op or (op.get("retired") or {}).get("reason") != MISMATCH):
+                    return None
+            elif state == 'resolved' and snap.get('remote') and resolution:
+                op = self.store.operation(owner, resolution['operationId'])['operation']
+                if not (op['dispatchState'] == 'delivered'
+                        and op.get('provenance') == dict(type='kanban_other', version=1)):
                     return None
             elif state != "withdrawn":
                 return None

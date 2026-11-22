@@ -146,11 +146,7 @@ def test_no_remote_tiles_without_fresh_portable_generation(tmp_path, changed):
     row = remote_row(hr)
     row.update(changed)
     mirror.remote.cards = lambda owner: [row]
-    if changed.get('stale'):
-        with pytest.raises(OSError, match='stale'):
-            mirror.remote.reconcile(OWNER)
-    else:
-        mirror.remote.reconcile(OWNER)
+    mirror.remote.reconcile(OWNER)
     assert store.requests(OWNER) == []
 
 
@@ -273,6 +269,7 @@ def test_mirrored_real_store_answer_receipt_against_owner(tmp_path, monkeypatch,
         if stale:
             with pytest.raises(core.ActionError, match='refused'):
                 mirror.deliver(op)
+            assert store.operation(source, op['operationId'])['operation']['dispatchState'] == 'cancelled'
         else:
             receipt = mirror.deliver(op)
             assert receipt['choice'] == 'plan-a'
@@ -281,6 +278,12 @@ def test_mirrored_real_store_answer_receipt_against_owner(tmp_path, monkeypatch,
             assert receipt['operationId'] == op['operationId']
             assert mirror.readback(op, receipt)
             assert mirror.deliver(op) == receipt
+            delivered = store.dispatch(source, op['operationId'], mirror)['operation']
+            assert delivered['dispatchState'] == 'delivered'
+            if other:
+                mirror.remote.reconcile(source)
+                opens = [r for r in store.requests(source) if r['state'] == 'open']
+                assert len(opens) == 1 and opens[0]['requestId'] != request['requestId']
         with connect_closing(owner_home / 'kanban.db') as conn:
             task = kb.get_task(conn, answer['task'])
             comments = helpers.comments(conn, answer['task'])
@@ -323,3 +326,102 @@ def test_membership_hydrates_only_exact_chat_gateway_profile_board_target(tmp_pa
     monkeypatch.setattr(module, 'load_file', lambda path: SimpleNamespace(open_view=lambda: view))
     assert module.linked_cards(owner) == [exact]
     assert closed == [True]
+
+
+@pytest.mark.parametrize('state', ['rejected', 'expired', 'failed'])
+def test_owner_refusal_retires_and_remints_without_retry(tmp_path, state):
+    mirror, store, _, hr = fixture(tmp_path)
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    mirror.remote.reconcile(OWNER)
+    old = store.requests(OWNER)[0]
+    op = decide(store, old)
+    calls = []
+    class Transport:
+        def exchange(self, envelope, rid):
+            calls.append(rid)
+            return dict(copy.deepcopy(envelope), id=rid, state=state, **{'from': 'gw:fixture-sync'})
+    mirror.remote.courier = Transport()
+    with pytest.raises(core.ActionError):
+        mirror.deliver(op)
+    assert store.operation(OWNER, op['operationId'])['operation']['dispatchState'] == 'cancelled'
+    store.reconcile(OWNER, mirror)
+    assert len(calls) == 1
+    mirror.remote.reconcile(OWNER)
+    open_rows = [r for r in store.requests(OWNER) if r['state'] == 'open']
+    assert len(open_rows) == 1 and open_rows[0]['requestId'] != old['requestId']
+
+
+@pytest.mark.parametrize('departure', [False, True])
+def test_changed_remote_generation_settles_recorded_operation(tmp_path, departure):
+    mirror, store, _, hr = fixture(tmp_path)
+    row = remote_row(hr)
+    mirror.remote.cards = lambda owner: [row]
+    mirror.remote.reconcile(OWNER)
+    old = store.requests(OWNER)[0]
+    op = decide(store, old)
+    mirror.remote.cards = lambda owner: [] if departure else [dict(row, card_answer_generation='b' * 64)]
+    mirror.remote.reconcile(OWNER)
+    assert store.operation(OWNER, op['operationId'])['operation']['dispatchState'] == 'cancelled'
+    assert store.get(OWNER, old['requestId'])['state'] == 'cancelled'
+    opens = [r for r in store.requests(OWNER) if r['state'] == 'open']
+    assert len(opens) == (0 if departure else 1)
+
+
+@pytest.mark.parametrize('bad', ['stale', 'duplicate', 'malformed', 'action-validation'])
+def test_bad_remote_row_preserves_only_its_tile_and_publishes_healthy_rows(tmp_path, bad):
+    mirror, store, _, hr = fixture(tmp_path)
+    row = remote_row(hr)
+    mirror.remote.cards = lambda owner: [row]
+    mirror.remote.reconcile(OWNER)
+    old = store.requests(OWNER)[0]
+    broken = (dict(row, stale=True) if bad == 'stale' else dict(row, human_request=dict(hr,
+        choices=[hr['choices'][0]] * 2 if bad == 'duplicate' else [{}])))
+    if bad == 'action-validation':
+        broken = dict(row, title={'invalid': 'title'}, card_answer_generation='b' * 64)
+    mirror.remote.cards = lambda owner: [broken, dict(row, id='t_healthy')]
+    mirror.remote.reconcile(OWNER)
+    assert store.get(OWNER, old['requestId'])['state'] == 'open'
+    assert len([r for r in store.requests(OWNER) if r['state'] == 'open']) == 2
+
+
+def test_remote_default_board_never_uses_local_binding_reader(tmp_path):
+    mirror, store, _, hr = fixture(tmp_path)
+    row = dict(remote_row(hr), board='default')
+    mirror.remote.cards = lambda owner: [row]
+    mirror.remote.reconcile(OWNER)
+    old = store.requests(OWNER)[0]
+    mirror._reconcile_binding(OWNER, mirror.binding(OWNER, old['requestId']))
+    assert store.get(OWNER, old['requestId'])['state'] == 'open'
+
+
+def test_receipt_mode_must_match_choice_envelope(tmp_path):
+    mirror, store, _, hr = fixture(tmp_path)
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    mirror.remote.reconcile(OWNER)
+    op = decide(store, store.requests(OWNER)[0])
+    class Transport:
+        def exchange(self, envelope, rid):
+            receipt = dict(copy.deepcopy(envelope['args']['answer']), mode='comment',
+                originGateway='fixture-sync', destination='kanban_ask', executionStarted=False,
+                decisionProvenance='recorded_desktop_operation')
+            return dict(copy.deepcopy(envelope), id=rid, state='done', result=receipt,
+                        **{'from': 'gw:fixture-sync'})
+    mirror.remote.courier = Transport()
+    with pytest.raises(OSError, match='receipt'):
+        mirror.deliver(op)
+
+
+def test_delivered_other_remints_same_generation(tmp_path):
+    mirror, store, _, hr = fixture(tmp_path)
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    mirror.remote.reconcile(OWNER)
+    old = store.requests(OWNER)[0]
+    op = mirror.decide_other(OWNER, dict(requestId=old['requestId'], expectedRevision=1,
+        idempotencyKey='other-remint', choiceId='answer-text', revisionText='Need context'))['operation']
+    class Receiver:
+        def deliver(self, op): return {'ok': True}
+        def readback(self, op, receipt): return True
+    store.dispatch(OWNER, op['operationId'], Receiver())
+    mirror.remote.reconcile(OWNER)
+    opens = [r for r in store.requests(OWNER) if r['state'] == 'open']
+    assert len(opens) == 1 and opens[0]['requestId'] != old['requestId']

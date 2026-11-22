@@ -113,30 +113,41 @@ class Remote:
 
     def snapshots(self, owner):
         for row in self.cards(owner):
-            if row.get('stale'):
-                raise OSError('Remote ask projection stale; retain prior request')
-            hr, generation = row.get('human_request'), row.get('card_answer_generation')
-            if (row.get('stale') or row.get('status') not in ('blocked', 'triage')
-                    or not isinstance(hr, dict) or not hr.get('action')
-                    or hr.get('interaction') not in ('reply', 'approval', 'user_terminal', 'physical', 'external')
-                    or not isinstance(generation, str) or not re.fullmatch('[0-9a-f]{64}', generation)):
-                continue
-            target = dict(zip(('ownerGateway', 'ownerProfile', 'board', 'task'),
-                              (row.get(k) for k in ('gateway', 'profile', 'board', 'id'))))
-            if (not all(isinstance(x, str) and re.fullmatch('[A-Za-z0-9_.-]+', x) for x in target.values())
-                    or target['ownerGateway'] == self.gateway()):
-                continue
-            target['generation'] = generation
-            options = hr.get('choices') or [dict(label='Unblock', value='unblock'), dict(label='Archive', value='archive')]
-            if (not isinstance(options, list) or any(not isinstance(ch, dict)
-                    or not isinstance(ch.get('label'), str) or not ch['label'].strip()
-                    or not isinstance(ch.get('value'), str) or not ch['value'].strip() for ch in options)
-                    or len({ch['value'] for ch in options}) != len(options)):
-                raise OSError('Remote ask choices malformed; retain prior request')
-            yield dict(task=target['task'], session=owner['storedSessionId'], generation=generation,
-                       ask=hr, title=row.get('title') or hr['action'],
-                       remote=dict(version=1, target=target,
-                                   choiceValues={f'card-{i}': ch['value'] for i, ch in enumerate(options)}))
+            try:
+                for snap in self._snapshot(owner, row):
+                    self.mirror._request(owner, snap['remote']['target']['board'], snap)
+                    yield snap
+            except (OSError, ValueError, TypeError, KeyError, self.mirror.core.ActionError):
+                # Only this target is unknown. Healthy rows still publish; the
+                # unknown row is not authority to retire its prior operation.
+                yield {'unknown': tuple(row.get(k) for k in ('gateway', 'profile', 'board', 'id'))}
+
+    def _snapshot(self, owner, row):
+        if row.get('stale'):
+            raise OSError('Remote ask projection stale; retain prior request')
+        if row.get('status') not in ('blocked', 'triage'):
+            return
+        hr, generation = row.get('human_request'), row.get('card_answer_generation')
+        if (not isinstance(hr, dict) or not hr.get('action')
+                or hr.get('interaction') not in ('reply', 'approval', 'user_terminal', 'physical', 'external')
+                or not isinstance(generation, str) or not re.fullmatch('[0-9a-f]{64}', generation)):
+            raise OSError('Remote ask incomplete; retain prior request')
+        target = dict(zip(('ownerGateway', 'ownerProfile', 'board', 'task'),
+                          (row.get(k) for k in ('gateway', 'profile', 'board', 'id'))))
+        if (not all(isinstance(x, str) and re.fullmatch('[A-Za-z0-9_.-]+', x) for x in target.values())
+                or target['ownerGateway'] == self.gateway()):
+            return
+        target['generation'] = generation
+        options = hr.get('choices') or [dict(label='Unblock', value='unblock'), dict(label='Archive', value='archive')]
+        if (not isinstance(options, list) or any(not isinstance(ch, dict)
+                or not isinstance(ch.get('label'), str) or not ch['label'].strip()
+                or not isinstance(ch.get('value'), str) or not ch['value'].strip() for ch in options)
+                or len({ch['value'] for ch in options}) != len(options)):
+            raise OSError('Remote ask choices malformed; retain prior request')
+        yield dict(task=target['task'], session=owner['storedSessionId'], generation=generation,
+                   ask=hr, title=row.get('title') or hr['action'],
+                   remote=dict(version=1, target=target,
+                               choiceValues={f'card-{i}': ch['value'] for i, ch in enumerate(options)}))
 
     def reconcile(self, owner):
         m = self.mirror
@@ -144,22 +155,47 @@ class Remote:
             snapshots = list(self.snapshots(owner))  # failure is not departure evidence
         except ImportError:
             return  # core-free installation: no remote decision authority or withdrawal
-        live = set()
-        for snap in snapshots:
-            board = snap['remote']['target']['board']
-            request = m._current_request(owner, board, snap)
-            if request is not None:
-                m._publish(owner, board, snap, request)
-                live.add(request['requestId'])
+        valid = [snap for snap in snapshots if 'unknown' not in snap]
+        unknown = {snap['unknown'] for snap in snapshots if 'unknown' in snap}
+        current = {self._target(snap['remote']['target']): snap for snap in valid}
         with m.store._read() as c:
             bindings = [dict(r) for r in c.execute(
                 "SELECT * FROM kanban_projections WHERE namespace=? AND session=? AND json_type(snapshot,'$.remote')='object'",
                 (m.store._ns(owner), owner['storedSessionId']))]
+        # Retire old intent before minting the current generation. Unknown rows
+        # deliberately preserve their own binding, not everybody else's.
         for binding in bindings:
-            if json.loads(binding['snapshot']).get('remote') and binding['request_id'] not in live:
-                request = m.store.get(owner, binding['request_id'])
-                if request['state'] in ('open', 'needs_context') and not request.get('resolution'):
-                    m._withdraw(owner, request)
+            frozen = json.loads(binding['snapshot'])
+            target = self._target(frozen['remote']['target'])
+            if target in unknown:
+                continue
+            request = m.store.get(owner, binding['request_id'])
+            snap = current.get(target)
+            if snap is not None and snap['generation'] == frozen['generation']:
+                continue
+            if request.get('resolution'):
+                self._retire(owner, request['resolution']['operationId'], 'Source card ask changed before delivery')
+            elif request['state'] in ('open', 'needs_context'):
+                m._withdraw(owner, request)
+        for snap in valid:
+            board = snap['remote']['target']['board']
+            request = m._current_request(owner, board, snap)
+            if request is not None:
+                m._publish(owner, board, snap, request)
+
+    @staticmethod
+    def _target(target):
+        return tuple(target.get(k) for k in ('ownerGateway', 'ownerProfile', 'board', 'task'))
+
+    def _retire(self, owner, oid, reason):
+        store = self.mirror.store
+        if store.operation(owner, oid)['operation']['dispatchState'] in ('delivered', 'cancelled'):
+            return
+        try:
+            store.retire_operation(owner, oid, by='system', reason='Remote card answer retired', evidence=reason)
+        except self.mirror.core.ActionError:
+            if store.operation(owner, oid)['operation']['dispatchState'] not in ('delivered', 'cancelled'):
+                raise
 
     def envelope(self, op, binding):
         snap = json.loads(binding['snapshot'])
@@ -192,12 +228,14 @@ class Remote:
                 or record.get('from') != 'gw:' + envelope['args']['source']['gateway']):
             raise OSError('Card-answer courier envelope mismatch')
         if record.get('state') in ('rejected', 'expired', 'failed'):
+            self._retire(op['owner'], op['operationId'], 'Authenticated owner terminal: ' + record['state'])
             raise self.mirror.core.ActionError('Remote owner refused or terminated the exact card answer: ' + record['state'], 409)
         if record.get('state') != 'done':
             raise OSError('Remote answer pending; check status or retry this operation')
         receipt = record.get('result')
         answer = envelope['args']['answer']
         if (not isinstance(receipt, dict) or any(receipt.get(k) != v for k, v in answer.items())
+                or receipt.get('mode') != answer.get('mode')
                 or receipt.get('originGateway') != envelope['args']['source']['gateway']
                 or receipt.get('destination') != 'kanban_ask' or receipt.get('executionStarted') is not False
                 or receipt.get('decisionProvenance') != 'recorded_desktop_operation'):
