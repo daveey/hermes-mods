@@ -329,17 +329,23 @@ def test_hydrated_graph_never_replaces_explicit_noncard_wait(on):
 
 
 @pytest.mark.parametrize('source, expected', [('live', True), ('replica', False)])
-def test_graph_leaf_inherits_serving_gateway_only_for_live_sources(source, expected):
+@pytest.mark.parametrize('depth', [1, 2])
+def test_graph_leaf_inherits_serving_gateway_only_for_live_sources(source, expected, depth):
     row = task('t_aaaaaaaaaaaaaaaa', status='blocked')
     cid = 't_bbbbbbbbbbbbbbbb'
     b = bundle(row, cards={row['id']: {'detail': {'links': {'parents': [cid]}}},
                            cid: {'board': 'other', 'detail': {'source': source, 'task': {'id': cid, 'title': 'Local leaf', 'status': 'scheduled'},
                                 'events': [{'kind': 'scheduled', 'payload': {'awaiting': {'kind': 'clock', 'why': 'Cooldown window'}}}]}}})
     b.update(gateway='hub', profile='default')
+    if depth == 2:
+        mid = 't_cccccccccccccccc'
+        b['cards'][row['id']]['detail']['links']['parents'] = [mid]
+        b['cards'][mid] = {'detail': {'source': 'live', 'task': {'id': mid, 'title': 'Intermediate', 'status': 'blocked'}, 'links': {'parents': [cid]}}}
+        row['wait'] = {'wait_state': 'waiting', 'waiting_on': f'card {mid}'}
     r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
     assert ('Local leaf' in r['detail']) is expected
     actions = [a for a in r['actions'] if a['label'] == 'Open parent card']
-    assert bool(actions) is expected
+    assert bool(actions) is (expected or depth == 2)
     if expected:
         assert 'Cooldown window' in r['detail'] and 'on hub' in r['detail']
         assert actions[0]['target'] == {'id': cid, 'gateway': 'hub', 'profile': 'default', 'board': 'other'}
