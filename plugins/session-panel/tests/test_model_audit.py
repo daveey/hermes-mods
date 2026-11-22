@@ -351,6 +351,30 @@ def test_graph_leaf_inherits_serving_gateway_only_for_live_sources(source, expec
         assert actions[0]['target'] == {'id': cid, 'gateway': 'hub', 'profile': 'default', 'board': 'other'}
 
 
+@pytest.mark.parametrize('on', ['the clock until 2026-11-23 12:00 UTC', 'the clock until 2026-11-21 00:00 UTC'])
+def test_owner_reason_preserves_clock_countdown_and_overdue(on):
+    row = task(status='scheduled', wait={'wait_state': 'waiting', 'waiting_on': on})
+    b = bundle(row, cards={row['id']: {'detail': {'events': [{'kind': 'scheduled', 'payload': {'awaiting': {'kind': 'clock', 'why': 'Cooldown window'}}}]}}})
+    r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert model.wait_phrase(row, NOW) in r['detail']
+    assert 'Blocking reason: Cooldown window' in r['details']
+
+
+@pytest.mark.parametrize('on', ['the clock until 2026-11-23 12:00 UTC', 'ci https://example.com/run', 'deploy release', 'card t_dddddddddddddddd'])
+def test_leaf_traversal_obeys_intermediate_explicit_producer(on):
+    mid, other, primary = 't_bbbbbbbbbbbbbbbb', 't_cccccccccccccccc', 't_dddddddddddddddd'
+    row = task(status='scheduled', wait={'wait_state': 'waiting', 'waiting_on': f'card {mid}'})
+    b = bundle(row, cards={mid: {'detail': {'owner': 'remote', 'task': {'id': mid, 'title': 'Actual producer', 'status': 'scheduled',
+                                     'wait': {'waiting_on': on}}, 'links': {'parents': [other]}}},
+                           other: {'detail': {'owner': 'remote', 'task': {'id': other, 'title': 'Unrelated ancestor', 'status': 'blocked'}}},
+                           primary: {'detail': {'owner': 'remote', 'task': {'id': primary, 'title': 'Named primary', 'status': 'scheduled'}}}})
+    b.update(gateway='remote', profile='default')
+    r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert 'Unrelated ancestor' not in r['detail']
+    expected = primary if on.startswith('card ') else mid
+    assert next(a for a in r['actions'] if a['label'] == 'Open parent card')['target']['id'] == expected
+
+
 def test_parent_wait_keeps_identity_in_details_not_status():
     upstream = {'id': 't_0123456789abcdef', 'status': 'blocked'}
     r = model.reduce_panel(bundle(task(status='todo', blocked_upstream=upstream)), now=NOW)['sections']['waiting'][0]
