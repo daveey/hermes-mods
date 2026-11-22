@@ -397,8 +397,9 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
   // Spec: hidden when there is neither open work nor finished history.
   if (!MODEL_SECTIONS.some(([section]) => model.sections[section].length)) return null
   const status = model.header.status
-  const state = status ? str(model.header.state) : 'unknown'
-  const label = status ? str(model.header.label) || state : 'unknown'
+  const hasHeader = status || model.header.source === 'derived'
+  const state = hasHeader ? str(model.header.state) : 'unknown'
+  const label = hasHeader ? str(model.header.label) || state : 'unknown'
   const stripe = status?.presentation?.stripe || 'attention'
   // Presentation palette only: no local activity/count/kind classification.
   const statusColor = { done: 'var(--color-emerald-500)', stuck: 'var(--color-red-500)', attention: 'var(--color-amber-500)',

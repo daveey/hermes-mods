@@ -114,7 +114,9 @@ def test_absent_recent_session_refreshes_without_poisoning_freshness(api, tmp_pa
     f.changes(['S1'])
     assert f.refresh_decisions(readers=r) == 1
     assert not f._decision_failures and 'S1' in pushed[-1]['fresh']
-    assert f.bundles['S1']['bundle']['model']['header']['state'] == 'unknown'
+    header = f.bundles['S1']['bundle']['model']['header']
+    assert header['state'] == 'waiting' and header['source'] == 'derived'
+    assert header['status'] is None
     r.release()
 
 

@@ -38,14 +38,14 @@ def test_no_legacy_or_row_count_reclassification():
     assert header['status']['presentation']['stripe'] == 'attention'
 
 
-def test_missing_malformed_or_unsupported_protocol_is_unknown_never_legacy_done():
+def test_missing_malformed_or_unsupported_protocol_is_derived_never_legacy_done():
     for value in ({'kind': 'done'}, {'kind': 'done', 'status': None}, {'kind': 'done', 'status': {'status_version': 2}},
                   {'kind': 'done', 'status': {**outcome()['status'], 'revision': -1}},
                   {'kind': 'done', 'status': {**outcome()['status'], 'coverage': {'state': 'unknown', 'reasons': ['source_failed']}}},
                   {'kind': 'done', 'status': {**outcome()['status'], 'kind': 'unresolved'}},
                   {'kind': 'done', 'status': {**outcome()['status'], 'coverage': {'state': 'partial'}}}):
         header = reduce(value)['header']
-        assert header['state'] == 'unknown'
+        assert header['source'] == 'derived' and header['state'] == 'idle'
         assert header['status'] is None
 
 
@@ -78,5 +78,5 @@ def test_nested_wire_objects_are_not_decoded_from_strings_into_canonical_status(
         value = outcome()
         value['status'][field] = json.dumps(value['status'][field])
         header = reduce(value)['header']
-        assert header['state'] == 'unknown', field
+        assert header['source'] == 'derived' and header['state'] == 'idle', field
         assert header['status'] is None, field

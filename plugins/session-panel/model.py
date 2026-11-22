@@ -779,9 +779,18 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     counts = {s: len(sections[s]) for s in SECTIONS}
     pips = [{'section': s, 'count': counts[s], 'label': {'needs_you': 'needs you', 'running': 'running'}.get(s, s)} for s in SECTIONS if counts[s]]
     status = published_status(outcome)
-    state = status['kind'] if status else 'unknown'
-    label = HEADER_LABELS.get(state, state)
-    result = {'version': 1, 'header': {'state': state, 'status': status, 'label': label, 'counts': counts, 'pips': pips}, 'sections': sections,
+    # Presentation fallback only: legacy outcome.kind is never a status envelope.
+    # An unavailable outcome does not make otherwise readable panel rows unknown.
+    row_errors = [e for e in bundle.get('input_errors') or [] if e != 'session outcome unavailable']
+    derived = ('unknown' if row_errors else
+               'needs-you' if counts['needs_you'] else
+               'stuck' if counts['stuck'] else
+               'running' if counts['running'] else
+               'waiting' if counts['waiting'] or counts['ready'] else 'idle')
+    state = status['kind'] if status else derived
+    label = HEADER_LABELS.get(state, state).replace('needs-you', 'needs you')
+    source = 'canonical' if status else 'derived'
+    result = {'version': 1, 'header': {'state': state, 'status': status, 'source': source, 'label': label, 'counts': counts, 'pips': pips}, 'sections': sections,
               'diagnostics': list(bundle.get('input_errors') or [])}
     result['revision'] = hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
     return result
