@@ -15,9 +15,10 @@ as plain text, never HTML or executable commands.
 Models cache in memory by exact connection/profile/stored-session scope, up to
 100 scopes. A route switch paints that scope's cached model synchronously while
 feed registration runs separately. A missing model shows **Loading session status…**
-while the focused scope gets up to three focused-only full reads (immediate, then
+while the focused scope triggers up to three full reads (immediate, then
 250 ms and 750 ms after the preceding attempt). A registered session is not a
-cached model: empty responses and transient failures still retry. Requests retain
+cached model: empty responses and transient failures still retry. Reads retain already-watched
+sessions at execution time before advancing the shared cursor, not unrelated sidebar chats. Requests retain
 the existing 15-second bridge deadline and per-connection serialization; this is
 not a five-second availability guarantee under an overloaded backend. After those
 attempts, the placeholder says status is taking longer and offers **Retry**; changing
