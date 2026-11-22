@@ -17,10 +17,11 @@ def load(name, path):
     return mod
 
 
-def test_changes_route_watches_and_catches_up():
+def test_changes_route_watches_and_catches_up(monkeypatch):
     api = load('_spf_routes_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
     fakes = load('_spf_routes_fakes', HERE.parent / 'test_feed.py')
     core = api._load_feed()
+    monkeypatch.setattr(api, 'CoreReaders', fakes.Readers)
     pushed = []
     core.PROCESS_FEED = core.Feed(fakes.Readers(), emit=pushed.append)
     try:
@@ -39,6 +40,8 @@ def test_changes_route_watches_and_catches_up():
         assert first['profile'] == api.LAUNCH_PROFILE
         assert c.post('/api/plugins/session-panel/changes', json={'sessions': ['x'] * 201}).status_code == 422
     finally:
+        core.PROCESS_FEED.stopped.set()
+        core.PROCESS_FEED._decision_thread.join(2)
         core.PROCESS_FEED = None
 
 
@@ -206,6 +209,54 @@ def test_a_reload_from_real_older_feed_code_hands_over_with_the_same_epoch(monke
         assert out['epoch'] == f.epoch and 'S2' in f.interest and 'S2' in out['bundles']
     finally:
         _restore(api, current)
+
+
+def test_current_api_adds_one_canonical_lane_to_feed_resumed_by_older_api(monkeypatch):
+    import threading
+    api, core = _hot(monkeypatch, 'mixed_decisions')
+    fakes = load('_spf_mixed_decision_fakes', HERE.parent / 'test_feed.py')
+    old_namespace = dict(api.__dict__)
+    old_namespace.update(CoreReaders=fakes.Readers,
+                         _run=lambda f: f.stopped.wait(5),
+                         load_snapshot=lambda: None,
+                         save_snapshot=lambda *a, **k: True,
+                         _save_at_exit=lambda: None)
+    source = (HERE.parent / 'fixtures' / 'feed_entry_before_decisions.py').read_text()
+    exec(compile(source, 'feed_entry_before_decisions.py', 'exec'), old_namespace)
+    observed, released = threading.Event(), threading.Event()
+    class CurrentReaders(fakes.Readers):
+        def decision_inputs(self, session, lineage):
+            observed.set()
+            return {'outcome_json': {'kind': 'done'}, 'requests': []}
+        def release(self):
+            released.set()
+    monkeypatch.setattr(api, 'CoreReaders', CurrentReaders)
+    f = None
+    try:
+        # A saved RESTART closure from before this change resumes a head Feed,
+        # but creates old readers and only its historical board thread.
+        core.PROCESS_FEED = core.Feed(fakes.Readers(), emit=lambda p: None)
+        core.PROCESS_FEED.stopped.set()
+        core.RESTART = old_namespace['feed']
+        f = core.RESTART()
+        f.changes(['S1'])
+        assert not hasattr(f.readers, 'decision_inputs')
+        assert not getattr(f, '_decision_thread', None)
+        assert api.feed() is f
+        assert observed.wait(2), 'current API must start decisions even for an existing current Feed'
+        lane = f._decision_thread
+        assert api.feed() is f and f._decision_thread is lane, 'idempotent under PROCESS_LOCK'
+        f.stopped.set()
+        lane.join(2)
+        assert not lane.is_alive() and released.is_set(), 'lane owns/releases its current-generation readers'
+        assert f.bundles['S1']['bundle']['model']['header']['state'] == 'done'
+    finally:
+        if f is not None:
+            f.stopped.set()
+            lane = getattr(f, '_decision_thread', None)
+            if lane:
+                lane.join(2)
+        _restore(api, core)
 
 
 def test_feed_role_is_stable_across_launches_and_tells_backends_apart():

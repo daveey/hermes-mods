@@ -93,8 +93,49 @@ def test_cheap_decision_inputs_match_outcome_normalization_without_board_reads(a
     monkeypatch.setattr(r, '_user_step_requests', canonical)
     assert r.decision_inputs('S1', ['S1']) == {'outcome_json': expected, 'requests': []}
     assert calls == [('S1', ['S1'], False)]
-    with pytest.raises(RuntimeError, match='stored session'):
-        r.decision_inputs('foreign', ['foreign'])
+    # A deleted recent chat is a known absent row, not an unavailable database.
+    # Keep canonical request lookup scoped to that exact session/lineage.
+    assert r.decision_inputs('foreign', ['foreign']) == {'outcome_json': {}, 'requests': []}
+    assert calls[-1] == ('foreign', ['foreign'], False)
+    r.release()
+
+
+def test_absent_recent_session_refreshes_without_poisoning_freshness(api, tmp_path, monkeypatch):
+    from test_feed import make
+    path = tmp_path / 'state.db'
+    with sqlite3.connect(path) as c:
+        c.execute('CREATE TABLE sessions(id TEXT, outcome_json TEXT)')
+    r = api.CoreReaders(state_db=path)
+    # Request authority is independent of whether the transcript row still exists.
+    requests = [{'id': 'exact-owner-request'}]
+    monkeypatch.setattr(r, '_user_step_requests', lambda session, lineage, **kw: requests)
+    assert r.decision_inputs('S1', ['S1'])['requests'] is requests
+    monkeypatch.setattr(r, '_user_step_requests', lambda *a, **kw: [])
+    f, readers, pushed, clock = make()
+    readers.panel_inputs = lambda *a: {'outcome_json': {'kind': 'done'}, 'requests': []}
+    f.changes(['S1'])
+    assert f.refresh_decisions(readers=r) == 1
+    assert not f._decision_failures and 'S1' in pushed[-1]['fresh']
+    assert f.bundles['S1']['bundle']['model']['header']['state'] == 'unknown'
+    r.release()
+
+
+def test_unavailable_decision_sources_raise_instead_of_vouching(api, tmp_path, monkeypatch):
+    path = tmp_path / 'state.db'
+    r = api.CoreReaders(state_db=path)
+    with pytest.raises(RuntimeError, match='session outcome unavailable'):
+        r.decision_inputs('S1', ['S1'])
+    with sqlite3.connect(path) as c:
+        c.execute('CREATE TABLE sessions(id TEXT, outcome_json TEXT)')
+    def broken(*args, **kwargs):
+        raise RuntimeError('canonical request store unreadable')
+    monkeypatch.setattr(r, '_user_step_requests', broken)
+    with pytest.raises(RuntimeError, match='canonical request store unreadable'):
+        r.decision_inputs('S1', ['S1'])
+    with sqlite3.connect(path) as c:
+        c.execute('DROP TABLE sessions')
+    with pytest.raises(sqlite3.Error):
+        r.decision_inputs('S1', ['S1'])
     r.release()
 
 

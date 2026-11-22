@@ -21,14 +21,19 @@ def load(name, path):
 
 
 @pytest.fixture
-def api():
+def api(monkeypatch):
     api = load('_spf_lanes_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
     fakes = load('_spf_lanes_fakes', HERE.parent / 'test_feed.py')
+    monkeypatch.setattr(api, 'CoreReaders', fakes.Readers)
     core = api._load_feed()
     core.PROCESS_FEED = core.Feed(fakes.Readers(), emit=lambda *_: None)
     try:
         yield api
     finally:
+        core.PROCESS_FEED.stopped.set()
+        lane = getattr(core.PROCESS_FEED, '_decision_thread', None)
+        if lane:
+            lane.join(2)
         core.PROCESS_FEED = None
 
 

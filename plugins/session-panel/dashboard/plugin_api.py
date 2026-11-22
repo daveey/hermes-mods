@@ -424,10 +424,10 @@ class CoreReaders:
         if c is None:
             raise RuntimeError('session outcome unavailable')
         row = c.execute('SELECT outcome_json FROM sessions WHERE id=?', (session,)).fetchone()
-        if row is None:
-            raise RuntimeError('stored session unavailable')
         try:
-            outcome = json.loads(row['outcome_json'] or '{}')
+            # A deleted chat may remain in Desktop's recent/watch list. A successful
+            # lookup with no row is known empty, unlike a failed/unavailable read.
+            outcome = json.loads(row['outcome_json'] or '{}') if row else {}
         except (TypeError, ValueError):
             outcome = {}
         return {'outcome_json': outcome if isinstance(outcome, dict) else {},
@@ -840,11 +840,15 @@ def feed():
                     _save_at_exit()
                 core.PROCESS_FEED = new
                 threading.Thread(target=_run, args=(core.PROCESS_FEED,), name='session-panel-feed', daemon=True).start()
-                threading.Thread(target=_run_decisions, args=(core.PROCESS_FEED,), name='session-panel-decisions', daemon=True).start()
+            # An older API's saved RESTART may already have resumed a current Feed
+            # with only its board thread. Ensure this lane for existing feeds too.
+            lane = getattr(core.PROCESS_FEED, '_decision_thread', None)
+            if lane is None or not lane.is_alive():
+                lane = threading.Thread(target=_run_decisions, args=(core.PROCESS_FEED,),
+                                        name='session-panel-decisions', daemon=True)
+                core.PROCESS_FEED._decision_thread = lane
+                lane.start()
             return core.PROCESS_FEED
-
-
-_load_feed().RESTART = feed  # plugin register() after a reload resumes the feed now, not at the next request
 
 
 def stop() -> None:
@@ -856,16 +860,19 @@ def stop() -> None:
 
 def _run_decisions(f) -> None:
     """A blocked board sweep must not delay a recorded decision's status line."""
+    # Own current-generation readers: the existing Feed may have been constructed
+    # through an older API whose readers do not implement the cheap decision path.
+    readers = CoreReaders()
     try:
         while not f.stopped.is_set():
             started = time.monotonic()
             try:
-                f.refresh_decisions()
+                f.refresh_decisions(readers=readers)
             except Exception:
                 log.warning('session-panel decision refresh failed', exc_info=True)
             f.stopped.wait(max(0.2, TICK_S - (time.monotonic() - started)))
     finally:
-        f.readers.release()
+        readers.release()
 
 
 def _run(f) -> None:
@@ -906,6 +913,11 @@ def _save_running() -> bool:
     """The exit hook: save the running feed's last state (never hanging the exit on a stuck push)."""
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     return f is not None and not f.stopped.is_set() and save_snapshot(f, timeout=EXIT_SAVE_TIMEOUT_S)
+
+
+# Loading changed feed bytes may immediately launch feed() on another thread;
+# register only after both lane targets and snapshot helpers are defined.
+_load_feed().RESTART = feed
 
 
 class ChangesBody(BaseModel):
