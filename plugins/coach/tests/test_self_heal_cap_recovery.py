@@ -71,7 +71,7 @@ def test_digest_unreadable_comments_after_memo_loss_fails_closed(env):
     assert "digest report unavailable" in out["error"]
     assert "digest report unavailable" in events(env.store, "selfheal_over_cap")[-1]["error"]
     assert path.read_text() == "not JSON" and env.board.calls == []
-    with sqlite3.connect(Path(env.store.root) / "selfheal_pending.sqlite") as db:
+    with sh.contextlib.closing(sqlite3.connect(Path(env.store.root) / "selfheal_pending.sqlite")) as db:
         assert db.execute("SELECT fp FROM pending").fetchall() == [(d["fingerprint"],)]
 
 

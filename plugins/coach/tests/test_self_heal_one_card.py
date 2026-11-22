@@ -514,7 +514,7 @@ def test_digest_io_failure_keeps_pending_and_reports_no_durability(env, monkeypa
     assert out["over_cap"] and out["digest_report"] is None and out["digest"] is None
     assert "digest report unavailable" in out["error"]
     assert events(env.store, "selfheal_over_cap")[-1]["error"] == out["error"]
-    with sqlite3.connect(Path(env.store.root) / "selfheal_pending.sqlite") as db:
+    with sh.contextlib.closing(sqlite3.connect(Path(env.store.root) / "selfheal_pending.sqlite")) as db:
         rows = db.execute("SELECT fp, retry FROM pending").fetchall()
     assert len(rows) == 1 and rows[0][0] == d["fingerprint"] and rows[0][1] >= NOW
     assert env.board.calls == [] and sh.cards_created_today(None, NOW) == 40
@@ -574,7 +574,7 @@ def test_atomic_report_replace_failure_preserves_previous_json_and_pending(env, 
     result = file(env, d)
     assert result["digest_report"] is None and "replace failure" in result["error"]
     assert (path.read_bytes(), path.with_suffix(".md").read_bytes()) == before
-    with sqlite3.connect(Path(env.store.root) / "selfheal_pending.sqlite") as db:
+    with sh.contextlib.closing(sqlite3.connect(Path(env.store.root) / "selfheal_pending.sqlite")) as db:
         assert {fp for fp, in db.execute("SELECT fp FROM pending")} == {
             defect(symptom="before disk failure")["fingerprint"], d["fingerprint"]}
     assert env.board.calls == [] and list(path.parent.glob(".digest-*")) == []
