@@ -48,6 +48,11 @@ Read the card's newest comments and runs, the linked PR/CI, and the actual state
 alive? file present? token valid? PR merged?). Many asks are already answered, already done, or about a process
 that no longer exists.
 
+A `⏸ … blocked` notice can be stale on arrival. It quotes its own event's reason and actor (an agent's CLI block
+can read `actor: user`) and can land after a later clear, including your own metadata-only clear, which sends you
+nothing. Compare the notice's reason with the card's newest `blocked` event and `human_request`. If a later event
+superseded it, nothing is left to clear or ask: leave one trail comment.
+
 Before writing an ask, look for one that already exists. A decision card the owner filed (named in the newest
 comments, or a blocked card whose evidence cites this card) is the ask: point at it and never file a second one,
 because two asks split David's answer. A live owner chat holds release: message it instead of asking David. Live
