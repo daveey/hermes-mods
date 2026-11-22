@@ -118,6 +118,11 @@ def _projection():
                 raise
         return sys.modules[name]
 
+_facts_spec = importlib.util.spec_from_file_location('_session_panel_fact_subscription', Path(__file__).with_name('fact_subscription.py'))
+_facts_module = importlib.util.module_from_spec(_facts_spec)
+_facts_spec.loader.exec_module(_facts_module)
+PanelSubscription = _facts_module.PanelSubscription
+
 
 def _hash(bundle: dict) -> str:
     body = {k: v for k, v in bundle.items() if k not in ('computed_at', 'computed_seq', 'canonical_seq')}
@@ -291,6 +296,8 @@ class Feed:
                 lane.service_wake.set()
         wanted = tuple(dict.fromkeys(sessions))[:MAX_REQUEST]
         self._registrations.put(wanted)
+        if getattr(self, '_facts_mode', False):
+            self._wake.set()  # interest renewal/demand is background-only
         current, rev, entries, header = self._wire
         reset = epoch != current
         if any(s not in entries for s in wanted):
@@ -724,18 +731,18 @@ class Feed:
         return self
 
     def _store(self, session: str, bundle: dict, *, canonical_only: bool = False, board_current: bool = False,
-               observation_only: bool = False, projection_module=None, reducer=None) -> bool:
+               observation_only: bool = False, projection_module=None, reducer=None, authoritative: bool = False) -> bool:
         """Keep `bundle`; True when it differs from what clients last got (it took a new revision)."""
         observation = (getattr(self, '_external_observations', None) or {}).get(session)
-        if observation and not board_current and bundle.get('computed_seq', 0) <= observation[0]:
+        if not authoritative and observation and not board_current and bundle.get('computed_seq', 0) <= observation[0]:
             bundle = self.readers.advance_external(bundle, observation[1])
             bundle = {**bundle, 'model': (reducer or _model().reduce_panel)(bundle, now=self.clock(), wire=True)}
         prev = self.bundles.get(session)
         if canonical_only and (not prev or prev['bundle']['lineage'] != bundle['lineage']):
             return False  # expired/re-watched or reparented while the cheap read was in flight
-        board_refresh = not observation_only and (board_current or not prev or bundle.get('computed_seq', 0) > prev['bundle'].get('computed_seq', 0))
+        board_refresh = not observation_only and (authoritative or board_current or not prev or bundle.get('computed_seq', 0) > prev['bundle'].get('computed_seq', 0))
         merged = canonical_only
-        if prev:
+        if prev and not authoritative:
             old = prev['bundle']
             if prev.get('board_admission') and (canonical_only or not board_current):
                 # Once opted in, an unversioned full/legacy result has NO board
@@ -787,7 +794,7 @@ class Feed:
 
     def _publish(self, computed: dict[str, dict], *, heartbeat: bool = False, canonical_only: bool = False,
                  age_only: bool = False, observations: Optional[dict] = None, watch_tokens=None,
-                 _projections=None, _snapshot_store=None, _results=None) -> dict[str, dict]:
+                 _projections=None, _snapshot_store=None, _results=None, authoritative: bool = False) -> dict[str, dict]:
         """Store what was computed and push one batch (or a heartbeat when nothing changed and one is due)."""
         # Resolve source-backed modules before borrowing the store publication
         # lock. Only immutable inputs and loaded pure helpers enter that borrow.
@@ -836,7 +843,7 @@ class Feed:
                         flight = self._flights.get(s)
                         if flight is not None and flight.bundle is b:
                             self._flights.pop(s)
-                    changed = {s: self.bundles[s]['bundle'] for s, b in computed.items() if s in self.interest and self._store(s, b, canonical_only=canonical_only)}
+                    changed = {s: self.bundles[s]['bundle'] for s, b in computed.items() if s in self.interest and self._store(s, b, canonical_only=canonical_only, authoritative=authoritative)}
                     for s, projection in (_projections or {}).items():
                         with _snapshot_store.publication(projection.admission) as current:
                             held_projection = (self.bundles.get(s) or {}).get('board_projection')
@@ -1292,10 +1299,12 @@ class Feed:
         if self._successor is not None:
             return self._current().changes(sessions, since=since, epoch=epoch)
         wanted = self.watch(sessions)
+        if getattr(self, '_facts_mode', False):
+            self._wake.set()
         reset = epoch != self.epoch
         with self.lock:
             missing = [s for s in wanted if s not in self.bundles]
-        if missing:
+        if missing and not getattr(self, '_facts_mode', False):
             try:
                 self._publish(self._compute_all(missing))
             finally:

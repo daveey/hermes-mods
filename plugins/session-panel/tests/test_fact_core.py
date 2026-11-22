@@ -1,0 +1,137 @@
+"""Execute the real shared FakeStore contract, not a panel-local store imitation."""
+import json
+from dataclasses import replace
+
+import pytest
+
+contract = pytest.importorskip('hermes_cli.fact_contract', reason='facts-v1 core integration')
+fakes = pytest.importorskip('hermes_cli.fact_fake', reason='facts-v1 core integration')
+from test_feed import feedmod, make
+from test_fact_subscription import bridge
+
+
+def test_shared_fake_parity_and_ring_recovery():
+    f, readers, pushed, clock = make()
+    bundle = f.compute('S1')
+    scope = contract.Scope('fixture-install', 'fixture-profile', None)
+    key = contract.FactKey(scope, 'ChatWaitingFact', 'S1')
+    store = fakes.FakeStore(ring_revisions=2, subscriber_envelopes=2)
+    fact = contract.Fact(key, {'panel': bundle}, observed_at=clock['now'], health='fresh')
+    store.publish([fact])
+    adapter = bridge.PanelSubscription(f, store, scope, store.key)
+    try:
+        f.changes_bytes(['S1'])
+        adapter.step()
+        store.drain()
+        adapter.step()
+        assert json.loads(f.changes_bytes(['S1']))['bundles']['S1'] == feedmod.wire_bundle(bundle)
+        held_epoch = f.epoch
+        pos = store.position(store.snapshot(scope).epoch, store.snapshot(scope).rev)
+        for n in range(8):
+            store.publish([replace(fact, value={'panel': {**bundle, 'tasks': [], 'computed_seq': n + 2}})])
+        assert store.changes(scope, pos).reset
+        store.drain()
+        adapter.step()
+        assert f.bundles['S1']['bundle']['tasks'] == []
+        assert f.epoch == held_epoch
+        store.publish([replace(fact, health='stale', error_code='source_failed')])
+        store.drain()
+        clock['now'] += f.heartbeat_s
+        adapter.step()
+        assert 'S1' in f.failures and pushed[-1]['fresh'] == []
+        store.publish([fact])
+        store.drain()
+        adapter.step()
+        assert f.failures == {}
+        assert f.bundles['S1']['bundle'] == bundle
+    finally:
+        adapter.close()
+
+
+def test_shared_fake_future_cursor_reset_and_atomic_catchup():
+    store = fakes.FakeStore()
+    scope = contract.Scope('fixture-install', 'fixture-profile', None)
+    f, _, _, _ = make()
+    bundle = f.compute('S1')
+    fact = contract.Fact(store.key(scope, 'ChatWaitingFact', 'S1'), {'panel': bundle}, health='fresh')
+    snapshot = store.snapshot(scope)
+    received = []
+    sub = store.subscribe(scope, ('ChatWaitingFact',), (fact.key,),
+                          store.position(snapshot.epoch, snapshot.rev + 100), received.append)
+    try:
+        store.publish([fact])  # publication between subscribe and callback drain
+        store.drain()
+        assert received and received[0].reset
+        assert any(any(x.key == fact.key for x in d.upserts) for d in received)
+    finally:
+        sub.close()
+
+
+def test_latch_stops_legacy_lanes_and_rollback_starts_once(monkeypatch):
+    import threading
+    import sys
+    from pathlib import Path
+    from types import SimpleNamespace as NS
+    from test_routes import load
+    from test_feed import Readers
+    # Isolate the process-wide singleton from other API-generation fixtures.
+    monkeypatch.delitem(sys.modules, '_session_panel_feed_core', raising=False)
+    monkeypatch.delitem(sys.modules, '_session_panel_feed_loader', raising=False)
+    api = load('_panel_facts_lifecycle_test', Path(__file__).resolve().parents[1] / 'dashboard/plugin_api.py')
+    core = api._load_feed()
+    monkeypatch.setattr(api, 'CoreReaders', Readers)
+    monkeypatch.setattr(api, 'save_snapshot', lambda *a, **k: True)
+    monkeypatch.setattr(api, 'load_snapshot', lambda *a, **k: None)
+    monkeypatch.setattr(api, '_emit', lambda *a: None)
+    starts, exits = [], []
+    events = {name: threading.Event() for name in ('feed', 'decisions', 'board')}
+    def lane(f, name):
+        starts.append(name)
+        events[name].set()
+        f.stopped.wait(5)
+        exits.append(name)
+    monkeypatch.setattr(api, '_run', lambda f: lane(f, 'feed'))
+    monkeypatch.setattr(api, '_run_decisions', lambda f: lane(f, 'decisions'))
+    monkeypatch.setattr(api, '_run_board', lambda f, cls: lane(f, 'board'))
+    store = fakes.FakeStore()
+    scope = contract.Scope('fixture-install', 'fixture-profile', None)
+    registrations = []
+    try:
+        original = api.feed()
+        for event in events.values():
+            assert event.wait(2)
+        epoch = original.epoch
+        registrations.append(api.install_facts(store, scope, NS(demand=lambda *a: None)))
+        with pytest.raises(RuntimeError, match='consumer set not ready'):
+            store.activate(scope)
+        for name in ('sessions', 'annotations', 'board', 'notifications'):
+            registrations.append(store.bind_consumer(name, scope, lambda *a: None))
+            store.report_ready(name, scope)
+        store.report_ready('panel', scope)
+        store.activate(scope)
+        active = core.PROCESS_FEED
+        assert sorted(exits) == ['board', 'decisions', 'feed']
+        assert active is not original and active.epoch == epoch
+        assert active._facts_mode and active.readers is None
+        store.activate(scope)
+        assert core.PROCESS_FEED is active
+        for event in events.values():
+            event.clear()
+        store.rollback(scope)
+        for event in events.values():
+            assert event.wait(2)
+        restored = core.PROCESS_FEED
+        assert restored is not active and restored.epoch == epoch
+        assert active._fact_subscription.closed
+        store.rollback(scope)
+        assert core.PROCESS_FEED is restored
+        assert sorted(starts) == ['board', 'board', 'decisions', 'decisions', 'feed', 'feed']
+    finally:
+        current = core.PROCESS_FEED
+        if current is not None:
+            api._quiesce(current, timeout=3)
+        core.PROCESS_FEED = None
+        for registration in registrations:
+            registration.close()
+        monkeypatch.delitem(sys.modules, '_session_panel_feed_core', raising=False)
+        monkeypatch.delitem(sys.modules, '_session_panel_feed_loader', raising=False)
