@@ -698,11 +698,14 @@ class Feed:
             return 0
         panel_dirty = self._panel_dirty(watched)
         stamps = self.readers.stamps()
+        external = getattr(self.readers, 'external_stamps', None)
+        external_seen = external() if callable(external) else None
+        external_changed = external_seen != getattr(self, '_external_stamps', None)
 
         with self.lock:
             retry = self._retry.intersection(watched)
             missing = any(s not in self.bundles for s in watched)
-        if stamps == self._stamps and not retry and not panel_dirty and not missing:
+        if stamps == self._stamps and not external_changed and not retry and not panel_dirty and not missing:
             self._publish({}, heartbeat=True)
             return 0
         # Board events are read only when a board file moved: state.db is written all
@@ -717,11 +720,15 @@ class Feed:
             changed_cards = {}
         self._board_stamps = seen
         self._stamps = stamps
+        self._external_stamps = external_seen
         touched = {v for v in changed_cards.values() if v}
         with self.lock:
             # Startup and writes without indexed task events (projection replacement,
             # board replacement) cannot be narrowed to a card: invalidate the held set.
-            dirty = set(watched) if initial or (unindexed_change and not changed_cards) else {
+            # Remote stores have no board event cursor and can add a first link to
+            # a previously empty chat. Until dependency indexing exists, refresh
+            # conservatively on their actual writes, never on a timer.
+            dirty = set(watched) if initial or external_changed or (unindexed_change and not changed_cards) else {
                 s for s in watched if s not in self.bundles}
             for s in watched:
                 b = self.bundles.get(s)

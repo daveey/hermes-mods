@@ -225,7 +225,7 @@ class CoreReaders:
                 except OSError:
                     out.append(None)
             return tuple(out)
-        return tuple(data_stamp(p) or stat(p) for p in self.files() + [self.state_db()])
+        return tuple(data_stamp(p) or stat(p) for p in self.files() + [self.state_db()]) + self.external_stamps()
 
     def _stamps_of(self, paths):
         from hermes_cli.session_list_flight import data_stamp
@@ -322,18 +322,21 @@ class CoreReaders:
         return scope
 
     def _session_tasks(self, ids, statuses):
+        # This runs on the producer, never HTTP. A stale display projection can
+        # finish asynchronously without a file write, leaving an event-only feed
+        # stuck forever on its old value. Wait for the strict core read instead.
         from hermes_cli import kanban_session_activity as ksa
         scope = self._batch_scope()
         if (scope is None or len(scope['lineages']) < 2 or len(scope['ids']) > 400
                 or not set(ids) <= set(scope['ids'])):
-            return ksa.session_tasks(ids, statuses, stale_ok=True)
+            return ksa.session_tasks(ids, statuses, stale_ok=False)
         from hermes_cli.kanban_session_outcome_tasks import select_listed_local_tasks
         from hermes_cli.kanban_session_activity_release import PENDING_RELEASE_STATUSES
         from hermes_cli.kanban_session_activity_card_details import annotate_remote_upstream
         from hermes_cli.kanban_execution_observations import add_cards
         out = []
         if scope.get('local_failed'):
-            return ksa.session_tasks(ids, statuses, stale_ok=True)
+            return ksa.session_tasks(ids, statuses, stale_ok=False)
         try:
             for path in ksa._board_db_paths():
                 key = (str(path), statuses)
@@ -350,7 +353,7 @@ class CoreReaders:
                 members = select_listed_local_tasks(c, ids, statuses)
                 # A writer may have changed membership after the union read; never omit a new card.
                 if not members.keys() <= rows.keys():
-                    return ksa.session_tasks(ids, statuses, stale_ok=True)
+                    return ksa.session_tasks(ids, statuses, stale_ok=False)
                 board = ksa._board_slug(path)
                 selected = []
                 for tid, member in members.items():
@@ -380,7 +383,7 @@ class CoreReaders:
             # Preserve stable per-lineage busy memos and per-session failure isolation on batch read failure.
             scope['local_failed'] = True
             log.debug('session-panel shared read unavailable; retrying lineage', exc_info=True)
-            return ksa.session_tasks(ids, statuses, stale_ok=True)
+            return ksa.session_tasks(ids, statuses, stale_ok=False)
 
     def _primary_absence(self, ksa, path, rows) -> bool:
         """True when every `_execution_error` in a union read is a PRIMARY mirror's ordinary answer, not a failed
@@ -414,16 +417,16 @@ class CoreReaders:
         from hermes_cli.profiles import get_active_profile_name
         if sync.sync_config().get('links_reader') != 'replica':
             if statuses not in scope['remote']:
-                scope['remote'][statuses] = ksa._remote_cards(scope['ids'], statuses, True)
+                scope['remote'][statuses] = ksa._remote_cards(scope['ids'], statuses, False)
             return scope['remote'][statuses]
         if statuses not in scope['remote']:
             # A ledger error must retain core's per-lineage empty/partial failure policy, not a union success.
             try:
                 gateway = self.ksc.load_identity().gateway
-                origin = ksa._remote_links(stale_ok=True)
+                origin = ksa._remote_links(stale_ok=False)
             except Exception:
-                return ksa._remote_cards(ids, statuses, True)
-            selected = links.replica_cards(scope['ids'], gateway, statuses, stale_ok=True, origin_cards=origin)
+                return ksa._remote_cards(ids, statuses, False)
+            selected = links.replica_cards(scope['ids'], gateway, statuses, stale_ok=False, origin_cards=origin)
             scope['remote'][statuses] = (selected, origin, gateway, get_active_profile_name())
         selected, origin, gateway, profile = scope['remote'][statuses]
         selected = [c for c in selected if c['session'] in ids]
@@ -480,7 +483,22 @@ class CoreReaders:
 
     def watch_paths(self) -> list[Path]:
         """Every file a bundle is computed from: a write to any of them is what makes a pass due."""
-        return self.files() + [self.state_db(), self.state_db().parent / 'user-steps' / 'actions.sqlite3']
+        return self.files() + [self.state_db(), self.state_db().parent / 'user-steps' / 'actions.sqlite3'] + self.external_paths()
+
+    def external_paths(self) -> list[Path]:
+        """Canonical remote inputs, including absent files so creation can wake us.
+
+        origin-work is the legacy snapshot; it is NOT the receipt ledger. Neither
+        ledger uses the board's task_events index. Keep their invalidation separate.
+        """
+        from hermes_constants import get_hermes_home
+        from hermes_cli.kanban_db import kanban_home
+        from hermes_cli.kanban_capability_registry import hub_db_path
+        return [hub_db_path(), get_hermes_home() / 'kanban' / 'origin-ledger.db',
+                kanban_home() / 'origin-work.db']
+
+    def external_stamps(self):
+        return tuple((str(p), self._stat(p)) for p in self.external_paths())
 
     def panel_files_stamp(self):
         """Moves with every committed write to either file `panel_stamps` reads (stat only, nothing opened)."""
@@ -562,7 +580,7 @@ class CoreReaders:
                 history = scope['history']
             else:
                 try:
-                    _, history = reader(stale_ok=True)
+                    _, history = reader(stale_ok=False)
                 except TypeError:
                     _, history = reader()
                 if scope is not None:
