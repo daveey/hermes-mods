@@ -403,6 +403,30 @@ test('2xx receipt repaints authoritative panel within 1s without polling', async
  delete window.hermesDesktop
  m.resetFeedForTests()
 })
+test('never-started admission refusal offers explicit same-key retry without unlocking choices', async () => {
+ const q = structuredClone(publicCases.own_letters.model.sections.needs_you[0]); q.request_revision += 51
+ const action = q.actions.find(a => a.kind === 'decide'); action.revision = q.request_revision
+ const request = { requestId: q.request_id, revision: q.request_revision, state: 'open', owner: action.owner,
+   scope: { complete: true, markdown: 'Frozen scope' }, choices: [{ id: q.options[0].choice_id, effect: 'answer', label: 'Pick' }] }
+ const posts = []
+ const call = async (path, opts) => {
+  if (path.endsWith('/decision-refresh')) return {}
+  if (path.endsWith('/decisions')) {
+   posts.push(opts.body)
+   if (posts.length === 1) throw Error('503: {"detail":"Decision not started: capacity busy"}')
+   return { operation: { operationId: 'retry-op', dispatchState: 'delivered', idempotencyKey: opts.body.idempotencyKey }, request: { ...request, resolution: { operationId: 'retry-op' } } }
+  }
+  return { request }
+ }
+ await m.chooseModelOption(q, q.options[0], current, { call })
+ assert.equal(m.modelDecisionStatus(q).retry, true)
+ await m.chooseModelOption(q, q.options[1], current, { call }); assert.equal(posts.length, 1)
+ await paint(m.renderModel({ ...publicCases.own_letters.model, sections: { ...publicCases.own_letters.model.sections, needs_you: [q] } }, { decisionStatus: m.modelDecisionStatus, onCheck: () => {} }))
+ assert.ok(document.body.textContent.includes('Retry decision'))
+ await m.checkModelDecision(q, { call })
+ assert.equal(posts.length, 2); assert.deepEqual(posts[1], posts[0])
+ assert.equal(m.modelDecisionStatus(q).text, 'Decision delivered.')
+})
 test('lost POST remains locked across alternate choices and check queries the retained key, never reposts', async () => {
  const q = structuredClone(publicCases.own_letters.model.sections.needs_you[0]); q.request_revision += 2
  q.actions.find(a => a.kind === 'decide').revision = q.request_revision
@@ -415,6 +439,20 @@ test('lost POST remains locked across alternate choices and check queries the re
  await m.chooseModelOption(q, q.options[0], current, { call }); await m.chooseModelOption(q, q.options[1], current, { call })
  assert.equal(posts.length, 1); assert.ok(m.modelDecisionStatus(q).locked)
  await m.checkModelDecision(q, { call }); assert.deepEqual(keys, [posts[0].idempotencyKey]); assert.equal(posts.length, 1)
+})
+test('generic 503 and a busy status GET never authorize a retry POST', async () => {
+ const q = structuredClone(publicCases.own_letters.model.sections.needs_you[0]); q.request_revision += 52
+ const action = q.actions.find(a => a.kind === 'decide'); action.revision = q.request_revision
+ let posts = 0
+ const call = async (path, opts) => {
+  if (opts.method === 'POST') { posts++; throw Error('503: delivery service unavailable') }
+  if (path.includes('/operations?')) throw Error('503: {"detail":"Decision not started: capacity busy"}')
+  return { request: { requestId: q.request_id, revision: q.request_revision, state: 'open', owner: action.owner, scope: { complete: true, markdown: 'scope' }, choices: [{ id: 'card-0', label: 'Pick', effect: 'answer' }] } }
+ }
+ await m.chooseModelOption(q, q.options[0], current, { call })
+ assert.equal(m.modelDecisionStatus(q).retry, false)
+ await m.checkModelDecision(q, { call }); await m.checkModelDecision(q, { call })
+ assert.equal(m.modelDecisionStatus(q).retry, false); assert.equal(posts, 1)
 })
 test('stale revision and foreign owner fail closed before POST', async () => {
  for (const invalid of ['revision', 'owner']) {

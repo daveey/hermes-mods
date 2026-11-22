@@ -44,6 +44,10 @@ def test_interactive_refresh_refuses_partial_inputs_and_recovers():
         f.refresh_decision('S1', readers=readers)
     assert f.rev == before
     assert 'S1' in f._decision_failures
+    assert f._decision_retry_at is not None
+    clock['now'] = f._decision_retry_at
+    f.beat()
+    assert f._decide.is_set()
     readers.decision_inputs = lambda *args: {'outcome_json': {}, 'requests': []}
     assert f.refresh_decision('S1', readers=readers)['bundle']['session'] == 'S1'
     assert 'S1' not in f._decision_failures

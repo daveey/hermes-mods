@@ -89,6 +89,23 @@ def load_module(name, path):
     return mod
 
 
+def test_cold_recovery_is_single_flight_not_four_occupied_decision_slots(setup, monkeypatch):
+    api, client = setup
+    monkeypatch.setattr(api, 'RETRY_INTERVAL_S', 0)
+    app = client().app
+    st = app.state.action_store
+    original = st.pending_owners
+    def slow():
+        time.sleep(1)
+        return original()
+    monkeypatch.setattr(st, 'pending_owners', slow)
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as c:
+            responses = await asyncio.gather(*(c.get('/requests/missing', params={'session': 'session-a'}) for _ in range(8)))
+            assert [r.status_code for r in responses] == [404] * 8
+    asyncio.run(exercise())
+
+
 def test_decision_lane_bounds_queue_and_keeps_cancelled_worker_capacity(setup):
     api, _ = setup
     async def exercise():
@@ -111,6 +128,7 @@ def test_decision_lane_bounds_queue_and_keeps_cancelled_worker_capacity(setup):
             with pytest.raises(HTTPException) as exc:
                 await api._on_decision(lambda: ran.append(True))
             assert exc.value.status_code == 503
+            assert exc.value.detail == 'Decision not started: capacity busy'
             assert ran == []
         finally:
             release.set()

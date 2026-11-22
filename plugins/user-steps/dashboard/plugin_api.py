@@ -54,7 +54,7 @@ async def _on_decision(fn, *args):
         async with asyncio.timeout(0.75):
             await gate.acquire()
     except TimeoutError:
-        raise HTTPException(503, 'Decision service busy; check status before retrying', headers={'Retry-After': '1'})
+        raise HTTPException(503, 'Decision not started: capacity busy', headers={'Retry-After': '1'})
     work = asyncio.create_task(anyio.to_thread.run_sync(functools.partial(fn, *args), limiter=runner))
     # Native task cancellation must not free capacity while a worker is still
     # delivering the frozen operation. Keep its context and slot until it exits.
@@ -276,6 +276,7 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
                   session_tasks=None, kanban_mirror=None):
     recovered = set()
     recovery_lock = threading.Lock()
+    recovery_tasks = weakref.WeakKeyDictionary()
 
     def recover_once():
         # The core hot-mount path includes routes AFTER app startup; router
@@ -300,7 +301,13 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         # A sync dependency would queue before the isolated endpoint can start.
         key = str(_load('core').home().resolve())
         if key not in recovered:
-            await _on_decision(recover_once)
+            # Every cold reader awaits the same recovery, not a separate worker
+            # blocked on recovery_lock (which used all decision capacity).
+            tasks = recovery_tasks.setdefault(asyncio.get_running_loop(), {})
+            task = tasks.get(key)
+            if task is None or task.done():
+                task = tasks[key] = asyncio.create_task(_on_decision(recover_once))
+            await asyncio.shield(task)
 
     router = APIRouter(lifespan=lifespan, dependencies=[Depends(ensure_recovered)])
 
