@@ -289,7 +289,7 @@ class CoreReaders:
         # canonical hub projections have no source='replica' tag. Only these
         # known producers define synced_at as an observation, not task evidence.
         return row.get('source') == 'replica' or (
-            row.get('remote') is True and row.get('via') == 'shepherd')
+            row.get('remote') is True and row.get('via') in ('shepherd', 'origin'))
 
     @staticmethod
     def external_semantic(captured):
@@ -314,7 +314,9 @@ class CoreReaders:
             # Selection adds source='origin-obligation' to canonical rows. It
             # does not change the observation producer; board replicas do.
             producer = 'replica' if row.get('source') == 'replica' else row.get('via')
-            return tuple(row.get(k) for k in ('gateway', 'profile', 'board', 'id', 'session')) + (producer,)
+            binding = tuple(row.get(k) for k in (
+                'origin_gateway', 'origin_profile', 'origin_session', 'binding_id')) if producer == 'origin' else ()
+            return tuple(row.get(k) for k in ('gateway', 'profile', 'board', 'id', 'session')) + (producer,) + binding
         rows = [json.loads(row) for row in captured]
         clocks = {identity(row): row['synced_at'] for row in rows
                   if CoreReaders._pull_observation(row) and 'synced_at' in row}
