@@ -526,3 +526,83 @@ def test_a_real_read_failure_still_counts_as_an_error(world, monkeypatch, error_
     if 'error_kinds' in (la.counters().get('chat-closeout.waiting_inputs') or {}):
         kind = error_type.__name__
         assert after['error_kinds'].get(kind, 0) - before['error_kinds'].get(kind, 0) == 1
+
+
+def _remote(**over):
+    return {'id': 't_r', 'key': 'owner/work/build/t_r', 'gateway': 'owner', 'profile': 'work', 'board': 'build',
+            'remote': True, 'via': 'origin', 'binding_id': 'b1', 'status': 'done', 'unfinished': False, 'stale': False, 'synced_at': 100.0, **over}
+
+
+def _nudge(world, at):
+    """Move one declared input (c3's transcript) so the next poll really runs a pass."""
+    with sqlite3.connect(world['state']) as conn:
+        conn.execute("INSERT INTO messages (session_id, role, content, timestamp, active) "
+                     "VALUES ('c3', 'user', 'hello', ?, 1)", (at,))
+
+
+def test_a_remote_cards_sync_stamp_alone_re_reconciles_nothing(world, monkeypatch):
+    """``synced_at`` follows every hub pull; settlement reads the ``stale`` verdict, never the stamp (hub,
+    2026-11-22: the stamp re-reconciled about 10 rows on every pass)."""
+    remote = _remote()
+    monkeypatch.setattr(plugin, 'remote_cards', lambda: [dict(remote)])
+    world['led'].write('other', batch=[remote['key']], open=[])
+    first = poll()
+    assert first == {'c1': ['t_1'], 'c2': ['t_2'], 'other': [remote['key']]}
+    reset(world['work'])
+    remote['synced_at'] = 250.0
+    _nudge(world, 200)
+    assert poll() == first  # the same answer
+    assert world['work']['reconcile_done'] == ['c3']  # the pass ran (a card read), and only c3's row moved
+    assert world['work']['read_cards'] > 0
+    reset(world['work'])
+    remote['stale'] = True  # a verdict settlement does read
+    _nudge(world, 201)
+    assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
+    assert sorted(world['work']['reconcile_done']) == ['c3', 'other']
+
+
+def test_an_unlink_observation_clock_re_reconciles_nothing_and_a_removal_does(world):
+    """The waker advances an observed entry's clocks on every healthy pass (``core.track_unlinked``); settlement
+    reads only the removed entries (``core.unlinked_removed``)."""
+    entry = {'at': 1.0, 'mono': 1.0, 'pid': 1, 'clocks': {}, 'observed': 5.0, 'since': 1.0, 'found': True}
+    world['led'].write('c1', unlinked={'owner/work/build/t_x': entry})
+    first = poll()
+    assert first == {'c1': ['t_1'], 'c2': ['t_2']}
+    key = plugin.waiting_inputs()
+    reset(world['work'])
+    world['led'].write('c1', unlinked={'owner/work/build/t_x': {**entry, 'at': 9.0, 'mono': 9.0, 'observed': 13.0}})
+    assert plugin.waiting_inputs() == key
+    assert poll() == first
+    assert world['work'] == {'reconcile_done': [], 'read_cards': 0}
+    _nudge(world, 200)  # a pass that does run still keeps c1's row
+    assert poll() == first
+    assert world['work']['reconcile_done'] == ['c3']
+    reset(world['work'])
+    world['led'].write('c1', unlinked={'owner/work/build/t_x': {'removed': 50.0, 'since': 1.0, 'found': True}})
+    assert plugin.waiting_inputs() != key
+    assert poll() == first
+    assert world['work']['reconcile_done'] == ['c1']
+
+
+def test_settlement_reads_nothing_the_waiting_row_key_leaves_out(world, monkeypatch):
+    """Parity: the answer computed from full rows and cards equals the one computed with the left-out stamps and
+    clocks changed, for every row at once (no cache)."""
+    remote = _remote()
+    monkeypatch.setattr(plugin, 'remote_cards', lambda: [dict(remote)])
+    entry = {'at': 1.0, 'mono': 1.0, 'pid': 1, 'clocks': {}, 'observed': 5.0, 'since': 1.0, 'found': True}
+    gone = {'removed': 50.0, 'since': 1.0, 'found': True}
+    world['led'].write('other', batch=[remote['key']], open=[], unlinked={'owner/work/build/t_x': entry})
+    world['led'].write('c2', unlinked={'owner/work/build/t_y': gone, 'owner/work/build/t_z': entry})
+
+    def full():
+        reader = plugin._pass_reader(light=True)
+        return core.pending_closeouts(world['led'], reader, proof=plugin.session_proof,
+                                      fields=core.SETTLE_ROW_FIELDS)
+
+    before = full()
+    remote['synced_at'] = 999.0
+    moved = {**entry, 'at': 9.0, 'mono': 9.0, 'pid': 2, 'clocks': {'2': {'at': 9.0}}, 'observed': 13.0}
+    world['led'].write('other', unlinked={'owner/work/build/t_x': moved})
+    world['led'].write('c2', unlinked={'owner/work/build/t_y': gone, 'owner/work/build/t_z': moved})
+    assert full() == before
+    assert before == {'c1': ['t_1'], 'c2': ['t_2'], 'other': [remote['key']]}

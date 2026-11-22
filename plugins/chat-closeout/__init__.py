@@ -1912,6 +1912,19 @@ def _host_row(row: dict) -> list:
     return sorted({**row, "unlinked": plain}.items())
 
 
+def _settle_fields(row: dict) -> list:
+    """The row fields settlement reads (``core.SETTLE_ROW_FIELDS``) as a key. Of ``unlinked`` it reads only the
+    removed entries (``core.unlinked_removed``): an entry still being observed carries clocks the waker advances on
+    every healthy pass (``core.track_unlinked``), and their motion alone settles nothing."""
+    out = []
+    for f in core.SETTLE_ROW_FIELDS:
+        v = row.get(f)
+        if f == "unlinked" and isinstance(v, dict):
+            v = {k: e for k, e in v.items() if isinstance(e, dict) and "removed" in e}
+        out.append([f, v])
+    return out
+
+
 def _input_parts(rows: list[dict], now: float, *, host: bool = False) -> dict[str, Any]:
     """Every input a waiting pass (``host``: a host wake pass) reads, as content keys; raises when one can't be
     read. Rows: the fields settlement reads (``core.SETTLE_ROW_FIELDS``, the only fields the waiting pass hands to
@@ -1949,7 +1962,7 @@ def _input_parts(rows: list[dict], now: float, *, host: bool = False) -> dict[st
         "v": [wi.VERSION, "host" if host else "waiting"],
         "scope": list(ksa._origin_scope()) if hasattr(ksa, "_origin_scope") else None,
         "ledger": str(ledger().path),
-        "rows": [[r["session_id"], _host_row(r) if host else [[f, r.get(f)] for f in core.SETTLE_ROW_FIELDS]]
+        "rows": [[r["session_id"], _host_row(r) if host else _settle_fields(r)]
                  for r in rows],
         "origin": _origin_digest(),
         "boards": boards,
@@ -2045,9 +2058,12 @@ def _own_inputs_hit(pop: bool) -> Optional[tuple]:
 
 def _waiting_row_key(lineages: Optional[dict[str, list]], floor: Any) -> Callable[[dict, Any], Optional[str]]:
     """A row's key carries the floor bucket too: a missed input is recomputed within ``FLOOR_S`` per row, not only
-    per pass."""
+    per pass. It leaves out what settlement never reads: a remote card's ``synced_at`` stamp (``wi.STAMP_FIELDS``)
+    and the observation clocks of unlink entries not yet removed (``_settle_fields``)."""
     def key(row: dict, cards: Any) -> Optional[str]:
-        return wi.row_key(row, cards, (lineages or {}).get(row["session_id"]), extra=floor)
+        settle = {f: v for f, v in _settle_fields(row)}
+        return wi.row_key({"session_id": row["session_id"], **settle}, cards,
+                          (lineages or {}).get(row["session_id"]), extra=floor, drop=wi.STAMP_FIELDS)
     return key
 
 
