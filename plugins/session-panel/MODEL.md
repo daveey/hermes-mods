@@ -118,30 +118,6 @@ it never repeats the decision. Older owners without a complete POST receipt use
 the existing exact-key receipt recovery. Native click-to-paint timing and transport
 contention must be measured separately from in-process saturation regression tests.
 
-## Source-event reconciliation ceiling
-
-The board feed reconciles source-admitted chats before publishing their changed
-inputs. Ceiling-only canonical work runs on one independent, event-woken worker,
-one chat at a time, oldest actual producer completion first. Wall time alone
-does not enqueue a sweep. A source event admits chats past the canonical safety
-ceiling; once admitted they finish even under continuous unrelated writes.
-
-Producer claims cover the watched chat and its compression lineage. A fresh
-event never waits on a ceiling claim: board publication proceeds independently,
-while canonical reconciliation for that owner remains owed until claim release.
-Claims survive hot handover; stopped/forgotten-generation completions cannot
-publish, settle source stamps or renew execution/canonical freshness. Completion
-wakes a new canonical read rather than publishing a worker-held snapshot.
-Each chat's thread-local reader connections are released after its call. Failed
-ceiling calls retry only a finite admitted backoff on the worker, then require
-another source event; they stay excluded from heartbeat freshness until recovery.
-
-Writes detected while a producer or compute is in flight remain owed even when
-a presentation stamp read consumes them. The independent worker isolates ceiling
-latency, not slow source-admitted computation, shared database locks or GIL cost.
-Synthetic loop tests at 40/400ms per chat and blocked-owner tests are scheduling
-proof, not the original live CPU/context-switch and under-one-second acceptance.
-
 ## Header fallback
 
 A validated published `outcome_json.status` remains authoritative, unchanged, with

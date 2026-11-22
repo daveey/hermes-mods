@@ -51,9 +51,8 @@ def reconcile_pass():
     """Owners reconciled inside one block (one feed producer pass, this thread) check each binding once.
 
     Every owner's pass also re-checks every OTHER owner's bindings of the namespace, so N owners re-checked
-    each binding N times: on the live hub (48 watched chats) that sweep was ~30% of the producer's py-spy
-    samples. A binding whose check failed is not recorded, so the next owner retries it, as before.
-    Nothing survives the block."""
+    each binding N times. A binding whose check failed is not recorded, so the next owner retries it,
+    as before. Nothing survives the block."""
     if getattr(_PASS, "done", None) is not None:
         yield
         return

@@ -1,8 +1,7 @@
 """One feed producer pass checks every other owner's binding once, not once per owner it reconciles.
 
 Every owner's reconcile also re-checks all OTHER owners' bindings of the namespace ("older owners may never
-reconcile again"), so a pass over N chats checked each binding N times. Live (hub serve, 48 watched chats) that
-sweep was ~30% of the producer's py-spy samples while the pass took 196 s."""
+reconcile again"), so a pass over N chats checked each binding N times."""
 import pytest
 
 from test_kanban_mirror import fixture, OWNER, core
@@ -79,3 +78,34 @@ def test_a_pass_still_withdraws_a_departed_ask_of_another_owner(tmp_path):
         mirror.reconcile(OTHER)
         mirror.reconcile(OTHER)
     assert store.requests(OWNER) == [], "the older owner's request was withdrawn by the other owner's sweep"
+
+
+def test_nested_pass_exception_cleanup_and_thread_isolation(tmp_path, monkeypatch):
+    import threading
+    mirror, store, path, hr = fixture(tmp_path)
+    mirror.reconcile(OWNER)
+    seen = counting(mirror, monkeypatch)
+    scope = type(mirror).reconcile.__globals__["reconcile_pass"]
+    with pytest.raises(RuntimeError, match="abort"):
+        with scope():
+            mirror.reconcile(OTHER)
+            with scope():
+                mirror.reconcile(OTHER)
+            assert len(seen) == 1
+            errors = []
+            def other_thread():
+                try:
+                    with scope():
+                        mirror.reconcile(OTHER)
+                except Exception as exc:
+                    errors.append(exc)
+            worker = threading.Thread(target=other_thread)
+            worker.start()
+            worker.join(5)
+            assert not worker.is_alive()
+            assert errors == []
+            assert len(seen) == 2, "another thread has an independent pass"
+            raise RuntimeError("abort")
+    with scope():
+        mirror.reconcile(OTHER)
+    assert len(seen) == 3, "exception exit must clear the prior pass"
