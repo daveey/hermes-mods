@@ -206,6 +206,17 @@ class Remote:
                 continue
             request = m.store.get(owner, binding['request_id'])
             snap = current.get(target)
+            # Custody survives display identity: an original generation can return
+            # while its answer is retiring. Observe it before the display shortcut.
+            oid = (request.get('resolution') or {}).get('operationId')
+            op = m.store.operation(owner, oid)['operation'] if oid else None
+            if op and (op.get('retired') or {}).get('evidence') == self.RETIRING:
+                if not self._retire(owner, oid, 'Source card ask changed before delivery'):
+                    held_targets.add(target)
+                    if snap is not None and snap['generation'] == frozen['generation']:
+                        self._display(owner, request['requestId'], display_current[target])
+                    continue
+                request = m.store.get(owner, binding['request_id'])
             if snap is not None and snap['generation'] == frozen['generation']:
                 self._display(owner, request['requestId'], display_current[target])
                 # The immutable projection/operation keeps its original bytes.

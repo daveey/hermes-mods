@@ -449,6 +449,8 @@ def route_model(row, detail):
 
 def decision_text(request, now):
     """One status line for an answered ask whose delivery has not been confirmed: `Done · delivers when this turn ends`."""
+    if obj(request.get('delivery')).get('state') == 'delivering':
+        return text(request['delivery'].get('text')) or 'Delivering…'
     resolution = obj(request.get('resolution'))
     choice = next((c for c in request.get('choices') or [] if isinstance(c, dict) and c.get('id') == resolution.get('choiceId')), {})
     label = clean(re.sub(r'\s*\(recommended\)\s*$', '', text(choice.get('label')), flags=re.I)) or 'Answered'
@@ -462,7 +464,8 @@ def decision_text(request, now):
 
 def recorded(request):
     """Answered but not yet delivered: the decision queue keeps the request open until delivery is confirmed."""
-    return bool(obj(request.get('resolution'))) and request.get('state') in ('open', 'needs_context')
+    return bool(obj(request.get('resolution'))) and (request.get('state') in ('open', 'needs_context')
+            or obj(request.get('delivery')).get('state') == 'delivering')
 
 
 RECORDED_STALE_S = 900
@@ -628,7 +631,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         owner = next((views[k] for k, row in rows_by_key.items() if k in views and any(_matches(row, a, same_gateway) for a in _aliases(r))), None)
         if owner is not None and 'decision' not in owner:
             owner['decision'] = info
-            if owner['detail'] == 'blocked · answered':
+            if owner['detail'] == 'blocked · answered' or obj(r.get('delivery')).get('state') == 'delivering':
                 owner['detail'] = ''
         elif owner is None:
             own = obj(r.get('owner'))

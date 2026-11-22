@@ -67,6 +67,27 @@ def test_canonical_header_never_rederived_from_rows():
     assert model.reduce_panel(bundle(), now=NOW)['header']['state'] == 'unknown'
 
 
+def test_remote_retiring_delivery_is_not_terminal_even_after_card_departure():
+    for departed in (False, True):
+        for note in ('Delivering…', 'Delivery to remote not confirmed (120 min)'):
+            r = request(state='cancelled')
+            r.update(resolution={'operationId': 'retiring', 'choiceId': 'card-0', 'revision': 3},
+                     delivery={'state': 'delivering', 'text': note})
+            b = bundle(*([] if departed else [task(human_request=human(), wait={'wait_state': 'human'})]), requests=[r])
+            result = model.reduce_panel(b, now=NOW)
+            assert result == model.reduce_panel(b, now=NOW)
+            rows = result['sections']['waiting']
+            assert len(rows) == 1 and rows[0]['decision']['text'] == note
+            assert rows[0]['detail'] == ''
+            assert not result['sections']['needs_you']
+            assert not any(a['kind'] == 'decide' for a in rows[0]['actions'])
+            assert 'request cancelled' not in json.dumps(result)
+            r.pop('delivery')  # terminal cancellation clears the pending decision line
+            settled = model.reduce_panel(b, now=NOW)
+            assert settled['revision'] != result['revision']
+            assert not any(row.get('decision') for row in settled['sections']['waiting'])
+
+
 def test_block_loop_triage_live_ask_but_no_block_kind_guessing():
     m = model.reduce_panel(bundle(task(status='triage', block_recurrences=4, human_request=human(), block_kind='needs_input')), now=NOW)
     assert len(m['sections']['needs_you']) == 1

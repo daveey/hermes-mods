@@ -113,7 +113,19 @@ test('a line row opens its own card by double-clicking the state square, with no
  assert.deepEqual(opened, [[row.id, row.id]])
 })
 
-for (const [name, fixture] of Object.entries(cases)) {
+for (const [name, fixture] of Object.entries(cases).filter(([name]) => name.startsWith('retiring_'))) {
+ test(`retiring delivery is one non-actionable line: ${name}`, async () => {
+  await paint(m.renderModel(fixture.model))
+  const rows = document.querySelectorAll('[data-panel-row]')
+  assert.equal(rows.length, 1)
+  assert.match(rows[0].textContent, /Delivering…|Delivery to remote not confirmed \(120 min\)/)
+  assert.doesNotMatch(rows[0].textContent, /request cancelled|delivers when this turn ends/i)
+  assert.equal(rows[0].querySelectorAll('[data-decision-option]').length, 0)
+  assert.equal(fixture.model.sections.needs_you.length, 0)
+ })
+}
+
+for (const [name, fixture] of Object.entries(cases).filter(([name]) => !name.startsWith('retiring_'))) {
  test(`hub model golden: ${name}`, async () => {
   const model = fixture.model || fixture.expected
   assert.ok(model, 'golden contains the P1 output model')

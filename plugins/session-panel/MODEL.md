@@ -22,6 +22,15 @@ Failed fast reads are retried on the next pass and excluded from heartbeat `fres
 `/status.decision_failures` exposes the affected sessions. Real delivery failures and
 unknown operations retain user-steps Check status/Retry recovery.
 
+Remote card-answer retirement is nonterminal delivery custody, even though its stored
+request is `cancelled` to refuse new proofs. The user-steps presenter supplies
+`delivery={state: "delivering", text, ageSeconds, unconfirmed}`. The reducer uses
+that text as the row's single `decision` status line (no choices or Retry), retaining
+a standalone Waiting row if the card departed. It never labels this state request
+cancelled. The standalone and hub-companion decision queues keep reading the exact
+operation until a delivered receipt or terminal retirement clears custody; the panel
+owns the line when mounted, rather than drawing it twice.
+
 The API idempotently ensures the canonical lane even if a previous API generation
 already resumed the current Feed. That lane owns current-generation readers rather
 than borrowing obsolete readers from the board lane. A successfully queried missing

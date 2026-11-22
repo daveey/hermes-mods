@@ -1028,8 +1028,9 @@ export function DecisionRow({ request, route, call = api, unavailable = false, c
     const status = operationState(data.operation)
     if (['delivered','cancelled'].includes(status) && data.request.resolution?.operationId !== operationId(data.operation)) throw Error('Delivery not yet confirmed by request readback')
     if (status === 'cancelled' && data.request.state !== 'cancelled') throw Error('Cancellation not yet confirmed by request readback')
-    update({ request: data.request, operation: data.operation, phase: status === 'delivered' ? 'confirmed' : status, error: status === 'failed' ? failedText(data.operation) : '' })
-    if (['delivered','cancelled'].includes(status)) { try { window.localStorage.removeItem(INTENT_PREFIX + key) } catch {} }
+    const retiring = remoteRetiring(data.request, data.operation)
+    update({ request: data.request, operation: data.operation, phase: retiring ? 'retiring' : status === 'delivered' ? 'confirmed' : status, error: status === 'failed' ? failedText(data.operation) : '' })
+    if (status === 'delivered' || (status === 'cancelled' && !retiring)) { try { window.localStorage.removeItem(INTENT_PREFIX + key) } catch {} }
     saveReadback(route, data.request)
     if (status === 'delivered') void readReceipts(operationId(data.operation))
   }
@@ -1050,7 +1051,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false, c
   useEffect(() => { if ((r.resolution?.operationId || (state.phase === 'unknown' && state.decision)) && (!state.operation || state.phase === 'checking')) void check() }, [r.resolution?.operationId, state.decision?.idempotencyKey])
   useEffect(() => {
     const poll = () => {
-      if (['pending','failed','unknown'].includes(state.phase)) void check()
+      if (['pending','failed','unknown','retiring'].includes(state.phase)) void check()
       else if (state.phase === 'confirmed' && operationId(state.operation) && !['applied','not_applied'].includes(ownerPhase(state.consumer))) void readReceipts(operationId(state.operation))
     }
     readbacks.add(poll); return () => readbacks.delete(poll)
@@ -1203,6 +1204,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false, c
   const exclusionsView = !!r.exclusions?.length && jsxs('div', { style: planStyle, children: [jsx('strong', { children: 'Not included' }), jsx('ul', { style: { margin: '4px 0', paddingLeft: 20 }, children: r.exclusions.map((text,i) => jsx('li', { children: text }, i)) })] })
   const fold = (label, children) => jsxs('details', { 'data-action-fold': '', children: [jsx('summary', { style: { cursor: 'pointer', fontSize: 12, color: 'var(--muted-foreground)', minHeight: 28, display: 'flex', alignItems: 'center' }, children: label }), ...children] })
   // Nothing for this plugin to draw under the panel: the panel already shows the ask and posts its plain options.
+  if (remoteRetiring(r, state.operation)) return jsx('div', { 'data-remote-retiring': '', role: 'status', children: r.delivery?.text || 'Delivering…' })
   if (companion && !locked && state.phase === 'idle' && !own.length && !approvalPending && !canWithdraw && !editing && !state.error && !dismissal.note && !dismissal.error) return null
   return jsxs('article', { ref: article, 'data-action-request': requestKey(r), 'data-decision-audience': agentPending(r) ? 'agent' : 'human', tabIndex: -1, 'aria-label': r.title, style: { ...rowStyle, minWidth: 0 }, children: [
     !companion && jsxs('div', { 'data-action-meta': '', style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 6, rowGap: 2, fontSize: 11, color: 'var(--muted-foreground)', marginTop: 4 }, children: [
@@ -1276,9 +1278,15 @@ function writeMinimized(keys) {
   try { if (keys.length) window.localStorage.setItem(MINIMIZED_KEY, JSON.stringify(keys.slice(-200))); else window.localStorage.removeItem(MINIMIZED_KEY) } catch {}
 }
 /** A recorded decision whose delivery is failed/pending/unconfirmed stays on screen (with Retry) until confirmed. */
+function remoteRetiring(r, op) {
+  // A newer exact operation readback supersedes cached presentation metadata.
+  if (op && ['delivered','cancelled'].includes(operationState(op))) return operationState(op) === 'cancelled' && op.retired?.evidence === 'remote-retiring'
+  return !!r.resolution && (r.delivery?.state === 'delivering' || (operationState(op) === 'cancelled' && op?.retired?.evidence === 'remote-retiring'))
+}
 function requestNeedsReadback(scope, r) {
   if (r.state === 'withdrawn' && !r.resolution) return false // nothing can be pending on a withdrawn revision
   const key = `${scope}:${requestKey(r)}`, op = operations.get(key)
+  if (remoteRetiring(r, op?.operation)) return true // proof refusal is not terminal delivery evidence
   if (['confirmed','cancelled'].includes(op?.phase) && op.request?.revision === r.revision && operationId(op.operation) === r.resolution?.operationId) return false
   // Terminal backend state is durable delivery confirmation: an old answered ask is neither pending nor shown.
   // Local in-flight decisions and recovery intents still get their readback.
