@@ -25,7 +25,7 @@ Route quickly, recover stalled work, and verify closeout in the originating sess
 | **Existing work** | A card or session already owns it | Comment on the card (`kanban_comment`) or resume that session with the message; reply with the id. A comment only subscribes this chat to notices, which don't count toward its outcome, so it paints green while the work is open: bind it with `hermes kanban --board <b> notify-subscribe <task> --platform tui --chat-id <this session>` (`kanban_origin_adopt` is for cross-gateway courier adoption only) and read back `outcome` = `waiting` on that card |
 | **New work** | Anything bigger or long-running | `kanban_create` a card with acceptance criteria (never `hermes kanban create` from a shell, so it links to this chat); reply with the card id at once |
 
-Never wait on a worker inside a turn and never predict its result.
+Never wait on a worker inside a turn and never predict its result. For a user-requested separate chat that preserves stopped work without restarting it, follow [Preservation handoff](references/preservation-handoff.md).
 
 ## What to read on each sweep
 
@@ -262,8 +262,4 @@ when nothing did.
 
 ## Reply style
 
-Lead with any verified user action: who must do what, where, and what it unblocks, with the task link
-and supported interaction ready. Translate internal handoff names into the actual action; “initiate
-HANDOFF” or a truncated block reason makes the user reconstruct the procedure from logs. If no user
-action remains, say what is executing next and distinguish recovery from completed delivery. Then give
-verified results briefly; do not replay the process.
+When David asks what a session is doing, start with his original request and whether it was delivered. Separate that request from any broader project it became attached to; explain what the current choice actually affects before relaying it. Repeated allocation/status notices can obscure that distinction. Recommend a concrete next step in plain language, not internal handoff names or card IDs. For ordinary action asks, name who does what, where, and what follows. Distinguish recovery, preserved work and shipped results; omit the coordination replay.
