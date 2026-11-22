@@ -49,6 +49,23 @@ def test_missing_malformed_or_unsupported_protocol_is_unknown_never_legacy_done(
         assert header['status'] is None
 
 
+def test_integer_valued_json_numbers_match_desktop_wire_validation():
+    for key, value in (('status_version', 1.0), ('revision', 9.0), ('generation', 3.0)):
+        wire = outcome()
+        wire['status'][key] = value
+        header = reduce(json.loads(json.dumps(wire)))['header']
+        assert header['state'] == 'done', key
+        assert header['status'] == wire['status'], key
+
+
+def test_invalid_json_numbers_never_publish_done():
+    for key in ('status_version', 'revision', 'generation'):
+        for value in (True, False, '1', -1, 1.5, float('inf'), float('nan'), 9007199254740992):
+            wire = outcome()
+            wire['status'][key] = value
+            assert reduce(wire)['header']['status'] is None, (key, value)
+
+
 def test_status_revision_changes_panel_revision_without_touching_counts_or_actions():
     first, second = reduce(outcome(revision=9)), reduce(outcome(revision=10))
     assert first['revision'] != second['revision']

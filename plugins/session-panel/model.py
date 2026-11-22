@@ -39,11 +39,14 @@ def obj(value):
 def published_status(outcome):
     """Validate the backend wire envelope; never derive a replacement from rows or legacy kind."""
     status = outcome.get('status')
-    if not isinstance(status, dict) or type(status.get('status_version')) is not int or status['status_version'] != 1:
+    def wire_integer(value):
+        # JSON has one number type: match Number.isSafeInteger after parsing in Desktop.
+        return type(value) in (int, float) and 0 <= value <= 9007199254740991 and value == int(value)
+
+    if not isinstance(status, dict) or not wire_integer(status.get('status_version')) or status['status_version'] != 1:
         return None
     for key in ('revision', 'generation'):
-        value = status.get(key)
-        if type(value) is not int or not 0 <= value <= 9007199254740991:
+        if not wire_integer(status.get(key)):
             return None
     if not all(isinstance(status.get(k), dict) for k in ('identity', 'coverage', 'presentation')):
         return None
