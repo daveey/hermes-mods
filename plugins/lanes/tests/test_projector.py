@@ -245,6 +245,13 @@ def test_slow_compat_projection_does_not_block_heartbeat_or_disconnect(monkeypat
     import threading
     from test_view import load
     api = load()
+    # Exercise the early-heartbeat schedule even on an otherwise idle host,
+    # without bypassing the real identity fence.
+    matches = api._identity.matches
+    def slow_identity(*args):
+        time.sleep(.08)
+        return matches(*args)
+    monkeypatch.setattr(api._identity, 'matches', slow_identity)
     gate = threading.Event()
     began = threading.Event()
     monkeypatch.setattr(api, '_ws_upgrade_authorized', lambda ws: True)
@@ -253,7 +260,7 @@ def test_slow_compat_projection_does_not_block_heartbeat_or_disconnect(monkeypat
     monkeypatch.setattr(api, 'HEARTBEAT_S', .03)
     def hung(*args):
         began.set()
-        gate.wait(5)
+        assert gate.wait(30), 'test did not release the projection'
         return {'configured': False}
     monkeypatch.setattr(api, 'lane_view', hung)
     class Socket:
@@ -262,20 +269,28 @@ def test_slow_compat_projection_does_not_block_heartbeat_or_disconnect(monkeypat
         async def accept(self):
             pass
         async def send_json(self, value):
-            if value.get('type') == 'heartbeat':
+            # An early heartbeat can precede worker startup under load. Only
+            # a heartbeat DURING the blocked projection proves independence.
+            if value.get('type') == 'heartbeat' and began.is_set():
+                assert not gate.is_set()
                 self.heartbeat.set()
         async def receive(self):
             await self.heartbeat.wait()
             return {'type': 'websocket.disconnect'}
     async def probe():
-        start = time.monotonic()
         try:
-            await asyncio.wait_for(api.stream_lanes(Socket()), .5)
+            # Real watchdog, shorter than the held worker's safety timeout.
+            await asyncio.wait_for(api.stream_lanes(Socket()), 5)
             assert began.is_set()
-            assert time.monotonic() - start < .5
+            assert not gate.is_set()
             assert api._compat_fallback.active is not None
+            assert not api._compat_fallback.active[1].done()
+            assert api._active_streams == 0
         finally:
+            active = api._compat_fallback.active
             gate.set()
+            if active is not None:
+                await asyncio.wait_for(asyncio.wrap_future(active[1]), 5)
     asyncio.run(probe())
 
 

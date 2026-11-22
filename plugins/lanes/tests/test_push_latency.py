@@ -41,25 +41,84 @@ def test_first_dirty_tick_after_quiet_projects_without_a_fixed_wait(monkeypatch)
 
 
 def test_changes_during_a_slow_projection_coalesce_into_one_gapped_follow_up(monkeypatch):
+    import asyncio
+    import contextlib
+    from types import SimpleNamespace
+
     api = load()
-    state = {'status': 'a', 'cursor': 0}
+    state = {'status': 'a', 'cursor': 0, 'clock': 100.}
     calls = []
-    with TestClient(stream_app(api, monkeypatch, state, compute_s=.4, calls=calls)) as client:
-        with client.websocket_connect('/v1/lanes/stream?debug=true') as ws:
-            assert ws.receive_json()['view']['status'] == 'a'
-            state.update(status='b', cursor=1)
-            time.sleep(.15)
+    began = threading.Event()
+    release = threading.Event()
+    monkeypatch.setattr(api, '_ws_upgrade_authorized', lambda ws: True)
+    monkeypatch.setattr(api, 'WATCH_S', .01)
+    monkeypatch.setattr(api, 'MIN_PROJECT_GAP_S', .1)
+    # Freeze ONLY the engine's scheduling clock, not asyncio's real watchdog.
+    # Identity hashing and thread scheduling are not projection compute time.
+    monkeypatch.setattr(api._stream_engine, 'time', SimpleNamespace(
+        monotonic=lambda: state['clock'], time=time.time))
+
+    def view(*args):
+        seen = state['status']
+        calls.append(seen)
+        if seen == 'b':
+            began.set()
+            assert release.wait(30), 'test did not release the projection'
+        return {'status': seen}
+    monkeypatch.setattr(api, 'lane_view', view)
+
+    async def probe():
+        frames = asyncio.Queue()
+        observed = asyncio.Queue()
+        def cursor():
+            return state['cursor']
+        monkeypatch.setattr(api, 'change_cursor', cursor)
+        refresh = api._refresh_cursor
+        def refreshed(value):
+            refresh(value)
+            observed.put_nowait(value)  # engine has consumed this revision
+        monkeypatch.setattr(api, '_refresh_cursor', refreshed)
+        class Socket:
+            query_params = {'debug': 'true'}
+            async def accept(self):
+                pass
+            async def send_json(self, value):
+                await frames.put(value)
+            async def receive(self):
+                await asyncio.Future()
+        stream = asyncio.create_task(api.stream_lanes(Socket()))
+        try:
+            assert (await frames.get())['view']['status'] == 'a'
+            assert await observed.get() == 0
+            state.update(status='b', cursor=1, clock=101.)
+            assert await asyncio.to_thread(began.wait, 5)
+            assert await observed.get() == 1
+            # Each revision is observed WHILE b remains held, so no sleep is
+            # used as evidence that the receiver saw the final watermark.
             for step in range(2, 7):
-                state.update(status=f's{step}', cursor=step)
-                time.sleep(.02)
-            first = ws.receive_json()
-            second = ws.receive_json()
+                state.update(status=f's{step}', cursor=step, clock=101. + step)
+                assert await observed.get() == step
+                assert calls == ['a', 'b']
+            release.set()
+            first, second = await frames.get(), await frames.get()
+            assert first['view']['status'] == 'b'
             assert second['view']['status'] == 's6'
-            assert len(calls) == 3, calls
-            gap = second['timing']['project_start'] - first['timing']['project_start']
-            # Compute exceeds the gap: follow-up starts when the active job ends,
-            # not another whole gap after that end.
-            assert .4 <= gap < .49, gap
+            assert calls == ['a', 'b', 's6']
+            # Clock stays at 107 after completion. Start-to-start is eligible;
+            # a completion-to-start cooldown can never deliver this frame.
+            assert state['clock'] == 107.
+            assert first['timing']['project_end'] <= second['timing']['project_start']
+        finally:
+            active = api._compat_fallback.active
+            release.set()
+            stream.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stream
+            if active is not None:
+                await asyncio.wait_for(asyncio.wrap_future(active[1]), 5)
+    async def bounded():
+        await asyncio.wait_for(probe(), 10)
+    asyncio.run(bounded())
 
 
 def test_continuous_churn_bounds_projection_duty_and_preserves_latest(monkeypatch):
