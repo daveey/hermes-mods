@@ -243,6 +243,8 @@ class Remote:
                 m._publish(owner, board, snap, request)
                 self._display(owner, request['requestId'], display_current[target])
 
+        return not unknown
+
     def _display(self, owner, rid, snap):
         with self.mirror.store._tx() as c:
             c.execute('INSERT INTO kanban_projection_display VALUES (?,?,?) '

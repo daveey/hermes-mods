@@ -33,11 +33,14 @@ class Reader:
             c.close()
 
 
-def test_feed_reconciles_before_opening_request_reader(tmp_path, monkeypatch):
+def test_presentation_reads_canonical_requests_without_reconciling(tmp_path, monkeypatch):
     events = []
     class FeedReader(Reader):
         def reconcile_user_steps(self, session, lineage):
-            events.append(('reconcile', session, tuple(lineage)))
+            raise AssertionError('presentation must not invoke the source producer')
+
+        def user_step_requests(self, session, lineage):
+            events.append(('read-only', session, tuple(lineage)))
             return [{'requestId': 'canonical-new', 'state': 'open'}]
 
         def conn(self, path):
@@ -49,7 +52,7 @@ def test_feed_reconciles_before_opening_request_reader(tmp_path, monkeypatch):
     try:
         result = inputs.read(reader, 'chat', ['parent', 'chat'])
         assert result['requests'] == [{'requestId': 'canonical-new', 'state': 'open'}]
-        assert events[0] == ('reconcile', 'chat', ('parent', 'chat'))
+        assert events == [('read-only', 'chat', ('parent', 'chat'))]
     finally:
         reader.close()
 

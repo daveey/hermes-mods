@@ -8,7 +8,9 @@ from test_kanban_mirror import OWNER, decide, fixture
 from test_withdrawal import ROOT, load_module
 
 
-def test_panel_read_produces_canonical_request_without_legacy_poll(tmp_path, monkeypatch):
+@pytest.mark.parametrize('source_phase', [False, True])
+def test_panel_read_produces_canonical_request_without_legacy_poll(tmp_path, monkeypatch, source_phase):
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
     mirror, store, path, _ = fixture(tmp_path)
     api = load_module('triage_panel_api', ROOT / 'dashboard' / 'plugin_api.py')
     with sqlite3.connect(tmp_path / 'state.db') as c:
@@ -25,7 +27,10 @@ def test_panel_read_produces_canonical_request_without_legacy_poll(tmp_path, mon
     # presentation and decision delivery all use the real producer/store.
     store_type = core.ActionStore
     monkeypatch.setattr(core, 'ActionStore', lambda **kwargs: store_type(store.path, **kwargs))
-    requests = api.panel_requests(tmp_path, OWNER['storedSessionId'], [OWNER['storedSessionId']])
+    if source_phase:
+        api.panel_reconcile(tmp_path, OWNER['storedSessionId'], [OWNER['storedSessionId']])
+    requests = api.panel_requests(tmp_path, OWNER['storedSessionId'], [OWNER['storedSessionId']],
+                                  reconcile=not source_phase)
     assert len(requests) == 1
     assert requests[0]['presentation']['kind'] == 'kanban-question'
     operation = decide(store, requests[0])
