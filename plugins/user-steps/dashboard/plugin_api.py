@@ -166,6 +166,20 @@ def panel_owners(home: Path, session: str, lineage) -> list:
     return owners
 
 
+def panel_reconcile(home: Path, session: str, lineage) -> None:
+    """Source-event producer, separate from read-only panel presentation."""
+    core = _load('core')
+    try:
+        owners = panel_owners(home, session, lineage)
+    except core.ActionError as exc:
+        if exc.status != 404:
+            raise
+        return  # queried absent own session, not failed source or failed reconciliation
+    producer = _load('kanban_mirror').Mirror(core, core.ActionStore())
+    for own in owners:
+        producer.reconcile(own, strict=True)
+
+
 def panel_requests(home: Path, session: str, lineage, *, reconcile=True) -> list:
     """Reconcile the canonical producer before the feed renders; no legacy GET needed.
 

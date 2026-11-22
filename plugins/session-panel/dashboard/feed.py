@@ -145,6 +145,7 @@ class Feed:
         self._seq = itertools.count(1)       # compute order: a bundle computed earlier never replaces a later one
         self._stamps: Any = None
         self._panel_stamps: dict[str, Any] = {}
+        self._reconcile_stamps: dict[str, Any] = {}
         self._panel_files: Any = None        # the files behind _panel_stamps, as last read
         self._decision_files: Any = None     # the same for the decision lane's last complete pass
         self._cursor: Any = None
@@ -291,6 +292,7 @@ class Feed:
         self._decision_seen.pop(s, None)
         self.interest.pop(s, None)
         self._panel_stamps.pop(s, None)
+        self._reconcile_stamps.pop(s, None)
         (getattr(self, '_external_observations', None) or {}).pop(s, None)
         (getattr(self, '_external_captures', None) or {}).pop(s, None)
         self.bundles.pop(s, None)
@@ -725,7 +727,7 @@ class Feed:
         """Settle a source pass atomically, with finite recovery of unread changes."""
         import copy
         names = ('_panel_stamps', '_panel_files', '_stamps', '_board_stamps',
-                 '_external_stamps', '_external_captures', '_external_observations', '_cursor')
+                 '_external_stamps', '_external_captures', '_external_observations', '_cursor', '_reconcile_stamps')
         saved = {name: copy.deepcopy(getattr(self, name, None)) for name in names}
         self._admission_retry_at = None
         try:
@@ -765,6 +767,23 @@ class Feed:
             self._publish_wire()
         if not watched:
             return 0
+        reconcile = getattr(self.readers, 'reconcile_sources', None)
+        source_stamp = getattr(self.readers, 'reconciliation_stamp', None)
+        reconcile_enabled = callable(reconcile) and callable(source_stamp)
+        # Captured BEFORE producer writes. Its own action-store commit is not
+        # a source event; a concurrent real source write remains eligible.
+        source_seen = source_stamp() if callable(source_stamp) else None
+        # Producer admission is independent of presentation invalidation: a
+        # compression/membership change can move no current outcome/request row.
+        # Until canonical per-session source capture exists this producer phase
+        # remains conservative; unchanged presentation is still never hydrated.
+        if reconcile_enabled and callable(reconcile):
+            admitted = [s for s in watched if s not in self._reconcile_stamps
+                        or self._reconcile_stamps[s] != source_seen]
+            if admitted:
+                reconcile(admitted)
+                with self.lock:
+                    self._reconcile_stamps.update((s, source_seen) for s in admitted if s in self.interest)
         panel_dirty = self._panel_dirty(watched)
         stamps = self.readers.stamps()
         external = getattr(self.readers, 'external_stamps', None)
@@ -845,6 +864,7 @@ class Feed:
                 dirty.update(watched)
         dirty.update(retry)
         dirty.update(panel_dirty)
+
         if not dirty:
             return len(self._publish({}, heartbeat=True))
         started = time.monotonic()

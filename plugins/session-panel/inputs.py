@@ -1,5 +1,5 @@
-"""Adapters for the panel reducer's extra inputs. The feed reconciles canonical
-asks before rendering; no decisions or cloud lifecycle operations run here.
+"""Read-only adapters for the panel reducer's extra inputs. Canonical ask
+reconciliation belongs to source admission, not presentation reads.
 """
 from __future__ import annotations
 
@@ -41,13 +41,13 @@ def read(reader, session, lineage):
     # Like the fast lane, a successfully queried absent own row has no
     # request authority. Do not resurrect surviving store rows for deleted chats.
     canonical = [] if known_absent else None
-    if not known_absent and hasattr(reader, 'reconcile_user_steps'):
+    if not known_absent and hasattr(reader, 'user_step_requests'):
         try:
-            canonical = reader.reconcile_user_steps(session, lineage)
+            canonical = reader.user_step_requests(session, lineage)
         except Exception:
-            out['input_errors'].append('user-steps reconciliation unavailable')
-            log.debug('panel canonical reconciliation unavailable', exc_info=True)
-    store = reader.conn(home / 'user-steps' / 'actions.sqlite3')
+            out['input_errors'].append('user-steps requests unavailable')
+            log.debug('panel canonical requests unavailable', exc_info=True)
+    store = reader.conn(home / 'user-steps' / 'actions.sqlite3') if canonical is None else None
     out['profile'] = profile
     try:
         out['gateway'] = reader.ksc.load_identity().gateway

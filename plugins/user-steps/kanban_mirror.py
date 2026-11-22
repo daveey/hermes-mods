@@ -701,11 +701,15 @@ class Mirror:
                 return False
         return True
 
-    def reconcile(self, owner):
+    def reconcile(self, owner, *, strict=False):
         self.core.validate_owner(owner)
         try:
-            self.remote.reconcile(owner)
+            remote_clean = self.remote.reconcile(owner)
+            if strict and remote_clean is False:
+                raise RuntimeError('Remote card reconciliation deferred')
         except Exception as exc:  # optional remote projection must not suppress local cards
+            if strict:
+                raise
             logging.getLogger('user-steps').warning('Remote card reconciliation unavailable: %s', exc)
         with _accounted_pass("user_steps.mirror_reconcile") as acct:
             fenced = self._fenced_core()
@@ -720,6 +724,8 @@ class Mirror:
             acct.change(memo is None or memo[0] != key)
             acct.fallback(key is None or (memo is not None and memo[0] == key))  # unkeyable, or the ceiling
             clean = self._reconcile(owner, fenced)
+            if strict and not clean:
+                raise RuntimeError('Card reconciliation deferred')
             with _MEMO_LOCK:
                 if key is None or not clean:
                     _MEMO.pop(okey, None)

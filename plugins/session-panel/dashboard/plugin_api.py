@@ -713,6 +713,25 @@ class CoreReaders:
         """Moves with every committed write to the user-steps store (requests, operations, deliveries)."""
         return self._stat(self.state_db().parent / 'user-steps' / 'actions.sqlite3')
 
+    def user_step_requests(self, session, lineage):
+        """Presentation never runs producer reconciliation or initializes stores."""
+        return self._user_step_requests(session, lineage, reconcile=False)
+
+    def reconciliation_stamp(self):
+        """Source admission only: action-store writes cannot trigger their producer."""
+        return self._stamps_of(self.board_paths() + [self.state_db()] + self.external_paths())
+
+    def reconcile_sources(self, sessions):
+        """Run the canonical writer only for source-admitted sessions, before reads.
+
+        This producer is deliberately separate from both presentation lanes. It
+        still uses canonical per-owner reconciliation; it is not a batched source
+        capture API.
+        """
+        api = self._user_step_api()
+        for session in sessions:
+            api.panel_reconcile(self.state_db().parent, session, self.lineage(session))
+
     def reconcile_user_steps(self, session, lineage):
         return self._user_step_requests(session, lineage, reconcile=True)
 
@@ -734,7 +753,8 @@ class CoreReaders:
         return {'outcome_json': outcome if isinstance(outcome, dict) else {},
                 'requests': self._user_step_requests(session, lineage, reconcile=False)}
 
-    def _user_step_requests(self, session, lineage, *, reconcile):
+    @staticmethod
+    def _user_step_api():
         path = Path(__file__).resolve().parents[2] / 'user-steps' / 'dashboard' / 'plugin_api.py'
         key = '_session_panel_user_steps_api_' + str(path) + ':' + str(path.stat().st_mtime_ns)
         mod = sys.modules.get(key)
@@ -744,6 +764,10 @@ class CoreReaders:
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             mod = sys.modules.setdefault(key, mod)
+        return mod
+
+    def _user_step_requests(self, session, lineage, *, reconcile):
+        mod = self._user_step_api()
         if reconcile:
             return mod.panel_requests(self.state_db().parent, session, lineage)
         return mod.panel_requests(self.state_db().parent, session, lineage, reconcile=False)
