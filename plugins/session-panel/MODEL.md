@@ -26,9 +26,14 @@ The model is a presentation snapshot, not authorization or execution authority.
 ## Board-source freshness
 
 A separate change-driven board lane observes the canonical task-change index and
-publishes affected watched chats independently of full-sweep mirror reconciliation.
+external hub/origin-ledger/replica source stamps, and publishes affected watched
+chats independently of full-sweep mirror reconciliation. External captures use the
+canonical owner-qualified adapter and semantic comparison; sync-bookkeeping-only
+pulls carry observations without hydration or renewed computation/execution clocks.
 Four bounded workers hydrate one chat each; a blocked reader does not hold the
-coordinator or another chat's publication. Writes during an in-flight read coalesce
+coordinator or another chat's publication. Pending admissions are oldest-first;
+coalescing a newer write retains a chat's oldest unserved admission. Writes during
+an in-flight read coalesce
 into one subsequent read. Source cursors are separate from the full sweep and only
 commit after complete capture/admission. Failed captures and stale reads have finite
 backoff, then await a real source write; there is no idle database polling.

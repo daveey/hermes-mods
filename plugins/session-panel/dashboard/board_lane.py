@@ -24,6 +24,7 @@ class BoardLane:
         self.capture_failures = 0
         self.capture_retry_at = None
         self.attempted_stamp = object()
+        self.external_captures = {}
 
     def close(self):
         # Reader ownership stays in each worker, even across unload. Publication
@@ -66,7 +67,9 @@ class BoardLane:
         rd = self.reader_factory()
         stamp = None
         try:
-            stamp = rd.board_stamps() if callable(getattr(rd, 'board_stamps', None)) else rd.stamps()
+            board_stamp = rd.board_stamps() if callable(getattr(rd, 'board_stamps', None)) else rd.stamps()
+            external = getattr(rd, 'external_stamps', None)
+            stamp = (board_stamp, external() if callable(external) else None)
             due = self.capture_retry_at is not None and now >= self.capture_retry_at
             moved = stamp != self.attempted_stamp
             if moved or (self.cursor is None and not self.capture_failures) or due:
@@ -82,16 +85,34 @@ class BoardLane:
                 at = capture_started
                 with f.lock:
                     held = {s: b for s, b in f.bundles.items() if s in f.interest}
+                    capture_seq = next(f._seq)
                     if callable(semantic):
-                        dirty = [s for s, b in held.items() if changed.affects(b)]
+                        dirty = {s for s, b in held.items() if changed.affects(b)}
                     else:
-                        dirty = [s for s, b in held.items()
-                                 if b['refs'].intersection(changed) or b['lineage'].intersection(v for v in changed.values() if v)]
+                        dirty = {s for s, b in held.items()
+                                 if b['refs'].intersection(changed) or b['lineage'].intersection(v for v in changed.values() if v)}
+                capture = getattr(rd, 'external_capture', None)
+                captured = self.external_captures
+                if callable(capture):
+                    captured = capture(held)
+                    compare = getattr(rd, 'external_semantic', lambda value: value)
+                    dirty.update(s for s in held if compare(captured[s]) != compare(self.external_captures.get(s)))
+                    if callable(getattr(rd, 'advance_external', None)):
+                        observations = {s: (capture_seq, captured[s]) for s in held
+                                        if s not in dirty and captured[s] != self.external_captures.get(s)}
+                        with f.lock:
+                            old = getattr(f, '_external_observations', None) or {}
+                            f._external_observations = {**old, **{s: value for s, value in observations.items()
+                                                               if s not in old or value[0] > old[s][0]}}
+                        f._publish({}, age_only=True, observations=observations)
+                elif callable(external) and (self.stamp is None or stamp[1] != self.stamp[1]):
+                    dirty.update(held)  # old adapters cannot attest unchanged external inputs
                 for session in dirty:
                     with f.lock:
-                        self.pending[session] = at
+                        self.pending.setdefault(session, at)  # retain the oldest unserved admission
                         f._board_failures.add(session)
                     self.retries.pop(session, None)  # a real source event renews finite recovery
+                self.external_captures = captured
                 self.cursor, self.stamp = cursor, stamp
                 self.capture_failures, self.capture_retry_at = 0, None
         except Exception:
@@ -103,7 +124,7 @@ class BoardLane:
             log.warning('session-panel board capture failed', exc_info=True)
         finally:
             rd.release()
-        for session in sorted(self.pending, key=self.pending.get, reverse=True):
+        for session in sorted(self.pending, key=self.pending.get):
             if len(self.active) >= self.capacity:
                 break
             if session in self.active:

@@ -671,7 +671,9 @@ class Feed:
                         base = held['bundle']
                         if observations is not None:
                             observation = observations.get(s)
-                            if observation is None or base.get('computed_seq', 0) > observation[0]:
+                            latest = (getattr(self, '_external_observations', None) or {}).get(s)
+                            if (observation is None or base.get('computed_seq', 0) > observation[0]
+                                    or (latest is not None and latest[0] > observation[0])):
                                 continue  # a later source capture owns a newer observation
                             base = self.readers.advance_external(base, observation[1])
                         bundle = {**base, 'model': reducer(base, now=now, wire=True)}
@@ -1020,7 +1022,9 @@ class Feed:
                     observations = {s: (capture_seq, captured[s]) for s in watched
                                     if s not in dirty and captured[s] != previous.get(s)}
                     with self.lock:
-                        self._external_observations = {**(getattr(self, '_external_observations', None) or {}), **observations}
+                        old = getattr(self, '_external_observations', None) or {}
+                        self._external_observations = {**old, **{s: value for s, value in observations.items()
+                                                               if s not in old or value[0] > old[s][0]}}
                     self._publish({}, age_only=True, observations=observations)
                 self._external_captures = captured
             elif external_dirty:  # Older readers cannot attest unchanged external inputs.

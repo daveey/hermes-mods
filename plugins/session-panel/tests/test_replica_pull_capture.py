@@ -9,8 +9,9 @@ from test_feed import make
 from test_source_coverage import api_module
 
 
+@pytest.mark.parametrize('lane_mode', [False, True])
 @pytest.mark.parametrize('board_only', [False, True])
-def test_replica_pull_carries_observation_without_hydration(tmp_path, monkeypatch, board_only):
+def test_replica_pull_carries_observation_without_hydration(tmp_path, monkeypatch, board_only, lane_mode):
     links = pytest.importorskip('hermes_cli.kanban_chat_links')
     from hermes_cli import kanban_session_activity as ksa, kanban_db_sync as sync
     from hermes_cli import profiles
@@ -68,6 +69,17 @@ def test_replica_pull_carries_observation_without_hydration(tmp_path, monkeypatc
     f.compute = counted
     f.watch(['S1', 'S2'])
     f.tick()
+    lane = None
+    if lane_mode:
+        from test_feed import feedmod
+        from test_board_lane import settle
+        lane = feedmod.BoardLane(f, lambda: r)
+        settle(lane)
+    def advance():
+        if lane is not None:
+            settle(lane)
+        else:
+            f.tick()
     initial = copy.deepcopy(f.bundles['S1']['bundle'])
     calls.clear()
     # A real concurrent producer reads before the pull and publishes after it.
@@ -91,7 +103,7 @@ def test_replica_pull_carries_observation_without_hydration(tmp_path, monkeypatc
             with sqlite3.connect(path) as c:
                 c.execute('UPDATE kanban_sync_state SET pulled_at=?', (clock['now'],))
             r.stamp += 1
-            f.tick()
+            advance()
         assert calls == [], 'unchanged semantic replica input must not hydrate every chat'
         after = f.bundles['S1']['bundle']
         assert after['tasks'][0]['synced_at'] == 1010
@@ -105,7 +117,7 @@ def test_replica_pull_carries_observation_without_hydration(tmp_path, monkeypatc
     with sqlite3.connect(path) as c:
         c.execute("UPDATE tasks SET title='changed receipt' WHERE id='card1'")
     r.stamp += 1
-    f.tick()
+    advance()
     assert calls == ['S1']
     assert f.bundles['S1']['bundle']['tasks'][0]['title'] == 'changed receipt'
     # A real freshness transition is still an input change, not erased bookkeeping.
@@ -113,5 +125,5 @@ def test_replica_pull_carries_observation_without_hydration(tmp_path, monkeypatc
     clock['now'] += 10000
     f.watch(['S1', 'S2'])
     r.stamp += 1
-    f.tick()
+    advance()
     assert sorted(calls) == ['S1', 'S2']

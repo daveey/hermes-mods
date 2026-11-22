@@ -81,6 +81,65 @@ def test_reconciliation_blocks_neither_board_capture_nor_publication():
             lane.close()
 
 
+def test_external_source_change_publishes_during_blocked_full_sweep():
+    r = Readers()
+    f = feedmod.Feed(r, emit=lambda p: None)
+    f.changes(['S1', 'S2'])
+    entered, release = threading.Event(), threading.Event()
+    external = [0]
+    r.external_stamps = lambda: external[0]
+    r.external_capture = lambda held: {s: external[0] if s == 'S2' else 0 for s in held}
+    lane = feedmod.BoardLane(f, lambda: r)
+    settle(lane)
+    r.reconciliation_stamp = lambda: r.stamp
+    def reconcile(sessions):
+        entered.set()
+        assert release.wait(5)
+    r.reconcile_sources = reconcile
+    sweep = threading.Thread(target=f.tick)
+    sweep.start()
+    try:
+        assert entered.wait(1)
+        r.links['S2'] = [{**r.links['S2'][0], 'status': 'ready'}]
+        external[0] += 1  # ledger/hub write; no local-board stamp or revision moves
+        settle(lane)
+        assert f.bundles['S2']['bundle']['tasks'][0]['status'] == 'ready'
+        assert not release.is_set()
+    finally:
+        release.set()
+        sweep.join(5)
+        lane.close()
+
+
+def test_older_changed_chat_is_not_starved_by_continually_newer_changes():
+    r = Readers()
+    painted = threading.Event()
+    f = feedmod.Feed(r, emit=lambda p: painted.set() if 'S1' in p['bundles'] else None)
+    f.changes(['S1', 'S2'])
+    painted.clear()
+    lane = feedmod.BoardLane(f, lambda: r, capacity=0)
+    lane.step()
+    r.links['S1'] = [{**r.links['S1'][0], 'status': 'ready'}]
+    r.events = [('t_aaaaaa1', 'S1')]
+    r.stamp += 1
+    lane.step()  # pool occupied: retain this older admission
+    lane.capacity = 1
+    try:
+        for i in range(8):
+            r.links['S2'] = [{**r.links['S2'][0], 'status': 'ready' if i % 2 else 'scheduled'}]
+            r.events = [('t_dddddd4', 'S2')]
+            r.stamp += 1
+            lane.step()
+            for worker in list(lane.active.values()):
+                worker.join(1)
+            if painted.is_set():
+                break
+        assert painted.wait(.1), 'newer arrivals starved the already admitted changed chat'
+    finally:
+        settle(lane)
+        lane.close()
+
+
 def settle(lane, timeout=2):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
