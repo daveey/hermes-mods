@@ -92,6 +92,41 @@ Stop at the first rung that works. Each rung is something agents may do without 
 | f. Human-only, but automatable handoff | Does it need David's hands only to type a password or click a dialog? | `run_in_user_terminal` / `remote_approve_dialog` / `browser_focus` (asking-the-user). That is a live step, not a parked card. |
 | g. Scope/acceptance change | Does finishing require lowering the card's acceptance criteria, spending beyond budget, or giving up the goal? | Only this rung, and true human-only steps (physical device, his own re-auth, publishing as him, other people), justify a card. |
 
+### Bounded repeat attempts: the creator or orchestrator decides
+
+**Renewing a spent bounded-attempt limit is not a David ask** when ALL five conditions hold:
+
+1. It is the same kind of action David already approved once for this goal; cite that prior approval.
+2. It is cheap: no spend over the standing $20 limit, no rented compute. Repeats do not reset or multiply
+   the standing budget; keep cumulative spend inside the approved envelope.
+3. It is bounded in time and reversible, with any temporary task-private grants removed and their removal
+   read back afterwards. State the time bound and cleanup/readback plan before each attempt.
+4. It adds no new OS/TCC permission, credential, or acceptance change, and does not wake or reconfigure a display.
+5. It is not destructive.
+
+**The card's creator or orchestrator decides with a `kanban_comment` citing the prior approval, and the card
+continues; do not ask David to renew the attempt limit.** If you are the worker rather than that decision owner,
+route the pick to the creator or orchestrator, not to David. Record the bound, spend check, reversal/cleanup plan
+and repeat count in the comment. Release only the exhausted attempt-limit hold through the supported owner
+route; preserve independent safety, spend and permission holds. A comment is not a bypass of runtime guards.
+
+**Loop guard:** stop repeating and comment after 3 repeats of the same failure with no new fix in between.
+Name the failure, attempts and evidence; have the creator or orchestrator re-plan or supply a new fix before
+another attempt. Exhausting this guard alone is not a David ask or permission to lower acceptance.
+
+**Still David-only:**
+- Typing a password or unlocking a Mac.
+- Physical clicks on OS permission prompts that agents cannot do.
+- New permission classes.
+- Spend above the standing limits.
+- Acceptance changes.
+- Destructive or irreversible steps.
+
+**Pitfall / not for generate-unblock-card:** do not write "Only you can: expand the … limit you approved"
+for repeat attempts meeting all five conditions. That is an agent-owned continuation decision, not a human-only
+permission; resolve it here before loading generate-unblock-card. If a condition fails, identify the actual new
+authority needed rather than treating every spent attempt as a new approval request.
+
 ## 4. Decide
 
 - **Resolved at rung a–f** → do it now. Comment on the card: `try-to-unblock: resolved at rung <x>: <what you did>;
