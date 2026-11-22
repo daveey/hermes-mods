@@ -228,6 +228,41 @@ def test_own_wait_and_unhydrated_primary_never_link_to_self_or_secondary():
         assert not any(a['label'] == 'Open parent card' for a in r['actions'])
 
 
+@pytest.mark.parametrize('graph_key', ['upstream', 'blocked_upstream'])
+@pytest.mark.parametrize('on', [
+    'card t_aaaaaaaaaaaaaaaa',
+    'card t_bbbbbbbbbbbbbbbb',
+    'producer card t_bbbbbbbbbbbbbbbb (scheduled), then its release',
+    'external comments on t_bbbbbbbbbbbbbbbb from source owner t_cccccccccccccccc',
+    'external vendor ticket update',
+])
+def test_explicit_primary_never_loses_to_unrelated_graph(graph_key, on):
+    other = 't_cccccccccccccccc'
+    row = task('t_aaaaaaaaaaaaaaaa', status='scheduled', **{graph_key: {'id': other, 'title': 'Unrelated work', 'gateway': 'remote', 'profile': 'default'}},
+               wait={'wait_state': 'waiting', 'waiting_on': on, 'waiting_since': NOW - 120})
+    b = bundle(row, cards={other: {'detail': {'source': 'replica', 'owner': 'remote', 'task': {'id': other, 'title': 'Unrelated work'}}}})
+    b.update(gateway='hub', profile='default')
+    r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    if on == 'card t_aaaaaaaaaaaaaaaa':
+        assert r['detail'] == 'waiting on an update · 2m'
+    assert 'Unrelated work' not in r['detail']
+    assert not any(a['label'] == 'Open parent card' for a in r['actions'])
+
+
+@pytest.mark.parametrize('on', ['', 'card t_bbbbbbbbbbbbbbbb', 'external comments on t_bbbbbbbbbbbbbbbb'])
+def test_primary_and_unpublished_graph_wait_resolve_intended_card(on):
+    primary, other = 't_bbbbbbbbbbbbbbbb', 't_cccccccccccccccc'
+    row = task('t_aaaaaaaaaaaaaaaa', status='scheduled', upstream={'id': primary if not on else other},
+               wait={'wait_state': 'waiting', 'waiting_on': on, 'waiting_since': NOW - 120})
+    cards = {cid: {'detail': {'source': 'replica', 'owner': 'remote', 'task': {'id': cid, 'title': title}}}
+             for cid, title in ((primary, 'Intended work'), (other, 'Unrelated work'))}
+    b = bundle(row, cards=cards)
+    b.update(gateway='hub', profile='default')
+    r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert r['detail'].startswith('waiting on: Intended work')
+    assert next(a for a in r['actions'] if a['label'] == 'Open parent card')['target']['id'] == primary
+
+
 def test_parent_wait_keeps_identity_in_details_not_status():
     upstream = {'id': 't_0123456789abcdef', 'status': 'blocked'}
     r = model.reduce_panel(bundle(task(status='todo', blocked_upstream=upstream)), now=NOW)['sections']['waiting'][0]

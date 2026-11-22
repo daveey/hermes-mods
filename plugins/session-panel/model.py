@@ -241,8 +241,8 @@ def wait_info(row, now):
         phrase = 'waiting on CI' + (f' · PR #{pr}' if pr else '')
     elif head:
         phrase = 'waiting on hub deploy' if re.search(r'\bhub\b', on, re.I) else 'waiting on deploy'
-    elif re.match(r'(?:producer\s+)?card\s+t_[0-9a-f]+\b', on, re.I):
-        phrase = 'waiting on parent card'
+    elif primary := re.match(r'(?:producer\s+)?card\s+(t_[0-9a-f]+)\b', on, re.I):
+        phrase = 'waiting on an update' if primary[1] == row.get('id') else 'waiting on parent card'
     elif re.search(r'\bt_[0-9a-f]+\b|\blocal:|\bPID\s*\d+|\S+\.service\b', on, re.I):
         phrase = 'waiting on external work' if re.match(r'external\b', on, re.I) else 'waiting on agent work'
     else:
@@ -263,10 +263,19 @@ def wait_target(row, bundle, detail):
     if on and not (re.match(r'(?:producer\s+)?card\b', on, re.I) or
                    re.match(r'external\b', on, re.I) or 'did not publish' in on):
         return None
-    refs = [obj(row.get(k)) for k in ('blocked_upstream', 'upstream') if obj(row.get(k)).get('id')]
     named = re.findall(r'\bt_[0-9a-f]+\b', on)
-    if not refs and named:
-        refs = [{'id': named[0]}]  # an unhydrated primary must not become a secondary mention
+    graph_refs = [obj(row.get(k)) for k in ('blocked_upstream', 'upstream') if obj(row.get(k)).get('id')]
+    if named:
+        # The published park owns its primary identity, including self-probes.
+        # Graph ancestry is independent of that park and must never replace it.
+        if named[0] == row.get('id'):
+            return None
+        refs = [next((ref for ref in graph_refs if ref.get('id') == named[0]), {'id': named[0]})]
+    else:
+        # Only absent/unpublished or explicitly parent-only waits use ancestry.
+        if on and not ('did not publish' in on or re.fullmatch(r'(?:producer\s+)?card(?:\s+parent)?', on, re.I)):
+            return None
+        refs = graph_refs
     for ref in refs[:1]:
         cid = text(ref.get('id'))
         if not cid or cid == row.get('id'):
@@ -544,7 +553,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v['details'].append(f'Parent card: {upstream.get("id")} ({upstream.get("status") or "status unknown"})')
             if contained:
                 v['details'].append(f'Release by card: {obj(contained.get("authority")).get("id") or "unknown"}')
-            v['detail'] = dependency_text or ('waiting on contained parent card' if contained else 'waiting on blocked parent card')
+            v['detail'] = on or ('waiting on contained parent card' if contained else 'waiting on blocked parent card')
             sections['waiting'].append(v); continue
         if look == 'stalled':
             v.update(reason='stalled', detail=f'stalled: {on or "agent-owned wait over 2 h"}')
