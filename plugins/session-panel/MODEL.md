@@ -22,6 +22,14 @@ Failed fast reads are retried on the next pass and excluded from heartbeat `fres
 `/status.decision_failures` exposes the affected sessions. Real delivery failures and
 unknown operations retain user-steps Check status/Retry recovery.
 
+The API idempotently ensures the canonical lane even if a previous API generation
+already resumed the current Feed. That lane owns current-generation readers rather
+than borrowing obsolete readers from the board lane. A successfully queried missing
+session row (a deleted chat retained in Desktop recents) yields an empty/unknown
+outcome, while canonical requests are still read with their exact owner/lineage.
+Unavailable databases or canonical-request readers remain retryable failures, not
+known-empty sources; successful retries clear failure diagnostics and restore `fresh`.
+
 ## Contract
 
 ```json

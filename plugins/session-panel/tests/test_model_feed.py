@@ -140,6 +140,8 @@ def test_fast_input_error_is_retried_without_board_stamps_and_not_vouched():
     readers.decision_inputs = lambda session, lineage: {'outcome_json': {'kind': 'done'}, 'requests': []}
     assert f.refresh_decisions() == 1
     assert f.bundles['S1']['bundle']['model']['header']['state'] == 'done'
+    assert 'S1' not in f._decision_failures
+    assert 'S1' in pushed[-1]['fresh'], 'successful retry restores freshness, not just presentation'
 
 
 def test_canonical_sequence_survives_resume_and_restore_without_churn():
@@ -159,6 +161,64 @@ def test_canonical_sequence_survives_resume_and_restore_without_churn():
         assert current.bundles['S1']['bundle']['canonical_seq'] > old_seq
         assert 'S1' in current._carried
     assert f.refresh_decisions() == 0
+
+
+def test_canonical_lineage_fence_even_when_board_sequences_are_equal():
+    f, readers, pushed, clock = make()
+    readers.panel_inputs = lambda *args: {'outcome_json': {}, 'requests': []}
+    f.changes(['S1'])
+    base = f.bundles['S1']['bundle']
+    raced = {**base, 'lineage': ['S1', 'obsolete-parent'],
+             'outcome_json': {'kind': 'done'}, 'canonical_seq': base['canonical_seq'] + 1}
+    before = f.rev
+    assert f._publish({'S1': raced}, canonical_only=True) == {}
+    assert f.rev == before and f.bundles['S1']['bundle'] is base
+
+
+def test_duplicate_joined_board_result_does_not_reissue_restored_evidence():
+    f, readers, pushed, clock = make()
+    f.changes(['S1'])  # legacy snapshot without canonical sequence
+    base = f.bundles['S1']['bundle']
+    f._carried.add('S1')
+    f._reissue.add('S1')
+    before = f.rev
+    assert f._publish({'S1': dict(base)}) == {}
+    assert f.rev == before
+    assert 'S1' in f._carried and 'S1' in f._reissue
+
+
+def test_unchanged_canonical_data_never_reduces_or_pushes(monkeypatch):
+    from test_feed import feedmod
+    f, readers, pushed, clock = make()
+    readers.panel_inputs = lambda *args: {'outcome_json': {}, 'requests': []}
+    readers.decision_inputs = readers.panel_inputs
+    f.changes(['S1'])
+    before, model = f.rev, f.bundles['S1']['bundle']['model']
+    def forbidden():
+        raise AssertionError('unchanged canonical inputs must not re-reduce')
+    monkeypatch.setattr(feedmod, '_model', forbidden)
+    assert f.refresh_decisions() == 0
+    assert not f._decision_failures, 'an exception swallowed by refresh is not a successful no-op'
+    assert f.rev == before and f.bundles['S1']['bundle']['model'] is model
+
+
+def test_merged_reduction_uses_current_clock_not_board_snapshot(monkeypatch):
+    from test_feed import feedmod
+    f, readers, pushed, clock = make()
+    readers.panel_inputs = lambda *args: {'outcome_json': {}, 'requests': []}
+    f.changes(['S1'])
+    old_clock = f.bundles['S1']['bundle']['computed_at']
+    clock['now'] += 90
+    readers.decision_inputs = lambda *args: {'outcome_json': {'kind': 'done'}, 'requests': []}
+    real_model, seen = feedmod._model(), []
+    class Reducer:
+        def reduce_panel(self, bundle, *, now):
+            seen.append(now)
+            return real_model.reduce_panel(bundle, now=now)
+    monkeypatch.setattr(feedmod, '_model', Reducer)
+    assert f.refresh_decisions() == 1
+    assert seen == [clock['now']] and seen != [old_clock]
+    assert f.bundles['S1']['bundle']['computed_at'] == old_clock
 
 
 def test_additive_model_and_request_outcome_invalidation_without_card_events():

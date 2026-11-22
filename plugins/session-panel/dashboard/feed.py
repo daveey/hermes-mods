@@ -233,13 +233,13 @@ class Feed:
         bundle['model'] = _model().reduce_panel(bundle, now=bundle['computed_at'])
         return bundle
 
-    def refresh_decisions(self) -> int:
+    def refresh_decisions(self, *, readers=None) -> int:
         """Read canonical decisions without board hydration during a long full sweep.
 
         Never reconcile mirrors or refresh board trust clocks here. Independent board
         and canonical sequences merge at publication. Failed reads remain unvouched.
         """
-        read = getattr(self.readers, 'decision_inputs', None)
+        read = getattr(self.readers if readers is None else readers, 'decision_inputs', None)
         if not callable(read) or not self._decision_lock.acquire(blocking=False):
             return 0
         try:
