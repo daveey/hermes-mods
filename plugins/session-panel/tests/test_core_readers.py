@@ -344,3 +344,47 @@ def test_a_board_whose_wal_files_were_removed_by_the_last_writer_still_opens(api
     assert not (path.parent / 'missing.db').exists()
     assert r.conn(path.parent / 'missing.db') is None, 'a missing file is never created'
     assert not (path.parent / 'missing.db').exists()
+
+
+def test_batched_panel_stamps_equal_the_per_chat_stamp_and_leave_no_connection_after_release(api, tmp_path, monkeypatch):
+    import uuid
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / 'state.db')
+    for s in ('S1', 'S2', 'S3'):
+        db.create_session(s, 'desktop')
+    path = Path(__file__).resolve().parents[2] / 'user-steps' / 'core.py'
+    spec = importlib.util.spec_from_file_location('_batched_stamp_core', path)
+    core = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = core
+    spec.loader.exec_module(core)
+    store = core.ActionStore()
+    for s in ('S2', 'S2', 'S3'):
+        owner = core.server_owner(s)
+        store.create(owner, dict(
+            schemaVersion=2, owner=dict(owner), requestId=str(uuid.uuid4()), revision=1,
+            kind='approval', title='Approve the synthetic change',
+            scope=dict(markdown='Change example.py; run tests.', complete=True, sourceRefs=[]),
+            limits=[], exclusions=[], outcomes=dict(approve='Authorize this scope only',
+            revise='Keep work blocked', decline='Cancel'),
+            choices=[dict(id=e, label=e.title(), effect=e) for e in ('approve', 'revise', 'decline')],
+            aliases=[], state='open'))
+    r = api.CoreReaders(state_db=tmp_path / 'state.db')
+    ids = ['S1', 'S2', 'S3', 'never-stored']
+    single = {s: r.panel_stamp(s) for s in ids}
+    assert len(single['S2'][1]) == 2 and single['S1'][1] == () and single['never-stored'] == (None, ())
+    assert r.panel_stamps(ids) == single
+    assert r.panel_stamps([]) == {}
+    before = r.panel_files_stamp()
+    assert before == r.panel_files_stamp(), 'stat only: stable while nothing is written'
+    owner = core.server_owner('S1')
+    store.create(owner, dict(
+        schemaVersion=2, owner=dict(owner), requestId=str(uuid.uuid4()), revision=1,
+        kind='approval', title='Another', scope=dict(markdown='x', complete=True, sourceRefs=[]),
+        limits=[], exclusions=[], outcomes=dict(approve='a', revise='b', decline='c'),
+        choices=[dict(id=e, label=e.title(), effect=e) for e in ('approve', 'revise', 'decline')],
+        aliases=[], state='open'))
+    assert r.panel_files_stamp() != before and r.decision_store_stamp() != before[1]
+    assert r.panel_stamps(ids) == {s: r.panel_stamp(s) for s in ids} != single
+    r.release()
+    assert r._local.conns == {}
