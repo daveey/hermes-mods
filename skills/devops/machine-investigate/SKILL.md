@@ -87,6 +87,10 @@ On macOS, inspect the allocator before predicting what a cut saves: `python3 <sk
 
 ## Remote backend timeouts: separate compute from transport
 
+When the host is idle but a Python backend is slow, follow `references/python-backend-latency.md`. It covers
+thread-queue vs handler time, the GIL-convoy test (per-thread context switches, strace futex share) and
+attribution of hot threads.
+
 First read the Desktop's own gate lines for the conn in `desktop.log`: `[remote-down] conn:<c>::... marked down (<reason>)` to `... answered again; gate open` bounds an outage, and while it lasts every poll logs a fail-fast line that quotes one timeout ("is down (Timed out ..., 27s ago)"), so the timeout count is not a request count. Reason `read ECONNRESET` means the backend process went away (check the backend host's `agent.log` for a core update or restart at that second); that is neither CPU nor link. `backend_timeouts.py --dry-run` lists these as `backend_down.episodes`.
 
 Compare authenticated request timings on the backend host with the same requests through the client's actual SSH forward before attributing timeouts to CPU. Probe independent direct and jump-host routes with a bounded payload transfer, then isolate each hop; a successful TCP port check proves reachability, not end-to-end delivery. Corroborate a stalled route with socket retransmission/queue evidence, and leave the physical loss point unknown unless measured.
