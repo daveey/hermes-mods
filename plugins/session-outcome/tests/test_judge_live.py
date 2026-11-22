@@ -90,6 +90,19 @@ MONITOR_CLOSED = (
     "remain with that worker card.\n"
     "- Obsolete rule t_103: I verified main retired the rule, closed the obsolete PR, and archived the card.")
 
+# A direct repair request remains open when the reply only diagnoses the issue and points at an active owner.
+# The monitoring exception must not turn delegated repair ownership into delivery of the requested fix.
+ACTIVE_OWNER_REPAIR_REQUEST = "I keep getting these errors; fix the recurring failure."
+ACTIVE_OWNER_REPAIR_REPLY = (
+    "The recurring failure is caused by the stale parser. I did not change anything here; the repair is in an "
+    "active PR owned by another worker, and its card will deploy the fix later. The errors continue for now.")
+
+# Diagnosis-only is still a complete answer when the user asked only why, even if it recommends a repair.
+DIAGNOSIS_REQUEST = "Why does the recurring failure happen?"
+DIAGNOSIS_REPLY = (
+    "The recurring failure happens because the parser accepts a stale schema marker. The relevant repair is a "
+    "validation guard at that boundary.")
+
 CASES = [
     (MONITOR_REQUEST, MONITOR_CLOSED, "YES"),
     (MONITOR_REQUEST, "CI is still running on t_101. I'm watching it here.", "NO"),
@@ -98,6 +111,8 @@ CASES = [
     (MONITOR_REQUEST, "All watched waits ended. Validator t_102 is red: which repair should I apply?", "NO"),
     (MONITOR_REQUEST, "All watched waits ended. Validator t_102 is parked waiting for you, its creator, "
      "to decide. Please choose the repair before we can finish.", "NO"),
+    (ACTIVE_OWNER_REPAIR_REQUEST, ACTIVE_OWNER_REPAIR_REPLY, "NO"),
+    (DIAGNOSIS_REQUEST, DIAGNOSIS_REPLY, "YES"),
     (POSTED_REQUEST, POSTED_ANSWER, "YES"),
     ("", POSTED_ANSWER, "YES"),
     (REVIEW_REQUEST, REVIEW_ANSWER, "YES"),
