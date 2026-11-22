@@ -995,6 +995,7 @@ class FileWatch:
         self.stale = False  # a watch ended under us: the owner re-lists (set_paths) before it sleeps again
         self._dirs: dict[str, int] = {}      # inotify: directory -> watch descriptor
         self._names: dict[int, set] = {}     # inotify: watch descriptor -> file names wanted in it
+        self._topology: dict[int, set] = {}  # child directory names whose replacement needs a relist
         self._fds: dict[str, int] = {}       # kqueue: path -> descriptor
         self._wanted: list[str] = []
         try:
@@ -1026,33 +1027,42 @@ class FileWatch:
             self._arm()
             return
         want: dict[str, set] = {}
+        topology: dict[str, set] = {}
         for f in files:
-            want.setdefault(os.path.dirname(f), set()).add(os.path.basename(f))
-        for d in [d for d in self._dirs if d not in want]:
-            wd = self._dirs.pop(d)
-            self._names.pop(wd, None)
-            self._libc.inotify_rm_watch(self._fd, wd)
+            directory = os.path.dirname(os.path.abspath(f))
+            want.setdefault(directory, set()).add(os.path.basename(f))
+            # Watch each ancestor's exact child name. This catches both a missing
+            # nested source appearing and an existing ancestor being renamed;
+            # watching only the leaf inode misses the latter. Unrelated names
+            # remain filtered, and ordinary DB writes never request a relist.
+            while directory != os.path.dirname(directory):
+                parent, child = os.path.split(directory)
+                want.setdefault(parent, set()).add(child)
+                topology.setdefault(parent, set()).add(child)
+                directory = parent
         self.stale = False
         import ctypes
-        for d, names in want.items():
-            # Asked every time: the kernel answers with the watch it already has for this directory, or a new one
-            # when the directory was removed and made again (the old watch died with it).
+        new_dirs, new_names, new_topology = {}, {}, {}
+        # Arm ancestors first: a tree appearing during registration is either
+        # observed by its parent or present when its own watch is installed.
+        for d in sorted(want, key=lambda p: (p.count(os.sep), p)):
             wd = self._libc.inotify_add_watch(self._fd, os.fsencode(d), self._IN)
-            old = self._dirs.get(d)
             if wd < 0:
                 err = ctypes.get_errno()
-                if old is not None:
-                    self._dirs.pop(d)
-                    self._names.pop(old, None)
                 if err in (errno.ENOENT, errno.ENOTDIR):
-                    continue  # no such directory yet: taken up by a later set_paths
-                # Refused (ENOSPC: fs.inotify.max_user_watches; EACCES...): a feed that believed it was watching
-                # would never hear a write. The owner logs this and withdraws its freshness vouch.
+                    continue  # an ancestor watch reports this path appearing
+                # Fail closed if complete topology coverage cannot be armed.
+                # A readable leaf under an unreadable ancestor is not proof that
+                # replacement of that ancestor can be observed.
                 raise OSError(err, f'inotify_add_watch refused: {os.strerror(err)}', d)
-            if old is not None and old != wd:
-                self._names.pop(old, None)
-            self._dirs[d] = wd
-            self._names[wd] = names
+            new_dirs[d] = wd
+            # Aliases of one inode share a descriptor. Union their filters and
+            # retire only descriptors that no remaining pathname owns.
+            new_names.setdefault(wd, set()).update(want[d])
+            new_topology.setdefault(wd, set()).update(topology.get(d, ()))
+        for wd in set(self._dirs.values()) - set(new_dirs.values()):
+            self._libc.inotify_rm_watch(self._fd, wd)
+        self._dirs, self._names, self._topology = new_dirs, new_names, new_topology
 
     def _arm(self) -> None:
         import select
@@ -1100,14 +1110,18 @@ class FileWatch:
                 name = data[at + 16:at + 16 + size].split(b'\0', 1)[0]
                 at += 16 + size
                 if mask & self._Q_OVERFLOW:
-                    hit = True  # events were dropped: any of ours may be among them
+                    self.stale = hit = True  # a dropped event may have replaced a watched directory
                 elif mask & self._IGNORED:
                     if wd in self._names:  # a watched directory went away (not our own rm_watch): its files with it
                         self._names.pop(wd)
+                        self._topology.pop(wd, None)
                         self._dirs = {d: w for d, w in self._dirs.items() if w != wd}
                         self.stale = hit = True
                 else:
-                    hit = hit or os.fsdecode(name) in self._names.get(wd, ())
+                    decoded = os.fsdecode(name)
+                    if decoded in self._topology.get(wd, ()):
+                        self.stale = hit = True
+                    hit = hit or decoded in self._names.get(wd, ())
             if hit:
                 return True  # anything else in those directories (logs, locks) is not ours
 
