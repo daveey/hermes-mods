@@ -104,6 +104,9 @@ async def run(api, ws, params, debug):
         tasks = [asyncio.create_task(receive(), name='lanes-receive'),
                  asyncio.create_task(sender(), name='lanes-send')]
         await poll()
+        next_poll = time.monotonic() + api.WATCH_S
+        for task in tasks:
+            task.add_done_callback(lambda _: wake.set())
         pending = {}  # initial frame has no per-change detection
         last_heartbeat = time.monotonic()
         while True:
@@ -138,17 +141,26 @@ async def run(api, ws, params, debug):
                 if timing:
                     timing = {**timing, 'released': time.time()}
                 current_task = asyncio.create_task(project(params, cursor, api._generation, timing), name='lanes-project')
+                current_task.add_done_callback(lambda _: wake.set())
             if time.monotonic() - last_heartbeat >= api.HEARTBEAT_S:
                 # Don't replace an unsent view with a heartbeat.
                 if outgoing.empty():
                     enqueue({'type': 'heartbeat', 'version': version})
                 last_heartbeat = time.monotonic()
             wake.clear()
+            now = time.monotonic()
+            deadline = min(next_poll, last_heartbeat + api.HEARTBEAT_S)
+            if pending is not None and current_task is None:
+                deadline = min(deadline, last_end + api.MIN_PROJECT_GAP_S)
             try:
-                await asyncio.wait_for(wake.wait(), api.WATCH_S)
+                await asyncio.wait_for(wake.wait(), max(0., deadline - now))
             except TimeoutError:
                 pass
-            await poll()
+            # A completed result is ready immediately. Cursor sampling retains
+            # its independent cadence rather than blocking every result wake.
+            if time.monotonic() >= next_poll:
+                await poll()
+                next_poll = time.monotonic() + api.WATCH_S
     finally:
         if current_task is not None:
             tasks.append(current_task)
