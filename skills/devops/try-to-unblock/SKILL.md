@@ -46,7 +46,17 @@ something concrete, the card is not blocked on a human. It is unclear work. Re-p
 
 Read the card's newest comments and runs, the linked PR/CI, and the actual state the blocker refers to (process
 alive? file present? token valid? PR merged?). Many asks are already answered, already done, or about a process
-that no longer exists. If the premise is gone, remove that ask without releasing independent holds. A stale
+that no longer exists.
+
+Before writing an ask, look for one that already exists. A decision card the owner filed (named in the newest
+comments, or a blocked card whose evidence cites this card) is the ask: point at it and never file a second one,
+because two asks split David's answer. A live owner chat holds release: message it instead of asking David. Live
+means an unreleased link of any kind (`created` counts) to a session with recent `last_activity_at`. Don't go by
+`ended_at`: `ws_orphan_reap` leaves it set on chats still in use. Test each option you would offer against the card
+first. Archiving or completing it promotes its waiting children, and re-scoping or promoting a safety-refused card
+is refused.
+
+If the premise is gone, remove that ask without releasing independent holds. A stale
 human ask can coexist with a valid spend hold: use `action_request` withdrawal for its exact request ID, then
 `hermes kanban block <id> --metadata-only --human-request null '<reason>'` to clear the card's human-request
 metadata without authorizing execution. Read back both results. This does not change block kind or renew spend;
