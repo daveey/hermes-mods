@@ -1657,3 +1657,35 @@ def status():
     if f is None:
         return {'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'running': False}
     return json_safe({'feed': FEED_ID, 'profile': LAUNCH_PROFILE, 'running': not f.stopped.is_set(), **f.status()})
+
+
+class DecisionRefreshBody(BaseModel):
+    session: str = Field(min_length=1, max_length=512)
+
+
+@router.post('/decision-refresh')
+async def decision_refresh(body: DecisionRefreshBody):
+    # Server reads canonical state; the caller cannot submit a model or receipt
+    # as presentation authority. Never join the background sweep or feed lane.
+    from fastapi import HTTPException
+    if _request_profile() != LAUNCH_PROFILE:
+        raise HTTPException(409, 'Panel profile unavailable')
+    f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
+    if f is None or f.stopped.is_set():
+        raise HTTPException(503, 'Session panel starting')
+    def read():
+        readers = CoreReaders()
+        try:
+            result = f.refresh_decision(body.session, readers=readers)
+            b = result['bundle']
+            # Decision repaint must not enqueue megabytes of historical raw card
+            # details on the same Desktop tunnel as the next interactive click.
+            result['bundle'] = {k: b[k] for k in ('session', 'lineage', 'model')}
+            result['bundle']['tasks'] = [{k: t[k] for k in ('id', 'gateway', 'profile', 'board') if k in t}
+                                         for t in b.get('tasks', [])]
+            return json_safe({'feed': FEED_ID, 'profile': LAUNCH_PROFILE, **result})
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        finally:
+            readers.release()
+    return await CoreReaders._user_step_api()._on_decision(read)

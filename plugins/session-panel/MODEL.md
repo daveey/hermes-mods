@@ -60,6 +60,31 @@ or infer an ancestor's owner. Existing sessions still read exact owner/lineage r
 Unavailable databases or canonical-request readers remain retryable failures, not
 known-empty sources; successful retries clear failure diagnostics and restore `fresh`.
 
+## Interactive decision publication
+
+Canonical owner lookup, decision POST, and operation/receipt readback use a bounded
+four-worker decision budget separate from the shared AnyIO and feed read pools.
+The router's recovery dependency is asynchronous too: warm decisions do not wait
+for a synchronous dependency in the saturated default pool. Queue admission is
+bounded at 750 ms; an admitted worker retains capacity even after its caller is
+cancelled. Durable operation/idempotency semantics are unchanged.
+
+Desktop validates the canonical POST receipt immediately instead of discarding it
+and doing three sequential GETs. It then requests `POST /decision-refresh {session}`
+on the **source panel** connection/profile, not an ambient or foreign request
+owner. This endpoint reads current canonical requests/outcome only, independent
+of the sweep decision lock, and returns a compact backend-authored model. It does
+not hydrate boards, reconcile mirrors, infer running state, renew execution
+leases, or advance board clocks. The existing canonical sequence merge fences
+older reads. The scoped response carries feed/epoch/revision; per-chat revision
+fences prevent an older push/catch-up from resurrecting an answered ask without
+advancing the connection-wide cursor and dropping unrelated updates.
+
+An unavailable refresh retains the recorded receipt and existing locked intent;
+it never repeats the decision. Older owners without a complete POST receipt use
+the existing exact-key receipt recovery. Native click-to-paint timing and transport
+contention must be measured separately from in-process saturation regression tests.
+
 ## Header fallback
 
 A validated published `outcome_json.status` remains authoritative, unchanged, with

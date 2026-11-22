@@ -4,6 +4,53 @@ import threading
 from test_feed import make
 
 
+def test_interactive_refresh_wins_over_inflight_sweep_without_changing_board_trust():
+    f, readers, pushed, clock = make()
+    readers.panel_inputs = lambda *args: {'outcome_json': canonical_outcome('decision'), 'requests': []}
+    f.changes(['S1'])
+    f._carried.add('S1'); f._reissue.add('S1')
+    before = f.bundles['S1']['bundle']['computed_at']
+    started, release = threading.Event(), threading.Event()
+    def slow(*args):
+        started.set()
+        assert release.wait(5)
+        return {'outcome_json': canonical_outcome('waiting'), 'requests': []}
+    readers.decision_inputs = slow
+    worker = threading.Thread(target=f.refresh_decisions)
+    worker.start()
+    try:
+        assert started.wait(5)
+        class Interactive:
+            def decision_inputs(self, session, lineage):
+                assert session == 'S1'
+                return {'outcome_json': canonical_outcome('done'), 'requests': []}
+        result = f.refresh_decision('S1', readers=Interactive())
+        assert result['bundle']['model']['header']['state'] == 'done'
+        assert result['bundle']['computed_at'] == before
+        assert 'S1' in f._carried and 'S1' in f._reissue
+    finally:
+        release.set(); worker.join(5)
+    assert not worker.is_alive()
+    assert f.bundles['S1']['bundle']['model']['header']['state'] == 'done'
+
+
+def test_interactive_refresh_refuses_partial_inputs_and_recovers():
+    import pytest
+    f, readers, pushed, clock = make()
+    f.changes(['S1'])
+    before = f.rev
+    readers.decision_inputs = lambda *args: {'requests': []}
+    with pytest.raises(ValueError, match='incomplete'):
+        f.refresh_decision('S1', readers=readers)
+    assert f.rev == before
+    assert 'S1' in f._decision_failures
+    readers.decision_inputs = lambda *args: {'outcome_json': {}, 'requests': []}
+    assert f.refresh_decision('S1', readers=readers)['bundle']['session'] == 'S1'
+    assert 'S1' not in f._decision_failures
+    with pytest.raises(ValueError, match='not hydrated'):
+        f.refresh_decision('never-watched', readers=readers)
+
+
 def test_recorded_and_delivered_request_reaches_model_without_board_reads():
     from test_model_audit import answered
     f, readers, pushed, clock = make()

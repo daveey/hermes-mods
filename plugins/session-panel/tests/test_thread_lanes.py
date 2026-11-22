@@ -64,3 +64,35 @@ def test_a_busy_lane_cannot_delay_a_published_read(api, monkeypatch):
     monkeypatch.setattr(api, '_run_in_lane', busy)
     out = _client(api).post('/api/plugins/session-panel/changes', json={'sessions': ['S1']})
     assert out.status_code == 200 and out.json()['bundles'] == {}
+
+
+def test_decision_refresh_route_publishes_compact_canonical_model_and_releases_reader(api, monkeypatch):
+    steps = load('_spf_interactive_steps_api', HERE.parents[2] / 'user-steps' / 'dashboard' / 'plugin_api.py')
+    released = []
+    BaseReaders = api.CoreReaders
+
+    class InteractiveReaders(BaseReaders):
+        _user_step_api = staticmethod(lambda: steps)
+
+        def decision_inputs(self, session, lineage):
+            return {'outcome_json': None, 'requests': []}
+
+        def release(self):
+            released.append(True)
+
+    monkeypatch.setattr(api, 'CoreReaders', InteractiveReaders)
+    feed = api._load_feed().PROCESS_FEED
+    feed.changes(['S1'])
+    before = feed.bundles['S1']['bundle']['computed_at']
+    response = _client(api).post('/api/plugins/session-panel/decision-refresh', json={'session': 'S1'})
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert set(payload['bundle']) == {'session', 'lineage', 'model', 'tasks'}
+    assert payload['bundle']['session'] == 'S1'
+    assert payload['bundle']['model']['version'] == 1
+    assert set(payload['bundle']['tasks'][0]) <= {'id', 'gateway', 'profile', 'board'}
+    assert feed.bundles['S1']['bundle']['computed_at'] == before
+    assert released == [True]
+    cold = _client(api).post('/api/plugins/session-panel/decision-refresh', json={'session': 'not-hydrated'})
+    assert cold.status_code == 409
+    assert released == [True, True]

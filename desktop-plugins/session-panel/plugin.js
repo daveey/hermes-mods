@@ -96,13 +96,21 @@ export function feedVouches(route, nowMs = Date.now()) {
   const st = route?.connectionId ? feeds.get(connKey(route.connectionId, route.profile)) : null
   return feedIsLive(route, nowMs) && !!st?.fresh?.includes(route.session)
 }
-export const resetFeedForTests = () => { feeds.clear(); feedFlights.clear(); feedQueued.clear(); modelCache.clear() }
+const modelVersions = new Map()
+export const resetFeedForTests = () => { feeds.clear(); feedFlights.clear(); feedQueued.clear(); modelCache.clear(); modelVersions.clear() }
 
 /** Cache only the model. Missing/unsupported models invalidate this exact scope; raw cards are never a fallback. */
-export function ingestBundle(connectionId, profile, b) {
+export function ingestBundle(connectionId, profile, b, version = null) {
   if (!connectionId || !b?.session) return false
   profile = profile || 'default'
   const scope = routeKey({ connectionId, profile, session: b.session })
+  const old = modelVersions.get(scope)
+  if (version && old?.feed === version.feed && old?.epoch === version.epoch && old.rev > version.rev) return false
+  if (version) {
+    modelVersions.delete(scope)
+    modelVersions.set(scope, { feed: version.feed, epoch: version.epoch, rev: version.rev })
+    if (modelVersions.size > MODEL_CACHE_MAX) modelVersions.delete(modelVersions.keys().next().value)
+  }
   modelCache.delete(scope)
   if (validModel(b.model)) {
     modelCache.set(scope, b.model)
@@ -212,7 +220,7 @@ async function feedCatchUpNow(target, { nowMs = Date.now(), reset = false, full 
   feeds.set(key, next)
   if (cur?.epoch !== r.epoch || cur?.feed !== r.feed) feedLog(`${target.connectionId}/${profile} registered feed=${r.feed} epoch=${r.epoch} rev=${next.rev} watching=${target.sessions.length} bundles=${Object.keys(r.bundles || {}).length}`)
   next.fresh = cur?.feed === r.feed && cur?.epoch === r.epoch ? cur.fresh || [] : []
-  for (const b of Object.values(r.bundles || {})) ingestBundle(target.connectionId, profile, b)
+  for (const b of Object.values(r.bundles || {})) ingestBundle(target.connectionId, profile, b, r)
   return true
 }
 
@@ -239,7 +247,7 @@ export function onFeedEvent(ev) {
   if (rev <= st.rev) return // already have it (a catch-up answered first)
   if (Number(p.prev) !== st.rev || (Array.isArray(p.sessions) && p.sessions.length)) { void feedCatchUp(target); return }
   st.rev = rev
-  for (const b of Object.values(p.bundles || {})) ingestBundle(st.connectionId, st.profile, b)
+  for (const b of Object.values(p.bundles || {})) ingestBundle(st.connectionId, st.profile, b, p)
   confirmFeed(st, p.fresh)
   if (!wasLive) void feedCatchUp(target, { full: true })
 }
@@ -270,7 +278,7 @@ export async function feedPeek(target, { timeoutMs = 5_000 } = {}) {
   const older = Number(r.rev) < cur.rev
   for (const b of Object.values(r.bundles || {})) {
     if (older && cachedModel({ connectionId: target.connectionId, profile, session: b?.session })) continue
-    ingestBundle(target.connectionId, profile, b)
+    ingestBundle(target.connectionId, profile, b, r)
   }
   cur.sessions = [...new Set([...(cur.sessions || []), ...target.sessions])]
   return true
@@ -578,6 +586,7 @@ export async function modelRequestRoute(action, sourceRoute, call, { delays = MO
 }
 const modelApi = (path, opts) => window.hermesDesktop.api({ path, timeoutMs: 10_000, ...opts })
 export async function chooseModelOption(row, option, sourceRoute, { call = modelApi } = {}) {
+  const clicked = performance.now()
   const action = row.actions.find(a => a.kind === 'decide')
   if (!row.request_id || !action?.owner || action.request_id !== row.request_id || action.revision !== row.request_revision || !option.choice_id) throw Error('No canonical decision binding')
   const key = modelDecisionKey(row)
@@ -585,6 +594,7 @@ export async function chooseModelOption(row, option, sourceRoute, { call = model
   modelDecisions.set(key, { locked: true, text: 'Checking decision owner…' }); modelChanged()
   try {
     const { route, request } = await modelRequestRoute(action, sourceRoute, call)
+    feedLog(`decision owner-ready elapsed_ms=${(performance.now()-clicked).toFixed(1)}`)
     const choice = request.choices?.find(c => c.id === option.choice_id)
     if (request.revision !== action.revision || request.state !== 'open' || request.resolution || !choice) throw Error('Request changed. Refresh the panel before choosing.')
     if (['approve', 'answer'].includes(choice.effect) && (!request.scope?.complete || !request.scope.markdown?.trim())) throw Error('The complete scope is not available. No decision posted.')
@@ -592,14 +602,48 @@ export async function chooseModelOption(row, option, sourceRoute, { call = model
     const decision = { session: route.session, expectedRevision: action.revision, choiceId: option.choice_id,
       ...(choice.effect === 'answer' ? { revisionText: choice.label } : {}), idempotencyKey: globalThis.crypto.randomUUID() }
     // Retain BEFORE POST. A timeout or reload must not permit a second choice or new key.
-    window.localStorage.setItem(MODEL_INTENT_PREFIX + key, JSON.stringify({ route, owner: action.owner, requestId: action.request_id, decision }))
+    window.localStorage.setItem(MODEL_INTENT_PREFIX + key, JSON.stringify({ route, sourceRoute, owner: action.owner, requestId: action.request_id, decision }))
     modelDecisions.set(key, { locked: true, text: 'Submitting decision…' }); modelChanged()
-    await call(`/api/plugins/user-steps/requests/${encodeURIComponent(action.request_id)}/decisions`, { ...route, method: 'POST', body: decision })
-    await checkModelDecision(row, { call })
+    const posted = performance.now()
+    const data = await call(`/api/plugins/user-steps/requests/${encodeURIComponent(action.request_id)}/decisions`, { ...route, method: 'POST', body: decision })
+    feedLog(`decision response operation=${data?.operation?.operationId || 'unknown'} post_ms=${(performance.now()-posted).toFixed(1)} elapsed_ms=${(performance.now()-clicked).toFixed(1)}`)
+    const intent = { route, sourceRoute, owner: action.owner, requestId: action.request_id, decision }
+    // Modern owners return the durable canonical operation. Do not throw that
+    // receipt away and wait on three redundant GETs before repainting.
+    if (applyDecisionReceipt(row, intent, data)) await refreshDecisionPanel(intent, call)
+    else await checkModelDecision(row, { call }) // mixed-version owner
   } catch (e) {
     const retained = window.localStorage.getItem(MODEL_INTENT_PREFIX + key)
     modelDecisions.set(key, { locked: !!retained, text: retained ? `Outcome unknown: ${e.message}. Check status; do not choose again.` : e.message })
     modelChanged()
+  }
+}
+function applyDecisionReceipt(row, intent, data) {
+  const op = data?.operation, r = data?.request, id = op?.operationId || op?.id
+  if (!id || !sameModelOwner(r?.owner, intent.owner) || r.requestId !== intent.requestId || r.revision < intent.decision.expectedRevision ||
+    (op.requestId && op.requestId !== intent.requestId) || (op.owner && !sameModelOwner(op.owner, intent.owner)) ||
+    (op.idempotencyKey && op.idempotencyKey !== intent.decision.idempotencyKey) || r.resolution?.operationId !== id) return false
+  const state = op.dispatchState || op.state
+  modelDecisions.set(modelDecisionKey(row), { locked: true, text: state === 'delivered' ? 'Decision delivered.' : `Decision recorded; delivery ${state || 'unconfirmed'}. Check status.` })
+  modelChanged()
+  return true
+}
+async function refreshDecisionPanel(intent, call) {
+  const route = intent.sourceRoute || intent.route
+  const started = performance.now()
+  try {
+    const data = await call('/api/plugins/session-panel/decision-refresh', { ...route, method: 'POST', body: { session: route.session } })
+    if (data?.bundle?.session !== route.session || !validModel(data.bundle.model) || typeof data.epoch !== 'string' || !Number.isSafeInteger(data.rev)) throw Error('Panel refresh unavailable')
+    const cur = feeds.get(connKey(route.connectionId, route.profile))
+    if (cur && (cur.feed !== data.feed || cur.epoch !== data.epoch)) return
+    // An unrelated chat may have advanced the connection cursor. The per-scope
+    // version fence below, not that global cursor, owns this model's freshness.
+    // Only backend-authored classification/counts; never move a row locally on
+    // the assumption that recording a choice means a worker is running.
+    ingestBundle(route.connectionId, route.profile, data.bundle, data)
+    feedLog(`decision model-applied refresh_ms=${(performance.now()-started).toFixed(1)} rev=${data.rev}`)
+  } catch (e) {
+    log('decision recorded; panel refresh deferred', e?.message || e)
   }
 }
 export async function checkModelDecision(row, { call = modelApi } = {}) {
@@ -616,9 +660,8 @@ export async function checkModelDecision(row, { call = modelApi } = {}) {
     const op = data?.operation, r = data?.request
     if (!op || (op.operationId || op.id) !== id || !sameModelOwner(r?.owner, intent.owner) || r.requestId !== intent.requestId || r.revision < intent.decision.expectedRevision ||
       (op.requestId && op.requestId !== intent.requestId) || (op.owner && !sameModelOwner(op.owner, intent.owner))) throw Error('Invalid decision receipt')
-    const state = op.dispatchState || op.state
-    const confirmed = state === 'delivered' && r.resolution?.operationId === id
-    modelDecisions.set(key, { locked: true, text: confirmed ? 'Decision delivered.' : `Decision recorded; delivery ${state || 'unconfirmed'}. Check status.` })
+    if (!applyDecisionReceipt(row, intent, data)) throw Error('Invalid decision receipt')
+    await refreshDecisionPanel(intent, call)
     // Keep intent even after confirmation: an old cached model must never offer the choice again.
     void request
   } catch (e) { modelDecisions.set(key, { locked: true, text: `Outcome unknown: ${e.message}. Check status.` }) }
