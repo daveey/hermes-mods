@@ -709,7 +709,9 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         owner = next((views[k] for k, row in rows_by_key.items() if k in views and any(_matches(row, a, same_gateway) for a in _aliases(r))), None)
         if owner is not None and 'decision' not in owner:
             owner['decision'] = info
-            if owner['detail'] == 'blocked · answered' or obj(r.get('delivery')).get('state') == 'delivering':
+            # Suppress only the redundant answered-ask placeholder. Delivery is a
+            # separate line, never a replacement for the owner's execution status.
+            if owner['detail'] == 'blocked · answered':
                 owner['detail'] = ''
         elif owner is None:
             own = obj(r.get('owner'))

@@ -45,4 +45,11 @@ for departed in (False, True):
                            'text': 'Delivery to remote not confirmed (120 min)' if unconfirmed else 'Delivering…'})
         cases[f'retiring_{departed}_{unconfirmed}'] = f.bundle(
             *([] if departed else [f.task(human_request=f.human(), wait={'wait_state': 'human'})]), requests=[r])
+for name, row in f.retiring_owner_cases().items():
+    for unconfirmed in (False, True):
+        r = f.request(state='cancelled')
+        r.update(resolution={'operationId': 'retiring-op', 'choiceId': 'card-0', 'revision': 3},
+                 delivery={'state': 'delivering', 'text': 'Delivery to remote not confirmed (120 min)' if unconfirmed else 'Delivering…'})
+        cases[f'owner_delivery_{name}_{unconfirmed}'] = f.bundle(row, requests=[r])
+        cases[f'owner_baseline_{name}'] = f.bundle(row)
 print(json.dumps({name: {'model': f.model.reduce_panel(b, now=f.NOW, projector=f.project)} for name, b in cases.items()}))
