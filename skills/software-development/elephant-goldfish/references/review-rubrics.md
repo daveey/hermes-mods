@@ -36,7 +36,7 @@ You are a capable engineer new to this project.
 
 ## Design
 
-Stress-test the design (this lens runs on the strongest model).
+Stress-test the design (this lens may request `class:deep`, with provider omitted and never mandatory).
 1. Problem, goals and non-goals: present and consistent with each other?
 2. Alternatives: were other viable designs considered, and rejected for stated reasons?
 3. Unbacked claims about external systems, data, performance or limits.

@@ -8,11 +8,17 @@ not, the gateway logs once per wall episode and reason:
 
 | reason | meaning | action |
 |---|---|---|
-| `explicit` | David's switch, a model he named, or a Kanban card pin | holds by design; `/model` to switch |
+| `explicit` | David's interactive chat switch or a model he named for that chat | holds by design for interactive chat; `/model` to switch |
 | `key` | the session was launched with an API key | holds by design |
 | `endpoint` | the creation request names a foreign base_url | holds by design |
 | `no-target` | no other route in the class can serve now | check the other pools |
 | `no-session` | lookup ran with no routing session | core bug: file a card |
+
+Legacy Kanban exact pins can also produce `explicit`; that is diagnostic history, not a policy to retain
+them. For Kanban and delegate reviews, clear exact-model/provider and mandatory restrictions through the
+supported routing interface. Use no selector or an optional `class:deep`, `class:standard` or `class:fast`
+preference, with provider omitted and never mandatory. Keep real quota/pacing and billing gates intact;
+review independence requires fresh run/session custody and the supported review handoff, not model identity.
 
 A Desktop chat's own provider URL (`https://chatgpt.com/backend-api/codex` for openai-codex) is not
 `endpoint`: it overrides nothing (`overrides_endpoint`). Core fix 78c49a510ba on main;

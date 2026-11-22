@@ -1023,8 +1023,8 @@ def test_do_it_creates_the_fix_card_with_red_green_acceptance(store, monkeypatch
     argv, verify = r.creates()[-2:]  # a default-board fix is a portable FIX card plus its hub VERIFY child
     assert out["action"] == "filed" and opt(argv, "--idempotency-key") == f"selfheal:{fp}:fix"
     assert opt(verify, "--idempotency-key") == f"selfheal:{fp}:verify" and opt(verify, "--parent") == out["card"]
-    assert opt(argv, "--model") == "claude-opus-5-5"  # the fix card writes and ships code: pinned
-    assert opt(argv, "--provider") == "anthropic"  # hub default provider is openai-codex: a bare opus model is refused
+    assert opt(argv, "--model") == "class:deep"  # the fix card writes and ships code: class-routed, never a concrete pin
+    assert "--provider" not in argv and "--pin-mandatory" not in argv
     assert "--model" not in verify and "--provider" not in verify  # verify follows the board model tier
     body = opt(argv, "--body")
     for part in ("add test_sort_stable", "FAILING", "PASSING", "fix_shas"):

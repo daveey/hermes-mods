@@ -165,7 +165,7 @@ def test_new_defect_files_one_card_that_fixes_and_verifies(env):
     assert f"{sh.SELF_EVENT} fixed {fp}" in body and "--result result.md" in body  # the verify card's receipt
     assert "event proposed" not in body and "proposal.md" not in body
     assert sh.NATURAL_EVENT_RULE.strip() in body  # the exact-symptom live proof stays on the card
-    assert argv[argv.index("--model") + 1] == sh.MODEL and argv[argv.index("--max-runtime") + 1] == str(sh.FIX_RUNTIME)
+    assert argv[argv.index("--model") + 1] == "class:deep" and "--provider" not in argv and "--pin-mandatory" not in argv and argv[argv.index("--max-runtime") + 1] == str(sh.FIX_RUNTIME)
     st = sh.LaneState(env.store.root).get(fp)
     assert st["status"] == "filed" and st["one_card"] is True
     assert events(env.store, "selfheal_filed")[-1]["one_card"] is True

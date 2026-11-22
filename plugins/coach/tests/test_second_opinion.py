@@ -1,4 +1,4 @@
-"""second_opinion: fix loop -> one Opus review card; unverified + repo diff -> one Opus diff review."""
+"""second_opinion: fix loop -> one class:deep card; unverified + repo diff -> one aux diff review."""
 import importlib.util
 import json
 import subprocess
@@ -50,7 +50,7 @@ def _fix_turn(hooks, user, path, reply, sid="s1"):
     return (out or {}).get("context", "")
 
 
-def test_second_failed_fix_creates_one_opus_card_idempotent(tmp_path, env):
+def test_second_failed_fix_creates_one_class_deep_card_idempotent(tmp_path, env):
     coach, hooks, store, calls, board = _fixloop_hooks(tmp_path, env)
     _fix_turn(hooks, "fix the login 500", "/repo/auth.py", "Fixed the login 500; it was a null session.")
     h1 = _fix_turn(hooks, "still getting the 500", "/repo/session.py", "Fixed for real: session cookie path.")
@@ -58,7 +58,8 @@ def test_second_failed_fix_creates_one_opus_card_idempotent(tmp_path, env):
     h2 = hooks["pre_llm_call"](session_id="s1", user_message="nope, still 500")["context"]
     assert len(calls) == 1
     a = calls[0]
-    assert a["model"] == "claude-opus-5-5" and a["assignee"] == "default" and a["session_id"] == "s1"
+    assert a["model"] == "class:deep" and a["assignee"] == "default" and a["session_id"] == "s1"
+    assert "provider" not in a and "pin_mandatory" not in a
     assert "do not edit" in a["body"].lower()
     assert "## Original ask\nfix the login 500" in a["body"]
     for s in ("still getting the 500", "nope, still 500", "null session", "session cookie path",

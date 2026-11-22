@@ -73,6 +73,8 @@ def test_ci_cost_request_is_held_without_a_model_call(gate, tmp_path):
     assert gate.LLM.seen == []  # deterministic: held before the judge
     assert "replan" in r["message"].lower()
     assert "spend, permission, acceptance" in r["message"]
+    assert "class:deep" in r["message"]
+    assert "claude-opus" not in r["message"] and "pinned to" not in r["message"]
     held = _events(tmp_path, "replan_hold")
     assert held and held[0]["tool"] == "kanban_block"
 

@@ -65,8 +65,8 @@ HOLD_MESSAGE = (
     "ask-gate: replan_hold. This ask hands David a choice between ending an approved goal with its target unmet and "
     "a new approach to it (\"expand scope\", \"redesign\", \"new approach\"). A new approach to the same approved goal "
     "is not new scope: approval covers the goal and its limits, not the first plan. Write the new approach on the "
-    "owner card (kanban_comment), get an independent review (a reviewer card, or delegate_task pinned to "
-    "claude-opus-5-5 + anthropic), then continue the work. Ask David only when a limit changes: name it in "
+    "owner card (kanban_comment), get an independent review (a separate reviewer run/session using class:deep "
+    "or capability routing, never a concrete model/provider pin), then continue the work. Ask David only when a limit changes: name it in "
     "why_human/the ask (spend, permission, acceptance or safety: e.g. \"$40 over the approved cap\", \"needs admin "
     "access\", \"lowers the 50% target\") or the step only a human can do.")
 

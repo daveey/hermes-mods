@@ -1087,8 +1087,8 @@ config turns them on.
 
 - **Fix loop → review card.** On the 2nd judge-confirmed failed fix inside one window (8 user turns), the plugin opens
   ONE Kanban card through the `kanban_create` tool handler. That is the path that stamps this session as the card's
-  origin and subscribes the chat, so the card shows in the chat's task strip. The card is pinned to
-  `model: claude-opus-5-5`, has a 30-minute runtime cap, and is assigned to `default`. Its body holds the original
+  origin and subscribes the chat, so the card shows in the chat's task strip. The card requests
+  `model: class:deep` with no provider or mandatory selector, has a 30-minute runtime cap, and is assigned to `default`. Its body holds the original
   ask, each "fixed" claim the agent made and the user's reply to it, the files touched in those turns (from the tool
   log), and the instruction **"trace and report what you observe; do not edit"**. The agent's hint names the card and
   says not to patch again until it has read the handoff (`kanban_show`). Idempotent: the key is
@@ -1109,10 +1109,19 @@ config turns them on.
   (repos, findings, diff size, seconds).
 
 Settings (env wins, then config `plugins.entries.coach.settings.<key>`): `fixloop_review` / `COACH_FIXLOOP_REVIEW`,
-`fixloop_review_model` (default `claude-opus-5-5`), `fixloop_review_provider`, `fixloop_review_assignee` (default
+`fixloop_review_assignee` (default
 `default`), `diff_review` / `COACH_DIFF_REVIEW`, `diff_review_max_chars` (60000), `diff_review_timeout_s` (120), and
 `diff_review_threshold` (default: the reply threshold). The reviewer model is `auxiliary.coach_diff_review.{provider,model}`
-(shared config: anthropic / claude-opus-5-5). Without that key, `fixloop_review_model` is passed.
+Without that key the auxiliary requests `class:deep`. Legacy `fixloop_review_model` and
+`fixloop_review_provider` keys (including environment overrides) are ignored; shared config cannot
+reintroduce an exact Kanban pin. Genuine review independence remains a separate run/session with
+authentic author/reviewer custody through the supported review handoff, never a concrete pin.
+
+All self-heal code-writing producers (one-card, fix, backport and lane-defect) request `class:deep`;
+investigation, verify, backlog and undeployed cards keep the board's class routing. The shared argv
+builder drops legacy concrete model/provider overrides and never emits `--provider` or `--pin-mandatory`.
+Regression coverage: `test_self_heal_class_routing.py`, `test_second_opinion_class_routing.py`,
+`test_self_heal_lane.py` and `test_self_heal_one_card.py`.
 
 **Cost, measured (MacBook `state.db`, 14 days to 2026-10-19, 6,717 non-cron turns in 2,484 sessions).** Method:
 `eval/second_opinion_replay.py --judge` rebuilds every turn and replays the shipped detectors, including the real

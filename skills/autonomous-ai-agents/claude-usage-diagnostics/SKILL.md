@@ -64,6 +64,12 @@ Probe **all models on all credentials** and report the matrix. Partial availabil
 - An enabled `fast-rate-limit-fallback` plugin may still be inactive: run its `check.py` with the managed Hermes Python and inspect `wrappers_active`. After upgrades, AST compatibility guards can disable wrappers while the plugin list still reports enabled. Do not replace compatibility fingerprints without auditing changed core behavior and rerunning regression tests.
 
 For managed routing or unavailable independent reviewers, read `references/managed-routing-evidence.md`.
+Kanban and delegate review recovery must use capability-only routing: no selector or an optional
+`class:deep`, `class:standard` or `class:fast`, with provider omitted and never mandatory. Remove legacy
+exact-model/provider restrictions through supported interfaces, not a scheduled restoration of exclusivity.
+Keep interactive chat model guidance, diagnostic account×model probes and benchmark/judge auxiliary calls
+separate from worker routing. Review independence requires genuine run/session custody and the supported
+review handoff, not different model identities; preserve quota, pacing, funding and billing gates.
 
 ### Managed workers versus direct CLI
 

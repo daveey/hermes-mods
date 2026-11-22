@@ -1,7 +1,7 @@
 """second_opinion: the coach's two checkpoints act instead of only advising.
 
 1. Fix loop (pre_llm_call): on the 2nd judge-confirmed failed fix inside fix_loop's window, open ONE read-only
-   review card pinned to a strong model (default claude-opus-5-5). It carries the user's complaints, the agent's
+   review card requesting class:deep (provider chosen by the router). It carries the user's complaints, the agent's
    prior claims, the files touched in the failing turns, and "trace and report what you observe; do not edit".
    The agent's hint names the card and says to read its handoff before patching again. Idempotent per
    session + loop window (kanban idempotency key; a 3rd failure in the same window reuses the card).
@@ -16,16 +16,16 @@ Both are OFF by default (current behaviour). Settings: env first, then config.ya
 | key | env | default |
 |---|---|---|
 | fixloop_review | COACH_FIXLOOP_REVIEW | false |
-| fixloop_review_model | COACH_FIXLOOP_REVIEW_MODEL | claude-opus-5-5 |
-| fixloop_review_provider | COACH_FIXLOOP_REVIEW_PROVIDER | "" (assignee profile's provider) |
+
 | fixloop_review_assignee | COACH_FIXLOOP_REVIEW_ASSIGNEE | default |
 | diff_review | COACH_DIFF_REVIEW | false |
 | diff_review_max_chars | COACH_DIFF_REVIEW_MAX_CHARS | 60000 |
 | diff_review_timeout_s | COACH_DIFF_REVIEW_TIMEOUT_S | 120 |
 | diff_review_threshold | COACH_DIFF_REVIEW_THRESHOLD | reply threshold (0.7) |
 
-The diff reviewer's model is the aux task's: `auxiliary.coach_diff_review.{provider,model}` (shared-config pins
-anthropic / claude-opus-5-5). With no aux config, `fixloop_review_model` is passed as the model.
+The diff reviewer's model is the aux task's: `auxiliary.coach_diff_review.{provider,model}`.
+With no aux config it requests class:deep. Legacy fixloop_review_model/provider config and environment
+values are ignored; they cannot constrain Kanban routing.
 """
 from __future__ import annotations
 
@@ -62,8 +62,7 @@ _FALSE = ("0", "off", "false", "no", "")
 
 DEFAULTS = {
     "fixloop_review": False,
-    "fixloop_review_model": "claude-opus-5-5",
-    "fixloop_review_provider": "",
+
     "fixloop_review_assignee": "default",
     "diff_review": False,
     "diff_review_max_chars": 60000,
@@ -242,8 +241,7 @@ def record_fail(state: dict, turn: int, user_text: str, issue: str) -> list[dict
 
 def card_args(session_id: str, recs: list[dict], ask: str = "", settings: Optional[dict] = None) -> dict:
     ask = ask or (recs[0].get("ask") if recs else "") or ""
-    model = setting("fixloop_review_model", settings)
-    provider = setting("fixloop_review_provider", settings)
+
     files: list[str] = []
     for r in recs:
         files += [f for f in r.get("files") or [] if f not in files]
@@ -274,10 +272,9 @@ def card_args(session_id: str, recs: list[dict], ask: str = "", settings: Option
     args = {"title": f"Second opinion (read-only): {incident_title(issue)}", "assignee": setting("fixloop_review_assignee", settings),
             "body": "\n".join(lines),
             "idempotency_key": f"coach-fixloop:{session_id}:{int(recs[0]['ts']) if recs else 0}",
-            "max_runtime_seconds": 1800, "model": model,
+            "max_runtime_seconds": 1800, "model": "class:deep",
             "placement": "local"}  # explicit pin: see the reason sentence in the body
-    if provider:
-        args["provider"] = provider
+
     if session_id:
         args["session_id"] = session_id
     return args
@@ -305,7 +302,7 @@ def fixloop_review(state: dict, session_id: str, turn: int, hit: dict, user_text
         if not tid:
             return None
         state["review_card"] = {key: tid}
-    return (f"[coach] A read-only second-opinion card `{tid}` (pinned to {setting('fixloop_review_model', settings)}) "
+    return (f"[coach] A read-only second-opinion card `{tid}` (class:deep routing) "
             f"is now tracing this failure with your claims, the user's replies and the files you touched. Don't patch "
             f"again until you've read its handoff: `kanban_show(task_id=\"{tid}\")` (you'll be notified when it "
             f"finishes). Meanwhile gather raw evidence only.")
@@ -333,7 +330,7 @@ def review_prompt(ask: str, reply: str, log_lines: list, diffs: dict[str, str]) 
 
 
 def aux_review(system: str, prompt: str, timeout: float = 120, settings: Optional[dict] = None) -> str:
-    """Aux task `coach_diff_review`; when that task has no model configured, pin fixloop_review_model."""
+    """Aux task `coach_diff_review`; without an aux model, request class:deep."""
     from agent.auxiliary_client import call_llm  # type: ignore
     kw: dict[str, Any] = {}
     try:
@@ -342,10 +339,7 @@ def aux_review(system: str, prompt: str, timeout: float = 120, settings: Optiona
     except Exception:
         aux = {}
     if not aux.get("model"):
-        kw["model"] = setting("fixloop_review_model", settings)
-        prov = setting("fixloop_review_provider", settings)
-        if prov:
-            kw["provider"] = prov
+        kw["model"] = "class:deep"
     resp = call_llm(task="coach_diff_review", messages=[{"role": "system", "content": system},
                                                        {"role": "user", "content": prompt}],
                     max_tokens=900, temperature=0, timeout=timeout, **kw)
