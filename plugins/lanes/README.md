@@ -116,7 +116,15 @@ size limits (16 KiB commands, 8 MiB replies), session/request/revision/parameter
 and captured plugin/core code hashes fence malformed or mixed-deployment replies.
 Code identity movement fails unavailable until a matching natural backend rotation;
 it never blesses new disk hashes from a stale parent. One projection runs globally,
-with at most one pending revision per legal parameter key (32 keys) and 128 viewers.
+with at most one pending revision per hours/window pair (16 pairs) and 128 viewers.
+Collapsed and expanded viewers share that source job: the hub runs the existing pure
+presentation projection twice on its one snapshot/raw result and fans out the exact
+requested variant. Opposite variants no longer each consume a global burst gap.
+One completed successful result may satisfy a same-revision late joiner within the
+existing gap, after another code-identity check on the supervisor thread. This never
+extends the gap deadline; it is discarded on expiry or replacement, and fallback
+results are never retained. Generation AND cursor digest must match; no mutable
+SQLite evidence/history survives the job.
 
 Startup/job failure bounds are 5/10 s, not latency promises. Child failure uses a fresh,
 uncached in-process fallback, one daemon slot held through actual completion with a

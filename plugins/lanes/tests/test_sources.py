@@ -15,7 +15,8 @@ board = fixtures.board
 from test_projector import actual_board
 
 
-def test_owner_status_push_does_not_wait_for_replica(actual_board, tmp_path, monkeypatch):
+@pytest.mark.parametrize('variants', [(True, True, True), (False, True, False)])
+def test_owner_status_push_does_not_wait_for_replica(actual_board, tmp_path, monkeypatch, variants):
     sources = pytest.importorskip('hermes_cli.kanban_lanes_sources')
     from hermes_cli import kanban_db_connect as kbc
     api, config = actual_board
@@ -57,8 +58,8 @@ def test_owner_status_push_does_not_wait_for_replica(actual_board, tmp_path, mon
                 stop.wait(.05)
     writer = threading.Thread(target=churn)
     with TestClient(app) as client, contextlib.ExitStack() as sockets:
-        viewers = [sockets.enter_context(client.websocket_connect('/v1/lanes/stream?expanded=true')) for _ in range(3)]
-        for ws in viewers:
+        viewers = [sockets.enter_context(client.websocket_connect(f'/v1/lanes/stream?expanded={str(flag).lower()}')) for flag in variants]
+        for ws, expanded in zip(viewers, variants):
             assert ws.receive_json()['view']['totals']['running'] == 1
         start = time.monotonic()
         writer.start()
@@ -66,19 +67,23 @@ def test_owner_status_push_does_not_wait_for_replica(actual_board, tmp_path, mon
             with connect() as conn:
                 conn.execute("UPDATE tasks SET status='scheduled' WHERE id='t_pr'")
                 conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('t_pr','scheduled','{}',100)")
-            for ws in viewers:
+            for ws, expanded in zip(viewers, variants):
                 frame = ws.receive_json()
                 assert time.monotonic() - start < 3
                 assert frame['view']['totals']['running'] == 0
-                assert frame['view']['totals']['open'] == frame['view']['flow']['graphs']['project']['total'] == 1
+                assert frame['view']['totals']['open'] == 1
+                if expanded:
+                    assert frame['view']['flow']['graphs']['project']['total'] == 1
             start = time.monotonic()
             with connect() as conn:
                 conn.execute("UPDATE tasks SET status='archived' WHERE id='t_pr'")
                 conn.execute("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES('t_pr','archived','{}',100)")
-            for ws in viewers:
+            for ws, expanded in zip(viewers, variants):
                 frame = ws.receive_json()
                 assert time.monotonic() - start < 3
-                assert frame['view']['totals']['open'] == frame['view']['flow']['graphs']['project']['total'] == 0
+                assert frame['view']['totals']['open'] == 0
+                if expanded:
+                    assert frame['view']['flow']['graphs']['project']['total'] == 0
         finally:
             stop.set()
             writer.join(3)

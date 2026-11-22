@@ -80,13 +80,14 @@ def main():
                 started = time.time()
                 with readers(config['local'], config.get('fleet'), cmd['mode']) as (local, fleet):
                     from hermes_cli.kanban_lanes_sources import presentation
-                    view = api._project_evidence(api.core(), local, presentation(local, fleet), *cmd['params'])
+                    views = api._project_evidence(api.core(), local, presentation(local, fleet), *cmd['params'], variants=True)
+                    view = views['expanded' if cmd['params'][2] else 'collapsed']
                 finished = time.time()  # snapshots released before publish
                 if not identity.matches(manifest):
                     raise RuntimeError('code identity moved')
                 send(envelope(cmd, 'result') | {'view': view, 'params': cmd['params'],
-                     'revision': cmd['revision'], 'projector_pid': os.getpid(),
-                     'timing': {'project_start': started, 'project_end': finished}})
+                     'revision': cmd['revision'], 'views': views, 'projector_pid': os.getpid(),
+                     'timing': {'project_start': started, 'project_end': finished, 'reply_start': time.time()}})
             except Exception:
                 send(envelope(cmd, 'error'))  # no paths, SQL, tokens or exception text
             finally:
