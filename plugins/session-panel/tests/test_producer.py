@@ -443,19 +443,14 @@ def test_a_quiet_backend_still_ages_open_work_and_retries_and_an_idle_one_does_n
     f.changes(['S1'])  # the test readers give every chat a running card
     f.tick()
     assert f.bundles['S1']['bundle'].get('tasks')
-    assert f._due(t['now'])[0] == pytest.approx(f.full_every_s), 'due when its run evidence and counted time age'
+    assert f._due(t['now']) == (None, None)
     assert f.idle_wait() == f.heartbeat_s
-    t['now'] += f.full_every_s - 5
-    assert f.idle_wait() == pytest.approx(5), 'the loop sleeps to that moment, not to the next heartbeat after it'
-    f.beat()
-    assert not f._wake.is_set()
-    t['now'] += 5
     before = f.bundles['S1']['bundle']['computed_at']
+    t['now'] += f.full_every_s + 1
     f.beat()
-    assert f._wake.is_set(), 'no write for full_every_s: the safety-net pass is woken'
-    f.tick()
-    assert f.bundles['S1']['bundle']['computed_at'] > before and not f._wake.is_set()
-    assert f._due(t['now'])[0] == pytest.approx(f.full_every_s)
+    assert not f._wake.is_set(), 'ageing held inputs is not a database refresh'
+    assert f.bundles['S1']['bundle']['computed_at'] == before
+    assert f._due(t['now']) == (None, None)
 
 
 def test_a_chat_with_no_open_work_is_not_due_before_the_quiet_period():
@@ -470,25 +465,26 @@ def test_a_chat_with_no_open_work_is_not_due_before_the_quiet_period():
     assert not f._wake.is_set() and not f._decide.is_set(), 'idle: nothing woken, nothing read'
     t['now'] = b['computed_at'] + feedmod.QUIET_FULL_EVERY_S
     f.beat()
-    assert f._wake.is_set()
+    assert not f._wake.is_set()
 
 
-def test_a_pending_retry_wakes_a_pass_without_a_write():
+def test_a_pending_retry_waits_for_an_external_trigger():
     f, r, pushed, t = make()
     f.changes(['S1'])
     f.tick()
     f._retry.add('S1')  # a read that raced its change cursor (or a stale source row)
-    assert f.idle_wait() == pytest.approx(feedmod.RETRY_EVERY_S)
+    assert f.idle_wait() == f.heartbeat_s
     f.beat()
     assert not f._wake.is_set(), 'not back to back'
     t['now'] += feedmod.RETRY_EVERY_S
     f.beat()
-    assert f._wake.is_set()
+    assert not f._wake.is_set() and 'S1' in f._retry
+    r.stamp += 1
     f.tick()
     assert 'S1' not in f._retry
 
 
-def test_a_failed_decision_read_wakes_the_decision_lane_without_a_write():
+def test_a_failed_decision_read_recovers_on_a_source_event_not_a_timer():
     f, r, pushed, t = make(Stamped())
     f.changes(['S1'])
     f.refresh_decisions()
@@ -498,11 +494,12 @@ def test_a_failed_decision_read_wakes_the_decision_lane_without_a_write():
     f.refresh_decisions()
     assert f._decision_failures == {'S1'}
     f.tick()
-    assert f.idle_wait() == pytest.approx(feedmod.RETRY_EVERY_S)
+    assert f.idle_wait() == f.heartbeat_s
     t['now'] += feedmod.RETRY_EVERY_S
     r.decision_inputs = real
     f.beat()
-    assert f._decide.is_set()
+    assert not f._decide.is_set() and f._decision_failures == {'S1'}
+    r.store += 1
     f.refresh_decisions()
     assert not f._decision_failures
     f._decide.clear()
@@ -511,7 +508,7 @@ def test_a_failed_decision_read_wakes_the_decision_lane_without_a_write():
     assert not f._decide.is_set()
 
 
-def test_the_event_loop_runs_the_due_pass_and_the_retries_with_no_write(tmp_path, monkeypatch):
+def test_the_event_loop_stays_idle_after_failure_until_a_write(tmp_path, monkeypatch):
     api = load('_spf_due_api', API)
     if not api.FileWatch().ok:
         pytest.skip('no kernel file notification on this platform')
@@ -545,8 +542,14 @@ def test_the_event_loop_runs_the_due_pass_and_the_retries_with_no_write(tmp_path
         assert f._decision_failures == {'S1'}
         computed.clear()
         time.sleep(4.2)  # no write at all
-        assert len(computed) >= 3, f'{len(computed)} recomputes of an open-card chat in 4 s at full_every_s=1'
-        assert not f._decision_failures, 'the failed decision read was retried'
+        assert computed == [], 'no timed full refresh, even with open work'
+        assert f._decision_failures == {'S1'}, 'no timed failed-read retry'
+        r.store += 1
+        r.db.write_bytes(b'2')
+        deadline = time.monotonic() + 3
+        while f._decision_failures and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not f._decision_failures, 'a write retries and recovers the decision read'
     finally:
         f.stopped.set()
         for t in threads:

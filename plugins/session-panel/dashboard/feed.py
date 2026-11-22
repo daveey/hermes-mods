@@ -256,7 +256,7 @@ class Feed:
             # Older feed code (a hot reload) reads neither `stopped` in its publish nor `_successor`: its entry points
             # are routed here as instance attributes (found before the class's), so a request still on it neither
             # moves its revision nor answers with one this feed never issued.
-            prev._publish = lambda computed, heartbeat=False, canonical_only=False: {}
+            prev._publish = lambda computed, heartbeat=False, canonical_only=False, age_only=False: {}
             prev.watch = self.watch
             prev.changes = self.changes
         return self
@@ -524,7 +524,7 @@ class Feed:
             self._publish_wire()
         return self
 
-    def _store(self, session: str, bundle: dict, *, canonical_only: bool = False) -> bool:
+    def _store(self, session: str, bundle: dict, *, canonical_only: bool = False, age_only: bool = False) -> bool:
         """Keep `bundle`; True when it differs from what clients last got (it took a new revision)."""
         prev = self.bundles.get(session)
         if canonical_only and (not prev or prev['bundle']['lineage'] != bundle['lineage']):
@@ -541,7 +541,7 @@ class Feed:
             elif old.get('canonical_seq', 0) > bundle.get('canonical_seq', 0) and old['lineage'] == bundle['lineage']:
                 bundle = {**bundle, **{k: old[k] for k in ('canonical_seq', 'outcome_json', 'requests')}}
                 merged = True
-            if not board_refresh and bundle.get('canonical_seq') and all(bundle.get(k) == old.get(k) for k in ('outcome_json', 'requests')):
+            if not age_only and not board_refresh and bundle.get('canonical_seq') and all(bundle.get(k) == old.get(k) for k in ('outcome_json', 'requests')):
                 prev['bundle'] = {**old, 'canonical_seq': max(old.get('canonical_seq', 0), bundle.get('canonical_seq', 0))}
                 return False  # no re-reduction of unchanged canonical data every second
             if merged and bundle.get('canonical_seq'):
@@ -571,18 +571,25 @@ class Feed:
                                  'lineage': set(bundle['lineage']), 'source_stale': source_stale}
         return True
 
-    def _publish(self, computed: dict[str, dict], *, heartbeat: bool = False, canonical_only: bool = False) -> dict[str, dict]:
+    def _publish(self, computed: dict[str, dict], *, heartbeat: bool = False, canonical_only: bool = False, age_only: bool = False) -> dict[str, dict]:
         """Store what was computed and push one batch (or a heartbeat when nothing changed and one is due)."""
         with self.compute_lock:
             if self.stopped.is_set():
                 return {}  # stopped (and possibly resumed by a successor): its revision space is no longer ours
             prev = self.rev
             with self.lock:
+                if age_only:
+                    # Reduce the current publication under its writer lock: never race a newer
+                    # canonical decision, and never renew computed_at or execution evidence.
+                    reducer = _model().reduce_panel
+                    now = self.clock()
+                    computed = {s: {**h['bundle'], 'model': reducer(h['bundle'], now=now)}
+                                for s, h in self.bundles.items() if s in self.interest}
                 for s, b in computed.items():
                     flight = self._flights.get(s)
                     if flight is not None and flight.bundle is b:
                         self._flights.pop(s)
-                changed = {s: self.bundles[s]['bundle'] for s, b in computed.items() if s in self.interest and self._store(s, b, canonical_only=canonical_only)}
+                changed = {s: self.bundles[s]['bundle'] for s, b in computed.items() if s in self.interest and self._store(s, b, canonical_only=canonical_only, age_only=age_only)}
                 self._publish_wire()
             now = self.clock()
             if changed or (heartbeat and now - self.last_emit >= self.heartbeat_s):
@@ -641,34 +648,15 @@ class Feed:
             self._panel_stamps[s] = stamp
         return dirty
 
-    def _full_dirty(self, watched, now: float) -> set:
-        """(lock held) The chats the safety-net pass recomputes with no event behind them. Open cards carry run
-        evidence that expires and lines that count time: those chats every FULL_EVERY_S. A chat with none changes
-        only through card events or a link adopted with no event: every QUIET_FULL_EVERY_S."""
-        return {s for s in watched if s not in self.bundles
-                or any(self.bundles[s]['bundle'].get(k) for k in OPEN_KEYS)
-                or now - self.bundles[s]['bundle'].get('computed_at', 0) >= QUIET_FULL_EVERY_S}
-
     def _due(self, now: float) -> tuple:
-        """(seconds until a pass is due with no write behind it or None, the same for the decision lane). Memory
-        only. What the passing of time alone makes due: the safety-net pass for a held chat that ages (its
-        time-derived lines, evidence expiry and vouch), and the retry of a read that failed or raced. A backend
-        whose watched chats have no open work and no failure has nothing due before QUIET_FULL_EVERY_S."""
+        """Only an unattempted registration needs a pass without a source write.
+
+        Elapsed time, including a failed read's age, never schedules database work.
+        Failures remain stale until a source event or a new client registration retries.
+        """
         with self.lock:
-            watched = [s for s in self.interest if s in self.bundles]
-            due = None
-            if len(watched) < len(self.interest) or self._retry.intersection(self.interest):
-                due = self._last_pass + RETRY_EVERY_S
-            full_at = self._last_full + self.full_every_s
-            for s in watched:
-                b = self.bundles[s]['bundle']
-                at = full_at if any(b.get(k) for k in OPEN_KEYS) else max(
-                    full_at, b.get('computed_at', 0) + QUIET_FULL_EVERY_S)
-                due = at if due is None else min(due, at)
-                if due <= now:
-                    break
-            decide = self._last_decision + RETRY_EVERY_S if self._decision_failures.intersection(self.interest) else None
-        return (None if due is None else due - now, None if decide is None else decide - now)
+            missing = any(s not in self.bundles and s not in self.failures for s in self.interest)
+        return (0.0 if missing else None, None)
 
     def idle_wait(self) -> float:
         """How long the event-driven loop sleeps when no file is written: to the liveness heartbeat, or sooner when
@@ -678,8 +666,7 @@ class Feed:
 
     def beat(self) -> int:
         """Between data changes: registrations are renewed, expired interest dropped and a heartbeat pushed when
-        due. Reads no database and computes nothing: a chat that needs a bundle, a held chat whose time-derived
-        state is due (`_due`) or a pending retry wakes a pass instead."""
+        due. Reads no database: age only the held inputs, preserving their observation timestamps."""
         self._drain()
         now = self.clock()
         with self.lock:
@@ -690,7 +677,7 @@ class Feed:
             self._wake.set()
         if decide is not None and decide <= 0:
             self._decide.set()
-        return len(self._publish({}, heartbeat=True))
+        return len(self._publish({}, heartbeat=True, age_only=now - self.last_emit >= self.heartbeat_s))
 
     def tick(self) -> int:
         """One pass: recompute what changed and push it, else a heartbeat when due. Returns bundles pushed.
@@ -710,41 +697,35 @@ class Feed:
             return 0
         panel_dirty = self._panel_dirty(watched)
         stamps = self.readers.stamps()
-        full = now - self._last_full >= self.full_every_s
+
         with self.lock:
             retry = self._retry.intersection(watched)
             missing = any(s not in self.bundles for s in watched)
-        if stamps == self._stamps and not full and not retry and not panel_dirty and not missing:
+        if stamps == self._stamps and not retry and not panel_dirty and not missing:
             self._publish({}, heartbeat=True)
             return 0
-        # Board events are read only when a board file moved (or on the safety-net pass): state.db is written all
+        # Board events are read only when a board file moved: state.db is written all
         # day by every chat, and each of those writes must not open every board.
         boards = getattr(self.readers, 'board_stamps', None)
         seen = boards() if callable(boards) else None
-        if seen is None or seen != self._board_stamps or full or self._cursor is None:
+        initial = self._cursor is None
+        unindexed_change = seen is not None and seen != self._board_stamps
+        if seen is None or seen != self._board_stamps or self._cursor is None:
             changed_cards, self._cursor = self.readers.changed_cards(self._cursor)
         else:
             changed_cards = {}
         self._board_stamps = seen
         self._stamps = stamps
-        if full:
-            self._last_full = now
-            with self.lock:
-                dirty = self._full_dirty(watched, now)
-            touched = {v for v in changed_cards.values() if v}
-            with self.lock:
-                for s in watched:
-                    b = self.bundles.get(s)
-                    if b and (b['refs'] & set(changed_cards) or b['lineage'] & touched):
-                        dirty.add(s)
-        else:
-            touched = {v for v in changed_cards.values() if v}
-            with self.lock:
-                dirty = {s for s in watched if s not in self.bundles}
-                for s in watched:
-                    b = self.bundles.get(s)
-                    if b and (b['refs'] & set(changed_cards) or b['lineage'] & touched):
-                        dirty.add(s)
+        touched = {v for v in changed_cards.values() if v}
+        with self.lock:
+            # Startup and writes without indexed task events (projection replacement,
+            # board replacement) cannot be narrowed to a card: invalidate the held set.
+            dirty = set(watched) if initial or (unindexed_change and not changed_cards) else {
+                s for s in watched if s not in self.bundles}
+            for s in watched:
+                b = self.bundles.get(s)
+                if b and (b['refs'] & set(changed_cards) or b['lineage'] & touched):
+                    dirty.add(s)
         dirty.update(retry)
         dirty.update(panel_dirty)
         if not dirty:

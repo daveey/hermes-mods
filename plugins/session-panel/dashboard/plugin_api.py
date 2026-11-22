@@ -246,14 +246,14 @@ class CoreReaders:
                 if key not in cursor or top < cursor[key]:
                     cursor[key] = top
                     continue
-                # Heartbeats change nothing a bundle shows (the full refresh renews run evidence every FULL_EVERY_S).
+                # Heartbeats renew execution evidence. With no timed database refresh,
+                # their committed writes must invalidate the referencing bundles too.
                 rows = c.execute("SELECT e.id, e.task_id, e.kind, t.session_id FROM task_events e LEFT JOIN tasks t "
                                  "ON t.id = e.task_id WHERE e.id > ? ORDER BY e.id LIMIT 20000", (cursor[key],)).fetchall()
             except sqlite3.Error:
                 continue
             for r in rows:
-                if r['kind'] != 'heartbeat':
-                    changed[str(r['task_id'])] = r['session_id'] or changed.get(str(r['task_id']))
+                changed[str(r['task_id'])] = r['session_id'] or changed.get(str(r['task_id']))
             if rows:
                 cursor[key] = rows[-1]['id']
         return changed, cursor

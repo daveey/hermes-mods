@@ -222,6 +222,17 @@ def test_push_payload_is_json_safe_and_bounded(api):
     assert big['bundles'] == {} and big['sessions'] == ['S1', 'S2'], 'too big: names only, clients fetch them'
 
 
+def test_heartbeat_events_invalidate_execution_evidence(api, board, monkeypatch):
+    path, conn = board
+    a = kanban_db.create_task(conn, title='A', initial_status='running', session_id='S1')
+    r = readers_for(api, path, monkeypatch)
+    _, cursor = r.changed_cards(None)
+    conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'heartbeat', '{}', 1)", (a,))
+    conn.commit()
+    changed, _ = r.changed_cards(cursor)
+    assert changed == {a: 'S1'}, 'run evidence renewal is write-driven, never a timed full pass'
+
+
 def test_heartbeats_change_nothing_in_a_card_record(api, board, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import kanban_queue_position as kqp
@@ -303,7 +314,7 @@ def test_each_thread_reads_on_its_own_connection_and_a_replaced_file_is_reopened
     assert r.card(a, 'default') is None
 
 
-def test_heartbeat_events_are_not_card_changes_and_rows_drop_last_heartbeat(api, board, monkeypatch):
+def test_heartbeat_events_refresh_evidence_but_rows_drop_last_heartbeat(api, board, monkeypatch):
     path, conn = board
     a = kanban_db.create_task(conn, title='A', initial_status='running', session_id='S1')
     r = readers_for(api, path, monkeypatch)
@@ -311,7 +322,7 @@ def test_heartbeat_events_are_not_card_changes_and_rows_drop_last_heartbeat(api,
     conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'heartbeat', '{}', 1)", (a,))
     conn.commit()
     changed, cursor = r.changed_cards(cursor)
-    assert changed == {}, 'a heartbeat is not a change'
+    assert changed == {a: 'S1'}, 'a heartbeat renews evidence via a committed write'
     assert api._calm([{'id': a, 'last_heartbeat_at': 5, 'status': 'running'}]) == [{'id': a, 'status': 'running'}]
 
 
