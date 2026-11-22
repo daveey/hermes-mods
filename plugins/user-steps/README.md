@@ -231,8 +231,18 @@ Offline cross-repo proof (M1 core and courier plus the record-only extension):
 
 ```sh
 HERMES_HUB_CLIENT_REAL=/path/to/courier/client/hermes_hub.py \
-  bash plugins/user-steps/run-core-integration.sh /path/to/isolated/core -k mirrored_real_store
+  bash plugins/user-steps/run-core-integration.sh /path/to/isolated/core \
+    --remote-card-composed /absolute/path/to/reports -j 1
 ```
+
+The required `remote-card-composed` hosted job uses Python 3.14, landed core
+`0397ba2abd1be2b28c41626152696f0901acab4f` and landed courier
+`11058ac91990624059dd4214e420334cbcc5d006`. It stages the existing fixtures under
+core's real `tests/conftest.py` and runs all three remote courier/race files through
+`scripts/run_tests.sh` with zero retries. `composed_results.py` requires the nine
+composed parameter cases and rejects missing/duplicate cases, failures and **any**
+skips in these reports. Standalone `test-all` success is not composed acceptance:
+setting a compatible core path alone does not load core's isolation guards.
 
 This exercises the real ActionStore, source proof, courier journals and owner DB;
 network authentication/OS identity are fixtures, not live HTTPS or Desktop proof.
