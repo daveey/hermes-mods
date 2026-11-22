@@ -311,7 +311,10 @@ class CoreReaders:
     def advance_external(bundle, captured):
         """Pure observation carriage; never renew board reads or execution leases."""
         def identity(row):
-            return tuple(row.get(k) for k in ('gateway', 'profile', 'board', 'id', 'session', 'source', 'via'))
+            # Selection adds source='origin-obligation' to canonical rows. It
+            # does not change the observation producer; board replicas do.
+            producer = 'replica' if row.get('source') == 'replica' else row.get('via')
+            return tuple(row.get(k) for k in ('gateway', 'profile', 'board', 'id', 'session')) + (producer,)
         rows = [json.loads(row) for row in captured]
         clocks = {identity(row): row['synced_at'] for row in rows
                   if CoreReaders._pull_observation(row) and 'synced_at' in row}

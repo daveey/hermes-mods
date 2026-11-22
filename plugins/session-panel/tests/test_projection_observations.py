@@ -6,7 +6,7 @@ import pytest
 from test_source_coverage import api_module
 
 
-def test_canonical_projection_clock_carriage_is_source_qualified():
+def test_canonical_projection_clock_carriage_is_source_qualified(monkeypatch):
     projection = pytest.importorskip('hermes_cli.kanban_replica_projection')
     adapter = api_module().CoreReaders
 
@@ -43,6 +43,15 @@ def test_canonical_projection_clock_carriage_is_source_qualified():
     split = adapter.advance_external({'tasks': [old, {**old, 'source': 'replica'}], 'done': []},
                                      capture(new, replica))
     assert [r['synced_at'] for r in split['tasks']] == [1010, 1200]
+    # The real selection adapter adds a source label without changing producer.
+    from hermes_cli import kanban_db_notify
+    from hermes_cli.kanban_origin_obligations import preserve_origin_obligations
+    monkeypatch.setattr(kanban_db_notify, 'is_machine_session', lambda *a, **kw: False)
+    selected = preserve_origin_obligations([], [old], gateway='local', profile='default',
+                                          ids=['S1'], statuses=('running',))
+    assert selected[0]['source'] == 'origin-obligation'
+    carried = adapter.advance_external({'tasks': selected, 'done': []}, capture(new))
+    assert carried['tasks'][0]['synced_at'] == 1010
     # A local/unknown producer's same-named field is not known pull bookkeeping.
     assert adapter.external_semantic(capture({'id': 'card1', 'synced_at': 1})) != adapter.external_semantic(
         capture({'id': 'card1', 'synced_at': 2}))
