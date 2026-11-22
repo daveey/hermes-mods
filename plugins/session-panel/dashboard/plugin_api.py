@@ -416,8 +416,26 @@ class CoreReaders:
         return (outcome, requests)
 
     def reconcile_user_steps(self, session, lineage):
+        return self._user_step_requests(session, lineage, reconcile=True)
+
+    def decision_inputs(self, session, lineage):
+        """Read authoritative owner-scoped decisions, with no unrelated board reconciliation."""
+        c = self.conn(self.state_db())
+        if c is None:
+            raise RuntimeError('session outcome unavailable')
+        row = c.execute('SELECT outcome_json FROM sessions WHERE id=?', (session,)).fetchone()
+        if row is None:
+            raise RuntimeError('stored session unavailable')
+        try:
+            outcome = json.loads(row['outcome_json'] or '{}')
+        except (TypeError, ValueError):
+            outcome = {}
+        return {'outcome_json': outcome if isinstance(outcome, dict) else {},
+                'requests': self._user_step_requests(session, lineage, reconcile=False)}
+
+    def _user_step_requests(self, session, lineage, *, reconcile):
         path = Path(__file__).resolve().parents[2] / 'user-steps' / 'dashboard' / 'plugin_api.py'
-        key = '_session_panel_user_steps_api_' + str(path)
+        key = '_session_panel_user_steps_api_' + str(path) + ':' + str(path.stat().st_mtime_ns)
         mod = sys.modules.get(key)
         if mod is None:
             spec = importlib.util.spec_from_file_location(key, path)
@@ -425,7 +443,9 @@ class CoreReaders:
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             mod = sys.modules.setdefault(key, mod)
-        return mod.panel_requests(self.state_db().parent, session, lineage)
+        if reconcile:
+            return mod.panel_requests(self.state_db().parent, session, lineage)
+        return mod.panel_requests(self.state_db().parent, session, lineage, reconcile=False)
 
     def panel_inputs(self, session, lineage):
         path = Path(__file__).resolve().parents[1] / 'inputs.py'
@@ -820,6 +840,7 @@ def feed():
                     _save_at_exit()
                 core.PROCESS_FEED = new
                 threading.Thread(target=_run, args=(core.PROCESS_FEED,), name='session-panel-feed', daemon=True).start()
+                threading.Thread(target=_run_decisions, args=(core.PROCESS_FEED,), name='session-panel-decisions', daemon=True).start()
             return core.PROCESS_FEED
 
 
@@ -831,6 +852,20 @@ def stop() -> None:
     f = _load_feed().PROCESS_FEED
     if f is not None:
         f.stopped.set()
+
+
+def _run_decisions(f) -> None:
+    """A blocked board sweep must not delay a recorded decision's status line."""
+    try:
+        while not f.stopped.is_set():
+            started = time.monotonic()
+            try:
+                f.refresh_decisions()
+            except Exception:
+                log.warning('session-panel decision refresh failed', exc_info=True)
+            f.stopped.wait(max(0.2, TICK_S - (time.monotonic() - started)))
+    finally:
+        f.readers.release()
 
 
 def _run(f) -> None:

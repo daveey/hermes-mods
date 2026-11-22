@@ -59,7 +59,7 @@ def stable(value):
     # Evidence clocks remain real in production; compare their content/identity, not sequential probe times.
     if isinstance(value, dict):
         return {k: stable(v) for k, v in value.items()
-                if k not in ('observed_at', 'observed_at_ms', 'age_ms', 'age_s', 'read_at', 'computed_at', 'computed_seq')}
+                if k not in ('observed_at', 'observed_at_ms', 'age_ms', 'age_s', 'read_at', 'computed_at', 'computed_seq', 'canonical_seq')}
     if isinstance(value, list):
         return [stable(v) for v in value]
     return value

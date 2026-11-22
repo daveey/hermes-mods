@@ -27,7 +27,16 @@ def test_panel_read_produces_canonical_request_without_legacy_poll(tmp_path, mon
     requests = api.panel_requests(tmp_path, OWNER['storedSessionId'], [OWNER['storedSessionId']])
     assert len(requests) == 1
     assert requests[0]['presentation']['kind'] == 'kanban-question'
-    receipt = mirror.deliver(decide(store, requests[0]))
+    operation = decide(store, requests[0])
+    with monkeypatch.context() as patch:
+        def no_reconcile(*args):
+            raise AssertionError('fast canonical reads must not hydrate boards')
+        patch.setattr(mirror, 'reconcile', no_reconcile)
+        pending = api.panel_requests(tmp_path, OWNER['storedSessionId'], [OWNER['storedSessionId']], reconcile=False)
+        assert len(pending) == 1
+        assert pending[0]['resolution']['operationId'] == operation['operationId']
+        assert pending[0]['state'] in ('open', 'needs_context')
+    receipt = mirror.deliver(operation)
     assert receipt['task'] == 't_test'
     with pytest.raises(ValueError, match='profile'):
         api.panel_requests(tmp_path / 'another-profile', OWNER['storedSessionId'], [OWNER['storedSessionId']])
