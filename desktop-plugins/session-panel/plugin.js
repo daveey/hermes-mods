@@ -663,6 +663,9 @@ function observeDecisionRender(route, model) {
   for (const [id, t] of decisionTimings) {
     if (now - t.clicked > 600_000) { decisionTimings.delete(id); continue }
     if (routeKey(route) !== routeKey(t.sourceRoute) || !model) continue
+    // Missing canonical requests can empty needs_you during an outage. That is
+    // not authoritative departure; retain the timing until a known model commits.
+    if (!Array.isArray(model.diagnostics) || model.diagnostics.includes('user-steps requests unavailable')) continue
     if (model.sections.needs_you.some(row => row.request_id === t.requestId &&
         row.actions.some(a => a.kind === 'decide' && sameModelOwner(a.owner, t.owner)))) continue
     decisionTimings.delete(id) // consume before calling arbitrary transport code
