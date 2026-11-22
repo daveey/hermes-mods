@@ -105,6 +105,14 @@ Stop at the first rung that works. Each rung is something agents may do without 
     why_human says "Tried: …", never "rung a/b/…" (rung letters belong only in your trail comment);
   - the decision David actually owns, phrased as a question he can answer without reading the card's history.
   Then load **generate-unblock-card** and file the card with it.
+- **Rung g already answered on a safety-refused card** (a `⏸ … Provider safety refusal retained` notice) → ask no
+  one, and nothing promotes, renews or re-files the refused work (rung d). Check that a card carries the recorded pick.
+  A decision card's worker only records it, and the owner can read "the decision card is running" as "the pick is
+  being carried out". Until a card carries it, every child of the held card waits forever. For a different-design
+  pick, the owning chat files the design as its own card (none of the refused approach). It links that card as a
+  parent of each child waiting on the held card, and adds a `parents=[that card]` follow-up that archives the held
+  card. The held card stays as the record: archiving withdraws it and never completes it. If no card carries the
+  pick, message the owning chat. A non-owner never files the carrier itself.
 
 ## 5. Leave a trail
 
