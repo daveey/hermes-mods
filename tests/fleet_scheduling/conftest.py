@@ -46,6 +46,25 @@ def identity(pid: int) -> str:
     return fields[19]
 
 
+def process_root(env, cwd):
+    """Recover fixture custody across the native executor's exec allowlist.
+
+    Legacy children retain the explicit marker. Native executors lose it by
+    design; require BOTH the exact runtime home and a fixture-owned working dir.
+    """
+    marker = env.get(b"FLEET_FIXTURE_ROOT")
+    if marker is not None:
+        root = Path(os.fsdecode(marker)).resolve()
+    else:
+        home = Path(os.fsdecode(env.get(b"HERMES_HOME", b"/"))).resolve()
+        if home.name != "runtime":
+            raise PermissionError("foreign process registration denied")
+        root = home.parent
+        owned(root, Path(cwd))
+    owned(root, Path(os.fsdecode(env[b"HERMES_HOME"])))
+    return root
+
+
 class OwnedProcesses:
     """Only an observed, fixture-rooted process with unchanged birth may be signalled."""
     def __init__(self, root: Path):
@@ -58,9 +77,8 @@ class OwnedProcesses:
         birth = identity(pid)
         raw = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
         env = dict(part.split(b"=", 1) for part in raw if b"=" in part)
-        if env.get(b"FLEET_FIXTURE_ROOT") != os.fsencode(self.root):
+        if process_root(env, Path(f"/proc/{pid}/cwd").resolve()) != self.root:
             raise PermissionError("foreign process registration denied")
-        owned(self.root, Path(os.fsdecode(env[b"HERMES_HOME"])))
         if identity(pid) != birth:
             raise PermissionError("PID changed during fixture registration")
         self.births[pid] = birth
@@ -165,6 +183,20 @@ def board_factory(fleet_root, containment):
             loopback_url(self.base_url)
             owned(fleet_root, self.root)
             super().__post_init__()
+            # Real dispatch requires class eligibility even for this closed fake
+            # transport. These are fixture-local routes, never host providers.
+            route = {"provider": "custom:fleet-fixture", "billing": "metered", "weight": 1,
+                     "eligible": True, "funding_verified": True,
+                     "capabilities": {"tools": True, "streaming": True, "context_tokens": 128000}}
+            policy = {"enabled": True, "allow_metered": True, "enforce_subscription_only": False, "routes": {
+                level: [dict(route, model=model)] for level, model in (
+                    ("fast", "fake-model"), ("standard", "fake-model"),
+                    ("deep", "fake-model"))}}
+            with (self.hermes_home / "config.yaml").open("a", encoding="utf-8") as config:
+                config.write("\nmodel_routing: " + json.dumps(policy) + "\n")
+                config.write("custom_providers: " + json.dumps([{
+                    "name": "fleet-fixture", "base_url": self.base_url,
+                    "api_key": "sk-fake-e2e"}]) + "\n")
             # Preserve the generated fixture config, but avoid HOME/.hermes/state.db
             # (correctly rejected as a default home by the core test guard).
             self.hermes_home.rename(self.root / "runtime")

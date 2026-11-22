@@ -200,36 +200,6 @@ if "false_human" in _ON:
             return guard
         module.check_respawn_guard = mutated
 
-if "oom_join" in _ON:
-    # The ONLY process that joins the memory-limited group is the bound executor itself:
-    # it writes its own pid, after the fixture touches the trigger. No foreign numeric
-    # PID is ever migrated by anyone.
-    @_hook("gateway.session_kanban")
-    def _oom(module):
-        real = module.bind_worker_context
-        def bound(frame):
-            result = real(frame)
-            if not (frame.get("policy") or {}).get("kanban_json"):
-                return result
-            def join():
-                trigger, group, joined = (os.environ[k] for k in ("FLEET_OOM_TRIGGER", "FLEET_OOM_GROUP", "FLEET_OOM_JOINED"))
-                deadline = time.monotonic() + 120
-                while not os.path.exists(trigger):
-                    if time.monotonic() > deadline:
-                        return
-                    time.sleep(0.02)
-                me = os.getpid()
-                with open(os.path.join(group, "cgroup.procs"), "w") as handle:
-                    handle.write(str(me))
-                stat = open(f"/proc/{me}/stat").read().rsplit(")", 1)[1].split()
-                record = {"pid": me, "start_identity": stat[19], "cgroup": open("/proc/self/cgroup").read().strip()}
-                with open(joined + ".tmp", "w") as handle:
-                    json.dump(record, handle)
-                os.replace(joined + ".tmp", joined)
-            threading.Thread(target=join, daemon=True, name="fleet-oom-self-join").start()
-            return result
-        module.bind_worker_context = bound
-
 if _HOOKS:
     sys.meta_path.insert(0, _Finder())
 '''
@@ -243,15 +213,6 @@ def hook_env(fleet_root, core, hooks, board_dir=None, **extra):
     env = {"FLEET_HOOKS": ",".join(hooks), "PYTHONPATH": f"{directory}{os.pathsep}{core}"}
     env.update({key: str(value) for key, value in extra.items()})
     return env
-
-
-def rewrite_launch_wrapper(board, hook_dir, core):
-    """Explicit launch wrapper: the owner/executor tree is started through HERMES_BIN."""
-    board.hermes_bin.write_text(
-        "#!/bin/sh\n"
-        f"PYTHONPATH={shlex.quote(str(hook_dir))}:{shlex.quote(str(core))} exec {shlex.quote(sys.executable)} "
-        '-m hermes_cli.main "$@"\n', encoding="utf-8")
-    board.hermes_bin.chmod(0o755)
 
 
 HUMAN_KINDS = {"blocked", "needs_input", "human_request", "human_requested", "awaiting_human", "auto_blocked"}
@@ -430,8 +391,6 @@ def test_crash_and_cgroup_oom_recover_original_work(fleet_root, containment, boa
                 continue
             assert (group / "memory.max").read_text(encoding="utf-8").strip() == str(32 * 1024 * 1024)
             assert not (group / "cgroup.procs").read_text(encoding="utf-8").strip()
-            env_extra.update(hook_env(fleet_root, core, ["oom_join"], FLEET_OOM_GROUP=group,
-                                      FLEET_OOM_TRIGGER=trigger, FLEET_OOM_JOINED=joined))
         cleanup = Cleanup()
         tid = None
         board = None
@@ -439,7 +398,15 @@ def test_crash_and_cgroup_oom_recover_original_work(fleet_root, containment, boa
             with FakeLLMServer(model) as server:
                 board = board_factory("crash-" + variant, server.base_url, env_extra=env_extra)
                 if variant == "oom":
-                    rewrite_launch_wrapper(board, Path(env_extra["PYTHONPATH"].split(os.pathsep)[0]), core)
+                    plugin = board.hermes_home / "plugins" / "fleet-oom"
+                    plugin.mkdir(parents=True)
+                    (plugin / "plugin.yaml").write_text(
+                        "name: fleet-oom\nversion: 1.0.0\ndescription: Fixture-only self-join instrumentation\n")
+                    (plugin / "__init__.py").write_bytes(Path(__file__).with_name("oom_plugin.py").read_bytes())
+                    (plugin / "fault.json").write_text(json.dumps({
+                        "trigger": str(trigger), "group": str(group), "joined": str(joined)}))
+                    with (board.hermes_home / "config.yaml").open("a") as config:
+                        config.write("\nplugins: {enabled: [fleet-oom]}\n")
                 tid = board.create("fixture " + variant + " recovery", "--no-requires")
                 board.dispatch()
                 assert ready.wait(45), board.diag(tid)
@@ -458,10 +425,11 @@ def test_crash_and_cgroup_oom_recover_original_work(fleet_root, containment, boa
                     release.set()
                     fault = {"signal": "SIGKILL", "pid": pid, "start_identity": birth}
                 else:
+                    assert group is not None
                     before = (group / "memory.events.local").read_text(encoding="utf-8")
-                    trigger.write_text("join", encoding="utf-8")  # the executor, and only it, self-joins
+                    trigger.write_text("join", encoding="utf-8")  # the bound executor self-joins via its plugin
                     wait_until(joined.exists, 30, "executor self-join record")
-                    trigger.unlink()  # one-shot: the recovery attempt's executor must not join the limited group
+                    trigger.unlink()  # the recovery executor must not enter the limited group
                     record = json.loads(joined.read_text(encoding="utf-8"))
                     assert record["pid"] == pid, "self-join came from a different process than the bound executor"
                     assert record["start_identity"] == birth == identity(pid), "local identity changed"
@@ -479,7 +447,7 @@ def test_crash_and_cgroup_oom_recover_original_work(fleet_root, containment, boa
                         require_oom(before)
                     fault = {"cgroup": str(group), "memory_max": 32 * 1024 * 1024, "memory_swap_max": 0,
                              "memory_events_before": before, "memory_events_after": after,
-                             "pid": pid, "start_identity": birth, "join": "executor self-join (own pid)"}
+                             "pid": pid, "start_identity": birth, "join": "executor self-join (own pid) via fixture plugin", "membership": record}
                 wait_until(lambda: not pid_alive(pid), 15, "fixture worker dead")
                 recovering[0] = True
                 board.wait_worker_exit(tid, submitter, timeout=30)
@@ -536,7 +504,8 @@ QUOTA_HOLDS = ("rate_limit_cooldown", "subscription_quota_reset")  # the real gu
 
 
 def provider_flow(board_factory, fleet_root, name, hooks=()):
-    from tests.e2e.core.kanban.test_kanban_rate_limit_review import TwoRoleModel, _seed_review_skill, one_terminal_turn
+    from tests.e2e.core.kanban.test_kanban_rate_limit_review import _seed_review_skill, one_terminal_turn
+    from provider_model import TwoRoleModel
     from tests.fakes.fake_llm_provider import FakeLLMServer
 
     core = Path(os.environ["FLEET_CORE_SOURCE"])
@@ -557,16 +526,17 @@ def provider_flow(board_factory, fleet_root, name, hooks=()):
     env_extra.update(hook_env(fleet_root, core, ("guard_clock",) + tuple(hooks), FLEET_GUARD_CLOCK=clock))
     with FakeLLMServer(model) as server:
         board = board_factory(name, server.base_url, env_extra=env_extra)
+        tid = None
         try:
             _seed_review_skill(board)
             tid = board.create("fixture provider recovery", "--no-requires")
             model.tick = 1
             first = board.dispatch()
-            assert any(row["task_id"] == tid for row in first.get("spawned", [])), first
+            assert any(row["task_id"] == tid for row in first.get("spawned", [])), (first, board.diag(tid))
             board.wait_worker_exit(tid, int(board.events(tid, "spawned")[-1]["payload"]["pid"]), timeout=90)
             ticks.append({"event": "spawned_429", "reason": first, "attempt": 1})
             requests_after_429 = len(server.main_requests())
-            assert requests_after_429 == 1, "429 attempt must be exactly one provider request"
+            assert requests_after_429 == 1, ("429 attempt must be exactly one provider request", board.diag(tid))
 
             model.tick = 2
             at(0)  # the reap stamps ended_at in this very dispatch: the guard sees "just ended"
@@ -625,7 +595,11 @@ def provider_flow(board_factory, fleet_root, name, hooks=()):
                          for event in board.events(tid))
             return outcomes, [a.answers for a in model.attempts], ticks
         finally:
-            board.kill_workers()
+            try:
+                if tid is not None:
+                    write_diagnostics(board, tid, name)
+            finally:
+                board.kill_workers()
 
 
 def test_provider_exhaustion_then_review(fleet_root, containment, board_factory):

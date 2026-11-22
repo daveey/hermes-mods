@@ -288,6 +288,48 @@ def test_process_cleanup_refuses_lost_marker_and_spares_foreign(tmp_path):
         lost.wait(timeout=5)
 
 
+# ---------------------- native executor custody ----------------------
+
+@pytest.mark.parametrize("foreign_cwd", [False, True])
+def test_scrubbed_native_executor_requires_owned_cwd_and_exact_runtime(tmp_path, foreign_cwd):
+    runner = load_runner()
+    root = tmp_path / "fx"
+    (root / "runtime").mkdir(parents=True)
+    workspace = root / "workspace"
+    workspace.mkdir()
+    env = {"PATH": os.defpath, "HERMES_HOME": str(root / "runtime")}
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                            cwd=tmp_path if foreign_cwd else workspace, env=env)
+    try:
+        time.sleep(0.1)
+        result = runner.cleanup_processes(root)
+        if foreign_cwd:
+            assert proc.poll() is None and result["signalled"] == []
+            assert any("lost ownership marker" in item for item in result["errors"])
+        else:
+            assert proc.wait(timeout=5) == -signal.SIGKILL
+            assert not result["errors"] and len(result["signalled"]) == 1
+            assert result["signalled"][0]["pid"] == proc.pid
+            assert result["signalled"][0]["start_identity"].isdigit()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_native_custody_does_not_accept_arbitrary_home_or_marker_override(tmp_path):
+    from conftest import process_root
+    root = tmp_path / "fx"
+    env = {b"HERMES_HOME": os.fsencode(root / "runtime")}
+    assert process_root(env, root / "workspace") == root
+    with pytest.raises(PermissionError):
+        process_root(env, tmp_path / "foreign")
+    with pytest.raises(PermissionError):
+        process_root({b"HERMES_HOME": os.fsencode(root / "not-runtime")}, root)
+    with pytest.raises(PermissionError):
+        process_root(env | {b"FLEET_FIXTURE_ROOT": os.fsencode(tmp_path / "other")}, root)
+
+
 # ---------------------- end-to-end unavailable-OOM fault ----------------------
 
 def test_e2e_unavailable_oom_is_unverified_not_pass(tmp_path):
