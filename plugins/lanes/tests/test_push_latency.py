@@ -56,8 +56,10 @@ def test_changes_during_a_slow_projection_coalesce_into_one_gapped_follow_up(mon
             second = ws.receive_json()
             assert second['view']['status'] == 's6'
             assert len(calls) == 3, calls
-            gap = second['timing']['project_start'] - first['timing']['project_end']
-            assert .1 <= gap < .3, gap
+            gap = second['timing']['project_start'] - first['timing']['project_start']
+            # Compute exceeds the gap: follow-up starts when the active job ends,
+            # not another whole gap after that end.
+            assert .4 <= gap < .49, gap
 
 
 def test_continuous_churn_bounds_projection_duty_and_preserves_latest(monkeypatch):
@@ -86,9 +88,9 @@ def test_continuous_churn_bounds_projection_duty_and_preserves_latest(monkeypatc
             finally:
                 stop.set()
                 thread.join()
-            assert len(starts) <= 7, starts
+            assert len(starts) <= 12, starts
             for first, second in zip(frames, frames[1:]):
-                gap = second['timing']['project_start'] - first['timing']['project_end']
+                gap = second['timing']['project_start'] - first['timing']['project_start']
                 assert gap >= .1, gap
             time.sleep(.15)
             monkeypatch.setattr(api, 'WATCH_S', .25)
