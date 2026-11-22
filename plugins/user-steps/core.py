@@ -2364,6 +2364,10 @@ class ActionError(ValueError):
         self.status = status
 
 
+class DeliveryRefused(ActionError):
+    """A receiver authenticated a terminal refusal; settle after receiver I/O."""
+
+
 # Withdrawal actors: board/reconciler (system), owning chat (agent), person (user), explicit cleanup (hygiene).
 WITHDRAW_BY = ('system', 'agent', 'user', 'hygiene')
 
@@ -3188,7 +3192,39 @@ class ActionStore:
                       (_json(resolution), ns, r['requestId']))
             return self._operation(c, owner, oid)
 
+    @contextmanager
+    def delivery_lease(self, owner, oid, *, dispatch=False):
+        """Process-safe operation custody through receiver I/O and settlement.
+
+        A nonblocking observer never retires an operation while a dispatcher or
+        receipt reconciler owns it. Kernel release on process exit needs no TTL.
+        """
+        key = hashlib.sha256(_json([owner, oid]).encode()).hexdigest()
+        directory = self.path.parent / 'delivery-leases'
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / key).open('a+') as lock:
+            try:
+                mode = fcntl.LOCK_SH if dispatch else fcntl.LOCK_EX
+                fcntl.flock(lock, mode | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
     def dispatch(self, owner, oid, receiver, *, early_tool_call_id=None, early_binding=None):
+        # Generic idempotent receivers permit concurrent retries. Card mirrors
+        # serialize terminal refusal settlement as well as receipt I/O, so a
+        # refusal cannot retire another in-flight attempt of the same operation.
+        with self.delivery_lease(owner, oid, dispatch=not getattr(receiver, 'exclusive_dispatch', False)) as held:
+            if not held:
+                return self.operation(owner, oid)
+            return self._dispatch(owner, oid, receiver, early_tool_call_id=early_tool_call_id,
+                                  early_binding=early_binding)
+
+    def _dispatch(self, owner, oid, receiver, *, early_tool_call_id=None, early_binding=None):
         # Commit the attempt then release the DB lock BEFORE external I/O. Other
         # requests stay usable; concurrent retries share the receiver's durable key.
         # early_tool_call_id: deliver through a blocked clarify's tool result (receiver.deliver_early) instead of
@@ -3203,7 +3239,7 @@ class ActionStore:
             c.execute('UPDATE operations SET body=? WHERE id=?', (_json(op), oid))
         receipt = None
         confirmed = False
-        busy = owner_wait = False
+        busy = owner_wait = terminal_refused = False
         failure_class = 'unconfirmed_readback'
         error_text = None
         try:
@@ -3213,6 +3249,7 @@ class ActionStore:
             confirmed = bool(receiver.readback(op, receipt))
         except Exception as exc:
             # Never expose credentials, receiver URLs or raw transport bodies: classify, plus redacted text.
+            terminal_refused = isinstance(exc, DeliveryRefused)
             lowered = str(exc).lower()
             busy = 'session is busy' in lowered
             owner_wait = not busy and any(m in lowered for m in _OWNER_WAIT_MARKERS)
@@ -3229,6 +3266,9 @@ class ActionStore:
             result = self._operation(c, owner, oid); op = result['operation']
             # A slow failed retry cannot downgrade a concurrently confirmed delivery.
             if op['dispatchState'] in ('delivered', 'cancelled'): return result
+            if terminal_refused:
+                return self._retire_operation(c, owner, oid, by='system',
+                    reason='Remote card answer retired', evidence='Authenticated owner terminal refusal')
             if busy or owner_wait or early_tool_call_id:
                 # Not a delivery failure: a busy owner refuses admission until its turn ends, a closed chat until
                 # it is opened, and an early answer never admits a turn. None may exhaust the retry budget.
@@ -3258,17 +3298,23 @@ class ActionStore:
         """Settle a recorded-but-undelivered decision without delivering it (its chat is gone, or the chat moved on
         and replaying the frozen decision now would act on stale intent). Not a decision: the recorded choice
         stays on the operation; the request closes as cancelled and nothing retries it."""
+        with self.delivery_lease(owner, oid) as held:
+            if not held:
+                raise ActionError('Delivery in flight; observe after settlement', 409)
+            with self._tx() as c:
+                return self._retire_operation(c, owner, oid, by=by, reason=reason, evidence=evidence)
+
+    def _retire_operation(self, c, owner, oid, *, by, reason, evidence):
         from datetime import datetime, timezone
-        with self._tx() as c:
-            op = self._operation(c, owner, oid)['operation']
-            if op['dispatchState'] in ('delivered', 'cancelled'): raise ActionError('Operation already settled', 409)
-            op.update(dispatchState='cancelled', retired={'by': by, 'reason': reason, 'evidence': evidence,
-                                                          'at': datetime.now(timezone.utc).isoformat()})
-            op.pop('error', None)
-            c.execute('UPDATE operations SET body=? WHERE id=?', (_json(op), oid))
-            c.execute('UPDATE requests SET state=? WHERE namespace=? AND id=? AND revision=?',
-                      ('cancelled', self._ns(owner), op['requestId'], op['revision']))
-            return {'operation': op, 'request': self._get(c, owner, op['requestId'])}
+        op = self._operation(c, owner, oid)['operation']
+        if op['dispatchState'] in ('delivered', 'cancelled'): raise ActionError('Operation already settled', 409)
+        op.update(dispatchState='cancelled', retired={'by': by, 'reason': reason, 'evidence': evidence,
+                                                      'at': datetime.now(timezone.utc).isoformat()})
+        op.pop('error', None)
+        c.execute('UPDATE operations SET body=? WHERE id=?', (_json(op), oid))
+        c.execute('UPDATE requests SET state=? WHERE namespace=? AND id=? AND revision=?',
+                  ('cancelled', self._ns(owner), op['requestId'], op['revision']))
+        return {'operation': op, 'request': self._get(c, owner, op['requestId'])}
 
     def pending_owners(self):
         with self._read() as c:

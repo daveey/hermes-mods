@@ -269,6 +269,7 @@ def test_mirrored_real_store_answer_receipt_against_owner(tmp_path, monkeypatch,
         if stale:
             with pytest.raises(core.ActionError, match='refused'):
                 mirror.deliver(op)
+            store.dispatch(source, op['operationId'], mirror)
             assert store.operation(source, op['operationId'])['operation']['dispatchState'] == 'cancelled'
         else:
             receipt = mirror.deliver(op)
@@ -341,8 +342,7 @@ def test_owner_refusal_retires_and_remints_without_retry(tmp_path, state):
             calls.append(rid)
             return dict(copy.deepcopy(envelope), id=rid, state=state, **{'from': 'gw:fixture-sync'})
     mirror.remote.courier = Transport()
-    with pytest.raises(core.ActionError):
-        mirror.deliver(op)
+    store.dispatch(OWNER, op['operationId'], mirror)
     assert store.operation(OWNER, op['operationId'])['operation']['dispatchState'] == 'cancelled'
     store.reconcile(OWNER, mirror)
     assert len(calls) == 1
@@ -359,6 +359,7 @@ def test_changed_remote_generation_settles_recorded_operation(tmp_path, departur
     mirror.remote.reconcile(OWNER)
     old = store.requests(OWNER)[0]
     op = decide(store, old)
+    mirror.remote.courier = SimpleNamespace(read=lambda envelope, rid: None)
     mirror.remote.cards = lambda owner: [] if departure else [dict(row, card_answer_generation='b' * 64)]
     mirror.remote.reconcile(OWNER)
     assert store.operation(OWNER, op['operationId'])['operation']['dispatchState'] == 'cancelled'
