@@ -21,7 +21,6 @@ class ReviewRoutingPolicy(unittest.TestCase):
             r"hermes kanban set-model <id> <model> --provider",
             r"mandatory, live-proven independent subscription pin",
             r"review_model`/`review_provider` set to the remaining independent route",
-            r"Don't override.*pinned `kanban.default_model`",
         ]
         hits = []
         for path in sorted(SKILLS.rglob('*.md')):
@@ -29,6 +28,23 @@ class ReviewRoutingPolicy(unittest.TestCase):
                 if re.search(pattern, path.read_text(), re.I):
                     hits.append(f'{path.relative_to(SKILLS)}: {pattern}')
         self.assertEqual(hits, [], '\n'.join(hits))
+
+    def test_recovery_commands_and_fleet_guardrail_are_explicit(self):
+        paths = (
+            'autonomous-ai-agents/claude-usage-diagnostics/references/pacing-governor.md',
+            'autonomous-ai-agents/claude-usage-diagnostics/references/pitfalls.md',
+            'autonomous-ai-agents/claude-usage-diagnostics/references/walled-pin-not-deferred.md',
+            'devops/kanban-red-sweep/references/gave-up-recipes.md',
+            'devops/kanban-hands-digest/references/clearing-blockers-yourself.md',
+        )
+        for path in paths:
+            text = (SKILLS / path).read_text()
+            self.assertIn('hermes kanban set-model <id> none', text)
+            self.assertIn('hermes kanban set-model <id> class:<level> --no-mandatory', text)
+        text = (SKILLS / paths[1]).read_text()
+        self.assertIn("Don't override `kanban.default_model`", text)
+        text = (SKILLS / 'software-development/elephant-goldfish/SKILL.md').read_text()
+        self.assertIn('`delegation.allow_task_model` is true', text)
 
     def test_design_review_is_capability_routed_and_custody_separated(self):
         text = (SKILLS / 'software-development/elephant-goldfish/SKILL.md').read_text()

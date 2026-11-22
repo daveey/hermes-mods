@@ -90,7 +90,9 @@ is not an OS sandbox. It still inherits global instructions, memory and skills o
 any file it can reach. Say "conversation-isolated" in the report, never "zero-context" or "sandboxed".
 
 **Routing:** architecture, design-assessment and refutation reviewers may request `model: class:deep`
-on the `tasks[]` entry, with provider omitted and never mandatory. Other lenses may use `class:standard`,
+on the `tasks[]` entry, with provider omitted and never mandatory. The per-task selector is honored
+only when `delegation.allow_task_model` is true (default false); otherwise it is stripped and the child
+inherits the parent's routing. Do not change that fleet setting just to force a reviewer selector. Other lenses may use `class:standard`,
 `class:fast` or no selector as their capability needs warrant. Do not select an exact model/provider for
 Kanban or delegate review, including recovery from a quota hold. Independence comes from fresh run/session custody,
 neutral inputs and the supported review handoff, not a different model identity; never bypass quota or billing gates.
