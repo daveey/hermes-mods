@@ -256,11 +256,20 @@ def wait_info(row, now):
 
 def wait_target(row, bundle, detail):
     """Resolve the named dependency from already-hydrated evidence, never a new read."""
-    refs = [obj(row.get(k)) for k in ('blocked_upstream', 'upstream')]
-    refs += [{'id': cid} for cid in re.findall(r'\bt_[0-9a-f]+\b', text(obj(row.get('wait')).get('waiting_on')))]
-    for ref in refs:
+    if row.get('status') not in ('scheduled', 'todo', 'blocked', 'triage'):
+        return None
+    on = text(obj(row.get('wait')).get('waiting_on'))
+    # A clock, CI, deploy or release-authority annotation is not a parent wait.
+    if on and not (re.match(r'(?:producer\s+)?card\b', on, re.I) or
+                   re.match(r'external\b', on, re.I) or 'did not publish' in on):
+        return None
+    refs = [obj(row.get(k)) for k in ('blocked_upstream', 'upstream') if obj(row.get(k)).get('id')]
+    named = re.findall(r'\bt_[0-9a-f]+\b', on)
+    if not refs and named:
+        refs = [{'id': named[0]}]  # an unhydrated primary must not become a secondary mention
+    for ref in refs[:1]:
         cid = text(ref.get('id'))
-        if not cid:
+        if not cid or cid == row.get('id'):
             continue
         rec = obj(obj(bundle.get('cards')).get(cid))
         hydration = obj(rec.get('detail'))

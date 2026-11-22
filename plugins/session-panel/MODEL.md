@@ -158,6 +158,11 @@ Order matters, matching Desktop `classify`:
   numeric `synced_at` with `0 <= now - synced_at <= 300 s`; no future skew allowance)
   running row is shown In progress with `evidence_state: "reported"` and a Details line saying so; parked
   states show their board state. No `· board status` tail on any row.
+- Named dependency waits use `waiting on: <hydrated title> · age` with an `open_card` action labeled `Open parent card`.
+  Resolve only the primary dependency from existing bundle/card evidence; never link an own-card wake check to itself,
+  reinterpret clock/CI/deploy waits as parents, or substitute a secondary mention when the primary is unavailable.
+  Replica actions require a known owner. Missing hydration uses a short category; service/PID/task identifiers and
+  parent/release coordinates stay in `details[]`. No additional reader I/O is introduced.
 - Waiting text is one short phrase (`waiting on CI · PR #3881 · 2m`, `waiting on hub deploy · 15m`); URLs go to an
   `open_url` action, the producer's wording to a `Waiting on:` Details line. Hashes never appear inline.
 - Answered-but-undelivered asks are one `decision: {request_id, text}` line on the card they unblock (own row
