@@ -30,6 +30,9 @@ def test_changes_route_watches_and_catches_up(monkeypatch):
         c = TestClient(app)
         first = c.post('/api/plugins/session-panel/changes', json={'sessions': ['S1', 'S2']}).json()
         assert first['feed'] == api.FEED_ID and first['reset'] is True
+        assert first['bundles'] == {}, 'cold request only registers interest'
+        core.PROCESS_FEED.tick()  # producer publishes independently of request
+        first = c.post('/api/plugins/session-panel/changes', json={'sessions': ['S1', 'S2']}).json()
         assert set(first['bundles']) == {'S1', 'S2'}
         assert set(first['bundles']['S1']['cards']) == {'t_aaaaaa1', 't_bbbbbb2', 't_ccccccc3'}
         again = c.post('/api/plugins/session-panel/changes',
@@ -41,7 +44,9 @@ def test_changes_route_watches_and_catches_up(monkeypatch):
         assert c.post('/api/plugins/session-panel/changes', json={'sessions': ['x'] * 201}).status_code == 422
     finally:
         core.PROCESS_FEED.stopped.set()
-        core.PROCESS_FEED._decision_thread.join(2)
+        lane = getattr(core.PROCESS_FEED, '_decision_thread', None)
+        if lane:
+            lane.join(2)
         core.PROCESS_FEED = None
 
 
@@ -56,7 +61,7 @@ def test_a_request_for_another_profile_is_refused_not_served_from_the_wrong_stat
     assert api._load_feed().PROCESS_FEED is None, 'no feed started for it'
 
 
-def test_a_plugin_reload_resumes_the_process_feed_on_register_and_on_the_next_request(monkeypatch):
+def test_a_plugin_reload_resumes_on_register_not_on_the_request(monkeypatch):
     # [daveey 2026-11-21] a reload (unload -> register) must not start a new revision space.
     import threading
     api = load('_spf_reload_api', HERE.parents[1] / 'dashboard' / 'plugin_api.py')
@@ -70,13 +75,14 @@ def test_a_plugin_reload_resumes_the_process_feed_on_register_and_on_the_next_re
         app = FastAPI()
         app.include_router(api.router, prefix='/api/plugins/session-panel')
         c = TestClient(app)
+        api.feed()  # lifecycle producer starts before interactive reads
         first = c.post('/api/plugins/session-panel/changes', json={'sessions': ['S1', 'S2']}).json()
-        # Unload: the feed stops. The next request resumes it (same epoch, no reset).
+        # Unload: reads keep the held publication; register owns restart work.
         plugin.stop()
         again = c.post('/api/plugins/session-panel/changes',
                        json={'sessions': ['S1', 'S2'], 'since': first['rev'], 'epoch': first['epoch']}).json()
         assert again['epoch'] == first['epoch'] and again['reset'] is False and again['bundles'] == {}
-        assert core.PROCESS_FEED.stopped.is_set() is False
+        assert core.PROCESS_FEED.stopped.is_set() is True
         # Unload then register again: register resumes it at once, before any request.
         resumed = core.PROCESS_FEED
         plugin.stop()

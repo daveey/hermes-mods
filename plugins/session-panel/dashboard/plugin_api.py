@@ -34,6 +34,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
+from starlette.responses import Response
 
 
 # Thread lanes (core ``hermes_cli.web_thread_lanes``): this plugin's Desktop-polled reads get their own thread
@@ -930,6 +931,14 @@ class ChangesBody(BaseModel):
 
 
 router = APIRouter()
+_WIRE_PREFIX = json.dumps({'feed': FEED_ID, 'profile': LAUNCH_PROFILE},
+                          ensure_ascii=False, separators=(',', ':')).encode()[:-1] + b','
+
+
+@router.on_event('startup')
+async def start_publication():
+    # Disk restore and feed lifecycle locks never run on an interactive request.
+    threading.Thread(target=feed, name='session-panel-start', daemon=True).start()
 
 
 @router.post('/changes')
@@ -937,10 +946,14 @@ async def changes(body: ChangesBody, request: Request):
     profile = _request_profile()
     if profile != LAUNCH_PROFILE:
         return {'feed': FEED_ID, 'profile': profile, 'profile_unsupported': True}
-    # A resume waits for the stopped feed's in-flight push: never on the loop, and on the feed lane like the read.
-    f = await _on_lane('feed', feed, request=request)
-    out = await _on_lane('feed', f.changes, body.sessions, since=body.since, epoch=body.epoch, request=request)
-    return json_safe({'feed': FEED_ID, 'profile': LAUNCH_PROFILE, **out})
+    # Do not call _load_feed here: source fingerprinting and hot handover also
+    # belong to the producer, not this byte-read path.
+    f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
+    if f is None or not hasattr(f, 'changes_bytes'):
+        return Response(b'{"detail":"Session panel starting"}', status_code=503,
+                        media_type='application/json', headers={'Retry-After': '1'})
+    wire = f.changes_bytes(body.sessions, since=body.since, epoch=body.epoch)
+    return Response(_WIRE_PREFIX + wire[1:], media_type='application/json')
 
 
 @router.get('/status')

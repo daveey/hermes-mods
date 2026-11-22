@@ -1,5 +1,4 @@
-"""POST /changes runs on core's ``feed`` thread lane (hermes_cli.web_thread_lanes); a core without lanes keeps
-the shared pool. Live 2026-11-21: /changes held shared-pool threads for up to 926 s and starved /api/status."""
+"""Published reads bypass both core lanes and the shared pool."""
 import importlib.util
 import sys
 from pathlib import Path
@@ -44,7 +43,7 @@ def _client(api):
 
 
 @pytest.mark.parametrize('lanes', [True, False], ids=['core-lanes', 'core-without-lanes'])
-def test_changes_runs_on_the_feed_lane(api, monkeypatch, lanes):
+def test_changes_never_enters_the_feed_lane(api, monkeypatch, lanes):
     seen = []
 
     async def fake_lane(lane, fn, *args, request=None, deadline=None, **kwargs):
@@ -52,16 +51,16 @@ def test_changes_runs_on_the_feed_lane(api, monkeypatch, lanes):
         return await run_in_threadpool(lambda: fn(*args, **kwargs))
 
     monkeypatch.setattr(api, '_run_in_lane', fake_lane if lanes else None)
+    api._load_feed().PROCESS_FEED.changes(['S1'])  # producer, before request
     out = _client(api).post('/api/plugins/session-panel/changes', json={'sessions': ['S1']})
     assert out.status_code == 200 and set(out.json()['bundles']) == {'S1'}
-    # The request goes along so a waiter whose client left is dropped.
-    assert seen == ([('feed', True)] * 2 if lanes else [])  # getting the feed (a resume may wait) and the read
+    assert seen == []
 
 
-def test_a_busy_lane_answers_503_with_retry_after(api, monkeypatch):
+def test_a_busy_lane_cannot_delay_a_published_read(api, monkeypatch):
     async def busy(lane, fn, *args, **kwargs):
         raise HTTPException(503, detail={'error': 'lane_busy', 'lane': lane}, headers={'Retry-After': '2'})
 
     monkeypatch.setattr(api, '_run_in_lane', busy)
     out = _client(api).post('/api/plugins/session-panel/changes', json={'sessions': ['S1']})
-    assert out.status_code == 503 and out.headers['Retry-After'] == '2'
+    assert out.status_code == 200 and out.json()['bundles'] == {}
