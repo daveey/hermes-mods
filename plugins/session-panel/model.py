@@ -45,7 +45,9 @@ def published_status(outcome):
         value = status.get(key)
         if type(value) is not int or not 0 <= value <= 9007199254740991:
             return None
-    identity, coverage, paint = (obj(status.get(k)) for k in ('identity', 'coverage', 'presentation'))
+    if not all(isinstance(status.get(k), dict) for k in ('identity', 'coverage', 'presentation')):
+        return None
+    identity, coverage, paint = (status[k] for k in ('identity', 'coverage', 'presentation'))
     if not all(isinstance(identity.get(k), str) and identity[k] for k in ('gateway', 'profile', 'session_id', 'owner_epoch')):
         return None
     if coverage.get('state') not in ('complete', 'unknown') or paint.get('stripe') not in ('attention', 'blocked', 'done', 'none', 'stuck', 'waiting'):
