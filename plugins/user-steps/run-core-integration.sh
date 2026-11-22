@@ -27,4 +27,21 @@ done
 cp "$plugins/coach/placement_evidence.py" "$fixtures/plugins/coach/placement_evidence.py"
 cp -R "$plugins/../desktop-plugins/user-steps" "$fixtures/desktop-plugins/user-steps"
 cd "$core"
-scripts/run_tests.sh "$fixtures/plugins/user-steps/tests" --file-retries 0 --tb=short "$@"
+if [[ "${1:-}" == --remote-card-composed ]]; then
+  shift
+  reports="${1:?pass an absolute report directory}"
+  shift
+  [[ "$reports" = /* ]] || { echo 'report directory must be absolute' >&2; exit 2; }
+  test -f "$fixtures/courier.py"
+  test -f tests/conftest.py
+  test -f tests/hermes_cli/test_card_answer_courier_integration.py
+  mkdir -p "$reports"
+  for stem in test_remote_card_async_custody test_remote_card_courier test_remote_card_review_race; do
+    rm -f "$reports/$stem.xml"
+    scripts/run_tests.sh "$fixtures/plugins/user-steps/tests/$stem.py" \
+      --file-retries 0 --tb=short -v -rA --junitxml="$reports/$stem.xml" "$@"
+  done
+  "${HERMES_PYTHON:-$core/.venv/bin/python}" "$plugins/user-steps/composed_results.py" "$reports"
+else
+  scripts/run_tests.sh "$fixtures/plugins/user-steps/tests" --file-retries 0 --tb=short "$@"
+fi

@@ -142,6 +142,18 @@ class PluginSuitesWorkflow(unittest.TestCase):
         self.assertIn("core_ref:", inputs)
         self.assertRegex(inputs, r"(?m)^        default: main$")
 
+    def test_remote_card_composed_is_unconditional_and_uses_landed_inputs(self):
+        job = self.text.split('  remote-card-composed:\n', 1)[1].split('\n  suites:', 1)[0]
+        self.assertIn('ref: ${{ github.event.pull_request.head.sha || github.sha }}', job)
+        self.assertIn('ref: 0397ba2abd1be2b28c41626152696f0901acab4f', job)
+        self.assertIn('ref: 11058ac91990624059dd4214e420334cbcc5d006', job)
+        self.assertIn('--python 3.14 --locked --group dev --group test', job)
+        self.assertIn('bash plugins/user-steps/run-core-integration.sh', job)
+        self.assertIn('--remote-card-composed "$RUNNER_TEMP/remote-card-composed" -j 1', job)
+        self.assertEqual(re.findall(r'(?m)^\s+if: (.+)$', job), ['always()'])
+        self.assertNotIn('continue-on-error', job)
+        self.assertIn('if-no-files-found: error', job)
+
     def test_failure_uploads_full_suite_logs_only(self):
         run = self.text.split("      - name: Run selected suites", 1)[1].split("      - name: Upload", 1)[0]
         self.assertRegex(run, r'--output-dir "\$logs"')
