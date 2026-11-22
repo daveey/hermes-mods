@@ -783,7 +783,8 @@ class Feed:
         seen = boards() if callable(boards) else None
         semantic = getattr(self.readers, 'board_changes', None)
         board_changes = None
-        if seen is None or seen != self._board_stamps or full or self._cursor is None:
+        board_dirty = seen is None or seen != self._board_stamps or full or self._cursor is None
+        if board_dirty:
             if callable(semantic):
                 board_changes, self._cursor = semantic(self._cursor)
                 changed_cards = {}
@@ -817,7 +818,9 @@ class Feed:
                 dirty.update(s for s in watched if s in self.bundles and board_changes.affects(self.bundles[s]))
         # File activity is only admission to capture, not proof that every
         # session's inputs changed. Compare canonical external rows per lineage.
-        if external_dirty:
+        # Replica observations also live in board shadows. A pull may change only
+        # their sync bookkeeping, with no hub/ledger write or task revision.
+        if external_dirty or board_dirty:
             capture = getattr(self.readers, 'external_capture', None)
             if callable(capture):
                 with self.lock:
@@ -837,7 +840,7 @@ class Feed:
                         self._external_observations = {**(getattr(self, '_external_observations', None) or {}), **observations}
                     self._publish({}, age_only=True, observations=observations)
                 self._external_captures = captured
-            else:  # Older/injected readers cannot attest unchanged external inputs.
+            elif external_dirty:  # Older readers cannot attest unchanged external inputs.
                 dirty.update(watched)
         dirty.update(retry)
         dirty.update(panel_dirty)

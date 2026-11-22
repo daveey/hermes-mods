@@ -1,6 +1,7 @@
 """Real replica SQL bookkeeping must not trigger per-chat hydration."""
 import copy
 import sqlite3
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -8,7 +9,8 @@ from test_feed import make
 from test_source_coverage import api_module
 
 
-def test_replica_pull_carries_observation_without_hydration(tmp_path, monkeypatch):
+@pytest.mark.parametrize('board_only', [False, True])
+def test_replica_pull_carries_observation_without_hydration(tmp_path, monkeypatch, board_only):
     links = pytest.importorskip('hermes_cli.kanban_chat_links')
     from hermes_cli import kanban_session_activity as ksa, kanban_db_sync as sync
     from hermes_cli import profiles
@@ -41,7 +43,8 @@ def test_replica_pull_carries_observation_without_hydration(tmp_path, monkeypatc
     adapter = object.__new__(api_module().CoreReaders)
     adapter.ksc = SimpleNamespace(load_identity=lambda: SimpleNamespace(gateway='local'))
     held = {s: {'lineage': {s}, 'refs': set()} for s in ('S1', 'S2')}
-    r.external_stamps = lambda: r.stamp
+    r.external_stamps = lambda: 1 if board_only else r.stamp
+    r.board_stamps = lambda: r.stamp if board_only else 1
     r.external_capture = adapter.external_capture
     # Optional adapter hooks: the baseline has neither, so RED is behavioral.
     for name in ('external_semantic', 'advance_external'):
@@ -61,21 +64,37 @@ def test_replica_pull_carries_observation_without_hydration(tmp_path, monkeypatc
     f.tick()
     initial = copy.deepcopy(f.bundles['S1']['bundle'])
     calls.clear()
-    # A hydration begun before the pull must not overwrite the carried clock.
-    delayed = copy.deepcopy(initial)
-    delayed['computed_seq'] = next(f._seq)
-    for i in range(1, 11):
-        clock['now'] = 1000 + i
-        with sqlite3.connect(path) as c:
-            c.execute('UPDATE kanban_sync_state SET pulled_at=?', (clock['now'],))
-        r.stamp += 1  # unrelated external write exposes the new replica observation
-        f.tick()
-    assert calls == [], 'unchanged semantic replica input must not hydrate every chat'
-    after = f.bundles['S1']['bundle']
-    assert after['tasks'][0]['synced_at'] == 1010
-    assert after['computed_at'] == initial['computed_at']
-    assert after['computed_seq'] == initial['computed_seq']
-    f._publish({'S1': delayed})
+    # A real concurrent producer reads before the pull and publishes after it.
+    ready, release = threading.Event(), threading.Event()
+    failures = []
+    def producer():
+        try:
+            bundles = f._compute_all(['S1'], refresh=True)
+            ready.set()
+            assert release.wait(5)
+            f._publish(bundles)
+        except BaseException as exc:
+            failures.append(exc)
+    worker = threading.Thread(target=producer)
+    worker.start()
+    try:
+        assert ready.wait(5)
+        calls.clear()  # count only hydration admitted by the subsequent pulls
+        for i in range(1, 11):
+            clock['now'] = 1000 + i
+            with sqlite3.connect(path) as c:
+                c.execute('UPDATE kanban_sync_state SET pulled_at=?', (clock['now'],))
+            r.stamp += 1
+            f.tick()
+        assert calls == [], 'unchanged semantic replica input must not hydrate every chat'
+        after = f.bundles['S1']['bundle']
+        assert after['tasks'][0]['synced_at'] == 1010
+        assert after['computed_at'] == initial['computed_at']
+        assert after['computed_seq'] == initial['computed_seq']
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive() and not failures
     assert f.bundles['S1']['bundle']['tasks'][0]['synced_at'] == 1010
     with sqlite3.connect(path) as c:
         c.execute("UPDATE tasks SET title='changed receipt' WHERE id='card1'")
