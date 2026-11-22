@@ -64,6 +64,39 @@ def test_exact_legacy_bundle_wire_and_push(setup):
     assert f.bundles['S1']['bundle'] == bundle
 
 
+def test_readiness_exception_recovery_and_deadline_without_publication():
+    import threading
+    transport = Transport()
+    reported = threading.Event()
+    reports = []
+    state = {'fail': False, 'ready': True, 'delay': None}
+    def refresh():
+        if state['fail']:
+            raise OSError('replica unavailable')
+        return state['ready'], state['delay']
+    def report(*a, **kw):
+        reports.append(kw['ready'])
+        reported.set()
+    transport.report_ready = report
+    worker = bridge.PanelReadiness(transport, 'profile-a', refresh)
+    try:
+        assert reported.wait(2) and reports == [True]
+        reported.clear()
+        state['fail'] = True
+        worker.wake.set()
+        assert reported.wait(2) and reports == [True, False]
+        reported.clear()
+        state.update(fail=False, delay=0.05)
+        worker.wake.set()
+        assert reported.wait(2) and reports == [True, False, True]
+        reported.clear()
+        state.update(ready=False, delay=None)
+        # No publication/wake: the outstanding expiry timer withdraws readiness.
+        assert reported.wait(2) and reports == [True, False, True, False]
+    finally:
+        worker.close()
+
+
 def test_warm_and_cold_reads_never_call_source_helpers(setup, monkeypatch):
     f, readers, _, _, bundle, transport, adapter = setup
     transport.send(bundle)

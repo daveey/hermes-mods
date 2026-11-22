@@ -122,6 +122,15 @@ _facts_spec = importlib.util.spec_from_file_location('_session_panel_fact_subscr
 _facts_module = importlib.util.module_from_spec(_facts_spec)
 _facts_spec.loader.exec_module(_facts_module)
 PanelSubscription = _facts_module.PanelSubscription
+PanelReadiness = _facts_module.PanelReadiness
+
+
+def decision_projection(bundle):
+    """The decision repaint wire, shared by legacy and facts publication."""
+    result = {k: bundle[k] for k in ('session', 'lineage', 'model')}
+    result['tasks'] = [{k: task[k] for k in ('id', 'gateway', 'profile', 'board') if k in task}
+                       for task in bundle.get('tasks', [])]
+    return result
 
 
 def _hash(bundle: dict) -> str:
@@ -172,6 +181,7 @@ class _Stop(threading.Event):
 
 class Feed:
     """One feed per gateway process (one profile: the process's own)."""
+    decision_projection = staticmethod(decision_projection)
 
     def __init__(self, readers: Any, *, emit: Callable[[dict], None], clock: Callable[[], float] = time.time,
                  full_every_s: float = FULL_EVERY_S, interest_ttl_s: float = INTEREST_TTL_S,
@@ -296,6 +306,9 @@ class Feed:
                 lane.service_wake.set()
         wanted = tuple(dict.fromkeys(sessions))[:MAX_REQUEST]
         self._registrations.put(wanted)
+        readiness = getattr(self, '_facts_readiness', None)
+        if readiness is not None:
+            readiness.set()
         if getattr(self, '_facts_mode', False):
             self._wake.set()  # interest renewal/demand is background-only
         current, rev, entries, header = self._wire

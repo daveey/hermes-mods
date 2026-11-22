@@ -8,6 +8,43 @@ contract = pytest.importorskip('hermes_cli.fact_contract', reason='facts-v1 core
 fakes = pytest.importorskip('hermes_cli.fact_fake', reason='facts-v1 core integration')
 from test_feed import feedmod, make
 from test_fact_subscription import bridge
+from test_fact_lifecycle import api
+
+
+def test_quiet_publication_readiness_is_serial_and_closes(api, monkeypatch):
+    import threading
+    from types import SimpleNamespace as NS
+    store = fakes.FakeStore()
+    scope = contract.Scope('fixture-install', 'fixture-profile', None)
+    f = api._load_feed().PROCESS_FEED
+    f.watch(['S1'])
+    reported = threading.Event()
+    reports = []
+    original = store.report_ready
+    def report(*args, **kwargs):
+        original(*args, **kwargs)
+        reports.append(kwargs['ready'])
+        reported.set()
+    monkeypatch.setattr(store, 'report_ready', report)
+    registration = api.install_facts(store, scope, NS(demand=lambda *a: None))
+    try:
+        assert reported.wait(2) and reports == [False]
+        reported.clear()
+        fact = contract.Fact(store.key(scope, 'ChatWaitingFact', 'S1'), {'panel': {}}, health='fresh')
+        view = contract.Fact(store.view_key(scope, 'panel_bundle', {'session': 'S1'}),
+                             {'encoded': b'{}'}, health='fresh')
+        store.publish([fact, view])
+        store.drain()  # no old reader activity: publication itself wakes readiness
+        assert reported.wait(2) and reports == [False, True]
+        reported.clear()
+        store.publish([replace(view, health='stale')])
+        store.drain()
+        assert reported.wait(2) and reports == [False, True, False]
+    finally:
+        registration.close()
+    store.publish([view])
+    store.drain()
+    assert not registration.thread.is_alive() and reports == [False, True, False]
 
 
 def test_shared_fake_parity_and_ring_recovery():
