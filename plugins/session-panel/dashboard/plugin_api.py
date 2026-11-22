@@ -416,6 +416,55 @@ class CoreReaders:
             requests = None
         return (outcome, requests)
 
+    def panel_stamps(self, sessions):
+        """`panel_stamp` for many chats in two reads per 400 (not two per chat): {session: (outcome, requests)},
+        every asked chat present, each value exactly what `panel_stamp` returns for it."""
+        ids = list(dict.fromkeys(str(s) for s in sessions))
+        outcomes: dict = {}
+        requests: dict = {s: [] for s in ids}
+        state = self.conn(self.state_db())
+        actions = self.conn(self.state_db().parent / 'user-steps' / 'actions.sqlite3')
+        for at in range(0, len(ids), 400):
+            part = ids[at:at + 400]
+            marks = ','.join('?' * len(part))
+            try:
+                if state:
+                    for row in state.execute(f'SELECT id,outcome_json FROM sessions WHERE id IN ({marks})', part):
+                        outcomes[row['id']] = row['outcome_json']
+            except sqlite3.Error:
+                for s in part:
+                    outcomes.pop(s, None)
+            try:
+                if actions:
+                    for row in actions.execute('SELECT session,id,revision,state,resolution FROM requests '
+                                               f'WHERE session IN ({marks}) ORDER BY id', part):
+                        row = tuple(row)
+                        requests[row[0]].append(row[1:])
+            except sqlite3.Error:
+                for s in part:
+                    requests[s] = None
+        return {s: (outcomes.get(s), None if requests[s] is None else tuple(requests[s])) for s in ids}
+
+    def panel_files_stamp(self):
+        """Moves with every committed write to either file `panel_stamps` reads (stat only, nothing opened)."""
+        from hermes_cli.session_list_flight import data_stamp
+        return (data_stamp(self.state_db()) or self._stat(self.state_db()), self.decision_store_stamp())
+
+    @staticmethod
+    def _stat(base):
+        out = []
+        for f in (base, Path(f'{base}-wal')):
+            try:
+                st = os.stat(f)
+                out.append((st.st_ino, st.st_mtime_ns, st.st_size))
+            except OSError:
+                out.append(None)
+        return tuple(out)
+
+    def decision_store_stamp(self):
+        """Moves with every committed write to the user-steps store (requests, operations, deliveries)."""
+        return self._stat(self.state_db().parent / 'user-steps' / 'actions.sqlite3')
+
     def reconcile_user_steps(self, session, lineage):
         return self._user_step_requests(session, lineage, reconcile=True)
 
@@ -862,6 +911,18 @@ def stop() -> None:
         f.stopped.set()
 
 
+MIN_PAUSE_S = 0.2
+MAX_PAUSE_S = 5.0
+
+
+def _pause(elapsed: float, tick_s: Optional[float] = None) -> float:
+    """How long a loop rests after a pass that took `elapsed` seconds. A pass inside the tick keeps the tick
+    period. A slower one rests as long as it ran (at most MAX_PAUSE_S): the old fixed 0.2 s floor turned every
+    overrunning pass into a near-continuous loop that took the interpreter from the request threads."""
+    tick_s = TICK_S if tick_s is None else tick_s
+    return max(MIN_PAUSE_S, tick_s - elapsed, min(elapsed, MAX_PAUSE_S))
+
+
 def _run_decisions(f) -> None:
     """A blocked board sweep must not delay a recorded decision's status line."""
     # Own current-generation readers: the existing Feed may have been constructed
@@ -874,7 +935,8 @@ def _run_decisions(f) -> None:
                 f.refresh_decisions(readers=readers)
             except Exception:
                 log.warning('session-panel decision refresh failed', exc_info=True)
-            f.stopped.wait(max(0.2, TICK_S - (time.monotonic() - started)))
+            readers.release()  # no connection outlives one pass
+            f.stopped.wait(_pause(time.monotonic() - started))
     finally:
         readers.release()
 
@@ -889,13 +951,23 @@ def _run(f) -> None:
                 f.tick()
             except Exception:
                 log.warning('session-panel feed tick failed', exc_info=True)
+            f.readers.release()  # no connection outlives one pass
             with f.lock:
                 state = (f.rev, frozenset(f.interest))
             if state != saved and time.monotonic() - saved_at >= SNAPSHOT_EVERY_S:
                 saved_at = time.monotonic()
                 if save_snapshot(f):
                     saved = state
-            f.stopped.wait(max(0.2, TICK_S - (time.monotonic() - started)))
+            # A read that found no bundle for its chat sets `_wake`: the next pass starts at once.
+            wake = getattr(f, '_wake', None)
+            pause = _pause(time.monotonic() - started)
+            if wake is None:
+                f.stopped.wait(pause)
+                continue
+            until = time.monotonic() + pause
+            f.stopped.wait(MIN_PAUSE_S)  # never back to back, even for a queue of cold reads
+            while not f.stopped.is_set() and not wake.is_set() and time.monotonic() < until:
+                wake.wait(min(MIN_PAUSE_S, max(0.0, until - time.monotonic())))  # a stop is seen within MIN_PAUSE_S
     finally:
         # A plugin reload's successor owns the revision space now (and saves it); a plain stop saves the last state.
         if getattr(f, '_successor', None) is None:
@@ -935,10 +1007,29 @@ _WIRE_PREFIX = json.dumps({'feed': FEED_ID, 'profile': LAUNCH_PROFILE},
                           ensure_ascii=False, separators=(',', ':')).encode()[:-1] + b','
 
 
-@router.on_event('startup')
-async def start_publication():
-    # Disk restore and feed lifecycle locks never run on an interactive request.
-    threading.Thread(target=feed, name='session-panel-start', daemon=True).start()
+def start_publication() -> bool:
+    """Start (or resume) the process's feed on its own thread; True when a start was launched. Disk restore and the
+    feed lifecycle locks never run on an interactive request. One start in flight per process."""
+    running = _LOADER.__dict__.get('starting')
+    if running is not None and running.is_alive():
+        return False
+    t = threading.Thread(target=feed, name='session-panel-start', daemon=True)
+    _LOADER.starting = t
+    t.start()
+    return True
+
+
+def _serves_desktop(name: str = __name__, role: str = FEED_ROLE) -> bool:
+    """True when core's web server imported this file as the plugin's API in a backend that serves Desktops
+    (`hermes serve` / `hermes dashboard`). Core's app runs a lifespan, so a router startup hook never fires, and
+    plugin routes may be mounted long after startup: the import is the one moment every such process passes."""
+    return name.startswith('hermes_dashboard_plugin_') and role.split('-', 1)[0] in ('serve', 'dashboard')
+
+
+if _serves_desktop():
+    # The producer runs before the first click: a restarted backend restores its saved bundles and recomputes them
+    # while Desktops reconnect, instead of starting on (and making wait) the first request.
+    start_publication()
 
 
 @router.post('/changes')
@@ -950,6 +1041,10 @@ async def changes(body: ChangesBody, request: Request):
     # belong to the producer, not this byte-read path.
     f = getattr(sys.modules.get(_FEED_KEY), 'PROCESS_FEED', None)
     if f is None or not hasattr(f, 'changes_bytes'):
+        # Not running in this process yet (a host process that did not start it at import): start it off this
+        # request and say so. Never compute here. A stopped feed (plugin unload) keeps answering with what it
+        # holds; register() resumes it.
+        start_publication()
         return Response(b'{"detail":"Session panel starting"}', status_code=503,
                         media_type='application/json', headers={'Retry-After': '1'})
     wire = f.changes_bytes(body.sessions, since=body.since, epoch=body.epoch)
