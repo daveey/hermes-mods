@@ -50,9 +50,15 @@ def test_replica_pull_carries_observation_without_hydration(tmp_path, monkeypatc
     for name in ('external_semantic', 'advance_external'):
         if hasattr(adapter, name):
             setattr(r, name, getattr(adapter, name))
-    r.linked = lambda ids: original(ids, 'local', ('running',), replicas=[('default', path)],
-                                  now=clock['now'], origin_cards=[])
-    r.done = lambda ids: []
+    # Exercise the real CoreReaders -> session_tasks -> selected_remote_cards
+    # path, not a replacement linked() that bypasses core's display memos.
+    from hermes_cli import kanban_sync_client as ksc
+    adapter._local = threading.local()
+    monkeypatch.setattr(ksc, 'load_identity', adapter.ksc.load_identity)
+    monkeypatch.setattr(ksa, '_board_db_paths', lambda: [])
+    monkeypatch.setattr(ksa, '_remote_links', lambda **kw: [])
+    r.linked = adapter.linked
+    r.done = adapter.done
     r.card = lambda *args: None
     calls = []
     compute = f.compute
