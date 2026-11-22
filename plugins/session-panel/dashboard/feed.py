@@ -826,7 +826,8 @@ class Feed:
                 with self.lock:
                     capture_seq = next(self._seq)
                     held = {s: {'lineage': set(self.bundles[s]['lineage']),
-                                'refs': set(self.bundles[s]['refs'])}
+                                'refs': set(self.bundles[s]['refs']),
+                                'bundle': self.bundles[s]['bundle']}
                             if s in self.bundles else {'lineage': {s}, 'refs': set()}
                             for s in watched}
                 captured = capture(held)
