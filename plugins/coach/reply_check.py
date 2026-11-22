@@ -3106,8 +3106,8 @@ def run_end_tool(tool_log: Optional[list] = None) -> Optional[str]:
 
 def lifecycle_park(tool_log: Optional[list] = None, now: Optional[float] = None, dbs: Optional[list] = None) -> bool:
     """True when this turn's tool log shows a successful human block, kind=time block, kanban_schedule, review
-    handoff (kanban_request_review / kanban_request_changes), or a dependency block on a live parent card
-    (live_dependency_parent)."""
+    handoff (kanban_request_review / kanban_request_changes), confirmed stop-only retention (kanban_retain),
+    or a dependency block on a live parent card (live_dependency_parent)."""
     if live_dependency_parent(tool_log, now=now, dbs=dbs):
         return True
     for line in tool_log or []:
@@ -3120,7 +3120,7 @@ def lifecycle_park(tool_log: Optional[list] = None, now: Optional[float] = None,
             continue
         if not isinstance(f, dict):
             continue
-        if f.get("tool") == "kanban_schedule" or f.get("tool") in _HANDOFF_PARKS:
+        if f.get("tool") in ("kanban_schedule", "kanban_retain") or f.get("tool") in _HANDOFF_PARKS:
             return True
         if f.get("tool") == "kanban_block":
             if f.get("kind") == "time":
@@ -3146,6 +3146,7 @@ def lifecycle_park(tool_log: Optional[list] = None, now: Optional[float] = None,
 # (tests/test_report_only_run_ended.py).
 RUN_ENDED_TO_CARD = (
     "kanban_block", "kanban_schedule", "kanban_request_review", "kanban_request_changes",
+    "kanban_retain",  # confirmed stop-only triage keeps acceptance open, without authority to act
     "kanban_continue",  # also exempt as continued_run; listed so the classification is complete
 )
 

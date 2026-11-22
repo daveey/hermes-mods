@@ -4134,7 +4134,7 @@ def owner_result_line(tool: str, args: Any, result: Any, now: Optional[float] = 
 # agent-8a6863884a: the review handoff ends the run too (core's _RUN_LIFECYCLE_TOOLS); kanban_request_review /
 # kanban_request_changes hand the card to its next owner (reviewer / implementer). Every run-ending tool must be here,
 # in reply_check.JUDGED_AFTER_RUN_END, or (kanban_continue) reply_check.continued_run: a test enforces it.
-PARK_TOOLS = ("kanban_block", "kanban_schedule", "kanban_request_review", "kanban_request_changes")
+PARK_TOOLS = ("kanban_block", "kanban_schedule", "kanban_request_review", "kanban_request_changes", "kanban_retain")
 
 
 _PARK_CARD_RE = re.compile(r"\bt_[0-9a-f]{8,}\b")
@@ -4171,6 +4171,12 @@ def park_result_line(tool: str, args: Any, linked: Optional[list] = None, result
         return None
     if name not in PARK_TOOLS:
         return None
+    # Retention is stop-only triage, not completion or execution authority. Unknown delivery
+    # must preserve the exact request: only its explicit terminal receipt proves this run ended.
+    if name == "kanban_retain":
+        receipt = _as_dict(result) or {}
+        if receipt.get("ok") is not True or receipt.get("terminal_for_run") is not True:
+            return None
     # every PARK_TOOLS call that succeeded ended the run of the card it names (`task`; absent = the worker's own):
     # reply_check.own_run_ended routes a report_only finding to that card instead of nudging (agent-689886b70b)
     facts: dict = {"tool": name, "run_ended": True}
