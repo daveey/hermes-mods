@@ -129,6 +129,7 @@ class BoardLane:
         now = f.clock()
         self.service()
         capture_started = time.time()
+        capture_timing: dict = {'started_at': capture_started}
         rd = self.reader_factory()
         stamp = None
         try:
@@ -156,12 +157,27 @@ class BoardLane:
                     else:
                         dirty = {s for s, b in held.items()
                                  if b['refs'].intersection(changed) or b['lineage'].intersection(v for v in changed.values() if v)}
+                # A known local delta is independently actionable. Strict external
+                # inventory can take longer than the freshness budget; it must not
+                # hold this admission hostage. Keep the capture cursor uncommitted
+                # until external capture succeeds, so failures remain retryable.
+                self._admit(dirty, at)
+                capture_timing.update(local_admitted_at=time.time(), local_sessions=sorted(dirty),
+                                      capture_seq=capture_seq)
+                self.service_wake.set()
+                self.service()
                 capture = getattr(rd, 'external_capture', None)
                 captured = self.external_captures
+                external_dirty = set()
                 if callable(capture):
-                    captured = capture(held)
+                    external_started = time.monotonic()
+                    try:
+                        captured = capture(held)
+                    finally:
+                        capture_timing['external_s'] = round(time.monotonic() - external_started, 4)
                     compare = getattr(rd, 'external_semantic', lambda value: value)
-                    dirty.update(s for s in held if compare(captured[s]) != compare(self.external_captures.get(s)))
+                    external_dirty = {s for s in held if compare(captured[s]) != compare(self.external_captures.get(s))}
+                    dirty.update(external_dirty)
                     if callable(getattr(rd, 'advance_external', None)):
                         observations = {s: (capture_seq, captured[s]) for s in held
                                         if s not in dirty and captured[s] != self.external_captures.get(s)}
@@ -171,16 +187,16 @@ class BoardLane:
                                                                if s not in old or value[0] > old[s][0]}}
                         f._publish({}, age_only=True, observations=observations)
                 elif callable(external) and (self.stamp is None or stamp[1] != self.stamp[1]):
-                    dirty.update(held)  # old adapters cannot attest unchanged external inputs
-                for session in dirty:
-                    with f.lock:
-                        self.pending.setdefault(session, at)  # retain the oldest unserved admission
-                        f._board_failures.add(session)
-                        self.retries.pop(session, None)  # a real source event renews finite recovery
+                    external_dirty.update(held)  # old adapters cannot attest unchanged external inputs
+                # Even a locally admitted chat needs a successor if this later
+                # external snapshot changed: its first read may predate that input.
+                self._admit(external_dirty, at)
+                capture_timing.update(external_admitted_at=time.time(), external_sessions=sorted(external_dirty))
                 self.external_captures = captured
                 self.cursor, self.stamp = cursor, stamp
                 self.capture_failures, self.capture_retry_at = 0, None
         except Exception:
+            capture_timing['failed'] = True
             self.attempted_stamp = stamp
             self.capture_failures += 1
             self.capture_retry_at = f._backoff(self.capture_failures)
@@ -189,8 +205,19 @@ class BoardLane:
             log.warning('session-panel board capture failed', exc_info=True)
         finally:
             rd.release()
+            if 'capture_seq' in capture_timing or capture_timing.get('failed'):
+                capture_timing['finished_at'] = time.time()
+                with f.lock:
+                    f.timing['board_captures'] = (f.timing.get('board_captures', []) + [capture_timing])[-128:]
         self.service_wake.set()
         self.service()
+
+    def _admit(self, sessions, at):
+        with self.feed.lock:
+            for session in sessions:
+                self.pending.setdefault(session, at)  # oldest outstanding generation wins service
+                self.feed._board_failures.add(session)
+                self.retries.pop(session, None)
 
     def _read(self, session, token, base, admitted_at):
         f, rd = self.feed, None

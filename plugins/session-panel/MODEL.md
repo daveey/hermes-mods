@@ -30,6 +30,13 @@ external hub/origin-ledger/replica source stamps, and publishes affected watched
 chats independently of full-sweep mirror reconciliation. External captures use the
 canonical owner-qualified adapter and semantic comparison; sync-bookkeeping-only
 pulls carry observations without hydration or renewed computation/execution clocks.
+Known local task-change deltas enter the pending queue and can publish **before**
+the same pass starts strict external capture. A later changed external snapshot
+admits its own successor, including for a chat already locally admitted; the first
+read may predate that external input. Capture failure leaves the source cursor and
+external baseline uncommitted for finite retry. This does not make a local event
+arriving during an already-blocked capture independently observable: the capture
+coordinator remains shared, and that pre-admission interval must still be measured.
 Four bounded workers hydrate one chat each; a blocked reader does not hold the
 coordinator or another chat's publication. A separate event-driven capacity service
 drains completions and refills admitted slots even while the coordinator is inside
@@ -53,6 +60,11 @@ changes require full hydration rather than reusing another lineage's decisions.
 Readers own and close their connections per invocation. `timing.board_recent`
 records admission, first read, publication, per-reader durations and whether a
 publication changed the model; `producer_readers` records per-chat reconciliation.
+`timing.board_captures` retains local/external admission wall times, strict external
+capture duration and failures. Successful `timing.recent` push records include each
+emitted model's exact revision and board computed sequence/time; failed transport
+calls do not create successful emit records. These bounded records distinguish
+capture/admission and emission from sparse disk checkpoint observations.
 These are producer timings, not installed Desktop click-to-render measurements.
 
 ## Canonical decision freshness
