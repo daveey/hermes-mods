@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v20-warm-sidebar'
+const VERSION = 'session-panel-v21-local-clock'
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 // Emoji-presentation glyphs the Desktop fonts draw as tofu (a Hermes-bug title carried "⛔"); the model strips them
 // too, this covers a cached older model.
@@ -392,7 +392,30 @@ export function writeCollapsed(scope, keys) {
 /** Collapsed only while every current ask/stuck row was already present when the user collapsed the panel. */
 export const isCollapsed = (model, stored) => !!stored && attentionKeys(model).every(k => stored.includes(k))
 
-export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck, collapsed = false, onToggle } = {}) {
+/** Only display text ages locally. Never refresh evidence, classify rows or read the network. */
+export function formatClockText(parts, now = Date.now() / 1000) {
+  const duration = value => {
+    const n = Math.max(0, Math.floor(value)), m = Math.floor(n / 60), h = Math.floor(n / 3600), d = Math.floor(n / 86400)
+    return d ? `${d}d${h % 24 ? ` ${h % 24}h` : ''}` : h ? `${h}h${m % 60 ? ` ${m % 60}m` : ''}` : m ? `${m}m` : `${n}s`
+  }
+  return Array.isArray(parts) ? parts.map(p => {
+    if (typeof p === 'string') return p
+    if (!p || !Number.isFinite(p.timestamp) || p.timestamp <= 0) return ''
+    const age = Math.max(0, Math.floor(now - p.timestamp))
+    if (p.format === 'elapsed') return duration(age)
+    if (p.format === 'remaining') return duration(p.timestamp - now)
+    if (p.format === 'ago') return age < 60 ? 'just now' : age < 3600 ? `${Math.floor(age / 60)} min ago` : age < 86400 ? `${Math.floor(age / 3600)} h ago` : `${Math.floor(age / 86400)} d ago`
+    return ''
+  }).join('') : ''
+}
+export function clockRow(row, now = Date.now() / 1000) {
+  const result = { ...row }
+  for (const key of ['detail', 'text']) if (row.clock_text?.[key]) result[key] = formatClockText(row.clock_text[key], now)
+  if (row.clock_text?.details) result.details = row.clock_text.details.map(parts => formatClockText(parts, now))
+  if (row.decision) result.decision = clockRow(row.decision, now)
+  return result
+}
+export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck, collapsed = false, onToggle, now = Date.now() / 1000 } = {}) {
   if (!validModel(model)) return null
   // Spec: hidden when there is neither open work nor finished history.
   if (!MODEL_SECTIONS.some(([section]) => model.sections[section].length)) return null
@@ -506,7 +529,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
     ...MODEL_SECTIONS.map(([section, label]) => {
       if (collapsed || !model.sections[section].length) return false
       const heading = jsx('h3', { 'data-section': section.replaceAll('_', '-'), style: { display: 'inline', fontSize: 11, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', margin: 0, color: section === 'needs_you' ? ALERT_TEXT : section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)' }, children: `${label} · ${model.header.counts[section]}` })
-      const rows = model.sections[section].map(row => section === 'needs_you' ? askRow(row) : lineRow(row, section))
+      const rows = model.sections[section].map(raw => { const row = clockRow(raw, now); return section === 'needs_you' ? askRow(row) : lineRow(row, section) })
       // Finished history stays one click away (closed by default), as before the cutover.
       if (section === 'done') return jsxs('details', { 'data-model-section': section, style: { marginTop: 12 }, children: [
         jsx('summary', { style: { margin: '0 0 6px', listStylePosition: 'inside', color: 'var(--muted-foreground)' }, children: heading }), ...rows
@@ -632,6 +655,10 @@ export function Panel() {
   const route = panelRoute(), scope = routeKey(route)
   useEffect(() => { const fn = () => tick(v => v + 1); modelSubs.add(fn); return () => modelSubs.delete(fn) }, [])
   useEffect(() => {
+    const timer = setInterval(() => { if (!document.hidden) tick(v => v + 1) }, 1000)
+    return () => clearInterval(timer)
+  }, [])
+  useEffect(() => {
     let active = true
     noteRecent(route)
     setPending({ scope, waiting: true })
@@ -666,7 +693,7 @@ export default {
   name: 'Session Panel',
   register(ctx) {
     osApi = ctx?.os || null
-    if (typeof window !== 'undefined') window.__sessionPanel = { active: true, version: VERSION, feedVouches, feedIsLive, cachedModel, showsDecision }
+    if (typeof window !== 'undefined') window.__sessionPanel = { active: true, version: VERSION, feedVouches, feedIsLive, cachedModel, showsDecision, clockRow }
     ctx.register({ id: 'panel', area: COMPOSER_AREAS.top, order: -30, render: () => jsx(Panel, {}) })
     const subscribe = typeof ctx.onEvent === 'function' ? ctx.onEvent : host?.onEvent
     const offFeed = typeof subscribe === 'function' ? subscribe(FEED_EVENT, onFeedEvent) : null

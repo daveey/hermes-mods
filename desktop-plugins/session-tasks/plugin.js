@@ -362,11 +362,12 @@ export function modelRowFor(model, chip) {
   return null
 }
 /** Chips with `display` ({title, detail}) copied verbatim from the PanelModel row that shows them; others unchanged. */
-export function withModelDisplay(chips, model) {
+export function withModelDisplay(chips, model, now = Date.now() / 1000) {
   if (!model) return chips
   return chips.map(c => {
     const row = modelRowFor(model, c)
-    return row ? { ...c, display: { title: str(row.title), detail: str(row.detail) } } : c
+    const painted = row && typeof window !== 'undefined' && window.__sessionPanel?.clockRow ? window.__sessionPanel.clockRow(row, now) : row
+    return painted ? { ...c, display: { title: str(painted.title), detail: str(painted.detail) } } : c
   })
 }
 

@@ -19,6 +19,11 @@ assert _spec is not None and _spec.loader is not None
 _brief = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_brief)
 parse_brief = _brief.parse_brief
+_spec_time = importlib.util.spec_from_file_location('_panel_relative_text', Path(__file__).with_name('relative_text.py'))
+assert _spec_time is not None and _spec_time.loader is not None
+_relative = importlib.util.module_from_spec(_spec_time)
+_spec_time.loader.exec_module(_relative)
+relative = _relative.relative
 
 SECTIONS = ('needs_you', 'stuck', 'running', 'waiting', 'ready', 'done')
 TERMINAL = {'done', 'archived', 'cancelled', 'canceled', 'resolved', 'withdrawn'}
@@ -142,19 +147,20 @@ def model_text(row):
     return ', '.join(p for p in (re.sub(r'^(class:|claude-)', '', s.strip()) for s in text(row.get('run_model')).split(',')) if p)
 
 
-def run_meta(row, state, progress, now):
+def run_meta(row, state, progress, now, *, wire=False):
     """Running/review row detail: `worker-a4 · opus-5-5 · 12m` (or `quiet 25m`), plus full-word details lines."""
     where, model = where_text(row), model_text(row)
     since = seconds(row.get('current_run_started_at')) or seconds(row.get('started_at'))
     quiet = bool(progress) and now - progress >= QUIET_S
-    run_for = short_dur(now - since) if 0 < since <= now else ''
-    last = (f'last event{" " + row["activity_kind"] if row.get("activity_kind") else ""} {ago(progress, now)}' if progress else 'last event unknown')
+    age = lambda at: relative(at, 'ago') if wire else ago(at, now)
+    run_for = (relative(since, 'elapsed') if wire else short_dur(now - since)) if 0 < since <= now else ''
+    last = (f'last event{" " + row["activity_kind"] if row.get("activity_kind") else ""} {age(progress)}' if progress else 'last event unknown')
     head = ['in review'] if state == 'review' else []
-    detail = ' · '.join(p for p in [*head, where, model, f'quiet {short_dur(now - progress)}' if quiet else run_for or (ago(progress, now) if progress else '')] if p) or 'running'
+    detail = ' · '.join(p for p in [*head, where, model, f'quiet {relative(progress, "elapsed") if wire else short_dur(now - progress)}' if quiet else run_for or (age(progress) if progress else '')] if p) or 'running'
     details = [' · '.join(p for p in [f'card {row.get("id")}' if row.get('id') else '', f'assignee {row["assignee"]}' if row.get('assignee') else '',
                                       f'model {row["run_model"]}' if row.get('run_model') else '', f'on {where}' if where else '',
                                       f'board {row["board"]}' if row.get('board') not in (None, '', 'default') else ''] if p),
-               ' · '.join(p for p in [f'started {ago(since, now)}' if 0 < since <= now else '', last] if p)]
+               ' · '.join(p for p in [f'started {age(since)}' if 0 < since <= now else '', last] if p)]
     return {'detail': detail, 'details': [d for d in details if d], 'quiet': quiet}
 
 
@@ -244,7 +250,7 @@ def _pr_number(row, urls, on):
     return found.pop() if len(found) == 1 else ''
 
 
-def wait_info(row, now):
+def wait_info(row, now, *, wire=False):
     """What a parked card waits on, as one short human phrase.
 
     Returns `{text, raw, urls}`: `text` for the row line, `raw` the producer's own wording (a Details line, only
@@ -258,12 +264,12 @@ def wait_info(row, now):
     match = re.match(r'the clock until (\d{4}-\d\d-\d\d) (\d\d:\d\d) UTC\b', on)
     if match:
         due = datetime.fromisoformat(f'{match[1]}T{match[2]}:00+00:00').timestamp()
-        prefix = f'waiting {short_dur(now - since)} · ' if 0 < since <= now else ''
+        prefix = f'waiting {relative(since, "elapsed") if wire else short_dur(now - since)} · ' if 0 < since <= now else ''
         if due >= now:
-            return {'text': f'{prefix}{short_dur(due - now)} left (until {pacific(due)})', 'raw': on if on != match[0] else '', 'urls': []}
-        return {'text': f'{prefix}{"⚠ " if now - due >= 1800 else ""}overdue by {short_dur(now - due)} (was due {pacific(due)})', 'raw': on if on != match[0] else '', 'urls': []}
+            return {'text': f'{prefix}{relative(due, "remaining") if wire else short_dur(due - now)} left (until {pacific(due)})', 'raw': on if on != match[0] else '', 'urls': []}
+        return {'text': f'{prefix}{"⚠ " if now - due >= 1800 else ""}overdue by {relative(due, "elapsed") if wire else short_dur(now - due)} (was due {pacific(due)})', 'raw': on if on != match[0] else '', 'urls': []}
     urls = [u.rstrip('.,;') for u in _URL.findall(on)]
-    age = f' · {short_dur(now - since)}' if 0 < since <= now else ''
+    age = f' · {relative(since, "elapsed") if wire else short_dur(now - since)}' if 0 < since <= now else ''
     head = re.match(r'(ci|deploy)\b', on, re.I)
     if head and head[1].lower() == 'ci':
         pr = _pr_number(row, urls, on)
@@ -507,7 +513,7 @@ def _parked(row, on):
             'blocked': 'blocked · no reason published'}.get(state, state or 'status unknown')
 
 
-def _ready(row, detail, now):
+def _ready(row, detail, now, *, wire=False):
     # The board publishes the admission cause. Never replace lane/quota holds with capacity wording.
     note = flat(detail.get('queue_note') or detail.get('capacity_note') or row.get('queue_reason'))
     if row.get('block_kind') == 'lane_gate' or 'lane_gate' in note:
@@ -515,7 +521,8 @@ def _ready(row, detail, now):
     if note:
         return f'ready · {note}'
     since = seconds(row.get('ready_since'))
-    return f'ready · waiting{f" {short_dur(now - since)}" if since else ""} for a worker to claim it'
+    age = relative(since, 'elapsed') if wire else short_dur(now - since)
+    return f'ready · waiting{f" {age}" if since else ""} for a worker to claim it'
 
 
 def route_model(row, detail):
@@ -535,7 +542,7 @@ def route_model(row, detail):
     return ''
 
 
-def decision_text(request, now):
+def decision_text(request, now, *, wire=False):
     """One status line for an answered ask whose delivery has not been confirmed: `Done · delivers when this turn ends`."""
     if obj(request.get('delivery')).get('state') == 'delivering':
         return text(request['delivery'].get('text')) or 'Delivering…'
@@ -547,7 +554,7 @@ def decision_text(request, now):
     except ValueError:
         at = 0
     # A decision that sat undelivered for long is no longer "waiting for the turn to end": say so.
-    return f'{label} · not delivered yet, recorded {ago(at, now)}' if at and now - at > RECORDED_STALE_S else f'{label} · delivers when this turn ends'
+    return f'{label} · not delivered yet, recorded {relative(at, "ago") if wire else ago(at, now)}' if at and now - at > RECORDED_STALE_S else f'{label} · delivers when this turn ends'
 
 
 def recorded(request):
@@ -560,7 +567,7 @@ RECORDED_STALE_S = 900
 HEADER_LABELS = {'unresolved': 'interrupted'}
 
 
-def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, rentals=None, projector=None):
+def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, rentals=None, projector=None, wire=False):
     """Return JSON-safe PanelModel v1. Inputs are snapshots, and are never mutated."""
     sections = {s: [] for s in SECTIONS}
     rows_by_key = {}
@@ -602,7 +609,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         if parent.get('id'):
             v['details'].append(f'Parent card: {parent["id"]} ({parent.get("status") or "status unknown"})')
         progress = number(row.get('activity_at')) or number(row.get('current_run_started_at'))
-        wi = wait_info(row, now)
+        wi = wait_info(row, now, wire=wire)
         dependency = wait_target(row, bundle, detail)
         dependency = wait_leaf(dependency, bundle) if dependency else None
         if state in ('scheduled', 'todo', 'blocked', 'triage') and not text(obj(row.get('wait')).get('waiting_on')) and obj(detail.get('links')).get('parents'):
@@ -623,12 +630,12 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             canonical = re.match(r'(?:the clock until|ci\b|deploy\b)', text(obj(row.get('wait')).get('waiting_on')), re.I)
             base = wi['text'] if canonical else why or wi['text']
             cap = max(24, WAIT_MAX - len(location))
-            wi['text'] = (base if len(base) <= cap else base[:cap - 1].rstrip() + '…') + location
+            wi['text'] = (_relative.clip(base, cap) if wire else (base if len(base) <= cap else base[:cap - 1].rstrip() + '…')) + location
         if dependency:
             title = clean(dependency['title'])
             title = title if len(title) <= WAIT_MAX else title[:WAIT_MAX - 1].rstrip() + '…'
             since = number(obj(row.get('wait')).get('waiting_since'))
-            age = f' · {short_dur(now - since)}' if 0 < since <= now else ''
+            age = f' · {relative(since, "elapsed") if wire else short_dur(now - since)}' if 0 < since <= now else ''
             # The awaited card is often not this chat's own (a worker made it), so it has no row of its
             # own here: its live status rides on this line, or a running dependency reads as idle.
             dep_status = text(dependency.get('status'))
@@ -699,7 +706,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         if unknown and state in ('scheduled', 'blocked', 'triage', 'review', 'ready', 'todo') and fresh:
             v['parked'] = True
             queued = state == 'todo' and not on and not obj(row.get('upstream')).get('id')
-            v['detail'] = _ready(row, detail, now) if state == 'ready' else 'not started' if queued else _parked(row, on)
+            v['detail'] = _ready(row, detail, now, wire=wire) if state == 'ready' else 'not started' if queued else _parked(row, on)
             v['details'].append(provenance)
             v['queued'] = queued
             sections['ready' if state == 'ready' or queued else 'waiting'].append(v); continue
@@ -707,15 +714,15 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v['detail'] = f'status unknown ({reason.replace("_", " ")}) · last known: {ev.get("last_known_state") or state or "unknown"}'
             sections['waiting'].append(v); continue
         if state == 'running' and progress and now - progress >= STUCK_S:
-            v.update(reason='no-progress', last_at=progress, detail=f'running, no progress since {pacific(progress)} ({ago(progress, now)})' + (f' · last event: {row["activity_kind"]}' if row.get('activity_kind') else ''))
+            v.update(reason='no-progress', last_at=progress, detail=f'running, no progress since {pacific(progress)} ({relative(progress, "ago") if wire else ago(progress, now)})' + (f' · last event: {row["activity_kind"]}' if row.get('activity_kind') else ''))
             sections['stuck'].append(v)
         elif state in ('running', 'review'):
-            v.update(run_meta(row, state, progress, now))
+            v.update(run_meta(row, state, progress, now, wire=wire))
             if v.get('reported'):
                 v['details'].append(provenance)
             sections['running'].append(v)
         elif state in ('ready', 'todo'):
-            v.update(detail=_ready(row, detail, now) if state == 'ready' else 'not started', queued=state == 'todo')
+            v.update(detail=_ready(row, detail, now, wire=wire) if state == 'ready' else 'not started', queued=state == 'todo')
             sections['ready'].append(v)
         else:
             v['detail'] = on or state or 'status unknown'
@@ -734,7 +741,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             continue
         # One status line next to the card the answer unblocks (or as its own row for a card-less ask), never a
         # second block: it disappears when the request resolves, i.e. once delivery is confirmed.
-        info = {'request_id': r.get('requestId'), 'text': decision_text(r, now)}
+        info = {'request_id': r.get('requestId'), 'text': decision_text(r, now, wire=wire)}
         owner = next((views[k] for k, row in rows_by_key.items() if k in views and any(_matches(row, a, same_gateway) for a in _aliases(r))), None)
         if owner is not None and 'decision' not in owner:
             owner['decision'] = info
@@ -792,5 +799,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     source = 'canonical' if status else 'derived'
     result = {'version': 1, 'header': {'state': state, 'status': status, 'source': source, 'label': label, 'counts': counts, 'pips': pips}, 'sections': sections,
               'diagnostics': list(bundle.get('input_errors') or [])}
+    if wire:
+        result = _relative.encode(result)
     result['revision'] = hashlib.sha256(json.dumps(result, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
     return result

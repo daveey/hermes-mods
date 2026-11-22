@@ -213,9 +213,9 @@ def test_merged_reduction_uses_current_clock_not_board_snapshot(monkeypatch):
     readers.decision_inputs = lambda *args: {'outcome_json': canonical_outcome('done'), 'requests': []}
     real_model, seen = feedmod._model(), []
     class Reducer:
-        def reduce_panel(self, bundle, *, now):
+        def reduce_panel(self, bundle, *, now, wire=False):
             seen.append(now)
-            return real_model.reduce_panel(bundle, now=now)
+            return real_model.reduce_panel(bundle, now=now, wire=wire)
     monkeypatch.setattr(feedmod, '_model', Reducer)
     assert f.refresh_decisions() == 1
     assert seen == [clock['now']] and seen != [old_clock]

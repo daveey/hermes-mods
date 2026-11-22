@@ -372,7 +372,7 @@ class Feed:
         if callable(panel_inputs):
             bundle['canonical_seq'] = next(self._seq)
             bundle.update(panel_inputs(session, lineage))
-        bundle['model'] = _model().reduce_panel(bundle, now=bundle['computed_at'])
+        bundle['model'] = _model().reduce_panel(bundle, now=bundle['computed_at'], wire=True)
         return bundle
 
     def refresh_decisions(self, *, readers=None) -> int:
@@ -575,7 +575,7 @@ class Feed:
         observation = (getattr(self, '_external_observations', None) or {}).get(session)
         if observation and bundle.get('computed_seq', 0) <= observation[0]:
             bundle = self.readers.advance_external(bundle, observation[1])
-            bundle = {**bundle, 'model': _model().reduce_panel(bundle, now=self.clock())}
+            bundle = {**bundle, 'model': _model().reduce_panel(bundle, now=self.clock(), wire=True)}
         prev = self.bundles.get(session)
         if canonical_only and (not prev or prev['bundle']['lineage'] != bundle['lineage']):
             return False  # expired/re-watched or reparented while the cheap read was in flight
@@ -597,7 +597,7 @@ class Feed:
             if merged and bundle.get('canonical_seq'):
                 # Evaluate ageing execution against current time, but retain computed_at:
                 # a fresh decision is never fresh board evidence or a renewed lease.
-                bundle = {**bundle, 'model': _model().reduce_panel(bundle, now=self.clock())}
+                bundle = {**bundle, 'model': _model().reduce_panel(bundle, now=self.clock(), wire=True)}
         h = _hash(bundle)
         rows = bundle['tasks'] + bundle['done']
         refs = set(bundle['cards']) | {str(t.get('id')) for t in rows if t.get('id')}
@@ -645,7 +645,7 @@ class Feed:
                             if observation is None or base.get('computed_seq', 0) > observation[0]:
                                 continue  # a later source capture owns a newer observation
                             base = self.readers.advance_external(base, observation[1])
-                        bundle = {**base, 'model': reducer(base, now=now)}
+                        bundle = {**base, 'model': reducer(base, now=now, wire=True)}
                         digest = _hash(bundle)
                         if digest != held['hash']:
                             self.rev += 1

@@ -39,6 +39,25 @@ const paint = tree => React.act(async () => root.render(tree))
 const publicCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./hub-model-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
 const privateCases = process.env.HERMES_PANEL_GOLDENS ? JSON.parse(readFileSync(process.env.HERMES_PANEL_GOLDENS, 'utf8')) : {}
 const cases = { ...publicCases, ...privateCases }
+test('absolute timestamps render 38m and started 38 min ago at the local clock', async () => {
+ const { model, now } = cases.relative_clock
+ const before = JSON.stringify(model)
+ await paint(m.renderModel(model, { now: now + 120 }))
+ assert.equal(document.querySelector('[data-run-meta]')?.textContent, 'worker · example-model · 38m')
+ assert.ok(document.body.textContent.includes('started 38 min ago · last event tool 3 min ago'))
+ await paint(m.renderModel(model, { now: now + 180 }))
+ assert.equal(document.querySelector('[data-run-meta]')?.textContent, 'worker · example-model · 39m')
+ assert.equal(JSON.stringify(model), before, 'local repaint never changes the cached wire model')
+})
+
+test('clock text boundaries, invalid values and legacy strings stay presentation-only', () => {
+ const now = 1800000000
+ assert.equal(m.formatClockText([{timestamp: now - 59, format: 'ago'}], now), 'just now')
+ assert.equal(m.formatClockText([{timestamp: now - 3600, format: 'elapsed'}], now), '1h')
+ assert.equal(m.formatClockText([{timestamp: now + 120, format: 'remaining'}], now), '2m')
+ assert.equal(m.formatClockText([{timestamp: 'bad', format: 'ago'}], now), '')
+ assert.equal(m.clockRow({detail: 'legacy'}, now).detail, 'legacy')
+})
 test('panel status pip consumes the published stripe and revision, never row-count authority', async () => {
  const model = cases.canonical_done_with_open_rows.model
  assert.ok(model.header.counts.needs_you > 0, 'contradictory row count is intentional')
@@ -200,7 +219,7 @@ for (const [name, fixture] of Object.entries(cases).filter(([name]) => !name.sta
   const model = fixture.model || fixture.expected
   assert.ok(model, 'golden contains the P1 output model')
   const before = JSON.stringify(model)
-  await paint(m.renderModel(model))
+  await paint(m.renderModel(model, { now: fixture.now }))
   assert.equal(document.querySelector('[data-session-status]').textContent, model.header.label || model.header.state)
   assert.equal(document.querySelector('[data-hub-model]').getAttribute('data-hub-model'), model.revision)
   for (const [section, rows] of Object.entries(model.sections)) {
@@ -210,7 +229,8 @@ for (const [name, fixture] of Object.entries(cases).filter(([name]) => !name.sta
    if (!block) continue
    const articles = [...block.querySelectorAll('[data-panel-row]')]
    assert.equal(articles.length, rows.length)
-   for (const [i, row] of rows.entries()) {
+   for (const [i, raw] of rows.entries()) {
+    const row = m.clockRow(raw, fixture.now)
     const article = articles[i]
     assert.equal(article.querySelector('[data-ask-title]').textContent, row.title)
     if (row.detail) assert.ok(article.textContent.includes(row.detail))

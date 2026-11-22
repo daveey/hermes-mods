@@ -1,5 +1,24 @@
 # PanelModel v1
 
+## Relative display text
+
+The feed calls `reduce_panel(..., wire=True)`. A row (or its `decision`)
+may carry additive `clock_text` templates for `detail`, `details`, or `text`.
+Each template is an array of literal strings and objects
+`{timestamp: <absolute Unix seconds>, format: "ago" | "elapsed" | "remaining"}`;
+`details` is an array of templates. No current/read clock or formatted age is
+part of these templates. The existing string fields remain static fallbacks
+for older clients. Internal construction tokens never leave the reducer.
+
+Desktop inserts relative text from its local clock and repaints locally;
+the cached model, revision and network cursor are unchanged. Session-tasks
+uses the panel's shared `clockRow` bridge when available. Missing/older
+renderers retain static wording rather than fabricating execution freshness.
+Classification, evidence expiry, quiet/stuck thresholds, deadline crossing
+and decision-delivery state remain server-owned semantic changes. The
+default non-wire reducer retains timestamp-pinned textual snapshots for
+existing offline consumers; every feed publication path uses wire mode.
+
 `POST /api/plugins/session-panel/changes` and `plugin.session-panel.changed` keep
 all existing bundle fields and add `bundle.model`. P1 does not change Desktop.
 The model is a presentation snapshot, not authorization or execution authority.
