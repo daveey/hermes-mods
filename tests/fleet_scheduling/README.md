@@ -34,8 +34,10 @@ Its OOM-unavailable integration test requires an explicit `FLEET_CORE_SOURCE`.
   final completion, and implementation mutations for retry, premature dispatch,
   and fabricated human blockers.
 - Crash: separate executor SIGKILL and actual bounded cgroup OOM, kernel
-  `memory.events` evidence, original-work recovery. The executor joins its own
-  cgroup; no asynchronous numeric PID is migrated. Missing OOM capability gives
+  `memory.events` evidence, original-work recovery. A fixture-only plugin hook
+  makes the bound executor join its own cgroup; it needs no inherited
+  `PYTHONPATH`/`FLEET_*` (native executors deliberately scrub those variables).
+  No asynchronous numeric PID is migrated. Missing OOM capability gives
   `UNVERIFIED` and a nonzero aggregate exit, never a substituted SIGKILL pass.
 - Wake: real workers park, repair broken probes, re-park and complete. Exit 1
   remains not-ready; exit 2/timeouts are broken, not condition-met. A legitimate
@@ -49,6 +51,12 @@ Its OOM-unavailable integration test requires an explicit `FLEET_CORE_SOURCE`.
 
 Kernel loopback-only network and hidden production DBus endpoints supplement
 fixture path, PID-start/pidfd, credential and inherited-descendant fences.
+The fixture config supplies eligible `class:fast`/`class:standard`/`class:deep`
+routes to one named loopback fake provider. Implementation and review use the
+same model identity in separate executions; role attribution comes from the
+review prompt, never a concrete-model pin. Native executor custody uses its
+exact fixture runtime home plus a fixture-owned cwd when the extra marker was
+scrubbed; a conflicting explicit marker is still refused.
 Registration exclusion uses disposable sentinel stores/transports, not live
 production database queries. The launcher retains per-scenario preflight,
 source/module provenance, assertions, transitions, bounded waits, raw output,
