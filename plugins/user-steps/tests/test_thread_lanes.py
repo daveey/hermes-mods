@@ -94,6 +94,8 @@ def test_cold_recovery_is_single_flight_not_four_occupied_decision_slots(setup, 
     monkeypatch.setattr(api, 'RETRY_INTERVAL_S', 0)
     app = client().app
     st = app.state.action_store
+    decisions = load_module('cold_recovery_decisions', HERE.parent / 'test_decisions.py')
+    view = st.views(decisions.OWNER)[0]
     original = st.pending_owners
     def slow():
         time.sleep(1)
@@ -101,8 +103,13 @@ def test_cold_recovery_is_single_flight_not_four_occupied_decision_slots(setup, 
     monkeypatch.setattr(st, 'pending_owners', slow)
     async def exercise():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as c:
-            responses = await asyncio.gather(*(c.get('/requests/missing', params={'session': 'session-a'}) for _ in range(8)))
-            assert [r.status_code for r in responses] == [404] * 8
+            responses = await asyncio.gather(
+                *(c.get('/requests/missing', params={'session': 'session-a'}) for _ in range(8)),
+                c.post('/requests/' + view['requestId'] + '/decisions', json={
+                    'session': 'session-a', 'expectedRevision': view['revision'],
+                    'choiceId': view['choices'][0]['id'], 'idempotencyKey': 'cold-recovery'}))
+            assert [r.status_code for r in responses] == [404] * 8 + [200]
+            assert responses[-1].json()['operation']['idempotencyKey'] == 'cold-recovery'
     asyncio.run(exercise())
 
 

@@ -190,6 +190,7 @@ class Feed:
         self._reissue: set[str] = set()  # restored from another process: their recompute takes a new revision
         self._successor: Optional['Feed'] = None  # the feed that resumed this one (requests still here move on)
         self._decision_failures: set[str] = set()
+        self._decision_result_seq: dict[str, int] = {}
         self._last_decision = 0.0  # clock of the last decision pass
         self._decision_lock = threading.Lock()  # cheap read lane, never board computation
         self._registrations = queue.SimpleQueue()
@@ -323,6 +324,7 @@ class Feed:
 
     def _forget(self, s: str) -> None:
         self._decision_failures.discard(s)
+        self._decision_result_seq.pop(s, None)
         self._decision_seen.pop(s, None)
         self.interest.pop(s, None)
         self._panel_stamps.pop(s, None)
@@ -375,6 +377,22 @@ class Feed:
         bundle['model'] = _model().reduce_panel(bundle, now=bundle['computed_at'], wire=True)
         return bundle
 
+    def _decision_result(self, session, base, seq, *, failed):
+        """Set read availability only from the newest completed scoped attempt."""
+        with self.lock:
+            held = self.bundles.get(session)
+            if (session not in self.interest or held is None
+                    or held['bundle']['lineage'] != base['lineage']
+                    or seq < max(self._decision_result_seq.get(session, 0),
+                                 held['bundle'].get('canonical_seq', 0))):
+                return False
+            self._decision_result_seq[session] = seq
+            if failed:
+                self._decision_failures.add(session)
+            else:
+                self._decision_failures.discard(session)
+            return True
+
     def refresh_decision(self, session, *, readers):
         """Interactive canonical read, independent of the sweep's decision lock.
 
@@ -393,12 +411,10 @@ class Feed:
                 raise ValueError('incomplete canonical decision inputs')
         except Exception:
             with self.lock:
-                if session in self.interest:
-                    self._decision_failures.add(session)
+                if self._decision_result(session, base, seq, failed=True):
                     self._decision_retry_at = self._spend('decision', {session}, keep=self._decision_failures - {session})
             raise
-        with self.lock:
-            self._decision_failures.discard(session)
+        self._decision_result(session, base, seq, failed=False)
         self._publish({session: {**base, **{k: inputs[k] for k in ('outcome_json', 'requests')},
                                  'canonical_seq': seq}}, canonical_only=True)
         with self.lock:
@@ -445,14 +461,13 @@ class Feed:
                     if not isinstance(inputs, dict) or any(k not in inputs for k in ('outcome_json', 'requests')):
                         raise ValueError('incomplete canonical decision inputs')
                     with self.lock:
-                        self._decision_failures.discard(s)
-                        if s in self.interest:
+                        if self._decision_result(s, base, seq, failed=False):
                             self._decision_seen[s] = (stamp, now)
                     update = {k: inputs[k] for k in ('outcome_json', 'requests')}
                     count += len(self._publish({s: {**base, **update, 'canonical_seq': seq}}, canonical_only=True))
                 except Exception:
                     with self.lock:
-                        self._decision_failures.add(s)
+                        self._decision_result(s, base, seq, failed=True)
                     log.debug('session-panel canonical refresh failed: %s', s, exc_info=True)
             if not self.stopped.is_set():
                 self._decision_files = moved if stamps else None

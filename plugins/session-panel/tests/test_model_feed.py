@@ -55,6 +55,54 @@ def test_interactive_refresh_refuses_partial_inputs_and_recovers():
         f.refresh_decision('never-watched', readers=readers)
 
 
+def test_overlapping_decision_results_keep_newest_failure_status():
+    from types import SimpleNamespace
+    for older_fails in (False, True):
+        for interactive_first in (False, True):
+            f, readers, pushed, clock = make()
+            f.changes(['S1'])
+            started, release = threading.Event(), threading.Event()
+            errors = []
+            good = {'outcome_json': {}, 'requests': []}
+            def older(*args):
+                started.set()
+                assert release.wait(5)
+                if older_fails:
+                    raise ValueError('old failure')
+                return good
+            def newer(*args):
+                if not older_fails:
+                    raise ValueError('new failure')
+                return good
+            old_reader = SimpleNamespace(decision_inputs=older)
+            new_reader = SimpleNamespace(decision_inputs=newer)
+            def run_old():
+                try:
+                    if interactive_first:
+                        f.refresh_decision('S1', readers=old_reader)
+                    else:
+                        f.refresh_decisions(readers=old_reader)
+                except ValueError as exc:
+                    errors.append(str(exc))
+            worker = threading.Thread(target=run_old)
+            worker.start()
+            try:
+                assert started.wait(5)
+                try:
+                    if interactive_first:
+                        f.refresh_decisions(readers=new_reader)
+                    else:
+                        f.refresh_decision('S1', readers=new_reader)
+                except ValueError:
+                    pass
+            finally:
+                release.set(); worker.join(5)
+            assert not worker.is_alive()
+            assert ('S1' in f._decision_failures) is (not older_fails)
+            if not older_fails:
+                assert f._decision_retry_at is not None
+
+
 def test_recorded_and_delivered_request_reaches_model_without_board_reads():
     from test_model_audit import answered
     f, readers, pushed, clock = make()
