@@ -4,7 +4,19 @@
 
 1. Read feed timing on the host (no Desktop token needed): `~/.hermes/session-panel/timing-feed-<role>-<profile>.json`, rewritten after every pass: `tick_started_at`, `tick_duration_s`, `producer_s`, `producer_chats`, and `recent` (last 32 pushes: `rev`, `at`, `sessions`, `pass_started_at`). Freshness of one write is the `recent` entry naming its chat minus the write's commit time; `/status` and `/changes` return 401 from a hub shell.
 2. Read the last published models from `feed-<role>-<profile>.json` in the same dir. It is two JSON lines (header, then body): `json.loads(text.splitlines()[1])`, not `json.load` (fails with "Extra data"). The chat's model is `bundles[<session>].bundle.model` (`sections`, `header`), with `bundle.computed_at` and `bundle.tasks`/`cards`.
-3. "Panel says nothing running / no dependency shown" while the board says otherwise: compare the card's claim/link/park event times with the painted push's `pass_started_at` before suspecting the reducer. Whole-feed passes can take minutes, so a correct reducer paints a snapshot from before the transition. If the current snapshot is right, the fault is producer freshness, not classification.
+3. "Panel says nothing running / no dependency shown" or "green done header but a card still listed Waiting (`status unknown (no run identity) · last known: triage`)" while the board says otherwise: compare the card's claim/link/park/archive event times (`task_events.created_at`) with the chat's bundle `computed_at` and with its `board_recent` entries in the timing file (`admitted_at`, `pass_started_at`, `latency_s` per session). Whole-feed passes can take minutes, so a correct reducer paints a snapshot read seconds before the transition; the header can still be right because it comes from the fresher canonical status. Confirm by computing the current snapshot yourself (below); if it is right, the fault is producer freshness, not classification: comment the timeline on the open feed-freshness card rather than filing a new one.
+
+   Fresh compute with the deployed code, read-only, from the core venv:
+   ```python
+   D='~/code/hermes-mods/plugins/session-panel/dashboard'  # expanded path
+   sys.path.insert(0, D)
+   spec = importlib.util.spec_from_file_location('pa', D + '/plugin_api.py')
+   pa = importlib.util.module_from_spec(spec); sys.modules['pa'] = pa  # register before exec
+   spec.loader.exec_module(pa)
+   b = pa._load_feed().Feed(pa.CoreReaders(), emit=lambda p: None).compute(SESSION)
+   b['model']['header'], b['model']['sections']
+   ```
+   `pa.CoreReaders().linked(lineage)` / `.done(lineage)` give the raw task inputs when you only need the source side.
 4. A remote parent (a card on a worker board) is absent from local `tasks`; `hermes kanban show <id>` says "no such task". Its status lives in hub `kanban_sync_remote_parents` (and `kanban_move_parent_results`, `task_chat_links`): query those directly instead of scanning every board DB (that scan timed out).
 
 ## Producer design rules
