@@ -340,7 +340,7 @@ class CoreReaders:
                 if key not in scope['local']:
                     # One attempt, no changing union key in core's bounded last-good lineage memo.
                     rows = ksa._read_session_tasks(path, scope['ids'], statuses)
-                    if any(row.get('_execution_error') for row in rows):
+                    if any(row.get('_execution_error') for row in rows) and not self._primary_absence(ksa, path, rows):
                         raise RuntimeError('session-panel union execution evidence unavailable')
                     scope['local'][key] = {r['id']: r for r in rows}
                 rows = scope['local'][key]
@@ -381,6 +381,30 @@ class CoreReaders:
             scope['local_failed'] = True
             log.debug('session-panel shared read unavailable; retrying lineage', exc_info=True)
             return ksa.session_tasks(ids, statuses, stale_ok=True)
+
+    def _primary_absence(self, ksa, path, rows) -> bool:
+        """True when every `_execution_error` in a union read is a PRIMARY mirror's ordinary answer, not a failed
+        evidence read. On a primary mirror core attests only a card whose current run is live there and marks every
+        other card (parked, queued, done) unknown, on every read: a per-lineage read returns the same rows, so the
+        union is as good. Asked again here for exactly the marked cards: evidence found now (the union's own read
+        failed), a board in another mode, or any error keeps the per-lineage fallback."""
+        try:
+            from hermes_cli import kanban_primary_execution as kpe
+            from hermes_cli.kanban_execution_observations import card_scope
+            c = self.conn(path)
+            if c is None:
+                return False
+            try:
+                ksa._require_local_execution_authority(c)
+                return False  # this gateway owns the board: a marked card there is a failed read
+            except kpe.PrimaryMirror:
+                pass
+            marked = {r['id']: dict(r) for r in rows if r.get('_execution_error')}
+            gateway, profile = card_scope(path)
+            return not kpe.attach(c, marked, gateway=gateway, profile=profile, board=ksa._board_slug(path))
+        except Exception:
+            log.debug('session-panel primary-mirror check failed', exc_info=True)
+            return False
 
     def _remote_inventory(self, scope, ids, statuses):
         """Share replica hydration, not ids-dependent origin-obligation dedup or failure decisions."""
