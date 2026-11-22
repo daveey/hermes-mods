@@ -52,6 +52,7 @@ DECISION_FULL_EVERY_S = 30.0 # a chat whose decision inputs did not move is stil
 RETRY_EVERY_S = 2.0          # with no write to wake a pass: a read that failed or raced is tried again this often
 MIN_IDLE_WAIT_S = 0.2        # the event-driven loop never sleeps less than this between idle checks
 RECENT_PUBLISHES = 32        # pushes kept in `Feed.timing['recent']` (rev, time, chats, pass start)
+PRODUCER_FULL_EVERY_S = 60.0 # source-event ceiling for canonical time/courier and unkeyed mirror inputs
 RETRY_STEPS = 3              # failed work is retried this many times without a source event (0.1, 0.2, 0.4 s)
 OPEN_KEYS = ('tasks', 'requests', 'subagents', 'processes', 'rentals')  # a bundle with any of these ages
 SNAPSHOT_VERSION = 1         # the on-disk shape of Feed.snapshot()
@@ -151,6 +152,7 @@ class Feed:
         self._producer_seen: Any = None      # global source stamp the producer last settled (admission only)
         self._producer_lineage: dict[str, tuple] = {}  # lineage each chat was last reconciled under
         self._producer_owed: set[str] = set()  # outcome/request stamp moved under a stamp that predated it
+        self._producer_at: dict[str, float] = {}  # last actual producer pass, not an unaffected stamp settlement
         self._pass: Optional[tuple] = None   # (thread ident, wall start) of the pass in flight
         self._seq = itertools.count(1)       # compute order: a bundle computed earlier never replaces a later one
         self._stamps: Any = None
@@ -312,6 +314,7 @@ class Feed:
         self._reconcile_stamps.pop(s, None)
         self.__dict__.setdefault('_producer_lineage', {}).pop(s, None)
         self.__dict__.setdefault('_producer_owed', set()).discard(s)
+        self._producer_at.pop(s, None)
         getattr(self, '_reconcile_deferred', set()).discard(s)
         (getattr(self, '_external_observations', None) or {}).pop(s, None)
         (getattr(self, '_external_captures', None) or {}).pop(s, None)
@@ -802,6 +805,7 @@ class Feed:
         with self.lock:
             settle = watched if scoped else todo
             self._reconcile_stamps.update((s, source_seen) for s in settle if s in self.interest)
+            self._producer_at.update((s, self.clock()) for s in todo if s in self.interest)
             self._reconcile_deferred = {s for s in (self._reconcile_deferred - set(todo)) | left
                                         if s in self.interest}
             waiting = set(self._reconcile_deferred)
@@ -818,7 +822,7 @@ class Feed:
         import copy
         names = ('_panel_stamps', '_panel_files', '_stamps', '_board_stamps',
                  '_external_stamps', '_external_captures', '_external_observations', '_cursor', '_reconcile_stamps', '_producer_seen',
-                 '_producer_lineage', '_producer_owed')
+                 '_producer_lineage', '_producer_owed', '_producer_at')
         saved = {name: copy.deepcopy(getattr(self, name, None)) for name in names}
         self._admission_retry_at = None
         self._hydrate_retry_at = None  # this pass is the retry; it re-arms below when a chat still fails
@@ -991,6 +995,12 @@ class Feed:
             owed.update(panel_dirty)
             lineages = {}
             if moved:
+                # The canonical producer reads clock/courier state and has a 60 s local-mirror
+                # fallback for inputs outside its key. Settling an unaffected source stamp must
+                # not starve those paths forever. Preserve their old source-event liveness with
+                # a per-chat ceiling, never an idle timer or an every-write global reconcile.
+                admitted |= {s for s in watched
+                             if now - self._producer_at.get(s, float('-inf')) >= PRODUCER_FULL_EVERY_S}
                 # Any source write re-admits producer work still owed after its retries ran out.
                 with self.lock:
                     admitted |= self._reconcile_deferred

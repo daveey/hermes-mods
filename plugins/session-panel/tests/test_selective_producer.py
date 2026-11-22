@@ -407,3 +407,84 @@ def test_core_readers_board_write_reconciles_only_the_chat_whose_card_it_touched
         r.release()
         conn.close()
         db.close()
+
+
+def test_source_event_ceiling_preserves_time_dependent_producer_work():
+    f, r, source, calls = setup()
+    now = {'value': 100.0}
+    f.clock = lambda: now['value']
+    f.watch(['C1', 'C2'])
+    f.tick()
+    calls.clear()
+    now['value'] += 59
+    write(r, source, 't_C1', 'C1')
+    f.tick()
+    assert calls == [['C1']]
+    now['value'] += 2
+    write(r, source)
+    f.tick()
+    assert calls == [['C1'], ['C2']], 'only the chat whose canonical fallback is due'
+    calls.clear()
+    now['value'] += 120
+    f.tick()
+    assert calls == [], 'wall time alone is never an idle producer sweep'
+    write(r, source)
+    f.tick()
+    assert calls == [['C1', 'C2']], 'the next real source write checks clock/courier work'
+    calls.clear()
+    write(r, source)
+    f.tick()
+    assert calls == [], 'not every source write'
+
+
+@pytest.mark.parametrize('scoped', [True, False])
+def test_retiring_remote_answer_finalizes_on_later_unrelated_source_write(tmp_path, monkeypatch, scoped):
+    # Real canonical Remote/Mirror/ActionStore, with only transport and feed readers faked.
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / 'user-steps' / 'tests'))
+    from test_remote_card_state_machine import setup as remote_setup, age, opens, operation, RETIRING, OWNER
+    mirror, store, row, old, op = remote_setup(tmp_path, 'absent', None)
+    chat = OWNER['storedSessionId']
+    f, r, pushed, clock = make()
+    source = {'version': 1}
+    calls = []
+
+    def stamp_rows():
+        with store._read() as c:
+            return tuple(tuple(row) for row in c.execute(
+                'SELECT id,revision,state,resolution FROM requests ORDER BY id'))
+
+    def produce(sessions):
+        calls.append(list(sessions))
+        if chat in sessions:
+            mirror.remote.reconcile(OWNER)
+        return set()
+
+    r.reconcile_scoped = scoped
+    r.reconciliation_stamp = lambda: source['version']
+    r.reconcile_sources = produce
+    r.panel_stamps = lambda ids: {s: stamp_rows() if s == chat else 0 for s in ids}
+    r.links[chat] = [{'id': 't_remote', 'status': 'blocked', 'board': 'default', 'session_id': chat}]
+    r.cards['t_remote'] = {'detail': {'task': {'id': 't_remote', 'status': 'blocked', 'session_id': chat},
+                                     'links': {'parents': [], 'children': []}, 'link_tasks': [], 'events': []},
+                          'board': 'default'}
+    f.watch([chat, 'OTHER'])
+    f.tick()
+    mirror.remote.cards = lambda owner: [dict(row, card_answer_generation='b' * 64)]
+    write(r, source, 't_remote', chat)
+    f.tick()
+    for _ in range(3):
+        write(r, source)
+        f.tick()
+    assert operation(store, op)['retired']['evidence'] == RETIRING
+    assert opens(store) == []
+    before = stamp_rows()
+    age(store, op, 600)
+    assert stamp_rows() == before, 'time/courier work moves no request stamp'
+    calls.clear()
+    for _ in range(4):
+        clock['now'] += 30
+        write(r, source, 't_unrelated', 'ELSEWHERE')
+        f.tick()
+    assert any(chat in batch for batch in calls)
+    assert operation(store, op)['retired']['evidence'] != RETIRING
+    assert len(opens(store)) == 1, 'replacement ask gets a tile'
