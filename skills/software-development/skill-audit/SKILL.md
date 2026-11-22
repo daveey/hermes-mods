@@ -117,6 +117,10 @@ metadata:
 - The ack file is what stops a handled lost write from re-firing the monitor; the script's "already landed" check
   only catches verbatim text, so reworded or relocated notes still need the agent's judgment and an ack.
 
+## Done means
+
+- [ ] Were convention-based evaluator and test-runner consumers checked before treating an unlinked supporting file as unreachable?
+
 ## Limits (do not cross unattended)
 
 - Edit relevant bundled, installed or pinned skills in place; honor explicit locks. Report a locked skill's proposed change instead of retrying or cloning it.
