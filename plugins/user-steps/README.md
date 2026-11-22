@@ -491,6 +491,14 @@ open, undecided request of the same session only with exact provenance:
 - the request was published or revised by the `action_request` tool in this very turn
   (server-recorded `turn_requests`; reset when the next turn starts), and the ask
   restates its title or is the approve/change/decline menu of the only such approval;
+- exactly one open request was producer-published or revised this turn, and its kind
+  is compatible (`approve` → approval, `choose` → choice/approval, `input` → input).
+  This is server-recorded provenance, not title similarity. Count all same-turn
+  publications before testing kind; several requests retain the existing rules.
+  The transform also enforces this singleton boundary after the publication hold
+  budget is exhausted: reuse the current sentence's existing step frame, or emit
+  no tile when the producer request has no legacy step. A different-kind ask may
+  still mint, as may an unmapped ask beside several same-turn requests;
 - the same sentence of this reply was already read as an approval (one sentence, one
   approval).
 

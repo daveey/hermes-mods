@@ -1655,11 +1655,16 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                     continue
                 if action_store is not None:
                     same = same_open_ask(candidate, asks, res.get("repeats") or (), mapped, turn_requests, reply=text)
+                    # Final transform backstop, independent of the publication hold's retry budget.
+                    # A singleton compatible producer publication must not gain a second tile,
+                    # even if the matcher could not map this extraction. Ambiguous/different kinds stay new.
+                    if same is None:
+                        same = same_turn_ask(candidate, asks, turn_requests)
                     if same is not None:
-                        # A re-ask of an open tile: frame it onto that tile, never mint a second one.
+                        # A re-ask of an open tile: frame this sentence, not its older evidence span.
                         mapped.setdefault(ask_key(candidate["verbatim_span"]), same)
                         if same["step"] is not None and all(p.get("id") != same["step"]["id"] for p in published):
-                            published.append(dict(same["step"]))
+                            published.append({**same["step"], "verbatim_span": candidate["verbatim_span"]})
                         drop("reused_open_ask", candidate)
                         continue
                 existing = next((s for s in prior if s.get("status") == "open"), None)
@@ -2196,6 +2201,18 @@ def split_repeats(repeats, tiles: dict, reply: str) -> tuple[list, list]:
     return kept, dropped
 
 
+def same_turn_ask(candidate: dict, asks: list[dict], turn_requests=()) -> Optional[dict]:
+    """A single compatible, open producer publication is server-recorded turn provenance.
+
+    Count all same-turn requests before testing kind: two publications remain ambiguous,
+    even when only one has the candidate's kind. Never use title similarity here.
+    """
+    turn = {str(x) for x in turn_requests or ()}
+    mine = [a for a in asks if a['id'] in turn]
+    compatible = {'approve': {'approval'}, 'choose': {'choice', 'approval'}, 'input': {'input'}}
+    return mine[0] if len(mine) == 1 and mine[0]['kind'] in compatible.get(str(candidate.get('kind') or ''), ()) else None
+
+
 def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optional[dict] = None,
                   turn_requests=(), reply: str = "") -> Optional[dict]:
     """The open ask ``candidate`` (an extracted step) provably repeats, or None (it is its own ask).
@@ -2205,7 +2222,9 @@ def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optiona
       sentence or its paragraph corroborates it (``repeat_corroborated``);
     - the request was published or revised by the producer tool in this very turn (``turn_requests``,
       server-recorded) and the candidate restates its title, or is the approve/change/decline menu of the only
-      such approval (or its sentence was already read as that approval in this reply).
+      such approval (or its sentence was already read as that approval in this reply);
+    - exactly one open request was producer-published/revised this turn and its kind is compatible
+      (approve -> approval, choose -> choice/approval, input -> input). Prose need not match its title.
     Two open requests with the same title are different requests: an equal title alone maps onto neither, and
     a card both name is context, not identity. With several candidates the newest open ask wins."""
     text, span = ask_key(candidate.get('text')), ask_key(candidate.get('verbatim_span'))
@@ -2227,6 +2246,9 @@ def same_open_ask(candidate: dict, asks: list[dict], repeats=(), mapped: Optiona
                                             _paragraph(reply, candidate.get('verbatim_span')), tile_texts(ids[r['id']])):
                 return ids[r['id']]
     mine = [a for a in asks if a['id'] in turn]
+    singleton = same_turn_ask(candidate, asks, turn)
+    if singleton is not None:
+        return singleton
     hit = pick([a for a in mine if (len(text) >= _ASK_KEY_MIN and text == ask_key(a['title']))
                 or (long_span and span == ask_key(a['title']))])
     if hit:

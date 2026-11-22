@@ -183,7 +183,8 @@ def test_api_owner_isolation_and_retry(tmp_path):
     assert client.post('/resolve', json={'id':'legacy','session':'session-a'}).status_code == 410
 
 
-def test_producer_and_extraction_are_separate(tmp_path, monkeypatch):
+@pytest.mark.parametrize('same_turn', [True, False])
+def test_producer_and_extraction_are_separate_across_turns(tmp_path, monkeypatch, same_turn):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path)); monkeypatch.setenv('HERMES_GATEWAY_ID', 'test-gateway')
     monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
     plugin = load_module('decision_plugin', ROOT / '__init__.py')
@@ -194,11 +195,19 @@ def test_producer_and_extraction_are_separate(tmp_path, monkeypatch):
     assert out['request']['scope']['complete'] is True
     monkeypatch.setattr(plugin, 'aux_llm', lambda *a: json.dumps({'steps':[{
         'text':'Approve example', 'kind':'approve', 'verbatim_span':'Should I change the example?', 'options':[]}], 'resolved':[]}))
+    if not same_turn:
+        plugin._TURN_PUBLISHED.pop('session-a')  # runtime resets producer provenance on the next turn
+    # At the exhausted publication budget, the transform must still not mint next to
+    # the same-turn publication. Earlier-turn identity is deliberately unchanged.
+    plugin.publication_buffer('session-a', 'desktop', 'Should I change the example?', attempt=2, hold_budget=2)
     plugin.transform_llm_output('Should I change the example?', 'session-a', 'desktop')
     requests = plugin.core.ActionStore().requests(OWNER)
-    assert len(requests) == 2
-    assert requests[1]['scope']['complete'] is False
-    assert requests[1]['choices'][0]['effect'] == 'revise'
+    if same_turn:
+        assert requests == [out['request']]
+    else:
+        assert len(requests) == 2
+        assert requests[1]['scope']['complete'] is False
+        assert requests[1]['choices'][0]['effect'] == 'revise'
 
 
 def test_real_receiver_crash_after_commit_and_changed_scope(tmp_path):
