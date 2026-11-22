@@ -1589,7 +1589,7 @@ function courierQuery(conn, conns) {
   if (isHome(conn)) q.push('home=1')
   const me = conns.find(isHome)
   if (me?.device) {
-    q.push(`courier=${enc(me.device)}`, `aliases=${enc(me.aliases.join(','))}`, `reach=${enc(reachNames(conns).join(','))}`)
+    q.push(`courier=${enc(me.device)}`, `aliases=${enc(me.aliases.join(','))}`, `reach=${enc(reachNames(conns).join(','))}`, 'replay_user_terminal=1')
     if (pluginStamp.loaded) {
       q.push(`plugin=${enc(pluginStamp.loaded)}`, `plugin_disk=${enc(pluginStamp.disk)}`, `plugin_at=${Math.round(pluginStamp.loadedAt / 1000)}`)
     }
@@ -1694,6 +1694,8 @@ export async function onOutboxEvent(ev) {
   await Promise.all(conns.filter(c => ids.has(c.id)).map(c => drainConnection(c, conns, { push: true })))
 }
 
+const requestInflight = new Set()
+
 /** Claim and perform this connection's requests. One drain in flight per connection: a call while one runs
  *  (a burst of pushes) is folded into ONE more drain after it, which sees everything that arrived meanwhile. */
 export async function drainConnection(conn, conns, { push = false } = {}) {
@@ -1721,7 +1723,11 @@ export async function drainConnection(conn, conns, { push = false } = {}) {
   lastPingAt.set(conn.id, Date.now())
   learnFeed(res?.feed, conn.id)
   for (const req of Array.isArray(res?.requests) ? res.requests : []) {
-    // Don't block the drain on a long send-and-wait.
+    const requestKey = `${conn.id}\0${req.id}`
+    if (requestInflight.has(requestKey)) continue
+    requestInflight.add(requestKey)
+    // Don't block the drain on a long send-and-wait. A restarted renderer can recover terminal
+    // starts; within this renderer, concurrent drains must not run the same request in parallel.
     void (async () => {
       let result
       try {
@@ -1740,7 +1746,7 @@ export async function drainConnection(conn, conns, { push = false } = {}) {
           await sleep(delay)
         }
       }
-    })()
+    })().finally(() => requestInflight.delete(requestKey))
   }
   if (drainAgain.delete(conn.id)) await drainConnection(conn, conns, { push: true })
 }

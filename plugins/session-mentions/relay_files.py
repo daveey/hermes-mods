@@ -247,8 +247,40 @@ def may_claim(req: dict, *, home: bool, courier: str = "", reach: list[str] | No
     return route in reach
 
 
+TERMINAL_REPLAY_S = 60.0  # bounded pickup recovery, never a delayed offline queue
+
+
+def _terminal_replays(base: Path, device: str) -> list[dict]:
+    """Only starts are idempotent by (gateway, request_id) on the Mac. Never replay Enter/send.
+
+    These are persisted freshness stamps, not a process-liveness timer. Refuse future stamps and
+    stop at the original claim's recovery horizon; retries never extend that horizon.
+    """
+    out = []
+    now = time.time()
+    for path in _list_json(base / "claimed"):
+        try:
+            req = json.loads(path.read_text())
+            args = req.get("args") or {}
+            age = now - float(req.get("claimed_at") or 0)
+            rid = str(req.get("id") or "")
+            if (req.get("claimed_by") != device or req.get("result_recorded")
+                    or not 0 <= age < TERMINAL_REPLAY_S or req.get("action") != "user_terminal"
+                    or not isinstance(args, dict) or not args.get("command")
+                    or set(args) - {"command", "reason", "cwd"}
+                    or len(rid) != 32 or any(c not in "0123456789abcdef" for c in rid)
+                    or (base / "results" / f"{rid}.json").exists()):
+                continue
+            out.append({k: v for k, v in req.items()
+                        if k not in {"claimed_by", "claimed_at", "claimed_plugin", "result_recorded"}})
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return out
+
+
 def claim_pending(base: Path | None = None, home: bool = True, courier: Any = "", reach: Any = None,
-                  aliases: Any = (), plugin: dict | None = None) -> list[dict]:
+                  aliases: Any = (), plugin: dict | None = None,
+                  replay_user_terminal: bool = False) -> list[dict]:
     """Claim every pending request this courier may serve (see ``may_claim``). A non-home drainer
     (another Mac's Desktop) gets nothing while this gateway's own Desktop courier is alive."""
     base = base or root()
@@ -258,10 +290,11 @@ def claim_pending(base: Path | None = None, home: bool = True, courier: Any = ""
         sweep(base)
         return []
     reach_list = None if reach is None else sorted(set(names(reach)) | set(names(aliases)) | ({device} - {""}))
+    replays = _terminal_replays(base, device) if replay_user_terminal and device else []
     pending = _list_json(base / "outbox")
     if not pending:  # idle: nothing to route, so no courier records to read
         sweep(base)
-        return []
+        return replays
     couriers = live_couriers(base)
     # While this gateway's own Desktop courier is alive, another Mac's Desktop may still claim a request
     # that ONLY it can serve: addressed to that Mac itself, or to a gateway the home courier cannot reach.
@@ -272,7 +305,7 @@ def claim_pending(base: Path | None = None, home: bool = True, courier: Any = ""
             if c.get("home"):
                 home_names |= set(names(c.get("reach") or ())) | set(names(c.get("aliases") or ())) | {norm_name(c.get("device"))}
         home_names.discard("")
-    out = []
+    out = list(replays)
     now = time.time()
 
     def _mtime(p: Path) -> float:  # a request withdrawn (unlinked) after the listing sorts first, then is skipped
@@ -372,6 +405,12 @@ def write_result(req_id: Any, result: dict, base: Path | None = None) -> bool:
     rid = safe_id(req_id)
     if not rid:
         return False
+    claimed = base / "claimed" / f"{rid}.json"
+    if claimed.is_file():
+        req = json.loads(claimed.read_text())
+        # Suppress execution replay BEFORE publishing a consumable result. If this write fails,
+        # fail the POST so the courier retries; never expose a failure and then re-arm its start.
+        atomic_write(claimed, {**req, "result_recorded": True})
     atomic_write(base / "results" / f"{rid}.json", result)
     return True
 

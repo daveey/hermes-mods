@@ -35,7 +35,16 @@ Invariants (each has a test in `tests_user_terminal.py` or `../session-mentions/
    under `COURIER_FRESH_S` (20 s). A failure in the Desktop's gateway-ticket step comes before the request is sent,
    so it is retried for up to 25 s. A failure after sending (`Timed out connecting…` on `start`) is never retried,
    so nothing can run twice. The result POST back to the gateway is retried, because it is keyed by request id.
-6. A relayed command is never sent twice and its outcome is never reported as "unknown"
+6. A relayed command is never started under a second request identity, and its outcome is never reported as "unknown".
+   A courier opting into `replay_user_terminal=1` may recover an unanswered START claim on its next drain for
+   60 seconds after the original claim (not extended by replay). This covers a renderer restart after pickup.
+   The same gateway/request ID reaches the Mac's locked idempotent `/start`, which returns the existing job
+   rather than opening another window. In-flight requests are folded within a renderer. Once a result is
+   recorded, the persisted claim is marked even if the gateway consumes its result file. Legacy couriers,
+   sends, Enter, withdrawals and status polls are never replayed. Claims older than 60 seconds stay lost;
+   no command is queued indefinitely after a crash. Tests: `test_terminal_claim_replay.py` and
+   `terminal-claim-replay.test.mjs` in session-mentions.
+   Existing result-recovery coverage:
    (`test_reconnect_running_job_polls_pending_then_real_result`, `test_unanswered_start_is_never_sent_twice`,
    `test_record_really_lost_says_result_lost_not_unknown_job_id`, `test_lost_job_id_is_found_by_its_request_id`):
    - The gateway records every start in `<root>/cache/user-terminal-relayed/<request id>.json` before sending it

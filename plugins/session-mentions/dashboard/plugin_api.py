@@ -206,7 +206,8 @@ async def outbox(request: Request) -> Dict[str, Any]:
     feed = {"feed": rf.feed_id()} if hasattr(rf, "feed_id") else {}
     if "courier" not in q:  # legacy courier
         return {"requests": rf.claim_pending(home=home), **feed}
-    return {"requests": rf.claim_pending(home=home, **_courier_args(rf, q)), **feed}
+    return {"requests": rf.claim_pending(home=home, replay_user_terminal=q.get("replay_user_terminal") == "1",
+                                          **_courier_args(rf, q)), **feed}
 
 
 @router.post("/result")
