@@ -658,10 +658,11 @@ class Mirror:
 
     def _withdrawn_scope(self, c, owner, board, snap):
         rows = c.execute(
-            "SELECT p.snapshot,l.withdrawal FROM kanban_projections p "
-            "JOIN requests r ON r.namespace=p.namespace AND r.id=p.request_id "
-            "JOIN lifecycle l ON l.namespace=r.namespace AND l.id=r.id "
-            "WHERE p.namespace=? AND p.board=? AND p.task=? AND r.state='withdrawn'",
+            "SELECT p.snapshot,w.withdrawal FROM kanban_projections p "
+            "JOIN (SELECT namespace,id,withdrawal FROM withdrawal_history "
+            "UNION SELECT namespace,id,withdrawal FROM lifecycle WHERE withdrawal IS NOT NULL) w "
+            "ON w.namespace=p.namespace AND w.id=p.request_id "
+            "WHERE p.namespace=? AND p.board=? AND p.task=?",
             (self.store._ns(owner), board, snap['task']))
         scope = self._ask_scope(snap)
         for row in rows:

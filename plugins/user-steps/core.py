@@ -2641,6 +2641,14 @@ class ActionStore:
                 CREATE TABLE IF NOT EXISTS lifecycle (
                   namespace TEXT, id TEXT, created_at REAL, withdrawal TEXT, notified_at REAL,
                   asked_revision INTEGER, PRIMARY KEY(namespace,id));
+                -- Historical withdrawals survive revise() resetting presentation lifecycle.
+                CREATE TABLE IF NOT EXISTS withdrawal_history (
+                  namespace TEXT, id TEXT, revision INTEGER, withdrawal TEXT,
+                  PRIMARY KEY(namespace,id,revision));
+                INSERT OR IGNORE INTO withdrawal_history
+                  SELECT l.namespace,l.id,r.revision,l.withdrawal FROM lifecycle l
+                  JOIN requests r ON r.namespace=l.namespace AND r.id=l.id
+                  WHERE l.withdrawal IS NOT NULL;
                 -- v1 bound answers + owner receipts: side tables only, so older processes keep working.
                 CREATE TABLE IF NOT EXISTS question_bindings (
                   namespace TEXT, request TEXT, revision INTEGER, digest TEXT, body TEXT,
@@ -3509,6 +3517,8 @@ class ActionStore:
                 raise ActionError('A decision is already recorded for this revision', 409)
             c.execute("UPDATE requests SET state='withdrawn' WHERE namespace=? AND id=? AND revision=?",
                       (ns, rid, r['revision']))
+            c.execute('INSERT OR IGNORE INTO withdrawal_history VALUES (?,?,?,?)',
+                      (ns, rid, r['revision'], _json(record)))
             c.execute('INSERT INTO lifecycle(namespace,id,withdrawal) VALUES (?,?,?) ON CONFLICT(namespace,id) '
                       'DO UPDATE SET withdrawal=excluded.withdrawal, notified_at=NULL', (ns, rid, _json(record)))
             return self._view(c, owner, rid)
