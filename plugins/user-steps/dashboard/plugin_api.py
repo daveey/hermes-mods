@@ -403,12 +403,16 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         return await _on_lane('feed', lambda: _load('core').steps_payload(ledger(), session), request=request)
 
     @router.get('/step')
-    def step(id: str, s: str = ''):
+    async def step(request: Request, id: str, s: str = ''):
         if not s: return {'root': None, 'step': None}
-        lg = ledger(); root = lg.root(s)
-        found = next((x for x in lg._read(root).get('steps', [])
-                      if x.get('id') == id and x.get('session') == s), None)
-        return {'root': root, 'step': _load('core').public_step(found) if found else None}
+        # Desktop polls this per open step; lineage_root reads state.db, which can wait on a lock. On the
+        # shared pool it queued behind slow reads (101 Desktop timeouts in 30 min, 2026-11-22): feed lane.
+        def read():
+            lg = ledger(); root = lg.root(s)
+            found = next((x for x in lg._read(root).get('steps', [])
+                          if x.get('id') == id and x.get('session') == s), None)
+            return {'root': root, 'step': _load('core').public_step(found) if found else None}
+        return await _on_lane('feed', read, request=request)
 
     def _session_cards_read(ids: str):
         # Every card the lineage created or shepherds, finished ones included, for the Desktop session panel's
