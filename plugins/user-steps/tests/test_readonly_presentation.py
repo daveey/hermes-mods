@@ -179,7 +179,11 @@ def test_panel_read_does_not_reconcile_or_initialize(tmp_path, monkeypatch):
     mirror = load('readonly_panel_mirror', root / 'kanban_mirror.py')
     monkeypatch.setattr(api, '_load', lambda name: {'core': core, 'kanban_mirror': mirror}[name])
     monkeypatch.setattr(core, 'home', lambda: tmp_path)
-    monkeypatch.setattr(core, '_row', lambda *args: ('session-a', None, None, 'desktop'))
+    c = sqlite3.connect(tmp_path / 'state.db')
+    c.execute('CREATE TABLE sessions(id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT, source TEXT)')
+    c.execute("INSERT INTO sessions(id) VALUES ('session-a')")
+    c.commit()
+    c.close()
     monkeypatch.setattr(core, 'server_owner', lambda sid: dict(OWNER, storedSessionId=sid))
     monkeypatch.setattr(core, 'kanban_boards', lambda: {})
     assert api.panel_requests(tmp_path, 'session-a', ['session-a'], reconcile=False) == []
@@ -191,4 +195,17 @@ def test_panel_read_does_not_reconcile_or_initialize(tmp_path, monkeypatch):
     monkeypatch.setattr(core.ActionStore, '_ensure_wal', lambda self: pytest.fail('reader initialized WAL'))
     monkeypatch.setattr(core.ActionStore, '_tx', lambda self: pytest.fail('reader opened write transaction'))
     monkeypatch.setattr(mirror.Mirror, 'reconcile', lambda *args: pytest.fail('reader reconciled'))
+    original = core._ro_connect
+    opened = []
+
+    def connect(path, **kwargs):
+        c = original(path, **kwargs)
+        opened.append((Path(path).name, c))
+        return c
+
+    monkeypatch.setattr(core, '_ro_connect', connect)
     assert api.panel_requests(tmp_path, 'session-a', ['session-a'], reconcile=False) == [expected]
+    assert [name for name, _ in opened] == ['state.db', 'actions.sqlite3']
+    for _, c in opened:
+        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+            c.execute('SELECT 1')
