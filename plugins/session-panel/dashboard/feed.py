@@ -683,7 +683,9 @@ class Feed:
         # Time-derived presentation is reduced from held inputs by beat().
         with self.lock:
             missing = any(s not in self.bundles and s not in self.failures for s in self.interest)
-        return (0.0 if missing else None), None
+        retry_at = getattr(self, '_admission_retry_at', None)
+        retry_wait = max(0.0, retry_at - now) if retry_at is not None else None
+        return (0.0 if missing else retry_wait), None
 
     def idle_wait(self) -> float:
         """How long the event-driven loop sleeps when no file is written: to the liveness heartbeat, or sooner when
@@ -708,6 +710,34 @@ class Feed:
         return len(self._publish({}, heartbeat=True, age_only=now - self.last_emit >= self.heartbeat_s))
 
     def tick(self) -> int:
+        """Settle a source pass atomically, with finite recovery of unread changes."""
+        import copy
+        names = ('_panel_stamps', '_panel_files', '_stamps', '_board_stamps',
+                 '_external_stamps', '_cursor')
+        saved = {name: copy.deepcopy(getattr(self, name, None)) for name in names}
+        self._admission_retry_at = None
+        try:
+            result = self._tick()
+        except Exception:
+            # A later reader can fail after an earlier one captured its stamp.
+            # Never consume that event, or keep vouching for the held old bundle.
+            for name, value in saved.items():
+                setattr(self, name, value)
+            with self.lock:
+                self._retry.update(self.interest)
+                # Cold registrations must not bypass the finite retry budget.
+                for s in self.interest:
+                    if s not in self.bundles:
+                        self.failures.setdefault(s, {'count': 0, 'at': self.clock(), 'error': 'source capture failed'})
+            attempt = getattr(self, '_admission_failures', 0) + 1
+            self._admission_failures = attempt
+            if attempt <= 3:
+                self._admission_retry_at = self.clock() + 0.1 * (2 ** (attempt - 1))
+            raise
+        self._admission_failures = 0
+        return result
+
+    def _tick(self) -> int:
         """One pass: recompute what changed and push it, else a heartbeat when due. Returns bundles pushed.
         Stored and pushed in chunks, the chats a reader is waiting for first: a click on a chat with no bundle is
         answered after its own compute, not after a whole sweep (requests arriving mid-pass are taken in between
