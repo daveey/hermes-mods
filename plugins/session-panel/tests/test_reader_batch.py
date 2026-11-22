@@ -150,6 +150,85 @@ def test_union_execution_error_does_not_spread_to_other_lineages(graph, monkeypa
     assert sum(len(ids) > 1 for ids in calls) == 1
 
 
+def _make_primary(path):
+    """The board becomes a PRIMARY mirror, as the hub's is: core then attests only cards with a live run there and
+    marks every other card `_execution_error` on every read."""
+    with contextlib.closing(sqlite3.connect(path)) as c:
+        # Core judges a read by the persisted mode alone (`_require_local_execution_authority`); its own columns.
+        c.execute('CREATE TABLE IF NOT EXISTS kanban_sync_state (board_id TEXT PRIMARY KEY, cursor INTEGER NOT NULL '
+                  'DEFAULT 0, gateway_id TEXT NOT NULL, hlc_last TEXT NOT NULL, mode TEXT NOT NULL, '
+                  'applying INTEGER NOT NULL DEFAULT 0, pending_run_uid TEXT)')
+        if c.execute('SELECT 1 FROM kanban_sync_state LIMIT 1').fetchone():
+            c.execute("UPDATE kanban_sync_state SET mode='primary'")
+        else:
+            c.execute("INSERT INTO kanban_sync_state (board_id, gateway_id, hlc_last, mode) VALUES ('default', 'local-test', '0', 'primary')")
+        c.commit()
+
+
+def _count_reads(ksa, monkeypatch):
+    calls, original = [], ksa._read_session_tasks
+
+    def read(path, ids, *a, **k):
+        calls.append(list(ids))
+        return original(path, ids, *a, **k)
+    monkeypatch.setattr(ksa, '_read_session_tasks', read)
+    return calls
+
+
+def test_primary_mirror_pass_shares_one_read_with_the_per_lineage_answer(graph, monkeypatch):
+    """The hub's board is a primary mirror: every parked card comes back marked unknown, which the union read took
+    for a failed read, so every chat of every pass fell back to two reads of its own (10% of the serve's samples)."""
+    r, local, _, ksa = graph
+    _make_primary(r.boards()[0][1])
+    ksa._reset_cache_for_tests()
+    sessions = ['S0', 'S1', 'S2']
+    baseline = {s: (r.linked([s]), r.done([s])) for s in sessions}
+    assert all(local in {t['id'] for t in rows} for rows, _ in baseline.values())
+    ksa._reset_cache_for_tests()
+    calls = _count_reads(ksa, monkeypatch)
+    with r.batch(sessions):
+        actual = {s: (r.linked([s]), r.done([s])) for s in sessions}
+    assert stable(actual) == stable(baseline)
+    assert [ids for ids in calls if len(ids) == 1] == [], 'no chat read the board on its own'
+    assert len(calls) == 2, 'one read per status set for the whole pass'
+
+
+@pytest.mark.parametrize('recheck', ['evidence', 'error'])
+def test_primary_mirror_union_falls_back_when_its_evidence_read_failed(graph, monkeypatch, recheck):
+    """A marked card core can attest now (the union's own evidence read failed), or a check that cannot be made,
+    is not the mirror's ordinary answer: each chat reads for itself, as on a board this gateway owns."""
+    from hermes_cli import kanban_primary_execution as kpe
+    r, local, _, ksa = graph
+    _make_primary(r.boards()[0][1])
+    ksa._reset_cache_for_tests()
+    original = kpe.attach
+    inside = []
+
+    def attach(conn, rows, **k):
+        if inside:  # core's own call, inside a board read
+            return original(conn, rows, **k)
+        if recheck == 'error':
+            raise sqlite3.OperationalError('fixture: board busy')
+        return {tid: {'state': 'running'} for tid in rows}
+    monkeypatch.setattr(kpe, 'attach', attach)
+    read = ksa._read_session_tasks
+    calls = []
+
+    def reading(path, ids, *a, **k):
+        calls.append(list(ids))
+        inside.append(1)
+        try:
+            return read(path, ids, *a, **k)
+        finally:
+            inside.pop()
+    monkeypatch.setattr(ksa, '_read_session_tasks', reading)
+    with r.batch(['S0', 'S1']):
+        for sid in ('S0', 'S1'):
+            assert local in {t['id'] for t in r.linked([sid])}
+    assert ['S0'] in calls and ['S1'] in calls
+    assert sum(len(ids) > 1 for ids in calls) == 1
+
+
 def test_batch_failure_falls_back_to_stable_lineage_reads(graph, monkeypatch):
     r, local, _, ksa = graph
     original = ksa._read_session_tasks
