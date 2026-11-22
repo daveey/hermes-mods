@@ -890,6 +890,10 @@ export async function refreshRequests(call = api) {
       canonical = { scope, requests: [], error: null }
       return publishCanonical()
     }
+    // The Desktop deliberately skips timer polls of /api/plugins/* while the backend link is slow or the Mac is
+    // settling after a wake (SlowLinkHeldError/PowerSettlingError; IPC strips `code`, the name survives in the
+    // message). That is "no new answer yet", not an outage: keep the last authoritative queue; the next poll retries.
+    if (isSkippedRead(e)) return
     canonical = { scope, requests: canonical.scope === scope ? canonical.requests : [], error: `Action queue unavailable: ${e.message}. Earlier asks shown below are not approvals.` }
     publishCanonical()
   }
@@ -920,6 +924,7 @@ export const ownerPhaseText = consumer => {
   }[phase]
 }
 const operationState = op => { const s = op?.dispatchState || op?.state || op?.status; return s === 'delivery_failed' ? 'failed' : s }
+const isSkippedRead = e => e?.code === 'POWER_SETTLING' || /PowerSettlingError:/.test(str(e?.message))
 const errorStatus = e => e?.status || e?.statusCode || e?.response?.status || Number(str(e?.message).match(/\b(400|403|404|409|422)\b/)?.[1])
 const actionStyle = { ...btn(), minHeight: 44, minWidth: 44, maxWidth: '100%', whiteSpace: 'normal', overflowWrap: 'anywhere' }
 const flowStyle = { display: 'flex', flexWrap: 'wrap', gap: 8 }

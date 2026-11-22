@@ -362,6 +362,21 @@ for (const companion of [false, true]) test(`remote retirement retains nontermin
  await show(null);delete window.hermesDesktop
 })
 
+test('a background read the Desktop skipped (slow link / settling after wake) keeps the last queue, no outage banner',async()=>{
+ const r=freshRequest()
+ window.hermesDesktop={api:async()=>({requests:[r]})}
+ await show(React.createElement(m.ActionQueue,{key:'skipped'}))
+ // Exact shape Electron delivers across IPC for SlowLinkHeldError / PowerSettlingError (code is stripped).
+ window.hermesDesktop.api=async()=>{throw Error("Error invoking remote method 'hermes:api': PowerSettlingError: Background read skipped: the connection to this backend is slow; the next poll retries.")}
+ await React.act(async()=>{await m.refreshRequests();await flush()})
+ assert.doesNotMatch(el().textContent,/Action queue unavailable/)
+ assert.equal([...el().querySelectorAll('button')].find(b=>b.textContent==='Approve').disabled,false)
+ window.hermesDesktop.api=async()=>{throw Error('backend unavailable')}
+ await React.act(async()=>{await m.refreshRequests();await flush()})
+ assert.match(el().textContent,/Action queue unavailable/,'a real failure still surfaces')
+ await show(null);delete window.hermesDesktop
+})
+
 test('backend failure and malformed owner render inline errors and disable cached authorization',async()=>{
  const r=freshRequest()
  window.hermesDesktop={api:async()=>({requests:[r]})}
