@@ -61,6 +61,21 @@ CHAIN_DEPTH = 6              # hops per chain (session-panel walks at most six c
 CHAIN_CARDS = 80             # cards per bundle
 TERMINAL = {'done', 'archived', 'cancelled'}
 CARD_ID = re.compile(r'\bt_[0-9a-f]{6,}\b')
+# Bundle inputs the hub reduces `model` from. No client reads them (Desktop renders `model` and takes `tasks` and
+# `lineage` for chips), yet they are most of a bundle (one long card chain: ~1 MB of `cards`). [daveey 2026-11-22]
+# "switching sessions ... should be instant": a Desktop pulled ~45 MB per 2 min of them over its ssh tunnel, and
+# every transcript read on that tunnel queued behind them (cache paint 40 ms, reconcile 6-8 s). Pushes and
+# catch-ups carry wire_bundle(); the held bundle (and Feed.changes(), the in-process view) keeps everything.
+WIRE_OMIT = frozenset({'cards', 'done', 'requests', 'outcome_json'})
+
+
+def wire_bundle(bundle):
+    """What a client receives for one chat: the held bundle without the server-only inputs in WIRE_OMIT."""
+    if not isinstance(bundle, dict):
+        return bundle
+    return {k: v for k, v in bundle.items() if k not in WIRE_OMIT}
+
+
 PROCESS_FEED = None          # the one feed of this process (plugin_api.feed())
 PROCESS_LOCK = threading.Lock()
 RESTART = None               # plugin_api.feed: a plugin reload restarts (resumes) the feed at once
@@ -203,7 +218,7 @@ class Feed:
             if old and self._wire_sources.get(s) is held['bundle'] and old[0] == held['rev']:
                 entries[s] = old
             else:
-                entries[s] = (held['rev'], self._encode(s), self._encode(held['bundle']))
+                entries[s] = (held['rev'], self._encode(s), self._encode(wire_bundle(held['bundle'])))
         self._wire_sources = {s: b['bundle'] for s, b in self.bundles.items()}
         header = b'{"epoch":' + self._encode(self.epoch) + b',"rev":' + str(self.rev).encode()
         self._wire = (self.epoch, self.rev, MappingProxyType(entries), header)
@@ -657,7 +672,8 @@ class Feed:
                                        self.full_every_s if self.bundles[s]['bundle'].get('tasks')
                                        else QUIET_FULL_EVERY_S))
                 try:
-                    self.emit({'epoch': self.epoch, 'prev': prev, 'rev': self.rev, 'bundles': changed, 'fresh': fresh,
+                    self.emit({'epoch': self.epoch, 'prev': prev, 'rev': self.rev,
+                               'bundles': {s: wire_bundle(b) for s, b in changed.items()}, 'fresh': fresh,
                                **({} if changed else {'heartbeat': True})})
                     self.last_emit = now
                     if changed:

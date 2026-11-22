@@ -35,7 +35,9 @@ def test_changes_route_watches_and_catches_up(monkeypatch):
         core.PROCESS_FEED.tick()  # producer publishes independently of request
         first = c.post('/api/plugins/session-panel/changes', json={'sessions': ['S1', 'S2']}).json()
         assert set(first['bundles']) == {'S1', 'S2'}
-        assert set(first['bundles']['S1']['cards']) == {'t_aaaaaa1', 't_bbbbbb2', 't_ccccccc3'}
+        # The wire carries what clients render (model, tasks, lineage), never the hub-only card chain it came from.
+        assert 'cards' not in first['bundles']['S1'] and first['bundles']['S1']['model']
+        assert first['bundles']['S1']['tasks']
         again = c.post('/api/plugins/session-panel/changes',
                        json={'sessions': ['S1', 'S2'], 'since': first['rev'], 'epoch': first['epoch']}).json()
         assert again['bundles'] == {} and again['reset'] is False
