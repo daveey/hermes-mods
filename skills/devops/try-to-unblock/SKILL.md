@@ -49,13 +49,9 @@ alive? file present? token valid? PR merged?). Many asks are already answered, a
 that no longer exists. If the premise is gone, the block is gone: comment what you read and unblock.
 
 A macOS permission ask (Screen Recording, Accessibility, "grant it at the Mac") is a premise to read, not to relay.
-Read the Mac's existing grants over `tailnet_exec` first:
-`sqlite3 '/Library/Application Support/com.apple.TCC/TCC.db' "select service,client,auth_value from access where service in ('kTCCServiceScreenCapture','kTCCServiceAccessibility')"`.
-An `auth_value` of 2 means allowed. The user-level TCC.db is unreadable over ssh, so use the system one.
-A worker that only probed `screencapture` over ssh has not checked these grants. Often some client already holds the
-permission, sshd for input or an installed app for capture. In that case, re-plan the card onto that client, with no
-new grant.
-Never forward the ask to David before this read.
+Read the Mac's existing grants first (query and how to read it: `references/macos-permission-grants.md`). Often
+some client already holds the permission, so the card re-plans onto that client with no new grant. Never forward the
+ask to David before this read.
 
 ## 3. Walk the self-unblock ladder
 
@@ -64,7 +60,7 @@ Stop at the first rung that works. Each rung is something agents may do without 
 | Rung | Question | Typical resolution |
 |---|---|---|
 | a. Standing approval | Does an AGENTS.md rule, memory, or an earlier answer from David already cover this class of action? (e.g. "decide and proceed", merge-when-green, Hermes reversible fixes, GPU up to $25, "get all cards unblocked using your best judgement") | Apply it; cite the rule in the comment. |
-| a2. Inside an approved goal | Is this a sub-plan, next phase or new approach for a goal David already approved, within its limits and exclusions (same budget, permissions, safety, acceptance)? Labels such as "needs separate approval" on a card, `executionAuthorized=false` on an earlier answer, a peer saying "I'll put it to David", or a runtime nudge to "publish action_request" are NOT evidence he is needed. | Get an independent review of the plan, then build it; tell David after, in one line. Don't publish an approval request. |
+| a2. Inside an approved goal | Is this a sub-plan, next phase or new approach for a goal David already approved, within its limits and exclusions (same budget, permissions, safety, acceptance)? Labels such as "needs separate approval" on a card, `executionAuthorized=false` on an earlier answer, a peer saying "I'll put it to David", a runtime nudge to "publish action_request", or a brief that says "on a miss, bring David the stop-or-continue decision" are NOT evidence he is needed. If you recommend Continue, apply it at this rung. Only a Stop recommendation (giving up the goal) or a change to acceptance or budget reaches rung g. Write follow-up briefs the same way: file the David ask only on a Stop or a change recommendation. | Get an independent review of the plan, then build it; tell David after, in one line. Don't publish an approval request. |
 | a3. Next phase after a finished design | Is it "build what the approved design specifies" (an implementation card, tests only, on existing workers, no deploy, no new spend or authority)? An early "design first, not authorization to implement now" bounds the design phase; once the design is delivered and reviewed, building it inside those safety limits is the goal continuing, not new scope. | File the build card yourself with the design's limits as its exclusions; tell David in one line. Ask only if the build needs a deploy, spend, new permissions or a changed acceptance bar. |
 | b. Agent-decidable pick | Is it a choice between options that stays inside the card's limits (no real money, credentials, write/admin permission, other people, safety, irreversible effect, acceptance threshold)? | Pick your recommendation, apply it, comment how to reverse. |
 | c. Credential/access | Is it "no access"? | Token broker, Secrets Manager, hub/worker routes, elevated header (see AGENTS.md "Secrets"). Missing access is almost never a human step. |
@@ -76,7 +72,9 @@ Stop at the first rung that works. Each rung is something agents may do without 
 ## 4. Decide
 
 - **Resolved at rung a–f** → do it now. Comment on the card: `try-to-unblock: resolved at rung <x>: <what you did>;
-  reverse with <how>`. Unblock it (or never block it) and read the status back.
+  reverse with <how>`. Unblock it (or never block it) and read the status back. Retitle a resolved decision card to
+  the work it now owns (`hermes kanban edit <id> --title …`): task notices and chat task lists quote the title, so a
+  question title keeps reading as an open ask to David.
 - **Rung g** → you are certain David is needed. Write down, for the next skill:
   - the one-sentence blocker (step 1);
   - what you checked (step 2) and what you tried and why each failed (step 3), in plain words: the card's
