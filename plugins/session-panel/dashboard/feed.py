@@ -412,7 +412,15 @@ class Feed:
         except Exception:
             with self.lock:
                 if self._decision_result(session, base, seq, failed=True):
-                    self._decision_retry_at = self._spend('decision', {session}, keep=self._decision_failures - {session})
+                    keep = self._decision_failures - {session}
+                    due = self._spend('decision', {session}, keep=keep)
+                    others = [n for s, n in self._budgets['decision'].items() if s in keep and n <= RETRY_STEPS]
+                    if others:
+                        earlier = self._decision_retry_at
+                        if earlier is None:
+                            earlier = self._backoff(min(others))
+                        due = earlier if due is None else min(due, earlier)
+                    self._decision_retry_at = due
             raise
         self._decision_result(session, base, seq, failed=False)
         self._publish({session: {**base, **{k: inputs[k] for k in ('outcome_json', 'requests')},

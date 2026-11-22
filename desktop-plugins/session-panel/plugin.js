@@ -622,7 +622,7 @@ export async function chooseModelOption(row, option, sourceRoute, { call = model
 }
 function decisionFailed(key, e, admission = false) {
   const retained = JSON.parse(window.localStorage.getItem(MODEL_INTENT_PREFIX + key) || 'null')
-  const message = String(e?.message || e).replace(/^Error invoking remote method '[^']*':\s*/, '')
+  const message = String(e?.message || e).replace(/^Error invoking remote method '[^']*':\s*/, '').replace(/^Error:\s*/, '')
   // This exact server refusal occurs BEFORE the work is admitted. Generic 503,
   // transport failures and timeouts remain uncertain and can never repost.
   const notStarted = admission && !!retained && /^503\b[^\n]*Decision not started: capacity busy/.test(message)

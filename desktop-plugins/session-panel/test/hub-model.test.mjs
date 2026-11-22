@@ -413,7 +413,7 @@ test('never-started admission refusal offers explicit same-key retry without unl
   if (path.endsWith('/decision-refresh')) return {}
   if (path.endsWith('/decisions')) {
    posts.push(opts.body)
-   if (posts.length === 1) throw Error('503: {"detail":"Decision not started: capacity busy"}')
+   if (posts.length === 1) throw new Error("Error invoking remote method 'hermes:api': Error: 503: {\"detail\":\"Decision not started: capacity busy\"}")
    return { operation: { operationId: 'retry-op', dispatchState: 'delivered', idempotencyKey: opts.body.idempotencyKey }, request: { ...request, resolution: { operationId: 'retry-op' } } }
   }
   return { request }
