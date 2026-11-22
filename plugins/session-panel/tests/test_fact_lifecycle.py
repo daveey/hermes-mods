@@ -76,6 +76,66 @@ def test_reload_retains_stuck_predecessor(api, monkeypatch):
     api._LOADER.facts_registration = None
 
 
+def test_unload_retains_failed_join_until_reregister(api, monkeypatch):
+    from types import SimpleNamespace as NS
+    plugin = load('_panel_fact_plugin', Path(__file__).resolve().parents[1] / '__init__.py')
+    core = api._load_feed()
+    predecessor = core.PROCESS_FEED
+    core.STOP_FACTS = api.stop_facts
+    closed = []
+    api._LOADER.facts_registration = NS(close=lambda: closed.append(True))
+    api._LOADER.facts_mode = 'facts'
+    api._LOADER.facts_v1 = object()
+    monkeypatch.setattr(api, '_quiesce', lambda f: (f.stopped.set() or False))
+    monkeypatch.setattr(api, 'CoreReaders', lambda: pytest.fail('escaped predecessor custody'))
+    with pytest.raises(RuntimeError, match='quiesce'):
+        plugin.stop()
+    assert api.feed() is predecessor
+    assert api._LOADER.facts_mode == 'facts'
+    assert api._LOADER.facts_transition_pending
+    with pytest.raises(RuntimeError, match='quiesce'):
+        plugin.register(NS())  # older core must not discard the facts fence
+    assert closed == [True]
+    monkeypatch.setattr(api, '_quiesce', lambda f: True)
+    monkeypatch.setattr(plugin, 'restart_after_reload', lambda: None)
+    plugin.register(NS())
+    assert api._LOADER.facts_mode == 'legacy'
+    assert not api._LOADER.facts_transition_pending
+    assert not hasattr(api._LOADER, 'facts_v1')
+
+
+def test_reload_preserves_unload_hooks(api, monkeypatch):
+    old = api._load_feed()
+    old.STOP_FACTS = api.stop_facts
+    old.INSTALL_FACTS = api.install_facts
+    monkeypatch.setattr(old, 'SOURCE_STAMP', ('older',))
+    monkeypatch.setattr(old, 'SOURCE_SHA', 'older')
+    # Keep the synthetic publisher fenced; this test exercises hook carriage.
+    api._LOADER.facts_transition_pending = True
+    new = api._load_feed()
+    assert new is not old
+    assert new.STOP_FACTS is api.stop_facts
+    assert new.INSTALL_FACTS is api.install_facts
+
+
+def test_closed_binding_callback_is_fenced_after_older_core_register(api, monkeypatch):
+    from types import SimpleNamespace as NS
+    plugin = load('_panel_fact_plugin_late', Path(__file__).resolve().parents[1] / '__init__.py')
+    token = object()
+    api._LOADER.facts_binding_token = token
+    api._LOADER.facts_mode = 'facts'
+    api._LOADER.facts_generation = 7
+    api._load_feed().STOP_FACTS = api.stop_facts
+    monkeypatch.setattr(api, '_quiesce', lambda f: (f.stopped.set() or True))
+    monkeypatch.setattr(plugin, 'restart_after_reload', lambda: None)
+    plugin.stop()
+    plugin.register(NS())
+    monkeypatch.setattr(api, 'CoreReaders', lambda: pytest.fail('late callback restarted lanes'))
+    api._facts_mode_changed('facts', 8, token=token)
+    assert api._LOADER.facts_mode == 'legacy'
+    assert not hasattr(api._LOADER, 'facts_v1')
+
+
 def test_concurrent_start_cannot_escape_mode_transition(api, monkeypatch):
     core = api._load_feed()
     predecessor = core.PROCESS_FEED

@@ -6,6 +6,13 @@ import types
 def register(ctx) -> None:
     # Only the published, authorized host scope enters this adapter. Old cores
     # have no facts attribute and retain the complete legacy implementation.
+    loader = sys.modules.get('_session_panel_feed_loader')
+    if getattr(loader, 'facts_transition_pending', False):
+        # A prior unload timed out. Retry the same custody gate even when the
+        # replacement core has no facts capability; never start beside it.
+        stop()
+    if loader is not None:
+        loader.facts_unloading = False
     facts = getattr(ctx, 'facts', None)
     if facts is not None and getattr(facts, 'v1', None) is not None:
         binding = types.ModuleType('_session_panel_facts_binding')
@@ -36,6 +43,11 @@ def restart_after_reload() -> None:
 
 def stop() -> None:
     loader = sys.modules.get('_session_panel_feed_loader')
+    stopper = getattr(sys.modules.get('_session_panel_feed_core'), 'STOP_FACTS', None)
+    if callable(stopper) and (getattr(loader, 'facts_registration', None) is not None
+                             or getattr(loader, 'facts_transition_pending', False)
+                             or getattr(loader, 'facts_mode', 'legacy') == 'facts'):
+        stopper()
     registration = getattr(loader, 'facts_registration', None)
     if registration is not None:
         registration.close()
