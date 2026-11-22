@@ -147,6 +147,10 @@ class PluginSuitesWorkflow(unittest.TestCase):
         self.assertIn('ref: ${{ github.event.pull_request.head.sha || github.sha }}', job)
         self.assertIn('ref: 0397ba2abd1be2b28c41626152696f0901acab4f', job)
         self.assertIn('ref: 11058ac91990624059dd4214e420334cbcc5d006', job)
+        courier_checkout = job.split('          repository: daveey/hermes-hub', 1)[1].split('      - uses:', 1)[0]
+        self.assertIn('ssh-key: ${{ secrets.HERMES_HUB_COMPOSED_READ_KEY }}', courier_checkout)
+        self.assertIn('persist-credentials: false', courier_checkout)
+        self.assertNotIn('token:', courier_checkout)
         self.assertIn('--python 3.14 --locked --group dev --group test', job)
         self.assertIn('bash plugins/user-steps/run-core-integration.sh', job)
         self.assertIn('--remote-card-composed "$RUNNER_TEMP/remote-card-composed" -j 1', job)
