@@ -58,10 +58,11 @@ test('missing/unsupported models invalidate their own scope without raw fallback
  }
  assert.equal(m.ingestBundle('', 'default', bundle()), false)
 })
-test('model cache is bounded to 100 scopes', () => {
- for (let i = 0; i < 101; i++) m.ingestBundle('C1', 'default', bundle(`S${i}`))
+test('model cache holds a whole warm sidebar and is bounded', () => {
+ assert.ok(m.MODEL_CACHE_MAX >= 2 * m.WARM_MAX)
+ for (let i = 0; i <= m.MODEL_CACHE_MAX; i++) m.ingestBundle('C1', 'default', bundle(`S${i}`))
  assert.equal(m.cachedModel(route('S0')), null)
- assert.ok(m.cachedModel(route('S1'))); assert.ok(m.cachedModel(route('S100')))
+ assert.ok(m.cachedModel(route('S1'))); assert.ok(m.cachedModel(route(`S${m.MODEL_CACHE_MAX}`)))
 })
 test('first heartbeat makes feed live and requests a full catch-up; models never tick locally', async () => {
  reply = () => answer({ bundles: { S1: bundle() } }); await m.feedCatchUp(target())
@@ -122,17 +123,101 @@ test('pending catch-ups merge sessions/flags and never overlap', async () => {
  assert.equal(calls.length, 2); assert.equal(most, 1)
  assert.deepEqual(calls[1].body.sessions, ['S2', 'S3']); assert.equal(calls[1].body.since, 0)
 })
-test('cold focus preserves warm coverage before advancing the shared connection cursor', async () => {
+test('cold focus reads only its chat and never advances the shared connection cursor', async () => {
  reply = () => answer({ bundles: { warm: bundle('warm', 'r3') } })
  await m.feedCatchUp(target(['warm']))
  reply = req => answer({ rev: 5, bundles: Object.fromEntries(req.body.sessions.map(s => [s, bundle(s, s === 'warm' ? 'r4' : 'r5')])) })
  await m.feedFocus(route(), { wait: async () => {} })
- assert.equal(m.cachedModel(route('warm'))?.revision, 'r4', 'a focused read must not skip a warm change behind its shared cursor')
- assert.deepEqual(calls.at(-1).body.sessions, ['S1', 'warm'])
- reply = () => answer({ rev: 5 })
- await m.feedPass()
- assert.equal(calls.at(-1).body.since, 5)
+ assert.deepEqual(calls.at(-1).body, { sessions: ['S1'], since: 0, epoch: 'E1' }, 'one chat, not the whole warm set')
+ assert.equal(m.cachedModel(route())?.revision, 'r5')
+ assert.equal(m.cachedModel(route('warm'))?.revision, 'r3')
+ await m.feedCatchUp(target(['S1', 'warm']))
+ assert.equal(calls.at(-1).body.since, 3, 'a focused read must not skip a warm change behind the shared cursor')
  assert.equal(m.cachedModel(route('warm'))?.revision, 'r4')
+})
+test('cold focus is not queued behind a catch-up in flight', async () => {
+ await m.feedCatchUp(target(['warm']))
+ let release
+ reply = () => new Promise(r => { release = r })
+ const slow = m.feedCatchUp(target(['warm'])); await settle()
+ reply = () => answer({ bundles: { S1: bundle('S1', 'clicked') } })
+ assert.equal(await m.feedFocus(route(), { wait: async () => {} }), true)
+ assert.equal(m.cachedModel(route())?.revision, 'clicked')
+ release(answer()); await slow
+})
+test('a peek answered from an older revision fills empty chats but never replaces a newer pushed model', async () => {
+ await m.feedCatchUp(target(['S1', 'S2']))
+ let release
+ reply = () => new Promise(r => { release = () => r(answer({ rev: 3, bundles: { S1: bundle('S1', 'old'), S2: bundle('S2', 'only') } })) })
+ const peek = m.feedPeek(target(['S1', 'S2'])); await settle()
+ push({ prev: 3, rev: 4, fresh: ['S1'], bundles: { S1: bundle('S1', 'new') } })
+ release(); assert.equal(await peek, true)
+ assert.equal(m.cachedModel(route()).revision, 'new')
+ assert.equal(m.cachedModel(route('S2')).revision, 'only')
+})
+test('a peek against an unregistered, restarted or other feed applies nothing and asks for a catch-up', async () => {
+ assert.equal(await m.feedPeek(target()), null); assert.equal(calls.length, 0)
+ await m.feedCatchUp(target())
+ for (const other of [{ epoch: 'E2' }, { feed: 'hub:2' }, { reset: true }]) {
+  reply = () => answer({ ...other, bundles: { S1: bundle('S1', 'foreign') } })
+  assert.equal(await m.feedPeek(target()), null)
+  assert.equal(m.cachedModel(route()), null)
+ }
+ reply = () => { throw Error('503: Session panel starting') }
+ assert.equal(await m.feedPeek(target()), false)
+})
+test('a pass reads chats that joined the watched set beside the cursor, once', async () => {
+ const rows = n => Array.from({ length: n }, (_, i) => ({ id: `side-${i}`, connection_id: 'C1', profile: 'default', last_active: i }))
+ let sidebar = rows(2)
+ const { host } = await import('@hermes/plugin-sdk')
+ host.sessions = { rows: { get: () => sidebar } }
+ try {
+  reply = req => answer({ bundles: Object.fromEntries(req.body.sessions.map(s => [s, bundle(s, 'first')])) })
+  await m.feedPass()
+  assert.equal(calls.length, 1, 'first registration is a full read: nothing to peek')
+  sidebar = rows(4)
+  reply = req => req.body.since ? answer() : answer({ bundles: Object.fromEntries(req.body.sessions.map(s => [s, bundle(s, 'joined')])) })
+  await m.feedPass()
+  assert.equal(calls.length, 3)
+  assert.equal(calls[1].body.since, 3)
+  assert.deepEqual(calls[2].body, { sessions: ['side-3', 'side-2'], since: 0, epoch: 'E1' })
+  assert.equal(m.cachedModel(route('side-3')).revision, 'joined'); assert.equal(m.cachedModel(route('side-0')).revision, 'first')
+  await m.feedPass()
+  assert.equal(calls.length, 4, 'already watched: no second peek')
+ } finally { delete host.sessions }
+})
+test('the whole sidebar is kept warm inside one registration', () => {
+ const rows = Array.from({ length: 300 }, (_, i) => ({ id: `side-${i}`, connection_id: 'C1', profile: 'default', last_active: i }))
+ const t = m.feedTargets(rows)
+ assert.equal(t.length, 1)
+ assert.ok(t[0].sessions.length >= 150 && t[0].sessions.length <= 200, 'one request carries at most 200 chats')
+ assert.equal(t[0].sessions[0], 'S1'); assert.equal(t[0].sessions[1], 'side-299')
+})
+test('a changed sidebar set re-registers after it settles; re-ordering alone does not', async () => {
+ let sidebar = [{ id: 'a', connection_id: 'C1', last_active: 1 }, { id: 'b', connection_id: 'C1', last_active: 2 }]
+ const subs = new Set(), timers = []
+ let passes = 0
+ const off = m.watchSidebar({ get: () => sidebar, subscribe: fn => { subs.add(fn); return () => subs.delete(fn) } },
+  { pass: async () => { passes++ }, setTimer: fn => timers.push(fn), clearTimer: () => {} })
+ const change = next => { sidebar = next; subs.forEach(fn => fn()); subs.forEach(fn => fn()); const run = timers.splice(0); assert.equal(run.length, 1, 'one settle timer per burst'); run[0]() }
+ change([{ id: 'a', connection_id: 'C1', last_active: 9 }, { id: 'b', connection_id: 'C1', last_active: 2 }])
+ assert.equal(passes, 0)
+ change([...sidebar, { id: 'c', connection_id: 'C1', last_active: 3 }])
+ assert.equal(passes, 1)
+ off(); assert.equal(subs.size, 0)
+ assert.equal(typeof m.watchSidebar(undefined), 'function')
+})
+test('a cached focus paints without the network and reconciles only while unvouched', async () => {
+ reply = () => answer({ bundles: { S1: bundle('S1', 'cached') } }); await m.feedCatchUp(target())
+ const before = calls.length
+ assert.equal(await m.feedFocus(route()), true); assert.equal(calls.length, before, 'cached: zero requests on the paint path')
+ reply = () => answer({ rev: 4, bundles: { S1: bundle('S1', 'current') } })
+ assert.equal(await m.feedReconcile(route()), true)
+ assert.equal(m.cachedModel(route()).revision, 'current')
+ push({ heartbeat: true, rev: 3, fresh: ['S1'] }); await settle(); await settle()
+ const vouched = calls.length
+ assert.equal(m.feedReconcile(route()), null); assert.equal(calls.length, vouched, 'a vouched model needs no read')
+ assert.equal(m.feedReconcile(route('never-cached')), null)
 })
 test('queued cold focus retains coverage registered by the preceding flight', async () => {
  let release
@@ -145,16 +230,18 @@ test('queued cold focus retains coverage registered by the preceding flight', as
  assert.deepEqual(calls[1].body.sessions, ['S1', 'new-warm'])
  assert.equal(m.cachedModel(route('new-warm')).revision, 'r6')
 })
-test('cold focus retries an empty registered session preserving watched coverage', async () => {
+test('cold focus retries an empty registered session beside the cursor', async () => {
  await m.feedCatchUp(target(['S1', 'warm']))
  const waits = []
  reply = req => calls.length < 3 ? answer() : answer({ bundles: { S1: bundle() } })
  const ready = await m.feedFocus(route(), { wait: async ms => waits.push(ms) })
  assert.equal(m.cachedModel(route())?.revision, 'r1', 'empty registration must not suppress model hydration')
  assert.equal(ready, true)
- assert.deepEqual(calls.slice(1).map(c => c.body.sessions), [['S1', 'warm'], ['S1', 'warm']])
- assert.ok(calls.slice(1).every(c => c.body.since === 0))
+ assert.deepEqual(calls.slice(1).map(c => c.body.sessions), [['S1'], ['S1']])
+ assert.ok(calls.slice(1).every(c => c.body.since === 0 && c.body.epoch === 'E1'))
  assert.deepEqual(waits, [250])
+ await m.feedCatchUp(target(['S1', 'warm']))
+ assert.equal(calls.at(-1).body.since, 3, 'the cursor stayed where the last catch-up left it')
 })
 test('cold focus bounds failed reads, stops on unmount and does not reread a cached model', async () => {
  reply = () => { throw Error('timeout') }

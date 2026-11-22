@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v18-cold-loading'
+const VERSION = 'session-panel-v19-warm-sidebar'
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 // Emoji-presentation glyphs the Desktop fonts draw as tofu (a Hermes-bug title carried "⛔"); the model strips them
 // too, this covers a cached older model.
@@ -39,9 +39,13 @@ const routeKey = r => JSON.stringify([r.connectionId || '', r.profile, r.session
 const RECENT_KEY = 'hermes.sessionPanel.recent.v1'
 export const WARM_RECENT = 8
 // [daveey 2026-11-20] "pre-compute the status panels ... so most switches are instant". Besides the chats you
-// focused, the most recently active sidebar chats are kept warm too (one never opened in this window included).
-export const WARM_SIDEBAR = 12
-export const WARM_MAX = 20
+// focused, the sidebar's chats are kept warm too (one never opened in this window included).
+// [daveey 2026-11-22] "clicking on a session takes forever to compute the status panel": 12 sidebar chats were
+// warm, every other click waited for the gateway. Now the whole sidebar is, most recently active first, up to
+// what one registration carries (200 chats a request; the gateway watches 400 across its Desktops).
+export const WARM_SIDEBAR = 180
+export const WARM_MAX = 190
+export const MODEL_CACHE_MAX = 400
 export function readRecent() {
   try { const v = JSON.parse(window.localStorage.getItem(RECENT_KEY) || '[]'); return Array.isArray(v) ? v.filter(r => r?.connectionId && r?.session) : [] } catch { return [] }
 }
@@ -100,7 +104,7 @@ export function ingestBundle(connectionId, profile, b) {
   modelCache.delete(scope)
   if (validModel(b.model)) {
     modelCache.set(scope, b.model)
-    if (modelCache.size > 100) modelCache.delete(modelCache.keys().next().value)
+    if (modelCache.size > MODEL_CACHE_MAX) modelCache.delete(modelCache.keys().next().value)
   }
   // Card chips consume the same final display model; raw tasks provide identity only.
   tasksBridge()?.ingestFeed?.({ connectionId, profile, session: b.session,
@@ -234,11 +238,80 @@ export function onFeedEvent(ev) {
   if (!wasLive) void feedCatchUp(target, { full: true })
 }
 
-/** Catch up every gateway once (the safety net, and on load). */
+export const PEEK_SLICE = 50
+/** Read `target.sessions`' current bundles without touching the connection's shared cursor: the answer is applied
+ *  per chat, the revision chain stays where pushes and catch-ups left it. Not queued behind a catch-up in flight
+ *  (a click never waits for a sidebar-wide read). True when applied, false when the call failed, null when there is
+ *  no registered feed to read against or it changed (the caller catches up instead). */
+export async function feedPeek(target, { timeoutMs = 5_000 } = {}) {
+  const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
+  if (!bridge || !target?.connectionId || !target.sessions?.length) return false
+  const profile = target.profile || 'default'
+  const key = connKey(target.connectionId, profile)
+  const st = feeds.get(key)
+  if (!st || st.unsupported || !st.epoch) return null
+  let r
+  try {
+    r = await bridge({ path: FEED_PATH, method: 'POST', connectionId: target.connectionId, profile, timeoutMs,
+      body: { sessions: target.sessions.slice(0, 200), since: 0, epoch: st.epoch } })
+  } catch (e) {
+    log('feed peek failed', target.connectionId, e?.message || e)
+    return false
+  }
+  const cur = feeds.get(key)
+  if (!r || r.profile_unsupported || typeof r.epoch !== 'string' || r.reset || !cur || cur.unsupported || cur.epoch !== r.epoch || cur.feed !== r.feed) return null
+  // Answered from a revision older than one already applied here: it may only fill chats that have no model yet.
+  const older = Number(r.rev) < cur.rev
+  for (const b of Object.values(r.bundles || {})) {
+    if (older && cachedModel({ connectionId: target.connectionId, profile, session: b?.session })) continue
+    ingestBundle(target.connectionId, profile, b)
+  }
+  cur.sessions = [...new Set([...(cur.sessions || []), ...target.sessions])]
+  return true
+}
+
+/** Catch up every gateway once (the safety net, on load, and when the sidebar changes). A chat that joined the
+ *  watched set since the last pass is read on its own: the cursor-bound catch-up returns only what changed after
+ *  our revision, and its bundle may be older than that. */
 export async function feedPass() {
   const done = []
-  for (const t of feedTargets()) if (await feedCatchUp(t)) done.push(t)
+  for (const t of feedTargets()) {
+    const key = connKey(t.connectionId, t.profile), before = feeds.get(key)
+    if (!(await feedCatchUp(t))) continue
+    done.push(t)
+    const st = feeds.get(key)
+    if (!before || before.unsupported || !st || st.unsupported || before.epoch !== st.epoch || before.feed !== st.feed) continue
+    const known = new Set(before.sessions || [])
+    const joined = t.sessions.filter(s => !known.has(s) && !cachedModel({ connectionId: t.connectionId, profile: t.profile, session: s }))
+    for (let i = 0; i < joined.length; i += PEEK_SLICE) await feedPeek({ ...t, sessions: joined.slice(i, i + PEEK_SLICE) })
+  }
   return done
+}
+export const SIDEBAR_SETTLE_MS = 500
+/** Re-register when the sidebar's set of chats changes (a new chat, another gateway's list arriving), so a chat is
+ *  warm before its first click instead of at the next minute's pass. Activity re-ordering alone does nothing.
+ *  Returns the unsubscribe. */
+export function watchSidebar(rowsAtom = host?.sessions?.rows, { pass = feedPass, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  if (typeof rowsAtom?.subscribe !== 'function') return () => {}
+  const names = () => warmTargets((() => { try { return rowsAtom.get?.() || [] } catch { return [] } })()).map(routeKey).sort().join('\n')
+  let last = names(), timer = null
+  const off = rowsAtom.subscribe(() => {
+    if (timer != null) return
+    timer = setTimer(() => {
+      timer = null
+      const now = names()
+      if (now === last) return
+      last = now
+      if (typeof document === 'undefined' || !document.hidden) void pass()
+    }, SIDEBAR_SETTLE_MS)
+  })
+  return () => { if (timer != null) clearTimer(timer); if (typeof off === 'function') off() }
+}
+/** A focused chat painted from cache while its feed does not vouch for it (no pushes reach this window, or the
+ *  gateway has not confirmed it): read it once in the background. The paint never waits for this. */
+export function feedReconcile(route) {
+  if (!route?.connectionId || !route?.session || !cachedModel(route) || feedVouches(route)) return null
+  return feedPeek({ connectionId: route.connectionId, profile: route.profile || 'default', sessions: [route.session] })
 }
 /** Hydrate the focused model, not every warm chat. Registration is not proof of a model:
  *  a failed backend read may return an empty bundle map after successfully recording interest.
@@ -251,8 +324,12 @@ export async function feedFocus(route, { wait = ms => new Promise(r => setTimeou
     if (cachedModel(route)) return true
     const st = feeds.get(connKey(route.connectionId, route.profile))
     if (st?.unsupported) return false
-    // The cursor is shared by every watched chat. Preserve its coverage at execution time.
-    await feedCatchUp({ connectionId: route.connectionId, profile: route.profile || 'default', sessions: [route.session] }, { full: true, preserveCoverage: true })
+    // One chat, read beside the shared cursor (never advancing it, never queued behind a sidebar-wide catch-up). A
+    // gateway that holds no bundle yet answers empty at once, computes it first and pushes it. With no feed
+    // registered yet (or a changed one) this is a full catch-up: the cursor is shared by every watched chat, so
+    // its coverage is preserved at execution time.
+    const target = { connectionId: route.connectionId, profile: route.profile || 'default', sessions: [route.session] }
+    if ((await feedPeek(target)) === null) await feedCatchUp(target, { full: true, preserveCoverage: true })
     if (cachedModel(route)) return true
   }
   return false
@@ -539,6 +616,7 @@ export function Panel() {
     let active = true
     noteRecent(route)
     setPending({ scope, waiting: true })
+    void feedReconcile(route)
     void feedFocus(route, { active: () => active }).then(() => {
       if (active) setPending({ scope, waiting: false })
     })
@@ -573,6 +651,7 @@ export default {
     ctx.register({ id: 'panel', area: COMPOSER_AREAS.top, order: -30, render: () => jsx(Panel, {}) })
     const subscribe = typeof ctx.onEvent === 'function' ? ctx.onEvent : host?.onEvent
     const offFeed = typeof subscribe === 'function' ? subscribe(FEED_EVENT, onFeedEvent) : null
+    const offSidebar = watchSidebar()
     const feedFirst = setTimeout(() => void feedPass(), 1_000)
     const feedTimer = setInterval(() => { if (typeof document === 'undefined' || !document.hidden) void feedPass() }, FEED_CATCHUP_MS)
     const onVisible = () => { if (typeof document !== 'undefined' && !document.hidden) void feedPass() }
@@ -582,6 +661,7 @@ export default {
       clearInterval(feedTimer)
       if (typeof document !== 'undefined') document.removeEventListener?.('visibilitychange', onVisible)
       if (typeof offFeed === 'function') offFeed()
+      offSidebar()
       if (typeof window !== 'undefined' && window.__sessionPanel?.version === VERSION) delete window.__sessionPanel
     }
   }
