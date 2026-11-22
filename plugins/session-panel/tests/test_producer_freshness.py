@@ -2,9 +2,10 @@
 
 Live, hub serve 2026-11-22 (acceptance of the change-driven producer): the source files never went quiet, so the
 60 s per-chat ceiling made ~40 of 48 watched chats due on every pass; one pass took 196 s (~5 s a chat) and a
-comment on a watched chat's card reached the panel 106-186 s after it was written (target: 1 s). The ceiling
-work now runs AFTER the pass's event-admitted chats are computed and pushed, a slice at a time, and a new source
-write (or a waiting reader) ends the pass after a slice."""
+comment on a watched chat's card reached the panel 106-186 s after it was written (target: 1 s).
+The production loop now gives ceiling reconciliation its own event-woken worker.
+These synthetic regressions do not establish live freshness or CPU acceptance.
+"""
 import threading
 import time
 
@@ -130,10 +131,13 @@ def test_wall_time_alone_still_never_sweeps_the_ceiling():
 
 # ── the real loop ──────────────────────────────────────────────────────────────────────────────────────────
 
-def test_real_loop_publishes_a_write_within_a_slice_while_sources_never_go_quiet(monkeypatch):
-    """`plugin_api._run` (settle, MIN_GAP, wake, tick, beat) with a producer that costs 40 ms a chat and a
-    source written 20 times a second. Before the fix every pass reconciled all 48 chats (~2 s) and the written
-    chat waited for the pass in flight plus the next pass's whole producer."""
+@pytest.mark.parametrize('producer_cost', [0.04, 0.4])
+def test_real_loop_publishes_a_write_within_a_slice_while_sources_never_go_quiet(monkeypatch, producer_cost):
+    """Real settle/wake/tick loop, 40ms and 400ms/chat, continuous writes.
+
+    Four-chat synchronous slices fail at 400ms/chat; a fast fake alone conceals
+    that head-of-line blocking. Neither fixture measures production CPU cost.
+    """
     api = load_api()
     core = api._load_feed()
     monkeypatch.setattr(core, 'PRODUCER_FULL_EVERY_S', 0.3)
@@ -151,7 +155,7 @@ def test_real_loop_publishes_a_write_within_a_slice_while_sources_never_go_quiet
 
     def produce(sessions):
         calls.append((time.monotonic(), list(sessions)))
-        time.sleep(0.04 * len(sessions))
+        time.sleep(producer_cost * len(sessions))
         return set()
 
     r.reconcile_sources = produce
@@ -204,3 +208,234 @@ def test_real_loop_publishes_a_write_within_a_slice_while_sources_never_go_quiet
         stop.set()
         f.stopped.set()
         thread.join(5)
+        f._ceiling_thread.join(5)
+
+
+@pytest.mark.parametrize('async_ceiling', [False, True])
+def test_outcome_write_during_compute_is_owed_to_next_source_pass(async_ceiling):
+    f, r, source, calls = setup()
+    panel = {s: 0 for s in WATCHED}
+    r.panel_stamps = lambda ids: {s: panel[s] for s in ids}
+    due(f, r, source, calls)
+    for i, s in enumerate(WATCHED):
+        f._producer_at[s] = 900 + i
+    target = WATCHED[-1]
+    f._producer_at[target] = f.clock()
+    armed = [True]
+    compute = f._compute_all
+
+    def computing(*args, **kwargs):
+        result = compute(*args, **kwargs)
+        if armed[0]:
+            armed[0] = False
+            panel[target] += 1
+            write(r, source)
+        return result
+
+    f._compute_all = computing
+    if async_ceiling:
+        f.start_ceiling()
+    try:
+        write(r, source, 't_C0', 'C0')
+        f.tick()
+        calls.clear()
+        f.tick()
+        assert [target] in calls, f'outcome lost producer admission: {calls}'
+    finally:
+        f.stopped.set()
+        if async_ceiling:
+            f._ceiling_thread.join(5)
+
+
+@pytest.mark.parametrize('target_kind', ['unrelated', 'same', 'ancestor'])
+def test_real_loop_write_during_blocked_ceiling_does_not_wait_or_overlap(monkeypatch, target_kind):
+    api = load_api()
+    monkeypatch.setattr(api, 'write_timing', lambda *a, **k: True)
+    monkeypatch.setattr(api, 'save_snapshot', lambda *a, **k: True)
+    f, r, source, calls = setup()
+    due(f, r, source, calls)
+    entered, release = threading.Event(), threading.Event()
+    reconciled = threading.Event()
+    blocked, other = WATCHED[:2]
+    target = other if target_kind != 'same' else blocked
+    lineage = r.lineage
+    if target_kind == 'ancestor':
+        r.lineage = lambda s: [s, 'shared-parent'] if s in (blocked, other) else lineage(s)
+        f._producer_lineage.update({s: tuple(r.lineage(s)) for s in (blocked, other)})
+    attempts = []
+
+    def produce(sessions):
+        ceiling = threading.current_thread().name == 'session-panel-ceiling'
+        attempts.append((ceiling, list(sessions)))
+        if ceiling and blocked in sessions and not entered.is_set():
+            entered.set()
+            assert release.wait(8), 'test must release the blocked producer'
+        elif target in sessions:
+            # No foreground writer may overlap the same owner/ancestor.
+            if target_kind != 'unrelated':
+                assert release.is_set()
+            reconciled.set()
+        return set()
+
+    r.reconcile_sources = produce
+    f.start_ceiling()
+    with f.lock:
+        f._ceiling_queue[blocked] = tuple(r.lineage(blocked))
+    f._ceiling_wake.set()
+    thread = threading.Thread(target=api._run, args=(f,), daemon=True)
+    try:
+        assert entered.wait(2)
+        before = f.bundles[target]['rev']
+        r.cards[f't_{target}']['detail']['task']['title'] = 'written while ceiling blocked'
+        write(r, source, f't_{target}', target)
+        started = time.monotonic()
+        f._wake.set()
+        thread.start()
+        deadline = started + 1
+        while f.bundles[target]['rev'] == before and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert f.bundles[target]['rev'] > before, 'blocked ceiling delayed board publication'
+        assert not release.is_set(), 'freshness must be observed while the producer is still blocked'
+        if target_kind != 'unrelated':
+            assert target in f._producer_blocked
+            assert not reconciled.is_set()
+        release.set()
+        assert reconciled.wait(3), 'same-owner new work must resume without another source write'
+        assert not f._producer_claims[1].intersection({'shared-parent'}) or target_kind != 'ancestor'
+    finally:
+        release.set()
+        f.stopped.set()
+        if thread.ident:
+            thread.join(5)
+        f._ceiling_thread.join(5)
+
+
+def test_ceiling_worker_does_not_poll_or_publish_and_discards_forgotten_completion():
+    f, r, source, calls = setup()
+    due(f, r, source, calls)
+    entered, release = threading.Event(), threading.Event()
+    s = WATCHED[0]
+
+    def produce(sessions):
+        calls.append(list(sessions))
+        entered.set()
+        assert release.wait(3)
+        return set()
+
+    r.reconcile_sources = produce
+    f.start_ceiling()
+    try:
+        assert not entered.wait(0.1), 'starting the worker is not source admission'
+        with f.lock:
+            f._ceiling_queue[s] = tuple(r.lineage(s))
+        f._ceiling_wake.set()
+        assert entered.wait(2)
+        before = (f.rev, dict(f._reconcile_stamps), f._producer_seen)
+        with f.lock:
+            f._forget(s)
+        f.watch([s])
+        release.set()
+        f.stopped.set()
+        f._ceiling_thread.join(3)
+        assert f.rev == before[0]
+        assert f._producer_seen == before[2]
+        assert s not in f._ceiling_at
+        assert s not in f._reconcile_stamps
+        assert f._ceiling_results.empty()
+        assert len(calls) == 1
+        assert not f._producer_claims[1]
+    finally:
+        release.set()
+        f.stopped.set()
+        f._ceiling_thread.join(3)
+
+
+def test_failed_ceiling_retries_are_finite_and_stay_off_the_feed_thread():
+    f, r, source, calls = setup()
+    due(f, r, source, calls)
+    target = WATCHED[0]
+    attempts = []
+
+    def produce(sessions):
+        attempts.append((threading.current_thread().name, list(sessions)))
+        return {target}
+
+    r.reconcile_sources = produce
+    f.start_ceiling()
+    try:
+        with f.lock:
+            f._ceiling_queue[target] = tuple(r.lineage(target))
+        f._ceiling_wake.set()
+        deadline = time.monotonic() + 3
+        while target not in f._ceiling_failed and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert target in f._ceiling_failed
+        assert len(attempts) == feedmod.RETRY_STEPS + 1
+        f.tick()  # drains completion, but must not re-run a failed slow producer here
+        assert len(attempts) == feedmod.RETRY_STEPS + 1
+        assert all(name == 'session-panel-ceiling' for name, _ in attempts)
+        assert not f._producer_blocked
+        assert f._reconcile_retry_at is None
+    finally:
+        f.stopped.set()
+        f._ceiling_thread.join(3)
+
+
+def test_completion_between_tick_snapshot_and_wake_clear_is_not_lost():
+    f, r, source, calls = setup()
+    due(f, r, source, calls)
+    original = f._tick
+
+    def racing_tick():
+        s = WATCHED[0]
+        f._ceiling_results.put((s, f._interest_generation.get(s, 0), False))
+        f._wake.set()
+        return original()
+
+    f._tick = racing_tick
+    f.tick()
+    assert f._ceiling_results.empty() or f._wake.is_set(), 'completion needs consumption or a surviving wake'
+
+
+def test_hot_resume_keeps_inflight_owner_claim_and_discards_old_completion():
+    f, r, source, calls = setup()
+    due(f, r, source, calls)
+    entered, release = threading.Event(), threading.Event()
+    s = WATCHED[0]
+    foreground = []
+
+    def produce(sessions):
+        if threading.current_thread().name == 'session-panel-ceiling':
+            entered.set()
+            assert release.wait(3)
+        else:
+            foreground.extend(sessions)
+        return set()
+
+    r.reconcile_sources = produce
+    f.start_ceiling()
+    with f.lock:
+        f._ceiling_queue[s] = tuple(r.lineage(s))
+    f._ceiling_wake.set()
+    successor = None
+    try:
+        assert entered.wait(2)
+        successor = feedmod.Feed(r, emit=lambda *_: None, clock=f.clock).resume(f)
+        successor.tick()
+        assert s not in foreground
+        assert s in successor._producer_blocked
+        release.set()
+        f._ceiling_thread.join(3)
+        assert not f._ceiling_thread.is_alive()
+        assert s not in f._ceiling_at
+        assert f._ceiling_results.empty()
+        successor.tick()  # no new write: release must preserve owed work
+        assert s in foreground
+        assert not successor._producer_blocked
+        assert not successor._producer_claims[1]
+    finally:
+        release.set()
+        f.stopped.set()
+        if successor:
+            successor.stopped.set()
+        f._ceiling_thread.join(3)

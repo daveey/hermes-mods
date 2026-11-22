@@ -1254,6 +1254,7 @@ def feed():
                     _save_at_exit()
                 core.PROCESS_FEED = new
                 threading.Thread(target=_run, args=(core.PROCESS_FEED,), name='session-panel-feed', daemon=True).start()
+            core.PROCESS_FEED.start_ceiling()
             # An older API's saved RESTART may already have resumed a current Feed
             # with only its board thread. Ensure this lane for existing feeds too.
             lane = getattr(core.PROCESS_FEED, '_decision_thread', None)
@@ -1589,6 +1590,9 @@ def _run_board(f, lane_type) -> None:
 
 
 def _run(f) -> None:
+    start_ceiling = getattr(f, 'start_ceiling', None)
+    if callable(start_ceiling):
+        start_ceiling()
     saved = (None, None)  # (rev, watched chats) last written
     saved_at = 0.0
     try:
