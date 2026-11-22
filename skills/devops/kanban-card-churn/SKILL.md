@@ -1,7 +1,7 @@
 ---
 name: kanban-card-churn
 description: "Use when one Kanban card has many runs, comments or a huge context and still isn't done."
-version: 1.5.0
+version: 1.6.0
 author: daveey
 license: MIT
 triggers:
@@ -140,8 +140,14 @@ Once the cleanup card's step is done, archive it.
    and to re-attach the overwritten file at run end.
 2. **Gate table instead of new cards.** Split acceptance into rows. Keep the original gate text word for word.
    Mark each row `fixture` or `real`. Do not open a card per gate unless the user asks for cards.
-3. **Run the fixture now** if an isolated harness exists (often it was last run on an older version). Port it to
-   the live version in a new directory, never edit the old run, and record PASS, FAIL, UNTESTED and harness errors
+3. **Choose the least invasive proof before building a fixture.** For installed behavior, prefer read-only log
+   evidence plus authoritative state readback over custom fault-injection tests. Specify positive, operation-
+   correlated evidence, complete log/rotation coverage, and the final state required by the original acceptance;
+   absence of errors, a generic replay, or an optimistic UI change is not success. If logging is insufficient,
+   add narrowly scoped tracing through the normal review/CI route and leave the live gate UNPROVEN until a
+   natural qualifying event. Use an existing isolated regression harness for code coverage; do not turn a
+   missing live observation into a new app/backend/tunnel/fault-injection project without a separately scoped,
+   bounded authorization. When a harness is appropriate, record PASS, FAIL, UNTESTED and harness errors
    separately. A harness that crashes is not a product failure.
 4. **Body.** Save the old body to a file in the workspace first. If the body is the user's mandate (scope, limits,
    acceptance in his words), keep it verbatim and append a short HOW TO WORK block. Replace the body only when it
@@ -164,6 +170,13 @@ Once the cleanup card's step is done, archive it.
    the exact episode through a live scoped authority decision, preserving independent spend admission,
    then wait on the actual next producer event. A prohibition on release plus a terminal-only wake needs
    an explicit superseding authority decision, not polling or an ordinary unblock.
+   **A frozen card always has an owned next step.** Before ending a containment disposition, name the exact
+   episode, the live authority or authenticated producer that can change it, the bounded action that owner
+   will take, and how the decision reaches that owner. A completed authority and “preserve triage; maybe
+   reconsider later” are not executable next steps. Deliver the missing decision to the managing owner via
+   supported custody/reopen paths, preserving spend, human and dependency holds; do not resume it yourself,
+   manufacture a fresh allocation, or start a timer. An intentional stop must say who owns reconsideration
+   and its trigger, or explicitly retire superseded tracking through the authorized route.
 7. **Retire superseded tracking.** When bounded successors have taken over every remaining acceptance criterion, reconcile the original spend-held umbrella in the same handoff. Verify the successor's current state and unchanged acceptance, record the transfer on the original, then archive the obsolete tracker and read back its authoritative status. Do not mark unmet acceptance done, reset its spend allowance, or leave instructions to preserve triage indefinitely. Keep the genuine final acceptance owner open; archiving duplicate tracking must not waive its gates.
 
 8. **Tell the thread once.** One comment: who you are, on whose instruction, what it supersedes, the files
