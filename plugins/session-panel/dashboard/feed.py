@@ -775,7 +775,13 @@ class Feed:
         at = time.time()
         current = getattr(self, '_pass', None)
         entry = {'rev': self.rev, 'at': at, 'sessions': sorted(changed),
-                 'pass_started_at': current[1] if current and current[0] == threading.get_ident() else None}
+                 'pass_started_at': current[1] if current and current[0] == threading.get_ident() else None,
+                 # Identity of the exact successfully emitted model, not the later
+                 # disk checkpoint or a newer mutable bundle read by an observer.
+                 'models': {s: {'revision': (b.get('model') or {}).get('revision'),
+                                'computed_seq': b.get('computed_seq'),
+                                'computed_at': b.get('computed_at')}
+                            for s, b in changed.items()}}
         timing.update(last_publish_at=at, last_publish_rev=self.rev,
                       recent=(list(timing.get('recent') or []) + [entry])[-RECENT_PUBLISHES:])
 

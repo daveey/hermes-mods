@@ -274,6 +274,112 @@ def test_admitted_chats_refill_capacity_while_next_external_capture_blocks():
         lane.close()
 
 
+def test_new_local_change_is_admitted_before_blocked_external_capture():
+    """Unlike the refill case, there is NO admitted work before recapture starts."""
+    r = Readers()
+    emitted = threading.Event()
+    f = feedmod.Feed(r, emit=lambda p: emitted.set() if 'S2' in p['bundles'] else None)
+    f.changes(['S2'])
+    r.external_stamps = lambda: 1
+    r.external_capture = lambda held: {s: 0 for s in held}
+    lane = feedmod.BoardLane(f, lambda: r)
+    settle(lane)
+    emitted.clear()
+    entered, release = threading.Event(), threading.Event()
+    def capture(held):
+        entered.set()
+        assert release.wait(5)
+        return {s: 1 for s in held}
+    r.external_capture = capture
+    r.links['S2'] = [{**r.links['S2'][0], 'status': 'ready'}]
+    r.events = [('t_dddddd4', 'S2')]
+    r.stamp += 1
+    lane.start_service()
+    thread = threading.Thread(target=lane.step)
+    thread.start()
+    try:
+        assert entered.wait(1)
+        assert emitted.wait(1), 'known local delta withheld until strict external inventory completes'
+        assert f.bundles['S2']['bundle']['tasks'][0]['status'] == 'ready'
+        assert not release.is_set()
+        # This later external snapshot cannot be treated as covered by the first
+        # local read; it must queue a successor even though that chat just emitted.
+        r.links['S2'] = [{**r.links['S2'][0], 'status': 'scheduled'}]
+        release.set()
+        thread.join(5)
+        settle(lane)
+        assert f.bundles['S2']['bundle']['tasks'][0]['status'] == 'scheduled'
+    finally:
+        release.set()
+        thread.join(5)
+        lane.close()
+
+
+def test_local_admission_keeps_external_failure_retry_and_later_successor():
+    r = Readers()
+    now = [1000.0]
+    f = feedmod.Feed(r, emit=lambda p: None, clock=lambda: now[0])
+    f.changes(['S2'])
+    external = [0]
+    r.external_stamps = lambda: external[0]
+    r.external_capture = lambda held: {s: external[0] for s in held}
+    lane = feedmod.BoardLane(f, lambda: r)
+    settle(lane)
+    cursor, stamp, captures = lane.cursor, lane.stamp, dict(lane.external_captures)
+    def fail(held):
+        raise RuntimeError('fixture inventory unavailable')
+    r.external_capture = fail
+    r.links['S2'] = [{**r.links['S2'][0], 'status': 'ready'}]
+    r.events = [('t_dddddd4', 'S2')]
+    r.stamp += 1
+    try:
+        lane.step()
+        for worker in list(lane.active.values()):
+            worker.join(1)
+        lane.service()
+        assert f.bundles['S2']['bundle']['tasks'][0]['status'] == 'ready'
+        assert (lane.cursor, lane.stamp, lane.external_captures) == (cursor, stamp, captures)
+        assert lane.capture_retry_at is not None
+        assert f.timing['board_captures'][-1]['failed'] is True
+        # Recover the SAME source stamp by finite retry, not another write.
+        now[0] = lane.capture_retry_at
+        r.external_capture = lambda held: {s: external[0] for s in held}
+        settle(lane)
+        assert lane.capture_failures == 0 and lane.capture_retry_at is None
+        assert lane.stamp != stamp
+        capture = f.timing['board_captures'][-1]
+        assert capture['local_admitted_at'] <= capture['external_admitted_at'] <= capture['finished_at']
+        assert capture['external_s'] >= 0
+        # A later external-only change must still hydrate the already-admitted chat.
+        r.links['S2'] = [{**r.links['S2'][0], 'status': 'scheduled'}]
+        external[0] += 1
+        settle(lane)
+        assert f.bundles['S2']['bundle']['tasks'][0]['status'] == 'scheduled'
+    finally:
+        lane.close()
+
+
+def test_emit_timing_names_exact_model_and_omits_failed_transport():
+    pushed = []
+    r = Readers()
+    f = feedmod.Feed(r, emit=pushed.append)
+    f.changes(['S2'])
+    record = f.timing['recent'][-1]
+    wire = pushed[-1]
+    assert record['rev'] == wire['rev']
+    assert record['models']['S2'] == {
+        'revision': wire['bundles']['S2']['model']['revision'],
+        'computed_seq': f.bundles['S2']['bundle']['computed_seq'],
+        'computed_at': f.bundles['S2']['bundle']['computed_at']}
+    previous = list(f.timing['recent'])
+    def offline(payload):
+        raise RuntimeError('fixture transport offline')
+    f.emit = offline
+    r.links['S2'] = [{**r.links['S2'][0], 'status': 'ready'}]
+    f._publish({'S2': f.compute('S2', base=f.bundles['S2']['bundle'])})
+    assert f.timing['recent'] == previous
+
+
 def test_capacity_service_registration_respects_stop_and_single_owner():
     r = Readers()
     f = feedmod.Feed(r, emit=lambda p: None)
