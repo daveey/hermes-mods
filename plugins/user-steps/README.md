@@ -495,6 +495,11 @@ open, undecided request of the same session only with exact provenance:
   is compatible (`approve` → approval, `choose` → choice/approval, `input` → input).
   This is server-recorded provenance, not title similarity. Count all same-turn
   publications before testing kind; several requests retain the existing rules.
+  An exact older open ledger action (or a corroborated model repeat) wins before
+  this fallback, preserving its own tile identity. The publication gate uses this
+  same ordering. Otherwise a compatible same-turn singleton covers even unrelated
+  prose at attempt 0: the gate does not ask the producer to publish a second plan.
+  This is the intentional provenance boundary, not semantic equivalence detection.
   The transform also enforces this singleton boundary after the publication hold
   budget is exhausted: reuse the current sentence's existing step frame, or emit
   no tile when the producer request has no legacy step. A different-kind ask may
