@@ -48,6 +48,23 @@ test('named dependency paints human title and a parent-card action', async () =>
  assert.equal(row.querySelector('[data-row-detail]').textContent, 'waiting on: Publish the release · 2m')
 })
 
+test('a line row opens its own card by double-clicking the state square, with no Open card button', async () => {
+ const model = structuredClone(cases.named_parent.model)
+ const row = model.sections.waiting[0]
+ const own = row.actions.find(a => a.kind === 'open_card' && a.target.id === row.id)
+ assert.ok(own, 'fixture row carries its own open_card action')
+ const opened = []
+ await paint(m.renderModel(model, { onAction: (r, a) => opened.push([r.id, a.target.id]) }))
+ const el = document.querySelector('[data-line-row]')
+ assert.ok(![...el.querySelectorAll('button')].some(b => b.textContent === 'Open card'))
+ assert.ok([...el.querySelectorAll('button')].some(b => b.textContent === 'Open parent card'))
+ const pip = el.querySelector('[data-row-pip][data-open-own-card]')
+ await React.act(async () => pip.click())
+ assert.deepEqual(opened, [], 'a single click does not open')
+ await React.act(async () => pip.dispatchEvent(new window.MouseEvent('dblclick', { bubbles: true })))
+ assert.deepEqual(opened, [[row.id, row.id]])
+})
+
 for (const [name, fixture] of Object.entries(cases)) {
  test(`hub model golden: ${name}`, async () => {
   const model = fixture.model || fixture.expected

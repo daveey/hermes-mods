@@ -511,7 +511,12 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             title = title if len(title) <= WAIT_MAX else title[:WAIT_MAX - 1].rstrip() + '…'
             since = number(obj(row.get('wait')).get('waiting_since'))
             age = f' · {short_dur(now - since)}' if 0 < since <= now else ''
-            dependency_text = f'waiting on: {title}{age}'
+            # The awaited card is often not this chat's own (a worker made it), so it has no row of its
+            # own here: its live status rides on this line, or a running dependency reads as idle.
+            dep_status = text(dependency.get('status'))
+            dep_state = f' ({dep_status})' if dep_status else ''
+            dependency_text = f'waiting on: {title}{dep_state}{age}'
+            v['details'].append(f'Blocking card: {dependency["id"]} ({dep_status or "status unknown"})')
             if not wi['text'].startswith(('waiting on CI', 'waiting on hub deploy', 'waiting on deploy')):
                 wi['text'] = dependency_text
             v['actions'].append({'kind': 'open_card', 'label': 'Open parent card', 'target': target(dependency)})

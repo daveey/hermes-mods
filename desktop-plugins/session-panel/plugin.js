@@ -290,7 +290,9 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
     jsx('summary', { style: { fontSize: 11.5 }, children: 'Details' }),
     ...row.details.map((text, i) => jsx('div', { style: { whiteSpace: 'pre-wrap', marginTop: 4, fontSize: 11.5 }, children: text }, i))
   ] })
-  const openLinks = row => row.actions.filter(action => action.kind === 'open_card' || (action.kind === 'open_url' && /^https?:\/\//.test(str(action.url)))).map((action, i) => jsx('button', { type: 'button', 'data-open-card': action.kind === 'open_card' ? '' : undefined, 'data-open-url': action.kind === 'open_url' ? '' : undefined,
+  // A line row's own card opens by double-clicking its state square, so its links skip that action.
+  const ownCard = row => row.actions.find(action => action.kind === 'open_card' && str(action.target?.id) === str(row.id))
+  const openLinks = (row, skip) => row.actions.filter(action => action !== skip && (action.kind === 'open_card' || (action.kind === 'open_url' && /^https?:\/\//.test(str(action.url))))).map((action, i) => jsx('button', { type: 'button', 'data-open-card': action.kind === 'open_card' ? '' : undefined, 'data-open-url': action.kind === 'open_url' ? '' : undefined,
     style: { ...askLinkBtn, fontSize: 11.5, whiteSpace: 'nowrap', cursor: onAction ? 'pointer' : 'default' }, disabled: !onAction, onClick: () => onAction?.(row, action), children: action.label }, `open${i}`))
   const askRow = row => {
     const status = decisionStatus(row)
@@ -340,9 +342,11 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
     const detail = section === 'done' && /^(done|archived)$/i.test(str(row.detail).trim()) ? '' : str(row.detail)
     const inline = (section === 'running' || section === 'done') && !!detail
     const title = plain(row.title) || row.id
+    const own = ownCard(row)
     return jsxs('article', { 'data-panel-row': row.key, 'data-line-row': '',
       style: { display: 'grid', gridTemplateColumns: '12px minmax(0,1fr) auto', columnGap: 8, alignItems: 'start', padding: '3px 4px', fontSize: 13, minWidth: 0 }, children: [
-      jsx('span', { 'aria-hidden': true, 'data-row-pip': section, style: { ...box(section), justifySelf: 'center', marginTop: 5 } }),
+      jsx('span', { 'aria-hidden': true, 'data-row-pip': section, ...(own ? { 'data-open-own-card': '', title: 'Double-click to open card', onDoubleClick: () => onAction?.(row, own) } : {}),
+        style: { ...box(section), justifySelf: 'center', marginTop: 5, ...(own && onAction ? { cursor: 'pointer' } : {}) } }),
       jsxs('div', { style: { minWidth: 0 }, children: [
         jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0 }, children: [
           jsx('strong', { 'data-ask-title': '', title, style: { flex: 1, minWidth: 0, fontWeight: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: title }),
@@ -354,7 +358,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
         row.decision?.text && jsx('div', { 'data-decision-status': row.decision.request_id || '', role: 'status', style: { ...muted, overflowWrap: 'anywhere' }, children: row.decision.text }),
         details(row)
       ] }),
-      jsx('span', { style: { display: 'flex', gap: 8, paddingTop: 2 }, children: openLinks(row) })
+      jsx('span', { style: { display: 'flex', gap: 8, paddingTop: 2 }, children: openLinks(row, own) })
     ] }, row.key)
   }
   return jsxs('section', { 'data-session-panel': '', 'data-hub-model': model.revision, 'aria-label': 'Session status',

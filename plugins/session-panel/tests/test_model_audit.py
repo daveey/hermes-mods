@@ -207,6 +207,21 @@ def test_wait_names_hydrated_parent_and_opens_exact_owner(source, owner, gateway
     assert not any(a['label'] == 'Open parent card' for a in r['actions'])
 
 
+def test_awaited_card_outside_this_chat_shows_its_live_status():
+    # A review card a worker created is no row of this chat: its running status rides on the waiting line.
+    cid = 't_0123456789abcdef'
+    row = task(status='todo', wait={'wait_state': 'waiting', 'waiting_on': f'card {cid}', 'waiting_since': NOW - 120})
+    b = bundle(row, cards={cid: {'detail': {'source': 'live', 'task': {'id': cid, 'title': 'Review PR', 'status': 'running'}}}})
+    b.update(gateway='hub', profile='default')
+    r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert r['detail'] == 'waiting on: Review PR (running) · 2m'
+    assert f'Blocking card: {cid} (running)' in r['details']
+    b['cards'][cid]['detail']['task'].pop('status')
+    r = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert r['detail'] == 'waiting on: Review PR · 2m'
+    assert f'Blocking card: {cid} (status unknown)' in r['details']
+
+
 @pytest.mark.parametrize('on', ['the clock until 2026-11-21 00:00 UTC', 'ci https://example.com/run', 'deploy release', 'an agent to release it: authority t_0123456789abcdef is archived'])
 def test_parent_metadata_does_not_replace_unrelated_waits(on):
     cid = 't_0123456789abcdef'
