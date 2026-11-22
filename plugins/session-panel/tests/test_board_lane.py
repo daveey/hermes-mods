@@ -1,0 +1,273 @@
+"""Source-to-publication freshness must not depend on unrelated readers."""
+import threading
+import time
+
+from test_feed import Readers, feedmod
+
+
+def test_changed_chat_publishes_while_other_chat_reader_is_blocked():
+    r = Readers()
+    entered, release, published = threading.Event(), threading.Event(), threading.Event()
+    pushes = []
+    f = feedmod.Feed(r, emit=lambda p: (pushes.append(p), published.set()
+                        if 'S2' in p['bundles'] else None))
+    f.changes(['S1', 'S2'])
+    published.clear()
+    original = r.linked
+
+    def slow(ids):
+        if 'S1' in ids:
+            entered.set()
+            assert release.wait(5)
+        return original(ids)
+
+    r.linked = slow
+    r.events = [('t_aaaaaa1', 'S1')]
+    r.stamp += 1
+    sweep = threading.Thread(target=f.tick)
+    sweep.start()
+    try:
+        assert entered.wait(2)
+        r.links['S2'] = [{**r.links['S2'][0], 'status': 'scheduled'}]
+        r.events = [('t_dddddd4', 'S2')]
+        r.stamp += 1
+        # The production source lane must stay independently admissible while tick
+        # is inside a reader. Baseline's only board lane is the blocked tick.
+        if hasattr(feedmod, 'BoardLane'):
+            lane = feedmod.BoardLane(f, lambda: r)
+            lane.step()
+        else:
+            lane = None
+        assert published.wait(1), 'chat B status is withheld by chat A/full-pass hydration'
+        assert f.bundles['S2']['bundle']['tasks'][0]['status'] == 'scheduled'
+    finally:
+        release.set()
+        sweep.join(5)
+        if lane is not None:
+            lane.close()
+
+
+def test_reconciliation_blocks_neither_board_capture_nor_publication():
+    r = Readers()
+    f = feedmod.Feed(r, emit=lambda p: None)
+    f.changes(['S1', 'S2'])
+    entered, release = threading.Event(), threading.Event()
+    r.reconciliation_stamp = lambda: r.stamp
+
+    def reconcile(sessions):
+        entered.set()
+        assert release.wait(5)
+
+    r.reconcile_sources = reconcile
+    sweep = threading.Thread(target=f.tick)
+    sweep.start()
+    try:
+        assert entered.wait(2)
+        r.links['S2'] = [{**r.links['S2'][0], 'status': 'ready'}]
+        r.events = [('t_dddddd4', 'S2')]
+        r.stamp += 1
+        lane = feedmod.BoardLane(f, lambda: r)
+        lane.step()
+        end = time.monotonic() + 1
+        while time.monotonic() < end:
+            if f.bundles['S2']['bundle']['tasks'][0]['status'] == 'ready':
+                break
+            f._board.wait(.01)
+        assert f.bundles['S2']['bundle']['tasks'][0]['status'] == 'ready'
+    finally:
+        release.set()
+        sweep.join(5)
+        if 'lane' in locals():
+            lane.close()
+
+
+def settle(lane, timeout=2):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        lane.step()
+        if not lane.active and not lane.pending:
+            return
+        lane.feed._board.wait(.01)
+    raise AssertionError('board workers did not settle')
+
+
+def test_slow_lane_worker_does_not_block_other_changed_chat():
+    r = Readers()
+    f = feedmod.Feed(r, emit=lambda p: None)
+    f.changes(['S1', 'S2'])
+    entered, release = threading.Event(), threading.Event()
+    original = r.linked
+    def slow(ids):
+        if 'S1' in ids:
+            entered.set()
+            assert release.wait(5)
+        return original(ids)
+    r.linked = slow
+    r.events = [('t_aaaaaa1', 'S1')]
+    lane = feedmod.BoardLane(f, lambda: r)
+    try:
+        lane.step()
+        assert entered.wait(1)
+        r.links['S2'] = [{**r.links['S2'][0], 'status': 'ready'}]
+        r.events = [('t_dddddd4', 'S2')]
+        r.stamp += 1
+        lane.step()
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and f.bundles['S2']['bundle']['tasks'][0]['status'] != 'ready':
+            f._board.wait(.01)
+        assert f.bundles['S2']['bundle']['tasks'][0]['status'] == 'ready'
+        assert not release.is_set()
+    finally:
+        release.set()
+        settle(lane)
+        lane.close()
+
+
+def test_board_lane_carries_canonical_component_and_rejects_old_sweep():
+    r = Readers()
+    f = feedmod.Feed(r, emit=lambda p: None)
+    f.changes(['S2'])
+    old = f.bundles['S2']['bundle']
+    current = {**old, 'canonical_seq': next(f._seq), 'requests': [], 'outcome_json': {'marker': 'current'}}
+    f._publish({'S2': current}, canonical_only=True)
+    # Any canonical read or source reconciliation here is a bug, not a cheap fallback.
+    def forbidden(*args):
+        raise AssertionError('board-only lane read canonical inputs')
+    r.panel_inputs = forbidden
+    r.reconcile_sources = forbidden
+    r.links['S2'] = [{**r.links['S2'][0], 'status': 'ready'}]
+    r.events = [('t_dddddd4', 'S2')]
+    lane = feedmod.BoardLane(f, lambda: r)
+    try:
+        settle(lane)
+        b = f.bundles['S2']['bundle']
+        assert b['canonical_seq'] == current['canonical_seq']
+        assert b['outcome_json'] == current['outcome_json']
+        assert b['tasks'][0]['status'] == 'ready'
+        f._publish({'S2': old})
+        assert f.bundles['S2']['bundle']['tasks'][0]['status'] == 'ready'
+    finally:
+        lane.close()
+
+
+def test_forget_rewatch_and_stop_fence_inflight_publication():
+    r = Readers()
+    f = feedmod.Feed(r, emit=lambda p: None)
+    f.changes(['S2'])
+    base = f.bundles['S2']['bundle']
+    token = f._watch_tokens['S2']
+    candidate = f.compute('S2', base=base)
+    with f.lock:
+        f._forget('S2')
+    f.changes(['S2'])
+    assert f._publish({'S2': candidate}, watch_tokens={'S2': token}) == {}
+    token = f._watch_tokens['S2']
+    f.stopped.set()
+    assert f._board.is_set()
+    assert f._publish({'S2': candidate}, watch_tokens={'S2': token}) == {}
+
+
+def test_event_during_worker_is_coalesced_into_one_followup_and_idle_does_no_db_capture():
+    r = Readers()
+    f = feedmod.Feed(r, emit=lambda p: None)
+    f.changes(['S2'])
+    entered, release = threading.Event(), threading.Event()
+    original = r.linked
+    reads = []
+    def slow(ids):
+        rows = original(ids)
+        reads.append(1)
+        if len(reads) == 1:
+            entered.set()
+            assert release.wait(5)
+        return rows
+    r.linked = slow
+    r.events = [('t_dddddd4', 'S2')]
+    lane = feedmod.BoardLane(f, lambda: r)
+    try:
+        lane.step()
+        assert entered.wait(1)
+        for status in ('scheduled', 'blocked', 'ready'):
+            r.links['S2'] = [{**r.links['S2'][0], 'status': status}]
+            r.events = [('t_dddddd4', 'S2')]
+            r.stamp += 1
+            lane.step()
+        assert len(reads) == 1
+        release.set()
+        settle(lane)
+        assert len(reads) == 2
+        assert f.bundles['S2']['bundle']['tasks'][0]['status'] == 'ready'
+        rev = f.rev
+        r.changed_cards = lambda cursor: (_ for _ in ()).throw(AssertionError('idle source capture'))
+        lane.step()
+        assert f.rev == rev
+    finally:
+        release.set()
+        lane.close()
+
+
+def test_capture_failure_has_finite_retry_and_new_source_recovers():
+    r = Readers()
+    now = [1000.]
+    f = feedmod.Feed(r, emit=lambda p: None, clock=lambda: now[0])
+    f.changes(['S2'])
+    calls = []
+    original = r.changed_cards
+    def fail(cursor):
+        calls.append(cursor)
+        raise RuntimeError('source unavailable')
+    r.changed_cards = fail
+    lane = feedmod.BoardLane(f, lambda: r)
+    try:
+        lane.step()
+        for _ in range(3):
+            now[0] = lane.retry_at()
+            lane.step()
+        assert len(calls) == 4 and lane.retry_at() is None
+        assert lane.cursor is None
+        assert 'S2' in f._board_failures
+        for _ in range(10):
+            now[0] += 100
+            lane.step()
+        assert len(calls) == 4, 'time/worker completion cannot renew an exhausted source retry'
+        r.changed_cards = original
+        r.stamp += 1
+        r.links['S2'] = [{**r.links['S2'][0], 'status': 'ready'}]
+        r.events = [('t_dddddd4', 'S2')]
+        settle(lane)
+        assert lane.cursor is not None
+        assert 'S2' not in f._board_failures
+        assert f.bundles['S2']['bundle']['tasks'][0]['status'] == 'ready'
+    finally:
+        lane.close()
+
+
+def test_actual_board_loop_wakes_on_source_event_and_stops(monkeypatch):
+    import importlib.util
+    import sys
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[1] / 'dashboard' / 'plugin_api.py'
+    spec = importlib.util.spec_from_file_location('_board_loop_api', path)
+    api = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = api
+    spec.loader.exec_module(api)
+    r = Readers()
+    f = feedmod.Feed(r, emit=lambda p: None)
+    f.changes(['S2'])
+    monkeypatch.setattr(api, 'CoreReaders', lambda: r)
+    monkeypatch.setattr(api, 'write_timing', lambda f: True)
+    thread = threading.Thread(target=api._run_board, args=(f, feedmod.BoardLane))
+    thread.start()
+    try:
+        r.links['S2'] = [{**r.links['S2'][0], 'status': 'ready'}]
+        r.events = [('t_dddddd4', 'S2')]
+        r.stamp += 1
+        f._board.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and f.bundles['S2']['bundle']['tasks'][0]['status'] != 'ready':
+            f._board.wait(.01)
+        assert f.bundles['S2']['bundle']['tasks'][0]['status'] == 'ready'
+    finally:
+        f.stopped.set()
+        thread.join(3)
+        assert not thread.is_alive()
