@@ -150,7 +150,7 @@ class Feed:
         # Failed work is retried a few times on a short backoff, then waits for the next source event.
         # It is never an idle timer: with nothing failed there is no retry time at all.
         self._reconcile_deferred: set[str] = set()   # producer work a reader could not finish
-        self._reconcile_failed = self._hydrate_failed = self._decision_failed = 0
+        self._budgets: dict[str, dict[str, int]] = {}  # lane -> chat -> retries spent since it last succeeded
         self._reconcile_retry_at = self._hydrate_retry_at = self._decision_retry_at = None
         self._attempted: set[str] = set()            # chats the current pass tried to hydrate
         self._panel_files: Any = None        # the files behind _panel_stamps, as last read
@@ -394,9 +394,8 @@ class Feed:
                 self._decision_files = moved if stamps else None
             # A failed read is not consumed source work: retry it without waiting for another write.
             with self.lock:
-                failing = bool(self._decision_failures.intersection(held))
-            self._decision_failed = getattr(self, '_decision_failed', 0) + 1 if failing else 0
-            self._decision_retry_at = self._backoff(self._decision_failed) if failing else None
+                failing = self._decision_failures.intersection(held)
+            self._decision_retry_at = self._spend('decision', failing)
             return count
         finally:
             self._decision_lock.release()
@@ -702,6 +701,20 @@ class Feed:
         """When failed work is next retried without a source event: RETRY_STEPS times, then not at all."""
         return self.clock() + 0.1 * (2 ** (attempt - 1)) if attempt <= RETRY_STEPS else None
 
+    def _spend(self, lane: str, failing: Iterable[str], keep: Iterable[str] = ()) -> Optional[float]:
+        """One retry budget per chat and lane. Each chat in `failing` spends one retry; a chat in neither
+        `failing` nor `keep` has succeeded or gone and starts afresh. Returns when the failing chats that
+        still have retries left are next due, None when none has: a chat that fails forever never spends
+        another chat's retries, and never keeps a timer alive on its own."""
+        budgets = self.__dict__.setdefault('_budgets', {})
+        old = budgets.get(lane) or {}
+        failing = set(failing)
+        counts = {s: old[s] for s in keep if s in old and s not in failing}
+        counts.update((s, old.get(s, 0) + 1) for s in failing)
+        budgets[lane] = counts
+        live = [counts[s] for s in failing if counts[s] <= RETRY_STEPS]
+        return self._backoff(min(live)) if live else None
+
     def _due(self, now: float) -> tuple:
         """A cold, unattempted registration is due; time alone never admits DB work.
 
@@ -772,11 +785,14 @@ class Feed:
         self._admission_failures = 0
         # A chat whose hydration failed was caught inside the pass, after its source event was consumed.
         # Keep it unvouched and due again: the same event must not need another write to be shown.
+        # So is one that succeeded with stale rows (core's busy fallback) or joined an older read: it is
+        # left in _retry, and nothing but this retry would read it again.
         with self.lock:
             failed = {s for s in self._attempted if s in self.failures and s in self.interest}
             self._retry.update(failed)
-        self._hydrate_failed = getattr(self, '_hydrate_failed', 0) + 1 if failed else 0
-        self._hydrate_retry_at = self._backoff(self._hydrate_failed) if failed else None
+            unsettled = {s for s in self._attempted if s in self._retry and s in self.interest}
+            waiting = {s for s in self._retry | set(self.failures) if s in self.interest}
+        self._hydrate_retry_at = self._spend('hydrate', unsettled, keep=waiting)
         return result
 
     def _tick(self) -> int:
@@ -822,12 +838,10 @@ class Feed:
                     self._reconcile_stamps.update((s, source_seen) for s in admitted if s in self.interest)
                     self._reconcile_deferred = {s for s in (self._reconcile_deferred - set(admitted)) | left
                                                 if s in self.interest}
-                    waiting = bool(self._reconcile_deferred)
-                if left:
-                    self._reconcile_failed = getattr(self, '_reconcile_failed', 0) + 1
-                    self._reconcile_retry_at = self._backoff(self._reconcile_failed)
-                elif not waiting:
-                    self._reconcile_failed, self._reconcile_retry_at = 0, None
+                    waiting = set(self._reconcile_deferred)
+                retry_at = self._spend('reconcile', left.intersection(waiting), keep=waiting)
+                if left or not waiting:
+                    self._reconcile_retry_at = retry_at
         panel_dirty = self._panel_dirty(watched)
         stamps = self.readers.stamps()
         external = getattr(self.readers, 'external_stamps', None)

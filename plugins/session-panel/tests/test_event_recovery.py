@@ -288,3 +288,118 @@ def test_core_reader_isolates_one_chats_producer_failure():
     cr._user_step_api = lambda: Steps
     assert cr.reconcile_sources(['ok', 'bad', 'late', 'ok2']) == {'bad', 'late'}
     assert seen == ['ok', 'bad', 'late', 'ok2']
+
+
+# ── one retry budget per chat: a chat that fails forever must not spend another chat's retries ──────────────
+
+def test_a_transient_hydration_failure_recovers_beside_a_permanently_failing_chat():
+    f, r, pushed, t = make()
+    r.links['T'] = [dict(r.links['S1'][0], id='t_bbbbbb1', title='old')]
+    f.watch(['S1', 'T'])
+    f.tick()
+    original, state = r.linked, {'t_fail': 0}
+
+    def linked(ids):
+        if 'S1' in ids:
+            raise sqlite3.OperationalError('S1 permanently broken')
+        if 'T' in ids and state['t_fail'] > 0:
+            state['t_fail'] -= 1
+            raise sqlite3.OperationalError('database is locked')
+        return original(ids)
+
+    r.linked = linked
+    r.events = [('t_aaaaaa1', 'S1')]
+    r.stamp += 1
+    f.tick()
+    assert idle(f, t, 60) == 3 and idle(f, t, 60) == 0, 'S1 spent its own retries'
+    state['t_fail'] = 1
+    r.links['T'] = [dict(r.links['T'][0], title='new')]
+    r.events = [('t_bbbbbb1', 'T')]
+    r.stamp += 1
+    f.tick()
+    assert 'T' in f.failures
+    assert idle(f, t, 5) == 1, "T's first failure is retried although S1 is out of retries"
+    assert f.bundles['T']['bundle']['tasks'][0]['title'] == 'new' and 'T' not in f.failures
+    assert 'S1' in f.failures and f._due(t['now']) == (None, None)
+    assert idle(f, t) == 0, 'S1 alone admits no further pass'
+
+
+def test_a_hydration_that_succeeds_with_stale_rows_is_retried_without_another_write():
+    f, r, pushed, t = make()
+    f.watch(['S1'])
+    f.tick()
+    fresh = dict(r.links['S1'][0], title='new')
+    r.links['S1'] = [dict(r.links['S1'][0], stale=True)]  # core's busy fallback: last-observed rows, no exception
+    r.events = [('t_aaaaaa1', 'S1')]
+    r.stamp += 1
+    f.tick()
+    assert f.bundles['S1']['source_stale'] and 'S1' in f._retry and not f.failures
+    r.links['S1'] = [fresh]  # readable again, no further write
+    assert idle(f, t, 5) == 1
+    assert f.bundles['S1']['bundle']['tasks'][0]['title'] == 'new' and not f.bundles['S1']['source_stale']
+    assert 'S1' not in f._retry and f._due(t['now']) == (None, None)
+    assert idle(f, t) == 0
+
+
+def test_persistently_stale_rows_are_retried_three_times_then_wait_for_a_source_event():
+    f, r, pushed, t = make()
+    f.watch(['S1'])
+    f.tick()
+    r.links['S1'] = [dict(r.links['S1'][0], stale=True)]
+    r.events = [('t_aaaaaa1', 'S1')]
+    r.stamp += 1
+    f.tick()
+    assert idle(f, t, 300) == 3
+    t['now'] += f.heartbeat_s
+    f.beat()
+    assert 'S1' not in pushed[-1]['fresh'], 'stale rows are never vouched for'
+    assert f._due(t['now']) == (None, None) and f.idle_wait() == f.heartbeat_s
+
+
+def test_a_transient_decision_failure_recovers_beside_a_permanently_failing_chat():
+    f, r, pushed, t = make()
+    r.links['T'] = [dict(r.links['S1'][0], id='t_bbbbbb1')]
+    state = {'t_fail': 0, 'broken': False, 'v': 1}
+
+    def decision_inputs(s, lineage):
+        if s == 'S1' and state['broken']:
+            raise sqlite3.OperationalError('S1 permanently broken')
+        if s == 'T' and state['t_fail'] > 0:
+            state['t_fail'] -= 1
+            raise sqlite3.OperationalError('database is locked')
+        return {'outcome_json': {'v': state['v']}, 'requests': []}
+
+    r.decision_inputs = decision_inputs
+    r.panel_files_stamp = lambda: r.stamp
+    r.decision_store_stamp = lambda: r.stamp
+    r.panel_stamps = lambda ids: {s: r.stamp for s in ids}
+    f.watch(['S1', 'T'])
+    f.tick()
+    f.refresh_decisions()
+    state['broken'] = True
+    r.stamp += 1
+    f.refresh_decisions()
+    assert decide_idle(f, t, 60) == 3 and decide_idle(f, t, 60) == 0
+    state.update(t_fail=1, v=2)
+    r.stamp += 1
+    f.refresh_decisions()
+    assert {'S1', 'T'} <= f._decision_failures
+    assert decide_idle(f, t, 5) == 1
+    assert f.bundles['T']['bundle']['outcome_json'] == {'v': 2} and 'T' not in f._decision_failures
+    assert decide_idle(f, t) == 0 and f._due(t['now']) == (None, None)
+
+
+def test_a_transient_producer_deferral_is_retried_beside_a_permanently_deferred_chat():
+    deferred = {'S1'}
+    f, r, source, calls, t = producer(deferred)
+    f.watch(['S1', 'S2'])
+    f.tick()
+    assert idle(f, t, 60) == 3 and idle(f, t, 60) == 0, 'S1 spent its own retries'
+    deferred.add('S2')
+    source['version'] += 1
+    f.tick()
+    assert f._reconcile_deferred == {'S1', 'S2'}
+    deferred.discard('S2')
+    assert idle(f, t, 5) == 1, "S2's first deferral is retried although S1 is out of retries"
+    assert f._reconcile_deferred == {'S1'}
+    assert idle(f, t) == 0 and f._due(t['now']) == (None, None)

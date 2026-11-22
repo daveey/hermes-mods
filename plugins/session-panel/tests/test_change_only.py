@@ -118,12 +118,20 @@ def test_idle_heartbeat_reduces_a_clock_edge_without_renewing_inputs(monkeypatch
     assert 'S1' not in pushed[-1]['fresh']
 
 
-def test_failed_source_stays_unvouched_without_idle_retry_and_recovers_on_event(monkeypatch):
+def test_failed_source_stays_unvouched_after_its_bounded_retries_and_recovers_on_event(monkeypatch):
     f, r, pushed, t = make()
     r.links['S1'][0]['_execution_error'] = True
     f.watch(['S1'])
     f.tick()
     assert 'S1' in f._retry
+    retries = 0
+    for _ in range(60):  # three short retries of the stale read, then nothing without a source event
+        t['now'] += 1
+        f.beat()
+        if f._wake.is_set():
+            retries += 1
+            f.tick()
+    assert retries == 3 and 'S1' in f._retry
     observed = f.bundles['S1']['bundle']['computed_at']
     t['now'] += 120
     f.beat()
