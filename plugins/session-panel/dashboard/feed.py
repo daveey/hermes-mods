@@ -102,6 +102,21 @@ class _Flight:
     bundle: Optional[dict] = None
 
 
+class _Stop(threading.Event):
+    """The feed's stop flag: setting it also wakes the threads that sleep until something happens."""
+
+    def __init__(self, feed):
+        super().__init__()
+        self._feed = feed
+
+    def set(self):
+        super().set()
+        for name in ('_wake', '_cold', '_decide'):
+            e = getattr(self._feed, name, None)
+            if e is not None:
+                e.set()
+
+
 class Feed:
     """One feed per gateway process (one profile: the process's own)."""
 
@@ -121,7 +136,7 @@ class Feed:
         self.failures: dict[str, dict] = {}  # session -> {count, error, at}: shown by /status
         self.lock = threading.RLock()        # interest / bundles / failures
         self.compute_lock = threading.Lock() # store + revision + emit, in order
-        self.stopped = threading.Event()
+        self.stopped = _Stop(self)
         self.last_emit = clock()          # the heartbeat clock starts with the feed
         self.last_tick_s = 0.0               # duration of the last tick that recomputed (shown by /status)
         self._seq = itertools.count(1)       # compute order: a bundle computed earlier never replaces a later one
@@ -139,7 +154,11 @@ class Feed:
         self._decision_failures: set[str] = set()
         self._decision_lock = threading.Lock()  # cheap read lane, never board computation
         self._registrations = queue.SimpleQueue()
-        self._wake = threading.Event()       # a read asked for a chat with no published bundle: tick now
+        # [daveey 2026-11-22] "no polling. Update only when the data changes": the producer threads sleep on these.
+        self._wake = threading.Event()       # a pass is due: a source file changed, or a read found no bundle
+        self._cold = threading.Event()       # ...the latter: a reader is waiting, skip the write-burst debounce
+        self._decide = threading.Event()     # the decision lane's own: a source file changed
+        self._board_stamps: Any = None       # the board files alone, as of the last pass that read their events
         self._urgent: list[str] = []         # tick thread only: chats with no bundle, most recently asked first
         self._focus: list[str] = []          # ...and of those, the ones that led their request (a focused chat)
         self._decision_seen: dict[str, tuple] = {}  # decision lane only: session -> (inputs stamp, read at)
@@ -193,7 +212,8 @@ class Feed:
         current, rev, entries, header = self._wire
         reset = epoch != current
         if any(s not in entries for s in wanted):
-            self._wake.set()  # the producer computes it on its own thread, at once
+            self._cold.set()  # the producer computes it on its own thread, at once
+            self._wake.set()
         parts = [entries[s][1] + b':' + entries[s][2] for s in wanted
                  if s in entries and (reset or entries[s][0] > since)]
         return (header + b',"reset":' + (b'true' if reset else b'false')
@@ -216,7 +236,8 @@ class Feed:
             self.bundles = {s: dict(b) for s, b in bundles.items()}
             self.interest = dict(getattr(prev, 'interest', {}))
             self._registrations = getattr(prev, '_registrations', self._registrations)
-            self._wake = getattr(prev, '_wake', self._wake)
+            for name in ('_wake', '_cold', '_decide'):
+                setattr(self, name, getattr(prev, name, getattr(self, name)))
             self.failures = {s: dict(f) for s, f in getattr(prev, 'failures', {}).items()}
             self._retry = set(getattr(prev, '_retry', ())) | set(bundles)  # recompute every carried chat next pass
             self._carried = set(bundles)  # ...and vouch for none of them until its new bundle is stored
@@ -615,13 +636,26 @@ class Feed:
             self._panel_stamps[s] = stamp
         return dirty
 
+    def beat(self) -> int:
+        """Liveness only, between data changes: registrations are renewed, expired interest dropped and a heartbeat
+        pushed when due. Reads no database and computes nothing (a chat that turns out to need a bundle wakes a
+        pass)."""
+        self._drain()
+        with self.lock:
+            self._expire(self.clock())
+            self._publish_wire()
+            if any(s not in self.bundles for s in self.interest):
+                self._wake.set()
+        return len(self._publish({}, heartbeat=True))
+
     def tick(self) -> int:
         """One pass: recompute what changed and push it, else a heartbeat when due. Returns bundles pushed.
         Stored and pushed in chunks, the chats a reader is waiting for first: a click on a chat with no bundle is
         answered after its own compute, not after a whole sweep (requests arriving mid-pass are taken in between
         chunks)."""
         now = self.clock()
-        self._wake.clear()  # before the drain: a request after this point wakes the next pass
+        self._wake.clear()  # before the drain: a request or write after this point wakes the next pass
+        self._cold.clear()
         with self.lock:
             self._expire(now)
         self._drain()
@@ -639,7 +673,15 @@ class Feed:
         if stamps == self._stamps and not full and not retry and not panel_dirty and not missing:
             self._publish({}, heartbeat=True)
             return 0
-        changed_cards, self._cursor = self.readers.changed_cards(self._cursor)
+        # Board events are read only when a board file moved (or on the safety-net pass): state.db is written all
+        # day by every chat, and each of those writes must not open every board.
+        boards = getattr(self.readers, 'board_stamps', None)
+        seen = boards() if callable(boards) else None
+        if seen is None or seen != self._board_stamps or full or self._cursor is None:
+            changed_cards, self._cursor = self.readers.changed_cards(self._cursor)
+        else:
+            changed_cards = {}
+        self._board_stamps = seen
         self._stamps = stamps
         if full:
             self._last_full = now
