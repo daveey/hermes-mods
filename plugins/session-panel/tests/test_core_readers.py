@@ -67,6 +67,149 @@ def test_changed_cards_reports_cards_with_new_events_and_their_chat(api, board, 
     assert r.stamps() != stamp, 'a board write moves the stamps'
 
 
+def test_semantic_board_changes_include_unevented_writes_and_new_subscribers(api, board, monkeypatch):
+    path, conn = board
+    a = kanban_db.create_task(conn, title='A', initial_status='running', session_id='S1')
+    r = readers_for(api, path, monkeypatch)
+    changes, cursor = r.board_changes(None)
+    assert changes.full
+    conn.execute('UPDATE tasks SET title=? WHERE id=?', ('without an event', a))
+    conn.commit()
+    changes, cursor = r.board_changes(cursor)
+    assert not changes.full
+    assert changes.sources == {(str(path), 'default'): {a}}
+    assert changes.sessions == {'S1'}
+    # The new subscriber has no previous bundle ref to the task. A max(event.id)
+    # cursor cannot discover this membership-only write.
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(kanban_notify_subs)')}
+    assert 'chat_id' in columns
+    conn.execute("INSERT INTO kanban_notify_subs(task_id, platform, chat_id, created_at) VALUES (?, 'tui', 'S2', 1000)", (a,))
+    conn.commit()
+    changes, cursor = r.board_changes(cursor)
+    assert changes.sources == {(str(path), 'default'): {a}}
+    assert {'S1', 'S2'} <= changes.sessions
+    changes, _ = r.board_changes(cursor)
+    assert not changes.sources and not changes.sessions and not changes.full
+    r.release()
+
+
+def test_semantic_cursor_includes_new_remote_chat_links(api, board, monkeypatch):
+    from hermes_cli import kanban_activity_revision as revision
+    path, conn = board
+    a = kanban_db.create_task(conn, title='A', initial_status='running', session_id='foreign-chat')
+    conn.execute('CREATE TABLE IF NOT EXISTS task_chat_links ('
+                 'uid TEXT PRIMARY KEY, task_id TEXT, chat_gateway TEXT, chat_profile TEXT, '
+                 'chat_session TEXT, kind TEXT, released INTEGER, created_at INTEGER)')
+    revision.ensure_revision(conn, revision.LOCAL_TABLES)
+    conn.commit()
+    r = readers_for(api, path, monkeypatch)
+    _, cursor = r.board_changes(None)
+    conn.execute("INSERT INTO task_chat_links(uid,task_id,chat_gateway,chat_profile,chat_session,kind,released,created_at) "
+                 "VALUES ('link-one',?,'gateway','default','new-origin-chat','shepherd',0,1000)", (a,))
+    conn.commit()
+    changes, _ = r.board_changes(cursor)
+    assert not changes.full
+    assert 'new-origin-chat' in changes.sessions
+
+
+def test_semantic_cursor_idle_has_no_db_opens(api, board, monkeypatch):
+    path, conn = board
+    kanban_db.create_task(conn, title='A', initial_status='running', session_id='S1')
+    r = readers_for(api, path, monkeypatch)
+    _, cursor = r.board_changes(None)
+    def forbidden(*args, **kwargs):
+        raise AssertionError('unchanged source opened a database')
+    monkeypatch.setattr(api.sqlite3, 'connect', forbidden)
+    for _ in range(60):
+        changes, again = r.board_changes(cursor)
+        assert again == cursor
+        assert not changes.sources and not changes.full and not changes.sessions
+
+
+def test_semantic_cursor_does_not_adopt_failed_capture(api, board, monkeypatch):
+    path, conn = board
+    a = kanban_db.create_task(conn, title='A', initial_status='running', session_id='S1')
+    r = readers_for(api, path, monkeypatch)
+    _, cursor = r.board_changes(None)
+    before = dict(cursor)
+    conn.execute('UPDATE tasks SET title=? WHERE id=?', ('changed', a))
+    conn.commit()
+    from hermes_cli import kanban_task_change as ktc
+    canonical = ktc.changed_since
+    def fail(*args, **kwargs):
+        raise sqlite3.OperationalError('busy source')
+    monkeypatch.setattr(ktc, 'changed_since', fail)
+    with pytest.raises(sqlite3.OperationalError, match='busy source'):
+        r.board_changes(cursor)
+    assert cursor == before
+    monkeypatch.setattr(ktc, 'changed_since', canonical)
+    changes, _ = r.board_changes(cursor)
+    assert a in changes.sources[(str(path), 'default')]
+
+
+def test_semantic_cursor_source_removal_invalidates_old_membership(api, board, monkeypatch):
+    path, conn = board
+    r = readers_for(api, path, monkeypatch)
+    _, cursor = r.board_changes(None)
+    monkeypatch.setattr(r, 'files', lambda: [])
+    changes, cursor = r.board_changes(cursor)
+    assert changes.full and cursor == {}
+
+
+def test_semantic_capture_owns_and_closes_one_query_only_connection(api, board, monkeypatch):
+    from hermes_cli import kanban_task_change as ktc
+    path, conn = board
+    r = readers_for(api, path, monkeypatch)
+    seen = []
+    canonical = ktc.changed_since
+    def capture(c, cursor):
+        seen.append(c)
+        assert c.execute('PRAGMA query_only').fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError, match='readonly'):
+            c.execute("UPDATE tasks SET title='not permitted'")
+        return canonical(c, cursor)
+    monkeypatch.setattr(ktc, 'changed_since', capture)
+    r.board_changes(None)
+    assert len(seen) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+        seen[0].execute('SELECT 1')
+
+
+def test_semantic_cursor_regressed_revision_invalidates_all(api, board, monkeypatch):
+    path, conn = board
+    kanban_db.create_task(conn, title='A', initial_status='running', session_id='S1')
+    r = readers_for(api, path, monkeypatch)
+    _, cursor = r.board_changes(None)
+    conn.execute('UPDATE kanban_activity_revision SET revision=0')
+    conn.execute('UPDATE kanban_task_change SET rev=0')
+    conn.commit()
+    changes, _ = r.board_changes(cursor)
+    assert changes.full
+
+
+def test_semantic_cursor_coverage_loss_is_full(api, board, monkeypatch):
+    path, conn = board
+    r = readers_for(api, path, monkeypatch)
+    _, cursor = r.board_changes(None)
+    conn.execute('DROP TRIGGER kanban_activity_rev_tasks_update')
+    conn.commit()
+    changes, cursor = r.board_changes(cursor)
+    assert changes.full
+    assert cursor[str(path)][1] is None
+
+
+def test_semantic_invalidations_keep_board_coordinates_and_old_refs(api):
+    changes = api.BoardChanges(sources={('source.db', 'other-board'): {'t_same0001'}}, sessions={'S-new'})
+    old = {'lineage': {'S-old'}, 'bundle': {
+        'tasks': [{'id': 't_same0001', 'board': 'default'}], 'done': [], 'cards': {}}}
+    assert not changes.affects(old), 'same task id on another board is not this input'
+    old['bundle']['tasks'][0]['board'] = 'other-board'
+    assert changes.affects(old), 'removed creator/subscriber still has an old scoped ref'
+    old['bundle']['tasks'] = []
+    old['lineage'] = {'S-new'}
+    assert changes.affects(old), 'new member did not have a previous card ref'
+
+
 def test_lineage_walks_parent_sessions(api, tmp_path, monkeypatch):
     db = tmp_path / 'state.db'
     c = sqlite3.connect(db)
