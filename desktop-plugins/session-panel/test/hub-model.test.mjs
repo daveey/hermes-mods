@@ -430,6 +430,16 @@ test('a real decision click emits exactly one monotonic client timing record; a 
   await paint(React.createElement(m.Panel))
   assert.equal(timings.length, 0, 'mounted old ask is not completion')
   await paint(null)
+  // An empty attention section during a canonical request outage is unknown,
+  // not evidence of departure. Keep tracking through recovery and a still-open ask.
+  m.ingestBundle(route.connectionId, route.profile, { session: route.session, model: publicCases.derived_unknown_with_done_history.model })
+  await paint(React.createElement(m.Panel))
+  assert.equal(timings.length, 0, 'unavailable canonical requests cannot complete timing')
+  await paint(null)
+  m.ingestBundle(route.connectionId, route.profile, { session: route.session, model: before })
+  await paint(React.createElement(m.Panel))
+  assert.equal(timings.length, 0, 'recovered still-open ask retains timing')
+  await paint(null)
   m.ingestBundle(route.connectionId, route.profile, { session: route.session, model: publicCases.instant_decision.model })
   await paint(React.createElement(m.Panel))
   await paint(React.createElement(m.Panel))
