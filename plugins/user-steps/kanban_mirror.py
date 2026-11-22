@@ -503,8 +503,9 @@ class Mirror:
         keys = list(dict.fromkeys((self.store._ns(o), o['storedSessionId']) for o in owners))
         if not keys:
             return []
-        scope = 'WITH scope(namespace,session) AS (VALUES ' + ','.join('(?,?)' for _ in keys) + ') '
-        params = tuple(value for key in keys for value in key)
+        scope = ('WITH scope(namespace,session) AS '
+                 "(SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?)) ")
+        params = (json.dumps(keys),)
         with self.store._read() as c:
             tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
             rows = c.execute(scope +

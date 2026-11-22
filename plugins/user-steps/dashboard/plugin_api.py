@@ -148,7 +148,17 @@ def panel_owners(home: Path, session: str, lineage) -> list:
     core = _load('core')
     if core.home().resolve() != Path(home).resolve():
         raise core.ActionError('Panel profile does not match current profile', 409)
-    ids = list(dict.fromkeys([*lineage, session]))
+    result = _panel_owners_many(core, {session: lineage})[session]
+    if isinstance(result, Exception):
+        raise result
+    return result
+
+
+def _panel_owners_many(core, lineages):
+    scopes = {sid: list(dict.fromkeys([*lineage, sid])) for sid, lineage in lineages.items()}
+    ids = list(dict.fromkeys(s for lineage in scopes.values() for s in lineage))
+    if not ids:
+        return {}
     c = core._ro_connect(core._state_db(), timeout=2)
     try:
         c.execute('PRAGMA query_only=ON')
@@ -157,13 +167,42 @@ def panel_owners(home: Path, session: str, lineage) -> list:
     finally:
         c.close()
     present = {row[0] for row in rows}
-    if session not in present:
-        raise core.ActionError('Unknown stored session on this profile', 404)
-    identity = core.server_owner(session)
-    owners = [dict(identity, storedSessionId=sid) for sid in ids if sid in present]
-    for own in owners:
+    valid = [sid for sid in scopes if sid in present]
+    identity = core.server_owner(valid[0]) if valid else None
+    owners = {sid: dict(identity, storedSessionId=sid) for sid in ids if sid in present} if identity else {}
+    for own in owners.values():
         core.validate_owner(own)
-    return owners
+    return {sid: [owners[s] for s in lineage if s in owners] if sid in present
+            else core.ActionError('Unknown stored session on this profile', 404)
+            for sid, lineage in scopes.items()}
+
+
+def panel_requests_many(home: Path, lineages) -> dict:
+    """Read all lineage requests with one closed snapshot per source database.
+
+    A missing watched session is a per-session 404, never authority inherited
+    from its parent. Source failures raise for the pass, not a successful empty
+    capture. Only immutable materialized values cross the SQL boundary.
+    """
+    import copy
+    core = _load('core')
+    if core.home().resolve() != Path(home).resolve():
+        raise core.ActionError('Panel profile does not match current profile', 409)
+    scopes = _panel_owners_many(core, lineages)
+    owners = {}
+    for group in scopes.values():
+        if not isinstance(group, Exception):
+            for own in group:
+                owners[own['storedSessionId']] = own
+    st = core.ActionStore(read_only=True)
+    by_session = {sid: [] for sid in owners}
+    if owners and st.path.exists():
+        producer = _load('kanban_mirror').Mirror(core, st)
+        for row in producer.views(list(owners.values()), include_withdrawn=True):
+            by_session[row['owner']['storedSessionId']].append(row)
+    return {sid: group if isinstance(group, Exception) else
+            copy.deepcopy([row for own in group for row in by_session[own['storedSessionId']]])
+            for sid, group in scopes.items()}
 
 
 def panel_reconcile(home: Path, session: str, lineage) -> None:

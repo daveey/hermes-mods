@@ -770,6 +770,21 @@ class CoreReaders:
         mod = self._user_step_api()
         if reconcile:
             return mod.panel_requests(self.state_db().parent, session, lineage)
+        scope = getattr(self._local, 'batch', None)
+        if scope is not None and scope['lineages'].get(session) == lineage:
+            if 'request_capture' not in scope:
+                groups = {s: ids for s, ids in scope['lineages'].items() if isinstance(ids, list)}
+                try:
+                    scope['request_capture'] = mod.panel_requests_many(self.state_db().parent, groups)
+                except Exception as exc:
+                    # Share failure as failure for this pass, never as empty rows;
+                    # the next source-admitted pass gets a fresh capture attempt.
+                    scope['request_capture'] = exc
+            captured = scope['request_capture']
+            value = captured if isinstance(captured, Exception) else captured[session]
+            if isinstance(value, Exception):
+                raise value
+            return copy.deepcopy(value)
         return mod.panel_requests(self.state_db().parent, session, lineage, reconcile=False)
 
     def panel_inputs(self, session, lineage):
