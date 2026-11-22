@@ -397,7 +397,11 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
   // Spec: hidden when there is neither open work nor finished history.
   if (!MODEL_SECTIONS.some(([section]) => model.sections[section].length)) return null
   const state = str(model.header.state)
-  const alert = state === 'decision' || state === 'needs_input' || state === 'needs_user' || (model.header.counts.needs_you || 0) > 0
+  const status = model.header.status
+  const stripe = status?.presentation?.stripe || 'attention'
+  // Presentation palette only: no local activity/count/kind classification.
+  const statusColor = { done: 'var(--color-emerald-500)', stuck: 'var(--color-red-500)', attention: 'var(--color-amber-500)',
+    blocked: 'var(--color-zinc-400)', waiting: 'var(--color-zinc-400)', none: 'var(--muted-foreground)' }[stripe]
   const details = row => row.details?.length > 0 && jsxs('details', { 'data-ask-details': '', style: { ...modelSmall, ...muted, flex: 1, minWidth: 0 }, children: [
     jsx('summary', { style: { fontSize: 11.5 }, children: 'Details' }),
     ...row.details.map((text, i) => jsx('div', { style: { whiteSpace: 'pre-wrap', marginTop: 4, fontSize: 11.5 }, children: text }, i))
@@ -485,10 +489,11 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
           title: collapsed ? 'Expand' : 'Collapse (reopens when something new needs you or gets stuck)', onClick: onToggle } : {}),
         style: { display: 'inline-flex', alignItems: 'center', gap: 6, color: 'var(--muted-foreground)', background: 'transparent', border: 0, padding: 0, font: 'inherit', cursor: onToggle ? 'pointer' : 'default' }, children: [
         onToggle && jsx('span', { 'aria-hidden': true, 'data-panel-caret': '', style: { display: 'inline-block', width: 10, fontSize: 10, transform: collapsed ? 'rotate(-90deg)' : 'none', transition: 'transform 120ms' }, children: '\u25be' }),
-        jsx('span', { 'aria-hidden': true, style: { width: 7, height: 7, borderRadius: '50%', background: alert ? SECTION_COLOR.needs_you : (model.header.counts.running ? SECTION_COLOR.running : SECTION_COLOR.done) } }),
+        jsx('span', { 'aria-hidden': true, 'data-panel-status-stripe': stripe, 'data-panel-status-revision': status?.revision,
+          style: { width: 7, height: 7, borderRadius: '50%', background: statusColor } }),
         jsx('span', { children: 'This session' })
       ] }),
-      jsx('span', { 'data-session-status': '', title: STATE_LABEL[state] || state, style: { color: alert ? ALERT_TEXT : 'var(--muted-foreground)', fontWeight: alert ? 600 : 400 }, children: str(model.header.label) || model.header.state }),
+      jsx('span', { 'data-session-status': '', title: STATE_LABEL[state] || state, style: { color: statusColor }, children: str(model.header.label) || model.header.state }),
       ...model.header.pips.map((pip, i) => jsxs('span', { 'data-model-pip': pip.section, style: { display: 'inline-flex', alignItems: 'center', gap: 5, color: pip.section === 'needs_you' ? ALERT_TEXT : pip.section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)', fontWeight: pip.section === 'needs_you' || pip.section === 'stuck' ? 600 : 400 }, children: [
         jsx('span', { 'aria-hidden': true, style: box(pip.section) }),
         `${pip.count} ${pip.label}`

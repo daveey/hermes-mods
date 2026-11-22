@@ -1,3 +1,4 @@
+from test_model import canonical_outcome
 import threading
 
 from test_feed import make
@@ -28,7 +29,7 @@ def test_canonical_lane_does_not_vouch_for_restored_board_evidence():
     f.changes(['S1'])
     f._carried.add('S1')
     f._reissue.add('S1')
-    readers.decision_inputs = lambda session, lineage: {'outcome_json': {'kind': 'done'}, 'requests': []}
+    readers.decision_inputs = lambda session, lineage: {'outcome_json': canonical_outcome('done'), 'requests': []}
     f.refresh_decisions()
     assert 'S1' in f._carried and 'S1' in f._reissue
     assert 'S1' not in pushed[-1]['fresh']
@@ -37,7 +38,7 @@ def test_canonical_lane_does_not_vouch_for_restored_board_evidence():
 def test_fast_read_is_discarded_on_changed_lineage_or_forgotten_interest():
     for forget in (False, True):
         f, readers, pushed, clock = make()
-        readers.panel_inputs = lambda session, lineage: {'outcome_json': {'kind': 'waiting'}, 'requests': []}
+        readers.panel_inputs = lambda session, lineage: {'outcome_json': canonical_outcome('waiting'), 'requests': []}
         f.changes(['S1'])
         def changed(session, lineage):
             if forget:
@@ -47,7 +48,7 @@ def test_fast_read_is_discarded_on_changed_lineage_or_forgotten_interest():
             else:
                 readers.lineages['S1'] = ['S1', 'NEW']
                 f._publish({'S1': f.compute('S1')})
-            return {'outcome_json': {'kind': 'done'}, 'requests': []}
+            return {'outcome_json': canonical_outcome('done'), 'requests': []}
         readers.decision_inputs = changed
         assert f.refresh_decisions() == 0
         if forget:
@@ -59,7 +60,7 @@ def test_fast_read_is_discarded_on_changed_lineage_or_forgotten_interest():
 
 def test_canonical_refresh_publishes_while_unrelated_board_read_is_blocked():
     f, readers, pushed, clock = make()
-    state = {'outcome_json': {'kind': 'waiting'}, 'requests': []}
+    state = {'outcome_json': canonical_outcome('waiting'), 'requests': []}
     readers.panel_inputs = lambda session, lineage: dict(state)
     readers.decision_inputs = lambda session, lineage: dict(state)
     f.changes(['S1', 'S2'])
@@ -74,7 +75,7 @@ def test_canonical_refresh_publishes_while_unrelated_board_read_is_blocked():
     worker.start()
     try:
         assert started.wait(5)
-        state['outcome_json'] = {'kind': 'done'}
+        state['outcome_json'] = canonical_outcome('done')
         before = f.bundles['S2']['bundle']['computed_at']
         clock['now'] += 10
         assert f.refresh_decisions() == 2
@@ -89,10 +90,10 @@ def test_canonical_refresh_publishes_while_unrelated_board_read_is_blocked():
 
 def test_old_full_read_cannot_restore_an_undecided_request_after_fast_refresh():
     f, readers, pushed, clock = make()
-    readers.panel_inputs = lambda session, lineage: {'outcome_json': {'kind': 'needs_user'}, 'requests': []}
+    readers.panel_inputs = lambda session, lineage: {'outcome_json': canonical_outcome('decision'), 'requests': []}
     f.changes(['S1'])
     old = f.compute('S1')
-    readers.decision_inputs = lambda session, lineage: {'outcome_json': {'kind': 'done'}, 'requests': []}
+    readers.decision_inputs = lambda session, lineage: {'outcome_json': canonical_outcome('done'), 'requests': []}
     f.refresh_decisions()
     f._publish({'S1': old})
     assert f.bundles['S1']['bundle']['model']['header']['state'] == 'done'
@@ -100,13 +101,13 @@ def test_old_full_read_cannot_restore_an_undecided_request_after_fast_refresh():
 
 def test_fast_read_racing_newer_board_read_keeps_new_board_and_canonical_state():
     f, readers, pushed, clock = make()
-    readers.panel_inputs = lambda session, lineage: {'outcome_json': {'kind': 'waiting'}, 'requests': []}
+    readers.panel_inputs = lambda session, lineage: {'outcome_json': canonical_outcome('waiting'), 'requests': []}
     f.changes(['S1'])
     started, release = threading.Event(), threading.Event()
     def delayed(session, lineage):
         started.set()
         assert release.wait(5)
-        return {'outcome_json': {'kind': 'done'}, 'requests': []}
+        return {'outcome_json': canonical_outcome('done'), 'requests': []}
     readers.decision_inputs = delayed
     worker = threading.Thread(target=f.refresh_decisions)
     worker.start()
@@ -125,7 +126,7 @@ def test_fast_read_racing_newer_board_read_keeps_new_board_and_canonical_state()
 
 def test_fast_input_error_is_retried_without_board_stamps_and_not_vouched():
     f, readers, pushed, clock = make()
-    readers.panel_inputs = lambda session, lineage: {'outcome_json': {'kind': 'waiting'}, 'requests': []}
+    readers.panel_inputs = lambda session, lineage: {'outcome_json': canonical_outcome('waiting'), 'requests': []}
     f.changes(['S1'])
     clock['now'] += 21
     f._publish({}, heartbeat=True)
@@ -137,7 +138,7 @@ def test_fast_input_error_is_retried_without_board_stamps_and_not_vouched():
     f.refresh_decisions()
     f._publish({}, heartbeat=True)
     assert 'S1' not in pushed[-1]['fresh']
-    readers.decision_inputs = lambda session, lineage: {'outcome_json': {'kind': 'done'}, 'requests': []}
+    readers.decision_inputs = lambda session, lineage: {'outcome_json': canonical_outcome('done'), 'requests': []}
     assert f.refresh_decisions() == 1
     assert f.bundles['S1']['bundle']['model']['header']['state'] == 'done'
     assert 'S1' not in f._decision_failures
@@ -169,7 +170,7 @@ def test_canonical_lineage_fence_even_when_board_sequences_are_equal():
     f.changes(['S1'])
     base = f.bundles['S1']['bundle']
     raced = {**base, 'lineage': ['S1', 'obsolete-parent'],
-             'outcome_json': {'kind': 'done'}, 'canonical_seq': base['canonical_seq'] + 1}
+             'outcome_json': canonical_outcome('done'), 'canonical_seq': base['canonical_seq'] + 1}
     before = f.rev
     assert f._publish({'S1': raced}, canonical_only=True) == {}
     assert f.rev == before and f.bundles['S1']['bundle'] is base
@@ -209,7 +210,7 @@ def test_merged_reduction_uses_current_clock_not_board_snapshot(monkeypatch):
     f.changes(['S1'])
     old_clock = f.bundles['S1']['bundle']['computed_at']
     clock['now'] += 90
-    readers.decision_inputs = lambda *args: {'outcome_json': {'kind': 'done'}, 'requests': []}
+    readers.decision_inputs = lambda *args: {'outcome_json': canonical_outcome('done'), 'requests': []}
     real_model, seen = feedmod._model(), []
     class Reducer:
         def reduce_panel(self, bundle, *, now):
@@ -223,14 +224,14 @@ def test_merged_reduction_uses_current_clock_not_board_snapshot(monkeypatch):
 
 def test_additive_model_and_request_outcome_invalidation_without_card_events():
     f, readers, pushed, clock = make()
-    state = {'kind': 'waiting'}
+    state = canonical_outcome('waiting')
     readers.panel_inputs = lambda session, lineage: {'outcome_json': dict(state)}
     readers.panel_stamp = lambda session: state['kind']
     first = f.changes(['S1'])['bundles']['S1']
     assert all(k in first for k in ('tasks', 'done', 'cards', 'lineage', 'model'))
     assert first['model']['header']['state'] == 'waiting'
     f.tick()  # establish stamps
-    state['kind'] = 'needs_user'
+    state.update(canonical_outcome('decision', revision=10))
     assert f.tick() == 1  # unchanged board stamp and no task event
-    assert pushed[-1]['bundles']['S1']['model']['header']['state'] == 'needs_user'
+    assert pushed[-1]['bundles']['S1']['model']['header']['state'] == 'decision'
     assert f.tick() == 0
