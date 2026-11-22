@@ -494,29 +494,81 @@ class Mirror:
             )
         )
 
-    def present(self, request):
+    def views(self, owners, *, include_withdrawn=False):
+        """Capture all owner presentation inputs once; project only after closing SQL.
+
+        Optional mirror tables may be absent in a store with no card producer yet.
+        This is a read seam, not reconciliation or decision authority.
+        """
+        keys = list(dict.fromkeys((self.store._ns(o), o['storedSessionId']) for o in owners))
+        if not keys:
+            return []
+        scope = 'WITH scope(namespace,session) AS (VALUES ' + ','.join('(?,?)' for _ in keys) + ') '
+        params = tuple(value for key in keys for value in key)
+        with self.store._read() as c:
+            tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            rows = c.execute(scope +
+                'SELECT r.namespace,r.session,r.id,r.state,r.resolution,v.body,l.created_at,l.withdrawal '
+                'FROM scope s JOIN requests r ON r.namespace=s.namespace AND r.session=s.session '
+                'LEFT JOIN revisions v ON r.namespace=v.namespace AND r.id=v.id AND r.revision=v.revision '
+                'LEFT JOIN lifecycle l ON r.namespace=l.namespace AND r.id=l.id ORDER BY r.rowid', params).fetchall()
+            bindings = c.execute(scope +
+                'SELECT p.* FROM scope s JOIN kanban_projections p '
+                'ON p.namespace=s.namespace AND p.session=s.session', params).fetchall() if 'kanban_projections' in tables else []
+            displays = c.execute(scope +
+                'SELECT d.* FROM scope s JOIN requests r ON r.namespace=s.namespace AND r.session=s.session '
+                'JOIN kanban_projection_display d ON d.namespace=r.namespace AND d.request_id=r.id',
+                params).fetchall() if 'kanban_projection_display' in tables else []
+            operations = c.execute(scope +
+                'SELECT o.namespace,o.session,o.id,o.body FROM scope s JOIN operations o '
+                'ON o.namespace=s.namespace AND o.session=s.session', params).fetchall()
+        bound = {(r['namespace'], r['session'], r['request_id']): dict(r) for r in bindings}
+        shown = {(r['namespace'], r['request_id']): r for r in displays}
+        ops = {(r['namespace'], r['session'], r['id']): r['body'] for r in operations}
+        by_owner = {key: [] for key in keys}
+        for row in rows:
+            if not include_withdrawn and row['state'] == 'withdrawn':
+                continue
+            key = (row['namespace'], row['session'], row['id'])
+            request = self.store._project_view(row)
+            frozen = json.loads(row['body'])
+            frozen['state'] = row['state']
+            oid = (request.get('resolution') or {}).get('operationId')
+            captured = dict(binding=bound.get(key), frozen=frozen,
+                            display_available='kanban_projection_display' in tables,
+                            display=shown.get((row['namespace'], row['id'])),
+                            operation=ops.get((row['namespace'], row['session'], oid)))
+            by_owner[key[:2]].append(self.present(request, captured=captured))
+        return [r for key in keys for r in by_owner[key]]
+
+    def present(self, request, *, captured=None):
         """A corrupt optional binding must never poison healthy requests."""
         try:
-            return self._present(request)
+            return self._present(request, captured=captured)
         except (ValueError, TypeError, KeyError, StopIteration, sqlite3.Error, self.core.ActionError) as exc:
             logging.getLogger('user-steps').warning('Card presentation unavailable: %s', exc)
             return request
 
-    def _present(self, request):
+    def _present(self, request, *, captured=None):
         """Display-only metadata; never rewrite a frozen request or mint a new tile."""
-        binding = self.binding(request['owner'], request['requestId'])
+        binding = self.binding(request['owner'], request['requestId']) if captured is None else captured['binding']
         if not binding:
             return request
-        frozen = self.store.get(request['owner'], request['requestId'])
+        frozen = self.store.get(request['owner'], request['requestId']) if captured is None else dict(captured['frozen'])
         frozen.pop('resolution', None)
         frozen['state'] = json.loads(binding['request'])['state']
         if encoded(frozen) != binding['request']:
             return request
         snap = json.loads(binding['snapshot'])
         if snap.get('remote'):
-            with self.store._read() as c:
-                display = c.execute('SELECT body FROM kanban_projection_display WHERE namespace=? AND request_id=?',
-                                    (self.store._ns(request['owner']), request['requestId'])).fetchone()
+            if captured is None:
+                with self.store._read() as c:
+                    display = c.execute('SELECT body FROM kanban_projection_display WHERE namespace=? AND request_id=?',
+                                        (self.store._ns(request['owner']), request['requestId'])).fetchone()
+            else:
+                if not captured['display_available']:
+                    raise sqlite3.OperationalError('Card presentation display table unavailable')
+                display = captured['display']
             if display is not None:
                 shown = json.loads(display['body'])
                 if shown['remote']['target'] == snap['remote']['target']:
@@ -544,7 +596,17 @@ class Mirror:
             if len(marked) == 1:
                 recommended = f'card-{marked[0]}'
         details = '\n\n'.join(str(hr[k]) for k in ('action', 'why_human', 'scope', 'evidence') if hr.get(k))
-        note = self.remote.delivery_note(request['owner'], request) if snap.get('remote') else None
+        note = None
+        if snap.get('remote'):
+            if captured is None:
+                note = self.remote.delivery_note(request['owner'], request)
+            elif (request.get('resolution') or {}).get('operationId'):
+                if captured['operation'] is None:
+                    raise self.core.ActionError('Unknown operation in this session', 404)
+                operation = json.loads(captured['operation'])
+                if (operation.get('requestId'), operation.get('revision')) != (request['requestId'], request['revision']):
+                    raise self.core.ActionError('Operation does not match presented request', 409)
+                note = self.remote.project_delivery_note(operation, binding)
         return dict(request, **(dict(delivery=note) if note else {}), presentation=dict(kind='kanban-question', question=question,
                     details=details, recommendedChoiceId=recommended, other=True,
                     sourceRef=dict(gatewayId=snap.get('remote', {}).get('target', {}).get('ownerGateway', request['owner']['gatewayId']),

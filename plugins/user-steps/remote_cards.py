@@ -276,8 +276,13 @@ class Remote:
         op = self.mirror.store.operation(owner, oid)['operation']
         if op['dispatchState'] != 'cancelled' or (op.get('retired') or {}).get('evidence') != self.RETIRING:
             return None
+        return self.project_delivery_note(op, self.mirror.binding(owner, request['requestId']))
+
+    def project_delivery_note(self, op, target):
+        """Reduce materialized operation/binding bytes without opening a store."""
+        if op['dispatchState'] != 'cancelled' or (op.get('retired') or {}).get('evidence') != self.RETIRING:
+            return None
         age = int(self._age(op))
-        target = self.mirror.binding(owner, request['requestId'])
         gateway = json.loads(target['snapshot'])['remote']['target']['ownerGateway']
         unconfirmed = age >= self.UNCONFIRMED_AFTER_S
         return dict(state='delivering', ageSeconds=age, unconfirmed=unconfirmed,

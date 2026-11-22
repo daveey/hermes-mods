@@ -153,15 +153,15 @@ def panel_requests(home: Path, session: str, lineage, *, reconcile=True) -> list
     if not reconcile and not st.path.exists():
         return []  # a fresh profile has no producer store; readers must not create it
     producer = _load('kanban_mirror').Mirror(core, st)
-    requests = []
+    owners = []
     for sid in dict.fromkeys([*lineage, session]):
         if not core._row(core._state_db(), sid):
             continue
         own = core.server_owner(sid)
+        owners.append(own)
         if reconcile:
             producer.reconcile(own)
-        requests.extend(producer.present(r) for r in st.views(own, include_withdrawn=True))
-    return requests
+    return producer.views(owners, include_withdrawn=True)
 
 
 def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = None,
