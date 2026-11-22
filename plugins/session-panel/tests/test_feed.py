@@ -263,7 +263,10 @@ def test_interest_expires_and_is_capped():
     t['now'] += feedmod.INTEREST_TTL_S + 1
     f.watch(['S2'])
     assert set(f.interest) == {'S2'} and 'S1' not in f.bundles
-    f.watch([f'X{i}' for i in range(feedmod.MAX_WATCHED + 10)])
+    names = [f'X{i}' for i in range(feedmod.MAX_WATCHED + 10)]
+    assert len(f.watch(names)) == feedmod.MAX_REQUEST, 'one request registers at most MAX_REQUEST chats'
+    for at in range(0, len(names), feedmod.MAX_REQUEST):
+        f.watch(names[at:at + feedmod.MAX_REQUEST])
     assert len(f.interest) == feedmod.MAX_WATCHED
 
 

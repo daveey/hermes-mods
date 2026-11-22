@@ -44,7 +44,11 @@ FULL_EVERY_S = 60.0          # a watched chat with open cards is recomputed at l
 QUIET_FULL_EVERY_S = 300.0   # one with none (it changes only through card events, which recompute it at once)
 HEARTBEAT_S = 20.0           # with nothing to push, a heartbeat at least this often (clients' liveness)
 INTEREST_TTL_S = 15 * 60.0   # a chat nobody re-registers stops being computed
-MAX_WATCHED = 200            # interest cap across all clients
+MAX_WATCHED = 400            # interest cap across all clients (a Desktop keeps its whole sidebar warm)
+MAX_REQUEST = 200            # chats one request may register
+FIRST_CHUNK = 4              # a pass stores and pushes the chats asked for most recently first, this many...
+CHUNK = 16                   # ...then the rest this many at a time, so a click never waits for a whole sweep
+DECISION_FULL_EVERY_S = 30.0 # a chat whose decision inputs did not move is still re-read this often
 SNAPSHOT_VERSION = 1         # the on-disk shape of Feed.snapshot()
 RESTORE_REV_GAP = 1_000_000  # a restored feed's revisions start this far past the snapshot's (see Feed.restore)
 CHAIN_DEPTH = 6              # hops per chain (session-panel walks at most six cards)
@@ -123,6 +127,8 @@ class Feed:
         self._seq = itertools.count(1)       # compute order: a bundle computed earlier never replaces a later one
         self._stamps: Any = None
         self._panel_stamps: dict[str, Any] = {}
+        self._panel_files: Any = None        # the files behind _panel_stamps, as last read
+        self._decision_files: Any = None     # the same for the decision lane's last complete pass
         self._cursor: Any = None
         self._last_full = 0.0
         self._flights: dict[str, _Flight] = {}
@@ -133,6 +139,9 @@ class Feed:
         self._decision_failures: set[str] = set()
         self._decision_lock = threading.Lock()  # cheap read lane, never board computation
         self._registrations = queue.SimpleQueue()
+        self._wake = threading.Event()       # a read asked for a chat with no published bundle: tick now
+        self._urgent: list[str] = []         # tick thread only: chats with no bundle, most recently asked first
+        self._decision_seen: dict[str, tuple] = {}  # decision lane only: session -> (inputs stamp, read at)
         self._wire_sources = {}
         self._wire = (self.epoch, self.rev, MappingProxyType({}), b'')
         self._publish_wire()
@@ -178,10 +187,12 @@ class Feed:
         """
         if self._successor is not None:
             return self._current().changes_bytes(sessions, since=since, epoch=epoch)
-        wanted = tuple(dict.fromkeys(sessions))[:MAX_WATCHED]
+        wanted = tuple(dict.fromkeys(sessions))[:MAX_REQUEST]
         self._registrations.put(wanted)
         current, rev, entries, header = self._wire
         reset = epoch != current
+        if any(s not in entries for s in wanted):
+            self._wake.set()  # the producer computes it on its own thread, at once
         parts = [entries[s][1] + b':' + entries[s][2] for s in wanted
                  if s in entries and (reset or entries[s][0] > since)]
         return (header + b',"reset":' + (b'true' if reset else b'false')
@@ -204,6 +215,7 @@ class Feed:
             self.bundles = {s: dict(b) for s, b in bundles.items()}
             self.interest = dict(getattr(prev, 'interest', {}))
             self._registrations = getattr(prev, '_registrations', self._registrations)
+            self._wake = getattr(prev, '_wake', self._wake)
             self.failures = {s: dict(f) for s, f in getattr(prev, 'failures', {}).items()}
             self._retry = set(getattr(prev, '_retry', ())) | set(bundles)  # recompute every carried chat next pass
             self._carried = set(bundles)  # ...and vouch for none of them until its new bundle is stored
@@ -232,7 +244,7 @@ class Feed:
     # ── interest ────────────────────────────────────────────────────────────
     def watch(self, sessions: Iterable[str]) -> list[str]:
         now = self.clock()
-        wanted = [s for s in dict.fromkeys(str(s) for s in sessions if s)][:MAX_WATCHED]
+        wanted = [s for s in dict.fromkeys(str(s) for s in sessions if s)][:MAX_REQUEST]
         with self.lock:
             for s in wanted:
                 self.interest[s] = now + self.interest_ttl_s
@@ -249,6 +261,7 @@ class Feed:
 
     def _forget(self, s: str) -> None:
         self._decision_failures.discard(s)
+        self._decision_seen.pop(s, None)
         self.interest.pop(s, None)
         self._panel_stamps.pop(s, None)
         self.bundles.pop(s, None)
@@ -303,10 +316,28 @@ class Feed:
         try:
             with self.lock:
                 held = {s: b['bundle'] for s, b in self.bundles.items() if s in self.interest}
+                failed = set(self._decision_failures)
+            # One batched stamp of every held chat's decision inputs, taken BEFORE the reads it guards (a write
+            # after it is seen by the next pass). A chat whose stamp did not move is not re-read every pass: on
+            # the hub that was one user-steps read per watched chat per second, most of the serve's lock traffic.
+            rd = self.readers if readers is None else readers
+            now = self.clock()
+            files = getattr(rd, 'panel_files_stamp', None)
+            moved = files() if callable(files) else None
+            if (moved is not None and moved == self._decision_files and not failed
+                    and all(s in self._decision_seen and 0 <= now - self._decision_seen[s][1] < DECISION_FULL_EVERY_S
+                            for s in held)):
+                return 0  # nothing behind any held chat's decisions moved: no database opened this pass
+            stamps = self._decision_stamps(rd, held)
             count = 0
             for s, base in held.items():
                 if self.stopped.is_set():
                     break
+                stamp = stamps.get(s)
+                seen = self._decision_seen.get(s)
+                if (stamp is not None and seen is not None and seen[0] == stamp and s not in failed
+                        and 0 <= now - seen[1] < DECISION_FULL_EVERY_S):
+                    continue
                 seq = next(self._seq)
                 try:
                     inputs = read(s, base['lineage'])
@@ -314,15 +345,34 @@ class Feed:
                         raise ValueError('incomplete canonical decision inputs')
                     with self.lock:
                         self._decision_failures.discard(s)
+                        if s in self.interest:
+                            self._decision_seen[s] = (stamp, now)
                     update = {k: inputs[k] for k in ('outcome_json', 'requests')}
                     count += len(self._publish({s: {**base, **update, 'canonical_seq': seq}}, canonical_only=True))
                 except Exception:
                     with self.lock:
                         self._decision_failures.add(s)
                     log.debug('session-panel canonical refresh failed: %s', s, exc_info=True)
+            if not self.stopped.is_set():
+                self._decision_files = moved if stamps else None
             return count
         finally:
             self._decision_lock.release()
+
+    @staticmethod
+    def _decision_stamps(readers, held: dict) -> dict:
+        """session -> a value that moves whenever its decision inputs may have; {} when the readers cannot say (every
+        chat is then read every pass, as before). Never raises."""
+        batch, store = getattr(readers, 'panel_stamps', None), getattr(readers, 'decision_store_stamp', None)
+        if not callable(batch) or not callable(store):
+            return {}
+        try:
+            whole = store()
+            rows = batch(list(dict.fromkeys(i for b in held.values() for i in b['lineage'])))
+            return {s: (whole, tuple(rows[i] for i in b['lineage'])) for s, b in held.items()}
+        except Exception:
+            log.debug('session-panel decision stamps failed', exc_info=True)
+            return {}
 
     def _wait_flight(self, flight: _Flight) -> Optional[dict]:
         # No interest/publication lock while waiting, including heartbeat emits.
@@ -527,32 +577,57 @@ class Feed:
                     log.debug('session-panel feed: push failed', exc_info=True)
             return changed
 
-    def tick(self) -> int:
-        """One pass: recompute what changed and push one batch, else a heartbeat when due. Returns bundles pushed."""
-        now = self.clock()
-        with self.lock:
-            self._expire(now)
-            watched = list(self.interest)
-        # Drain a bounded batch; requests arriving during this sweep wait for the
-        # next tick, never the other way round.
+    def _drain(self) -> None:
+        """Tick thread: take in what readers registered since the last look. A chat with no bundle goes to the head
+        of the urgent list (the newest request first; inside one request the client's own order, focused chat
+        first)."""
         for _ in range(MAX_WATCHED):
             try:
-                self.watch(self._registrations.get_nowait())
+                wanted = self.watch(self._registrations.get_nowait())
             except queue.Empty:
                 break
+            with self.lock:
+                cold = [s for s in wanted if s in self.interest and s not in self.bundles]
+            self._urgent = cold + [s for s in self._urgent if s not in cold]
+
+    def _panel_dirty(self, watched: list[str]) -> set[str]:
+        """The watched chats whose outcome/request stamp moved: one batched read when the readers have one."""
+        dirty: set[str] = set()
+        batch, single = getattr(self.readers, 'panel_stamps', None), getattr(self.readers, 'panel_stamp', None)
+        if not callable(batch) and not callable(single):
+            return dirty
+        # Change-driven: no database is opened while neither file behind these stamps has moved.
+        files = getattr(self.readers, 'panel_files_stamp', None)
+        moved = files() if callable(files) else None
+        if moved is not None and moved == self._panel_files and all(s in self._panel_stamps for s in watched):
+            return dirty
+        self._panel_files = moved
+        with self.lock:
+            lineages = {s: list(self.bundles.get(s, {}).get('bundle', {}).get('lineage', [s])) for s in watched}
+        rows = batch(list(dict.fromkeys(i for ids in lineages.values() for i in ids))) if callable(batch) else None
+        for s, ids in lineages.items():
+            stamp = tuple(rows[i] if rows is not None else single(i) for i in ids)
+            if self._panel_stamps.get(s) != stamp:
+                dirty.add(s)
+            self._panel_stamps[s] = stamp
+        return dirty
+
+    def tick(self) -> int:
+        """One pass: recompute what changed and push it, else a heartbeat when due. Returns bundles pushed.
+        Stored and pushed in chunks, the chats a reader is waiting for first: a click on a chat with no bundle is
+        answered after its own compute, not after a whole sweep (requests arriving mid-pass are taken in between
+        chunks)."""
+        now = self.clock()
+        self._wake.clear()  # before the drain: a request after this point wakes the next pass
+        with self.lock:
+            self._expire(now)
+        self._drain()
         with self.lock:
             watched = list(self.interest)
             self._publish_wire()
         if not watched:
             return 0
-        panel_dirty = set()
-        stamp_reader = getattr(self.readers, 'panel_stamp', None)
-        if callable(stamp_reader):
-            for s in watched:
-                stamp = tuple(stamp_reader(i) for i in self.bundles.get(s, {}).get('bundle', {}).get('lineage', [s]))
-                if self._panel_stamps.get(s) != stamp:
-                    panel_dirty.add(s)
-                self._panel_stamps[s] = stamp
+        panel_dirty = self._panel_dirty(watched)
         stamps = self.readers.stamps()
         full = now - self._last_full >= self.full_every_s
         with self.lock:
@@ -586,11 +661,27 @@ class Feed:
                         dirty.add(s)
         dirty.update(retry)
         dirty.update(panel_dirty)
+        if not dirty:
+            return len(self._publish({}, heartbeat=True))
         started = time.monotonic()
-        computed = self._compute_all(sorted(dirty), refresh=True) if dirty else {}
-        if dirty:
-            self.last_tick_s = time.monotonic() - started
-        return len(self._publish(computed, heartbeat=True))
+        pushed, pending, tried = 0, set(dirty), set()
+        while pending and not self.stopped.is_set():
+            if tried:
+                self._drain()  # a chat asked for while the last chunk computed: next, ahead of the sweep
+            with self.lock:
+                # Once per pass each: a chat whose compute failed is retried by the next pass, never in a loop here.
+                cold = [s for s in self._urgent if s in self.interest and s not in self.bundles and s not in tried]
+                pending = {s for s in pending if s in self.interest}
+            self._urgent = cold
+            pending.update(cold)
+            if not pending:
+                break
+            chunk = cold[:FIRST_CHUNK] or sorted(pending)[:CHUNK]
+            tried.update(chunk)
+            pending.difference_update(chunk)
+            pushed += len(self._publish(self._compute_all(chunk, refresh=True), heartbeat=True))
+        self.last_tick_s = time.monotonic() - started
+        return pushed
 
     # ── catch-up ────────────────────────────────────────────────────────────
     def changes(self, sessions: Iterable[str], *, since: int = 0, epoch: Optional[str] = None) -> dict:
