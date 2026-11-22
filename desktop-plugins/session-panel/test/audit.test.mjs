@@ -73,11 +73,24 @@ test('defect 4: CI waits show the short phrase and an Open action that opens the
   assert.equal(document.querySelector('[data-open-url]'), null) // only http(s) links get a button
 })
 
-test('defect 1: an answered ask is one status line on its row; the header never says unresolved', async () => {
+test('an answered ask retains its one status line while a legacy header stays unknown', async () => {
   const decision = { request_id: 'req-9', text: 'Done \u00b7 delivers when this turn ends' }
   await paint(m.renderModel(model({ waiting: [row('a', { decision })] }, { state: 'unresolved', label: 'decision recorded' })))
   assert.equal(document.querySelector('[data-decision-status]').textContent, decision.text)
+  assert.equal(document.querySelector('[data-session-status]').textContent, 'unknown')
+  assert.equal(document.querySelector('[data-panel-status-stripe]').getAttribute('data-panel-status-stripe'), 'attention')
+  assert.doesNotMatch(text(), /unresolved|Delivering|Recorded choice|Check status|Retry/)
+})
+
+test('a canonical answered-ask header preserves the backend label and row status line', async () => {
+  const decision = { request_id: 'req-canonical', text: 'Done \u00b7 delivers when this turn ends' }
+  const status = { status_version: 1, kind: 'waiting', revision: 7, generation: 3,
+    identity: { gateway: 'gateway', profile: 'default', session_id: 'session', owner_epoch: 'epoch' },
+    coverage: { state: 'complete', reasons: [] }, presentation: { stripe: 'waiting', reason_codes: ['test_waiting'] } }
+  await paint(m.renderModel(model({ waiting: [row('a', { decision })] }, { state: 'waiting', label: 'decision recorded', status })))
+  assert.equal(document.querySelector('[data-decision-status]').textContent, decision.text)
   assert.equal(document.querySelector('[data-session-status]').textContent, 'decision recorded')
+  assert.equal(document.querySelector('[data-panel-status-stripe]').getAttribute('data-panel-status-stripe'), 'waiting')
   assert.doesNotMatch(text(), /unresolved|Delivering|Recorded choice|Check status|Retry/)
 })
 
