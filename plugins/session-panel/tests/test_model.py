@@ -88,6 +88,36 @@ def test_remote_retiring_delivery_is_not_terminal_even_after_card_departure():
             assert not any(row.get('decision') for row in settled['sections']['waiting'])
 
 
+def retiring_owner_cases():
+    """Owner evidence stays separate from a retiring answer's delivery status."""
+    return {
+        'running': observed(task(status='running', run_model='m', started_at=NOW - 600)),
+        'stuck': task(status='scheduled', wait={'wait_state': 'stalled'}),
+        'unknown': task(status='running'),
+        'stale': task(status='running', stale=True),
+    }
+
+
+def test_retiring_delivery_preserves_each_owner_rows_own_status():
+    for name, row in retiring_owner_cases().items():
+        baseline = model.reduce_panel(bundle(row), now=NOW, projector=project)
+        section, plain = next((s, rows[0]) for s, rows in baseline['sections'].items() if rows)
+        assert plain['detail'], name
+        for note in ('Delivering…', 'Delivery to remote not confirmed (120 min)'):
+            r = request(state='cancelled')
+            r.update(resolution={'operationId': 'retiring', 'choiceId': 'card-0', 'revision': 3},
+                     delivery={'state': 'delivering', 'text': note})
+            result = model.reduce_panel(bundle(row, requests=[r]), now=NOW, projector=project)
+            owner = result['sections'][section][0]
+            assert owner['detail'] == plain['detail'], name
+            assert owner['details'] == plain['details'], name
+            assert owner['decision']['text'] == note
+            assert result['header']['counts'] == baseline['header']['counts']
+            assert not result['sections']['needs_you']
+            assert not any(a['kind'] == 'decide' for a in owner['actions'])
+            assert 'request cancelled' not in json.dumps(result)
+
+
 def test_block_loop_triage_live_ask_but_no_block_kind_guessing():
     m = model.reduce_panel(bundle(task(status='triage', block_recurrences=4, human_request=human(), block_kind='needs_input')), now=NOW)
     assert len(m['sections']['needs_you']) == 1

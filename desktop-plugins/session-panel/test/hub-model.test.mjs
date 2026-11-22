@@ -125,13 +125,31 @@ for (const [name, fixture] of Object.entries(cases).filter(([name]) => name.star
  })
 }
 
+for (const [name, fixture] of Object.entries(publicCases).filter(([name]) => name.startsWith('owner_delivery_'))) {
+ test(`retiring answer preserves owner detail beside delivery: ${name}`, async () => {
+  const state = name.split('_')[2]
+  const baseline = publicCases[`owner_baseline_${state}`].model
+  const plain = Object.values(baseline.sections).flat()[0]
+  assert.ok(plain.detail, 'control carries its own status')
+  await paint(m.renderModel(fixture.model))
+  const rows = document.querySelectorAll('[data-panel-row]')
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].querySelector('[data-row-detail]')?.textContent, plain.detail)
+  assert.equal(rows[0].querySelectorAll('[data-decision-status]').length, 1)
+  assert.match(rows[0].textContent, /Delivering…|Delivery to remote not confirmed \(120 min\)/)
+  assert.doesNotMatch(rows[0].textContent, /request cancelled/i)
+  assert.equal(rows[0].querySelectorAll('[data-decision-option]').length, 0)
+  assert.equal(fixture.model.sections.needs_you.length, 0)
+ })
+}
+
 for (const [name, fixture] of Object.entries(cases).filter(([name]) => !name.startsWith('retiring_'))) {
  test(`hub model golden: ${name}`, async () => {
   const model = fixture.model || fixture.expected
   assert.ok(model, 'golden contains the P1 output model')
   const before = JSON.stringify(model)
   await paint(m.renderModel(model))
-  assert.equal(document.querySelector('[data-session-status]').textContent, model.header.state)
+  assert.equal(document.querySelector('[data-session-status]').textContent, model.header.label || model.header.state)
   assert.equal(document.querySelector('[data-hub-model]').getAttribute('data-hub-model'), model.revision)
   for (const [section, rows] of Object.entries(model.sections)) {
    assert.equal(document.querySelector(`[data-model-count="${section}"]`).textContent, String(model.header.counts[section]))
