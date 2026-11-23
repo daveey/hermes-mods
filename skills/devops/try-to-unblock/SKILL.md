@@ -58,12 +58,17 @@ comments, or a blocked card whose evidence cites this card) is the ask: point at
 because two asks split David's answer. A live owner chat holds release: message it instead of asking David. Live
 means an unreleased link of any kind (`created` counts) to a session with recent `last_activity_at`. Don't go by
 `ended_at`: `ws_orphan_reap` leaves it set on chats still in use. A `scope_stopped` hold is released only by
-`hermes kanban renew-scope` (then `promote`) run by the card's owning chat, a human terminal, or its creator task.
+`hermes kanban renew-scope <id> --episode <stop event uid> --mandate-comment <integer comment id> --reason …`, then
+`promote <id> --seen <newest comment id>`. It is run by the card's owning chat, a human terminal, or its creator task.
+The mandate is a fresh comment posted from that same session after the stop, at most 8000 characters, stating the
+renewed scope and caps. The renewal compares the comment's `writer_session` with `HERMES_SESSION_ID`, so run it from
+that chat's own terminal; a worker or relayed command is refused.
 The owning chat is an unreleased `created` link, even an archived chat: wake it with cross_session. A shepherd or
 desk chat never qualifies, and `origin_session=None` does not mean the card has no owner: read `task_chat_links`.
 Never file a core card for an "orphan" release; if renew-scope is not installed yet, wait on the card shipping it. Test each option you would offer against the card
-first. Archiving or completing it promotes its waiting children, and re-scoping or promoting a safety-refused card
-is refused.
+first. Completing it promotes its waiting children. Archiving a safety-refused card does not: the Board keeps
+refusing its children (see the withdrawal rule under rung g). Re-scoping or promoting a safety-refused card is
+refused.
 
 If the premise is gone, remove that ask without releasing independent holds. A stale
 human ask can coexist with a valid spend hold: use `action_request` withdrawal for its exact request ID, then
