@@ -79,19 +79,7 @@ Completion criterion: one authoritative producer, a documented contract, Python 
 
 ## Golden-fixture recipe
 
-Public structural cases live in `plugins/session-panel/tests/test_model.py`; `desktop-plugins/session-panel/test/hub-model-fixtures.py` serializes the **real reducer** into `hub-model.test.mjs`. Extend both sides, not a hand-built JavaScript imitation of PanelModel.
-
-Through `terminal`, run:
-
-```sh
-python3 scripts/test-all --no-core --exact -k plugins/session-panel -k plugins/ask-gate -k plugins/user-steps
-python3 scripts/test-all --no-core --exact -k repo-guards
-node --experimental-strip-types --test desktop-plugins/session-panel/test/hub-model.test.mjs
-```
-
-When pinning core for `scripts/test-all`, pass `--hermes-core <isolated checkout>` (or `HERMES_CORE_CHECKOUT`) and verify the emitted core path in `--json` results; setting `HERMES_CORE_SOURCE` alone does not select the runner's checkout. Before the Node command, provision dependencies exactly as `.github/workflows/desktop-plugin-tests.yml` specifies. For full core-backed coverage set `HERMES_CORE_SOURCE` to an isolated compatible core checkout, `HERMES_DESKTOP_DIR`/`HERMES_DESKTOP_PACKAGE` to its installed test dependencies, and make nanostores resolvable from that core. Run serially and require zero core-dependent skips before claiming full coverage. No backend `plugins/session-tasks` suite exists; its tests are Desktop tests. Run all `desktop-plugins/*/test/*.mjs` when changing shared rendering/answer integration.
-
-For a private historical golden, retain raw input, observation time, source revision and expected output in private task attachments. Pin `now` and source clocks to the recorded snapshot; distinguish historical replay from current production. Never publish personal/employer/network details or normalize source identifiers/timestamps just to make a replay pass. Include local, remote, triage, C/A ordering, stale human block kind, retired requests, canonical header and consent boundaries. Inspect every resulting assertion and test exit code; missing dependencies or a timeout are not behavioral proof.
+Before adding or running golden fixtures (real-reducer Python + `hub-model.test.mjs`, test commands, core pinning, private historical goldens), read `references/golden-fixtures.md`.
 
 ## Latency, producer contention and stale panels
 
@@ -121,6 +109,8 @@ Before claiming BoardLane load reduction, read `references/aggregate-board-load.
 - Exercise leaf traversal through real CoreReaders hydration, not only hand-built task dictionaries: stored core Task has no `wait` field. Populate canonical wait annotations in the reader for both live and replica details before the pure reducer chooses graph ancestry. A synthetic `task.wait` can make nested clock/CI/deploy precedence tests pass while production opens an unrelated ancestor. Include disposable-board reader-to-reducer controls and assert the exact parent action target as well as its text.
 - A card the chat is waiting on is often not linked to that chat (for example, a worker created a review card). It then gets no row of its own, so the waiting row's line must carry that card's live status, not just its title. Otherwise running work looks idle. When the user asks "why isn't that card shown?", check `wait_target` and the hydrated `cards[id]` before you look at session linkage.
 - Row UI preference: open a line row's own card by double-clicking its state square, not with an "Open card" button. Keep text buttons for other targets (parent card, CI, links).
+- Color preference: a wait on something already producing the result (CI, deploy, clock) paints light blue `#38bdf8` (row box, waiting pip, header dot), never grey or amber; stalled waits stay amber. The model emits `wait_kind` per row, and on the header and pip only when every waiting row qualifies; the renderer just reads it.
+- Before keying renderer state on a reason/status code, grep core for a producer that emits it: jsdom fixtures that hand in an unemitted code pass while nothing paints live. Derive the state in `model.py` from row data and test it there.
 - "The panel asked me the same question twice" means duplicate user-steps requests, not a renderer bug. List the session's requests in the owner's `~/.hermes/user-steps/actions.sqlite3`: `requests` (namespace, id, session, state, resolution) joined to `revisions.body` (JSON title/kind/choices) and `lifecycle` (created_at, withdrawal). Then read `~/.hermes/cache/user-steps/trace.jsonl` for that session around the second request's created_at. An `open_ask_hold` → `publication_buffer verdict=pass attempt=<budget>` with the sentence in `unmapped`, followed by `transform new:[us_…]`, means the reply's prose restatement of a card the producer tool published that turn was minted as a second tile (`core.same_open_ask` maps only exact titles or corroborated repeats). Fix that in user-steps, not in the panel.
 - An approval tile showing only "A · Request changes" is a `needs_context` request: an `approve` step extracted from prose with no plan, so user-steps offers only the revise choice. `model.py:ask` emits no options for it. If the work was already answered and done, withdraw the moot request; then file the producer leak as a user-steps card. Withdraw by hand from the user-steps plugin dir with `core.withdraw_request(core.ActionStore(<dir>/actions.sqlite3), core.Ledger(<dir>, None), owner, request_id, by='agent', reason=...)`. Take `owner` from the ledger step's `requestOwner` in `~/.hermes/user-steps/<session>.json`: `core.server_owner()` raises "Server gateway identity ... missing" outside the gateway process.
 - Renderer rewrites must keep the header's collapse caret (`data-panel-toggle`, persisted per chat, reopened by new needs_you/stuck keys). The hub-model cutover silently dropped it, and the audit test now asserts it.
