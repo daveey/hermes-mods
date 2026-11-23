@@ -25,7 +25,8 @@ PERMISSIONS = ('absent', 'true', 'false', 'legacy')
 
 
 def test_backend_views_satisfy_desktop_contract(tmp_path):
-    node = find_node()  # first Node >= 18.19; fails (never skips) listing candidates if none
+    # This contract only needs PATH's Node, not a scan of the person's home.
+    node = find_node(home=tmp_path)  # fail rather than skip if no qualifying Node exists
     store = core.ActionStore(tmp_path / 'actions.sqlite3')
     cases = list(itertools.product(KINDS, PERMISSIONS, (False, True)))
     for kind, permission, withdrawn in cases:

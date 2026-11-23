@@ -3281,7 +3281,19 @@ class ActionStore:
                 results.append(self._dispatch(owner, oid, inbox))
         return results
 
-    def dispatch(self, owner, oid, receiver, *, early_tool_call_id=None, early_binding=None):
+    @staticmethod
+    def _retry_due(op, min_retry_interval):
+        if min_retry_interval <= 0 or not op.get('dispatchStartedAt'):
+            return True
+        from datetime import datetime, timezone
+        try:
+            started = datetime.fromisoformat(op['dispatchStartedAt'])
+            return (datetime.now(timezone.utc) - started).total_seconds() >= min_retry_interval
+        except (ValueError, TypeError):
+            return False  # malformed clocks cannot accelerate automatic retries
+
+    def dispatch(self, owner, oid, receiver, *, early_tool_call_id=None, early_binding=None,
+                 max_attempts=None, min_retry_interval=0):
         # Generic idempotent receivers permit concurrent retries. Card mirrors
         # serialize terminal refusal settlement as well as receipt I/O, so a
         # refusal cannot retire another in-flight attempt of the same operation.
@@ -3289,9 +3301,11 @@ class ActionStore:
             if not held:
                 return self.operation(owner, oid)
             return self._dispatch(owner, oid, receiver, early_tool_call_id=early_tool_call_id,
-                                  early_binding=early_binding)
+                                  early_binding=early_binding, max_attempts=max_attempts,
+                                  min_retry_interval=min_retry_interval)
 
-    def _dispatch(self, owner, oid, receiver, *, early_tool_call_id=None, early_binding=None):
+    def _dispatch(self, owner, oid, receiver, *, early_tool_call_id=None, early_binding=None,
+                  max_attempts=None, min_retry_interval=0):
         # Commit the attempt then release the DB lock BEFORE external I/O. Other
         # requests stay usable; concurrent retries share the receiver's durable key.
         # early_tool_call_id: deliver through a blocked clarify's tool result (receiver.deliver_early) instead of
@@ -3299,6 +3313,12 @@ class ActionStore:
         with self._tx() as c:
             result = self._operation(c, owner, oid); op = result['operation']
             if op['dispatchState'] in ('delivered', 'cancelled'): return result
+            # Selection can precede slow sibling I/O or a manual Retry. Check
+            # automatic eligibility atomically with this attempt, not only at scan.
+            if max_attempts is not None and op.get('attempts', 0) >= max_attempts:
+                return result
+            if not self._retry_due(op, min_retry_interval):
+                return result
             if 'uncertainAttempts' not in op and op.get('attempts', 0):
                 refused = op.get('error') in (BUSY_ERROR, OWNER_WAIT_ERROR)
                 if op['dispatchState'] == 'pending':
@@ -3448,23 +3468,17 @@ class ActionStore:
     def reconcile(self, owner, receiver, *, max_attempts=None, min_retry_interval=0):
         # Durable cadence belongs to operations, not lossy hints or router lifetime.
         # Fresh operations have no dispatchStartedAt and are immediately eligible.
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc)
+        # The prefilter avoids unnecessary leases; _dispatch rechecks in its tx.
         def due(op):
-            if min_retry_interval <= 0 or not op.get('dispatchStartedAt'):
-                return True
-            try:
-                started = datetime.fromisoformat(op['dispatchStartedAt'])
-                return (now - started).total_seconds() >= min_retry_interval
-            except (ValueError, TypeError):
-                return False  # malformed clocks do not accelerate automatic retries
+            return self._retry_due(op, min_retry_interval)
         with self._tx() as c:
             ids = [row['id'] for row in c.execute(
                 'SELECT id,body FROM operations WHERE namespace=? AND session=? ORDER BY rowid',
                 (self._ns(owner), owner['storedSessionId']))
                 if (op := json.loads(row['body']))['dispatchState'] not in ('delivered', 'cancelled')
                 and (max_attempts is None or op.get('attempts', 0) < max_attempts) and due(op)]
-        return [self.dispatch(owner, oid, receiver) for oid in ids]
+        return [self.dispatch(owner, oid, receiver, max_attempts=max_attempts,
+                              min_retry_interval=min_retry_interval) for oid in ids]
 
     # ---- lifecycle: withdrawal (a moot ask leaves the queue; NOT a decision) ----------------------------
 
