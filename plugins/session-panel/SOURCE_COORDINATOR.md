@@ -27,6 +27,13 @@ registers new watches and reacquires changed input. `refresh_keyed` uses the sam
 `full` tickets and publication fences, while Feed retains canonical producer
 ownership. The actual file watcher's fixed recovery branch uses this seam too;
 composition must not terminate that watcher or silently use legacy hydration.
+Keyed admission retains Feed's lock through membership filtering and successful
+pending mutation. Projection base selection must therefore never acquire
+`Feed.lock` while holding the coordinator lock: snapshot the coordinator's base,
+release its lock, then read the Feed base. The immutable pin retains its original
+Feed watch token through publication, so a forget/re-watch during this unlocked
+interval cannot publish an old projection into a new same-name watch. Store
+source/demand/lineage CAS and Feed's writer membership fence still run at commit.
 
 The optional completion service is a scheduler, not a fifth hydration slot.
 Manual construction and composition start no thread. `step()` starts requested
