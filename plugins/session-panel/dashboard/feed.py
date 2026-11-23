@@ -724,12 +724,12 @@ class Feed:
         return self
 
     def _store(self, session: str, bundle: dict, *, canonical_only: bool = False, board_current: bool = False,
-               observation_only: bool = False) -> bool:
+               observation_only: bool = False, projection_module=None, reducer=None) -> bool:
         """Keep `bundle`; True when it differs from what clients last got (it took a new revision)."""
         observation = (getattr(self, '_external_observations', None) or {}).get(session)
         if observation and not board_current and bundle.get('computed_seq', 0) <= observation[0]:
             bundle = self.readers.advance_external(bundle, observation[1])
-            bundle = {**bundle, 'model': _model().reduce_panel(bundle, now=self.clock(), wire=True)}
+            bundle = {**bundle, 'model': (reducer or _model().reduce_panel)(bundle, now=self.clock(), wire=True)}
         prev = self.bundles.get(session)
         if canonical_only and (not prev or prev['bundle']['lineage'] != bundle['lineage']):
             return False  # expired/re-watched or reparented while the cheap read was in flight
@@ -743,7 +743,7 @@ class Feed:
                 # independently merged, including current source-read errors.
                 if old['lineage'] != bundle['lineage'] or old.get('canonical_seq', 0) >= bundle.get('canonical_seq', 0):
                     return False
-                bundle = _projection().canonical_overlay(old, bundle)
+                bundle = (projection_module or _projection()).canonical_overlay(old, bundle)
                 board_refresh, merged = False, True
             elif not board_current and old.get('computed_seq', 0) > bundle.get('computed_seq', 0):
                 if old.get('canonical_seq', 0) >= bundle.get('canonical_seq', 0) or old['lineage'] != bundle['lineage']:
@@ -751,7 +751,7 @@ class Feed:
                 bundle = {**old, **{k: bundle[k] for k in ('canonical_seq', 'outcome_json', 'requests')}}
                 merged = True
             elif old.get('canonical_seq', 0) > bundle.get('canonical_seq', 0) and old['lineage'] == bundle['lineage']:
-                bundle = (_projection().canonical_overlay(bundle, old) if board_current else
+                bundle = ((projection_module or _projection()).canonical_overlay(bundle, old) if board_current else
                           {**bundle, **{k: old[k] for k in ('canonical_seq', 'outcome_json', 'requests')}})
                 merged = True
             if not board_current and not board_refresh and bundle.get('canonical_seq') and all(bundle.get(k) == old.get(k) for k in ('outcome_json', 'requests', 'input_errors')):
@@ -760,7 +760,7 @@ class Feed:
             if merged and bundle.get('canonical_seq'):
                 # Evaluate ageing execution against current time, but retain computed_at:
                 # a fresh decision is never fresh board evidence or a renewed lease.
-                bundle = {**bundle, 'model': _model().reduce_panel(bundle, now=self.clock(), wire=True)}
+                bundle = {**bundle, 'model': (reducer or _model().reduce_panel)(bundle, now=self.clock(), wire=True)}
         h = _hash(bundle)
         rows = bundle['tasks'] + bundle['done']
         refs = set(bundle['cards']) | {str(t.get('id')) for t in rows if t.get('id')}
@@ -789,10 +789,14 @@ class Feed:
                  age_only: bool = False, observations: Optional[dict] = None, watch_tokens=None,
                  _projections=None, _snapshot_store=None, _results=None) -> dict[str, dict]:
         """Store what was computed and push one batch (or a heartbeat when nothing changed and one is due)."""
+        # Resolve source-backed modules before borrowing the store publication
+        # lock. Only immutable inputs and loaded pure helpers enter that borrow.
+        projection_module = _projection() if _projections is not None else None
+        projection_reducer = _model().reduce_panel if _projections is not None else None
         with self.compute_lock:
             if self.stopped.is_set():
                 if _results is not None:
-                    _results.update({s: _projection().PublishResult('stopped') for s in _projections})
+                    _results.update({s: projection_module.PublishResult('stopped') for s in _projections})
                 return {}  # stopped (and possibly resumed by a successor): its revision space is no longer ours
             prev = self.rev
             with self.lock:
@@ -842,15 +846,16 @@ class Feed:
                                     or (projection.observation_parent is None and held_projection is not None
                                         and held_projection.observation_parent is not None
                                         and held_projection.admission == projection.admission)):
-                                _results[s] = _projection().PublishResult('superseded')
+                                _results[s] = projection_module.PublishResult('superseded')
                                 continue
                             module = sys.modules[type(_snapshot_store).__module__]
                             b = module.thaw(projection.bundle)
                             did_change = self._store(s, b, board_current=True,
-                                                     observation_only=projection.observation_parent is not None)
+                                                     observation_only=projection.observation_parent is not None,
+                                                     projection_module=projection_module, reducer=projection_reducer)
                             self.bundles[s]['board_admission'] = projection.admission
                             self.bundles[s]['board_projection'] = projection
-                            _results[s] = _projection().PublishResult('stored' if did_change else 'no_change', did_change,
+                            _results[s] = projection_module.PublishResult('stored' if did_change else 'no_change', did_change,
                                 revision=self.bundles[s]['rev'])
                             if did_change:
                                 changed[s] = self.bundles[s]['bundle']
@@ -880,7 +885,7 @@ class Feed:
                         for s in changed:
                             if s in _results:
                                 prior_result = _results[s]
-                                _results[s] = _projection().PublishResult(prior_result.disposition, prior_result.changed,
+                                _results[s] = projection_module.PublishResult(prior_result.disposition, prior_result.changed,
                                     True, prior_result.revision)
                     if changed:
                         self._note_publish(changed)

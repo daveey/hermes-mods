@@ -61,6 +61,24 @@ def project(f, store, chat, *, pin=None, canonical=None, seq=None):
     return f.project_board(store, chat, canonical_base=canonical or base(chat), pin=pin, seq=seq)
 
 
+def test_publication_preloads_source_modules_outside_store_borrow(monkeypatch):
+    m, store, local, _, (chat,), f = setup(external=False)
+    capture(m, store, local, {'S1': 'scheduled'})
+    p = project(f, store, chat)
+    for name in ('_projection', '_model'):
+        original = getattr(feedmod, name)
+        def outside(*args, _original=original, **kwargs):
+            assert not store._lock._is_owned(), 'source-module filesystem I/O inside store publication borrow'
+            return _original(*args, **kwargs)
+        monkeypatch.setattr(feedmod, name, outside)
+    assert f.publish_projections(store, {chat.session_id: p})[chat.session_id].disposition == 'stored'
+    canonical = {**base(chat), 'canonical_seq': 3, 'input_errors': ['current canonical unavailable']}
+    f._publish({chat.session_id: canonical}, canonical_only=True)
+    newer = project(f, store, chat)
+    assert f.publish_projections(store, {chat.session_id: newer})[chat.session_id].disposition == 'no_change'
+    assert 'current canonical unavailable' in f.bundles[chat.session_id]['bundle']['input_errors']
+
+
 def test_partial_local_progress_during_held_external_capture():
     m, store, local, remote, (chat,), f = setup()
     capture(m, store, local, {'S1': 'ready'})
