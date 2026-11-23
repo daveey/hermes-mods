@@ -531,6 +531,53 @@ test('refresh failure restores the locked ask; failed POST operation never hides
  }
  m.resetFeedForTests()
 })
+test('delayed refresh retires only its exact receipt across owners, revisions and request IDs', async () => {
+ let caseIndex = 0
+ for (const variant of ['owner', 'revision', 'request']) for (const outcome of ['failure', 'success', 'stale']) {
+  m.resetFeedForTests()
+  const before = structuredClone(publicCases.own_letters.model)
+  const a = before.sections.needs_you[0]; a.request_revision += 700 + 10 * caseIndex++
+  a.actions.find(x => x.kind === 'decide').revision = a.request_revision
+  const b = structuredClone(a)
+  if (variant === 'owner') b.actions.find(x => x.kind === 'decide').owner.gatewayId += '-other'
+  if (variant === 'revision') { b.request_revision++; b.actions.find(x => x.kind === 'decide').revision++ }
+  if (variant === 'request') { b.request_id += '-other'; b.actions.find(x => x.kind === 'decide').request_id = b.request_id }
+  b.key += '-other'
+  before.sections.needs_you = [a, b]; before.header.counts.needs_you = 2
+  const route = { connectionId: 'isolation-' + variant + outcome, profile: 'default', session: 'isolation-chat' }
+  const pending = []; let posts = 0
+  const requestFor = row => ({ requestId: row.request_id, revision: row.request_revision, state: 'open',
+    owner: row.actions.find(x => x.kind === 'decide').owner, scope: { complete: true, markdown: 'Exact scope' },
+    choices: [{ id: row.options[0].choice_id, effect: 'answer', label: 'Pick' }] })
+  const choose = async (row, id) => {
+   const request = requestFor(row)
+   await m.chooseModelOption(row, row.options[0], route, { call: async (path, opts) => {
+    if (path.endsWith('/decision-refresh')) return new Promise((resolve, reject) => pending.push({ resolve, reject }))
+    if (path.endsWith('/decisions')) { posts++; return { operation: { operationId: id, dispatchState: 'recorded',
+      idempotencyKey: opts.body.idempotencyKey }, request: { ...request, resolution: { operationId: id } } } }
+    return { request }
+   } })
+  }
+  m.ingestBundle(route.connectionId, route.profile, { session: route.session, model: before }, { feed: 'f', epoch: 'e', rev: 10 })
+  await choose(a, variant + outcome + '-a'); await choose(b, variant + outcome + '-b')
+  assert.equal(m.decisionPresentation(before, route).header.counts.needs_you, 0)
+  if (outcome === 'failure') pending[0].reject(Error('Only A refresh failed'))
+  else pending[0].resolve({ feed: 'f', epoch: 'e', rev: outcome === 'stale' ? 9 : 11,
+    bundle: { session: route.session, model: before } })
+  await new Promise(resolve => setTimeout(resolve, 0))
+  const presented = m.decisionPresentation(m.cachedModel(route), route)
+  assert.equal(presented.sections.waiting.filter(row => row.request_id === b.request_id && row.key === b.key).length, 1,
+    variant + '/' + outcome + ': B remains provisionally waiting')
+  assert.ok(!m.modelDecisionStatus(b).text.includes('Only A'), 'A error never reaches B')
+  assert.equal(m.modelDecisionStatus(b).locked, true)
+  await paint(m.renderModel(presented, { decisionStatus: m.modelDecisionStatus, onCheck: () => {} }))
+  assert.equal(document.querySelectorAll('[data-model-section="waiting"]').length, 1)
+  assert.equal(posts, 2, 'no decision repost')
+  pending[1].reject(Error('B cleanup')); await new Promise(resolve => setTimeout(resolve, 0))
+  await paint(null); window.localStorage.clear()
+ }
+ m.resetFeedForTests()
+})
 test('operation failure readback restores a provisional row without posting again', async () => {
  m.resetFeedForTests()
  const before = structuredClone(publicCases.own_letters.model)
