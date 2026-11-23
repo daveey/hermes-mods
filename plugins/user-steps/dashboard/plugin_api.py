@@ -67,6 +67,9 @@ async def _on_decision(fn, *args):
 # Background re-delivery of decisions refused because the session was mid-turn. ~1h of attempts, then manual Retry.
 RETRY_INTERVAL_S = float(os.environ.get('HERMES_USER_STEPS_RETRY_S', '15'))
 RETRY_MAX_ATTEMPTS = 240
+# GET /requests skips the remote card pass for an owner whose strict feed pass finished cleanly within this window
+# (``Mirror.reconcile_poll``); 0 turns the skip off. Matches the linked-card projection's max age.
+FEED_FRESH_S = float(os.environ.get('HERMES_USER_STEPS_FEED_FRESH_S', '15'))
 
 
 _LOAD_LOCK = threading.Lock()
@@ -476,7 +479,9 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         def action():
             own = owner(session)
             try:
-                mirror().reconcile(own)
+                producer = mirror()
+                poll = getattr(producer, 'reconcile_poll', None)  # an injected mirror without it: full pass
+                poll(own, FEED_FRESH_S) if poll is not None else producer.reconcile(own)
             except (ValueError, sqlite3.Error, OSError):
                 logging.getLogger('user-steps').exception('Card projection reconciliation deferred')
             st = migrate(own)

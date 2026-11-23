@@ -39,6 +39,26 @@ _EVENT_KINDS = ("created", "blocked", "block_loop_detected", "unblocked", "archi
 _MEMO: dict = {}  # owner key -> (inputs key, monotonic time of the full pass that produced it)
 _MEMO_LOCK = threading.Lock()
 _MEMO_MAX = 256
+_REMOTE_FRESH: dict = {}  # owner key -> monotonic start of its last clean strict pass (``Mirror.reconcile``)
+_REMOTE_FRESH_LOCK = threading.Lock()
+_REMOTE_FRESH_MAX = 512
+
+
+def _mark_remote_fresh(key, started):
+    with _REMOTE_FRESH_LOCK:
+        if started >= _REMOTE_FRESH.get(key, float('-inf')):
+            _REMOTE_FRESH.pop(key, None)
+            _REMOTE_FRESH[key] = started
+        while len(_REMOTE_FRESH) > _REMOTE_FRESH_MAX:
+            del _REMOTE_FRESH[next(iter(_REMOTE_FRESH))]
+
+
+def _remote_fresh(key, within_s):
+    with _REMOTE_FRESH_LOCK:
+        started = _REMOTE_FRESH.get(key)
+    return started is not None and 0 <= time.monotonic() - started <= within_s
+
+
 _POOL: dict = {}
 _POOL_LOCK = threading.Lock()
 _POOL_MAX = 64
@@ -742,8 +762,22 @@ class Mirror:
                 return False
         return True
 
+    def reconcile_poll(self, owner, fresh_s):
+        """The Desktop request poll: ``reconcile`` without the remote pass while a strict pass for this owner
+        completed cleanly and started within ``fresh_s`` seconds; the local pass still runs. [daveey] The session
+        panel's feed runs that strict pass for every watched chat whenever its sources move, and the remote pass
+        waits on the linked-card projection (3-7 s per poll on the hub, 2026-11-23). An owner no feed covers, or
+        whose last strict pass failed, is reconciled in full here as before."""
+        self.core.validate_owner(owner)
+        if fresh_s > 0 and _remote_fresh(encoded(owner), fresh_s):
+            self._reconcile_local(owner, False)
+            return
+        self.reconcile(owner)
+
     def reconcile(self, owner, *, strict=False):
         self.core.validate_owner(owner)
+        key = encoded(owner)
+        started = time.monotonic()
         deferred = None
         try:
             if self.remote.reconcile(owner) is False:
@@ -756,6 +790,8 @@ class Mirror:
         self._reconcile_local(owner, strict)
         if strict and deferred is not None:
             raise deferred
+        if strict:  # both halves clean (a strict local pass raises when it is not)
+            _mark_remote_fresh(key, started)
 
     def _reconcile_local(self, owner, strict):
         with _accounted_pass("user_steps.mirror_reconcile") as acct:
