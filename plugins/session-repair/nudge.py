@@ -22,29 +22,65 @@ def config_mode(home):
     return value if value in ('shadow', 'live') else 'shadow'
 
 
+def plain(value, limit):
+    return ' '.join(str(value or 'unknown').split())[:limit]
+
+
+def producer_line(producer):
+    state = (producer or {}).get('state')
+    if not isinstance(state, dict):
+        return plain(state, 180)
+    # Allowlist scalar facts; never render checks, task bodies or raw JSON.
+    facts = [state.get(k) for k in ('status', 'conclusion', 'state', 'reviewDecision')]
+    checks = state.get('statusCheckRollup') or []
+    if checks:
+        green = all(x.get('conclusion') == 'SUCCESS' or x.get('state') == 'SUCCESS' for x in checks)
+        facts.append('CI green' if green else 'CI not all green')
+    return plain(' / '.join(str(x) for x in facts if x), 180)
+
+
 def message(f, times):
     e = f['evidence']
     def age(n):
         n = int(n or 0)
         return f'{n//3600}h {n%3600//60}m'
-    text = (f"[session-repair] You've been waiting on {e.get('kind')} {e.get('ref')} for "
+    text = (f"[session-repair] You've been waiting on {plain(e.get('kind'), 20)} {plain(e.get('ref'), 180)} for "
             f"{age(e.get('waited_s'))} (limit {age(e.get('threshold_s'))}). Live state: "
-            f"{json.dumps(e.get('live_producer'), default=str)}. Are you stuck? If the event happened, continue now. "
+            f"{producer_line(e.get('live_producer'))}. Are you stuck? If the event happened, continue now. "
             "If the wait is still right, re-park with a fresh reason/wake. If you can't move, block with the real reason.")
     if times:
         stamps = ', '.join(datetime.datetime.fromtimestamp(t, datetime.timezone.utc).isoformat() for t in times)
         text += f' Nudge #{len(times)+1}; earlier nudges: {stamps}.'
-    return text
+    return text[:850]
+
+
+# A watch/probe is not an answer, even if it borrows a run id. Positive owner vocabulary only.
+OWNER_EVENTS = {'claimed', 'spawned', 'owner_admitted', 'worker_bound', 'heartbeat',
+                'scheduled', 'blocked', 'continued', 'completed', 'review_requested', 'status', 'retained', 'contained'}
 
 
 def progress(scan, src, f):
     if f.get('card'):
         c = src.conn(f['board'])
-        for ev in scan._events(c, f['card'], limit=200):
+        # Filter in SQL, not a fixed last-200 window: many probe ticks must not hide the last owner event.
+        kinds = (*OWNER_EVENTS, 'commented')
+        events = scan._events(c, f['card'], kinds=kinds, limit=10000)
+        for ev in events:
             if ev['kind'] == 'commented':
-                row = c.execute('SELECT body FROM task_comments WHERE id=?', (ev['payload'].get('comment_id'),)).fetchone()
-                if row and row[0].startswith('[session-repair]'):
+                row = c.execute('SELECT body FROM task_comments WHERE task_id=? AND id=?',
+                                (f['card'], ev['payload'].get('comment_id'))).fetchone()
+                if not row or row[0].startswith('[session-repair]'):
                     continue
+                owner = c.execute('SELECT 1 FROM task_runs WHERE task_id=? AND id=?',
+                                  (f['card'], ev['payload'].get('writer_run_id'))).fetchone()
+                writer = ev['payload'].get('writer_session')
+                if not owner and writer:
+                    owner = c.execute('SELECT 1 FROM tasks WHERE id=? AND session_id=?',
+                                      (f['card'],writer)).fetchone()
+                if not owner:
+                    continue
+            elif ev['kind'] not in OWNER_EVENTS:
+                continue
             return ev['id']
         return 0
     c = src.state_conn()
@@ -86,6 +122,98 @@ def receipt(src, f, text):
     return {'message_id':row[0], 'chat':f['chat']} if row else None
 
 
+def wake_owner(scan, src, f, rec, text):
+    """One supported core unblock, fenced under its write transaction; never raw board writes.
+
+    The comment alone does not wake scheduled owners. The nudge is a reassessment,
+    not proof the producer happened, and cannot release a deliberate hold.
+    """
+    if not f.get('card'):
+        return {'outcome':'chat_turn'}
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    from hermes_cli.kanban_release_comments import check
+    from hermes_cli.kanban_spend_decision import pending, execution_refusal
+    from hermes_cli.kanban_wake_check import foreign_ids
+    import os
+
+    tid, cid = f['card'], rec['comment_id']
+    path = dict(src.boards()).get(f['board'])
+    if path is None:
+        return {'outcome':'wake_refused','reason':'board unavailable'}
+    with connect_closing(path) as c:
+        def prior():
+            for ev in scan._events(c, tid, kinds=('unblocked',), limit=10000):
+                if ev['payload'].get('session_repair_nudge') == cid:
+                    return {'outcome':'woken','event_id':ev['id'],'at':ev['at'],'comment_id':cid,
+                            'status':ev['payload'].get('status','ready')}
+            return None
+
+        def eligible(conn):
+            task = kb.get_task(conn, tid)
+            if not task or task.status not in ('scheduled','blocked') or task.current_run_id:
+                return 'owner moved or has a run'
+            card = scan.Card(tid, f['board'], f.get('chat'), task, conn, None)
+            if (scan._human_request(task)[1] or scan._promotion_held(conn, card)
+                    or pending(conn, tid) or execution_refusal(conn, tid) or tid in foreign_ids(conn)):
+                return 'human, spend, recovery, containment or foreign hold'
+            if conn.execute("SELECT 1 FROM task_runs WHERE task_id=? AND status='running'", (tid,)).fetchone():
+                return 'owner running'
+            park = scan.current_park(card)
+            from hermes_cli.kanban_wait_info import parse_awaiting
+            awaited = parse_awaiting(park['payload'].get('awaiting')) if park else None
+            if (not park or park['id'] != f['evidence']['park_id'] or not awaited
+                    or awaited['kind'] not in scan.LONG_WAIT_S):
+                return 'park changed or clock wait'
+            baseline = f['evidence']['last_event']['id']
+            for ev in scan._events(conn, tid, limit=10000):
+                if ev['id'] <= baseline:
+                    break
+                if ev['kind'] in ('external_watch','wake_check_alive','wake_probe_unproven_notice'):
+                    continue
+                if ev['kind']=='commented' and ev['payload'].get('comment_id')==cid:
+                    continue
+                return 'event changed after scan'
+            row = conn.execute('SELECT body FROM task_comments WHERE task_id=? AND id=?', (tid,cid)).fetchone()
+            if not row or row[0] != text:
+                return 'receipt mismatch'
+            # Revalidate comment/event identity inside the lock; a new watch tick is safe,
+            # a changed park/owner or any other comment is not.
+            last_comment = conn.execute('SELECT MAX(id) FROM task_comments WHERE task_id=?', (tid,)).fetchone()[0]
+            if last_comment != cid:
+                return 'new comment after receipt'
+            check(conn, tid, session=os.environ.get('HERMES_SESSION_ID'), seen=cid,
+                  verb='unblock', board=f['board'])
+            return None
+
+        old = prior()
+        if old:
+            return old
+        refusal = []
+        def guarded(conn):
+            why = eligible(conn)
+            if why:
+                refusal.append(why)
+            return why
+        # Core owns the transaction; eligibility runs under its write lock, before mutation.
+        ok = kb.unblock_task(c, tid, precondition=guarded,
+                             event_extra={'session_repair_nudge':cid, 'fingerprint':f['fingerprint'],
+                                          'park_id':f['evidence']['park_id']})
+        result = prior()
+        return result or {'outcome':'wake_unknown' if ok else 'wake_refused',
+                          'reason':refusal[0] if refusal else 'core refused unblock'}
+
+
+def finish_delivery(scan, src, f, history, rec, text):
+    # A crash after the unblock is recoverable by its exact event/comment identity.
+    try:
+        wake = wake_owner(scan, src, f, rec, text)
+    except Exception as exc:
+        wake = {'outcome':'wake_unknown','reason':type(exc).__name__}
+    history['wake'] = wake
+    return wake
+
+
 def process(findings, *, home, now, scan, runner, argv, read_json, write_json, append):
     sd = home / 'session-repair'
     mode = config_mode(home)
@@ -95,7 +223,12 @@ def process(findings, *, home, now, scan, runner, argv, read_json, write_json, a
     actions, escalations = [], []
     deadline = time.monotonic() + 300  # leave remaining candidates for the next 15-minute tick
     room = min(PER_RUN, max(0, PER_DAY-len(state['sent'])))
-    for original in findings:
+    # Recover frozen deliveries even if the wake has already moved the target out of scanner eligibility.
+    by_fp = {f['fingerprint']:f for f in findings}
+    for fp, h in state['fps'].items():
+        if h.get('pending', {}).get('finding'):
+            by_fp[fp] = h['pending']['finding']
+    for original in by_fp.values():
         if time.monotonic() >= deadline:
             break
         fp = original['fingerprint']
@@ -106,10 +239,15 @@ def process(findings, *, home, now, scan, runner, argv, read_json, write_json, a
             src = scan.Sources()
             rec = receipt(src, original, pending['text'])
             if rec:
-                history['times'].append(pending['at'])
+                wake = finish_delivery(scan, src, original, history, rec, pending['text'])
+                if pending['at'] not in history['times']:
+                    history['times'].append(pending['at'])
                 history['receipt'] = rec
-                history.pop('pending')
-                append(sd/'nudges-live.jsonl', [{'at':now,'fingerprint':fp,'outcome':'nudged','receipt':rec,'recovered':True}])
+                if wake['outcome'] != 'wake_unknown':
+                    history.pop('pending')
+                actions.append({'at':now,'fingerprint':fp,'outcome':'nudged','receipt':rec,'wake':wake,'recovered':True})
+                write_json(path,state)
+                continue
             else:
                 actions.append({'fingerprint':fp,'outcome':'delivery_unknown','pending_at':pending['at']})
                 continue
@@ -118,9 +256,13 @@ def process(findings, *, home, now, scan, runner, argv, read_json, write_json, a
             actions.append({'fingerprint':fp,'outcome':'moved_on'})
             continue
         checkpoint = progress(scan, src, current)
-        if history.get('progress') != checkpoint:
+        previous = history.get('progress')
+        if previous is None or checkpoint > previous:
             history.update(times=[], progress=checkpoint)
             history.pop('escalated', None)
+        else:
+            # Migrating from probe-inclusive progress must not erase a real send/cooldown.
+            history['progress'] = checkpoint
         times = history['times']
         if times and now-times[-1] < INTERVAL_S:
             continue
@@ -142,14 +284,14 @@ def process(findings, *, home, now, scan, runner, argv, read_json, write_json, a
             continue
         text = message(current, times)
         marker = f"\n[session-repair receipt {fp} {now}]"
-        text += marker
+        text = text[:max(0, 1000-len(marker))] + marker
         action = {'at':now,'fingerprint':fp,'finding':current,'would':'nudge','nudge_count':len(times)+1,'earlier_times':list(times)}
         if mode == 'shadow':
             actions.append({**action,'outcome':'would_nudge'})
             times.append(now)
             state['sent'].append(now)
         else:
-            history['pending'] = {'text':text,'at':now}
+            history['pending'] = {'text':text,'at':now,'finding':current}
             state['sent'].append(now)  # reserve even uncertain delivery against the rolling cap
             write_json(path,state)  # write-ahead; a timeout cannot silently double-send
             if current.get('card'):
@@ -176,10 +318,12 @@ def process(findings, *, home, now, scan, runner, argv, read_json, write_json, a
             except Exception:
                 rec = None
             if rec:
+                wake = finish_delivery(scan, scan.Sources(), current, history, rec, text)
                 times.append(now)
-                history.pop('pending',None)
+                if wake['outcome'] != 'wake_unknown':
+                    history.pop('pending',None)
                 history['receipt'] = rec
-                actions.append({**action,'outcome':'nudged','receipt':rec})
+                actions.append({**action,'outcome':'nudged','receipt':rec,'wake':wake})
             else:
                 actions.append({**action,'outcome':'delivery_unknown'})
         room -= 1
