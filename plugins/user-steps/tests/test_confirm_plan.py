@@ -111,6 +111,37 @@ def test_trailing_limits_are_frozen_too(tmp_path):
     assert limit in requests[0]['scope']['markdown']
 
 
+@pytest.mark.parametrize('source', [None, 'session_outcome'])
+@pytest.mark.parametrize('before', [False, True])
+def test_distinct_confirmation_never_widens_scope(tmp_path, source, before):
+    other = 'Say yes to also deploy production.'
+    reply = PLAN + '\n\n' + (other + '\n\n' + ASK if before else ASK + '\n\n' + other)
+    _, requests, _ = publish(tmp_path, reply, source=source)
+    assert not any(r['scope']['complete'] for r in requests)
+    assert not any(c['effect'] == 'approve' for r in requests for c in r['choices'])
+
+
+@pytest.mark.parametrize('source', [None, 'session_outcome'])
+@pytest.mark.parametrize('opening,interior,closing', [
+    ('````markdown', '```example', '````'),
+    ('`````markdown', '````', '`````'),
+    ('~~~~markdown', '~~~', '~~~~'),
+    ('~~~~~markdown', '~~~~', '~~~~~'),
+])
+def test_fenced_confirmation_never_becomes_authorizing(tmp_path, source, opening, interior, closing):
+    reply = PLAN + '\n\n' + '\n'.join([opening, interior, ASK, interior, closing])
+    _, requests, _ = publish(tmp_path, reply, source=source)
+    assert not any(r['scope']['complete'] for r in requests)
+    assert not any(c['effect'] == 'approve' for r in requests for c in r['choices'])
+
+
+def test_closed_code_in_plan_preserves_limits(tmp_path):
+    code = '\n\n````text\n```example\nNo network writes.\n```\n````'
+    _, requests, _ = publish(tmp_path, PLAN + code + '\n\n' + ASK)
+    assert requests[0]['scope']['complete'] is True
+    assert code in requests[0]['scope']['markdown']
+
+
 def test_change_plan_is_non_authorizing_and_retains_exact_plan(tmp_path):
     store, requests, _ = publish(tmp_path, PLAN + '\n\n' + ASK)
     op = store.decide(OWNER, decision(requests[0], choice='change-plan', text='Use a smaller patch'))['operation']
