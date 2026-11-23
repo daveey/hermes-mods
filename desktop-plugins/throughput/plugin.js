@@ -1093,6 +1093,49 @@ export const CSS = `
 .hermes-tp-warn{color:var(--ui-orange,#c2410c)}
 `
 
+// Additive plugin-owned area protocol, shared with lanes; no dependency on it.
+export function stripArea() {
+  const key = Symbol.for('hermes.lanes.stripRight.v1')
+  return globalThis[key] ||= { hosts: new Set(), item: null, listeners: new Set(),
+    notify() { for (const fn of [...this.listeners]) fn() } }
+}
+
+// The lease is released only after the old placement has committed its unmount.
+// Two independently committed roots must never each run Throughput's subscriptions.
+export function ExclusiveChip({ ctx, component = Throughput }) {
+  const area = stripArea(), token = useRef({}).current
+  const [owned, setOwned] = useState(false)
+  useEffect(() => {
+    const acquire = () => {
+      if (!area.lease) { area.lease = token; setOwned(true) }
+    }
+    area.listeners.add(acquire); acquire()
+    return () => {
+      area.listeners.delete(acquire)
+      if (area.lease === token) { area.lease = null; area.notify() }
+    }
+  }, [area, token])
+  return owned ? h(component, { ctx }) : null
+}
+
+export function ChipPlacement({ ctx, component }) {
+  const area = stripArea()
+  const [, update] = useState(0)
+  useEffect(() => {
+    const changed = () => update((n) => n + 1)
+    area.listeners.add(changed)
+    return () => area.listeners.delete(changed)
+  }, [area])
+  return area.hosts.size ? null : h(ExclusiveChip, { ctx, component })
+}
+
+export function registerStripChip(ctx, component = Throughput) {
+  const area = stripArea()
+  const item = { render: () => h(ExclusiveChip, { ctx, component }) }
+  area.item = item; area.notify()
+  return () => { if (area.item === item) { area.item = null; area.notify() } }
+}
+
 export default {
   id: 'throughput',
   name: 'Throughput',
@@ -1102,7 +1145,8 @@ export default {
     style.textContent = CSS
     document.head.append(style)
     ctx.onDispose(() => style.remove())
-    ctx.register({ id: 'chip', area: STATUSBAR_AREAS.right, order: 7, render: () => h(Throughput, { ctx }) })
+    ctx.onDispose(registerStripChip(ctx))
+    ctx.register({ id: 'chip', area: STATUSBAR_AREAS.right, order: 7, render: () => h(ChipPlacement, { ctx }) })
     ctx.register({
       id: 'show-throughput',
       area: PALETTE_AREA,

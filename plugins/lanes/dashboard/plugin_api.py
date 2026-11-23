@@ -257,6 +257,27 @@ def _current_view(mods, hours, window, expanded, *, variants=False):
         return _view_module().project(snap, None, expanded)
 
 
+def token_series(db, policy, *, now=None):
+    """Six-hour, 10-minute buckets from canonical run-end usage, like core usage().
+
+    A repeated worker_result for one task/run contributes its maximum reported
+    usage once, at the latest report time. Do not merge local/fleet accounting.
+    """
+    now = int(time.time() if now is None else now)
+    cutoff = now - 21600
+    out = {name: [0] * 36 for name in policy.lanes}
+    for tenant, stamp, tokens in db.execute(
+            "SELECT t.tenant, MAX(e.created_at), "
+            "MAX(COALESCE(json_extract(e.payload, '$.usage.input_tokens'), 0) + "
+            "COALESCE(json_extract(e.payload, '$.usage.output_tokens'), 0)) "
+            "FROM task_events e JOIN tasks t ON t.id=e.task_id "
+            "WHERE e.kind='worker_result' AND e.created_at > ? "
+            "AND json_extract(e.payload, '$.usage') IS NOT NULL GROUP BY e.task_id,e.run_id", (cutoff,)):
+        bucket = min(35, max(0, int((stamp - cutoff) // 600)))
+        out[policy.lane_of(tenant)][bucket] += int(tokens or 0)
+    return out
+
+
 def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants=False):
     """Same hub-computed projection for owned in-process or borrowed RPC readers."""
     snap = mods[2].snapshot(conn, hours=hours, evidence=evidence)
@@ -272,6 +293,9 @@ def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants
                 reader = _observations().reader(contexts)
             raw = flow_mod.snapshot(evidence.conn, window=window, reader=reader, evidence=evidence)
             raw['configured'] = bool(raw.get('lanes'))
+            pol = mods[1].policy()
+            if pol is not None:
+                raw['strip_tokens'] = token_series(evidence.conn, pol)
         except Exception as exc:
             raw = {'configured': False, 'reason': f'lanes flow is unavailable: {exc}'}
     if variants:

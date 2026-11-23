@@ -61,7 +61,7 @@ def test_collapsed_view_carries_all_lanes_status_counts(monkeypatch):
         strips = {n: view['lanes'][n]['strip'] for n in ('a', 'b')}
         assert sum(s['blocked'] for s in strips.values()) == view['status']['you']
         assert sum(s['running'] for s in strips.values()) == view['status']['run']
-        assert sum(sum(s.values()) for s in strips.values()) == len(cards)
+        assert sum(s[k] for s in strips.values() for k in ('blocked', 'running', 'other')) == len(cards)
         for key in view['status']:  # per-lane status adds up to the all-lanes totals
             assert sum(view['lanes'][n]['status'][key] for n in ('a', 'b')) == view['status'][key]
     collapsed = api.lane_view(6, '6h', False)
@@ -87,6 +87,62 @@ def test_collapsed_view_maps_open_cards_to_their_sessions(monkeypatch):
     monkeypatch.setattr(api, 'flow', lambda window: {'configured': True, 'cards': cards, 'lanes': {}})
     assert api.lane_view(6, '6h', False)['sessions'] == {
         's1': {'a': {'you': 1, 'run': 1}, 'b': {'dep': 1}}, 's2': {'b': {'worker': 1}}}
+
+
+@pytest.mark.parametrize('maximum,target,running,cap,inside,over', [
+    (2, .5, 7, 2, 2, 5), (None, .25, 7, 2, 2, 5),
+    (2, .5, 0, 2, 0, 0), (0, .5, 7, 0, 0, 7), (None, .5, 0, 0, 0, 0)])
+def test_strip_capacity_wait_and_tokens(maximum, target, running, cap, inside, over):
+    project = load()._view_module().project
+    cards = [dict(lane='work', reason=r) for r in ['run'] * running + ['you', 'dep', 'dep', 'slot', 'mystery']]
+    snap = {'lanes': {'work': {'target': target}}}
+    raw = {'cards': cards, 'lanes': {'work': {'limits': {'max_workers': maximum}}},
+           'strip_tokens': {'work': [10] * 36}}
+    for expanded in (False, True):
+        # Expanded fixtures need the normal card identity/step metadata.
+        for i, card in enumerate(cards):
+            card.update(id=f't_{i}', step='waiting')
+        strip = project(snap, raw, expanded)['lanes']['work']['strip']
+        assert (strip['cap'], strip['in_share'], strip['over']) == (cap, inside, over)
+        assert strip['wait'] == {'dep': 2, 'slot': 1, 'mystery': 1}
+        assert sum(strip['wait'].values()) == strip['other'] == 4
+        assert strip['tokens'] == [10] * 36
+    old = project(snap, {'lanes': {}}, False)['lanes']['work']
+    assert 'strip' not in old and 'status' not in old
+
+
+def test_strip_token_buckets_deduplicate_and_match_usage_window():
+    import json
+    import sqlite3
+    from contextlib import closing
+    from types import SimpleNamespace
+    api = load()
+    pol = SimpleNamespace(lanes={'work': {}, 'idle': {}}, lane_of=lambda t: 'work')
+    with closing(sqlite3.connect(':memory:')) as db:
+        db.executescript('CREATE TABLE tasks(id TEXT,tenant TEXT); '
+                         'CREATE TABLE task_events(task_id TEXT,run_id INTEGER,kind TEXT,created_at INTEGER,payload TEXT);')
+        db.execute("INSERT INTO tasks VALUES ('t_1','mapped-tenant')")
+        now = 100000
+        def seed(run, stamp, tokens, kind='worker_result'):
+            db.execute('INSERT INTO task_events VALUES (?,?,?,?,?)',
+                       ('t_1', run, kind, stamp, json.dumps({'usage': {'input_tokens': tokens, 'output_tokens': 3}})))
+        seed(1, now-21600, 900)  # cutoff excluded, as in core usage
+        seed(2, now-21599, 10)
+        seed(2, now-21598, 20)  # one task/run, maximum once
+        seed(3, now-600, 30)
+        seed(4, now, 40)
+        seed(5, now-10, 900, 'heartbeat')
+        series = api.token_series(db, pol, now=now)
+        assert len(series['work']) == 36
+        assert series['work'][0] == 23 and series['work'][35] == 76
+        assert series['idle'] == [0] * 36
+        # Exactly core usage()'s aggregate; a bucket query must not sum duplicate reports.
+        total = db.execute("SELECT SUM(tokens) FROM (SELECT MAX("
+            "COALESCE(json_extract(payload,'$.usage.input_tokens'),0) + "
+            "COALESCE(json_extract(payload,'$.usage.output_tokens'),0)) AS tokens "
+            "FROM task_events WHERE kind='worker_result' AND created_at > ? "
+            "AND json_extract(payload,'$.usage') IS NOT NULL GROUP BY task_id,run_id)", (now-21600,)).fetchone()[0]
+        assert sum(series['work']) == total == 99
 
 
 def test_get_flow_returns_the_same_expanded_view(monkeypatch):

@@ -107,11 +107,26 @@ def project(snap, raw, expanded):
                       ('running', 'not_ready', 'blocked_on_you', 'open', 'ready', 'held', 'done')}
     if raw and raw.get('configured') is not False and 'cards' in raw:
         view['status'] = status_counts(raw['cards'])
-        # Per-lane strip counts from the same card reasons, so a lane's red always adds up to the total's red.
+        # The same card evidence owns counts and the fleet fair-share denominator.
+        fleet_running = sum(c.get('reason') == 'run' for c in raw['cards'])
+        idle = [name for name, row in view['lanes'].items() if not row['ready']]
         for name, row in view['lanes'].items():
-            lane = Counter(status_of(c.get('reason')) for c in raw['cards'] if c.get('lane') == name)
+            reasons = Counter(c.get('reason') or 'unknown' for c in raw['cards'] if c.get('lane') == name)
+            lane = Counter()
+            for reason, count in reasons.items():
+                lane[status_of(reason)] += count
+            limits = raw.get('lanes', {}).get(name, {}).get('limits') or row.get('limits') or {}
+            maximum = limits.get('max_workers')
+            cap = maximum if maximum is not None else round(row.get('target', 0) * fleet_running)
             row['strip'] = {'blocked': lane['you'], 'running': lane['run'],
-                            'other': sum(lane.values()) - lane['you'] - lane['run']}
+                            'other': sum(lane.values()) - lane['you'] - lane['run'],
+                            'cap': cap, 'in_share': min(lane['run'], cap), 'over': max(0, lane['run'] - cap),
+                            'wait': {r: n for r, n in reasons.items() if r not in ('you', 'run')},
+                            'cap_kind': 'max' if maximum is not None else 'fair share',
+                            'fleet_running': fleet_running, 'idle_lanes': [n for n in idle if n != name]}
+            series = raw.get('strip_tokens', {}).get(name)
+            if series is not None:
+                row['strip']['tokens'] = series
             row['status'] = {key: lane.get(key, 0) for key in STATUS}  # the strip's totals for a lane selection
         view['sessions'] = session_counts(raw['cards'])
     if not expanded:
