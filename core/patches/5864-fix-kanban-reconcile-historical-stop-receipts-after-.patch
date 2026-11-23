@@ -1,0 +1,273 @@
+From e46da8c7cdb9848f278011e3c68ea8361a1c7832 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 17:17:14 +0000
+Subject: [PATCH] fix(kanban): reconcile historical stop receipts after renewal
+ [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_protect_evidence.py         |  3 +-
+ hermes_cli/kanban_protect_guards.py           | 23 +++++++++--
+ hermes_cli/kanban_protect_operator.py         | 12 +++---
+ hermes_cli/kanban_protect_transport.py        | 18 +++++++--
+ .../test_kanban_protect_stopped_board.py      | 40 +++++++++++++++++--
+ .../test_kanban_protect_stopped_local.py      | 40 ++++++++++++++++---
+ 6 files changed, 113 insertions(+), 23 deletions(-)
+
+diff --git a/hermes_cli/kanban_protect_evidence.py b/hermes_cli/kanban_protect_evidence.py
+index f4003b07c6f..fbde12a1c6d 100644
+--- a/hermes_cli/kanban_protect_evidence.py
++++ b/hermes_cli/kanban_protect_evidence.py
+@@ -47,8 +47,7 @@ def rows(hub, board, wire, home):
+             or p.get('run_uid') != wire['source_run_uid'] or p.get('reason_code') != 'provider_refusal'
+             or p.get('tripped') is not True or p.get('final_status') != 'triage'
+             or p.get('infrastructure', False) is not False or run.get('ended_at') is None
+-            or run.get('status') == 'running' or target.get('created_on') != home
+-            or target.get('status') not in ('triage', 'archived') or target.get('current_run_uid') is not None):
++            or run.get('status') == 'running' or target.get('created_on') != home):
+         raise ValueError('protect canonical target/source/run changed')
+     return source, run, target
+ 
+diff --git a/hermes_cli/kanban_protect_guards.py b/hermes_cli/kanban_protect_guards.py
+index 589e8eea24f..6f722926f91 100644
+--- a/hermes_cli/kanban_protect_guards.py
++++ b/hermes_cli/kanban_protect_guards.py
+@@ -17,12 +17,20 @@ def install(conn):
+                 "OR OLD.id=json_extract(ps.payload,'$.episode_row_id') "
+                 "OR OLD.id=json_extract(ps.payload,'$.restriction_row_id')))")
+     # Lazy uid bootstrap on unsynced boards assigns NULL -> uid only; any other change stays fenced.
+-    uid_only = ("(OLD.uid IS NULL AND NEW.uid IS NOT NULL AND NEW.task_id IS OLD.task_id AND NEW.kind IS OLD.kind "
+-                "AND NEW.payload IS OLD.payload AND NEW.run_id IS OLD.run_id AND NEW.created_at IS OLD.created_at)")
++    columns = {r[1] for r in conn.execute('PRAGMA table_info(task_events)')}
++    origin_same = ' AND NEW.origin_gateway IS OLD.origin_gateway' if 'origin_gateway' in columns else ''
++    uid_only = ("(OLD.uid IS NULL AND NEW.uid IS NOT NULL AND NEW.id IS OLD.id "
++                "AND NEW.task_id IS OLD.task_id AND NEW.kind IS OLD.kind "
++                "AND NEW.payload IS OLD.payload AND NEW.run_id IS OLD.run_id AND NEW.created_at IS OLD.created_at"
++                + origin_same + ")")
+     runs = ("EXISTS (SELECT 1 FROM task_events ps WHERE ps.kind='decision_protected_stopped' "
+             "AND ps.task_id=OLD.task_id AND OLD.uid=json_extract(ps.payload,'$.source_run_uid'))")
+     links = f"OLD.parent_id IN ({protected}) OR OLD.child_id IN ({protected})"
+     changes = {
++        # REPLACE does not fire DELETE triggers with SQLite's default recursive_triggers=OFF.
++        'event_insert': ('BEFORE INSERT ON task_events',
++                         'EXISTS (SELECT 1 FROM task_events AS OLD WHERE '
++                         f'(OLD.id=NEW.id OR OLD.uid=NEW.uid) AND ({evidence}))'),
+         'event_update': ('BEFORE UPDATE ON task_events', f'({evidence}) AND NOT {uid_only}'),
+         'event_delete': ('BEFORE DELETE ON task_events', evidence),
+         'run_update': ('BEFORE UPDATE ON task_runs', runs),
+@@ -37,5 +45,12 @@ def install(conn):
+                         'OR NEW.assignee IS NOT OLD.assignee)'),
+     }
+     for name, (when, predicate) in changes.items():
+-        conn.execute(f"CREATE TRIGGER IF NOT EXISTS protect_stopped_{name} {when} WHEN {predicate} "
+-                     "BEGIN SELECT RAISE(ABORT,'protect_evidence_immutable'); END")
++        trigger = f'protect_stopped_{name}'
++        ddl = (f"CREATE TRIGGER {trigger} {when} WHEN {predicate} "
++               "BEGIN SELECT RAISE(ABORT,'protect_evidence_immutable'); END")
++        old = conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (trigger,)).fetchone()
++        if old and old[0].replace('IF NOT EXISTS ', '') == ddl:
++            continue
++        # Runs inside the caller's write transaction; no connection sees an unfenced gap.
++        conn.execute(f'DROP TRIGGER IF EXISTS {trigger}')
++        conn.execute(ddl)
+diff --git a/hermes_cli/kanban_protect_operator.py b/hermes_cli/kanban_protect_operator.py
+index 1fc23903675..157c3226281 100644
+--- a/hermes_cli/kanban_protect_operator.py
++++ b/hermes_cli/kanban_protect_operator.py
+@@ -76,9 +76,10 @@ def _finish(conn, own, payload, result, *, outcome='applied'):
+         old = conn.execute("SELECT finished_at FROM operator_calls WHERE request_uid=? AND side='execute'", (uid,)).fetchone()
+         if old is None or old[0] is not None:
+             return
+-        courier.log(conn, request_uid=uid, side='execute', outcome=outcome, finished=True,
+-                    detail=('exact canonical stop receipt and held replica confirmed' if outcome == 'applied'
+-                            else 'canonical refusal recorded; no stop receipt'))
++        detail = ('exact canonical stop receipt and held replica confirmed' if outcome == 'applied'
++                  else 'canonical refusal recorded; no stop receipt' if outcome == 'refused'
++                  else 'historical stop receipt confirmed; current hold not confirmed after separate renewal')
++        courier.log(conn, request_uid=uid, side='execute', outcome=outcome, finished=True, detail=detail)
+         kb._append_event(conn, target, courier.RESULT_KIND, {
+             'request_uid': uid, 'action': ACTION, 'outcome': outcome, 'executor_gateway': own,
+             'detail': 'Administrative protection only; no execution authority', 'protection': result,
+@@ -129,9 +130,10 @@ def tick(conn, own, board):
+                 _BACKOFF.pop(old['request_uid'], None)
+                 done.append((old['request_uid'], 'refused'))
+                 continue
+-            _finish(conn, own, payload, result)
++            outcome = 'applied' if result['protection_state'] == 'held_confirmed' else 'recorded'
++            _finish(conn, own, payload, result, outcome=outcome)
+             _BACKOFF.pop(old['request_uid'], None)
+-            done.append((old['request_uid'], 'applied'))
++            done.append((old['request_uid'], outcome))
+         except (ValueError, OSError, client.HubError) as exc:
+             delay = min(_BACKOFF_MAX, _BACKOFF.get(old['request_uid'], (0.0, _BACKOFF_START / 2))[1] * 2)
+             _BACKOFF[old['request_uid']] = (time.monotonic() + delay, delay)
+diff --git a/hermes_cli/kanban_protect_transport.py b/hermes_cli/kanban_protect_transport.py
+index fbbe67a810e..decdddc6f89 100644
+--- a/hermes_cli/kanban_protect_transport.py
++++ b/hermes_cli/kanban_protect_transport.py
+@@ -141,9 +141,18 @@ def confirm(conn, hub, board, request_uid):
+           client._row_change('task_events',source),client._row_change('task_events',episode),
+           client._row_change('task_events',event)]
+     sync.apply_remote_changes(conn,rows,new_cursor=state['cursor'],board=board)
+-    # Existing budget episodes acquire a separate monotone restriction. Wait for
+-    # normal authenticated sync to carry it; never manufacture it from this receipt.
+-    if not proof.projected(conn, wire['task'], p['episode_uid']):
++    # The receipt acknowledges history; it never promises the target is STILL held.
++    # Pull a bounded authenticated feed before reporting current protection, so a
++    # renewal of the adopted episode cannot be missed by the direct row refresh.
++    pulled = client.pull(conn, hub, board, observers=False)
++    if pulled.more:
++        raise ValueError('protect current projection incomplete; preserve frozen command')
++    renewed = conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='scope_renewed' "
++                           "AND json_valid(payload) AND json_extract(payload,'$.episode')=? LIMIT 1",
++                           (wire['task'], p['episode_uid'])).fetchone() is not None
++    held = (not renewed and target.get('status') in ('triage', 'archived')
++            and target.get('current_run_uid') is None and proof.projected(conn, wire['task'], p['episode_uid']))
++    if not held and not renewed:
+         raise ValueError('protect restriction projection prerequisite; preserve frozen command')
+     with write_txn(conn):
+         changed=conn.execute("UPDATE kanban_protect_commands SET delivery_state='confirmed',canonical_receipt_json=? "
+@@ -152,4 +161,5 @@ def confirm(conn, hub, board, request_uid):
+         if changed!=1:
+             raise ValueError('protect custody changed during confirmation')
+     return {'ok':True,'task_id':wire['task'],'receipt_uid':wire['event_uid'],'episode_uid':p['episode_uid'],
+-            'delivery_state':'confirmed','execution_authority':False,'dependency_satisfied':False,'terminal_for_run':False}
++            'delivery_state':'confirmed','protection_state':'held_confirmed' if held else 'recorded_hold_unconfirmed',
++            'execution_authority':False,'dependency_satisfied':False,'terminal_for_run':False}
+diff --git a/tests/hermes_cli/test_kanban_protect_stopped_board.py b/tests/hermes_cli/test_kanban_protect_stopped_board.py
+index b21e767660e..02c1bb2c19b 100644
+--- a/tests/hermes_cli/test_kanban_protect_stopped_board.py
++++ b/tests/hermes_cli/test_kanban_protect_stopped_board.py
+@@ -77,6 +77,35 @@ def composed(tmp_path, monkeypatch, request):
+         conn.close()
+ 
+ 
++def renew_adoption(c):
++    hub, board, target = c['hub'], c['board'], c['target']
++    receipt = json.loads(hub.row_evidence(board, 'task_events', c['wire']['event_uid'])['row']['payload'])
++    comment, renewal = 'm-'+uuid.uuid4().hex, 'n-'+uuid.uuid4().hex
++    body = 'Explicit bounded fixture renewal'
++    def up(table, uid, fields):
++        return {'client_op_id':'u-'+uuid.uuid4().hex,'op':'upsert','table':table,'uid':uid,'fields':fields,'hlc':f'{time.time_ns()//1_000_000:013d}-0000-fixture'}
++    assert all(r['status'] == 'applied' for r in hub.ops(board, [
++        up('task_comments',comment,{'task_id':target,'body':body,'author':'human','created_at':int(time.time())+5}),
++        up('task_events','e-'+uuid.uuid4().hex,{'task_id':target,'kind':'commented','created_at':int(time.time())+5,'payload':json.dumps({'comment_uid':comment,'writer_kind':'human'})})])['results'])
++    assert hub.ops(board,[{'client_op_id':renewal,'op':'renew_scope','task':target,'event_uid':renewal,'episode':receipt['episode_uid'],
++        'mandate_comment_uid':comment,'mandate_body':body,'payload':{'version':1,'actor_kind':'human','actor_session':None,'actor_profile':'default',
++        'authority_kind':'human','authority_ref':None,'reason':'bounded fixture renewal'}}])['results'][0]['status']=='applied'
++
++
++def test_recorded_stop_reconciles_after_authorised_renewal_without_claiming_current_protection(composed):
++    from hermes_cli import kanban_protect_transport as transport
++    c = composed
++    hub, board, target = c['hub'], c['board'], c['target']
++    assert hub.ops(board, [c['wire']])['results'][0]['status'] == 'applied'
++    renew_adoption(c)
++    result = transport.confirm(c['conn'], hub, board, c['request_uid'])
++    assert result['delivery_state'] == 'confirmed'
++    assert result['protection_state'] == 'recorded_hold_unconfirmed'
++    assert result['execution_authority'] is False
++    assert transport.command(c['conn'], c['request_uid'])['request_json'] == c['frozen']['request_json']
++    assert hub.row_evidence(board, 'tasks', target)['row']['status'] == 'triage'
++
++
+ def test_home_stop_lost_reply_restart_exact_receipt(composed):
+     from hermes_cli import kanban_protect_transport as transport
+     c = composed
+@@ -159,7 +188,8 @@ def test_real_applied_response_lost_inside_confirm_then_reopen(composed):
+         assert transport.confirm(reopened, c['hub'], c['board'], c['request_uid'])['delivery_state'] == 'confirmed'
+ 
+ 
+-def test_actual_incoming_courier_lost_reply_restart_one_terminal_result(composed, monkeypatch):
++@pytest.mark.parametrize('renewed', [False, True])
++def test_actual_incoming_courier_lost_reply_restart_one_terminal_result(composed, monkeypatch, renewed):
+     from contextlib import contextmanager
+     from hermes_cli import kanban_operator_call as courier, kanban_protect_transport as transport
+     c = composed
+@@ -189,18 +219,22 @@ def test_actual_incoming_courier_lost_reply_restart_one_terminal_result(composed
+         row = conn.execute("SELECT outcome,finished_at FROM operator_calls WHERE side='execute' AND request_uid=?", (uid,)).fetchone()
+         assert tuple(row) == ('accepted_pending_canonical', None)
+         assert transport.command(conn, uid)['request_json'] == c['frozen']['request_json']
++        if renewed:
++            renew_adoption(c)
++        expected = 'recorded' if renewed else 'applied'
+         conn.close()
+         with kbc.connect(c['home']/'kanban.db') as reopened:
+             monkeypatch.setattr(client.Hub, 'ops', original)
+             courier._MARK.clear()
+             from hermes_cli import kanban_protect_operator as _operator
+             _operator._BACKOFF.clear()  # a restart forgets in-memory backoff
+-            assert (uid, 'applied') in courier.apply_incoming(reopened)
++            assert (uid, expected) in courier.apply_incoming(reopened)
+             assert courier.apply_incoming(reopened) == []
+             results = reopened.execute("SELECT payload FROM task_events WHERE kind='operator_call_result'").fetchall()
+             assert len(results) == 1
+             result = json.loads(results[0][0])
+-            assert result['outcome'] == 'applied' and result['protection']['execution_authority'] is False
++            assert result['outcome'] == expected and result['protection']['execution_authority'] is False
++            assert result['protection']['protection_state'] == ('recorded_hold_unconfirmed' if renewed else 'held_confirmed')
+             assert transport.command(reopened, uid)['request_json'] == c['frozen']['request_json']
+     finally:
+         rep.close()
+diff --git a/tests/hermes_cli/test_kanban_protect_stopped_local.py b/tests/hermes_cli/test_kanban_protect_stopped_local.py
+index 6ebdad9aacb..b545a8af518 100644
+--- a/tests/hermes_cli/test_kanban_protect_stopped_local.py
++++ b/tests/hermes_cli/test_kanban_protect_stopped_local.py
+@@ -163,6 +163,36 @@ def add_target(conn, actor, args):
+     return target, old, {**args, 'task_id': target, 'source_event_uid': source, 'source_run_uid': run_uid}
+ 
+ 
++@pytest.mark.parametrize('mutation', ['move_id', 'replace_episode', 'replace_receipt', 'change_origin'])
++def test_uid_bootstrap_does_not_allow_evidence_row_escape_or_replace(board, monkeypatch, mutation):
++    import sqlite3
++    from hermes_cli import kanban_protect_stopped as protect
++    _, _, session, target, _, args = fixture(board, monkeypatch)
++    with scoped_current_session_id(session):
++        result = protect.protect(board, board='default', **args)
++    episode = dict(board.execute("SELECT * FROM task_events WHERE task_id=? AND kind=?", (target, decision.EVENT)).fetchone())
++    assert episode['uid'] is None
++    if mutation == 'move_id':
++        sql, params = "UPDATE task_events SET uid='escape',id=id+100000 WHERE id=?", (episode['id'],)
++    elif mutation == 'change_origin':
++        # Legacy unsynced schemas lack this optional column; the guarded bootstrap
++        # must pin it too whenever a board later acquires it.
++        if 'origin_gateway' not in {r[1] for r in board.execute('PRAGMA table_info(task_events)')}:
++            board.execute('ALTER TABLE task_events ADD COLUMN origin_gateway TEXT')
++        from hermes_cli import kanban_protect_guards
++        kanban_protect_guards.install(board)
++        sql, params = "UPDATE task_events SET uid='escape',origin_gateway='foreign' WHERE id=?", (episode['id'],)
++    else:
++        row = episode if mutation == 'replace_episode' else dict(board.execute('SELECT * FROM task_events WHERE uid=?', (result['event_uid'],)).fetchone())
++        columns = list(row)
++        row['kind'], row['payload'] = 'note', '{}'
++        sql = f"INSERT OR REPLACE INTO task_events ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})"
++        params = tuple(row[c] for c in columns)
++    with pytest.raises(sqlite3.IntegrityError, match='protect_evidence_immutable'):
++        board.execute(sql, params)
++    assert decision.execution_restricted(board, target)
++
++
+ def test_two_protections_on_one_unsynced_board(board, monkeypatch):
+     from hermes_cli import kanban_protect_stopped as protect
+     from hermes_cli.kanban_containment_connections import bootstrap
+@@ -194,11 +224,11 @@ def test_existing_episode_protection_keeps_uid_bootstrap_and_containment_usable(
+     bootstrap(board)
+     assert board.execute("SELECT COUNT(*) FROM task_events WHERE uid IS NULL").fetchone()[0] == 0
+     row = board.execute("SELECT id FROM task_events WHERE task_id=? AND kind='decision_hold_restricted'", (target,)).fetchone()
+-    if row is not None:
+-        with pytest.raises(sqlite3.IntegrityError, match='protect_evidence_immutable'):
+-            board.execute('DELETE FROM task_events WHERE id=?', (row[0],))
+-        with pytest.raises(sqlite3.IntegrityError, match='protect_evidence_immutable'):
+-            board.execute("UPDATE task_events SET payload='{}' WHERE id=?", (row[0],))
++    assert row is not None
++    with pytest.raises(sqlite3.IntegrityError, match='protect_evidence_immutable'):
++        board.execute('DELETE FROM task_events WHERE id=?', (row[0],))
++    with pytest.raises(sqlite3.IntegrityError, match='protect_evidence_immutable'):
++        board.execute("UPDATE task_events SET payload='{}' WHERE id=?", (row[0],))
+     episode = board.execute("SELECT id FROM task_events WHERE task_id=? AND kind=?", (target, decision.EVENT)).fetchone()[0]
+     with pytest.raises(sqlite3.IntegrityError, match='protect_evidence_immutable'):
+         board.execute('DELETE FROM task_events WHERE id=?', (episode,))
+-- 
+2.43.0
+

@@ -1,0 +1,693 @@
+From a958acf8bc9c9ce083997042961ee4fad3d40edd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 01:57:39 +0000
+Subject: [PATCH] [daveey] perf(kanban board): seal event histories and sign
+ runs in SQL; count polls stop waiting on board builds
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_diagnostic_history.py       |   6 +
+ .../kanban/dashboard/board_event_history.py   | 116 ++++++++
+ plugins/kanban/dashboard/board_read.py        |  29 +-
+ plugins/kanban/dashboard/board_rows.py        |  34 ++-
+ plugins/kanban/dashboard/board_run_history.py |  20 +-
+ tests/plugins/test_kanban_board_hot_rows.py   | 259 ++++++++++++++++++
+ tests/plugins/test_kanban_event_marks.py      |  13 +-
+ tests/plugins/test_kanban_projection_cost.py  |  18 +-
+ tests/plugins/test_kanban_run_history.py      |   4 +-
+ 9 files changed, 467 insertions(+), 32 deletions(-)
+ create mode 100644 tests/plugins/test_kanban_board_hot_rows.py
+
+diff --git a/hermes_cli/kanban_diagnostic_history.py b/hermes_cli/kanban_diagnostic_history.py
+index eb30a3a62ee..6d177194ba4 100644
+--- a/hermes_cli/kanban_diagnostic_history.py
++++ b/hermes_cli/kanban_diagnostic_history.py
+@@ -14,6 +14,12 @@ class EventHistory(tuple):
+     def __new__(cls, rows):
+         return super().__new__(cls, (MappingProxyType(dict(row)) for row in rows))
+ 
++    @classmethod
++    def extended(cls, history, rows):
++        """``history`` plus ``rows`` appended, sharing its (read-only) event mappings rather than
++        copying each one again. Reductions are rebuilt lazily on the new snapshot."""
++        return tuple.__new__(cls, (*history, *(MappingProxyType(dict(row)) for row in rows)))
++
+     def __setattr__(self, name, value):
+         raise AttributeError("event snapshots cannot be reassigned")
+ 
+diff --git a/plugins/kanban/dashboard/board_event_history.py b/plugins/kanban/dashboard/board_event_history.py
+index 94e00cc2320..14c2e5089ef 100644
+--- a/plugins/kanban/dashboard/board_event_history.py
++++ b/plugins/kanban/dashboard/board_event_history.py
+@@ -1,7 +1,9 @@
+ """Exact, storage-type-preserving history comparison in the caller's snapshot."""
+ from __future__ import annotations
+ 
++import hashlib
+ import marshal
++import sqlite3
+ from itertools import groupby
+ from operator import itemgetter
+ from types import MappingProxyType
+@@ -40,6 +42,120 @@ def same_histories(conn, histories: dict) -> dict[str, bool]:
+     return matches
+ 
+ 
++# ``group_concat(... ORDER BY ...)`` needs SQLite 3.44; older libraries keep the full reloads.
++ORDERED_AGGREGATES = sqlite3.sqlite_version_info >= (3, 44, 0)
++
++
++def row_text(columns) -> str:
++    """SQL text of one row, injective over SQLite storage values: storage class, then integers,
++    text and blobs as hex of their bytes, reals as ``quote`` (round-trip exact). A real zero adds
++    random hex: ``quote`` drops the sign of -0.0, so a zero never vouches for itself (always a miss).
++    Only ``[a-z0-9A-F.:|+-]`` appear, never the ``,`` that separates rows."""
++    def one(name):
++        c = '"' + name.replace('"', '""') + '"'
++        return (f"typeof({c})||':'||CASE typeof({c}) WHEN 'real' THEN quote({c})||"
++                f"CASE WHEN {c} = 0 THEN hex(randomblob(8)) ELSE '' END ELSE hex({c}) END")
++    return "||'|'||".join(one(name) for name in columns)
++
++
++# The newest rows of a history are re-read on every refresh that moves it, never vouched for by
++# a seal: sync stamps a fresh event after its insert (``origin_gateway`` NULL -> 'hub'), so on the
++# hub the last row of a busy card has usually changed by the next read.
++RECENT = 16
++
++
++def _seal(columns: tuple, text: str) -> tuple:
++    """``(columns, rows, length, hash, stable rows, stable length, stable hash)`` of ``text``:
++    the whole history, and its head without the ``RECENT`` newest rows."""
++    rows = text.count(",") + 1 if text else 0
++    stable = max(rows - RECENT, 0)
++    cut = len(text)
++    for _ in range(RECENT if stable else 0):
++        cut = text.rindex(",", 0, cut)
++    h = hashlib.blake2b(text[:cut if stable else 0].encode(), digest_size=32)
++    head = h.digest()
++    h.update(text[cut if stable else 0:].encode())
++    return columns, rows, len(text), h.digest(), stable, cut if stable else 0, head
++
++
++def _ph(n: int) -> str:
++    return ",".join("?" * n)
++
++
++def extend(conn, wanted: dict) -> tuple[dict, dict]:
++    """Retained event histories that only changed at their newest rows, without re-reading the rest.
++
++    ``wanted`` is ``{task id: (retained EventHistory or None, its seal or None)}``. Returns
++    ``(histories, seals)``: ``histories`` holds each task whose current rows, ordered by id, still
++    start with the retained history's sealed head (all but its ``RECENT`` newest rows); it is that
++    head plus the rows after it, read again (or the old object itself when the whole history is
++    unchanged). ``seals`` holds the current seal of every wanted task, to retain with whatever the
++    caller then holds for it. A seal hashes the ``row_text`` rows joined by ``,`` in id order:
++    SQLite builds that text in C and returns one row per task, so a 9k-event history costs one row
++    instead of 9k. Seals are only exact inside one read snapshot (the caller's transaction):
++    outside one, nothing is sealed or extended.
++    """
++    if not wanted or not ORDERED_AGGREGATES or not conn.in_transaction:
++        return {}, {}
++    from hermes_cli.kanban_diagnostic_history import EventHistory
++
++    cur = conn.cursor()
++    cur.row_factory = None
++    try:
++        columns = tuple(d[0] for d in cur.execute("SELECT * FROM task_events LIMIT 0").description)
++        ids = tuple(wanted)
++        texts = dict(cur.execute(
++            f"SELECT task_id, group_concat({row_text(columns)}, ',' ORDER BY id) FROM task_events "
++            f"WHERE task_id IN ({_ph(len(ids))}) GROUP BY task_id", ids).fetchall())
++    finally:
++        cur.close()
++    seals, keep, after = {}, {}, {}
++    for tid, (history, seal) in wanted.items():
++        text = texts.get(tid) or ""
++        seals[tid] = now = _seal(columns, text)
++        if not _usable(history, seal, columns, EventHistory):
++            continue
++        if now[1:4] == seal[1:4]:
++            keep[tid] = history  # nothing changed
++            continue
++        stable, cut, head = seal[4:]
++        if len(text) < cut or (cut and len(text) > cut and text[cut] != ",") \
++                or hashlib.blake2b(text[:cut].encode(), digest_size=32).digest() != head:
++            continue  # an older row changed, moved or went away: the caller reloads it
++        count = text.count(",", cut) + (1 if text and not cut else 0)
++        after[tid] = (history[:stable], history[stable - 1]["id"] if stable else None, count)
++    keep.update(_tails(conn, after, columns, EventHistory))
++    return keep, seals
++
++
++def _usable(history, seal, columns, history_type) -> bool:
++    return (isinstance(history, history_type) and seal is not None and seal[0] == columns
++            and len(history) == seal[1] and (not history or tuple(history[0].keys()) == columns))
++
++
++def _tails(conn, after: dict, columns: tuple, history_type) -> dict:
++    """Each sealed head plus every row past its last id, when exactly the counted rows arrived."""
++    if not after:
++        return {}
++    cur = conn.cursor()
++    cur.row_factory = sqlite3.Row
++    try:
++        params = [v for tid, (_h, last, _n) in after.items() for v in (tid, last)]
++        rows = cur.execute(
++            f"WITH w(task_id, after) AS (VALUES {','.join(['(?, ?)'] * len(after))}) "
++            "SELECT e.* FROM w JOIN task_events e ON e.task_id = w.task_id "
++            "AND (w.after IS NULL OR e.id > w.after) ORDER BY e.task_id, e.id", params).fetchall()
++    finally:
++        cur.close()
++    groups = {tid: list(group) for tid, group in groupby(rows, key=lambda r: r["task_id"])}
++    out = {}
++    for tid, (head, _last, count) in after.items():
++        group = groups.get(tid, [])
++        if len(group) == count and (not group or tuple(group[0].keys()) == columns):
++            out[tid] = history_type.extended(head, group)
++    return out
++
++
+ def same_events(conn, tid, history) -> bool:
+     """Scalar compatibility helper, also the pre-batch parity oracle."""
+     cur = conn.cursor()
+diff --git a/plugins/kanban/dashboard/board_read.py b/plugins/kanban/dashboard/board_read.py
+index 9529264f865..2e9e4d85224 100644
+--- a/plugins/kanban/dashboard/board_read.py
++++ b/plugins/kanban/dashboard/board_read.py
+@@ -15,6 +15,7 @@ from hermes_cli import kanban_diagnostics as kd
+ from hermes_cli import kanban_workflow
+ from plugins.kanban.dashboard.board_diagnostics import _attach_diagnostics
+ from plugins.kanban.dashboard.board_run_history import retained_runs
++from plugins.kanban.dashboard.board_event_history import extend as extend_histories
+ from plugins.kanban.dashboard.board_event_history import same_histories as _same_event_histories
+ 
+ # Dashboard columns, left-to-right ("archived" is a filter toggle, not a column), from the
+@@ -223,6 +224,12 @@ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_input
+     cannot already prove a change; unmarked tasks retain histories without scanning.
+     Legacy callers without a cursor compare whole-history count/max plus the task row and
+     runs (conservative). Clock/config rules stay fresh.
++
++    A history read in the caller's transaction is retained with its seal (memo slot 6,
++    ``board_event_history.extend``). A moved task with a seal is compared in SQL instead:
++    one row per task proves all but its newest ``RECENT`` rows unchanged, and only those and
++    any new rows are read again (a 9.3k-event hub card gaining a skip event every few seconds
++    re-read all 9.3k rows, twice when its marks were equal).
+     """
+     ids = [r["id"] for r in diag_rows]
+     trusted = event_changed is not None
+@@ -233,8 +240,9 @@ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_input
+     else:
+         marks = _event_marks(conn, ids)
+     runs = retained_runs(conn, ids, prev, event_changed, _rows_by_task)
+-    same_events = _same_event_histories(conn, {
+-        tid: prev[tid][3] for tid in ids if trusted and tid in event_changed
++    seals = {tid: prev[tid][6] for tid in ids if tid in prev and len(prev[tid]) > 6 and prev[tid][6] is not None}
++    same_events = _same_event_histories(conn, {  # a sealed history is compared by extend() below
++        tid: prev[tid][3] for tid in ids if trusted and tid in event_changed and tid not in seals
+         and tid in prev and prev[tid][2] == marks.get(tid, _NO_EVENTS)
+     })
+ 
+@@ -247,7 +255,7 @@ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_input
+                 # An append/delete is already known to differ: avoid scanning it
+                 # once for equality and again to reload. Equal marks still need
+                 # the exact comparison for same-ID edits and replacements.
+-                if old[2] != marks.get(tid, _NO_EVENTS):
++                if old[2] != marks.get(tid, _NO_EVENTS) or tid in seals:
+                     return True
+                 return not same_events[tid]
+             if len(old) > 5 and old[5] is not None:
+@@ -258,15 +266,24 @@ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_input
+         return (old[1] if old[1] is not None else _raw(old[4])) != _raw(runs[tid])
+ 
+     changed = {tid for r, tid in zip(diag_rows, ids) if moved(r, tid)}
+-    part = diagnostic_inputs(conn, task_ids=[tid for tid in ids if tid in changed]) if changed else None
+-    fresh_events = part[1] if part is not None else {}
++    # A moved task whose sealed head is unchanged keeps it and re-reads only its newest rows; the rest reload.
++    # A history just proven equal (unsealed, marked, same marks) is sealed too, so the next
++    # mark of that task costs one row instead of another exact rescan.
++    resealed = {tid for tid, same in same_events.items() if same and tid not in changed}
++    grown, new_seals = extend_histories(conn, {
++        tid: (prev[tid][3] if tid in prev else None, seals.get(tid)) for tid in ids
++        if tid in changed or tid in resealed})
++    reload = [tid for tid in ids if tid in changed and tid not in grown]
++    part = diagnostic_inputs(conn, task_ids=reload) if reload else None
++    fresh_events = {**(part[1] if part is not None else {}), **grown}
+     events = {}
+     memo = {}
+     for r, tid in zip(diag_rows, ids):
+         if tid in fresh_events or tid not in changed:
+             events[tid] = fresh_events[tid] if tid in fresh_events else prev[tid][3]
+             # Raw run signatures are only compared by a legacy refresh, which derives them then.
+-            memo[tid] = (tuple(r), None, _history_mark(events[tid]), events[tid], runs[tid], unmarked.get(tid))
++            memo[tid] = (tuple(r), None, _history_mark(events[tid]), events[tid], runs[tid], unmarked.get(tid),
++                         new_seals.get(tid) if tid in changed or tid in resealed else seals.get(tid))
+         else:  # vanished between reads: no events held, so never vouch for a mark
+             events[tid] = ()
+             memo[tid] = (tuple(r), None, None, (), runs[tid], None)
+diff --git a/plugins/kanban/dashboard/board_rows.py b/plugins/kanban/dashboard/board_rows.py
+index c964fd079c3..abb460842dd 100644
+--- a/plugins/kanban/dashboard/board_rows.py
++++ b/plugins/kanban/dashboard/board_rows.py
+@@ -55,7 +55,7 @@ _generation = itertools.count(1)
+ 
+ 
+ class _Observer:
+-    __slots__ = ("conn", "gen", "ident", "lock", "path", "pid", "shm", "used")
++    __slots__ = ("conn", "gen", "ident", "lock", "path", "pid", "refresh", "shm", "used")
+ 
+     def __init__(self, path: str, conn: sqlite3.Connection, ident: tuple, shm: Optional[tuple] = None):
+         self.path = path
+@@ -65,7 +65,8 @@ class _Observer:
+         self.gen = next(_generation)
+         self.pid = os.getpid()
+         self.used = time.monotonic()
+-        self.lock = threading.Lock()
++        self.lock = threading.Lock()  # borrows ``conn`` (a few PRAGMAs); close() waits for it
++        self.refresh = threading.Lock()  # serializes ``incremental`` builds; never guards ``conn``
+ 
+     def close(self) -> None:
+         try:
+@@ -272,9 +273,13 @@ def content_version(path: str) -> Optional[tuple]:
+ def incremental(key: tuple, path: str, build: Callable, fallback: Callable) -> dict:
+     """Read cursor, delta and volatile overlay in ONE short-lived guarded snapshot.
+ 
+-    Serialize a board's refreshes through its observer lock, so concurrent readers cannot
+-    publish an older result over a newer cursor. Only the commit-clock observer survives;
+-    the row reader closes before projection, including on a failed build.
++    Serialize a board's refreshes through its observer's ``refresh`` lock, so concurrent readers
++    cannot publish an older result over a newer cursor. The observer's connection lock is held
++    only for the commit-clock PRAGMAs, never across the build: ``version``/``content_version``
++    (every GET /boards count poll) borrow it too, and used to queue behind a whole board read
++    (15.4 thread-s per minute of lock wait on the hub). An observer dropped mid-build is noticed
++    at publish (it is no longer current) and stores nothing. Only the commit-clock observer
++    survives; the row reader closes before projection, including on a failed build.
+     """
+     from hermes_cli import kanban_task_change
+ 
+@@ -284,17 +289,18 @@ def incremental(key: tuple, path: str, build: Callable, fallback: Callable) -> d
+     if obs is None:
+         return fallback()
+     cache_key = (*key, "p2")
+-    with obs.lock:
+-        with _lock:
+-            current = _observers.get(str(path)) is obs
+-            hit = _entries.get(cache_key)
++    with obs.refresh:
++        with obs.lock:
++            with _lock:
++                current = _observers.get(str(path)) is obs
++                hit = _entries.get(cache_key)
++            # Retain only the observer's commit clock, not a history-reader connection.
++            # Sample before opening the snapshot: a later commit invalidates next read.
++            commit_key = (obs.gen, *obs.ident,
++                          obs.conn.execute("PRAGMA schema_version").fetchone()[0],
++                          obs.conn.execute("PRAGMA data_version").fetchone()[0]) if current else None
+         if not current:
+             return fallback()
+-        # Retain only the observer's commit clock, not a history-reader connection.
+-        # Sample before opening the snapshot: a later commit invalidates next read.
+-        commit_key = (obs.gen, *obs.ident,
+-                      obs.conn.execute("PRAGMA schema_version").fetchone()[0],
+-                      obs.conn.execute("PRAGMA data_version").fetchone()[0])
+         if hit is not None and len(hit) > 2 and hit[0] is not None and hit[2] == commit_key:
+             from hermes_cli import loop_accounting
+             with loop_accounting.pass_("kanban.board.rows", skipped=True):
+diff --git a/plugins/kanban/dashboard/board_run_history.py b/plugins/kanban/dashboard/board_run_history.py
+index b52d16452c9..0934fdb3164 100644
+--- a/plugins/kanban/dashboard/board_run_history.py
++++ b/plugins/kanban/dashboard/board_run_history.py
+@@ -74,15 +74,25 @@ class RunHistory(tuple):
+ 
+ 
+ def _signatures(conn, task_ids, columns) -> dict:
+-    """Exact typed run values, packed in C instead of SQL quote/concatenation.
++    """Exact typed run values of each task, one row per task.
+ 
+-    These bytes are only compared in-process, never persisted or unmarshalled.
+-    Version 2 avoids reference-identity encoding: equal values must encode equally
+-    regardless of Python object sharing. It preserves SQLite NULL/int/float/text/blob,
+-    including embedded NULs that SQLite quote(text) truncates.
++    SQLite builds each task's text in C (``board_event_history.row_text``: storage class plus
++    hex bytes, so NULL/int/float/text/blob and embedded NULs stay distinct) over the covering
++    ``idx_runs_task_bookkeeping`` index. Every GET after a bookkeeping commit signs every run of
++    every displayed card here; stepping each run row into Python (1.3k-3k rows on the hub board,
++    each one a GIL hand-off in the busy backend) was the cost. Signatures are only compared
++    in-process. Without ordered aggregates (SQLite < 3.44) runs are packed with ``marshal``
++    (version 2: equal values encode equally regardless of object sharing).
+     """
+     if not task_ids:
+         return {}
++    from plugins.kanban.dashboard.board_event_history import ORDERED_AGGREGATES, row_text
++    if ORDERED_AGGREGATES:
++        cur = conn.cursor()
++        cur.row_factory = None
++        return dict(cur.execute(
++            f"SELECT task_id, group_concat({row_text(('id', *columns))}, ',' ORDER BY id) FROM task_runs "
++            f"WHERE task_id IN ({','.join('?' for _ in task_ids)}) GROUP BY task_id", tuple(task_ids)).fetchall())
+     selected = ", ".join(("task_id", "id", *columns))
+     # Plain tuples, grouped in C: every GET after a bookkeeping commit reads every run of
+     # every displayed card here, and per-row Row objects were most of its cost.
+diff --git a/tests/plugins/test_kanban_board_hot_rows.py b/tests/plugins/test_kanban_board_hot_rows.py
+new file mode 100644
+index 00000000000..49f32e01a30
+--- /dev/null
++++ b/tests/plugins/test_kanban_board_hot_rows.py
+@@ -0,0 +1,259 @@
++"""GET /board hot rows: a refresh after a commit steps few SQLite rows into Python.
++
++Profile example: a large event-history card gaining one event re-read its history, every
++displayed card's runs were signed row by row, and GET /boards waited on the observer lock for
++whole board builds. Each test pins the same payload as a cold read and the reduced work.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++import threading
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli.kanban_diagnostic_history import EventHistory
++from plugins.kanban.dashboard import board_event_history as beh
++from plugins.kanban.dashboard import board_read as br
++from plugins.kanban.dashboard import board_run_history as brh
++from plugins.kanban.dashboard import board_rows
++from tests.plugins import test_kanban_board_incremental as helpers
++
++board = helpers.board
++
++needs_ordered = pytest.mark.skipif(not beh.ORDERED_AGGREGATES, reason="SQLite < 3.44: full reloads kept")
++HISTORY = 300
++
++
++def _write(sql_args):
++    conn = kbc.connect()
++    try:
++        for sql, args in sql_args:
++            conn.execute(sql, args)
++        conn.commit()
++    finally:
++        conn.close()
++
++
++def _events(tid, kind, n, created_at=5):
++    return [("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, '{}', ?)",
++             (tid, kind, created_at))] * n
++
++
++@pytest.fixture
++def long_card(board):
++    ids, _run = helpers._seed()
++    tid = ids[1]
++    _write(_events(tid, "dispatch_skipped", HISTORY))
++    helpers._read(board)  # FULL: no seals yet
++    _write(_events(tid, "dispatch_skipped", 1))
++    helpers._read(board)  # first delta reloads the moved card once and seals it
++    return board, tid
++
++
++@pytest.fixture
++def spy(monkeypatch):
++    seen = {"reloaded": [], "appended": []}
++    real_rows, real_extended = br._rows_by_task, EventHistory.extended.__func__
++
++    def rows_by_task(conn, table, ids):
++        if table == "task_events":
++            seen["reloaded"].extend(ids)
++        return real_rows(conn, table, ids)
++
++    def extended(cls, history, rows):
++        seen["appended"].append(len(rows))
++        return real_extended(cls, history, rows)
++
++    monkeypatch.setattr(br, "_rows_by_task", rows_by_task)
++    monkeypatch.setattr(EventHistory, "extended", classmethod(extended))
++    return seen
++
++
++def _warm(mod):
++    return helpers._stable(helpers._read(mod)), dict(board_rows._entries)
++
++
++def _cold(mod, saved):
++    """A cold read of the same database; the warm retained rows are put back afterwards."""
++    cold = helpers._cold(mod)
++    board_rows._entries.update(saved)
++    return cold
++
++
++@needs_ordered
++@pytest.mark.parametrize("kind", ["dispatch_skipped", "heartbeat"])
++def test_grown_history_reads_only_its_new_rows(long_card, spy, kind):
++    mod, tid = long_card
++    _write(_events(tid, kind, 2, created_at=7))
++    warm, saved = _warm(mod)
++    assert tid not in spy["reloaded"], "a grown history must not be re-read whole"
++    assert spy["appended"] == [beh.RECENT + 2], "only the newest retained rows are read again"
++    assert warm == _cold(mod, saved)
++
++
++@needs_ordered
++def test_a_late_stamp_on_the_newest_event_is_read_again(long_card, spy):
++    """Sync stamps ``origin_gateway`` on a fresh event after its insert (seen on every busy hub
++    card): the newest rows are re-read, never vouched for, so the stamp shows without a reload."""
++    mod, tid = long_card
++    _write([("UPDATE task_events SET origin_gateway = 'hub' WHERE id = "
++             "(SELECT MAX(id) FROM task_events WHERE task_id = ?)", (tid,))])
++    warm, saved = _warm(mod)
++    assert tid not in spy["reloaded"]
++    assert spy["appended"] == [beh.RECENT]
++    assert warm == _cold(mod, saved)
++
++
++def _traced_read(mod):
++    import unittest.mock
++
++    from hermes_cli import kanban_generation
++    statements, original = [], kanban_generation.open_ro
++
++    def observe(*args, **kwargs):
++        conn = original(*args, **kwargs)
++        conn.set_trace_callback(statements.append)
++        return conn
++
++    with unittest.mock.patch.object(kanban_generation, "open_ro", observe):
++        warm, saved = _warm(mod)
++    scans = [s for s in statements if s.startswith("SELECT * FROM task_events WHERE")]
++    return warm, saved, statements, scans
++
++
++@needs_ordered
++def test_unchanged_marked_history_skips_the_exact_rescan(long_card):
++    mod, tid = long_card
++    _write([("UPDATE tasks SET title = title || ' edited' WHERE id = ?", (tid,))])
++    warm, saved, statements, scans = _traced_read(mod)
++    assert any(tid in s for s in statements if "group_concat" in s), "the marked card is compared in SQL"
++    assert scans == [], scans
++    assert warm == _cold(mod, saved)
++
++
++@needs_ordered
++def test_a_history_proven_equal_is_sealed_for_the_next_mark(board):
++    """A card marked again and again without event changes (title or bookkeeping edits) pays the
++    exact rescan once, then is compared in SQL."""
++    ids, _run = helpers._seed()
++    tid = ids[2]
++    _write(_events(tid, "commented", HISTORY))
++    helpers._read(board)  # FULL: nothing sealed
++    for i, expect_scan in ((1, True), (2, False), (3, False)):
++        _write([("UPDATE tasks SET title = ? WHERE id = ?", (f"edit {i}", tid))])
++        warm, saved, _statements, scans = _traced_read(board)
++        assert bool(scans) == expect_scan, (i, scans)
++        assert warm == _cold(board, saved)
++
++
++@needs_ordered
++@pytest.mark.parametrize("change", ["update_old", "delete_old", "backfill", "delete_then_append"])
++def test_any_change_below_the_retained_tail_reloads_exactly(long_card, spy, change):
++    mod, tid = long_card
++    first = f"(SELECT MIN(id) FROM task_events WHERE task_id = '{tid}')"
++    sql = {
++        "update_old": [(f"UPDATE task_events SET payload = '{{\"x\":1}}' WHERE id = {first}", ())],
++        "delete_old": [(f"DELETE FROM task_events WHERE id = {first}", ())],
++        "backfill": [(f"INSERT INTO task_events (id, task_id, kind, payload, created_at) "
++                      f"VALUES ({first} - 1, ?, 'heartbeat', '{{}}', 1)", (tid,))],
++        "delete_then_append": [(f"DELETE FROM task_events WHERE id = {first}", ()),
++                               *_events(tid, "dispatch_skipped", 1)],
++    }[change]
++    if change == "backfill":  # make room below the card's first event
++        _write([("UPDATE task_events SET id = id + 1000000 WHERE task_id = ?", (tid,))])
++        helpers._read(mod)
++        spy["reloaded"].clear()
++    _write(sql)
++    warm, saved = _warm(mod)
++    assert tid in spy["reloaded"]
++    assert warm == _cold(mod, saved)
++
++
++def test_row_text_is_injective_and_never_vouches_for_a_real_zero():
++    with sqlite3.connect(":memory:") as conn:
++        conn.execute("CREATE TABLE t (k INTEGER PRIMARY KEY, v)")
++        values = [None, 0, 1, 1.0, 0.5, "1", b"1", "", b"", "a\x00b", "a", -1, 2 ** 62, 1e300]
++        conn.executemany("INSERT INTO t (v) VALUES (?)", [(v,) for v in values])
++        sql = f"SELECT {beh.row_text(('v',))} FROM t ORDER BY k"
++        texts = [r[0] for r in conn.execute(sql)]
++        assert len(set(texts)) == len(values)
++        assert not any("," in t for t in texts)
++        conn.execute("INSERT INTO t (v) VALUES (-0.0)")
++        zero = f"SELECT {beh.row_text(('v',))} FROM t WHERE k = (SELECT MAX(k) FROM t)"
++        assert conn.execute(zero).fetchone()[0] != conn.execute(zero).fetchone()[0]
++
++
++@needs_ordered
++def test_outside_a_transaction_nothing_is_sealed():
++    with sqlite3.connect(":memory:") as conn:
++        conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT)")
++        conn.execute("INSERT INTO task_events VALUES (1, 't', 'created')")
++        conn.commit()
++        assert not conn.in_transaction
++        assert beh.extend(conn, {"t": (EventHistory(()), None)}) == ({}, {})
++
++
++@pytest.fixture
++def runs_source():
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, claim_expires, worker_pid)")
++    conn.executemany("INSERT INTO task_runs (task_id, claim_expires, worker_pid) VALUES (?, ?, ?)",
++                     [(f"t{i % 3}", i, None) for i in range(60)])
++    yield conn
++    conn.close()
++
++
++@needs_ordered
++def test_run_signatures_return_one_row_per_task(runs_source):
++    statements = []
++    runs_source.set_trace_callback(statements.append)
++    sigs = brh._signatures(runs_source, ["t0", "t1", "t2", "none"], ["claim_expires", "worker_pid"])
++    assert sorted(sigs) == ["t0", "t1", "t2"]  # 3 rows for 60 runs; a task without runs is absent
++    assert len(statements) == 1 and "GROUP BY task_id" in statements[0]
++    for value in (1.0, "20", b"20", 0.0):
++        runs_source.execute("UPDATE task_runs SET claim_expires = ? WHERE id = 21", (value,))
++        again = brh._signatures(runs_source, ["t2"], ["claim_expires", "worker_pid"])
++        assert again["t2"] != sigs["t2"], value
++    runs_source.execute("UPDATE task_runs SET claim_expires = 20 WHERE id = 21")
++    assert brh._signatures(runs_source, ["t2"], ["claim_expires", "worker_pid"]) == {"t2": sigs["t2"]}
++
++
++def test_count_polls_do_not_wait_for_a_board_build(board):
++    """``version``/``content_version`` borrow the observer only for PRAGMAs; a build holds the
++    separate refresh lock, which still serializes concurrent builds of the same board."""
++    helpers._seed()
++    path = str(kb.kanban_db_path())
++    assert board_rows.version(path) is not None
++    entered, release = threading.Event(), threading.Event()
++    order = []
++
++    def slow_build(conn, prev, changed):
++        order.append("build")
++        entered.set()
++        assert release.wait(10)
++        return {"rows": 1}
++
++    def run(name, build):
++        board_rows.incremental((path, name), path, build, lambda: pytest.fail("fallback"))
++
++    builder = threading.Thread(target=run, args=("a", slow_build))
++    builder.start()
++    assert entered.wait(10)
++    try:
++        poll = threading.Thread(target=lambda: order.append(board_rows.content_version(path)))
++        poll.start()
++        poll.join(5)
++        assert not poll.is_alive(), "a count poll waited for a board build"
++        second = threading.Thread(target=run, args=("b", lambda *a: order.append("second") or {}))
++        second.start()
++        second.join(0.3)
++        assert second.is_alive(), "builds of one board must stay serialized"
++    finally:
++        release.set()
++    builder.join(10)
++    second.join(10)
++    assert order[0] == "build" and order[-1] == "second"
+diff --git a/tests/plugins/test_kanban_event_marks.py b/tests/plugins/test_kanban_event_marks.py
+index 43206b4d0cd..593342486c0 100644
+--- a/tests/plugins/test_kanban_event_marks.py
++++ b/tests/plugins/test_kanban_event_marks.py
+@@ -67,14 +67,21 @@ def test_trusted_refresh_marks_only_heartbeats_the_cursor_excludes(monkeypatch):
+     assert loads == [('t', 'u')], 'nothing moved: retain every history'
+     assert len(steps) < 100, f'trusted marks must not scan whole histories ({len(steps)} x100 VM steps)'
+     assert len(inputs[1]['t']) == HISTORY + 3
+-    # An unmarked heartbeat insert is still seen exactly.
++    # An unmarked heartbeat insert is still seen exactly. The fixture never commits, so every
++    # refresh reads in one transaction and the first one sealed each history: the heartbeat is
++    # appended to the retained rows (board_event_history.extend), never re-read whole.
+     conn.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('t', 'heartbeat', 2)")
+     inputs, memo = _refresh(conn, memo, frozenset(), loads)
+-    assert loads[-1] == ('t',) and len(inputs[1]['t']) == HISTORY + 4
++    from plugins.kanban.dashboard.board_event_history import ORDERED_AGGREGATES
++    assert loads[-1] == (('t', 'u') if ORDERED_AGGREGATES else ('t',)) and len(inputs[1]['t']) == HISTORY + 4
++    assert inputs[1]['t'][-1]['kind'] == 'heartbeat' and inputs[1]['t'][-1]['created_at'] == 2
+     # A heartbeat backfilled below every id (pickup history) moves the count, not the max.
+     conn.execute("INSERT INTO task_events (id, task_id, kind, created_at) VALUES (-5, 'u', 'heartbeat', 0)")
+     inputs, memo = _refresh(conn, memo, frozenset(), loads)
+-    assert loads[-1] == ('u',) and inputs[1]['u'][0]['id'] == -5
++    # 'u' is shorter than board_event_history.RECENT, so its sealed head is empty: every row is
++    # read again with its tail, not through a reload.
++    assert loads[-1] == (('t', 'u') if ORDERED_AGGREGATES else ('u',)) and inputs[1]['u'][0]['id'] == -5
++    assert len(inputs[1]['u']) == 2
+     # Marked changes reload through the cursor set.
+     conn.execute("DELETE FROM task_events WHERE id = 1")
+     inputs, memo = _refresh(conn, memo, frozenset({'t'}), loads)
+diff --git a/tests/plugins/test_kanban_projection_cost.py b/tests/plugins/test_kanban_projection_cost.py
+index 862bd906b98..575736cbb11 100644
+--- a/tests/plugins/test_kanban_projection_cost.py
++++ b/tests/plugins/test_kanban_projection_cost.py
+@@ -46,11 +46,23 @@ def runs():
+     conn.close()
+ 
+ 
+-def test_run_overlay_does_not_build_sql_text_per_field(runs):
++def test_run_signatures_step_one_row_per_task_and_never_quote_text(runs):
++    """In the busy backend each stepped row is a GIL hand-off, so runs are signed in SQL, one row
++    per task (profile example: many run rows per board refresh). Text and blobs are hex,
++    never ``quote``d (``quote`` truncates at an embedded NUL); only reals use ``quote``."""
++    from plugins.kanban.dashboard.board_event_history import ORDERED_AGGREGATES
++    runs.executemany("INSERT INTO task_runs VALUES (?, 't', ?)", [(i, i) for i in range(2, 40)])
+     statements = []
+     runs.set_trace_callback(statements.append)
+-    assert rh._signatures(runs, ["t"], ["worker_pid"])
+-    assert not any("quote(" in s.lower() or "group_concat(" in s.lower() for s in statements)
++    assert list(rh._signatures(runs, ["t"], ["worker_pid"])) == ["t"]
++    runs.set_trace_callback(None)
++    assert len(statements) == 1
++    sql = statements[0].lower()
++    if not ORDERED_AGGREGATES:
++        assert "group_concat(" not in sql
++        return
++    assert "group by task_id" in sql and 'hex("worker_pid")' in sql
++    assert sql.count("quote(") == sql.count("when 'real' then quote(") == 2  # id, worker_pid
+ 
+ 
+ @pytest.mark.parametrize("before,after", [(1, 1.0), (None, 0), ("1", 1),
+diff --git a/tests/plugins/test_kanban_run_history.py b/tests/plugins/test_kanban_run_history.py
+index d3f0d9c7919..dcd405084bf 100644
+--- a/tests/plugins/test_kanban_run_history.py
++++ b/tests/plugins/test_kanban_run_history.py
+@@ -134,7 +134,9 @@ def test_unchanged_run_bookkeeping_keeps_decoded_rows(source):
+     source.set_trace_callback(None)
+     reads = [s for s in statements if 'FROM task_runs' in s]
+     assert len(reads) == 1
+-    assert reads[0].startswith('SELECT task_id, id, ')
++    from plugins.kanban.dashboard.board_event_history import ORDERED_AGGREGATES
++    # One narrow signature read: one row per task when SQLite can aggregate in id order.
++    assert reads[0].startswith('SELECT task_id, group_concat(' if ORDERED_AGGREGATES else 'SELECT task_id, id, ')
+     assert got[2]['t'] is retained
+     source.execute("UPDATE task_runs SET worker_pid = 42")
+     got, old = refresh(source, old)
+-- 
+2.43.0
+

@@ -1,0 +1,239 @@
+From a59e19de01bb2fe4b556bbbcc27d94059e69f450 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 02:13:00 +0000
+Subject: [PATCH] fix(kanban): keep receipt dedup out of full sidebar
+ enrichment [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_links_associations.py       |  17 +++
+ hermes_cli/kanban_session_activity.py         |   4 +-
+ hermes_cli/kanban_session_activity_busy.py    |   4 +
+ .../hermes_cli/test_kanban_busy_first_read.py |   3 +-
+ .../test_kanban_links_association_reader.py   | 105 ++++++++++++++++++
+ .../test_kanban_local_dedup_cost.py           |   5 +-
+ 6 files changed, 134 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_links_associations.py
+ create mode 100644 tests/hermes_cli/test_kanban_links_association_reader.py
+
+diff --git a/hermes_cli/kanban_links_associations.py b/hermes_cli/kanban_links_associations.py
+new file mode 100644
+index 00000000000..4467924f0ab
+--- /dev/null
++++ b/hermes_cli/kanban_links_associations.py
+@@ -0,0 +1,17 @@
++"""Association-only local read for receipt dedup under the links projection lock."""
++from contextlib import closing
++import sqlite3
++
++
++def read(path, ids, statuses):
++    """Preserve listed creator/subscriber selection, without execution, waits or history.
++
++    An owned reader never queues behind a sidebar borrower. The caller retains
++    bounded busy fallback in its separate memo namespace; no transaction escapes.
++    """
++    from hermes_cli.kanban_session_activity import _execution_transaction, _open_ro
++    from hermes_cli.kanban_session_outcome_tasks import select_listed_local_tasks
++
++    with closing(_open_ro(path, timeout=0.5)) as conn, _execution_transaction(conn):
++        conn.row_factory = sqlite3.Row
++        return list(select_listed_local_tasks(conn, ids, statuses).values())
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 8c78110d027..746f6a7ea8f 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -861,7 +861,9 @@ def _without_local_open_duplicates(rows: list[dict[str, Any]], *, gateway: str,
+     def contains(path: Path, sid: str, task_id: str) -> bool:
+         key = (path, sid)
+         if key not in task_ids:  # no deadline: never wait out a busy board while the caller holds _links_lock
+-            task_ids[key] = {t['id'] for t in _busy.session_tasks(path, [sid], LISTED_STATUSES, _read_session_tasks)}
++            from hermes_cli.kanban_links_associations import read
++            task_ids[key] = {t['id'] for t in _busy.session_tasks(
++                path, [sid], LISTED_STATUSES, read, memo_namespace="links")}
+         return task_id in task_ids[key]
+ 
+     for row in local:
+diff --git a/hermes_cli/kanban_session_activity_busy.py b/hermes_cli/kanban_session_activity_busy.py
+index 5949e87d8b4..56045b9e123 100644
+--- a/hermes_cli/kanban_session_activity_busy.py
++++ b/hermes_cli/kanban_session_activity_busy.py
+@@ -31,6 +31,7 @@ reuse_sink = threading.local()
+ 
+ _tasks_memo: dict[tuple, list[dict[str, Any]]] = {}  # last good per-board task list, by (board, ids, statuses)
+ _lean_tasks_memo: dict[tuple, list[dict[str, Any]]] = {}  # outcome lean reader; never the sidebar namespace
++_links_tasks_memo: dict[tuple, list[dict[str, Any]]] = {}  # association-only; never poison enriched readers
+ _tasks_lock = threading.Lock()
+ TASKS_MEMO_MAX = 512
+ # One request's shared budget for re-reading busy boards that have no last good list for the query (well inside the
+@@ -73,6 +74,8 @@ def board_reads(path: Path, key: tuple, hit: tuple | None, parked: bool, stalled
+ 
+ 
+ def _memo(namespace: str) -> dict[tuple, list[dict[str, Any]]]:
++    if namespace == "links":
++        return _links_tasks_memo
+     return _lean_tasks_memo if namespace == "lean" else _tasks_memo
+ 
+ 
+@@ -132,3 +135,4 @@ def reset() -> None:
+     with _tasks_lock:
+         _tasks_memo.clear()
+         _lean_tasks_memo.clear()
++        _links_tasks_memo.clear()
+diff --git a/tests/hermes_cli/test_kanban_busy_first_read.py b/tests/hermes_cli/test_kanban_busy_first_read.py
+index 9312cd09f71..23963be14f5 100644
+--- a/tests/hermes_cli/test_kanban_busy_first_read.py
++++ b/tests/hermes_cli/test_kanban_busy_first_read.py
+@@ -116,8 +116,9 @@ def test_links_projection_never_waits_on_a_busy_board(tmp_path, monkeypatch):
+     db = tmp_path / "kanban.db"
+     monkeypatch.setattr(ksa, "_board_db_paths", lambda: [db])
+ 
+-    def fake(path, ids, statuses, read, *, deadline=None):
++    def fake(path, ids, statuses, read, *, deadline=None, memo_namespace=""):
+         seen.append(deadline)
++        assert memo_namespace == "links"
+         raise gen.BoardLifecycleBusy()
+ 
+     monkeypatch.setattr(ksa._busy, "session_tasks", fake)
+diff --git a/tests/hermes_cli/test_kanban_links_association_reader.py b/tests/hermes_cli/test_kanban_links_association_reader.py
+new file mode 100644
+index 00000000000..bb96a73983c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_links_association_reader.py
+@@ -0,0 +1,105 @@
++"""Links dedup reads associations, never full sidebar execution or history."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import kanban_session_activity_busy as busy
++from tests.hermes_cli import test_kanban_session_outcome_tasks as fixtures
++
++
++def test_dedup_does_not_enrich_while_holding_links_lock(monkeypatch, tmp_path):
++    board = tmp_path / 'kanban.db'
++    conn = fixtures._connect(board)
++    fixtures._insert_task(conn, 'open', 'running', 'tip')
++    conn.commit()
++    conn.close()
++    monkeypatch.setattr(activity, '_board_db_paths', lambda: [board])
++
++    def forbidden(*args, **kwargs):
++        pytest.fail('dedup invoked full sidebar enrichment under links lock')
++
++    monkeypatch.setattr(activity, '_read_session_tasks', forbidden)
++    row = dict(gateway='gw', profile='default', board='default', id='open',
++               key='gw/default/default/open', session='tip', origin_session='tip')
++    busy.reset()
++    try:
++        with activity._links_lock:
++            assert activity._without_local_open_duplicates([row], gateway='gw', profile='default') == []
++    finally:
++        busy.reset()
++
++
++def test_associations_preserve_creator_subscriber_and_status_selection(tmp_path):
++    from hermes_cli.kanban_links_associations import read
++    from hermes_cli.kanban_session_outcome_tasks import select_listed_local_tasks
++
++    board = tmp_path / 'kanban.db'
++    conn = fixtures._connect(board)
++    for tid, status, sid in [('open', 'running', 'tip'), ('done', 'done', 'tip'),
++                             ('sub', 'blocked', 'elsewhere'), ('other', 'ready', 'elsewhere')]:
++        fixtures._insert_task(conn, tid, status, sid)
++    fixtures._sub(conn, 'sub', 'tip', 'created')
++    conn.commit()
++    conn.row_factory = sqlite3.Row
++    expected = select_listed_local_tasks(conn, ['tip'], activity.LISTED_STATUSES)
++    conn.close()
++    assert set(expected) == {'open', 'sub'}
++    assert read(board, ['tip'], activity.LISTED_STATUSES) == list(expected.values())
++
++
++def test_association_reader_owns_and_closes_connection_even_on_failure(tmp_path, monkeypatch):
++    from hermes_cli import kanban_links_associations as associations
++    from hermes_cli import kanban_session_outcome_tasks as selection
++    from hermes_cli.kanban_reader_lifecycle import cached_entry
++
++    board = tmp_path / 'kanban.db'
++    fixtures._connect(board).close()
++    readers = []
++    real_open = activity._open_ro
++
++    def capture(*args, **kwargs):
++        conn = real_open(*args, **kwargs)
++        readers.append(conn)
++        return conn
++
++    _key, cached = cached_entry(board)
++    monkeypatch.setattr(activity, '_open_ro', capture)
++    with cached[2]:  # full sidebar borrower cannot delay the lock holder's association read
++        assert associations.read(board, ['tip'], activity.LISTED_STATUSES) == []
++
++    def fail(*args):
++        raise ValueError('selection failed')
++
++    monkeypatch.setattr(selection, 'select_listed_local_tasks', fail)
++    with pytest.raises(ValueError, match='selection failed'):
++        associations.read(board, ['tip'], activity.LISTED_STATUSES)
++    assert len(readers) == 2
++    for conn in readers:
++        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
++            conn.execute('SELECT 1')
++
++
++def test_busy_associations_never_poison_sidebar_or_outcome_memos(tmp_path):
++    board = tmp_path / 'kanban.db'
++
++    def read(*args):
++        return [{'id': 'open'}]
++
++    def unavailable(*args):
++        from hermes_cli.kanban_generation import BoardLifecycleBusy
++        raise BoardLifecycleBusy()
++
++    busy.reset()
++    try:
++        assert busy.session_tasks(board, ['tip'], ('running',), read, memo_namespace='links') == [{'id': 'open'}]
++        assert busy.session_tasks(board, ['tip'], ('running',), unavailable,
++                                  memo_namespace='links') == [{'id': 'open', 'stale': True}]
++        for namespace in ('', 'lean'):
++            with pytest.raises(sqlite3.OperationalError, match='locked'):
++                busy.session_tasks(board, ['tip'], ('running',), unavailable, memo_namespace=namespace)
++        busy.reset()
++        with pytest.raises(sqlite3.OperationalError, match='locked'):
++            busy.session_tasks(board, ['tip'], ('running',), unavailable, memo_namespace='links')
++    finally:
++        busy.reset()
+diff --git a/tests/hermes_cli/test_kanban_local_dedup_cost.py b/tests/hermes_cli/test_kanban_local_dedup_cost.py
+index 3586c7a6e06..9ea392e6859 100644
+--- a/tests/hermes_cli/test_kanban_local_dedup_cost.py
++++ b/tests/hermes_cli/test_kanban_local_dedup_cost.py
+@@ -1,5 +1,6 @@
+ """Receipt aliases share board reads without sharing evidence across profiles."""
+ from hermes_cli import kanban_session_activity as activity
++from hermes_cli import kanban_links_associations as associations
+ 
+ 
+ def test_repeated_receipts_read_each_board_alias_once(monkeypatch, tmp_path):
+@@ -11,7 +12,7 @@ def test_repeated_receipts_read_each_board_alias_once(monkeypatch, tmp_path):
+         calls.append((path, tuple(ids)))
+         return [{'id': 'open'}] if ids == ['tip'] else []
+ 
+-    monkeypatch.setattr(activity, '_read_session_tasks', read)
++    monkeypatch.setattr(associations, 'read', read)
+     rows = [dict(gateway='gw', profile='default', board='default', id='open',
+                  key='gw/default/default/open', session='tip', origin_session='tip')
+             for _ in range(20)]
+@@ -21,5 +22,5 @@ def test_repeated_receipts_read_each_board_alias_once(monkeypatch, tmp_path):
+     assert result == retained
+     assert len(calls) == 2
+     # Request-local only: changed board state must be consulted on the next call.
+-    monkeypatch.setattr(activity, '_read_session_tasks', lambda *args: [])
++    monkeypatch.setattr(associations, 'read', lambda *args: [])
+     assert activity._without_local_open_duplicates(rows, gateway='gw', profile='default') == rows
+-- 
+2.43.0
+

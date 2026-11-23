@@ -1,0 +1,529 @@
+From 6b4cb93af4089afd65a3318c9c6fd52cb94753a8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 07:59:35 +0000
+Subject: [PATCH] feat(links): select in-process display facts at serve startup
+ [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ docs/designs/links-facts-cutover.md           |  37 +++++
+ hermes_cli/fact_links_startup.py              | 106 +++++++++++++
+ hermes_cli/fact_remote_links.py               |  30 ++--
+ hermes_cli/kanban_session_activity.py         |   8 +-
+ hermes_cli/web_server_app.py                  |   3 +-
+ tests/hermes_cli/test_fact_links_startup.py   | 148 ++++++++++++++++++
+ .../test_fact_remote_links_serialization.py   | 109 +++++++++++++
+ 7 files changed, 427 insertions(+), 14 deletions(-)
+ create mode 100644 docs/designs/links-facts-cutover.md
+ create mode 100644 hermes_cli/fact_links_startup.py
+ create mode 100644 tests/hermes_cli/test_fact_links_startup.py
+ create mode 100644 tests/hermes_cli/test_fact_remote_links_serialization.py
+
+diff --git a/docs/designs/links-facts-cutover.md b/docs/designs/links-facts-cutover.md
+new file mode 100644
+index 00000000000..f3371c283da
+--- /dev/null
++++ b/docs/designs/links-facts-cutover.md
+@@ -0,0 +1,37 @@
++# In-process links display cutover
++
++`hermes serve`/dashboard app startup selects the in-process links projection for
++its exact launch origin scope. `HERMES_FACTS_LINKS` is ON when unset. Set it to
++`0`, `off`, `false`, or `no` in the service launch environment for rollback on the
++next natural startup; rollback closes any retained replacement before calling
++`ScopeRefresher.resume()`. No live process is signalled by the cutover.
++
++Startup fences and drains the scope's legacy refresher before registering one
++external `RemoteLinksSource` on an in-process ChangeFeed/FactStore. Display
++`stale_ok=True` entrypoints select that binding by the complete existing origin
++scope (home, profile, board root, hub root, mail configuration). Reads take an
++immutable generation under the FactStore publication condition and return
++separate mutable copies. Strict/read-your-writes callers are unchanged. Explicit
++request bindings still take precedence; other profile/storage scopes are not
++implicitly authorized and keep their existing path.
++
++The source captures the same canonical origin-ledger/legacy projection under
++`_links_lock`, with the lock wait charged against its five-second capture budget.
++It recaptures external input every 30 seconds after completion. Failed captures
++publish unknown/stale, never a successful empty inventory; display requests do
++not fall back to synchronous projection or legacy refresher admission. Existing
++90-second validity is checked on every display read. A dead feed is unavailable.
++No fact-host socket, replica IPC, demand channel, or per-request watch is started.
++
++Shutdown closes the feed and its captured worker before removing the binding and
++resuming legacy admission. Failed cleanup retains the startup owner and fence,
++blocking a replacement until cleanup succeeds. The drain itself retains its
++fence on timeout; startup unwind explicitly rolls back only its own owner.
++
++Verification covers actual ASGI composition, zero legacy admissions under repeated
++ON reads, OFF and strict behavior, isolation, publication copy safety, failed
++cleanup and drain timeout, and native origin-ledger projection parity. Production
++CPU acceptance is separate: after natural deployment, identify the routed serve
++and take a continuous >=10 minute native per-thread context-switch sample;
++`kanban-remote-l` must remain below 2k context switches/second. A passing unit suite
++or a merged PR is not that live result.
+diff --git a/hermes_cli/fact_links_startup.py b/hermes_cli/fact_links_startup.py
+new file mode 100644
+index 00000000000..6a6441230a4
+--- /dev/null
++++ b/hermes_cli/fact_links_startup.py
+@@ -0,0 +1,106 @@
++"""Startup-owned in-process links display projection. [daveey]
++
++Only the launch origin is authorized here; other profile/storage contexts keep
++legacy behavior. No replica IPC, request-side source discovery or strict-reader
++cutover. The external origin inventory is recaptured at most every 30 seconds.
++"""
++from contextlib import asynccontextmanager
++import asyncio
++import os
++import threading
++
++from hermes_cli.fact_capture import CaptureBudget
++from hermes_cli.fact_content_owner import ContentOwner
++from hermes_cli.fact_contract import Scope, SourceId
++from hermes_cli.fact_reducers import ReducerEngine
++from hermes_cli.fact_remote_links import LinksFacts, RemoteLinksSource
++from hermes_cli.fact_store import FactStore
++
++_lock = threading.RLock()
++_runtimes = {}
++
++
++def binding_for(origin):
++    """Memory-only exact-origin selection; snapshot publication owns its lock."""
++    with _lock:
++        runtime = _runtimes.get(origin)
++        return runtime.binding if runtime is not None else None
++
++
++class LinksRuntime:
++    def __init__(self, origin):
++        self.origin = origin
++        self.scope = Scope(origin[0], origin[1])
++        self.store = FactStore()
++        self.owner = None
++        self.binding = None
++        self.closed = False
++        self.v1 = self  # LinksFacts' scoped snapshot interface, no subscriber workers needed.
++
++    def snapshot(self, scope):
++        if self.closed or self.owner is None or not self.owner.feed._thread.is_alive():
++            raise RuntimeError('links owner unavailable')
++        if scope != self.scope:
++            raise ValueError('unauthorized links scope')
++        return self.store.snapshot(scope)
++
++    def start(self, *, timeout=5):
++        from hermes_cli import kanban_session_activity as activity
++        with _lock:
++            if self.origin in _runtimes:
++                raise RuntimeError('links startup custody already retained')
++            _runtimes[self.origin] = self
++        # Never hold the publication lock while joining a legacy projection.
++        activity._links_refresher.drain(self.origin, timeout=timeout)
++        engine = ReducerEngine(self.store, self.scope)
++        source = RemoteLinksSource(engine, SourceId(self.scope, 'remote.links', 'origin'), self.origin)
++        try:
++            self.owner = ContentOwner({self.scope: engine}, [], operational=[source],
++                                      budget=CaptureBudget(max_seconds=5))
++        except BaseException as exc:
++            # ContentStartupError carries an owner whose failed close must be retried.
++            self.owner = getattr(exc, 'owner', None)
++            raise
++        with _lock:
++            self.binding = LinksFacts(self, self.scope, self.origin)
++        return self
++
++    def close(self):
++        from hermes_cli import kanban_session_activity as activity
++        if self.owner is not None:
++            self.owner.close()  # failure keeps both custody and the admission fence
++        with _lock:
++            self.closed = True
++            if _runtimes.get(self.origin) is self:
++                del _runtimes[self.origin]
++            self.binding = None
++        activity._links_refresher.resume(self.origin)
++
++
++@asynccontextmanager
++async def lifespan(app):
++    """Select before other serve services, and unwind after their shutdown."""
++    from hermes_cli import kanban_session_activity as activity
++    origin = activity._origin_scope()
++    # health: allow HX002 -- task-defined startup-only emergency rollback switch; never stored as a credential
++    if os.environ.get('HERMES_FACTS_LINKS', '1').strip().lower() in ('0', 'off', 'false', 'no'):
++        with _lock:
++            retained = _runtimes.get(origin)
++        if retained is not None:
++            await asyncio.to_thread(retained.close)
++        else:
++            activity._links_refresher.resume(origin)
++        yield
++        return
++    runtime = LinksRuntime(origin)
++    # Start on the lifespan task so the adapter captures the launch context.
++    # Drain may wait briefly, but no request is admitted until it completes.
++    try:
++        runtime.start()
++        yield
++    finally:
++        # A duplicate app must not release another app's scope fence.
++        with _lock:
++            owned = _runtimes.get(origin) is runtime
++        if owned:
++            await asyncio.to_thread(runtime.close)
+diff --git a/hermes_cli/fact_remote_links.py b/hermes_cli/fact_remote_links.py
+index 903adca3ea0..93be7433167 100644
+--- a/hermes_cli/fact_remote_links.py
++++ b/hermes_cli/fact_remote_links.py
+@@ -116,22 +116,30 @@ class RemoteLinksSource:
+     def _build(self, budget):
+         from hermes_cli import kanban_session_activity as activity
+         started = time.monotonic()
+-        observed_at = time.time()
+         try:
+             if activity._origin_scope() != self._origin_scope:
+                 raise ValueError('remote links capture scope changed')
+-            activity._origin_rows_sink.rows = []
++            # Strict readers project under _links_lock and share its row sink and board reads: serialize
++            # with them. The wait spends this capture's budget; once spent, never start the projection.
++            remaining = budget.max_seconds - (time.monotonic() - started)
++            if remaining <= 0 or not activity._links_lock.acquire(timeout=remaining):
++                raise CaptureBudgetExceeded('remote links capture budget exceeded waiting for the projection')
+             try:
+-                cards = activity._project_remote_links()
+-                rows = activity._origin_rows_sink.rows
+-                value = {'cards': cards, 'origin_rows': rows}
+-                encoded = json.dumps(value, separators=(',', ':'), allow_nan=False).encode()
+-                if (len(cards) + len(rows) > budget.max_keys or len(encoded) > budget.max_bytes
+-                        or time.monotonic() - started > budget.max_seconds):
+-                    raise CaptureBudgetExceeded('remote links capture budget exceeded')
+-                result = LinksCapture(freeze(value), hashlib.sha256(encoded).hexdigest(), observed_at)
++                observed_at = time.time()  # the projection observes stores from here, not from launch
++                activity._origin_rows_sink.rows = []
++                try:
++                    cards = activity._project_remote_links()
++                    rows = activity._origin_rows_sink.rows
++                finally:
++                    activity._origin_rows_sink.rows = None
+             finally:
+-                activity._origin_rows_sink.rows = None
++                activity._links_lock.release()
++            value = {'cards': cards, 'origin_rows': rows}
++            encoded = json.dumps(value, separators=(',', ':'), allow_nan=False).encode()
++            if (len(cards) + len(rows) > budget.max_keys or len(encoded) > budget.max_bytes
++                    or time.monotonic() - started > budget.max_seconds):
++                raise CaptureBudgetExceeded('remote links capture budget exceeded')
++            result = LinksCapture(freeze(value), hashlib.sha256(encoded).hexdigest(), observed_at)
+         except Exception:  # health: allow BLE001 -- source failure publishes stale without exception text or empty success
+             result = LinksCapture(failed=True, observed_at=time.time())
+         with self._lock:
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index c7e8bc0c06a..895e2e4b6ba 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -943,8 +943,12 @@ def _remote_links(stale_ok: bool = False) -> list[dict[str, Any]]:
+ def _links_entry(stale_ok: bool, *, with_rows: bool = False):
+     from hermes_cli.fact_remote_links import _current
+     binding = _current.get()
+-    if stale_ok and binding is not None:
+-        return binding.read(with_rows)
++    if stale_ok:
++        if binding is None:
++            from hermes_cli.fact_links_startup import binding_for
++            binding = binding_for(_origin_scope())
++        if binding is not None:
++            return binding.read(with_rows)
+ 
+     def out(entry):
+         return (list(entry[3]), list(entry[4])) if with_rows else list(entry[3])
+diff --git a/hermes_cli/web_server_app.py b/hermes_cli/web_server_app.py
+index f47e4ebd43e..eaee9ddb8ad 100644
+--- a/hermes_cli/web_server_app.py
++++ b/hermes_cli/web_server_app.py
+@@ -316,8 +316,9 @@ async def app_lifespan(app: FastAPI):
+     from gateway import host_attach
+     host_attach.enable_stale_while_revalidate()
+     from hermes_cli.fact_plugin_mount import lifespan as plugin_lifespan
++    from hermes_cli.fact_links_startup import lifespan as links_lifespan
+     try:
+-        async with plugin_lifespan(app), lifespan(app):
++        async with links_lifespan(app), plugin_lifespan(app), lifespan(app):
+             yield
+     finally:
+         host_attach.enable_stale_while_revalidate(False)
+diff --git a/tests/hermes_cli/test_fact_links_startup.py b/tests/hermes_cli/test_fact_links_startup.py
+new file mode 100644
+index 00000000000..ab5e29690e4
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_links_startup.py
+@@ -0,0 +1,148 @@
++"""Serve cutover uses an in-process publication, never the legacy queue."""
++import threading
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++from hermes_cli import kanban_session_activity as activity
++from tests.waiting import wait_until
++
++
++@pytest.fixture
++def origin(monkeypatch):
++    from hermes_cli.kanban_links_refresh import ScopeRefresher
++    scope = ('test-home', 'default', 'boards', 'hub', 'mail')
++    monkeypatch.setattr(activity, '_origin_scope', lambda: scope)
++    admissions = []
++    monkeypatch.setattr(activity, '_links_refresher', ScopeRefresher(admissions.append, 16))
++    monkeypatch.setattr(activity, '_project_remote_links', lambda: [{'id': 't_one', 'status': 'running'}])
++    return scope, admissions
++
++
++def test_serve_lifespan_defaults_on_and_reads_publication(origin, monkeypatch):
++    from hermes_cli.fact_links_startup import lifespan, binding_for
++    scope, admissions = origin
++    monkeypatch.delenv('HERMES_FACTS_LINKS', raising=False)
++    app = FastAPI(lifespan=lifespan)
++
++    @app.get('/')
++    def display():
++        return activity._remote_links(stale_ok=True)
++
++    with TestClient(app) as client:
++        binding = binding_for(scope)
++        assert binding is not None
++        wait_until(lambda: binding.handle.v1.snapshot(binding.scope).get(binding.key) is not None)
++        expected = activity._project_remote_links()
++        import time
++        from hermes_cli.fact_remote_links import RemoteLinksSource
++        def recapture_scheduled():
++            with binding.handle.owner.feed._condition:
++                return any(isinstance(s.adapter, RemoteLinksSource) and s.due is not None
++                           and 25 < s.due - time.monotonic() <= 30
++                           for s in binding.handle.owner.feed._sources)
++        wait_until(recapture_scheduled)
++        monkeypatch.setattr(activity, '_links_lookup', lambda *a, **k: pytest.fail('legacy display read'))
++        for _ in range(50):
++            activity._refresh_links_in_background(scope)
++            assert client.get('/').json() == expected
++        assert admissions == [] and not activity._links_refresher.busy
++        assert activity.remote_links_and_origin_rows(stale_ok=True) == (expected, [])
++        # Caller mutation cannot modify the shared generation.
++        activity._remote_links(stale_ok=True)[0]['status'] = 'corrupt'
++        assert client.get('/').json() == expected
++    assert binding_for(scope) is None
++    activity._refresh_links_in_background(scope)
++    wait_until(lambda: admissions == [scope])
++
++
++def test_switch_off_resumes_and_preserves_strict_and_display_paths(origin, monkeypatch):
++    from hermes_cli.fact_links_startup import lifespan, binding_for
++    scope, admissions = origin
++    monkeypatch.setenv('HERMES_FACTS_LINKS', '0')
++    activity._links_refresher.drain(scope, timeout=0)
++    calls = []
++    monkeypatch.setattr(activity, '_links_lookup', lambda scope, stale: calls.append(stale) or (0, scope, (), ['legacy'], ['row']))
++    with TestClient(FastAPI(lifespan=lifespan)):
++        assert binding_for(scope) is None
++        assert activity._remote_links(stale_ok=True) == ['legacy']
++        assert activity._remote_links() == ['legacy']
++        activity._refresh_links_in_background(scope)
++        wait_until(lambda: admissions == [scope])
++    assert calls == [True, False]
++
++
++def test_bound_strict_and_foreign_scopes_remain_legacy(origin, monkeypatch):
++    from hermes_cli.fact_links_startup import lifespan
++    monkeypatch.delenv('HERMES_FACTS_LINKS', raising=False)
++    monkeypatch.setattr(activity, '_links_lookup', lambda scope, stale: (0, scope, (), ['strict'], []))
++    with TestClient(FastAPI(lifespan=lifespan)):
++        assert activity._remote_links() == ['strict']
++        monkeypatch.setattr(activity, '_origin_scope', lambda: ('foreign',))
++        assert activity._remote_links(stale_ok=True) == ['strict']
++
++
++def test_drain_timeout_keeps_fence_and_does_not_start_replacement(origin, monkeypatch):
++    from hermes_cli.fact_links_startup import LinksRuntime, binding_for
++    scope, _ = origin
++    started, release = threading.Event(), threading.Event()
++    def blocked(_):
++        started.set()
++        assert release.wait(5)
++    activity._links_refresher._refresh = blocked
++    activity._refresh_links_in_background(scope)
++    assert started.wait(5)
++    runtime = LinksRuntime(scope)
++    try:
++        with pytest.raises(TimeoutError):
++            runtime.start(timeout=0)
++        assert runtime.owner is None and binding_for(scope) is None
++        assert scope in activity._links_refresher._fenced
++    finally:
++        release.set()
++        wait_until(lambda: not activity._links_refresher.busy)
++        runtime.close()
++    assert scope not in activity._links_refresher._fenced
++
++
++def test_real_app_composition_binds_before_services_and_releases_after(origin, monkeypatch):
++    from contextlib import asynccontextmanager
++    from hermes_cli import web_server_app
++    from hermes_cli.fact_links_startup import binding_for
++    scope, _ = origin
++    monkeypatch.delenv('HERMES_FACTS_LINKS', raising=False)
++    seen = []
++
++    @asynccontextmanager
++    async def services(app):
++        seen.append(binding_for(scope) is not None)
++        yield
++        seen.append(binding_for(scope) is not None)
++
++    monkeypatch.setattr(web_server_app, 'standalone_lifespan', services)
++    with TestClient(FastAPI(lifespan=web_server_app.app_lifespan)):
++        assert binding_for(scope) is not None
++    assert seen == [True, True] and binding_for(scope) is None
++
++
++def test_failed_cleanup_retains_fence_binding_and_blocks_duplicate(origin, monkeypatch):
++    from hermes_cli.fact_links_startup import LinksRuntime, binding_for
++    scope, _ = origin
++    runtime = LinksRuntime(scope).start()
++    close = runtime.owner.close
++    def failed():
++        raise TimeoutError('owned capture still running')
++    monkeypatch.setattr(runtime.owner, 'close', failed)
++    try:
++        with pytest.raises(TimeoutError):
++            runtime.close()
++        assert binding_for(scope) is runtime.binding
++        assert scope in activity._links_refresher._fenced
++        with pytest.raises(RuntimeError, match='custody'):
++            LinksRuntime(scope).start()
++    finally:
++        monkeypatch.setattr(runtime.owner, 'close', close)
++        runtime.close()
++    assert binding_for(scope) is None
++    assert scope not in activity._links_refresher._fenced
+diff --git a/tests/hermes_cli/test_fact_remote_links_serialization.py b/tests/hermes_cli/test_fact_remote_links_serialization.py
+new file mode 100644
+index 00000000000..bbb7199c3e7
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_remote_links_serialization.py
+@@ -0,0 +1,109 @@
++"""RemoteLinksSource capture serializes with strict ``_links_lock`` readers. [daveey]
++
++The source's canonical ``_project_remote_links`` shares ``_origin_rows_sink`` and the
++ledger/replica reads with strict read-your-writes callers, which project under
++``activity._links_lock``. The capture must take that same lock, count the wait against
++its budget, and never start the expensive projection once the budget is spent waiting.
++"""
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli.fact_capture import CaptureBudget
++from hermes_cli.fact_contract import Scope, SourceId
++from hermes_cli.fact_reducers import ReducerEngine
++from hermes_cli.fact_store import FactStore
++from tests.waiting import wait_until
++
++
++class _ObservedLock:
++    """The real lock, plus an event set when a thread asks for it while another holds it."""
++
++    def __init__(self):
++        self._lock = threading.Lock()
++        self.requested = threading.Event()
++        self._holder = None
++
++    def acquire(self, blocking=True, timeout=-1):
++        if self._lock.locked() and threading.get_ident() != self._holder:
++            self.requested.set()  # contended: another thread holds it
++        got = self._lock.acquire(blocking, timeout)
++        if got:
++            self._holder = threading.get_ident()
++        return got
++
++    def release(self):
++        self._holder = None
++        self._lock.release()
++
++    def locked(self):
++        return self._lock.locked()
++
++    def held_by_current_thread(self):
++        return self._lock.locked() and self._holder == threading.get_ident()
++
++    __enter__ = acquire
++
++    def __exit__(self, *exc):
++        self.release()
++
++
++@pytest.fixture
++def links(monkeypatch):
++    from hermes_cli.fact_remote_links import RemoteLinksSource
++    lock = _ObservedLock()
++    monkeypatch.setattr(activity, '_links_lock', lock)
++    monkeypatch.setattr(activity, '_origin_scope', lambda: ('authorized',))
++    calls = []
++
++    def projector():
++        calls.append(lock.held_by_current_thread())
++        activity._origin_rows_sink.rows.append({'key': 'k'})
++        return [{'key': 'k'}]
++
++    monkeypatch.setattr(activity, '_project_remote_links', projector)
++    scope = Scope('install', 'default')
++    engine = ReducerEngine(FactStore(), scope)
++    source = RemoteLinksSource(engine, SourceId(scope, 'remote.links', 'origin'), ('authorized',))
++    woke = threading.Event()
++    source.watch(woke.set)
++    yield source, lock, calls, woke
++    if lock.held_by_current_thread():
++        lock.release()
++    source.close()
++
++
++def test_capture_projection_waits_for_strict_reader_and_holds_the_lock(links):
++    source, lock, calls, woke = links
++    lock.acquire()  # a strict reader is projecting under _links_lock
++    source.capture(None, CaptureBudget(max_seconds=10))
++    wait_until(lambda: calls or lock.requested.is_set(), what='capture projects or asks for _links_lock')
++    assert calls == [], 'capture projected concurrently with a strict reader'
++    released_at = time.time()
++    lock.release()
++    assert woke.wait(10)
++    assert calls == [True], 'projection ran without holding _links_lock'
++    result = source.capture(None, CaptureBudget(max_seconds=10))
++    assert not result.failed
++    assert result.value['cards'][0]['key'] == 'k' and result.value['origin_rows'][0]['key'] == 'k'
++    assert result.observed_at >= released_at  # observed after the wait, not when the worker launched
++    assert not lock.locked()
++    source.commit(result)
++    fact = source.engine.store.snapshot(source.engine.scope).get(source.key)
++    assert fact.health == 'fresh'
++
++
++def test_lock_wait_past_budget_fails_without_projecting(links):
++    source, lock, calls, woke = links
++    lock.acquire()  # held for the whole capture budget
++    source.capture(None, CaptureBudget(max_seconds=0.05))
++    assert woke.wait(10), 'lock-wait expiry never completed the capture'
++    assert lock.requested.is_set(), 'capture never contended for _links_lock'
++    assert calls == [], 'expired lock wait still ran the expensive projection'
++    result = source.capture(None, CaptureBudget(max_seconds=0.05))
++    assert result.failed and result.value is None
++    source.commit(result)
++    fact = source.engine.store.snapshot(source.engine.scope).get(source.key)
++    assert fact.health == 'unknown' and fact.error_code == 'links_capture_failed'
+-- 
+2.43.0
+

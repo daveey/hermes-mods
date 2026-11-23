@@ -1,0 +1,179 @@
+From 5497c7945f5f5b022168c31f916a87f65615a5e1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 08:00:52 +0000
+Subject: [PATCH] [daveey] Retry quiet fact replica callbacks with bounded
+ per-subscriber backoff
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/fact_replica.py                  |  36 +++++--
+ tests/hermes_cli/test_fact_replica_retry.py | 100 ++++++++++++++++++++
+ 2 files changed, 130 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_fact_replica_retry.py
+
+diff --git a/hermes_cli/fact_replica.py b/hermes_cli/fact_replica.py
+index 2c56457e7ca..9c41b357d57 100644
+--- a/hermes_cli/fact_replica.py
++++ b/hermes_cli/fact_replica.py
+@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
+ import socket
+ import threading
+ import logging
++import time
+ 
+ from hermes_cli.fact_contract import Delta, Fact, FactKey, Position, Ready, Pending, Unavailable
+ from hermes_cli.fact_ipc import connect, receive, send
+@@ -90,14 +91,37 @@ class ReplicaHandle:
+         self._demands.put(view, selector)
+ 
+     def _dispatch(self):
++        retries = {}
++        timeout = None
+         while not self._stop.is_set():
+-            self._deliver.wait()
++            self._deliver.wait(timeout)
+             self._deliver.clear()
+-            try:
+-                self._store.drain()
+-            except (RuntimeError, ValueError, TypeError, OSError):
+-                # The failing subscription retains reset_pending for the next publication.
+-                continue
++            if self._stop.is_set():
++                break
++            with self._store._condition:
++                subscriptions = set(self._store._subscribers)
++                pending = [s for s in subscriptions if s.queue or s.reset_pending]
++            retries = {s: retry for s, retry in retries.items() if s in pending}
++            for sub in pending:
++                due, count = retries.get(sub, (0, 0))
++                if due > time.monotonic():
++                    continue
++                if not sub.delivery_lock.acquire(blocking=False):
++                    retries[sub] = (time.monotonic() + .1, count)
++                    continue
++                try:
++                    sub._deliver()
++                    retries.pop(sub, None)
++                except Exception:  # health: allow BLE001 -- isolate subscribers and retry retained reset
++                    delay = (.1, .2, .4, 1., 2., 5.)[min(count, 5)]
++                    retries[sub] = (time.monotonic() + delay, min(count + 1, 5))
++                    logging.getLogger(__name__).exception('replica callback failed; reset retained')
++                finally:
++                    sub.delivery_lock.release()
++            # Publication wakes healthy peers immediately, but cannot bypass a
++            # failing subscriber's backoff. Quiet owners still get a retry.
++            timeout = (max(0, min(due for due, _ in retries.values()) - time.monotonic())
++                       if retries else None)
+ 
+     def _apply(self, delta):
+         if not isinstance(delta, Delta) or type(delta.rev) is not int or type(delta.prev) is not int:
+diff --git a/tests/hermes_cli/test_fact_replica_retry.py b/tests/hermes_cli/test_fact_replica_retry.py
+new file mode 100644
+index 00000000000..0c98a2fb646
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_replica_retry.py
+@@ -0,0 +1,100 @@
++"""Quiet socket replicas retain callback retries without starving peers."""
++import threading
++from types import SimpleNamespace
++
++from hermes_cli import fact_replica
++from hermes_cli.fact_store import FactStore
++
++import pytest
++
++from hermes_cli.fact_contract import Scope
++from hermes_cli.fact_host import FactHost, acquire
++from hermes_cli.fact_replica import Endpoint
++from tests.waiting import wait_until
++
++
++@pytest.mark.platforms('linux')
++def test_quiet_replica_retries_failed_callback_and_delivers_sibling(tmp_path_factory):
++    scope = Scope('fixture', 'alpha')
++    token = 'retry-fixture-capability-token-00000000'
++    host = FactHost(tmp_path_factory.mktemp('retry'), {token: scope}).start()
++    handle = acquire(scope, endpoint=Endpoint(str(host.directory / 'facts.sock'), token))
++    recovered, sibling = threading.Event(), threading.Event()
++    calls = []
++
++    def transient(delta):
++        calls.append(delta)
++        if len(calls) == 1:
++            raise RuntimeError('one transient consumer failure')
++        recovered.set()
++
++    try:
++        assert wait_until(lambda: handle._online, timeout=5)
++        revision = host.store.snapshot(scope).rev
++        sub = handle.v1.subscribe(scope, (), None, None, transient)
++        peer = handle.v1.subscribe(scope, (), None, None, lambda delta: sibling.set())
++        assert sibling.wait(5)
++        assert recovered.wait(3), 'quiet source must retry retained reset without publication'
++        assert calls[-1].reset
++        assert host.store.snapshot(scope).rev == revision
++        sub.close()
++        peer.close()
++    finally:
++        handle.close()
++        host.close()
++    assert not handle._callbacks.is_alive()
++
++
++def test_retry_backoff_caps_and_stops_after_success(monkeypatch):
++    scope = Scope('fixture', 'alpha')
++    handle = object.__new__(fact_replica.ReplicaHandle)
++    handle._store = FactStore()
++    handle._stop = threading.Event()
++    clock, waits, calls = [0.0], [], []
++    monkeypatch.setattr(fact_replica, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
++
++    def wait(timeout=None):
++        waits.append(timeout)
++        if len(waits) > 10:
++            pytest.fail('callback retry failed to become idle')
++        if timeout is None and calls:
++            handle._stop.set()
++        elif timeout is not None:
++            clock[0] += timeout
++
++    handle._deliver = SimpleNamespace(wait=wait, clear=lambda: None)
++
++    def callback(delta):
++        calls.append(delta)
++        if len(calls) <= 7:
++            raise LookupError('consumer-specific exception is isolated too')
++
++    handle._store.subscribe(scope, (), None, None, callback)
++    handle._dispatch()
++    assert waits[0] is None and waits[-1] is None
++    assert waits[1:-1] == pytest.approx([.1, .2, .4, 1., 2., 5., 5.])
++    assert len(calls) == 8
++    assert all(delta.reset for delta in calls)
++
++
++@pytest.mark.platforms('linux')
++def test_failed_callback_close_cancels_retry(tmp_path_factory):
++    scope = Scope('fixture', 'alpha')
++    token = 'cancel-fixture-capability-token-0000000'
++    host = FactHost(tmp_path_factory.mktemp('cancel'), {token: scope}).start()
++    handle = acquire(scope, endpoint=Endpoint(str(host.directory / 'facts.sock'), token))
++    failed = threading.Event()
++
++    def broken(delta):
++        failed.set()
++        raise RuntimeError('persistent consumer failure')
++
++    try:
++        assert wait_until(lambda: handle._online, timeout=5)
++        sub = handle.v1.subscribe(scope, (), None, None, broken)
++        assert failed.wait(5)
++        sub.close()
++    finally:
++        handle.close()
++        host.close()
++    assert not handle._callbacks.is_alive()
+-- 
+2.43.0
+

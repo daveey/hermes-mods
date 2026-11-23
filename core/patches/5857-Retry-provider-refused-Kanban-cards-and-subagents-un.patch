@@ -1,0 +1,899 @@
+From 66b27ffafa15844286a20892bdb35e4ce56259c9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 02:01:53 +0000
+Subject: [PATCH] Retry provider-refused Kanban cards and subagents unchanged
+ on other eligible providers [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_db_dispatch_admission.py    |   3 +
+ hermes_cli/kanban_model_tier.py               |  14 +-
+ hermes_cli/kanban_refusal_fallback.py         | 260 ++++++++++++++++++
+ hermes_cli/kanban_refusal_receipt.py          |  42 +--
+ hermes_cli/kanban_spend_decision.py           |  12 +-
+ .../test_kanban_refusal_fallback.py           | 239 ++++++++++++++++
+ tests/tools/test_delegate_refusal_fallback.py |  94 +++++++
+ tools/delegate_tool_dispatch.py               |   6 +
+ tools/delegate_tool_refusal.py                |  73 +++++
+ 9 files changed, 724 insertions(+), 19 deletions(-)
+ create mode 100644 hermes_cli/kanban_refusal_fallback.py
+ create mode 100644 tests/hermes_cli/test_kanban_refusal_fallback.py
+ create mode 100644 tests/tools/test_delegate_refusal_fallback.py
+ create mode 100644 tools/delegate_tool_refusal.py
+
+diff --git a/hermes_cli/kanban_db_dispatch_admission.py b/hermes_cli/kanban_db_dispatch_admission.py
+index 53d3f68738f..49be1b90e1b 100644
+--- a/hermes_cli/kanban_db_dispatch_admission.py
++++ b/hermes_cli/kanban_db_dispatch_admission.py
+@@ -28,6 +28,9 @@ def lane_admission_refused(conn: sqlite3.Connection, task_id: str, assignee: str
+     if (code := dispatch_refusal(conn, task_id, assignee, spawn_fn, dry_run=dry_run)) is not None:
+         result.capsule_refused.append((task_id, code))
+         return True
++    from hermes_cli.kanban_refusal_fallback import admission as refusal_admission
++    if refusal_admission(conn, task_id, result, dry_run=dry_run):  # every eligible provider refused: fail closed
++        return True
+     from hermes_cli.kanban_class_walls import unroutable_class
+     if why := unroutable_class(conn, task_id, lane=lane):
+         result.skipped_ineligible.append((task_id, f'model_unroutable:{why}'))
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 0270c5e3382..41ce2018362 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -37,6 +37,7 @@ FAILED_RUN_OUTCOMES = ("crashed", "oom_killed", "signaled", "timed_out", "gave_u
+ # Events that mean "a reviewer rejected the previous attempt".
+ REWORK_EVENT_KINDS = ("changes_requested", "review_reopened")
+ REVIEW_SKILL = "sdlc-review"
++_REFUSAL_EXHAUSTED = "refusal_exhausted"  # kanban_refusal_fallback.EXHAUSTED
+ 
+ 
+ def _str(value: Any) -> str:
+@@ -331,12 +332,23 @@ def apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Opt
+     plus the run's resolved ``run_route`` receipt (every spawn, tier off included).
+     Returns the reason. Review resolution/receipt failures refuse admission rather than inventing a route."""
+     reason = _apply_model_tier(conn, task, lane=lane, cfg=cfg)
++    if f"+{_REFUSAL_EXHAUSTED}:" in reason:
++        from agent.model_routing import ModelRoutingError
++        raise ModelRoutingError(f"Every eligible provider refused this card's work ({reason.rsplit(':', 1)[1]})")
+     record_run_route(conn, task, lane=lane, reason=reason)
+     return reason
+ 
+ 
+ def resolve_dispatch_tier(conn, task, *, lane, cfg=None):
+-    """One read-only route decision for preview and actual admission."""
++    """One read-only route decision for preview and actual admission.
++
++    A card with a provider-refused set never starts on a refused provider (``kanban_refusal_fallback``)."""
++    route = _resolve_dispatch_tier(conn, task, lane=lane, cfg=cfg)
++    from hermes_cli.kanban_refusal_fallback import reroute
++    return reroute(conn, task, route, lane=lane)
++
++
++def _resolve_dispatch_tier(conn, task, *, lane, cfg=None):
+     base = resolve_model_tier(conn, task, lane=lane, cfg=cfg)
+     from hermes_cli.kanban_model_neutral import routing_view
+     task = routing_view(task)
+diff --git a/hermes_cli/kanban_refusal_fallback.py b/hermes_cli/kanban_refusal_fallback.py
+new file mode 100644
+index 00000000000..0e0d30f0040
+--- /dev/null
++++ b/hermes_cli/kanban_refusal_fallback.py
+@@ -0,0 +1,260 @@
++"""A provider safety refusal retries the same card, unchanged, on another provider of its class. [daveey]
++
++Owner policy ("automatic retries"): a verified provider safety refusal used to send the card to triage with a
++``cause: safety_refusal`` restriction no ordinary release clears. Another provider of the same class may well
++accept the same work, so the refusal now stops only the provider that gave it:
++
++1. The refusing run's concrete provider is its worker_result ``route_provider`` (a class selector's worker
++   allocates the provider), else its ``run_route`` receipt's provider. A card's *refused set* is the providers of
++   all its ``safety_refused`` runs (``task_runs.metadata.refused_provider``, else re-derived from the run's own
++   receipts, so a Board-closed run needs no extra field). Nothing new is stored.
++2. :func:`plan` at the refusal: while a provider of the card's class level is eligible (enabled, serving on this
++   host's live pool, not walled: the checks ratio/paced reroute use) and not refused, the run still ends
++   ``safety_refused`` (kept), ``safety_refusal_fallback`` is recorded and the card returns to ``ready`` with NO
++   safety restriction (:func:`kanban_refusal_receipt.restricted` stays false).
++3. :func:`reroute` (inside ``resolve_dispatch_tier``): a card with a refused set never starts on a refused
++   provider; it moves to an eligible peer, tier_reason ``<reason>+refusal:<providers>``. :func:`admission`
++   fails closed before the claim when none is left: today's safety triage, ``refused_providers`` listed.
++4. Everything else is as before: no rewording, no injected note, never the same provider twice, a refusal whose
++   provider is unknown (or a review run) is stopped exactly as before, and non-refusal failures are untouched.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import time
++from typing import Any, Optional
++
++logger = logging.getLogger(__name__)
++
++EVENT = "safety_refusal_fallback"
++REASON = "refusal"
++EXHAUSTED = "refusal_exhausted"
++
++
++def _norm(provider: Any) -> str:
++    return str(provider or "").strip().lower()
++
++
++def _concrete(provider: Any) -> str:
++    value = _norm(provider)
++    return "" if value in ("", "auto", "none") else value
++
++
++def _payload(raw: Any) -> dict:
++    try:
++        value = json.loads(raw or "{}")
++    except (TypeError, ValueError):
++        return {}
++    return value if isinstance(value, dict) else {}
++
++
++def run_provider(conn, task_id: str, run_id: Optional[int], result: Optional[dict] = None) -> str:
++    """The concrete provider that ran *run_id* ('' = unknown): its worker_result route, else its run_route."""
++    if run_id is None:
++        return ""
++    if result and _concrete(result.get("route_provider")):
++        return _concrete(result["route_provider"])
++    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_result' "
++                       "ORDER BY id DESC", (task_id, run_id)).fetchall()
++    for (raw,) in row:
++        if (found := _concrete(_payload(raw).get("route_provider"))):
++            return found
++    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='run_route' "
++                               "ORDER BY id DESC", (task_id, run_id)):
++        return _concrete(_payload(raw).get("provider"))
++    return ""
++
++
++def refused_providers(conn, task_id: str) -> list[str]:
++    """Providers of this card's ``safety_refused`` runs, oldest first, no repeats."""
++    out: list[str] = []
++    for run_id, raw in conn.execute("SELECT id, metadata FROM task_runs WHERE task_id=? AND outcome='safety_refused' "
++                                    "ORDER BY id", (task_id,)).fetchall():
++        provider = _concrete(_payload(raw).get("refused_provider")) or run_provider(conn, task_id, run_id)
++        if provider and provider not in out:
++            out.append(provider)
++    return out
++
++
++def _class_model(conn, task, lane: str) -> str:
++    """The model whose class level bounds the card's peers: a concrete pin's own level, else the routed class."""
++    from agent.model_routing import is_class_selector
++    from hermes_cli.kanban_model_neutral import routing_view
++    from hermes_cli.kanban_model_tier import resolve_model_tier
++    raw = getattr(task, "_routing_source", task)
++    pin = str(getattr(raw, "model_override", None) or "").strip()
++    if pin and not is_class_selector(pin):
++        return pin
++    return str(resolve_model_tier(conn, routing_view(task), lane=lane)[0] or "")
++
++
++def eligible_routes(conn, task, lane: str = "ready") -> list[tuple[str, str]]:
++    """``[(model, provider)]`` of the card's class level (see :func:`class_peers`). Read-only."""
++    return class_peers(task, _class_model(conn, task, lane))
++
++
++def class_peers(task, model: str) -> list[tuple[str, str]]:
++    """``[(model, provider)]`` of ``model``'s class level, registry order: enabled, serving on this host's live
++    pool and not walled (``kanban_ratio_routing`` / ``kanban_paced_reroute`` eligibility). ``task`` supplies the
++    assignee whose routing policy applies. Shared with the subagent retry (``delegate_tool_refusal``)."""
++    from hermes_cli import kanban_provider_walls as pw
++    from hermes_cli.kanban_ratio_routing import _pool_routes
++    walled = pw.active_walls(now=time.time())
++    out: list[tuple[str, str]] = []
++    for pool, models in _pool_routes(task, model):
++        if pool in walled:
++            continue
++        for candidate in models:
++            if not pw.live_quota_wall(pool, candidate) and pw.live_pool_serving(pool, candidate):
++                out.append((candidate, pool))
++                break
++    return out
++
++
++def _next_route(conn, task, refused: list[str], lane: str = "ready") -> Optional[tuple[str, str]]:
++    try:
++        return next(((m, p) for m, p in eligible_routes(conn, task, lane) if p not in refused), None)
++    except Exception:  # health: allow BLE001 -- an unreadable class policy means no proven peer: fail closed
++        logger.warning("kanban refusal fallback: eligibility unreadable for %s", getattr(task, "id", "?"), exc_info=True)
++        return None
++
++
++def _run_lane(conn, task_id: str, run_id: Optional[int]) -> str:
++    for (raw,) in conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='run_route' "
++                               "ORDER BY id DESC", (task_id, run_id)):
++        return str(_payload(raw).get("lane") or "ready")
++    return "ready"
++
++
++def plan(conn, row, result: dict) -> dict:
++    """The decision for a verified refusal of ``row``'s current run: ``{refused_provider, refused_providers, next}``.
++
++    ``next`` is ``(model, provider)`` only when the refusing provider is proven and an unrefused peer is eligible;
++    anything else keeps today's stop. Read-only."""
++    from hermes_cli import kanban_db as kb
++    task_id, run_id = row["id"], row["current_run_id"]
++    provider = run_provider(conn, task_id, run_id, result)
++    refused = refused_providers(conn, task_id)
++    if provider and provider not in refused:
++        refused.append(provider)
++    out: dict = {"refused_provider": provider or None, "refused_providers": refused, "next": None}
++    task = kb.get_task(conn, task_id)
++    if not provider or task is None:
++        return out
++    lane = _run_lane(conn, task_id, run_id)
++    from hermes_cli.kanban_review_model import is_review_run
++    if is_review_run(conn, task, lane):
++        return out  # an independent reviewer is chosen by the review resolver, not by class peers
++    out["next"] = _next_route(conn, task, refused, lane)
++    return out
++
++
++def fallback_message(refused: str, nxt: str) -> str:
++    return f"Provider {refused} refused; retrying unchanged on {nxt}"
++
++
++def fallback_payload(decision: dict, payload: dict, run_uid: Optional[str]) -> dict:
++    model, provider = decision["next"]
++    out = {"refused_provider": decision["refused_provider"], "refused_providers": decision["refused_providers"],
++           "next_provider": provider, "next_model": model,
++           "message": fallback_message(decision["refused_provider"], provider)}
++    for key in ("source_result_event_id", "source_result_event_uid"):
++        if payload.get(key) is not None:
++            out[key] = payload[key]
++    if run_uid:
++        out["run_uid"] = run_uid
++    return out
++
++
++def requeue(conn, row, decision: dict, payload: dict) -> None:
++    """Local board: end the refused run (record kept) and make the card ready, unchanged and unrestricted.
++
++    Called inside the reclaim transaction after the run's CAS has been revalidated by the caller."""
++    from hermes_cli import kanban_db as kb
++    task, run = row["id"], row["current_run_id"]
++    from hermes_cli import kanban_db_sync as sync
++    event = fallback_payload(decision, payload, sync.run_uid(conn, run))  # None on an unsynced board
++    meta = {**payload, "refused_provider": decision["refused_provider"],
++            "refused_providers": decision["refused_providers"], "fallback_provider": event["next_provider"],
++            "reason": event["message"]}
++    kb._end_run(conn, task, outcome="safety_refused", status="safety_refused", error=event["message"], metadata=meta)
++    kb._append_event(conn, task, "safety_refused", meta, run_id=run)
++    kb._append_event(conn, task, EVENT, event, run_id=run)
++
++
++def _triage(conn, task_id: str, run_id: Optional[int], payload: dict) -> None:
++    """Today's safety stop events (shared by the reclaim path and the claim-time fail-closed path)."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_spend_decision as decision
++    if (stop := decision.pending_episode(conn, task_id)) is not None:
++        payload["episode"] = stop.get("uid") or str(stop["id"])
++        kb._append_event(conn, task_id, "decision_hold_restricted", payload, run_id=run_id)
++    else:
++        kb._append_event(conn, task_id, decision.EVENT, payload, run_id=run_id)
++    kb._append_event(conn, task_id, "safety_refused", payload, run_id=run_id)
++    decision.safe_ensure_producer(conn, task_id)
++
++
++def admission(conn, task_id: str, result, *, dry_run: bool) -> bool:
++    """Pre-claim: True when a card with a refused set has no unrefused eligible provider left.
++
++    A local board is then stopped as today (triage + safety restriction, ``refused_providers`` listed); a
++    primary board's rows belong to the Board, so the card is only refused here (not claimed)."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli.kanban_refusal_receipt import restricted
++    refused = refused_providers(conn, task_id)
++    if not refused:
++        return False
++    task = kb.get_task(conn, task_id)
++    if task is None or restricted(conn, task_id):
++        return False
++    from hermes_cli.kanban_review_model import is_review_run
++    if is_review_run(conn, task, "ready") or _next_route(conn, task, refused) is not None:
++        return False
++    result.skipped_ineligible.append((task_id, EXHAUSTED))
++    if dry_run or sync.board_mode(conn) == "primary":
++        return True
++    with kb.write_txn(conn):
++        changed = conn.execute("UPDATE tasks SET status='triage', claim_lock=NULL, claim_expires=NULL, "
++                               "last_failure_error='Provider safety refusal; every eligible provider refused' "
++                               "WHERE id=? AND status='ready' AND current_run_id IS NULL", (task_id,)).rowcount
++        if changed:
++            last = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='safety_refused' "
++                                "ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
++            payload = {**_payload(last[0] if last else None), "cause": "safety_refusal", "accounting_boundary": False,
++                       "reason": "Provider safety refusal; every eligible provider refused",
++                       "release_authority": "unavailable", "refused_providers": refused,
++                       "next_step": "Owning supervisor must resolve the scope/authority boundary; "
++                                    "do not rerun refused work"}
++            _triage(conn, task_id, None, payload)
++    return True
++
++
++def reroute(conn, task, route: tuple, *, lane: str) -> tuple:
++    """``route`` (model, provider, reason) moved off every refused provider (module rule 3); unchanged otherwise.
++
++    A class selector's worker would allocate the provider itself, so a card with a refused set always gets a
++    concrete unrefused peer. No peer left: the reason gains ``+refusal_exhausted`` (admission already fails closed
++    before the claim; the spawn path refuses on it)."""
++    from hermes_cli import kanban_provider_walls as pw
++    from agent.model_routing import is_class_selector
++    task_id = getattr(task, "id", None)
++    if not task_id:
++        return route
++    refused = refused_providers(conn, task_id)
++    if not refused:
++        return route
++    model, provider, reason = route
++    from hermes_cli.kanban_review_model import is_review_run
++    if is_review_run(conn, task, lane):
++        return route
++    concrete = _concrete(provider) if model and not is_class_selector(model) else ""
++    if concrete and concrete not in refused:
++        return route
++    peers = _next_route(conn, task, refused, lane)
++    tag = ",".join(refused)
++    if peers is None:
++        return model, provider, f"{reason}+{EXHAUSTED}:{tag}"
++    return peers[0], pw._norm(peers[1]), f"{reason}+{REASON}:{tag}"
+diff --git a/hermes_cli/kanban_refusal_receipt.py b/hermes_cli/kanban_refusal_receipt.py
+index 95b5ddaceb6..faa33f348b1 100644
+--- a/hermes_cli/kanban_refusal_receipt.py
++++ b/hermes_cli/kanban_refusal_receipt.py
+@@ -1,7 +1,9 @@
+ """Credential-free, typed safety evidence for an attributable worker result.
+ 
+-This is stop evidence, not provider clearance or a retry grant. Never classify a
+-refusal from last_output: it can quote a refusal from an unrelated attempt.
++This is stop evidence for the refusing provider, not clearance of the work. The card is retried
++unchanged on another eligible provider (``kanban_refusal_fallback``) until every one has refused; only then is it
++held with the safety restriction below. Never classify a refusal from last_output: it can quote a refusal from an
++unrelated attempt.
+ """
+ from __future__ import annotations
+ 
+@@ -45,8 +47,9 @@ def reclaim_admission(conn, row, *, failed_results_only=False):
+ def stop_failed_refusal(conn, row, proof) -> bool:
+     """Consume an exact dead-interpreter proof inside the reclaim transaction.
+ 
+-    Primary closure belongs solely to the canonical release/feed. Local boards
+-    end the run and retain the same decision kernel atomically, without retry.
++    Primary closure belongs solely to the canonical release/feed. Local boards end the run atomically and
++    either return the card to ``ready`` for an unchanged run on another eligible provider (no restriction), or,
++    when none is left or the refusing provider is unproven, retain the same decision kernel as before.
+     """
+     from hermes_cli.kanban_refusal_proof import select_refusal
+     proof = select_refusal(conn, row, proof)
+@@ -59,36 +62,43 @@ def stop_failed_refusal(conn, row, proof) -> bool:
+         raise RuntimeError('refusal finalization requires the reclaim transaction')
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_failure_release as release
+-    from hermes_cli import kanban_spend_decision as decision
+ 
+     task, run = row['id'], row['current_run_id']
+     diagnostic = {k: v for k, v in proof.items() if k != 'result'}
+     diagnostic.update(refusal_fields(result))
++    from hermes_cli import kanban_refusal_fallback as fallback
++    plan = fallback.plan(conn, row, result)
++    if plan['refused_provider']:
++        diagnostic['refused_provider'] = plan['refused_provider']
++    if plan['refused_providers']:
++        diagnostic['refused_providers'] = plan['refused_providers']
++    if plan['next']:
++        # Board authority closes a primary run; this is the core side of the contract (see fallback docs).
++        diagnostic['safety_fallback'] = {'next_model': plan['next'][0], 'next_provider': plan['next'][1]}
+     if release.queue(conn, task, run, outcome='crashed',
+                      error='Provider safety refusal; execution release unavailable', diagnostic=diagnostic):
+         return True
+     # Revalidate the exact admitted run; no state from a later attempt is changed.
+     from hermes_cli.kanban_source_receipt import with_source_receipt
++    # A fallback card is ready and unrestricted, so it carries no failure text (nothing was charged).
++    status, error = ('ready', None) if plan['next'] else ('triage', 'Provider safety refusal; execution release unavailable')
+     changed = with_source_receipt(conn, task, lambda: conn.execute(
+-        "UPDATE tasks SET status='triage', claim_lock=NULL, claim_expires=NULL, "
+-        "worker_pid=NULL, worker_started_at=NULL, "
+-        "last_failure_error='Provider safety refusal; execution release unavailable' "
++        "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
++        "worker_pid=NULL, worker_started_at=NULL, last_failure_error=? "
+         "WHERE id=? AND status='running' AND current_run_id=? AND claim_lock IS ? "
+         "AND worker_pid IS ? AND worker_started_at IS ?",
+-        (task, run, row['claim_lock'], row['worker_pid'], row['worker_started_at'])), run_id=run)
++        (status, error, task, run, row['claim_lock'], row['worker_pid'], row['worker_started_at'])), run_id=run)
+     if changed.rowcount != 1:
+         return True  # lost CAS: never book a competing failure
++    if plan['next']:
++        fallback.requeue(conn, row, plan, diagnostic)
++        return True
++    diagnostic.pop('safety_fallback', None)
+     payload = {**diagnostic, 'cause': 'safety_refusal', 'accounting_boundary': False,
+                'reason': 'Provider safety refusal; execution release unavailable',
+                'release_authority': 'unavailable',
+                'next_step': 'Owning supervisor must resolve the scope/authority boundary; do not rerun refused work'}
+     kb._end_run(conn, task, outcome='safety_refused', status='safety_refused',
+                 error=payload['reason'], metadata=payload)
+-    if (stop := decision.pending_episode(conn, task)) is not None:
+-        payload['episode'] = stop.get('uid') or str(stop['id'])
+-        kb._append_event(conn, task, 'decision_hold_restricted', payload, run_id=run)
+-    else:
+-        kb._append_event(conn, task, decision.EVENT, payload, run_id=run)
+-    kb._append_event(conn, task, 'safety_refused', payload, run_id=run)
+-    decision.safe_ensure_producer(conn, task)
++    fallback._triage(conn, task, run, payload)
+     return True
+diff --git a/hermes_cli/kanban_spend_decision.py b/hermes_cli/kanban_spend_decision.py
+index 82f877486f7..ea9b4c63a6a 100644
+--- a/hermes_cli/kanban_spend_decision.py
++++ b/hermes_cli/kanban_spend_decision.py
+@@ -170,7 +170,11 @@ def notice(payload: dict) -> str:
+         return ('Scope stopped without execution authority. No generic promotion, comment, timer or review releases it. '
+                 'Only an explicit scope renewal does: ' + ROUTE.format(task=payload.get('task_id') or '<task>') + '.')
+     if payload.get('cause') == 'safety_refusal':
+-        return ('Provider safety refusal retained. There is no supported execution release; '
++        retried = payload.get('refused_providers')
++        head = ('Provider safety refusal retained' if not retried else
++                'Provider safety refusal retained after the work was retried unchanged on other eligible providers '
++                f'until every one refused ({", ".join(str(p) for p in retried)})')
++        return (head + '. There is no supported execution release; '
+                 'ordinary promotion, review, comments and timers are not clearance. '
+                 'The owning supervisor may resolve the scope/authority boundary or withdraw '
+                 'the work without declaring incomplete acceptance satisfied. Do not rerun the refused work.')
+@@ -248,7 +252,11 @@ def _route(conn, task_id, task, own, active, bind, note, dead) -> dict:
+     from hermes_cli.kanban_refusal_receipt import restricted
+     safety = restricted(conn, task_id)
+     stopped = execution_restricted(conn, task_id)
+-    guidance = notice({'reason': note, **({'cause': 'safety_refusal' if safety else 'scope_stopped'} if stopped else {})})
++    import json as _json
++    stop = pending_episode(conn, task_id)
++    listed = _json.loads(stop['payload'] or '{}').get('refused_providers') if stop is not None and safety else None
++    guidance = notice({'reason': note, **({'cause': 'safety_refusal' if safety else 'scope_stopped'} if stopped else {}),
++                       **({'refused_providers': listed} if listed else {})})
+     action = ('\n\nRecord the administrative scope/authority decision without execution release. '
+               'Do not run the original work here. Administrative acceptance is decision recorded; authority unavailable, not root-work completion.' if stopped else
+               f"\n\nRecord the decision on {task_id}; use `hermes kanban promote {task_id} --reason '<what changed>'` "
+diff --git a/tests/hermes_cli/test_kanban_refusal_fallback.py b/tests/hermes_cli/test_kanban_refusal_fallback.py
+new file mode 100644
+index 00000000000..e319566972d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_refusal_fallback.py
+@@ -0,0 +1,239 @@
++"""A provider safety refusal retries the same card, unchanged, on another provider of its class. [daveey]
++
++Real failed interpreter -> dispatcher stop (as ``test_kanban_refusal_stop``), no model/provider call.
++Standard class: anthropic + openai-codex. Pinned/deep class: anthropic + openai-codex + xai-oauth.
++"""
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli import kanban_provider_walls as walls
++from hermes_cli import kanban_refusal_fallback as fb
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli.kanban_refusal_receipt import restricted
++from tests.hermes_cli import test_kanban_failed_result_reconcile as fixtures
++from tests.hermes_cli import test_kanban_sync_run_rows as transport
++from tests.hermes_cli.test_kanban_quota_episode import routing
++
++board = fixtures.board
++kanban_home = transport.kanban_home
++svc = transport.svc
++live = transport.live
++UNSERVED: set = set()
++CHILD = fixtures._CHILD  # pristine: each refusal rebuilds its child from it
++
++
++@pytest.fixture
++def pools(monkeypatch):
++    config, _cfg = routing(monkeypatch)
++    deep = config['model_routing']['routes']['deep'][0]
++    config['model_routing']['routes']['deep'] = [
++        dict(deep, provider='anthropic', model='claude-opus-5-5'),
++        dict(deep, provider='openai-codex', model='gpt-6-astra'),
++        dict(deep, provider='xai-oauth', model='grok-4.7')]
++    config['providers'] = {}
++    UNSERVED.clear()
++    monkeypatch.setattr(walls, 'active_walls', lambda **_k: {})
++    monkeypatch.setattr(walls, 'live_quota_wall', lambda *_a, **_k: None)
++    monkeypatch.setattr(walls, 'live_pool_serving', lambda provider, model=None: provider not in UNSERVED)
++    return config
++
++
++def refuse(conn, context, monkeypatch, provider):
++    """The claimed run ends in a verified provider safety refusal from ``provider`` (worker_result route)."""
++    source = CHILD.replace(
++        "_record_worker_result(context, 1, 'fixture worker_receipt_timeout')",
++        "_record_worker_result(context, 1, 'fixture refusal', "
++        "{'failed': True, 'failure_reason': 'content_policy_blocked', 'failure_retryable': False}, "
++        f"{{'route_provider': {provider!r}}})")
++    assert source != CHILD
++    monkeypatch.setattr(fixtures, '_CHILD', source)
++    fixtures._failed_child(conn, context)
++    dispatch.detect_crashed_workers(conn)
++
++
++def reclaim(conn, tid):
++    task = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++    assert task is not None
++    return task, {'db': str(kb.kanban_db_path(board='default')), 'task_id': tid, 'run_id': task.current_run_id,
++                  'claim_lock': task.claim_lock}
++
++
++def events(conn, tid, kind):
++    return [json.loads(r[0]) for r in conn.execute(
++        'SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id', (tid, kind))]
++
++
++def test_one_refusal_returns_card_ready_and_next_claim_uses_another_provider(board, pools, monkeypatch):
++    conn, context = board
++    tid = context['task_id']
++    before = kb.get_task(conn, tid)
++    refuse(conn, context, monkeypatch, 'anthropic')
++    task = kb.get_task(conn, tid)
++    assert task.status == 'ready' and task.current_run_id is None and task.claim_lock is None
++    assert task.consecutive_failures == 0
++    assert not restricted(conn, tid) and not decision.pending(conn, tid)
++    assert fb.refused_providers(conn, tid) == ['anthropic']
++    (fallback,) = events(conn, tid, 'safety_refusal_fallback')
++    assert (fallback['refused_provider'], fallback['next_provider']) == ('anthropic', 'openai-codex')
++    assert fallback['refused_providers'] == ['anthropic']
++    assert fallback['message'] == 'Provider anthropic refused; retrying unchanged on openai-codex'
++    assert not events(conn, tid, 'spend_budget_triaged') and not events(conn, tid, 'decision_hold_restricted')
++    # The next claim is routed off the refused provider, and the receipt says why.
++    claimed, _ = reclaim(conn, tid)
++    reason = tier.apply_model_tier(conn, claimed, lane='ready')
++    assert reason.endswith('+refusal:anthropic')
++    assert (claimed.model_override, claimed.provider_override) == ('gpt-test', 'openai-codex')
++    route = [e for e in events(conn, tid, 'run_route') if e['tier_reason'].endswith('+refusal:anthropic')]
++    assert route and route[-1]['provider'] == 'openai-codex'
++    assert before.body == claimed.body and before.title == claimed.title
++
++
++def test_refusal_record_and_events_preserved_after_fallback(board, pools, monkeypatch):
++    conn, context = board
++    tid, run_id = context['task_id'], context['run_id']
++    refuse(conn, context, monkeypatch, 'anthropic')
++    run = conn.execute('SELECT * FROM task_runs WHERE id=?', (run_id,)).fetchone()
++    assert (run['outcome'], run['status']) == ('safety_refused', 'safety_refused') and run['ended_at'] is not None
++    meta = json.loads(run['metadata'])
++    assert meta['refused_provider'] == 'anthropic' and meta['failure_reason'] == 'content_policy_blocked'
++    assert meta.get('cause') != 'safety_refusal'
++    (refused,) = events(conn, tid, 'safety_refused')
++    assert refused['refused_provider'] == 'anthropic' and 'cause' not in refused
++    fallback = conn.execute("SELECT run_id FROM task_events WHERE task_id=? AND kind='safety_refusal_fallback'",
++                            (tid,)).fetchone()
++    assert fallback['run_id'] == run_id  # the event belongs to the refused run
++
++
++def test_retried_run_receives_identical_card_and_no_refusal_note(board, pools, monkeypatch):
++    conn, context = board
++    tid = context['task_id']
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET body=? WHERE id=?", ('Do the exact thing.\nSecond line \u00e9.', tid))
++    first = kb.get_task(conn, tid)
++    refuse(conn, context, monkeypatch, 'anthropic')
++    comments = conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id=?", (tid,)).fetchone()[0]
++    claimed, _ = reclaim(conn, tid)
++    tier.apply_model_tier(conn, claimed, lane='ready')
++    seen = [(claimed.title, claimed.body, list(claimed.skills or []), claimed.model_override, claimed.provider_override)]
++    again = kb.get_task(conn, tid)
++    assert seen[0][0].encode() == first.title.encode() and seen[0][1].encode() == first.body.encode()
++    assert (again.title, again.body, again.skills) == (first.title, first.body, first.skills)
++    assert conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id=?", (tid,)).fetchone()[0] == comments
++    assert seen[0][4] != 'anthropic'
++
++
++def test_every_eligible_provider_refused_triages_with_safety_restriction(board, pools, monkeypatch):
++    conn, context = board
++    tid = context['task_id']
++    refuse(conn, context, monkeypatch, 'anthropic')
++    claimed, second = reclaim(conn, tid)
++    tier.apply_model_tier(conn, claimed, lane='ready')
++    refuse(conn, second, monkeypatch, 'openai-codex')
++    task = kb.get_task(conn, tid)
++    assert task.status == 'triage' and restricted(conn, tid) and decision.pending(conn, tid)
++    stop = decision.pending_episode(conn, tid)
++    payload = json.loads(stop['payload'])
++    assert payload['cause'] == 'safety_refusal'
++    assert payload['refused_providers'] == ['anthropic', 'openai-codex'] and payload['refused_provider'] == 'openai-codex'
++    assert len(events(conn, tid, 'safety_refusal_fallback')) == 1  # only the first refusal fell back
++    outcomes = [r[0] for r in conn.execute('SELECT outcome FROM task_runs WHERE task_id=? ORDER BY id', (tid,))]
++    assert outcomes == ['safety_refused', 'safety_refused']
++    notice = events(conn, tid, decision.NOTICE)[-1]
++    assert notice['cause'] == 'safety_refusal' and notice['refused_providers'] == ['anthropic', 'openai-codex']
++    text = decision.notice(notice)
++    assert 'anthropic, openai-codex' in text and 'retried unchanged' in text and 'Do not rerun the refused work' in text
++    assert not any('retrying unchanged' in json.dumps(e) for e in events(conn, tid, decision.NOTICE))
++    ok, reason = kb.promote_task(conn, tid, actor='fixture', reason='administrative promotion')
++    assert not ok and 'safety' in reason.lower()
++
++
++def test_no_unrefused_provider_left_at_claim_time_fails_closed(board, pools, monkeypatch):
++    conn, context = board
++    tid = context['task_id']
++    refuse(conn, context, monkeypatch, 'anthropic')
++    assert kb.get_task(conn, tid).status == 'ready'
++    UNSERVED.add('openai-codex')  # the only peer lost its live pool before the next claim
++    result = SimpleNamespace(skipped_ineligible=[])
++    assert fb.admission(conn, tid, result, dry_run=False) is True
++    assert result.skipped_ineligible == [(tid, 'refusal_exhausted')]
++    assert kb.get_task(conn, tid).status == 'triage' and restricted(conn, tid)
++    payload = json.loads(decision.pending_episode(conn, tid)['payload'])
++    assert payload['cause'] == 'safety_refusal' and payload['refused_providers'] == ['anthropic']
++    # A peer that is still serving keeps the card claimable.
++
++
++def test_admission_leaves_card_with_an_unrefused_peer_alone(board, pools, monkeypatch):
++    conn, context = board
++    tid = context['task_id']
++    refuse(conn, context, monkeypatch, 'anthropic')
++    result = SimpleNamespace(skipped_ineligible=[])
++    assert fb.admission(conn, tid, result, dry_run=False) is False
++    assert kb.get_task(conn, tid).status == 'ready' and not result.skipped_ineligible
++
++
++def test_pinned_card_falls_back_to_a_class_peer(board, pools, monkeypatch):
++    conn, context = board
++    tid = context['task_id']
++    with kb.write_txn(conn):  # historical raw pin seed, as the model-neutral routing tests do
++        conn.execute("UPDATE tasks SET model_override='claude-opus-5-5', provider_override='anthropic' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, 'run_route', {'model': 'claude-opus-5-5', 'provider': 'anthropic', 'lane': 'ready',
++                                                  'source': 'pin', 'tier_reason': 'pinned'}, run_id=context['run_id'])
++    # No worker route_provider: the provider comes from the run_route receipt.
++    source = CHILD.replace(
++        "_record_worker_result(context, 1, 'fixture worker_receipt_timeout')",
++        "_record_worker_result(context, 1, 'fixture refusal', "
++        "{'failed': True, 'failure_reason': 'content_policy_blocked', 'failure_retryable': False})")
++    monkeypatch.setattr(fixtures, '_CHILD', source)
++    fixtures._failed_child(conn, context)
++    dispatch.detect_crashed_workers(conn)
++    assert kb.get_task(conn, tid).status == 'ready' and not restricted(conn, tid)
++    (fallback,) = events(conn, tid, 'safety_refusal_fallback')
++    assert (fallback['refused_provider'], fallback['next_provider']) == ('anthropic', 'openai-codex')
++    task = kb.get_task(conn, tid)
++    model, provider, reason = tier.resolve_dispatch_tier(conn, task, lane='ready')
++    assert (model, provider) == ('gpt-6-astra', 'openai-codex') and reason.endswith('+refusal:anthropic')
++
++
++def test_refusing_provider_unproven_keeps_todays_stop(board, pools, monkeypatch):
++    conn, context = board
++    tid = context['task_id']
++    source = CHILD.replace(
++        "_record_worker_result(context, 1, 'fixture worker_receipt_timeout')",
++        "_record_worker_result(context, 1, 'fixture refusal', "
++        "{'failed': True, 'failure_reason': 'content_policy_blocked', 'failure_retryable': False})")
++    monkeypatch.setattr(fixtures, '_CHILD', source)
++    fixtures._failed_child(conn, context)
++    dispatch.detect_crashed_workers(conn)
++    assert kb.get_task(conn, tid).status == 'triage' and restricted(conn, tid)
++    assert not events(conn, tid, 'safety_refusal_fallback')
++
++
++def test_non_refusal_failure_is_untouched(board, pools, monkeypatch):
++    conn, context = board
++    tid = context['task_id']
++    fixtures._failed_child(conn, context)  # plain exit-1 failure, no content_policy_blocked
++    dispatch.detect_crashed_workers(conn)
++    assert not events(conn, tid, 'safety_refusal_fallback') and not fb.refused_providers(conn, tid)
++    assert kb.get_task(conn, tid).status != 'triage' or not restricted(conn, tid)
++
++
++def test_primary_board_queues_release_naming_provider_and_fallback(live, kanban_home, svc, pools, monkeypatch):
++    from hermes_cli.kanban_sync_wire import translate
++    monkeypatch.setenv('HERMES_KANBAN_CRASH_GRACE_SECONDS', '0')
++    tid, _uid = transport._claimed(live, kanban_home, svc, 'refused interpreter transport')
++    task = kb.get_task(live, tid)
++    context = {'db': str(kanban_home / 'kanban.db'), 'task_id': tid, 'run_id': task.current_run_id,
++               'claim_lock': task.claim_lock, 'board': transport.BOARD}
++    refuse(live, context, monkeypatch, 'anthropic')
++    (release,) = live.execute("SELECT * FROM kanban_sync_outbox WHERE op='release'").fetchall()
++    diagnostic = translate(dict(release), '0000000000000-0000-fixture')['diagnostic']
++    assert diagnostic['refused_provider'] == 'anthropic' and diagnostic['refused_providers'] == ['anthropic']
++    assert diagnostic['safety_fallback'] == {'next_model': 'gpt-test', 'next_provider': 'openai-codex'}
++    assert kb.get_task(live, tid).status == 'running'  # the Board, not this replica, closes a primary run
+diff --git a/tests/tools/test_delegate_refusal_fallback.py b/tests/tools/test_delegate_refusal_fallback.py
+new file mode 100644
+index 00000000000..164f6de5154
+--- /dev/null
++++ b/tests/tools/test_delegate_refusal_fallback.py
+@@ -0,0 +1,94 @@
++"""A subagent refused by its provider is re-run unchanged on the class's other providers, then fails. [daveey]"""
++from __future__ import annotations
++
++from types import SimpleNamespace
++
++import pytest
++
++from agent import kanban_delegation_policy as policy
++from hermes_cli import kanban_refusal_fallback as fb
++from tools import delegate_tool, delegate_tool_refusal as refusal
++from tools.delegate_tool_dispatch import _Batch
++
++REFUSAL = {'status': 'failed', 'failure_reason': 'content_policy_blocked', 'summary': '', 'task_index': 0}
++
++
++def entry(**kw):
++    return {'status': 'completed', 'summary': 'done', 'task_index': 0, **kw}
++
++
++@pytest.fixture
++def rig(monkeypatch):
++    """Class peers anthropic/openai-codex/xai-oauth; each child is tagged with its provider; calls recorded."""
++    calls = []
++    behaviour = {}  # provider -> entry returned by a child on it
++
++    monkeypatch.setattr(policy, 'origin_for', lambda parent: None)
++    monkeypatch.setattr(fb, 'class_peers', lambda task, model: [
++        ('claude-opus-5-5', 'anthropic'), ('gpt-6-astra', 'openai-codex'), ('grok-4.7', 'xai-oauth')])
++    monkeypatch.setattr('tools.delegate_tool_routes.route_for_config',
++                        lambda cfg, parent: SimpleNamespace(**cfg))
++
++    def build(task_list, schemas, routes, **kw):
++        route = routes[0]
++        child = SimpleNamespace(model=route.model, provider=route.provider)
++        calls.append(('build', route.provider, dict(task_list[0])))
++        return [(0, task_list[0], child)], None
++
++    monkeypatch.setattr(delegate_tool, '_build_children', build)
++
++    def run_once(self, i, task, child):
++        calls.append(('run', child.provider, dict(task)))
++        return dict(behaviour.get(child.provider, entry()))
++
++    parent = SimpleNamespace(_profile_name=None)
++    batch = SimpleNamespace(parent_agent=parent, top_role='leaf')
++    batch._run_once = lambda i, task, child: run_once(batch, i, task, child)
++    return SimpleNamespace(batch=batch, calls=calls, behaviour=behaviour)
++
++
++def run(rig, task, provider='anthropic'):
++    child = SimpleNamespace(model='claude-opus-5-5', provider=provider)
++    return _Batch.run_child(rig.batch, 0, task, child)
++
++
++def test_subagent_retries_unchanged_on_another_provider(rig):
++    task = {'goal': 'Refactor X.', 'context': 'Exact context \u00e9\n'}
++    rig.behaviour['anthropic'] = dict(REFUSAL)
++    out = run(rig, task)
++    assert out['status'] == 'completed' and out['refusal_fallback'] == {
++        'refused_providers': ['anthropic'], 'provider': 'openai-codex'}
++    runs = [c for c in rig.calls if c[0] == 'run']
++    assert [c[1] for c in runs] == ['anthropic', 'openai-codex']  # first peer after the refuser, not the same provider
++    assert runs[0][2] == runs[1][2] == task  # byte-identical goal/context, no note about the refusal
++    assert str(task) == "{'goal': 'Refactor X.', 'context': 'Exact context \u00e9\\n'}"
++
++
++def test_subagent_tries_each_other_provider_once_then_returns_the_failure(rig):
++    rig.behaviour.update({p: dict(REFUSAL) for p in ('anthropic', 'openai-codex', 'xai-oauth')})
++    out = run(rig, {'goal': 'g'})
++    assert out['failure_reason'] == 'content_policy_blocked' and out['status'] == 'failed'
++    assert out['refused_providers'] == ['anthropic', 'openai-codex', 'xai-oauth']
++    assert [c[1] for c in rig.calls if c[0] == 'run'] == ['anthropic', 'openai-codex', 'xai-oauth']
++
++
++def test_second_provider_refusal_falls_through_to_third(rig):
++    rig.behaviour.update({'anthropic': dict(REFUSAL), 'openai-codex': dict(REFUSAL)})
++    out = run(rig, {'goal': 'g'})
++    assert out['status'] == 'completed'
++    assert out['refusal_fallback'] == {'refused_providers': ['anthropic', 'openai-codex'], 'provider': 'xai-oauth'}
++
++
++def test_other_failures_and_success_are_not_retried(rig):
++    rig.behaviour['anthropic'] = {'status': 'failed', 'failure_reason': 'rate_limit', 'task_index': 0}
++    assert run(rig, {'goal': 'g'})['failure_reason'] == 'rate_limit'
++    rig.behaviour['anthropic'] = entry()
++    assert run(rig, {'goal': 'g'})['status'] == 'completed'
++    assert [c[1] for c in rig.calls if c[0] == 'run'] == ['anthropic', 'anthropic']
++
++
++def test_kanban_origin_parent_is_left_to_the_card_path(rig, monkeypatch):
++    monkeypatch.setattr(policy, 'origin_for', lambda parent: object())
++    rig.behaviour['anthropic'] = dict(REFUSAL)
++    assert run(rig, {'goal': 'g'})['failure_reason'] == 'content_policy_blocked'
++    assert [c[1] for c in rig.calls if c[0] == 'run'] == ['anthropic']
+diff --git a/tools/delegate_tool_dispatch.py b/tools/delegate_tool_dispatch.py
+index 42a4ce67512..45baa52241f 100644
+--- a/tools/delegate_tool_dispatch.py
++++ b/tools/delegate_tool_dispatch.py
+@@ -66,6 +66,12 @@ class _Batch:
+         }
+ 
+     def run_child(self, i: int, task: dict[str, Any], child: Any) -> dict[str, Any]:
++        from tools.delegate_tool_refusal import refused, rerun
++        entry = self._run_once(i, task, child)
++        # A provider safety refusal re-runs the same task unchanged on the class's other providers.
++        return rerun(self, i, task, child, entry, self._run_once) if refused(entry) else entry
++
++    def _run_once(self, i: int, task: dict[str, Any], child: Any) -> dict[str, Any]:
+         from tools.delegate_tool import _run_single_child
+         return _run_single_child(task_index=i, goal=task["goal"], child=child, parent_agent=self.parent_agent, **self.owner_kwargs())
+ 
+diff --git a/tools/delegate_tool_refusal.py b/tools/delegate_tool_refusal.py
+new file mode 100644
+index 00000000000..e443c04fc43
+--- /dev/null
++++ b/tools/delegate_tool_refusal.py
+@@ -0,0 +1,73 @@
++"""A subagent stopped by a provider safety refusal is re-run unchanged on the class's other providers. [daveey]
++
++Same rule as a Kanban card (``hermes_cli.kanban_refusal_fallback``): when a child ends ``content_policy_blocked``,
++the same goal/context runs once on each other eligible provider of the refusing model's class (enabled, serving on
++this host's live pool, not walled), stopping at the first that does not refuse. Only when every one refused does
++the original failure return, with ``refused_providers`` listed. Nothing in the goal is reworded and no note about
++the refusal is added.
++
++Limits: a Kanban-origin parent routes children by class only (``kanban_delegation_policy``), so it is not
++retried here (its card is retried by the Board path); peers come from the ``model_routing`` class policy, so a
++child whose model sits in no single class has none; each retry's progress events are the new child's own.
++"""
++from __future__ import annotations
++
++import logging
++from types import SimpleNamespace
++from typing import Any
++
++logger = logging.getLogger(__name__)
++
++REFUSED = "content_policy_blocked"
++
++
++def refused(entry: Any) -> bool:
++    return isinstance(entry, dict) and entry.get("failure_reason") == REFUSED
++
++
++def _provider(child: Any) -> str:
++    return str(getattr(child, "provider", None) or "").strip().lower()
++
++
++def peers(child: Any, parent_agent: Any, skip: list[str]) -> list[tuple[str, str]]:
++    """Unrefused eligible ``(model, provider)`` peers of the child's class, registry order."""
++    from hermes_cli.kanban_refusal_fallback import class_peers
++    model = str(getattr(child, "model", None) or "")
++    task = SimpleNamespace(assignee=getattr(parent_agent, "_profile_name", None))
++    try:
++        return [(m, p) for m, p in class_peers(task, model) if p not in skip]
++    except Exception:  # health: allow BLE001 -- unreadable class policy means no proven peer: return the failure
++        logger.warning("delegate refusal fallback: class peers unreadable", exc_info=True)
++        return []
++
++
++def rerun(batch: Any, index: int, task: dict, child: Any, entry: dict, run_child) -> dict:
++    """``entry`` or the first non-refused rerun of the same task on another provider (see module doc)."""
++    from agent import kanban_delegation_policy as policy
++    from tools.delegate_tool import DEFAULT_MAX_ITERATIONS, _build_children, _load_config
++    from tools.delegate_tool_routes import route_for_config
++    parent = batch.parent_agent
++    if policy.origin_for(parent) is not None:
++        return entry
++    tried = [p for p in (_provider(child),) if p]
++    schema = getattr(child, "_delegate_output_schema", None)
++    images = getattr(child, "_delegate_images", None)
++    for model, provider in peers(child, parent, tried):
++        tried.append(provider)
++        try:
++            route = route_for_config({"model": model, "provider": provider}, parent)
++            built, err = _build_children(
++                [task], [schema], [route], top_role=batch.top_role, max_iterations=_load_config().get("max_iterations", DEFAULT_MAX_ITERATIONS),
++                parent_agent=parent, live_deleg_id=None, live_writers=[], task_images=[images])
++        except (ValueError, RuntimeError) as exc:
++            logger.warning("delegate refusal fallback: cannot build a child on %s (%s)", provider, exc)
++            continue
++        if err or not built:
++            continue
++        again = run_child(index, task, built[0][2])
++        if not refused(again):
++            again["refusal_fallback"] = {"refused_providers": tried[:-1], "provider": provider}
++            return again
++    if len(tried) > 1:
++        entry["refused_providers"] = tried
++    return entry
+-- 
+2.43.0
+

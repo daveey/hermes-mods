@@ -1,0 +1,164 @@
+From b743508e3f9d83935ccb9082ee04b9ab8ac0e6a7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 09:22:20 +0000
+Subject: [PATCH] [daveey] preserve stopped scope across dependency readiness
+ and archived parents
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_containment_terminal.py     | 24 ++++-
+ hermes_cli/kanban_db.py                       |  2 +-
+ .../test_kanban_actionability_dependencies.py | 94 +++++++++++++++++++
+ 3 files changed, 115 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_actionability_dependencies.py
+
+diff --git a/hermes_cli/kanban_containment_terminal.py b/hermes_cli/kanban_containment_terminal.py
+index 884d39b022e..f0c2510bade 100644
+--- a/hermes_cli/kanban_containment_terminal.py
++++ b/hermes_cli/kanban_containment_terminal.py
+@@ -119,8 +119,24 @@ def archive_local(conn, task, *, comment=None, precondition=None, via=None, even
+ 
+ 
+ def parent_status_sql(conn, alias="", *, table="tasks"):
+-    """Legacy schemas lack the marker; ordinary archived parents remain successful."""
+-    prefix = alias + "." if alias else ""
+-    if "containment_episode" not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
++    """Effective dependency state, never terminal success for an execution-restricted scope.
++
++    Both full and incremental foreign mirrors use this expression. Legacy minimal
++    schemas may lack history/marker columns; do not reference nonexistent columns.
++    Ordinary archives remain successful; administrative archive does not clear a stop.
++    """
++    prefix = (alias or table) + "."
++    clauses = []
++    if "containment_episode" in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
++        clauses.append(f"({prefix}status='archived' AND {prefix}containment_episode IS NOT NULL)")
++    columns = {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
++    if {"task_id", "kind", "payload"} <= columns:
++        live = " AND de.deleted_at IS NULL" if "deleted_at" in columns else ""
++        clauses.append(f"EXISTS (SELECT 1 FROM task_events de WHERE de.task_id={prefix}id "
++                       "AND de.kind IN ('spend_budget_triaged','decision_hold_restricted') "
++                       "AND CASE WHEN json_valid(de.payload) THEN json_extract(de.payload,'$.cause') END "
++                       f"IN ('safety_refusal','scope_stopped'){live})")
++    if not clauses:
+         return prefix + "status"
+-    return f"CASE WHEN {prefix}status='archived' AND {prefix}containment_episode IS NOT NULL THEN 'triage' ELSE {prefix}status END"
++    return (f"CASE WHEN {prefix}status IN ('done','archived') AND ({' OR '.join(clauses)}) "
++            f"THEN 'triage' ELSE {prefix}status END")
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 078ac0bc6f0..0e933dbf790 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1930,7 +1930,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None)
+                 continue
+             # A spend stop leaves only on a recorded decision (kanban_spend_decision.pending). The triage clause
+             # above would read an older ``gave_up`` as the stop: promote here, re-triage in the hold, every tick.
+-            if row["status"] == "triage" and spend_decision.pending(conn, task_id):
++            if spend_decision.pending(conn, task_id):
+                 continue
+             cur_status = _graph.clear_found_parents(conn, row, remote=remote)  # parent_missing block, parents back: todo
+             if cur_status == row["status"] and recovery_held(conn, row, failure_limit):
+diff --git a/tests/hermes_cli/test_kanban_actionability_dependencies.py b/tests/hermes_cli/test_kanban_actionability_dependencies.py
+new file mode 100644
+index 00000000000..c555610d5bb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_dependencies.py
+@@ -0,0 +1,94 @@
++"""Real dependency lifecycle regressions: stopped scope never becomes parent success. [daveey]"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_spend_budget as budget
++from tests.hermes_cli import test_kanban_pacing as pacing
++from tests.hermes_cli import test_kanban_spend_budget as spend
++
++board = pacing.board
++
++
++def restrict(conn, tid):
++    spend._runs(conn, tid, 2, usage={'cache_read_tokens': 1})
++    assert budget.hold(conn, tid, lim=budget.Limits(1, 1)) == 'triage'
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, 'decision_hold_restricted', {'cause': 'scope_stopped'})
++
++
++def test_archived_scope_stopped_parent_never_satisfies_child(board):
++    parent = kb.create_task(board, title='Historical scope stop', assignee='default')
++    child = kb.create_task(board, title='Waiter acceptance', assignee='default', parents=[parent])
++    restrict(board, parent)
++    assert kb.archive_task(board, parent)
++    assert kb.get_task(board, parent).status == 'archived'
++    assert kb.parent_states(board, child) == [(parent, 'triage')]
++    kb.recompute_ready(board)
++    assert kb.get_task(board, child).status == 'todo'
++    assert kb.claim_task(board, child) is None
++    assert board.execute('SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id=?', (parent, child)).fetchone()[0] == 1
++
++
++@pytest.mark.parametrize('stale_status', ['todo', 'blocked'])
++def test_recompute_never_promotes_stopped_scope_from_stale_status(board, stale_status):
++    tid = kb.create_task(board, title='Historical mismatched status', assignee='default')
++    restrict(board, tid)
++    # Simulate pre-fix legacy row, not a supported release or a mocked hold predicate.
++    with kb.write_txn(board):
++        board.execute('UPDATE tasks SET status=? WHERE id=?', (stale_status, tid))
++    assert kb.recompute_ready(board) == 0
++    assert kb.get_task(board, tid).status == stale_status
++    assert kb.claim_task(board, tid) is None
++
++
++def test_ordinary_archived_and_all_done_parents_release_exactly_once(board):
++    archived = kb.create_task(board, title='Ordinary withdrawn prerequisite', assignee='default')
++    done = kb.create_task(board, title='Successful prerequisite', assignee='default')
++    child = kb.create_task(board, title='Ordinary dependency waiter', assignee='default', parents=[archived, done])
++    assert kb.archive_task(board, archived)
++    assert kb.get_task(board, child).status == 'todo'
++    assert kb.complete_task(board, done, summary='Fixture acceptance satisfied')
++    assert kb.get_task(board, child).status == 'ready'
++    count = board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='promoted'", (child,)).fetchone()[0]
++    kb.recompute_ready(board)
++    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='promoted'", (child,)).fetchone()[0] == count == 1
++
++
++@pytest.mark.parametrize('incremental', [False, True])
++def test_foreign_parent_mirrors_preserve_actual_archived_stop(board, monkeypatch, incremental):
++    import sqlite3
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_parent_refresh as refresh
++    from hermes_cli import kanban_move_parent_evidence as evidence
++    parent = kb.create_task(board, title='Foreign stopped scope', assignee='default')
++    ordinary = kb.create_task(board, title='Foreign ordinary archive', assignee='default')
++    restrict(board, parent)
++    assert kb.archive_task(board, parent)
++    assert kb.archive_task(board, ordinary)
++    live = sqlite3.connect(':memory:', isolation_level=None)
++    live.row_factory = sqlite3.Row
++    live.executescript('CREATE TABLE tasks(id TEXT PRIMARY KEY,status TEXT);'
++                       'CREATE TABLE task_links(parent_id TEXT,child_id TEXT);'
++                       'CREATE TABLE kanban_sync_remote_parents(parent_id TEXT PRIMARY KEY,status TEXT,refreshed_at INTEGER);'
++                       "INSERT INTO tasks VALUES('child','todo');")
++    live.executemany("INSERT INTO task_links VALUES(?,'child')", [(parent,), (ordinary,)])
++    # This fixture isolates status transport; unrelated move-result evidence is not under test.
++    monkeypatch.setattr(evidence, 'prepare', lambda *a, **kw: ({}, {}))
++    monkeypatch.setattr(evidence, 'stored', lambda *a: {parent: None, ordinary: None})
++    try:
++        if incremental:
++            refresh._refresh_rows(live, board, {parent, ordinary}, scoped={})
++        else:
++            sync.refresh_remote_parents(live, board, scoped={})
++        assert dict(kb.parent_states(live, 'child', remote=True)) == {parent: 'triage', ordinary: 'archived'}
++        # Exact source correlation matters even when the event table has an id column.
++        unrelated = kb.create_task(board, title='Unrelated archived control', assignee='default')
++        assert kb.archive_task(board, unrelated)
++        from hermes_cli.kanban_containment_terminal import parent_status_sql
++        expression = parent_status_sql(board)
++        rows = dict(board.execute(f'SELECT id,{expression} FROM tasks WHERE id IN (?,?,?)', (parent, ordinary, unrelated)))
++        assert rows == {parent: 'triage', ordinary: 'archived', unrelated: 'archived'}
++    finally:
++        live.close()
+-- 
+2.43.0
+

@@ -1,0 +1,320 @@
+From 3d0cfe365a5412d0bf053c15e5c5ea0dd458a35b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 01:35:56 +0000
+Subject: [PATCH] fix(desktop): recover oversized gzip transcripts as bounded
+ identity [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ .../desktop/electron/delta-reads-gzip.test.ts | 84 ++++++++++++++++++-
+ apps/desktop/electron/delta-reads.ts          | 12 ++-
+ apps/desktop/electron/display-transcript.ts   | 15 +++-
+ apps/desktop/electron/json-fetch.ts           | 45 ++++++++--
+ ...est_session_messages_display_transcript.py | 19 +++++
+ 5 files changed, 167 insertions(+), 8 deletions(-)
+
+diff --git a/apps/desktop/electron/delta-reads-gzip.test.ts b/apps/desktop/electron/delta-reads-gzip.test.ts
+index adbecba7bc8..59c8d8a2443 100644
+--- a/apps/desktop/electron/delta-reads-gzip.test.ts
++++ b/apps/desktop/electron/delta-reads-gzip.test.ts
+@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest'
+ 
+ import { destroyKeepaliveAgents, withRetry } from './api-transport'
+ import { bodyHash, decodeDeltaBody, deltaBodyStore, DeltaBodyStore, DeltaRetryError, readEncodingHeaders } from './delta-reads'
++import { GzipExpansionError } from './display-transcript'
+ import { fetchJsonWith } from './json-fetch'
+ 
+ const HUB = 'http://127.0.0.1:49921'
+@@ -148,7 +149,7 @@ describe('negotiated gzip transcript deltas', () => {
+     decodeDeltaBody(URL, whole(base), base, store)
+     const bomb = gzipSync(Buffer.alloc(16 * 1024 * 1024 + 1, 65))
+     const encoded = delta(base, bomb)
+-    expect(() => decodeDeltaBody(URL, encoded.response, encoded.body, store)).toThrow(DeltaRetryError)
++    expect(() => decodeDeltaBody(URL, encoded.response, encoded.body, store)).toThrow(GzipExpansionError)
+     expect(store.size).toBe(0)
+   })
+ 
+@@ -171,6 +172,87 @@ describe('negotiated gzip transcript deltas', () => {
+     expect(store.size).toBe(0)
+   })
+ 
++  it.each(['local', 'old remote', 'whole', 'delta'])('recovers an oversized valid gzip page from %s with one identity retry', async mode => {
++    const page = { messages: Array.from({ length: 200 }, () => ({ role: 'assistant', content: 'x'.repeat(90_000) })) }
++    const text = JSON.stringify(page)
++    const zipped = gzipSync(text)
++    const base = entity()
++    const requests: http.IncomingHttpHeaders[] = []
++
++    const server = http.createServer((req, res) => {
++      requests.push(req.headers)
++
++      if (req.headers['accept-encoding'] === 'identity') {
++        res.writeHead(200, { 'content-type': 'application/json' })
++        res.end(text)
++      } else if (mode === 'delta') {
++        const frame = delta(base, zipped)
++        res.writeHead(200, frame.response.headers)
++        res.end(frame.body)
++      } else {
++        res.writeHead(200, mode === 'whole' ? whole(zipped).headers : { 'content-encoding': 'gzip' })
++        res.end(zipped)
++      }
++    })
++
++    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
++    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
++    const url = `${origin}/api/sessions/example/messages?limit=200&order=latest`
++    const scope = `large-page-${mode}`
++
++    if (mode !== 'local') { deltaBodyStore.bindRemote(origin, scope) }
++
++    if (mode === 'delta') { deltaBodyStore.put(deltaBodyStore.keyFor(url)!, bodyHash(base), base) }
++
++    try {
++      expect(await fetchJsonWith({ remoteHeaders: () => ({}), nativeHeaders: async () => null }, url, 'test')).toEqual(page)
++      expect(requests).toHaveLength(2)
++      expect(requests[1]['accept-encoding']).toBe('identity')
++      expect(requests[1]['x-hermes-display-transcript']).toBe('1')
++      expect(requests[1]['x-hermes-delta-accept']).toBeUndefined()
++      expect(requests[1]['x-hermes-delta-base']).toBeUndefined()
++
++      if (mode !== 'local') { expect(deltaBodyStore.get(deltaBodyStore.keyFor(url)!)).toBeUndefined() }
++    } finally {
++      deltaBodyStore.unbindScope(scope)
++      server.closeAllConnections()
++      await new Promise<void>(resolve => server.close(() => resolve()))
++    }
++  })
++
++  it.each(['oversized identity', 'ignores identity'])('bounds recovery when the server %s', async mode => {
++    const zipped = gzipSync(Buffer.alloc(16 * 1024 * 1024 + 1, 65))
++    let requests = 0
++
++    const server = http.createServer((req, res) => {
++      requests += 1
++
++      if (req.headers['accept-encoding'] !== 'identity' || mode === 'ignores identity') {
++        res.writeHead(200, { 'content-encoding': 'gzip' })
++        res.end(zipped)
++      } else {
++        // Chunked: no Content-Length to trust, and no single huge fixture allocation.
++        res.writeHead(200, { 'content-type': 'application/json' })
++        const chunk = Buffer.alloc(1024 * 1024, 65)
++
++        for (let i = 0; i < 65; i += 1) { res.write(chunk) }
++        res.end()
++      }
++    })
++
++    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
++    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/sessions/example/messages?limit=200`
++
++    try {
++      await expect(fetchJsonWith({ remoteHeaders: () => ({}), nativeHeaders: async () => null }, url, 'test'))
++        .rejects.toThrow(mode === 'oversized identity' ? '64 MiB recovery budget' : 'Gzip transcript exceeds')
++      expect(requests).toBe(2)
++    } finally {
++      server.closeAllConnections()
++      await new Promise<void>(resolve => server.close(() => resolve()))
++    }
++  })
++
+   it('fetchJson negotiates over real HTTP, decodes gzip/deltas, and retries a bad delta without a base', async () => {
+     const requests: http.IncomingHttpHeaders[] = []
+     const v0 = entity()
+diff --git a/apps/desktop/electron/delta-reads.ts b/apps/desktop/electron/delta-reads.ts
+index 41294e33ac5..d020acdcaa9 100644
+--- a/apps/desktop/electron/delta-reads.ts
++++ b/apps/desktop/electron/delta-reads.ts
+@@ -29,7 +29,7 @@ import fs from 'node:fs'
+ import path from 'node:path'
+ import { zstdDecompressSync } from 'node:zlib'
+ 
+-import { decodeResponseBody, displayTranscriptHeaders, isDisplayTranscriptRead } from './display-transcript'
++import { decodeResponseBody, displayTranscriptHeaders, GzipExpansionError, isDisplayTranscriptRead } from './display-transcript'
+ 
+ export const DELTA_ACCEPT_HEADER = 'X-Hermes-Delta-Accept'
+ export const DELTA_BASE_HEADER = 'X-Hermes-Delta-Base'
+@@ -589,6 +589,11 @@ function decodeWholeEntity(
+   try {
+     text = decodeResponseBody(body, headers['content-encoding'])
+   } catch (error) {
++    if (error instanceof GzipExpansionError) {
++      if (key) { store.delete(key) }
++      throw error
++    }
++
+     if (compressedBase) { return fail(`bad gzip entity: ${String(error).slice(0, 80)}`) }
+     throw error
+   }
+@@ -662,6 +667,11 @@ export function decodeDeltaBody(
+   try {
+     text = decodeResponseBody(decoded, originalEncoding)
+   } catch (error) {
++    if (error instanceof GzipExpansionError) {
++      store.delete(key)
++      throw error
++    }
++
+     return fail(`bad reconstructed entity: ${String(error).slice(0, 80)}`)
+   }
+ 
+diff --git a/apps/desktop/electron/display-transcript.ts b/apps/desktop/electron/display-transcript.ts
+index 3a84d07fa71..93cd830f87a 100644
+--- a/apps/desktop/electron/display-transcript.ts
++++ b/apps/desktop/electron/display-transcript.ts
+@@ -29,9 +29,22 @@ export function displayTranscriptHeaders(method: string | undefined, url: string
+   return isDisplayTranscriptRead(method, url) ? { [DISPLAY_TRANSCRIPT_HEADER]: '1', 'Accept-Encoding': 'gzip' } : {}
+ }
+ 
++/** Spend the existing GET retry on identity rather than inflate an oversized gzip entity. */
++export class GzipExpansionError extends Error {
++  readonly code = 'HERMES_DELTA_RETRY'
++}
++
+ /** The response body as text, gunzipped when the server compressed it. */
+ export function decodeResponseBody(body: Buffer, contentEncoding: string | string[] | undefined): string {
+   const encoding = String(Array.isArray(contentEncoding) ? contentEncoding[0] : contentEncoding || '').trim().toLowerCase()
+ 
+-  return (encoding === 'gzip' ? gunzipSync(body, { maxOutputLength: 16 * 1024 * 1024 }) : body).toString('utf8')
++  try {
++    return (encoding === 'gzip' ? gunzipSync(body, { maxOutputLength: 16 * 1024 * 1024 }) : body).toString('utf8')
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException).code === 'ERR_BUFFER_TOO_LARGE') {
++      throw new GzipExpansionError('Gzip transcript exceeds the decode budget; retry with identity encoding')
++    }
++
++    throw error
++  }
+ }
+diff --git a/apps/desktop/electron/json-fetch.ts b/apps/desktop/electron/json-fetch.ts
+index a4d318ca193..9dfce53126b 100644
+--- a/apps/desktop/electron/json-fetch.ts
++++ b/apps/desktop/electron/json-fetch.ts
+@@ -20,8 +20,17 @@ import {
+   withRetry
+ } from './api-transport'
+ import { decodeDeltaBody, readEncodingHeaders } from './delta-reads'
++import { displayTranscriptHeaders, GzipExpansionError, isDisplayTranscriptRead } from './display-transcript'
+ import { DEFAULT_FETCH_TIMEOUT_MS, resolveTimeoutMs } from './hardening'
+ 
++// Oversized gzip pages retry as identity, bounded by actual received bytes rather than Content-Length.
++export const TRANSCRIPT_IDENTITY_MAX_BYTES = 64 * 1024 * 1024
++
++function identityHeaders(headers: Record<string, string>): Record<string, string> {
++  return { ...Object.fromEntries(Object.entries(headers).filter(([name]) =>
++    !['accept-encoding', 'x-hermes-delta-accept', 'x-hermes-delta-base'].includes(name.toLowerCase()))), 'Accept-Encoding': 'identity' }
++}
++
+ /** What main.ts supplies: headers configured for remote gateways, and one-use native gateway grants. */
+ export interface JsonFetchDeps {
+   remoteHeaders: (url: string) => Record<string, string>
+@@ -29,6 +38,8 @@ export interface JsonFetchDeps {
+ }
+ 
+ export function fetchJsonWith(deps: JsonFetchDeps, url: string, token: null | string, options: any = {}) {
++  let identityTranscript = false
++
+   // Retry policy lives in api-transport.ts: idempotent verbs retry on any
+   // transient transport error; POST/PUT/DELETE only when the request provably
+   // never reached the server (see shouldRetryRequest) — never double-submit.
+@@ -71,6 +82,12 @@ export function fetchJsonWith(deps: JsonFetchDeps, url: string, token: null | st
+         // On the wire from here (api-transport sendWithRequestDeadline): the deadline is armed with the body's size,
+         // and requestState.bodySent is set, so a later transport error no longer proves the server didn't process it
+         // and non-idempotent verbs are not retried.
++        const encodingHeaders = {
++          ...deps.remoteHeaders(url),
++          ...(identityTranscript ? displayTranscriptHeaders(options.method, url) : readEncodingHeaders(options.method, url)),
++          ...(options.headers || {})
++        }
++
+         sendWithRequestDeadline(
+           deadline,
+           () =>
+@@ -80,10 +97,7 @@ export function fetchJsonWith(deps: JsonFetchDeps, url: string, token: null | st
+                 agent,
+                 method: options.method || 'GET',
+                 headers: {
+-                  ...deps.remoteHeaders(url),
+-                  // [daveey] Transcript pages slim + gzip (display-transcript.ts); large reads as deltas (delta-reads.ts).
+-                  ...readEncodingHeaders(options.method, url),
+-                  ...(options.headers || {}),
++                  ...(identityTranscript ? identityHeaders(encodingHeaders) : encodingHeaders),
+                   'Content-Type': contentType,
+                   ...(nativeHeaders || { 'X-Hermes-Session-Token': token }),
+                   // RFC 8252 native flow authenticates the gated gateway with a bearer
+@@ -97,14 +111,35 @@ export function fetchJsonWith(deps: JsonFetchDeps, url: string, token: null | st
+               },
+               res => {
+                 const chunks: Buffer[] = []
++                let bytes = 0
+                 res.on('error', reject)
+-                res.on('data', chunk => chunks.push(chunk))
++                res.on('data', chunk => {
++                  bytes += chunk.length
++
++                  if (identityTranscript && bytes > TRANSCRIPT_IDENTITY_MAX_BYTES) {
++                    res.destroy(new Error('Identity transcript exceeds the 64 MiB recovery budget'))
++
++                    return
++                  }
++
++                  chunks.push(chunk)
++                })
+                 res.on('end', () => {
+                   let text: string
+ 
+                   try {
+                     text = decodeDeltaBody(url, res, Buffer.concat(chunks))
+                   } catch (error) {
++                    if (error instanceof GzipExpansionError && isDisplayTranscriptRead(options.method, url)) {
++                      if (identityTranscript) {
++                        reject(new Error(error.message, { cause: error }))
++
++                        return
++                      }
++
++                      identityTranscript = true
++                    }
++
+                     reject(error)
+ 
+                     return
+diff --git a/tests/hermes_cli/test_session_messages_display_transcript.py b/tests/hermes_cli/test_session_messages_display_transcript.py
+index 222d917c8e8..67c8b51e0b2 100644
+--- a/tests/hermes_cli/test_session_messages_display_transcript.py
++++ b/tests/hermes_cli/test_session_messages_display_transcript.py
+@@ -5,6 +5,8 @@ A long hub session's 120-row page was 1.4 MB, mostly ``reasoning_details`` (prov
+ drops what a transcript never shows and is gzipped when the client accepts it; without it, nothing changes.
+ """
+ 
++import gzip
++import json
+ from pathlib import Path
+ 
+ import pytest
+@@ -75,3 +77,20 @@ def test_display_page_is_gzipped_when_accepted(client):
+     page = resp.json()  # the test client decodes it
+     assert page["session_id"] == "long-chat" and page["pagination"]["returned"] == 3
+     assert "reasoning_details" not in _assistants(page)[0]
++
++
++def test_large_valid_page_has_exact_identity_recovery():
++    from starlette.requests import Request
++
++    from hermes_cli.web_routers.sessions import _display_transcript_response
++
++    page = {"messages": [{"role": "assistant", "content": "x" * 90_000} for _ in range(200)]}
++    def request(encoding):
++        return Request({"type": "http", "headers": [(b"accept-encoding", encoding)]})
++
++    zipped = _display_transcript_response(request(b"gzip"), page)
++    raw = gzip.decompress(zipped.body)
++    assert len(raw) > 16 * 1024 * 1024
++    assert json.loads(raw) == page
++    assert _display_transcript_response(request(b"identity"), page) == page
++
+-- 
+2.43.0
+

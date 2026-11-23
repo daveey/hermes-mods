@@ -1,0 +1,288 @@
+From 4ff42c596f7b98cba85bd05a0642bb0978f377b2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 05:39:09 +0000
+Subject: [PATCH] [daveey] Reconcile persisted gateway busy count on heartbeat
+ and deferred release
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ gateway/run.py                        |   9 +-
+ gateway/run_deferred_workers.py       |  12 ++
+ gateway/run_runtime_heartbeat.py      |  29 +++++
+ gateway/run_shutdown.py               |  12 +-
+ tests/gateway/test_live_busy_count.py | 157 ++++++++++++++++++++++++++
+ 5 files changed, 204 insertions(+), 15 deletions(-)
+ create mode 100644 gateway/run_deferred_workers.py
+ create mode 100644 gateway/run_runtime_heartbeat.py
+ create mode 100644 tests/gateway/test_live_busy_count.py
+
+diff --git a/gateway/run.py b/gateway/run.py
+index 174109b12e8..ec57dc8c643 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4298,6 +4298,7 @@ def _start_gateway_housekeeping(
+     """Background thread for gateway-only periodic chores (NOT cron). Separate from the cron trigger
+     so chores run under any ``CronScheduler`` provider (external scale-to-zero has no 60s loop).
+     Cadences are ticks of ``interval``; inner gates own the real cadence."""
++    from gateway.run_runtime_heartbeat import runtime_heartbeat
+     from gateway.run_checkpoint_prune import CHORE_LABEL as PRUNE_LABEL, CheckpointPruneWorker
+     from gateway.run_delivery_queue_watch import DRAIN_LABEL, DeliveryQueueWatch, wait_for_next_tick
+     from gateway.runtime_ownership import process_ownership
+@@ -4306,11 +4307,9 @@ def _start_gateway_housekeeping(
+     from hermes_cli.plugins_idle_tasks import IdleTaskFence
+     prune_worker = CheckpointPruneWorker(logger, start=process_ownership.start_writer)
+     chores: list[tuple[int, str, Any]] = [
+-        # First every tick: re-stamp ``updated_at`` in gateway_state.json so it is a real heartbeat.
+-        # ``hermes gateway status`` / ``/api/status`` warn when it ages past 2x ``interval`` with the
+-        # PID alive — the thread (or a chore blocked on the loop) wedged (#113372). Runs first so a
+-        # wedged chore stops the NEXT stamp instead of a slow one delaying this tick's.
+-        (1, "Runtime heartbeat", _write_runtime_status_quiet)]
++        # First stamp thread liveness (#113372), then request a coalesced loop-side recount.
++        # Neither a wedged loop nor stale busy state may mask the other's observation.
++        (1, "Runtime heartbeat", runtime_heartbeat(runner, loop))]
+     if adapters is not None or runner is not None:
+         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
+         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.
+diff --git a/gateway/run_deferred_workers.py b/gateway/run_deferred_workers.py
+new file mode 100644
+index 00000000000..d86cbd6421e
+--- /dev/null
++++ b/gateway/run_deferred_workers.py
+@@ -0,0 +1,12 @@
++"""Release-side publication for executor work that outlives its turn [daveey]."""
++from contextlib import suppress
++
++
++def discard_deferred_worker(runner, workers, done_future):
++    workers.pop(done_future, None)
++    # No later waiter remains; consume failures so asyncio does not warn (#98973).
++    if not done_future.cancelled():
++        with suppress(Exception):
++            done_future.exception()
++    # The originating turn published while this worker was live. Recount AFTER release.
++    runner._persist_active_agents()
+diff --git a/gateway/run_runtime_heartbeat.py b/gateway/run_runtime_heartbeat.py
+new file mode 100644
+index 00000000000..7d0ef3bd2bb
+--- /dev/null
++++ b/gateway/run_runtime_heartbeat.py
+@@ -0,0 +1,29 @@
++"""Thread heartbeat plus a coalesced, owner-loop busy-count refresh [daveey]."""
++import threading
++
++
++def runtime_heartbeat(runner, loop):
++    """Keep thread liveness independent of the loop; never sample authority state here.
++
++    A wedged loop retains at most one callback. Once it runs, the next tick may
++    enqueue another; closing a loop must not suppress the thread-side stamp.
++    """
++    pending = threading.Event()
++
++    def refresh():
++        try:
++            runner._persist_active_agents()
++        finally:
++            pending.clear()
++
++    def tick():
++        from gateway.run import _write_runtime_status_quiet
++        _write_runtime_status_quiet()
++        if runner is None or loop is None or pending.is_set():
++            return
++        pending.set()
++        try:
++            loop.call_soon_threadsafe(refresh)
++        except RuntimeError:  # loop closed during shutdown; retry only on a later tick
++            pending.clear()
++    return tick
+diff --git a/gateway/run_shutdown.py b/gateway/run_shutdown.py
+index 77170ab5aa9..c0b04f677e5 100644
+--- a/gateway/run_shutdown.py
++++ b/gateway/run_shutdown.py
+@@ -308,16 +308,8 @@ class GatewayShutdownMixin(GatewayRestartWaitMixin, GatewaySessionEndMixin, Gate
+             workers = self._deferred_agent_workers = {}
+         workers[future] = agent
+ 
+-        def _discard_worker(done_future: asyncio.Future) -> None:
+-            workers.pop(done_future, None)
+-            # Workers that outlive their starting coroutine have no later waiter: consume the
+-            # terminal exception so asyncio emits no unhandled-future warning.
+-            # See #98973.
+-            if not done_future.cancelled():
+-                with suppress(Exception):
+-                    done_future.exception()
+-
+-        future.add_done_callback(_discard_worker)
++        from gateway.run_deferred_workers import discard_deferred_worker
++        future.add_done_callback(lambda done: discard_deferred_worker(self, workers, done))
+ 
+     def _interrupt_deferred_agent_workers(self, reason: str) -> int:
+         """Request cancellation of detached executor-backed agent work."""
+diff --git a/tests/gateway/test_live_busy_count.py b/tests/gateway/test_live_busy_count.py
+new file mode 100644
+index 00000000000..66e29cef704
+--- /dev/null
++++ b/tests/gateway/test_live_busy_count.py
+@@ -0,0 +1,157 @@
++"""File/live convergence at real release and housekeeping boundaries."""
++import asyncio
++import json
++import threading
++from types import SimpleNamespace
++
++import pytest
++
++from gateway import run, status
++from gateway.run_agent_cache import GatewayAgentCacheMixin
++from gateway.run_shutdown import GatewayShutdownMixin
++
++
++class CountRunner(GatewayShutdownMixin, GatewayAgentCacheMixin):
++    """Keep the real aggregate and publisher, without unrelated gateway startup."""
++    def _running_agent_count(self):
++        return 0
++
++    def _running_agent_items(self):
++        return []
++
++    def _active_cron_job_count(self):
++        return 0
++
++    def _active_api_run_count(self):
++        return 0
++
++    def _describe_parked_work(self):
++        return []
++
++
++@pytest.fixture
++def counter(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    monkeypatch.setattr('gateway.run_shutdown.managed_turn_count', lambda runner: 0)
++    runner = CountRunner()
++    def read():
++        assert status.flush_runtime_status(timeout=2)
++        return json.loads((tmp_path / 'gateway_state.json').read_text())
++    return runner, read
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('outcome', ['result', 'exception', 'cancel'])
++async def test_deferred_worker_completion_republishes_live_count(counter, outcome):
++    runner, read = counter
++    future = asyncio.get_running_loop().create_future()
++    runner._track_deferred_agent_worker(future, object())
++    runner._persist_active_agents()  # the originating turn ends while its worker is live
++    assert read()['active_agents'] == runner._active_work_count() == 1
++    if outcome == 'exception':
++        future.set_exception(RuntimeError('worker failed'))
++    elif outcome == 'cancel':
++        future.cancel()
++    else:
++        future.set_result(None)
++    await asyncio.sleep(0)  # dispatch the real done callback, no heartbeat to mask the leak
++    assert runner._active_work_count() == 0
++    assert read()['active_agents'] == 0
++    assert runner._deferred_agent_workers == {}
++
++
++def heartbeat_from_housekeeping(monkeypatch, runner, loop):
++    callbacks = []
++    stop = threading.Event()
++
++    def chore(label, fn):
++        if label == 'Runtime heartbeat':
++            callbacks.append(fn)
++            stop.set()
++    monkeypatch.setattr(run, '_housekeeping_chore', chore)
++    run._start_gateway_housekeeping(stop, loop=loop, runner=runner, interval=0)
++    assert len(callbacks) == 1
++    return callbacks[0]
++
++
++@pytest.mark.asyncio
++async def test_heartbeat_converges_on_loop_not_housekeeping_thread(counter, monkeypatch):
++    runner, read = counter
++    status.publish_runtime_status(active_agents=4, gateway_state='running')
++    loop = asyncio.get_running_loop()
++    owner = threading.get_ident()
++    real_count = runner._active_work_count
++    calls = []
++
++    def count():
++        calls.append(threading.get_ident())
++        assert threading.get_ident() == owner
++        return real_count()
++    runner._active_work_count = count
++    tick = heartbeat_from_housekeeping(monkeypatch, runner, loop)
++    await asyncio.to_thread(tick)
++    await asyncio.sleep(0)
++    assert calls == [owner]
++    assert read()['active_agents'] == 0
++    assert read()['gateway_state'] == 'running'
++
++
++def test_wedged_loop_keeps_thread_stamp_and_coalesces(counter, monkeypatch):
++    runner, read = counter
++    pending = []
++    loop = SimpleNamespace(call_soon_threadsafe=lambda cb: pending.append(cb))
++    tick = heartbeat_from_housekeeping(monkeypatch, runner, loop)
++    status.publish_runtime_status(active_agents=3)
++    stamps = []
++    for _ in range(3):
++        tick()
++        stamps.append(read()['updated_at'])
++        assert read()['active_agents'] == 3
++    assert stamps[0] < stamps[1] < stamps[2]
++    assert len(pending) == 1
++    pending.pop()()
++    assert read()['active_agents'] == 0
++    tick()
++    assert len(pending) == 1  # completion re-arms the next tick
++
++
++@pytest.mark.parametrize('missing', ['runner', 'loop'])
++def test_heartbeat_without_loop_or_runner_still_stamps(counter, missing):
++    from gateway.run_runtime_heartbeat import runtime_heartbeat
++    runner, read = counter
++    pending = []
++    loop = SimpleNamespace(call_soon_threadsafe=pending.append)
++    tick = runtime_heartbeat(None if missing == 'runner' else runner,
++                             None if missing == 'loop' else loop)
++    status.publish_runtime_status(active_agents=2)
++    before = read()['updated_at']
++    tick()
++    assert read()['updated_at'] > before
++    assert read()['active_agents'] == 2
++    assert pending == []
++
++
++def test_closed_loop_and_failed_refresh_rearm(counter):
++    from gateway.run_runtime_heartbeat import runtime_heartbeat
++    runner, read = counter
++    pending = []
++    def closed(callback):
++        raise RuntimeError('closed')
++    loop = SimpleNamespace(call_soon_threadsafe=closed)
++    tick = runtime_heartbeat(runner, loop)
++    tick()
++    assert read()['updated_at']
++    loop.call_soon_threadsafe = pending.append
++    tick()
++    assert len(pending) == 1
++    original = runner._persist_active_agents
++    def fail():
++        raise ValueError('publication failed')
++    runner._persist_active_agents = fail
++    with pytest.raises(ValueError, match='publication failed'):
++        pending.pop()()
++    runner._persist_active_agents = original
++    tick()
++    assert len(pending) == 1
++    pending.pop()()
++    assert read()['active_agents'] == 0
+-- 
+2.43.0
+

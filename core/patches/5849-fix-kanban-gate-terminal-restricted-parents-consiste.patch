@@ -1,0 +1,290 @@
+From 66956b0bd79c2e651b0f60ab3303ebaa10cf8408 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 01:46:47 +0000
+Subject: [PATCH] fix(kanban): gate terminal restricted parents consistently
+ with Board [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_db.py                       |  24 ++--
+ hermes_cli/kanban_db_parent_states.py         |  17 +++
+ hermes_cli/kanban_db_sync.py                  |   3 +-
+ hermes_cli/kanban_sync_parent_refresh.py      |   3 +-
+ hermes_cli/kanban_worker_node.py              |   9 +-
+ .../test_kanban_parent_restrictions.py        | 113 ++++++++++++++++++
+ 6 files changed, 148 insertions(+), 21 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_parent_restrictions.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 1aaf37c6392..078ac0bc6f0 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1531,9 +1531,8 @@ def link_tasks(
+             raise ValueError(f"cannot link {parent_id} -> {child_id}: child is already running")
+         check_link_parent(conn, parent_id, child_id)  # cycles; standing parents [daveey]
+         _link(conn, parent_id, child_id)
+-        # If child was ready but parent is not yet terminal, demote child to todo
+-        # (archived counts as terminal, matching _parents_satisfied/recompute_ready).
+-        if _task_status(conn, parent_id) not in ("done", "archived"):
++        # Terminal restrictions must gate newly linked children too.
++        if parent_blocks(conn, parent_id, _task_status(conn, parent_id)):
+             cur = conn.execute(
+                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                 (child_id,),
+@@ -1941,7 +1940,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None)
+             # ``parent_found``) and block after PARENT_MISSING_BLOCK_SECONDS (synced: replica at the feed head only).
+             if cur_status == "todo" and _graph.note_missing_parents(conn, task_id, states, remote=remote, fresh=fresh):
+                 continue
+-            if all(st in ("done", "archived") for _pid, st in states):
++            if not any(parent_blocks(conn, pid, st) for pid, st in states):
+                 resume_status = _resume_status_from_events(conn, task_id)
+                 promotion_payload = kanban_review_release.promotion_payload(conn, task_id, resume_status, releases)
+                 if cur_status in ("blocked", "triage"):
+@@ -1970,22 +1969,19 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None)
+ PARENT_MISSING_BLOCK_SECONDS = 600
+ 
+ 
+-from hermes_cli.kanban_db_parent_states import parent_states
++from hermes_cli.kanban_db_parent_states import parent_blocks, parent_states
+ 
+ 
+ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
+-    """Return whether every direct parent is terminal for dependency gating (:func:`parent_states`: a parent
+-    another gateway owns counts by its Board status, a missing parent gates)."""
+-    return all(st in ("done", "archived") for _pid, st in parent_states(conn, task_id))
++    """Mirror hermes-hub worker/src/transitions.ts parentsSatisfied: terminal, unrestricted parents only.
++    Foreign parents use the Board mirror; missing parents and containment archives gate."""
++    return not any(parent_blocks(conn, pid, st) for pid, st in parent_states(conn, task_id))
+ 
+ 
+ def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
+-    """``(parent_id, status)`` for every direct parent :func:`_parents_satisfied`
+-    still counts as open (``done`` / ``archived`` release the child), in id
+-    order, so a refusal or a board view can name the blockers instead of the
+-    caller guessing. Read-only."""
+-    return [(pid, st if st is not None else "missing") for pid, st in parent_states(conn, task_id)
+-            if st not in ("done", "archived")]
++    """Read-only blockers in id order; terminal restrictions carry a distinct ``:restricted`` label."""
++    return [(pid, f"{st}:restricted" if st in ("done", "archived") else st or "missing")
++            for pid, st in parent_states(conn, task_id) if parent_blocks(conn, pid, st)]
+ 
+ 
+ def claim_task(
+diff --git a/hermes_cli/kanban_db_parent_states.py b/hermes_cli/kanban_db_parent_states.py
+index 37b68f9ec75..bec5c9b04d6 100644
+--- a/hermes_cli/kanban_db_parent_states.py
++++ b/hermes_cli/kanban_db_parent_states.py
+@@ -4,6 +4,23 @@ from __future__ import annotations
+ import sqlite3
+ 
+ 
++def parent_blocks(conn: sqlite3.Connection, pid: str, status: str | None) -> bool:
++    """Mirror hermes-hub worker/src/transitions.ts parentsSatisfied: terminal is not always success."""
++    if status not in ("done", "archived"):
++        return True
++    if status == "archived":
++        row = conn.execute("SELECT containment_episode FROM tasks WHERE id=?", (pid,)).fetchone()
++        if row is not None and row[0] is not None:
++            return True
++    from hermes_cli.kanban_spend_decision import execution_restricted
++    return execution_restricted(conn, pid)
++
++
++def mirrored_status(conn: sqlite3.Connection, pid: str, status: str) -> str:
++    """Freeze restriction evidence in the status-only foreign-parent mirror, in the replica snapshot."""
++    return f"{status}:restricted" if status in ("done", "archived") and parent_blocks(conn, pid, status) else status
++
++
+ def parent_states(conn: sqlite3.Connection, task_id: str, *, remote: bool | None = None) -> list[tuple[str, str | None]]:
+     """Direct prerequisite statuses; missing and containment-archived parents gate.
+ 
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index a3f68ef7717..2f6291ee73a 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -390,6 +390,7 @@ def refresh_remote_parents(live: sqlite3.Connection, replica: sqlite3.Connection
+     from hermes_cli.kanban_db_connect import write_txn
+     from hermes_cli.kanban_containment_terminal import parent_status_sql
+     status = parent_status_sql(replica)
++    from hermes_cli.kanban_db_parent_states import mirrored_status
+ 
+     # Status and result must describe the same replica snapshot. A savepoint also
+     # composes with callers already reading a transaction on this connection.
+@@ -398,7 +399,7 @@ def refresh_remote_parents(live: sqlite3.Connection, replica: sqlite3.Connection
+         found: dict[str, str] = {}
+         for i in range(0, len(wanted), 500):
+             chunk = wanted[i:i + 500]
+-            found.update({r[0]: r[1] for r in replica.execute(
++            found.update({r[0]: mirrored_status(replica, r[0], r[1]) for r in replica.execute(
+                 f"SELECT id, {status} FROM tasks WHERE id IN ({','.join('?' * len(chunk))})", chunk)})
+         values, evidence_changed = evidence.prepare(live, replica, wanted, scoped=scoped)
+     finally:
+diff --git a/hermes_cli/kanban_sync_parent_refresh.py b/hermes_cli/kanban_sync_parent_refresh.py
+index af77963a047..12c1a2d923f 100644
+--- a/hermes_cli/kanban_sync_parent_refresh.py
++++ b/hermes_cli/kanban_sync_parent_refresh.py
+@@ -132,6 +132,7 @@ def _refresh_rows(live, replica, targets, scoped) -> list[str]:
+     from hermes_cli import kanban_move_parent_evidence as evidence
+     from hermes_cli.kanban_db_connect import write_txn
+     from hermes_cli.kanban_containment_terminal import parent_status_sql
++    from hermes_cli.kanban_db_parent_states import mirrored_status
+     status = parent_status_sql(replica)
+ 
+     targets = sorted(targets)
+@@ -142,7 +143,7 @@ def _refresh_rows(live, replica, targets, scoped) -> list[str]:
+     try:
+         found: dict[str, str] = {}
+         for part, marks in _chunks(wanted):
+-            found.update({r[0]: r[1] for r in replica.execute(
++            found.update({r[0]: mirrored_status(replica, r[0], r[1]) for r in replica.execute(
+                 f"SELECT id, {status} FROM tasks WHERE id IN ({marks})", part)})
+         values = {p: (evidence.payload(replica, p) if p in wanted and p in scoped else None) for p in targets}
+     finally:
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index b4273836d51..a5e90e27cec 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -475,16 +475,15 @@ def candidates(replica: sqlite3.Connection, own: str, *, now_ms: Optional[int] =
+     picked up, so a ``runs_on=[machine:hub]`` card that asked for review sat in the MacBook's review column,
+     which the MacBook could never lease (``labels_mismatch``)."""
+     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+-    return replica.execute(
++    rows = replica.execute(
+         "SELECT * FROM tasks WHERE status IN ('ready', 'review') AND created_on IS NOT NULL AND created_on != ? "
+         "AND (lease_holder IS NULL OR COALESCE(lease_expires, 0) < ?) "
+-        # The replica holds the whole board: a card with an open (or missing) parent would only be refused
+-        # parents_not_done by the Board, and that refusal demotes it on every machine. [daveey]
+-        "AND NOT EXISTS (SELECT 1 FROM task_links l LEFT JOIN tasks p ON p.id = l.parent_id "
+-        "WHERE l.child_id = tasks.id AND COALESCE(p.status, '') NOT IN ('done', 'archived')) "
+         # Same lane order as the hub dispatcher (``DISPATCH_ORDER``): a waited-on parent first. [daveey]
+         f"ORDER BY status = 'review' DESC, {DISPATCH_ORDER}, id",
+         (own, now_ms)).fetchall()
++    from hermes_cli.kanban_db import _parents_satisfied
++    # The whole-board replica must reject the same open, missing and restricted parents as the Board.
++    return [row for row in rows if _parents_satisfied(replica, row["id"])]
+ 
+ 
+ def _changes_for(replica: sqlite3.Connection, tid: str, card: sqlite3.Row) -> list[sync.RemoteChange]:
+diff --git a/tests/hermes_cli/test_kanban_parent_restrictions.py b/tests/hermes_cli/test_kanban_parent_restrictions.py
+new file mode 100644
+index 00000000000..08def7c14aa
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_parent_restrictions.py
+@@ -0,0 +1,113 @@
++"""Core mirrors Board parentsSatisfied, including terminal non-success parents."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_scope_renewal as renewal
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli import kanban_worker_node as node
++from tests.hermes_cli import kanban_sync_support as support
++
++
++@pytest.fixture
++def local(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    support.write_sync_config(home, False)
++    conn = kbc.connect(home / 'kanban.db')
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++@pytest.mark.parametrize('status,cause,contained,renewed,blocked', [
++    ('archived', 'safety_refusal', False, False, True),
++    ('done', 'safety_refusal', False, False, True),
++    ('archived', 'scope_stopped', False, False, True),
++    ('done', 'scope_stopped', False, False, True),
++    ('done', 'scope_stopped', False, True, False),
++    ('archived', None, True, False, True),
++    ('done', None, False, False, False),
++    ('archived', None, False, False, False),
++])
++def test_terminal_parent_gates_every_local_surface(local, status, cause, contained, renewed, blocked):
++    parent = kb.create_task(local, title='parent', assignee='worker')
++    child = kb.create_task(local, title='child', assignee='worker', parents=[parent])
++    with kb.write_txn(local):
++        if cause:
++            kb._append_event(local, parent, 'spend_budget_triaged', {'cause': cause})
++        local.execute('UPDATE tasks SET status=?,containment_episode=? WHERE id=?',
++                      (status, 'fixture-episode' if contained else None, parent))
++    if renewed:
++        event = dict(local.execute("SELECT * FROM task_events WHERE task_id=? AND kind='spend_budget_triaged'",
++                                   (parent,)).fetchone())
++        comment = kb.add_comment(local, parent, 'default', 'Renewed scope: finish parent.', writer_kind='human')
++        row = dict(local.execute('SELECT * FROM task_comments WHERE id=?', (comment,)).fetchone())
++        with kb.write_txn(local):
++            kb._append_event(local, parent, 'scope_renewed', {
++                'version': 1, 'episode': renewal.key(event), 'mandate_comment_uid': renewal.comment_ref(row),
++                'mandate_body_sha256': renewal.digest(row['body']),
++                'covered_restriction_uids': [renewal.key(event)]})
++        assert not decision.execution_restricted(local, parent)
++    assert kb.parent_blocks(local, parent, status) is blocked
++    assert kb._parents_satisfied(local, child) is not blocked
++    waiting = kb.unsatisfied_parents(local, child)
++    if cause and blocked:
++        assert waiting == [(parent, status + ':restricted')]
++    else:
++        assert bool(waiting) is blocked
++    for _ in range(3):
++        kb.recompute_ready(local)
++    assert kb.get_task(local, child).status == ('todo' if blocked else 'ready')
++    assert local.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='promoted'",
++                         (child,)).fetchone()[0] == (0 if blocked else 1)
++    late_child = kb.create_task(local, title='newly linked child', assignee='worker')
++    kb.link_tasks(local, parent, late_child)
++    assert kb.get_task(local, late_child).status == ('todo' if blocked else 'ready')
++
++
++@pytest.mark.parametrize('cause,contained', [('safety_refusal', False), ('scope_stopped', False), (None, True), (None, False)])
++def test_worker_candidates_gate_terminal_parent(local, cause, contained):
++    # The whole-board replica includes transport-only task columns.
++    for column, kind in [('created_on', 'TEXT'), ('lease_holder', 'TEXT'), ('lease_expires', 'INTEGER')]:
++        if column not in {r[1] for r in local.execute('PRAGMA table_info(tasks)')}:
++            local.execute(f'ALTER TABLE tasks ADD COLUMN {column} {kind}')
++    parent = kb.create_task(local, title='parent', assignee='worker')
++    child = kb.create_task(local, title='child', assignee='worker', parents=[parent])
++    with kb.write_txn(local):
++        if cause:
++            kb._append_event(local, parent, 'spend_budget_triaged', {'cause': cause})
++        local.execute("UPDATE tasks SET status='archived',containment_episode=? WHERE id=?",
++                      ('fixture-episode' if contained else None, parent))
++        local.execute("UPDATE tasks SET status='ready',created_on='hub' WHERE id=?", (child,))
++    assert (child in [r['id'] for r in node.candidates(local, 'worker')]) is (not cause and not contained)
++
++
++@pytest.mark.parametrize('incremental', [False, True])
++def test_foreign_restriction_changes_mirror_without_parent_status_change(local, tmp_path, incremental):
++    from hermes_cli.kanban_sync_parent_refresh import _refresh_rows
++    replica = kbc.connect(tmp_path / 'replica.db')
++    try:
++        parent = kb.create_task(replica, title='foreign parent', assignee='worker')
++        child = kb.create_task(local, title='child', assignee='worker')
++        with kb.write_txn(local):
++            local.execute('CREATE TABLE kanban_sync_remote_parents (parent_id TEXT PRIMARY KEY, status TEXT, refreshed_at INTEGER)')
++            local.execute('INSERT INTO task_links (parent_id,child_id) VALUES (?,?)', (parent, child))
++            local.execute("UPDATE tasks SET status='todo' WHERE id=?", (child,))
++        with kb.write_txn(replica):
++            replica.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
++        refresh = (lambda: _refresh_rows(local, replica, {parent}, frozenset())) if incremental else (
++            lambda: sync.refresh_remote_parents(local, replica))
++        assert refresh() == [parent]
++        assert kb._parents_satisfied(local, child)
++        with kb.write_txn(replica):
++            kb._append_event(replica, parent, 'spend_budget_triaged', {'cause': 'scope_stopped'})
++        assert refresh() == [parent]
++        assert kb.get_task(local, parent) is None
++        assert kb.unsatisfied_parents(local, child) == [(parent, 'done:restricted')]
++        assert not kb._parents_satisfied(local, child)
++        assert kb.recompute_ready(local) == 0
++        assert refresh() == []
++    finally:
++        replica.close()
+-- 
+2.43.0
+

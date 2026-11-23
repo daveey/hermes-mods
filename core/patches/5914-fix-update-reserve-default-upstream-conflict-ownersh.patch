@@ -1,0 +1,223 @@
+From 04153c02395bb32020513546c9a36a97f88b6bcd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 10:12:38 +0000
+Subject: [PATCH] fix(update): reserve default upstream conflict ownership for
+ the hub [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/update_upstream_conflict.py        | 19 ++++++-
+ .../test_update_conflict_reporting.py         |  2 +
+ .../test_update_upstream_before_pause.py      | 25 +++++++-
+ .../test_update_upstream_conflict.py          | 57 +++++++++++++++++++
+ 4 files changed, 100 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/update_upstream_conflict.py b/hermes_cli/update_upstream_conflict.py
+index 93aa77121d9..3db7f5c1c9e 100644
+--- a/hermes_cli/update_upstream_conflict.py
++++ b/hermes_cli/update_upstream_conflict.py
+@@ -12,6 +12,7 @@ from pathlib import Path
+ log = logging.getLogger(__name__)
+ AUTHOR = "upstream-merge"
+ _RESULT = "__HERMES_UPSTREAM_CONFLICT_TASK__="
++_SKIPPED = "__HERMES_UPSTREAM_CONFLICT_HUB_ONLY__"
+ _TIMEOUT_S = 60
+ 
+ 
+@@ -34,6 +35,11 @@ def report(cwd: Path, upstream: str, conflicts: list[str]) -> str | None:
+             runtime_command(root, args, module="hermes_cli.update_upstream_conflict", home=get_hermes_home()), cwd=str(root),
+             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=_TIMEOUT_S, check=False)
+         found = re.findall(rf"^{re.escape(_RESULT)}(t_\w+)$", proc.stdout or "", re.MULTILINE)
++        if proc.returncode == 0 and _SKIPPED in (proc.stdout or "").splitlines():
++            message = "upstream integration belongs to the hub; no local repair card filed; keeping the fork-only update"
++            log.info(message)
++            print(f"    {message}")
++            return None
+         if proc.returncode == 0 and found:
+             return found[-1]
+         detail = f"exit {proc.returncode}: " + (proc.stderr or proc.stdout or "")[-2000:]
+@@ -55,17 +61,26 @@ def main(argv: list[str] | None = None) -> int:
+ 
+     with connect_closing() as conn:
+         task_id = _report(conn, ns.cwd, ns.upstream, ns.conflict)
+-    print(f"{_RESULT}{task_id}", flush=True)
++    print(f"{_RESULT}{task_id}" if task_id else _SKIPPED, flush=True)
+     return 0
+ 
+ 
+-def _report(conn, cwd: Path, upstream: str, conflicts: list[str]) -> str:
++def _report(conn, cwd: Path, upstream: str, conflicts: list[str]) -> str | None:
+     from hermes_cli import kanban_db as kb
+ 
+     from hermes_cli import update_conflict_reporting as routing
+     config = routing.configured()
+     if config is not None:
+         return routing.report(conn, config, cwd, upstream, conflicts)
++    from hermes_cli.kanban_capability_registry import self_gateway
++    from hermes_cli.kanban_hub_admission_placement import is_hub
++    from hermes_cli.kanban_placement import config as placement_config
++
++    # A worker's local board cannot deduplicate against the hub's integration owner.
++    # Explicit observation routing above remains available; unknown identity is not authority.
++    gateway = self_gateway()
++    if not gateway or not is_hub(gateway, placement_config()):
++        return None
+     key = "upstream-merge-conflict:" + hashlib.sha256(str(cwd.resolve()).encode()).hexdigest()[:24]
+     evidence = f"Upstream SHA: `{upstream}`\nConflicting paths:\n" + "\n".join(f"- `{p}`" for p in conflicts)
+     # Serialize lookup + create so overlapping unattended invocations cannot create two owners.
+diff --git a/tests/hermes_cli/test_update_conflict_reporting.py b/tests/hermes_cli/test_update_conflict_reporting.py
+index 61b63ee1bc3..c6f6c6db3a5 100644
+--- a/tests/hermes_cli/test_update_conflict_reporting.py
++++ b/tests/hermes_cli/test_update_conflict_reporting.py
+@@ -19,6 +19,8 @@ REPO = 'https://github.com/example/core.git'
+ 
+ @pytest.fixture
+ def routing(tmp_path, monkeypatch):
++    from hermes_cli import kanban_capability_registry as registry
++    monkeypatch.setattr(registry, 'self_gateway', lambda: 'hub')
+     checkout = tmp_path / 'checkout'
+     checkout.mkdir()
+     monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'board.db'))
+diff --git a/tests/hermes_cli/test_update_upstream_before_pause.py b/tests/hermes_cli/test_update_upstream_before_pause.py
+index a5c3f4a23e8..430b45cccca 100644
+--- a/tests/hermes_cli/test_update_upstream_before_pause.py
++++ b/tests/hermes_cli/test_update_upstream_before_pause.py
+@@ -119,6 +119,7 @@ def fork(tmp_path, monkeypatch):
+ 
+     monkeypatch.setattr(update_cmd_pause_gate, '_checkout_move', checkout_move)
+     report = []
++    from hermes_cli.update_upstream_conflict import report as real_report
+ 
+     def conflict_report(cwd, sha, conflicts):
+         rec.note('conflict report')
+@@ -137,7 +138,7 @@ def fork(tmp_path, monkeypatch):
+     args = SimpleNamespace(branch=None, channel='main', yes=True, force=True, force_venv=True, check=False,
+                            plan=False, gateway=True, install_id=False, set_channel=None)
+     return SimpleNamespace(origin=origin, clone=clone, upstream=upstream, base=base, rec=rec, args=args,
+-                           requests=requests, report=report, gate=gate)
++                           requests=requests, report=report, gate=gate, real_report=real_report)
+ 
+ 
+ @pytest.mark.parametrize('conflict', [True, False], ids=['conflict', 'clean'])
+@@ -170,6 +171,28 @@ def test_fork_merge_fetches_merges_and_reports_before_the_gateways_pause(fork, m
+         assert t.report == []
+ 
+ 
++def test_worker_conflict_keeps_fork_update_without_local_owner(fork, tmp_path, monkeypatch, capsys):
++    from tests.hermes_cli.test_update_upstream_conflict import _gateway_identity
++    from hermes_cli.config import save_config
++    from hermes_cli.kanban_db_connect import connect_closing
++
++    _gateway_identity(tmp_path, monkeypatch, 'worker-a4')
++    monkeypatch.setenv('HERMES_KANBAN_DB', str(tmp_path / 'board.db'))
++    save_config({'platform_toolsets': {'cli': ['terminal', 'file']}})
++    monkeypatch.setattr('hermes_cli.update_upstream_conflict.report', fork.real_report)
++    monkeypatch.setattr(update_cmd_git, '_fork_merges_upstream', lambda: True)
++    commit(fork.upstream, 'upstream\n', 'upstream change')
++    fork_tip = commit(fork.origin, 'fork\n', 'fork change')
++
++    cli_main.cmd_update(fork.args)
++
++    assert git(fork.clone, 'rev-parse', 'HEAD') == fork_tip
++    assert len(fork.requests) == 1 and fork.gate == []
++    assert 'upstream integration belongs to the hub' in capsys.readouterr().out
++    with connect_closing() as conn:
++        assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == 0
++
++
+ def test_upstream_fast_forward_still_moves_the_tree_paused_under_checkout_move(fork):
+     t = fork
+     origin_tip = commit(t.origin, 'origin\n', 'origin change')
+diff --git a/tests/hermes_cli/test_update_upstream_conflict.py b/tests/hermes_cli/test_update_upstream_conflict.py
+index 4d705b4aa32..79ce6f2dbb0 100644
+--- a/tests/hermes_cli/test_update_upstream_conflict.py
++++ b/tests/hermes_cli/test_update_upstream_conflict.py
+@@ -5,8 +5,11 @@
+ for a name it did not have yet, and validate_assignment surfaced the ImportError as "Assignee 'default'
+ lacks required capabilities", so no repair owner was filed (defect kanban-c50ee42be6).
+ """
++import json
+ import sys
+ import types
++
++import pytest
+ from pathlib import Path
+ 
+ from hermes_cli.config import save_config
+@@ -21,7 +24,17 @@ def _stale_config_effective(monkeypatch):
+     monkeypatch.setitem(sys.modules, "hermes_cli.config_effective", stale)
+ 
+ 
++def _gateway_identity(tmp_path, monkeypatch, gateway):
++    path = tmp_path / "mail.json"
++    path.write_text(json.dumps({"gateway": gateway}))
++    monkeypatch.setenv("HERMES_MAIL_CONFIG", str(path))
++    # Prevent a missing identity from falling back to the real host's replica.
++    from hermes_cli import kanban_capability_registry as registry
++    monkeypatch.setattr(registry, "hub_db_path", lambda: tmp_path / "absent.db")
++
++
+ def test_report_files_owner_despite_stale_in_process_modules(tmp_path, monkeypatch):
++    _gateway_identity(tmp_path, monkeypatch, "hub")
+     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
+     save_config({"platform_toolsets": {"cli": ["terminal", "file"]}, "terminal": {"backend": "local"}})
+     _stale_config_effective(monkeypatch)
+@@ -47,6 +60,7 @@ def test_report_files_owner_despite_stale_in_process_modules(tmp_path, monkeypat
+ 
+ 
+ def test_report_failure_is_best_effort_and_logged(tmp_path, monkeypatch, capsys, caplog):
++    _gateway_identity(tmp_path, monkeypatch, "hub")
+     # A child that cannot file (unwritable board path) returns None, warns, and keeps its stderr tail.
+     blocker = tmp_path / "not-a-dir"
+     blocker.write_text("x")
+@@ -69,3 +83,46 @@ def test_conflict_without_owner_prints_not_filed(monkeypatch, tmp_path, capsys):
+     monkeypatch.setattr(ucg, "_git_stdout", lambda *a, **k: "head")
+     assert ucg._synthesize_upstream_merge(["git"], Path(tmp_path), "u" * 40) is None
+     assert "Repair owner: NOT FILED" in capsys.readouterr().out
++
++
++@pytest.mark.parametrize("gateway", ["worker-a1", "worker-a4", "mac"])
++def test_non_hub_fresh_child_never_creates_local_owner(tmp_path, monkeypatch, capsys, gateway):
++    _gateway_identity(tmp_path, monkeypatch, gateway)
++    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
++    save_config({"platform_toolsets": {"cli": ["terminal", "file"]}})
++    for sha in ("a" * 40, "b" * 40):
++        assert uuc.report(tmp_path, sha, ["conflict.txt"]) is None
++    assert "upstream integration belongs to the hub" in capsys.readouterr().out
++    with connect_closing() as conn:
++        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("returncode,output,skipped", [
++    (0, uuc._SKIPPED + "\n", True),
++    (1, uuc._SKIPPED + "\n", False),
++    (0, "prefix" + uuc._SKIPPED, False),
++    (0, "", False),
++])
++def test_skip_protocol_requires_success_and_exact_marker(monkeypatch, tmp_path, capsys, returncode, output, skipped):
++    monkeypatch.setattr(uuc.subprocess, "run", lambda *a, **k: types.SimpleNamespace(
++        returncode=returncode, stdout=output, stderr=""))
++    assert uuc.report(tmp_path, "a" * 40, ["conflict.txt"]) is None
++    text = capsys.readouterr().out
++    assert ("upstream integration belongs to the hub" in text) is skipped
++    assert ("could not file upstream merge conflict card" in text) is not skipped
++
++
++@pytest.mark.parametrize("gateway", [None, "", "worker-a4", "hermes-hub", "hub"])
++def test_local_owner_authority_is_checked_at_filing_boundary(tmp_path, monkeypatch, gateway):
++    from hermes_cli import kanban_capability_registry as registry
++    monkeypatch.setattr(registry, "self_gateway", lambda: gateway)
++    save_config({"platform_toolsets": {"cli": ["terminal", "file"]}})
++    with connect_closing() as conn:
++        first = uuc._report(conn, tmp_path, "a" * 40, ["conflict.txt"])
++        second = uuc._report(conn, tmp_path, "b" * 40, ["conflict.txt"])
++        if gateway in ("hub", "hermes-hub"):
++            assert first and second == first
++            assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
++        else:
++            assert first is second is None
++            assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+-- 
+2.43.0
+

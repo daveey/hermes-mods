@@ -1,0 +1,247 @@
+From 611dac3807466e044e6dc0d512282d519aec4d79 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 06:50:19 +0000
+Subject: [PATCH] [daveey] Honor notification deadlines and bound incomplete
+ retries
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ .../test_kanban_unloaded_fact_schedule.py     | 60 +++++++++++++++++
+ .../tui_gateway/test_loaded_notification_f.py | 66 +++++++++++++++++++
+ tui_gateway/kanban_unloaded.py                |  4 ++
+ tui_gateway/kanban_unloaded_schedule.py       |  6 ++
+ tui_gateway/notification_loaded_f.py          | 21 ++++--
+ 5 files changed, 152 insertions(+), 5 deletions(-)
+
+diff --git a/tests/tui_gateway/test_kanban_unloaded_fact_schedule.py b/tests/tui_gateway/test_kanban_unloaded_fact_schedule.py
+index bdc8d4aeafb..fbf1f51418e 100644
+--- a/tests/tui_gateway/test_kanban_unloaded_fact_schedule.py
++++ b/tests/tui_gateway/test_kanban_unloaded_fact_schedule.py
+@@ -177,6 +177,66 @@ def test_actual_loop_keeps_lease_cadence_while_sources_are_quiet(monkeypatch):
+         owner.close()
+ 
+ 
++@pytest.mark.parametrize("bound", [False, True])
++def test_early_report_deadline_does_not_postpone_legacy_work(monkeypatch, bound):
++    import threading
++    from types import SimpleNamespace
++
++    owner = None
++    if bound:
++        store = FakeStore()
++        helpers.ready_siblings(store)
++        owner = notification_facts.bind(store, helpers.SCOPE, "/canonical/early-deadline")
++        owner.report_ready()
++        store.activate(helpers.SCOPE)
++        store.drain()
++    now = [0.0]
++    calls, released = [], []
++    stop = threading.Event()
++
++    class Wake:
++        def set(self):
++            pass
++
++        def clear(self):
++            pass
++
++        def is_set(self):
++            return False
++
++        def wait(self, timeout):
++            now[0] += timeout
++            if now[0] >= 6.1:
++                stop.set()
++
++    def host(*args, **kwargs):
++        calls.append(now[0])
++        result = FanoutResult()
++        result.next_deadline = now[0] + 0.5
++        gates.run("card_change_pass", lambda: result, live=set())
++
++    time_wall = [1000.0]
++    lease = Lease()
++    monkeypatch.setattr(lease, "release", lambda: released.append(True), raising=False)
++    monkeypatch.setattr(unloaded, "make_lease", lambda: lease)
++    monkeypatch.setattr(unloaded, "threading", SimpleNamespace(Event=Wake))
++    monkeypatch.setattr(scheduling.time, "monotonic", lambda: now[0])
++    monkeypatch.setattr(gates.time, "time", lambda: time_wall[0] + now[0])
++    monkeypatch.setenv("HERMES_KANBAN_UNLOADED_SWEEP_S", "2")
++    monkeypatch.setenv("HERMES_KANBAN_UNLOADED_FIRST_S", "0")
++    monkeypatch.setattr(unloaded.wake_slots, "set_holder", lambda _: None)
++    monkeypatch.setattr(unloaded, "host_pass", host)
++    try:
++        unloaded._loop(stop)
++        # Both the bound action and the unbound legacy executor run each 0.5 s
++        # reported deadline, not just the 2 s interval.
++        assert calls == [i / 2 for i in range(13)]
++        assert released == [True]
++    finally:
++        if owner:
++            owner.close()
++
++
+ def test_empty_fanout_result_is_not_a_quiet_certificate():
+     from gateway.kanban_notification_schedule import PassReport
+     result = FanoutResult()
+diff --git a/tests/tui_gateway/test_loaded_notification_f.py b/tests/tui_gateway/test_loaded_notification_f.py
+index bd4d2503772..fbde403aaa2 100644
+--- a/tests/tui_gateway/test_loaded_notification_f.py
++++ b/tests/tui_gateway/test_loaded_notification_f.py
+@@ -1,6 +1,8 @@
+ """f-only loaded notification acceptance, with real replica and claim ledgers."""
+ import time
+ 
++import pytest
++
+ from tests.tui_gateway import test_kanban_remote_notices_keyed as fixtures
+ from tui_gateway import kanban_remote_notices as krn
+ 
+@@ -16,6 +18,14 @@ def _hub(tmp_path, cards):
+ def test_remote_delivered_by_shared_reconcile_with_pollers_off(tmp_path, monkeypatch):
+     from tui_gateway import notification_loaded_f as loaded
+     from tui_gateway import server
++    from hermes_cli import fact_host, fact_replica, fact_demand
++
++    def no_ipc(*args, **kwargs):
++        pytest.fail('first-ship f must not start replica IPC or a demand channel')
++
++    monkeypatch.setattr(fact_host.FactHost, 'start', no_ipc)
++    monkeypatch.setattr(fact_replica.ReplicaHandle, '__init__', no_ipc)
++    monkeypatch.setattr(fact_demand.DemandChannel, '__init__', no_ipc)
+     old = fixtures._card('t_history', fixtures.CHAT, status='done', at=time.time() - krn.FRESH_S - 60)
+     alias = fixtures._card('t_history', fixtures.CHAT, status='done', at=time.time())
+     alias['key'] = 'default/t_history'
+@@ -99,6 +109,62 @@ def test_remote_delivered_by_shared_reconcile_with_pollers_off(tmp_path, monkeyp
+     action.close()
+ 
+ 
++@pytest.mark.parametrize('linked', [False, True])
++def test_incomplete_reconciliation_retries_only_positive_chat_keys(tmp_path, monkeypatch, linked):
++    import sqlite3
++    from tui_gateway import notification_loaded_f as loaded, server
++    from tui_gateway import kanban_remote_notices_keyed as keyed, notification_loaded_local
++
++    cards = [fixtures._card(f't_foreign_{i}', 'unrelated-chat', status='done', at=time.time())
++             for i in range(1200)]
++    relevant = fixtures._card('t_relevant', 'ancestor-chat', status='done', at=time.time())
++    if linked:
++        cards.append(relevant)
++    # A legacy replica has no incremental metadata index: unknown recovery
++    # must stay on reconciliation, independently of native key hints.
++    replica = fixtures._hub(tmp_path, cards)
++    with sqlite3.connect(replica) as conn:
++        conn.execute("UPDATE meta SET v='99' WHERE k='cursor'")
++    monkeypatch.setattr(krn, 'hub_db_path', lambda: replica)
++    monkeypatch.setattr(krn, 'ledger_path', lambda: tmp_path / 'ledger.db')
++    monkeypatch.setattr(server, '_session_lineage', lambda *_: ('ancestor-chat',))
++    monkeypatch.setattr(server, '_forwarded_locally', lambda *_: False)
++    monkeypatch.setattr(server, '_remote_transcript_has', lambda *_: lambda *_: False)
++    monkeypatch.setattr(notification_loaded_local, 'capture', lambda *_: ({}, {}))
++    clock = [100.0]
++    scheduler = loaded.Scheduler(clock=lambda: clock[0])
++    session = {'session_key': fixtures.CHAT, 'profile_home': None}
++    action = scheduler.add(session, 'default', lambda: None)
++    reads = []
++    read_rows = keyed.read_rows
++
++    def read(path, keys):
++        reads.append(keys)
++        return read_rows(path, keys)
++
++    monkeypatch.setattr(keyed, 'read_rows', read)
++    try:
++        scheduler.step()
++        assert action.due(legacy_due=False)
++        texts = server._collect_remote_kanban_notifications(fixtures.CHAT, [], session=session)
++        assert len(texts) == int(linked)
++        retry_at = session['_kanban_remote_retry_at']
++        action.tick('ui', retry_at, retry_at - 1, None, lambda *_: None)
++        expected = {('hub', relevant['key'])} if linked else set()
++        assert scheduler.dirty == expected
++        clock[0] = 101
++        scheduler.step()
++        assert reads == ([None, list(expected)] if linked else [None])
++        clock[0] = 129.999
++        scheduler.step()
++        assert sum(keys is None for keys in reads) == 1
++        clock[0] = 130
++        scheduler.step()
++        assert sum(keys is None for keys in reads) == 2
++    finally:
++        action.close()
++
++
+ def test_wake_reaches_loaded_executor_under_two_seconds(tmp_path, monkeypatch):
+     import threading
+     from tools import async_delegation
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 978841d107c..c61cde01fd8 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -878,6 +878,10 @@ def _loop(stop: threading.Event) -> None:
+                     schedule.gate.retry_at = time.monotonic() + interval
+                     logger.warning("kanban unloaded pass failed", exc_info=True)
+                 maintenance = time.monotonic() + interval
++                if not schedule.gate.was_bound and schedule.role != "retired":
++                    # An early report wake may not admit legacy work. Keep its
++                    # outstanding deadline rather than postponing it a full interval.
++                    maintenance = min(maintenance, schedule.next_legacy)
+             # Stop observation is memory-only. Lease custody still gets its
+             # normal maintenance cadence even with no admitted source pass.
+             wake.wait(min(1.0, max(0.01, min(maintenance, schedule.gate.retry_at) - time.monotonic())))
+diff --git a/tui_gateway/kanban_unloaded_schedule.py b/tui_gateway/kanban_unloaded_schedule.py
+index 1f9a6d8f5bc..989032e1543 100644
+--- a/tui_gateway/kanban_unloaded_schedule.py
++++ b/tui_gateway/kanban_unloaded_schedule.py
+@@ -15,7 +15,13 @@ class UnloadedSchedule:
+         now = time.monotonic()
+         changed = role != self.role
+         self.role = role
++        # Read before due(): an empty membership resets retry_at.
++        report_due = now >= self.gate.retry_at
+         due = self.gate.due(now, legacy_due=now >= self.next_legacy)
++        if not due and report_due and not self.gate.was_bound and not self.gate.actions:
++            # Never-bound work is the legacy executor; its reported deadline is
++            # due work. A detached binding still waits for a fresh membership.
++            due = True
+         # Ownership changes require catch-up, but a detached facts registry is
+         # never permission to resume scans using the launch profile instead.
+         if not due and not (changed and (self.gate.actions or not self.gate.was_bound)):
+diff --git a/tui_gateway/notification_loaded_f.py b/tui_gateway/notification_loaded_f.py
+index 5321775f472..2fae094ca38 100644
+--- a/tui_gateway/notification_loaded_f.py
++++ b/tui_gateway/notification_loaded_f.py
+@@ -44,12 +44,23 @@ class Action:
+             return True
+ 
+     def retry(self):
+-        import json
++        from tui_gateway import server
++        from tui_gateway.kanban_remote_notices import _linked_chats
++
+         batch = self.session.get('_notif_remote_batch')
+-        if hasattr(batch, 'rows'):
+-            self.scheduler.invalidate([(gw, key) for gw, key, _ in json.loads(batch.rows)])
+-        else:
+-            self.scheduler.source_changed()
++        if not hasattr(batch, 'rows'):
++            return  # Unknown recovery belongs to the unchanged 30s clock.
++        chat = self.session.get('session_key')
++        if not chat:
++            return
++        chats = {chat, *server._session_lineage(chat)}
++        keys = [(gw, key) for gw, key, task in json.loads(batch.rows)
++                if any(profile == self.profile and sid in chats
++                       for profile, sid in _linked_chats(task, batch.me))]
++        if keys:
++            # Full captures contain other chats/profiles too. Incompleteness
++            # cannot turn their population into a one-second keyed census.
++            self.scheduler.invalidate(keys)
+ 
+     def deadline(self, now, last_poll):
+         with self.scheduler.lock:
+-- 
+2.43.0
+

@@ -1,0 +1,890 @@
+From a39aec40800d378cee02b9e4ce0ab8cefcceca83 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 10:36:16 +0000
+Subject: [PATCH] [daveey] Add owner-local inactive text CAS without lifecycle
+ effects
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban.py                          |   6 +-
+ hermes_cli/kanban_db_edit.py                  |  44 ++--
+ hermes_cli/kanban_parser.py                   |   5 +
+ hermes_cli/kanban_text_edit.py                | 220 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_text_edit.py     | 145 ++++++++++++
+ tests/hermes_cli/test_kanban_text_edit_cli.py |  60 +++++
+ .../test_kanban_text_edit_contract.py         | 187 +++++++++++++++
+ .../docs/developer-guide/owner-text-cas.md    |  54 +++++
+ 8 files changed, 704 insertions(+), 17 deletions(-)
+ create mode 100644 hermes_cli/kanban_text_edit.py
+ create mode 100644 tests/hermes_cli/test_kanban_text_edit.py
+ create mode 100644 tests/hermes_cli/test_kanban_text_edit_cli.py
+ create mode 100644 tests/hermes_cli/test_kanban_text_edit_contract.py
+ create mode 100644 website/docs/developer-guide/owner-text-cas.md
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index e260e48096c..e474de0623c 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -56,7 +56,7 @@ from hermes_cli.kanban_cli_park import (
+ from hermes_cli.kanban_ops import (
+     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_recover, _cmd_repair, _cmd_tail, _cmd_watch,
+ )
+-from hermes_cli.kanban_parser import build_parser, cmd_resume as _cmd_resume, cmd_quota_release as _cmd_quota_release, cmd_correct_diagnostics as _cmd_correct_diagnostics
++from hermes_cli.kanban_parser import build_parser, cmd_resume as _cmd_resume, cmd_quota_release as _cmd_quota_release, cmd_correct_diagnostics as _cmd_correct_diagnostics, cmd_edit_text as _cmd_edit_text
+ from hermes_cli.kanban_claim_cli import cmd_claim as _cmd_claim  # moved; re-exported for callers
+ from hermes_cli.kanban_source_cli import cmd_source_release as _cmd_source_release
+ from hermes_cli.kanban_run_models_cli import command as _cmd_attest_run_models
+@@ -215,7 +215,7 @@ def kanban_command(args: argparse.Namespace) -> int:
+             return importlib.import_module("hermes_cli.kanban_actionability_cli").command(args)
+         # Maintenance handlers skip init_db; their connections still run schema setup.
+         if handler := {"repair": _cmd_repair, "recover": _cmd_recover,
+-                       "correct-diagnostics": _cmd_correct_diagnostics}.get(action):
++                       "correct-diagnostics": _cmd_correct_diagnostics, "edit-text": _cmd_edit_text}.get(action):
+             return handler(args)
+         try:
+             kb.init_db()
+@@ -268,7 +268,7 @@ def _profile_author() -> str:
+ 
+ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+     "init", "attest-run-models", "create", "swarm", "assign", "reclaim", "move", "reassign", "link", "unlink",
+-    "claim", "comment", "attach", "attach-rm", "complete", "edit", "block", "correct-diagnostics",
++    "claim", "comment", "attach", "attach-rm", "complete", "edit", "block", "correct-diagnostics", "edit-text",
+     "schedule", "unblock", "contain", "resume-contained", "promote", "archive", "dispatch", "daemon", "repair", "recover",
+     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+     "request-review", "request-changes", "reopen-review", "reopen", "resume", "quota-release", "source-release",
+diff --git a/hermes_cli/kanban_db_edit.py b/hermes_cli/kanban_db_edit.py
+index 04e21a43b1d..13c29cede73 100644
+--- a/hermes_cli/kanban_db_edit.py
++++ b/hermes_cli/kanban_db_edit.py
+@@ -11,8 +11,10 @@ from typing import Optional
+ _UNSET = object()
+ 
+ 
+-def _edit_snapshot_matches(conn, task_id, status, expected_body, home_open_only):
++def _edit_snapshot_matches(conn, task_id, status, expected_body, home_open_only, text_cas=None):
+     """Recheck maintenance custody and body CAS under edit_task's write transaction."""
++    if text_cas is not None:
++        text_cas.check(conn, task_id)
+     if home_open_only:
+         from hermes_cli.kanban_model_retirement import owns_policy
+         if status in ('done', 'archived') or not owns_policy(conn, task_id):
+@@ -23,11 +25,27 @@ def _edit_snapshot_matches(conn, task_id, status, expected_body, home_open_only)
+     return True
+ 
+ 
+-def _append_edit_comment(conn, task_id, audit_comment):
++def _append_edit_comment(conn, task_id, audit_comment, text_cas=None):
++    if text_cas is not None:
++        text_cas.audit(conn, task_id)
+     if audit_comment is not None:
+         _kb.add_comment(conn, task_id, *audit_comment)
+ 
+ 
++def _selected_fields(supplied):
++    hook = supplied["text_cas"]
++    if hook is not None:
++        from hermes_cli.kanban_text_edit import TextCAS
++        if type(hook) is not TextCAS:
++            raise ValueError("invalid internal text CAS hook")
++        return hook.fields(supplied)
++    return {key: supplied[key] for key in ("title", "body", "priority") if supplied[key] is not None}
++
++
++def _ordinary_edit_fields(fields, text_cas):
++    return [] if text_cas is not None else [field for field in fields if field != "priority"]
++
++
+ class PriorityLowerRefused(ValueError):
+     """An edit would lower a card's priority without a reason (``require_lower_reason``). [daveey]"""
+ 
+@@ -93,7 +111,7 @@ def edit_task(
+     priority_bump: Optional[int] = None,
+     admission_class: Optional[str] = None, admission_frees: Optional[str] = None,
+     expected_body: object = _UNSET, home_open_only: bool = False,
+-    audit_comment: Optional[tuple[str, str]] = None,
++    audit_comment: Optional[tuple[str, str]] = None, text_cas=None,
+ ) -> bool:
+     """Edit task fields, optionally backfilling a completed task's result.
+ 
+@@ -106,6 +124,7 @@ def edit_task(
+     exact stored-body CAS, ``home_open_only`` to recheck nonterminal home custody,
+     and ``audit_comment`` to append an explanation in the same transaction. [daveey]
+     """
++    selected = _selected_fields(locals())
+     from hermes_cli.kanban_model_neutral import validate_text
+     validate_text(title, body)
+     from hermes_cli.kanban_priority import bounded
+@@ -113,15 +132,12 @@ def edit_task(
+         raise ValueError("priority_bump must be positive and cannot be combined with priority")
+     if priority is not None:
+         priority = bounded(priority)
+-    changed_fields = [
+-        field for field, value in (("title", title), ("body", body), ("priority", priority))
+-        if value is not None
+-    ]
++    changed_fields = list(selected)
+     with _kb.write_txn(conn):
+         status = _kb._task_status(conn, task_id)
+         if status is None or (result is not None and status != "done"):
+             return False
+-        if not _edit_snapshot_matches(conn, task_id, status, expected_body, home_open_only):
++        if not _edit_snapshot_matches(conn, task_id, status, expected_body, home_open_only, text_cas):
+             return False
+         previous_priority = conn.execute("SELECT priority FROM tasks WHERE id=?", (task_id,)).fetchone()[0] or 0
+         if priority_bump is not None:
+@@ -134,10 +150,10 @@ def edit_task(
+         from hermes_cli.kanban_admission_class import edit_fields
+         admission = edit_fields(conn, task_id, admission_class, admission_frees)
+         changed_fields.extend(admission)
+-        for field, value in (("title", title), ("body", body), ("priority", priority), *admission.items()):
+-            if value is not None:
+-                assignments.append(f"{field} = ?")
+-                params.append(value)
++        selected.update({k: v for k, v in (("priority", priority), *admission.items()) if v is not None})
++        for field, value in selected.items():
++            assignments.append(f"{field} = ?")
++            params.append(value)
+         if result is not None:
+             assignments.append("result = ?")
+             params.append(result)
+@@ -157,7 +173,7 @@ def edit_task(
+                 payload["reason"] = priority_reason.strip()
+             _kb._append_event(conn, task_id, "reprioritized", payload)
+         if result is None:
+-            non_priority_fields = [field for field in changed_fields if field != "priority"]
++            non_priority_fields = _ordinary_edit_fields(changed_fields, text_cas)
+             if non_priority_fields:
+                 _kb._append_event(conn, task_id, "edited", {"fields": non_priority_fields})
+         else:
+@@ -201,7 +217,7 @@ def edit_task(
+                 },
+                 run_id=run_id,
+             )
+-        _append_edit_comment(conn, task_id, audit_comment)
++        _append_edit_comment(conn, task_id, audit_comment, text_cas)
+     _kb.notify_task_updated(conn, task_id, changed_fields, board=board)
+     return True
+ 
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 1058a1e311c..da710f21f53 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -19,6 +19,7 @@ from hermes_cli.kanban_chat_links_settle import DEFAULT_SETTLE_S
+ # FILE_LINES cap) gains no line for it. [daveey]
+ from hermes_cli.kanban_operator_resume import cmd as cmd_resume
+ from hermes_cli.kanban_diagnostic_correction import command as cmd_correct_diagnostics
++from hermes_cli.kanban_text_edit import command as cmd_edit_text
+ from hermes_cli.kanban_quota_episode_release import cmd as cmd_quota_release  # same ride as cmd_resume
+ 
+ 
+@@ -533,6 +534,10 @@ _SPECS = [
+              help="Override the live-claim guard: complete a running, claimed task "
+                   "even without owning its run (closes the worker's run)."),
+     ], help="Mark one or more tasks done"),
++    _cmd("edit-text", [
++        _TASK_ID,
++        _arg("--request-file", required=True, help="Exact UTF-8 JSON text CAS request (owner operator only)"),
++    ], help="Audited inactive owner-local text CAS; preserves lifecycle and admission"),
+     _cmd("correct-diagnostics", [
+         _TASK_ID,
+         _arg("--request-file", required=True, help="UTF-8 JSON exact-content quotation request (operator only)"),
+diff --git a/hermes_cli/kanban_text_edit.py b/hermes_cli/kanban_text_edit.py
+new file mode 100644
+index 00000000000..0bc61cc22ad
+--- /dev/null
++++ b/hermes_cli/kanban_text_edit.py
+@@ -0,0 +1,220 @@
++"""Trusted owner-local exact-text CAS; no lifecycle or author authority. [daveey]"""
++from __future__ import annotations
++
++import json
++import os
++import re
++import sqlite3
++import time
++
++
++class TextEditResult(Exception):
++    """Leave the existing write transaction before returning a refusal/replay."""
++
++    def __init__(self, disposition, *, receipt_checked=False, event_uid=None):
++        super().__init__(disposition)
++        self.result = {"ok": disposition == "replayed", "disposition": disposition,
++                       "receipt_checked": receipt_checked, "event_uid": event_uid}
++
++
++def _text(value, limit, *, nullable=False, nonblank=False):
++    if nullable and value is None:
++        return
++    if type(value) is not str or len(value.encode("utf-8")) > limit:
++        raise ValueError("invalid text type or UTF-8 byte length")
++    if nonblank and not value.strip():
++        raise ValueError("blank text")
++
++
++def validate_request(request):
++    """Exact schema; expected content is evidence, replacement is policy input."""
++    if type(request) is not dict or set(request) != {"request_id", "reason", "expected", "replacement"}:
++        raise ValueError("expected request_id, reason, expected, replacement")
++    _text(request["request_id"], 128, nonblank=True)
++    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request["request_id"]):
++        raise ValueError("invalid request_id token")
++    _text(request["reason"], 2000, nonblank=True)
++    for key in ("expected", "replacement"):
++        value = request[key]
++        if type(value) is not dict or set(value) != {"title", "body"}:
++            raise ValueError("expected exact title/body pair")
++        _text(value["title"], 4000, nonblank=True)
++        _text(value["body"], 100000, nullable=True)
++    if request["expected"] == request["replacement"]:
++        raise ValueError("no-op request refused")
++    from hermes_cli.kanban_model_neutral import validate_text
++    validate_text(request["replacement"]["title"], request["replacement"]["body"])
++
++
++def _unique(pairs):
++    result = {}
++    for key, value in pairs:
++        if key in result:
++            raise ValueError("duplicate JSON key")
++        result[key] = value
++    return result
++
++
++def _constant(value):
++    raise ValueError(f"nonfinite JSON constant: {value}")
++
++
++def read_request(path):
++    with open(path, "rb") as source:
++        raw = source.read(500001)
++    if len(raw) > 500000:
++        raise ValueError("request exceeds 500000 bytes")
++    request = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique, parse_constant=_constant)
++    validate_request(request)
++    return request
++
++
++def _inactive(conn, task):
++    if task["status"] not in {"todo", "ready", "blocked", "scheduled", "triage"}:
++        return False
++    if any(task[key] is not None for key in ("current_run_id", "claim_lock", "claim_expires", "worker_pid")):
++        return False
++    if conn.execute("SELECT 1 FROM task_runs WHERE task_id=? AND ended_at IS NULL LIMIT 1",
++                    (task["id"],)).fetchone():
++        return False
++    return not (task.get("lease_holder") is not None and
++                (task.get("lease_expires") is None or task["lease_expires"] > time.time()))
++
++
++class TextCAS:
++    """Internal hook; only edit_task's existing transaction may call check/audit."""
++
++    def __init__(self, request):
++        self.request = json.loads(json.dumps(request))
++        self.event_uid = None
++        self.gateway = None
++
++    def fields(self, supplied):
++        from hermes_cli.kanban_review_required import worker_identity
++        if worker_identity():
++            raise TextEditResult("worker_refused")
++        allowed = {"title", "body", "expected_body", "home_open_only", "text_cas", "conn", "task_id"}
++        for key, value in supplied.items():
++            if key not in allowed and not (
++                    value is None or (key == "require_lower_reason" and value is False)):
++                raise ValueError("text CAS cannot mix other edit options")
++        if (supplied["title"] != self.request["replacement"]["title"] or
++                supplied["body"] != self.request["replacement"]["body"] or
++                supplied["expected_body"] != self.request["expected"]["body"] or
++                supplied["home_open_only"] is not True):
++            raise ValueError("text CAS parameters disagree")
++        validate_request(self.request)
++        return dict(self.request["replacement"])
++
++    def check(self, conn, task_id):
++        from hermes_cli import kanban_db_sync as sync
++        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
++        if row is None:
++            raise TextEditResult("not_found")
++        task = dict(row)
++        state = sync.sync_state(conn)
++        configured = conn.execute(
++            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_sync_state'").fetchone()
++        if configured and (not state or state["mode"] != "primary" or not state["gateway_id"] or
++                           task.get("created_on") != state["gateway_id"]):
++            raise TextEditResult("foreign_owner")
++        self.gateway = state["gateway_id"] if state else None
++        if not _inactive(conn, task):
++            raise TextEditResult("active_custody")
++        current = {key: task[key] for key in ("title", "body")}
++        self._replay(conn, task_id, current)
++        if current != self.request["expected"]:
++            raise TextEditResult("stale_preimage", receipt_checked=True)
++
++    def _replay(self, conn, task_id, current):
++        from hermes_cli.kanban_completion_refs import origin_of
++        columns = {row[1] for row in conn.execute("PRAGMA table_info(task_events)")}
++        uid = "uid" if "uid" in columns else "NULL AS uid"
++        rows = conn.execute(f"SELECT id,{uid},payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id",
++                            (task_id, "text_cas_edited"))
++        wanted = self.payload()
++        for row in rows:
++            try:
++                payload = json.loads(row["payload"])
++            except (ValueError, TypeError):
++                raise TextEditResult("malformed_receipt", receipt_checked=True) from None
++            if type(payload) is not dict:
++                raise TextEditResult("malformed_receipt", receipt_checked=True)
++            if payload.get("request_id") != self.request["request_id"]:
++                continue
++            if origin_of(conn, row["id"]) is not None or any(
++                    payload.get(key) != wanted[key] for key in ("request_id", "reason", "before", "after")):
++                raise TextEditResult("request_id_conflict", receipt_checked=True)
++            if not row["uid"]:
++                raise TextEditResult("malformed_receipt", receipt_checked=True)
++            if current != self.request["replacement"]:
++                raise TextEditResult("replay_state_drift", receipt_checked=True)
++            raise TextEditResult("replayed", receipt_checked=True, event_uid=row["uid"])
++
++    def payload(self):
++        return {"request_id": self.request["request_id"], "reason": self.request["reason"],
++                "before": self.request["expected"], "after": self.request["replacement"],
++                "process_context": {"authority_model": "trusted-operator", "worker_markers_present": False,
++                                    "session_hint": os.environ.get("HERMES_SESSION_ID"), "gateway": self.gateway}}
++
++    def audit(self, conn, task_id):
++        from hermes_cli import kanban_db as kb
++        from hermes_cli.kanban_db_sync import uuid7
++        columns = {row[1] for row in conn.execute("PRAGMA table_info(task_events)")}
++        if "uid" not in columns:
++            conn.execute("ALTER TABLE task_events ADD COLUMN uid TEXT")
++        kb._append_event(conn, task_id, "text_cas_edited", self.payload())
++        row = conn.execute("SELECT id,uid FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1",
++                           (task_id, "text_cas_edited")).fetchone()
++        self.event_uid = row["uid"] or uuid7()
++        if row["uid"] is None:
++            conn.execute("UPDATE task_events SET uid=? WHERE id=?", (self.event_uid, row["id"]))
++
++
++def edit_text(conn, task_id, request):
++    """Trusted non-worker operator API, not authentication by marker absence.
++
++    Unknown outcomes retain the exact request identity: read target and history,
++    never mint a replacement request or automatically retry. Local commit does
++    not prove sync convergence. No lifecycle, leases or admission are changed.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_review_required import worker_identity
++    if worker_identity():
++        return {"ok": False, "disposition": "worker_refused", "receipt_checked": False}
++    try:
++        validate_request(request)
++        _text(task_id, 64, nonblank=True)
++    except (ValueError, TypeError, RecursionError) as exc:
++        return {"ok": False, "disposition": "invalid_request", "receipt_checked": False, "error": str(exc)}
++    hook = TextCAS(request)
++    try:
++        applied = kb.edit_task(conn, task_id, **request["replacement"],
++                               expected_body=request["expected"]["body"], home_open_only=True, text_cas=hook)
++    except TextEditResult as exc:
++        return {**exc.result, "request_id": request["request_id"]}
++    except (sqlite3.Error, OSError, RuntimeError) as exc:
++        return {"ok": False, "disposition": "unknown", "request_id": request["request_id"], "error": str(exc)}
++    return {"ok": applied, "disposition": "applied" if applied else "not_found",
++            "request_id": request["request_id"], "receipt_checked": applied, "event_uid": hook.event_uid}
++
++
++def command(args):
++    """CLI entry skips init/activity side effects before validation."""
++    from hermes_cli.kanban_db_connect import connect_closing
++    from hermes_cli.kanban_review_required import worker_identity
++    if worker_identity():
++        print(json.dumps({"ok": False, "disposition": "worker_refused", "receipt_checked": False}))
++        return 2
++    try:
++        request = read_request(args.request_file)
++    except (OSError, ValueError, RecursionError) as exc:
++        print(json.dumps({"ok": False, "disposition": "invalid_request", "error": str(exc)}))
++        return 2
++    try:
++        with connect_closing() as conn:
++            result = edit_text(conn, args.task_id, request)
++    except (sqlite3.Error, OSError, RuntimeError, ValueError) as exc:
++        result = {"ok": False, "disposition": "unknown", "request_id": request["request_id"], "error": str(exc)}
++    print(json.dumps(result, ensure_ascii=False))
++    return 0 if result["ok"] else 1
+diff --git a/tests/hermes_cli/test_kanban_text_edit.py b/tests/hermes_cli/test_kanban_text_edit.py
+new file mode 100644
+index 00000000000..6df9b7e4895
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_text_edit.py
+@@ -0,0 +1,145 @@
++"""Owner-local exact-text edits preserve inactive custody and receipt identity."""
++from __future__ import annotations
++
++import copy
++import importlib
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_edit_operator_fields as fixtures
++
++kanban_home = fixtures.kanban_home
++
++
++def api():
++    return importlib.import_module("hermes_cli.kanban_text_edit")
++
++
++def request(body="old", replacement="new"):
++    return {"request_id": "text-test-1", "reason": "Neutral future routing only",
++            "expected": {"title": "Text fixture", "body": body},
++            "replacement": {"title": "Text fixture", "body": replacement}}
++
++
++@pytest.mark.parametrize("body,replacement", [("old", "new"), (None, ""), ("", None),
++                                               ("é\n", " 字\r\n")])
++def test_apply_replay_preserves_nontext_and_history(kanban_home, monkeypatch, body, replacement):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Text fixture", body=body)
++        kb.add_comment(conn, tid, "original", "Original history")
++        before = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++        comments = list(conn.execute("SELECT * FROM task_comments"))
++        seen = []
++        monkeypatch.setattr(kb, "notify_task_updated", lambda *a, **kw: seen.append((a, kw)))
++        result = api().edit_text(conn, tid, request(body, replacement))
++        assert result["disposition"] == "applied" and result["event_uid"]
++        after = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++        assert after == {**before, "body": replacement}
++        assert list(conn.execute("SELECT * FROM task_comments")) == comments
++        assert len(seen) == 1
++        events = kb.list_events(conn, tid)
++        assert [e.kind for e in events].count("text_cas_edited") == 1
++        assert "edited" not in [e.kind for e in events]
++        snapshot = list(conn.iterdump())
++        replay = api().edit_text(conn, tid, request(body, replacement))
++        assert replay["disposition"] == "replayed"
++        assert replay["event_uid"] == result["event_uid"]
++        assert list(conn.iterdump()) == snapshot and len(seen) == 1
++
++
++@pytest.mark.parametrize("field", ["title", "body"])
++def test_stale_exact_preimage(kanban_home, field):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Text fixture", body="old")
++        req = request()
++        req["expected"][field] += " "
++        snapshot = list(conn.iterdump())
++        result = api().edit_text(conn, tid, req)
++        assert result["disposition"] == "stale_preimage"
++        assert list(conn.iterdump()) == snapshot
++
++
++@pytest.mark.parametrize("status", ["todo", "ready", "blocked", "scheduled", "triage"])
++def test_inactive_states_keep_holds(kanban_home, status):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Text fixture", body="old")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status=?,block_kind='needs_input' WHERE id=?", (status, tid))
++        before = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++        assert api().edit_text(conn, tid, request())["ok"]
++        assert dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()) == {**before, "body": "new"}
++
++
++@pytest.mark.parametrize("field,value", [("status", "running"), ("status", "review"),
++    ("status", "done"), ("status", "archived"), ("claim_lock", "held"),
++    ("claim_expires", 1), ("worker_pid", 123)])
++def test_custody_refuses_without_writes(kanban_home, field, value):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Text fixture", body="old")
++        with kb.write_txn(conn):
++            conn.execute(f"UPDATE tasks SET {field}=? WHERE id=?", (value, tid))
++        snapshot = list(conn.iterdump())
++        result = api().edit_text(conn, tid, request())
++        assert result["disposition"] == "active_custody" and not result["receipt_checked"]
++        assert list(conn.iterdump()) == snapshot
++
++
++def test_conflict_drift_missing_receipt(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Text fixture", body="old")
++        assert api().edit_text(conn, tid, request())["ok"]
++        req = request(); req["reason"] = "different reason"
++        assert api().edit_text(conn, tid, req)["disposition"] == "request_id_conflict"
++        kb.edit_task(conn, tid, body="later")
++        assert api().edit_text(conn, tid, request())["disposition"] == "replay_state_drift"
++        with kb.write_txn(conn):
++            conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='text_cas_edited'", (tid,))
++        assert api().edit_text(conn, tid, request())["disposition"] == "stale_preimage"
++
++
++def test_audit_failure_rolls_back(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Text fixture", body="old")
++        before = list(conn.iterdump())
++        original = kb._append_event
++        def fail(c, task, kind, *a, **kw):
++            if kind == "text_cas_edited":
++                raise sqlite3.OperationalError("injected audit failure")
++            return original(c, task, kind, *a, **kw)
++        monkeypatch.setattr(kb, "_append_event", fail)
++        assert api().edit_text(conn, tid, request())["disposition"] == "unknown"
++        assert list(conn.iterdump()) == before
++
++
++@pytest.mark.parametrize("key", ["HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK"])
++def test_worker_denied_before_db(kanban_home, monkeypatch, key):
++    monkeypatch.setenv(key, "fixture-worker")
++    result = api().edit_text(None, "fixture", request())
++    assert result["disposition"] == "worker_refused"
++
++
++@pytest.mark.parametrize("mutation", ["extra", "noop", "blank", "surrogate", "token", "nulltitle"])
++def test_invalid_before_db(kanban_home, mutation):
++    req = copy.deepcopy(request())
++    if mutation == "extra": req["force"] = True
++    if mutation == "noop": req["replacement"] = req["expected"].copy()
++    if mutation == "blank": req["replacement"]["title"] = " \n"
++    if mutation == "surrogate": req["replacement"]["body"] = "\ud800"
++    if mutation == "token": req["request_id"] = "bad token"
++    if mutation == "nulltitle": req["expected"]["title"] = None
++    assert api().edit_text(None, "fixture", req)["disposition"] == "invalid_request"
++
++
++def test_stamps_do_not_break_replay(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Text fixture", body="old")
++        result = api().edit_text(conn, tid, request())
++        row = conn.execute("SELECT id,payload FROM task_events WHERE kind='text_cas_edited'").fetchone()
++        payload = json.loads(row["payload"]); payload["stamp"] = "extra"
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(payload), row["id"]))
++        assert api().edit_text(conn, tid, request())["event_uid"] == result["event_uid"]
+diff --git a/tests/hermes_cli/test_kanban_text_edit_cli.py b/tests/hermes_cli/test_kanban_text_edit_cli.py
+new file mode 100644
+index 00000000000..233b4bbf647
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_text_edit_cli.py
+@@ -0,0 +1,60 @@
++"""Actual parser/dispatch coverage for trusted owner-local text CAS."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_edit_operator_fields as fixtures
++from tests.hermes_cli.test_kanban_text_edit import request
++
++kanban_home = fixtures.kanban_home
++
++
++def test_cli_apply_replay_without_init(kanban_home, tmp_path, monkeypatch, capsys):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Text fixture", body="old")
++    path = tmp_path / "request.json"
++    path.write_text(json.dumps(request()))
++    monkeypatch.setattr(kb, "init_db", lambda: pytest.fail("must not initialize board"))
++    assert fixtures._main(["edit-text", tid, "--request-file", str(path)]) == 0
++    result = json.loads(capsys.readouterr().out)
++    assert result["disposition"] == "applied" and result["event_uid"]
++    with kbc.connect_closing() as conn:
++        snapshot = list(conn.iterdump())
++    assert fixtures._main(["edit-text", tid, "--request-file", str(path)]) == 0
++    assert json.loads(capsys.readouterr().out)["disposition"] == "replayed"
++    with kbc.connect_closing() as conn:
++        assert list(conn.iterdump()) == snapshot
++
++
++@pytest.mark.parametrize("raw", ['{"request_id":"a","request_id":"b"}', '{"expected":{"title":1,"title":2}}',
++                                 '{"value":NaN}', '{"value":Infinity}', 'x' * 500001, '\ud800'],
++                         ids=["duplicate-root", "duplicate-nested", "nan", "infinity", "oversize", "surrogate"])
++def test_cli_bad_file_no_write(kanban_home, tmp_path, capsys, raw):
++    path = tmp_path / "bad.json"
++    path.write_bytes(raw.encode("utf-8", errors="surrogatepass"))
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Text fixture", body="old")
++        before = list(conn.iterdump())
++    assert fixtures._main(["edit-text", tid, "--request-file", str(path)]) == 2
++    assert json.loads(capsys.readouterr().out)["disposition"] == "invalid_request"
++    with kbc.connect_closing() as conn:
++        assert list(conn.iterdump()) == before
++
++
++def test_cli_worker_denied(kanban_home, monkeypatch):
++    monkeypatch.setenv("HERMES_KANBAN_WORKER_TASK", "fixture-worker")
++    assert fixtures._main(["edit-text", "fixture", "--request-file", "/nonexistent"]) != 0
++
++
++def test_cli_stale_preserves_snapshot(kanban_home, tmp_path, capsys):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="Text fixture", body="concurrent")
++        before = list(conn.iterdump())
++    path = tmp_path / "stale.json"
++    path.write_text(json.dumps(request()))
++    assert fixtures._main(["edit-text", tid, "--request-file", str(path)]) == 1
++    assert json.loads(capsys.readouterr().out)["disposition"] == "stale_preimage"
++    with kbc.connect_closing() as conn:
++        assert list(conn.iterdump()) == before
+diff --git a/tests/hermes_cli/test_kanban_text_edit_contract.py b/tests/hermes_cli/test_kanban_text_edit_contract.py
+new file mode 100644
+index 00000000000..9b0c51a6569
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_text_edit_contract.py
+@@ -0,0 +1,187 @@
++"""Text CAS schema, concurrency, custody and consumer contracts."""
++import concurrent.futures
++import threading
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_sync as sync
++from tests.hermes_cli.test_kanban_text_edit import api, request, kanban_home as _kanban_home
++
++kanban_home = _kanban_home
++
++
++def new(conn):
++    return kb.create_task(conn, title="Text fixture", body="old")
++
++
++@pytest.mark.parametrize("current", [False, True])
++def test_open_run_custody(kanban_home, current):
++    with kbc.connect_closing() as conn:
++        tid = new(conn)
++        with kb.write_txn(conn):
++            rid = conn.execute("INSERT INTO task_runs(task_id,status,started_at) VALUES (?,'running',1)",
++                               (tid,)).lastrowid
++            if current:
++                conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (rid, tid))
++        before = list(conn.iterdump())
++        assert api().edit_text(conn, tid, request())["disposition"] == "active_custody"
++        assert list(conn.iterdump()) == before
++
++
++def test_empty_sync_identity_refused(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = new(conn)
++        sync.apply_sync_schema_steps(conn)
++        before = list(conn.iterdump())
++        assert api().edit_text(conn, tid, request())["disposition"] == "foreign_owner"
++        assert list(conn.iterdump()) == before
++
++
++def test_downstream_diagnostics_and_decomposition_preserved(kanban_home):
++    from hermes_cli.kanban_diagnostics import _active_hallucination_events, _block_loop_ask
++    with kbc.connect_closing() as conn:
++        tid = new(conn)
++        parent = kb.create_task(conn, title="Parent")
++        with kb.write_txn(conn):
++            conn.execute("INSERT INTO task_links(parent_id,child_id) VALUES (?,?)", (parent, tid))
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++            kb._append_event(conn, tid, "block_loop_detected", {"reason": "keep held"})
++            kb._append_event(conn, tid, "completion_blocked_hallucination", {"ids": ["missing"]})
++        links = list(conn.execute("SELECT * FROM task_links"))
++        refusal = kb.decomposition_refusal(conn, tid)
++        assert refusal and kb.awaiting_human_after_block_loop(conn, tid)
++        assert api().edit_text(conn, tid, request())["ok"]
++        events = kb.list_events(conn, tid)
++        assert _block_loop_ask(events) == "keep held"
++        assert len(_active_hallucination_events(events, "completion_blocked_hallucination")) == 1
++        assert kb.awaiting_human_after_block_loop(conn, tid)
++        assert kb.decomposition_refusal(conn, tid) == refusal
++        assert list(conn.execute("SELECT * FROM task_links")) == links
++
++
++def test_concurrent_connections_exactly_one_apply(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = new(conn)
++    barrier = threading.Barrier(2)
++    def apply(index):
++        with kbc.connect_closing() as conn:
++            req = request(replacement=str(index)); req["request_id"] = f"request-{index}"
++            barrier.wait(timeout=10)
++            return api().edit_text(conn, tid, req)
++    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
++        results = list(executor.map(apply, [1, 2]))
++    assert sorted(r["disposition"] for r in results) == ["applied", "stale_preimage"]
++
++
++def test_unknown_after_commit_replays_same_identity(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid = new(conn)
++        def lost(*args, **kwargs):
++            raise OSError("lost response after commit")
++        monkeypatch.setattr(kb, "notify_task_updated", lost)
++        assert api().edit_text(conn, tid, request())["disposition"] == "unknown"
++        before = list(conn.iterdump())
++        result = api().edit_text(conn, tid, request())
++        assert result["disposition"] == "replayed" and result["event_uid"]
++        assert list(conn.iterdump()) == before
++
++
++@pytest.mark.parametrize("option,value", [("priority", 0), ("result", False), ("audit_comment", False),
++                                            ("priority_bump", 0), ("require_lower_reason", 0)])
++def test_internal_mixed_options_refused(kanban_home, option, value):
++    with kbc.connect_closing() as conn:
++        tid = new(conn); before = list(conn.iterdump())
++        with pytest.raises(ValueError, match="cannot mix"):
++            kb.edit_task(conn, tid, title="Text fixture", body="new", expected_body="old",
++                         home_open_only=True, text_cas=api().TextCAS(request()), **{option: value})
++        assert list(conn.iterdump()) == before
++
++
++def test_unsynced_original_history_not_stamped(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = new(conn)
++        before = [tuple(row) for row in conn.execute("SELECT * FROM task_events")]
++        assert "uid" not in {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
++        assert api().edit_text(conn, tid, request())["ok"]
++        after = list(conn.execute("SELECT * FROM task_events ORDER BY id"))
++        assert [tuple(row)[:-1] for row in after[:-1]] == before
++        assert all(row["uid"] is None for row in after[:-1])
++
++
++def synced(conn, home, tid, mode="primary", owner="owner"):
++    from tests.hermes_cli.kanban_sync_support import write_sync_config
++    write_sync_config(home, True)
++    sync.install_or_remove(conn, conn.execute("PRAGMA database_list").fetchone()[2])
++    sync.set_identity(conn, "test-board", "owner")
++    sync.set_mode(conn, mode)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET created_on=? WHERE id=?", (owner, tid))
++
++
++@pytest.mark.parametrize("mode,owner", [("primary", "foreign"), ("primary", None), ("primary", ""),
++                                       ("shadow", "owner"), ("off", "owner")])
++def test_strict_owner_refusal(kanban_home, mode, owner):
++    with kbc.connect_closing() as conn:
++        tid = new(conn); synced(conn, kanban_home, tid, mode, owner)
++        before = list(conn.iterdump())
++        assert api().edit_text(conn, tid, request())["disposition"] == "foreign_owner"
++        assert list(conn.iterdump()) == before
++
++
++def test_synced_atomic_outbox(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = new(conn); synced(conn, kanban_home, tid)
++        before = conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0]
++        result = api().edit_text(conn, tid, request())
++        assert result["disposition"] == "applied", result
++        assert conn.execute("SELECT COUNT(*) FROM kanban_sync_outbox").fetchone()[0] > before
++        receipt = conn.execute("SELECT uid FROM task_events WHERE kind='text_cas_edited'").fetchone()
++        assert receipt[0] == result["event_uid"]
++
++
++@pytest.mark.parametrize("expiry", [None, 9999999999])
++def test_own_gateway_lease_refused(kanban_home, expiry):
++    with kbc.connect_closing() as conn:
++        tid = new(conn); synced(conn, kanban_home, tid)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET lease_holder='owner',lease_expires=? WHERE id=?", (expiry, tid))
++        before = list(conn.iterdump())
++        assert api().edit_text(conn, tid, request())["disposition"] == "active_custody"
++        assert list(conn.iterdump()) == before
++
++
++@pytest.mark.parametrize("corruption,expected", [("foreign", "request_id_conflict"),
++                                                 ("json", "malformed_receipt"), ("uid", "malformed_receipt")])
++def test_bad_receipts_fail_closed(kanban_home, corruption, expected):
++    with kbc.connect_closing() as conn:
++        tid = new(conn); synced(conn, kanban_home, tid)
++        assert api().edit_text(conn, tid, request())["ok"]
++        with kb.write_txn(conn):
++            if corruption == "foreign":
++                conn.execute("UPDATE task_events SET origin_gateway='peer' WHERE kind='text_cas_edited'")
++            elif corruption == "json":
++                conn.execute("UPDATE task_events SET payload='invalid' WHERE kind='text_cas_edited'")
++            else:
++                conn.execute("UPDATE task_events SET uid=NULL WHERE kind='text_cas_edited'")
++        before = list(conn.iterdump())
++        assert api().edit_text(conn, tid, request())["disposition"] == expected
++        assert list(conn.iterdump()) == before
++
++
++def test_no_progress_marker_unchanged(kanban_home):
++    from hermes_cli.kanban_no_progress import progress_marker
++    with kbc.connect_closing() as conn:
++        tid = new(conn)
++        before = progress_marker(conn, tid)
++        assert api().edit_text(conn, tid, request())["ok"]
++        assert progress_marker(conn, tid) == before
++        kb.edit_task(conn, tid, body="ordinary edit")
++        assert progress_marker(conn, tid) > before
++
++
++def test_replacement_model_policy_remains(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = new(conn); before = list(conn.iterdump())
++        result = api().edit_text(conn, tid, request(replacement="require_model: true"))
++        assert result["disposition"] == "invalid_request"
++        assert list(conn.iterdump()) == before
+diff --git a/website/docs/developer-guide/owner-text-cas.md b/website/docs/developer-guide/owner-text-cas.md
+new file mode 100644
+index 00000000000..6d4b80305fc
+--- /dev/null
++++ b/website/docs/developer-guide/owner-text-cas.md
+@@ -0,0 +1,54 @@
++# Owner-local text compare-and-swap
++
++`hermes kanban --board default edit-text TASK_ID --request-file request.json`
++provides an audited text-only edit for a trusted operator at the owning home.
++It is not an authentication mechanism, worker escape hatch, release command,
++or a remote courier operation. Worker and delegated-child invocations refuse.
++The Python entry is `hermes_cli.kanban_text_edit.edit_text(conn, task_id, request)`.
++No dashboard, REST, tool, or distributed delivery interface is added.
++
++```json
++{
++  "request_id": "operator-request-1",
++  "reason": "Replace a superseded future routing instruction",
++  "expected": {"title": "Existing title", "body": "Exact existing body"},
++  "replacement": {"title": "Existing title", "body": "Exact new body"}
++}
++```
++
++Both title/body pairs are mandatory. No trimming or Unicode normalization occurs;
++null body differs from empty body. Unknown keys, duplicate keys, nonfinite JSON,
++invalid UTF-8, no-op requests, and invalid model-neutral replacement text refuse.
++Limits in UTF-8 bytes: file 500000, title 4000, each body 100000, reason 2000.
++Title/reason must be nonblank. Request IDs are 1–128 ASCII letters, digits,
++underscores or hyphens. Expected text is evidence, not new policy input.
++
++The existing edit transaction checks existence, strict primary-home identity,
++inactive custody, prior request receipts, then both exact preimages. Allowed
++states are todo, ready, blocked, scheduled and triage. Running/review/terminal
++cards, any current/open run, claim fields, worker PID, or unexpired/unknown-expiry
++lease (including an own-home lease) refuse. This does not clear stale custody.
++Status, holds, dependencies, run history, admission and leases remain unchanged.
++
++A successful edit emits only `text_cas_edited`, not the ordinary `edited` event:
++a text correction must not reset no-progress or diagnostic/decomposition gates.
++The payload contains before/after, request ID, reason and explicitly non-author
++process context. Original history is not restamped. On an unsynced board only the
++new receipt receives a stable UID, adding the existing nullable UID column in
++the same transaction when needed. Audit failure rolls back text and schema.
++Normal legacy edits retain their existing behavior.
++
++The result contains `ok`, `disposition`, request identity and, for applied/replayed
++requests, an event UID. Identical local receipt plus current replacement returns
++`replayed` without writing or notifying. Changed request content returns
++`request_id_conflict`; changed current text returns `replay_state_drift`.
++Foreign-origin or malformed receipts cannot authorize replay. Missing receipt
++plus stale text refuses; it never reconstructs history. Pre-receipt refusals
++report `receipt_checked: false`. A storage/postcommit response failure returns
++`unknown`: retain the exact request and read target/history before deciding
++anything. Never mint a replacement identity or automatically resubmit an unknown
++outcome. A committed local receipt does not prove sync convergence.
++
++CLI exit codes: 0 applied/replayed, 2 invalid input or worker refusal, otherwise 1.
++Publication and independent exact-head review of this interface do not authorize
++application to production cards; that remains a separate scoped operator action.
+-- 
+2.43.0
+

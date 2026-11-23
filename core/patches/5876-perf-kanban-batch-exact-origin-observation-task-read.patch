@@ -1,0 +1,226 @@
+From 1dc9dc6a0a9e5f8a5e011844a9941736bc4d8d5c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 06:19:57 +0000
+Subject: [PATCH] perf(kanban): batch exact origin observation task reads
+ [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_origin_batch.py            | 30 ++++++++
+ hermes_cli/kanban_origin_ledger.py           | 38 +++++----
+ tests/hermes_cli/test_kanban_origin_batch.py | 81 ++++++++++++++++++++
+ 3 files changed, 132 insertions(+), 17 deletions(-)
+ create mode 100644 hermes_cli/kanban_origin_batch.py
+ create mode 100644 tests/hermes_cli/test_kanban_origin_batch.py
+
+diff --git a/hermes_cli/kanban_origin_batch.py b/hermes_cli/kanban_origin_batch.py
+new file mode 100644
+index 00000000000..387ebb21823
+--- /dev/null
++++ b/hermes_cli/kanban_origin_batch.py
+@@ -0,0 +1,30 @@
++"""Invocation-local exact owner task reads for origin-ledger projection.
++
++No cross-call memo and no write-stamp lifetime: each phase reads its own current
++snapshot, including a fresh read after the ledger write lock is acquired.
++"""
++from __future__ import annotations
++
++import json
++import os
++
++
++def task_rows(source, bindings):
++    """None selects the legacy keyed-query path; errors never become absence."""
++    enabled = os.environ.get('HERMES_ORIGIN_BATCH_READS', '1').lower() not in ('0', 'false', 'off', 'no')  # health: allow HX002 -- reversible emergency read batching
++    if not enabled:
++        return None
++    wanted = sorted({(b['owner']['gateway'], b['task_record_key']) for b in bindings})
++    if not wanted or source is None:
++        return {}
++    return {(gw, key): (version, data) for gw, key, version, data in source.execute(
++        "SELECT r.gw,r.key,r.version,r.data FROM json_each(?) AS wanted JOIN replica AS r "
++        "ON r.gw=json_extract(wanted.value,'$[0]') AND r.coll='tasks' "
++        "AND r.key=json_extract(wanted.value,'$[1]')", (json.dumps(wanted),)).fetchall()}
++
++
++def lookup(source, binding, rows):
++    key = binding['owner']['gateway'], binding['task_record_key']
++    if rows is not None:
++        return rows.get(key)
++    return source.execute("SELECT version,data FROM replica WHERE gw=? AND coll='tasks' AND key=?", key).fetchone()
+diff --git a/hermes_cli/kanban_origin_ledger.py b/hermes_cli/kanban_origin_ledger.py
+index 067981b833c..8e339d21d2d 100644
+--- a/hermes_cli/kanban_origin_ledger.py
++++ b/hermes_cli/kanban_origin_ledger.py
+@@ -348,14 +348,13 @@ def _stuck_unreleased(task_raw: str, released: int) -> bool:
+         return False
+ 
+ 
+-def _advanced_observation(binding_raw: str, observed: int, source: sqlite3.Connection) -> tuple | None:
++def _advanced_observation(binding_raw: str, observed: int, source: sqlite3.Connection, rows=None) -> tuple | None:
+     """``(task, version, released)`` when the replica holds a newer, exactly bound record for this obligation."""
+     from hermes_cli.kanban_origin_structure import binding as read_binding
++    from hermes_cli.kanban_origin_batch import lookup
+ 
+     binding = read_binding(binding_raw)
+-    row = source.execute(
+-        "SELECT version,data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
+-        (binding['owner']['gateway'], binding['task_record_key'])).fetchone()
++    row = lookup(source, binding, rows)
+     if not row or type(row[0]) is not int or row[0] <= observed:
+         return None
+     task = json.loads(row[1])
+@@ -388,26 +387,30 @@ def refresh_observations(path: Path, replica: Path, *, timeout: float = 5) -> No
+         return
+     from hermes_cli.kanban_origin import _ro
+ 
++    from hermes_cli.kanban_origin_batch import task_rows
++    from hermes_cli.kanban_origin_structure import binding as read_binding
+     source = _ro(replica)
+     try:
+         try:
+             with closing(_ro(path)) as ledger:
+-                pending = any(
+-                    _stuck_unreleased(task_raw, released)
+-                    or _advanced_observation(raw, observed, source) is not None
+-                    for raw, observed, task_raw, released in ledger.execute(
+-                        "SELECT binding_json,observation_version,task_json,released FROM origin_obligations"
+-                    ).fetchall())
++                obligations = ledger.execute(
++                    "SELECT binding_json,observation_version,task_json,released FROM origin_obligations").fetchall()
++                rows = task_rows(source, (read_binding(row[0]) for row in obligations))
++                pending = any(_stuck_unreleased(task_raw, released)
++                              or _advanced_observation(raw, observed, source, rows) is not None
++                              for raw, observed, task_raw, released in obligations)
+         except sqlite3.OperationalError:
+             pending = True  # no table yet (or unreadable read-only): the locked path below decides
+         if not pending:
+             return
+         with _db(path, timeout=timeout) as conn, conn:
+             conn.execute("BEGIN IMMEDIATE")
+-            for key, raw, observed, task_raw, stored_released in conn.execute(
+-                    "SELECT binding_id,binding_json,observation_version,task_json,released"
+-                    " FROM origin_obligations").fetchall():
+-                advanced = _advanced_observation(raw, observed, source)
++            obligations = conn.execute(
++                "SELECT binding_id,binding_json,observation_version,task_json,released"
++                " FROM origin_obligations").fetchall()
++            rows = task_rows(source, (read_binding(row[1]) for row in obligations))
++            for key, raw, observed, task_raw, stored_released in obligations:
++                advanced = _advanced_observation(raw, observed, source, rows)
+                 if advanced is None:
+                     if _stuck_unreleased(task_raw, stored_released):
+                         conn.execute("UPDATE origin_obligations SET released=1 WHERE binding_id=?", (key,))
+@@ -619,6 +622,9 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+             elsewhere = _Publications(source, listed, wanted={
+                 (b['owner']['board'], b['owner']['task_id']) for _, b, *_ in obligations
+                 if (b['origin']['gateway'], b['origin']['profile']) == (gateway, profile)})
++            from hermes_cli.kanban_origin_batch import task_rows, lookup
++            task_snapshot = task_rows(source, (b for _, b, *_ in obligations
++                                               if (b['origin']['gateway'], b['origin']['profile']) == (gateway, profile))) if fresh else {}
+             for raw, binding, resolved, payload, version, released in obligations:
+                 origin, owner = binding['origin'], binding['owner']
+                 if (origin['gateway'], origin['profile']) != (gateway, profile):
+@@ -630,9 +636,7 @@ def project(path: Path, *, replica: Path | None, gateway: str, profile: str,
+                 current = settled = False
+                 absent = scope_live = False
+                 if fresh and source is not None:
+-                    row = source.execute(
+-                        "SELECT version,data FROM replica WHERE gw=? AND coll='tasks' AND key=?",
+-                        (owner['gateway'], binding['task_record_key'])).fetchone()
++                    row = lookup(source, binding, task_snapshot)
+                     current = bool(row and row[0] == version and json.loads(row[1]) == task)
+                     # [daveey] A verified completion that is still the owner's latest published record is settled:
+                     # the owner going quiet afterwards does not reopen it, only a newer record does. Without this
+diff --git a/tests/hermes_cli/test_kanban_origin_batch.py b/tests/hermes_cli/test_kanban_origin_batch.py
+new file mode 100644
+index 00000000000..bee1fe10f62
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_batch.py
+@@ -0,0 +1,81 @@
++"""Batching changes SQL crossings, never exact custody or freshness decisions."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_origin_batch as batch, kanban_origin_ledger as ledger
++from tests.hermes_cli import test_kanban_origin_ledger as support
++
++world = support.world
++
++
++def test_exact_keys_dedup_absence_failure_and_rollback(monkeypatch):
++    conn = sqlite3.connect(':memory:')
++    conn.execute('CREATE TABLE replica(gw,coll,key,version,data,PRIMARY KEY(gw,coll,key))')
++    conn.executemany('INSERT INTO replica VALUES(?,?,?,?,?)', [
++        ('owner', 'tasks', 'default/default/t_one', 2, '{}'),
++        ('other', 'tasks', 'default/default/t_one', 8, 'wrong'),
++        ('owner', 'tasks', 'other/default/t_one', 9, 'wrong')])
++    bindings = [{'owner': {'gateway': 'owner'}, 'task_record_key': 'default/default/t_one'},
++                {'owner': {'gateway': 'missing'}, 'task_record_key': 'default/default/t_one'}]
++    sql = []
++    conn.set_trace_callback(sql.append)
++    rows = batch.task_rows(conn, bindings * 100)
++    assert rows == {('owner', 'default/default/t_one'): (2, '{}')}
++    assert len(sql) == 1
++    assert batch.lookup(conn, bindings[1], rows) is None
++    assert len(sql) == 1
++    monkeypatch.setenv('HERMES_ORIGIN_BATCH_READS', '0')
++    assert batch.task_rows(conn, bindings) is None
++    assert batch.lookup(conn, bindings[0], None) == (2, '{}')
++    monkeypatch.delenv('HERMES_ORIGIN_BATCH_READS')
++    conn.execute('DROP TABLE replica')
++    with pytest.raises(sqlite3.OperationalError):
++        batch.task_rows(conn, bindings)
++    conn.close()
++
++
++@pytest.mark.parametrize('enabled', ['0', '1'])
++def test_refresh_and_projection_remain_strict_after_committed_changes(world, monkeypatch, enabled):
++    monkeypatch.setenv('HERMES_ORIGIN_BATCH_READS', enabled)
++    path, replica, binding = world
++    support.publish(replica, binding)
++    support.accept(world)
++    for status, version in [('done', 4), ('running', 5)]:
++        support.publish(replica, binding, status=status)
++        with sqlite3.connect(replica) as db:
++            db.execute('UPDATE replica SET version=?', (version,))
++        ledger.refresh_observations(path, replica)
++        row = ledger.obligations(path, gateway='origin', profile='default', sessions=['s_current'])[0]
++        assert row['observation_version'] == version
++        assert row['unfinished']  # unverified terminal evidence is never upgraded
++        projected = ledger.project(path, replica=replica, gateway='origin', profile='default')
++        assert projected[0]['reported_status'] == status
++        assert projected[0]['observation_version'] == version
++        assert projected[0]['status'] == 'unknown'  # fixture owner has no current scope heartbeat
++
++
++def test_locked_refresh_takes_new_batch_after_preflight(world, monkeypatch):
++    path, replica, binding = world
++    support.publish(replica, binding)
++    support.accept(world)
++    support.publish(replica, binding, status='done')
++    with sqlite3.connect(replica) as db:
++        db.execute('UPDATE replica SET version=4')
++    original = batch.task_rows
++    phases = []
++    def rows(source, bindings):
++        result = original(source, bindings)
++        phases.append(result)
++        if len(phases) == 1:
++            support.publish(replica, binding, status='running')
++            with sqlite3.connect(replica) as db:
++                db.execute('UPDATE replica SET version=5')
++        return result
++    monkeypatch.setattr(batch, 'task_rows', rows)
++    ledger.refresh_observations(path, replica)
++    assert len(phases) == 2
++    assert next(iter(phases[0].values()))[0] == 4
++    assert next(iter(phases[1].values()))[0] == 5
++    row = ledger.obligations(path, gateway='origin', profile='default', sessions=['s_current'])[0]
++    assert row['observation_version'] == 5 and row['unfinished']
+-- 
+2.43.0
+

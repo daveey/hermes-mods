@@ -1,0 +1,964 @@
+From ac4b772604aaba28b2c4920b652512c9da77b2b9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 01:42:24 +0000
+Subject: [PATCH] [daveey] perf(kanban readers): hand Python one row per probe
+ and only the rows that can win
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_external_watch.py           |  27 +-
+ hermes_cli/kanban_primary_execution.py        |   5 +-
+ hermes_cli/kanban_replica_execution.py        |   5 +-
+ hermes_cli/kanban_run_machine.py              |   3 +-
+ hermes_cli/kanban_run_model.py                |  23 +-
+ hermes_cli/kanban_session_activity.py         |  16 +-
+ .../kanban_session_activity_card_details.py   |  82 +++-
+ hermes_cli/kanban_session_outcome_tasks.py    |   3 +-
+ hermes_cli/kanban_session_wait_rows.py        |   3 +-
+ hermes_cli/kanban_table_columns.py            |  39 ++
+ hermes_cli/kanban_watch.py                    |   3 +-
+ .../hermes_cli/test_kanban_reader_hot_rows.py | 459 ++++++++++++++++++
+ 12 files changed, 623 insertions(+), 45 deletions(-)
+ create mode 100644 hermes_cli/kanban_table_columns.py
+ create mode 100644 tests/hermes_cli/test_kanban_reader_hot_rows.py
+
+diff --git a/hermes_cli/kanban_external_watch.py b/hermes_cli/kanban_external_watch.py
+index 2d8e76bb7f8..123270617e8 100644
+--- a/hermes_cli/kanban_external_watch.py
++++ b/hermes_cli/kanban_external_watch.py
+@@ -73,6 +73,28 @@ _HOSTS_LOCK = threading.Lock()
+ _HOSTS: dict[str, tuple[int, dict[str, float]]] = {}  # board file -> (last event id read, host -> newest record)
+ 
+ 
++# The board's newest event id and, as ONE JSON array, every watch payload after the cursor (from 0 when the newest
++# id is below the cursor): one statement and one result row. Read row by row, a cold read was ~10k rows on the hub
++# and each row step can wait out a GIL switch interval in the Desktop backend.
++_WATCH_PAYLOADS_SQL = (
++    "SELECT m.top, json_group_array(e.payload) FILTER (WHERE e.id IS NOT NULL) "
++    "FROM (SELECT COALESCE(MAX(id), 0) AS top FROM task_events) m LEFT JOIN task_events e "
++    "ON e.kind = ? AND e.id > (CASE WHEN m.top < ? THEN 0 ELSE ? END)")
++
++
++def _watch_payloads(conn: sqlite3.Connection, cursor: int) -> tuple[int, list]:
++    """``(newest event id, watch payloads with a larger id than the cursor)``; the cursor counts as 0 when the
++    newest id is below it."""
++    try:
++        top, packed = conn.execute(_WATCH_PAYLOADS_SQL, (WATCH_EVENT, cursor, cursor)).fetchone()
++        return int(top), json.loads(packed)
++    except sqlite3.Error:  # e.g. a payload JSON cannot carry (a BLOB): read row by row, as before
++        top = conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0] or 0
++        return top, [payload for _eid, payload in conn.execute(
++            "SELECT id, payload FROM task_events WHERE kind = ? AND id > ?",
++            (WATCH_EVENT, 0 if top < cursor else cursor))]
++
++
+ def hosts_seen(conn: sqlite3.Connection) -> dict[str, float]:
+     """``{host: when it last wrote a watch record}`` on this board: the hosts that advertise
+     ``external-watch-v1``. Read incrementally (only events newer than the last read, through the
+@@ -82,12 +104,11 @@ def hosts_seen(conn: sqlite3.Connection) -> dict[str, float]:
+         key = str(row[2] or id(conn)) if row else str(id(conn))
+         with _HOSTS_LOCK:
+             cursor, hosts = _HOSTS.get(key, (0, {}))
+-        top = conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0] or 0
++        top, payloads = _watch_payloads(conn, cursor)
+         if top < cursor:  # another database behind the same key (a test's fresh file): start over
+             cursor, hosts = 0, {}
+         hosts = dict(hosts)
+-        for _eid, payload in conn.execute("SELECT id, payload FROM task_events WHERE kind = ? AND id > ?",
+-                                         (WATCH_EVENT, cursor)):
++        for payload in payloads:
+             rec = _json(payload)
+             if rec.get("host"):
+                 at = float(rec.get("observed_at") or 0)
+diff --git a/hermes_cli/kanban_primary_execution.py b/hermes_cli/kanban_primary_execution.py
+index d8a3f2e13f2..8be2d5305d9 100644
+--- a/hermes_cli/kanban_primary_execution.py
++++ b/hermes_cli/kanban_primary_execution.py
+@@ -1,5 +1,6 @@
+ """Executor-owned running evidence on a PRIMARY mirror; never local read authority."""
+ from hermes_cli.kanban_replica_execution import LIVENESS_KINDS, raw, run_evidence
++from hermes_cli.kanban_table_columns import tables_columns
+ 
+ 
+ class PrimaryMirror(ValueError):
+@@ -18,9 +19,7 @@ def attach(conn, rows, *, gateway, profile, board):
+ 
+ def materialize(conn, rows):
+     """Fetch current-run tuples; the returned list owns no cursor or connection."""
+-    tasks = {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}
+-    runs = {r[1] for r in conn.execute('PRAGMA table_info(task_runs)')}
+-    events = {r[1] for r in conn.execute('PRAGMA table_info(task_events)')}
++    tasks, runs, events = tables_columns(conn, 'tasks', 'task_runs', 'task_events')  # one row, not one per column
+     if not ({'id', 'status', 'current_run_id', 'assignee'} <= tasks
+             and {'id', 'task_id', 'uid', 'status', 'ended_at'} <= runs
+             and {'task_id', 'run_id', 'kind', 'created_at', 'uid'} <= events):
+diff --git a/hermes_cli/kanban_replica_execution.py b/hermes_cli/kanban_replica_execution.py
+index bd57054e2fc..d0116c2c1e7 100644
+--- a/hermes_cli/kanban_replica_execution.py
++++ b/hermes_cli/kanban_replica_execution.py
+@@ -14,6 +14,7 @@ import json
+ import sqlite3
+ 
+ from hermes_cli.execution_observations import epoch, ident
++from hermes_cli.kanban_table_columns import tables_columns
+ 
+ # Executor-written lifecycle events of an attempt; liveness only, never progress.
+ LIVENESS_KINDS = ("heartbeat", "claimed", "spawned")
+@@ -42,9 +43,7 @@ def read_runs(conn: sqlite3.Connection, gateway: str, profile: str) -> dict[str,
+     (``idx_task_chat_links_chat``, the ``tasks`` and ``task_runs`` primary keys, the ``task_events(run_id, id)``
+     index; ~4 ms including the schema probe for 154 links / 3 running cards on a real default-board replica).
+     Empty on a replica whose schema lacks the run columns."""
+-    tasks = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+-    runs = {r[1] for r in conn.execute("PRAGMA table_info(task_runs)")}
+-    events = {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
++    tasks, runs, events = tables_columns(conn, "tasks", "task_runs", "task_events")  # one row, not one per column
+     if not ({"current_run_id", "status", "created_on"} <= tasks
+             and {"id", "task_id", "uid", "status", "ended_at"} <= runs
+             and {"task_id", "run_id", "kind", "created_at", "uid"} <= events):
+diff --git a/hermes_cli/kanban_run_machine.py b/hermes_cli/kanban_run_machine.py
+index b37172ec5e1..d293d6d4e9c 100644
+--- a/hermes_cli/kanban_run_machine.py
++++ b/hermes_cli/kanban_run_machine.py
+@@ -56,7 +56,8 @@ def run_machine(row: dict[str, Any], now: Optional[float] = None) -> Optional[st
+ 
+ def placement_select(conn: sqlite3.Connection, alias: str = "", names: tuple[str, ...] = _PLACEMENT) -> str:
+     """SELECT terms for ``names`` of ``tasks`` (aliased ``alias``); a column an older board lacks reads NULL."""
+-    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    from hermes_cli.kanban_table_columns import table_columns
++    cols = table_columns(conn, "tasks")  # one result row, not one per column
+     pre = f"{alias}." if alias else ""
+     return ", ".join(f"{pre}{c}" if c in cols else f"NULL AS {c}" for c in names)
+ 
+diff --git a/hermes_cli/kanban_run_model.py b/hermes_cli/kanban_run_model.py
+index 69fff0f771e..8e95f6fa579 100644
+--- a/hermes_cli/kanban_run_model.py
++++ b/hermes_cli/kanban_run_model.py
+@@ -37,32 +37,33 @@ def _concrete(payload: dict[str, Any]) -> Optional[str]:
+ 
+ 
+ def add_run_models(conn: sqlite3.Connection, found: dict[str, dict[str, Any]]) -> None:
+-    """Stamp ``run_model`` on each listed card from its newest run's terminal/attestation/route events."""
++    """Stamp ``run_model`` on each listed card from its newest run's terminal/attestation/route events.
++
++    One statement: SQLite joins each card's newest run (``MAX(task_runs.id)``) to that run's events through
++    ``idx_events_run``. Reading every run's events of these kinds and dropping the older runs' in Python cost a
++    result row each (2,228 rows for the hub's 157 listed cards), and in the Desktop backend every row step can wait
++    out a GIL switch interval."""
+     if not found:
+         return
+     ids = list(found)
+     ph = ",".join("?" for _ in ids)
+     try:
+-        newest = dict(conn.execute(
+-            f"SELECT task_id, MAX(id) FROM task_runs WHERE task_id IN ({ph}) GROUP BY task_id", ids).fetchall())
+-        if not newest:
+-            return
+         got = conn.execute(
+-            f"SELECT task_id, run_id, kind, payload FROM task_events WHERE task_id IN ({ph}) "
+-            f"AND kind IN ({','.join('?' for _ in _KINDS)}) ORDER BY id", [*ids, *_KINDS]).fetchall()
++            f"SELECT e.task_id, e.kind, e.payload FROM (SELECT task_id, MAX(id) AS run_id FROM task_runs "
++            f"WHERE task_id IN ({ph}) GROUP BY task_id) n JOIN task_events e "
++            f"ON e.run_id = n.run_id AND e.task_id = n.task_id "
++            f"WHERE e.kind IN ({','.join('?' for _ in _KINDS)}) ORDER BY e.id", [*ids, *_KINDS]).fetchall()
+     except sqlite3.Error:
+         return
+     concrete: dict[str, str] = {}
+     routed: dict[str, Optional[str]] = {}
+-    for task_id, run_id, kind, raw in got:
+-        if run_id is None or run_id != newest.get(task_id):
+-            continue
++    for task_id, kind, raw in got:  # the newest run's events only, oldest first
+         payload = _payload(raw)
+         if kind == "run_route":
+             routed[task_id] = str(payload.get("model") or "").strip() or None  # an unknown route counts too
+         elif model := _concrete(payload):
+             concrete[task_id] = model
+-    for task_id in newest:
++    for task_id in {**routed, **concrete}:
+         model = concrete.get(task_id) or routed.get(task_id)
+         if task_id in found and model:
+             found[task_id]["run_model"] = model
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 895e2e4b6ba..4c4403394c2 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -53,6 +53,7 @@ from hermes_cli import kanban_links_diagnostics as diag
+ from hermes_cli.kanban_links_tickets import StartTickets as _StartTickets
+ from hermes_cli import kanban_links_narrow as _links_narrow, kanban_external_activity as _external_activity
+ from hermes_cli.kanban_session_wait_rows import _describe_waits, _local_wait_info, _local_wait_rows
++from hermes_cli.kanban_table_columns import table_columns  # one result row per probe, not one per column
+ from hermes_cli.kanban_open_asks import card_is_open_human_ask
+ from hermes_cli.kanban_activity_projection import WAITING_ON_CAP
+ import contextlib
+@@ -151,7 +152,7 @@ def _status_filter(conn: sqlite3.Connection, statuses: tuple[str, ...]) -> tuple
+     including malformed JSON and Python's non-ASCII whitespace handling.
+     """
+     ph = ",".join("?" for _ in statuses)
+-    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    cols = table_columns(conn, "tasks")
+     conn.create_function("kanban_open_ask", 3, card_is_open_human_ask, deterministic=True)
+     evidence = "t.human_request" if "human_request" in cols else "NULL"
+     kind = "t.block_kind" if "block_kind" in cols else "NULL"
+@@ -180,7 +181,7 @@ def _counted_sub_clause(conn: sqlite3.Connection) -> str:
+     """SQL predicate (aliases ``s`` subs, ``t`` tasks) for a ``tui`` sub that counts as the chat's work."""
+     owner = "s.chat_id = COALESCE(t.session_id, '')"
+     try:
+-        cols = {r[1] for r in conn.execute("PRAGMA table_info(kanban_notify_subs)")}
++        cols = table_columns(conn, "kanban_notify_subs")  # one result row, not one per column
+     except sqlite3.Error:
+         cols = set()
+     if "delivery_metadata" not in cols:
+@@ -209,7 +210,7 @@ def _read_counts(path: Path, statuses: tuple[str, ...] = ACTIVE_STATUSES) -> dic
+ 
+ 
+ def _counts_on(conn: sqlite3.Connection, statuses: tuple[str, ...] = ACTIVE_STATUSES, *, tasks=None) -> dict[str, int]:
+-    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    cols = table_columns(conn, "tasks")
+     if "session_id" not in cols:
+         return {}  # explicitly supported pre-session schema, not a failed read
+     match, params = _status_filter(conn, statuses)
+@@ -256,7 +257,7 @@ def _read_parked(path: Path) -> tuple[dict[str, int], dict[str, int]]:
+ 
+ 
+ def _parked_on(conn: sqlite3.Connection) -> tuple[dict[str, int], dict[str, int]]:
+-    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    cols = table_columns(conn, "tasks")
+     if "session_id" not in cols:
+         return {}, {}
+     match, params = _status_filter(conn, ACTIVE_STATUSES)
+@@ -325,7 +326,7 @@ def _parked_on(conn: sqlite3.Connection) -> tuple[dict[str, int], dict[str, int]
+ 
+ def _parked_pairs(conn: sqlite3.Connection) -> set[tuple[str, str]]:
+     """(session, task) for every parked card (scheduled/blocked/triage) a session created or shepherds."""
+-    if "session_id" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++    if "session_id" not in table_columns(conn, "tasks"):
+         return set()
+     parked = f"(t.status IN ('scheduled', 'blocked', 'triage') AND {_not_watch(conn)})"  # watch: kanban_watch
+     pairs: set[tuple[str, str]] = {
+@@ -625,7 +626,7 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+         if not me:
+             return []
+         # Old replicas can still be displayed, but cannot prove an exact revision.
+-        columns = {r[1] for r in conn.execute('PRAGMA table_info(replica)')}
++        columns = table_columns(conn, 'replica')
+         version_column = 'version' if 'version' in columns else 'NULL'
+         info_rows = conn.execute("SELECT gw, data FROM replica WHERE coll = 'gateway' AND key = 'info'").fetchall()
+         last_ok, offline = _meta_float(conn, "last_ok"), _meta_float(conn, "offline_since")
+@@ -1609,8 +1610,7 @@ def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -
+     of, in ``statuses`` — the same pairs ``_read_counts`` counts."""
+     with cached_ro(path) as conn, _execution_transaction(conn) as read_at:
+         conn.row_factory = sqlite3.Row
+-        cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+-        if "session_id" not in cols:
++        if "session_id" not in table_columns(conn, "tasks"):
+             return []  # explicitly supported pre-session schema
+         from hermes_cli.kanban_session_outcome_tasks import select_listed_local_tasks
+         found = select_listed_local_tasks(conn, ids, statuses)
+diff --git a/hermes_cli/kanban_session_activity_card_details.py b/hermes_cli/kanban_session_activity_card_details.py
+index 71dc3f7020b..be3863536a8 100644
+--- a/hermes_cli/kanban_session_activity_card_details.py
++++ b/hermes_cli/kanban_session_activity_card_details.py
+@@ -23,13 +23,58 @@ def _first_line(text: Any) -> str:
+     return line[:_NOTE_CHARS]
+ 
+ 
++# Run summaries and comments that can still decide ``note``/``pr_url``, in ``_add_card_details``' offer order (runs,
++# then comments; each in its ``(task_id, started_at|created_at, rowid)`` index order). Per card, ``m`` is the newest
++# time of a text that surely has a visible first line (TEXT with an ASCII letter or digit): every older row loses the
++# note to it. Rows at or after ``m`` and rows that may name a PR stay, so the winner and its ties are unchanged; a
++# non-numeric time (``bad``) keeps all of that card's rows (Python compares, or fails, exactly as before). Reading
++# them all cost one result row each (4,549 for the hub's listed cards, 874 comments on one), and each row step can
++# wait on the GIL in the Desktop backend; ``b`` aggregates without copying the texts.
++_KEEP = "(b.bad OR b.m IS NULL OR {at} >= b.m OR (instr({text}, 'https://github.com/') AND instr({text}, '/pull/')))"
++_NOTE_ROWS = f"""
++WITH b AS (SELECT task_id, MAX(bad) AS bad, MAX(m) AS m FROM (
++    SELECT task_id, MAX(typeof(COALESCE(ended_at, started_at, 0)) NOT IN ('integer', 'real')) AS bad,
++           MAX(CASE WHEN typeof(summary) = 'text' AND summary GLOB '*[0-9A-Za-z]*'
++                    THEN COALESCE(ended_at, started_at, 0) END) AS m
++    FROM task_runs WHERE task_id IN ({{ph}}) AND summary IS NOT NULL GROUP BY task_id
++    UNION ALL
++    SELECT task_id, MAX(typeof(COALESCE(created_at, 0)) NOT IN ('integer', 'real')),
++           MAX(CASE WHEN typeof(body) = 'text' AND body GLOB '*[0-9A-Za-z]*' THEN COALESCE(created_at, 0) END)
++    FROM task_comments WHERE task_id IN ({{ph}}) GROUP BY task_id) GROUP BY task_id)
++SELECT 0 AS src, r.task_id, COALESCE(r.ended_at, r.started_at) AS at, r.summary, r.started_at AS k, r.rowid AS rid
++FROM task_runs r JOIN b ON b.task_id = r.task_id WHERE r.task_id IN ({{ph}}) AND r.summary IS NOT NULL
++  AND {_KEEP.format(at='COALESCE(r.ended_at, r.started_at, 0)', text='r.summary')}
++UNION ALL
++SELECT 1, c.task_id, c.created_at, c.body, c.created_at, c.rowid
++FROM task_comments c JOIN b ON b.task_id = c.task_id WHERE c.task_id IN ({{ph}})
++  AND {_KEEP.format(at='COALESCE(c.created_at, 0)', text='c.body')}
++ORDER BY 1, 2, 5, 6"""
++
++
++def _note_rows(conn: sqlite3.Connection, ids: list[str], ph: str) -> list[tuple[Any, Any, Any]]:
++    """``(task_id, at, text)`` of the run summaries and comments that can decide each card's note and PR."""
++    try:
++        return [tuple(r)[1:4] for r in conn.execute(_NOTE_ROWS.format(ph=ph), [*ids, *ids, *ids, *ids]).fetchall()]
++    except sqlite3.Error:  # a board without one of the tables: read each one that exists, as before
++        out: list[tuple[Any, Any, Any]] = []
++        for sql in (f"SELECT task_id, COALESCE(ended_at, started_at) AS at, summary FROM task_runs "
++                    f"WHERE task_id IN ({ph}) AND summary IS NOT NULL",
++                    f"SELECT task_id, created_at AS at, body FROM task_comments WHERE task_id IN ({ph})"):
++            try:
++                out.extend(tuple(r) for r in conn.execute(sql, ids).fetchall())
++            except sqlite3.Error:
++                pass
++        return out
++
++
+ def _add_card_details(conn: sqlite3.Connection, found: dict[str, dict[str, Any]], *, replica: Any = LEGACY_REPLICA) -> None:
+     """Canonical details in chunks sized for the largest query's fixed bindings."""
+     from hermes_cli.kanban_run_model import _KINDS
+ 
+     if not found:
+         return
+-    size = min(500, conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) - len(_KINDS))
++    limit = conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
++    size = min(500, limit - len(_KINDS), limit // 4)  # _NOTE_ROWS binds the chunk four times
+     ids = list(found)
+     owned = replica is LEGACY_REPLICA
+     if owned:
+@@ -74,11 +119,8 @@ def _add_card_details_chunk(conn: sqlite3.Connection, found: dict[str, dict[str,
+             if at >= prs.get(task_id, (-1, ""))[0]:
+                 prs[task_id] = (at, url)
+ 
+-    for r in rows(f"SELECT task_id, COALESCE(ended_at, started_at) AS at, summary FROM task_runs "
+-                  f"WHERE task_id IN ({ph}) AND summary IS NOT NULL"):
+-        offer(r["task_id"], r["at"], r["summary"])
+-    for r in rows(f"SELECT task_id, created_at AS at, body FROM task_comments WHERE task_id IN ({ph})"):
+-        offer(r["task_id"], r["at"], r["body"])
++    for task_id, at, text in _note_rows(conn, ids, ph):
++        offer(task_id, at, text)
+     for r in rows(f"SELECT id AS task_id, completed_at AS at, result FROM tasks WHERE id IN ({ph}) AND result IS NOT NULL"):
+         for url in _PR_URL_RE.findall(str(r["result"] or "")):
+             if (r["at"] or 0) >= prs.get(r["task_id"], (-1, ""))[0]:
+@@ -188,17 +230,28 @@ def _authority(conn: sqlite3.Connection, replica: sqlite3.Connection | None,
+ 
+ 
+ def _blocked_payload(conn: sqlite3.Connection, replica: sqlite3.Connection | None,
+-                     parent: str, info: dict[str, Any]) -> dict[str, Any]:
++                     parent: str, info: dict[str, Any], memo: dict | None = None) -> dict[str, Any]:
+     out: dict[str, Any] = {"id": parent, "status": info["status"]}
+     episode = info.get("episode")
+     if info["status"] == "triage" and episode:
+-        out["contained"] = {"episode": episode, "authority": _authority(conn, replica, parent, episode)}
++        authority = _read_once(memo, ("authority", parent, episode), lambda: _authority(conn, replica, parent, episode))
++        out["contained"] = {"episode": episode, "authority": dict(authority)}
+     return out
+ 
+ 
++def _read_once(memo: dict | None, key: tuple, read):
++    """``read()``, once per ``key`` in one ``_add_blocked_upstream`` call (``memo``); a raising read is not kept."""
++    if memo is None:
++        return read()
++    if key not in memo:
++        memo[key] = read()
++    return memo[key]
++
++
+ def _walk(conn: sqlite3.Connection, task_id: str,
+           replica: sqlite3.Connection | None, *,
+-          root_parents: dict[str, list[str]] | None = None) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
++          root_parents: dict[str, list[str]] | None = None,
++          memo: dict | None = None) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
+     seen = {task_id}
+     frontier = {task_id}
+     nearest_open: dict[str, str] | None = None
+@@ -206,11 +259,11 @@ def _walk(conn: sqlite3.Connection, task_id: str,
+         parents: dict[str, dict[str, Any]] = {}
+         for child in sorted(frontier):
+             parent_ids = (root_parents[child] if root_parents is not None and child in root_parents
+-                          else _parent_ids(conn, replica, child))
++                          else _read_once(memo, ("parents", child), lambda: _parent_ids(conn, replica, child)))
+             for parent in parent_ids:
+                 if parent in seen or parent in parents:
+                     continue
+-                info = _task_info(conn, replica, parent)
++                info = _read_once(memo, ("task", parent), lambda: _task_info(conn, replica, parent))
+                 if info is not None:
+                     parents[parent] = info
+         if not parents:
+@@ -220,7 +273,7 @@ def _walk(conn: sqlite3.Connection, task_id: str,
+             if nearest_open is None and status not in {"todo", "done", "archived"}:
+                 nearest_open = {"id": parent, "status": status}
+             if status in {"blocked", "triage"}:
+-                return _blocked_payload(conn, replica, parent, parents[parent]), nearest_open
++                return _blocked_payload(conn, replica, parent, parents[parent], memo), nearest_open
+         seen.update(parents)
+         frontier = set(parents)
+     return None, nearest_open
+@@ -233,6 +286,9 @@ def _add_blocked_upstream(conn: sqlite3.Connection, found: dict[str, dict[str, A
+     owned = replica is LEGACY_REPLICA
+     if owned:
+         replica = _replica_for(conn)
++    # Cards share ancestors: read each parent's edges, status and containment authority once per call, not once per
++    # card that reaches it (1,449 statements for the hub's 120 listed cards, each a GIL wait in the Desktop backend).
++    memo: dict = {}
+     try:
+         try:
+             root_parents = _root_parents(conn, replica, list(found))
+@@ -245,7 +301,7 @@ def _add_blocked_upstream(conn: sqlite3.Connection, found: dict[str, dict[str, A
+             if card.get("status") in {"done", "archived", "blocked", "triage"}:
+                 continue
+             try:
+-                blocked, upstream = _walk(conn, task_id, replica, root_parents=root_parents)
++                blocked, upstream = _walk(conn, task_id, replica, root_parents=root_parents, memo=memo)
+             except sqlite3.Error:
+                 logging.getLogger(__name__).debug("Could not read blocked upstream for %s", task_id, exc_info=True)
+                 continue
+diff --git a/hermes_cli/kanban_session_outcome_tasks.py b/hermes_cli/kanban_session_outcome_tasks.py
+index 334bfe849b4..67b5af23131 100644
+--- a/hermes_cli/kanban_session_outcome_tasks.py
++++ b/hermes_cli/kanban_session_outcome_tasks.py
+@@ -41,7 +41,8 @@ def select_listed_local_task_set(conn: sqlite3.Connection, ids: Iterable[str], s
+     args = (json.dumps(list(dict.fromkeys(ids))), json.dumps(statuses))
+     sid_ph = "SELECT value FROM json_each(?)"
+     st_ph = "SELECT value FROM json_each(?)"
+-    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    from hermes_cli.kanban_table_columns import table_columns
++    cols = table_columns(conn, "tasks")  # one result row, not one per column
+     if "session_id" not in cols:
+         return {}, {}  # explicitly supported pre-session schema
+     select = ", ".join(f"t.{c}" if c in cols else f"NULL AS {c}" for c in _TASK_FIELDS)
+diff --git a/hermes_cli/kanban_session_wait_rows.py b/hermes_cli/kanban_session_wait_rows.py
+index af52b6e891b..ed51be3eac6 100644
+--- a/hermes_cli/kanban_session_wait_rows.py
++++ b/hermes_cli/kanban_session_wait_rows.py
+@@ -49,7 +49,8 @@ def _local_wait_rows(conn: sqlite3.Connection, task_ids: Iterable[str], *, repli
+     ids = [str(t) for t in dict.fromkeys(task_ids)]
+     if not ids:
+         return {}, {}
+-    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    from hermes_cli.kanban_table_columns import table_columns
++    cols = table_columns(conn, "tasks")  # one result row, not one per column
+     pick = ", ".join(f"t.{c}" if c in cols else f"NULL AS {c}" for c in ("id", "status", "block_kind", "human_request",
+                                                                           "awaiting"))
+     parked: dict[str, tuple] = {}
+diff --git a/hermes_cli/kanban_table_columns.py b/hermes_cli/kanban_table_columns.py
+new file mode 100644
+index 00000000000..be62bc515ac
+--- /dev/null
++++ b/hermes_cli/kanban_table_columns.py
+@@ -0,0 +1,39 @@
++"""Column names of kanban tables in ONE SQLite result row. [daveey]
++
++CPython's sqlite3 releases the GIL around every statement prepare and every row step. In the Desktop backend (one
++GIL process, ~190 threads) each re-acquire can wait out the 5 ms switch interval, so ``PRAGMA table_info(tasks)``
++(one row per column: 59 on the hub board) took ~140 ms beside ONE busy thread instead of 0.06 ms, and the schema
++probes of the session-task and linked-card readers were the top lines of the backend's profile.
++
++``pragma_table_info`` aggregated with ``json_group_array`` returns the same names, built inside SQLite, in one row:
++one statement for any number of tables. It is the same lookup as the PRAGMA (temp, main, then attached schemas; an
++empty set for a missing table), read on the caller's connection and in its snapshot. So there is no cache and no
++cache key that could miss a migration, a rebuilt replica or another file at the same path: a memo would still need
++one statement to prove its key (``schema_version``), which is all this costs. ``machine_metrics.table_columns``
++uses the same one-row form.
++"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++
++_ONE = "(SELECT json_group_array(name) FROM pragma_table_info(?))"
++
++
++def tables_columns(conn: sqlite3.Connection, *tables: str) -> tuple[frozenset[str], ...]:
++    """``PRAGMA table_info(<table>)`` column names for each of ``tables``, in one statement and one row."""
++    if not tables:
++        return ()
++    cur = conn.cursor()
++    try:
++        cur.row_factory = None  # whatever the connection's factory, index the single row positionally
++        row = cur.execute("SELECT " + ", ".join(_ONE for _ in tables), tables).fetchone()
++    finally:
++        cur.close()
++    return tuple(frozenset(json.loads(cell)) for cell in row)
++
++
++def table_columns(conn: sqlite3.Connection, table: str) -> frozenset[str]:
++    """``{r[1] for r in conn.execute('PRAGMA table_info(<table>)')}`` without one result row per column."""
++    return tables_columns(conn, table)[0]
+diff --git a/hermes_cli/kanban_watch.py b/hermes_cli/kanban_watch.py
+index 33523f07b5d..5db37e965b3 100644
+--- a/hermes_cli/kanban_watch.py
++++ b/hermes_cli/kanban_watch.py
+@@ -39,7 +39,8 @@ def watch_park_sql(alias: str = "t") -> str:
+ def not_watch_sql(conn: sqlite3.Connection, alias: str = "t") -> str:
+     """``NOT watch_park_sql`` on boards whose ``task_events`` carry park payloads, else ``1`` (no watches)."""
+     try:
+-        cols = {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
++        from hermes_cli.kanban_table_columns import table_columns
++        cols = table_columns(conn, "task_events")  # one result row, not one per column
+     except sqlite3.Error:
+         cols = set()
+     return f"NOT {watch_park_sql(alias)}" if {"id", "task_id", "kind", "payload"} <= cols else "1"
+diff --git a/tests/hermes_cli/test_kanban_reader_hot_rows.py b/tests/hermes_cli/test_kanban_reader_hot_rows.py
+new file mode 100644
+index 00000000000..e550527bb22
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_reader_hot_rows.py
+@@ -0,0 +1,459 @@
++"""Kanban readers answer as before while handing Python far fewer SQLite rows. [daveey]
++
++In the Desktop backend every statement prepare and row step releases the GIL and may wait out a 5 ms switch
++interval, so each reader below must keep its answer and do its filtering/aggregation inside SQLite. Each test pins
++the old answer (a reference copy of the old per-row reader) and the reduced work (statements and rows handed out).
++"""
++
++from __future__ import annotations
++
++import json
++import random
++import sqlite3
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_external_watch as kew
++from hermes_cli import kanban_session_activity_card_details as details
++from hermes_cli.kanban_run_model import _KINDS, _concrete, _payload, add_run_models
++from hermes_cli.kanban_table_columns import table_columns, tables_columns
++
++
++class _Counted:
++    """A cursor that counts the rows it hands out."""
++
++    def __init__(self, cur, owner):
++        self._cur, self._owner = cur, owner
++
++    def __iter__(self):
++        for row in self._cur:
++            self._owner.rows += 1
++            yield row
++
++    def fetchall(self):
++        rows = self._cur.fetchall()
++        self._owner.rows += len(rows)
++        return rows
++
++    def fetchone(self):
++        row = self._cur.fetchone()
++        self._owner.rows += row is not None
++        return row
++
++
++class Counting:
++    """Connection proxy counting statements and result rows (``execute`` only, as the readers use it)."""
++
++    def __init__(self, conn):
++        self.conn, self.statements, self.rows = conn, 0, 0
++
++    def execute(self, sql, params=()):
++        self.statements += 1
++        return _Counted(self.conn.execute(sql, params), self)
++
++    def __getattr__(self, name):
++        return getattr(self.conn, name)
++
++
++# --- schema probe ---------------------------------------------------------------------------------------------
++
++def _pragma(conn, table):
++    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
++
++
++def test_table_columns_match_the_pragma_in_one_statement(tmp_path: Path):
++    conn = sqlite3.connect(tmp_path / "b.db")
++    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, " + ", ".join(f"c{i} TEXT" for i in range(60)) + ")")
++    conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT)")
++    statements: list[str] = []
++    conn.set_trace_callback(statements.append)
++    got = tables_columns(conn, "tasks", "task_runs", "missing")
++    conn.set_trace_callback(None)
++    # One statement (and one result row) for three tables, 63 columns; ``--`` lines trace the pragma virtual tables
++    # SQLite runs inside it.
++    assert len([s for s in statements if not s.startswith("--")]) == 1
++    assert got == (frozenset(_pragma(conn, "tasks")), frozenset(_pragma(conn, "task_runs")), frozenset())
++    assert table_columns(conn, "tasks") == _pragma(conn, "tasks") and len(_pragma(conn, "tasks")) == 61
++
++
++@pytest.mark.parametrize("factory", [None, sqlite3.Row, lambda cur, row: dict(zip([d[0] for d in cur.description], row))])
++def test_table_columns_ignore_the_connection_row_factory(factory):
++    conn = sqlite3.connect(":memory:")
++    conn.execute("CREATE TABLE tasks (id TEXT, session_id TEXT)")
++    conn.row_factory = factory
++    assert table_columns(conn, "tasks") == {"id", "session_id"}
++
++
++def test_table_columns_follow_schema_changes_and_file_swaps(tmp_path: Path):
++    """No memo: a migration on this or another connection, or another file at the same path, is read as it is."""
++    path = tmp_path / "b.db"
++    conn = sqlite3.connect(path)
++    conn.execute("CREATE TABLE tasks (id TEXT)")
++    conn.commit()
++    reader = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
++    assert table_columns(reader, "tasks") == {"id"}
++    conn.execute("ALTER TABLE tasks ADD COLUMN session_id TEXT")
++    conn.commit()
++    assert table_columns(reader, "tasks") == {"id", "session_id"}
++    reader.close()
++    conn.close()
++    path.unlink()
++    other = sqlite3.connect(path)
++    other.execute("CREATE TABLE tasks (id TEXT, assignee TEXT)")
++    other.commit()
++    reader = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
++    assert table_columns(reader, "tasks") == {"id", "assignee"}
++
++
++def test_table_columns_resolve_like_the_pragma_temp_then_main_then_attached(tmp_path: Path):
++    conn = sqlite3.connect(tmp_path / "main.db")
++    conn.execute(f"ATTACH DATABASE '{tmp_path / 'aux.db'}' AS aux")
++    conn.execute("CREATE TABLE aux.only_aux (a TEXT, b TEXT)")
++    conn.execute("CREATE TABLE tasks (id TEXT)")
++    assert table_columns(conn, "only_aux") == _pragma(conn, "only_aux") == {"a", "b"}
++    conn.execute("CREATE TEMP TABLE tasks (id TEXT, shadow TEXT)")
++    assert table_columns(conn, "tasks") == _pragma(conn, "tasks") == {"id", "shadow"}
++
++
++# --- add_run_models -------------------------------------------------------------------------------------------
++
++def _old_run_models(conn, found):
++    """The reader before: every run's events of these kinds, newest run picked in Python."""
++    ids = list(found)
++    ph = ",".join("?" for _ in ids)
++    newest = dict(conn.execute(f"SELECT task_id, MAX(id) FROM task_runs WHERE task_id IN ({ph}) GROUP BY task_id",
++                               ids).fetchall())
++    got = conn.execute(f"SELECT task_id, run_id, kind, payload FROM task_events WHERE task_id IN ({ph}) "
++                       f"AND kind IN ({','.join('?' for _ in _KINDS)}) ORDER BY id", [*ids, *_KINDS]).fetchall()
++    concrete, routed = {}, {}
++    for task_id, run_id, kind, raw in got:
++        if run_id is None or run_id != newest.get(task_id):
++            continue
++        payload = _payload(raw)
++        if kind == "run_route":
++            routed[task_id] = str(payload.get("model") or "").strip() or None
++        elif model := _concrete(payload):
++            concrete[task_id] = model
++    return {t: concrete.get(t) or routed.get(t) for t in newest if concrete.get(t) or routed.get(t)}
++
++
++def test_run_models_match_the_old_reader_and_read_only_the_newest_runs_events():
++    rng = random.Random(7)
++    conn = sqlite3.connect(":memory:")
++    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER, kind TEXT, "
++                 "payload TEXT, created_at INTEGER)")
++    conn.execute("CREATE INDEX idx_events_run ON task_events(run_id, id)")
++    conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT)")
++    models = ["class:deep", "class:standard", "gpt-6-astra", "", None]
++    run_id = 0
++    for t in range(40):
++        for _ in range(rng.randint(0, 25)):
++            run_id += 1
++            conn.execute("INSERT INTO task_runs (id, task_id) VALUES (?, ?)", (run_id, f"t{t}"))
++            for _ in range(rng.randint(0, 4)):
++                kind = rng.choice([*_KINDS, "heartbeat", "commented"])
++                payload = ({"model": rng.choice(models)} if kind == "run_route" else
++                           {"session_models": rng.sample(["a", "b", " ", "c"], rng.randint(0, 3))})
++                conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload) VALUES (?, ?, ?, ?)",
++                             (f"t{t}", rng.choice([run_id, run_id, None, max(1, run_id - 1)]), kind,
++                              rng.choice([json.dumps(payload), "{bad", None])))
++    found = {f"t{t}": {"id": f"t{t}"} for t in range(45)}
++    old = _old_run_models(conn, found)
++    counted = Counting(conn)
++    add_run_models(counted, found)
++    assert {t: c["run_model"] for t, c in found.items() if "run_model" in c} == old
++    newest_rows = conn.execute(
++        f"SELECT COUNT(*) FROM task_events e WHERE e.kind IN ({','.join('?' for _ in _KINDS)}) "
++        "AND e.run_id = (SELECT MAX(id) FROM task_runs r WHERE r.task_id = e.task_id)", _KINDS).fetchone()[0]
++    all_rows = conn.execute(f"SELECT COUNT(*) FROM task_events WHERE kind IN ({','.join('?' for _ in _KINDS)})",
++                            _KINDS).fetchone()[0]
++    assert counted.statements == 1 and counted.rows == newest_rows < all_rows / 5
++
++
++# --- card notes and PR links ----------------------------------------------------------------------------------
++
++_SCHEMA = """
++CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, completed_at INTEGER, result TEXT);
++CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER, kind TEXT, payload TEXT,
++                          created_at INTEGER);
++CREATE TABLE task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, started_at INTEGER, ended_at INTEGER,
++                        summary TEXT);
++CREATE TABLE task_comments (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, author TEXT, body TEXT,
++                            created_at INTEGER);
++CREATE INDEX idx_runs_task ON task_runs(task_id, started_at);
++CREATE INDEX idx_comments_task ON task_comments(task_id, created_at);
++"""
++
++
++def _old_notes(conn, ids):
++    """The reader before: every run summary and comment, offered in its index order."""
++    ph = ",".join("?" for _ in ids)
++    notes, prs = {}, {}
++
++    def offer(task_id, at, text):
++        at = at or 0
++        line = details._first_line(text)
++        if line and at >= notes.get(task_id, (-1, ""))[0]:
++            notes[task_id] = (at, line)
++        for url in details._PR_URL_RE.findall(str(text or "")):
++            if at >= prs.get(task_id, (-1, ""))[0]:
++                prs[task_id] = (at, url)
++
++    for r in conn.execute(f"SELECT task_id, COALESCE(ended_at, started_at), summary FROM task_runs "
++                          f"WHERE task_id IN ({ph}) AND summary IS NOT NULL", ids):
++        offer(*r)
++    for r in conn.execute(f"SELECT task_id, created_at, body FROM task_comments WHERE task_id IN ({ph})", ids):
++        offer(*r)
++    return {t: v[1] for t, v in notes.items()}, {t: v[1] for t, v in prs.items()}
++
++
++def _details_only(conn, found, monkeypatch):
++    for name in ("add_run_machines", "add_run_models", "_add_blocked_upstream"):
++        monkeypatch.setattr(details, name, lambda *_a, **_k: None)
++    details._add_card_details(conn, found)
++    return ({t: c["note"] for t, c in found.items() if "note" in c},
++            {t: c["pr_url"] for t, c in found.items() if "pr_url" in c})
++
++
++TEXTS = ["", " ", "\n\n", "\xa0", " \n", "x", "  fixed it\nmore", "!!", "\t?\n",
++         "see https://github.com/o/r/pull/7 now", "https://github.com/o/r/pull/8 and https://github.com/o/r/pull/9",
++         "https://github.com/o/r/pull/x", "HTTPS://GITHUB.COM/o/r/pull/3", "done"]
++
++
++def test_notes_and_pr_links_match_the_old_reader_on_random_boards(monkeypatch):
++    for seed in range(60):
++        rng = random.Random(seed)
++        conn = sqlite3.connect(":memory:")
++        conn.row_factory = sqlite3.Row
++        conn.executescript(_SCHEMA)
++        ids = [f"t{i}" for i in range(6)]
++        for t in ids:
++            conn.execute("INSERT INTO tasks (id, status) VALUES (?, 'running')", (t,))
++            for _ in range(rng.randint(0, 6)):
++                start = rng.choice([0, 1, 5, 9, None]) if rng.random() < 0.2 else rng.randint(1, 9)
++                conn.execute("INSERT INTO task_runs (task_id, started_at, ended_at, summary) VALUES (?, ?, ?, ?)",
++                             (t, start, rng.choice([None, rng.randint(1, 9)]), rng.choice([*TEXTS, None, 0])))
++            for _ in range(rng.randint(0, 12)):
++                conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, 'w', ?, ?)",
++                             (t, rng.choice([*TEXTS, 0]), rng.choice([rng.randint(1, 9), 0, None])))
++        if seed % 10 == 0:  # a non-numeric time: the old reader compares (and may fail) exactly as before
++            conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES ('t0', 'w', 'odd', 'x')")
++        found = {t: {"id": t} for t in ids}
++        try:
++            old = _old_notes(conn, ids)
++        except TypeError as exc:
++            with pytest.raises(TypeError, match=str(exc)[:20]):
++                _details_only(conn, found, monkeypatch)
++            continue
++        assert _details_only(conn, found, monkeypatch) == old, seed
++
++
++def test_a_long_comment_thread_hands_out_only_the_rows_that_can_win(monkeypatch):
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.executescript(_SCHEMA)
++    conn.execute("INSERT INTO tasks (id, status) VALUES ('t1', 'running')")
++    conn.executemany("INSERT INTO task_runs (task_id, started_at, ended_at, summary) VALUES ('t1', ?, ?, ?)",
++                     [(i, i + 1, f"run {i}") for i in range(0, 400, 2)])
++    conn.executemany("INSERT INTO task_comments (task_id, author, body, created_at) VALUES ('t1', 'w', ?, ?)",
++                     [(f"comment {i}", i) for i in range(874)])
++    conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES "
++                 "('t1', 'w', 'opened https://github.com/o/r/pull/12', 10)")
++    old = _old_notes(conn, ["t1"])
++    counted = Counting(conn)
++    for name in ("add_run_machines", "add_run_models", "_add_blocked_upstream"):
++        monkeypatch.setattr(details, name, lambda *_a, **_k: None)
++    found = {"t1": {"id": "t1"}}
++    details._add_card_details(counted, found, replica=None)  # a caller-owned (absent) shadow: no lookup statement
++    assert (found["t1"]["note"], found["t1"]["pr_url"]) == (old[0]["t1"], old[1]["t1"]) == (
++        "comment 873", "https://github.com/o/r/pull/12")
++    # task_events (none) + one note statement + tasks.result: the newest comment and the PR comment, not 1,075 rows.
++    assert counted.statements == 3 and counted.rows == 2
++
++
++def test_notes_without_a_comments_table_still_read_run_summaries(monkeypatch):
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.executescript(_SCHEMA + "DROP TABLE task_comments;")
++    conn.execute("INSERT INTO task_runs (task_id, started_at, summary) VALUES ('t1', 5, 'https://github.com/o/r/pull/4')")
++    assert _details_only(conn, {"t1": {"id": "t1"}}, monkeypatch) == (
++        {"t1": "https://github.com/o/r/pull/4"}, {"t1": "https://github.com/o/r/pull/4"})
++
++
++# --- external-watch hosts -------------------------------------------------------------------------------------
++
++def _old_hosts(conn, cursor, hosts):
++    top = conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0] or 0
++    if top < cursor:
++        cursor, hosts = 0, {}
++    hosts = dict(hosts)
++    for _eid, payload in conn.execute("SELECT id, payload FROM task_events WHERE kind = ? AND id > ?",
++                                      (kew.WATCH_EVENT, cursor)):
++        rec = kew._json(payload)
++        if rec.get("host"):
++            at = float(rec.get("observed_at") or 0)
++            hosts[str(rec["host"])] = max(hosts.get(str(rec["host"]), 0.0), at)
++    return int(top), hosts
++
++
++@pytest.fixture
++def watch_board(tmp_path: Path):
++    kew._HOSTS.clear()
++    conn = sqlite3.connect(tmp_path / "board.db")
++    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER, kind TEXT, "
++                 "payload TEXT, created_at INTEGER)")
++    conn.execute("CREATE INDEX idx_events_kind_task_id ON task_events(kind, task_id, id)")
++    yield conn
++    kew._HOSTS.clear()
++
++
++def _watch(conn, payload, kind=None):
++    conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES ('t1', ?, ?, 0)",
++                 (kind or kew.WATCH_EVENT, payload))
++
++
++def test_hosts_match_the_old_incremental_reader_in_one_statement(watch_board):
++    rng = random.Random(3)
++    cursor, hosts = 0, {}
++    for _round in range(8):
++        for _ in range(rng.randint(0, 40)):
++            _watch(watch_board, rng.choice([
++                json.dumps({"host": rng.choice(["hub", "mini", "w1", ""]), "observed_at": rng.randint(0, 99)}),
++                json.dumps({"host": "w2"}), json.dumps(["not", "a", "dict"]), "{bad", None, 7, 1.5]),
++                kind=rng.choice([None, None, "heartbeat"]))
++        cursor, hosts = _old_hosts(watch_board, cursor, hosts)
++        counted = Counting(watch_board)
++        assert kew.hosts_seen(counted) == hosts
++        assert counted.statements == 2 and counted.rows == 2  # database_list, then one row for every new record
++
++
++def test_hosts_start_over_on_a_smaller_board_behind_the_same_key(watch_board):
++    for at in (5, 9):
++        _watch(watch_board, json.dumps({"host": "old", "observed_at": at}))
++    assert kew.hosts_seen(watch_board) == {"old": 9.0}
++    watch_board.execute("DELETE FROM task_events")
++    _watch(watch_board, json.dumps({"host": "new", "observed_at": 1}))
++    watch_board.execute("UPDATE task_events SET id = 1")
++    assert kew.hosts_seen(watch_board) == {"new": 1.0}
++
++
++def test_hosts_fall_back_to_rows_when_a_payload_is_a_blob(watch_board):
++    _watch(watch_board, json.dumps({"host": "hub", "observed_at": 4}))
++    _watch(watch_board, sqlite3.Binary(json.dumps({"host": "blob", "observed_at": 6}).encode()))
++    assert kew.hosts_seen(watch_board) == _old_hosts(watch_board, 0, {})[1] == {"hub": 4.0, "blob": 6.0}
++
++
++def test_hosts_keep_the_old_all_or_nothing_failure(watch_board):
++    _watch(watch_board, json.dumps({"host": "hub", "observed_at": "soon"}))
++    assert kew.hosts_seen(watch_board) == {}
++
++
++# --- no reader probes a schema one row per column --------------------------------------------------------------
++
++def test_listed_card_readers_probe_each_schema_in_one_row():
++    from hermes_cli.kanban_primary_execution import materialize
++    from hermes_cli.kanban_replica_execution import read_runs
++    from hermes_cli.kanban_run_machine import placement_select
++    from hermes_cli.kanban_session_activity import LISTED_STATUSES, _counted_sub_clause
++    from hermes_cli.kanban_session_outcome_tasks import select_listed_local_tasks
++    from hermes_cli.kanban_session_wait_rows import _local_wait_rows
++    from hermes_cli.kanban_watch import not_watch_sql
++
++    conn = sqlite3.connect(":memory:")
++    conn.executescript(
++        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, session_id TEXT, "
++        "created_at INTEGER, started_at INTEGER, block_kind TEXT, human_request TEXT, current_run_id INTEGER, "
++        "last_heartbeat_at INTEGER, ready_since INTEGER, awaiting TEXT, created_on TEXT, runs_on TEXT);"
++        "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, uid TEXT, status TEXT, started_at INTEGER, "
++        "ended_at INTEGER);"
++        "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER, kind TEXT, payload TEXT, "
++        "created_at INTEGER, uid TEXT);"
++        "CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, delivery_metadata TEXT);"
++        "CREATE TABLE task_chat_links (task_id TEXT, chat_gateway TEXT, chat_profile TEXT, released INTEGER);"
++        "INSERT INTO tasks (id, title, status, session_id, current_run_id, created_on) "
++        "VALUES ('t1', 'a', 'running', 's1', 1, 'hub'), ('t2', 'b', 'blocked', 's1', NULL, 'hub');"
++        "INSERT INTO task_runs VALUES (1, 't1', 'run-1', 'running', 5, NULL);"
++        "INSERT INTO task_events (task_id, run_id, kind, created_at, uid) VALUES ('t1', 1, 'heartbeat', 6, 'e1');")
++    conn.row_factory = sqlite3.Row
++    statements: list[str] = []
++    conn.set_trace_callback(statements.append)
++    found = select_listed_local_tasks(conn, ["s1"], LISTED_STATUSES)
++    assert set(found) == {"t1", "t2"}
++    assert [tuple(r) for r in materialize(conn, found)] == [("t1", "run-1", '[6,"e1"]', None)]
++    assert read_runs(conn, "mini", "default") == {}
++    assert "awaiting" in placement_select(conn, names=("awaiting",)) and _counted_sub_clause(conn) != "1"
++    assert not_watch_sql(conn) != "1" and set(_local_wait_rows(conn, ["t1", "t2"])[0]) == {"t2"}
++    assert statements and not [s for s in statements if "table_info(" in s.lower() and "pragma_table_info" not in s]
++
++
++# --- blocked-upstream walk -------------------------------------------------------------------------------------
++
++def _old_upstream(conn, found):
++    """The walk before: every card re-reads the parents, statuses and authorities it reaches."""
++    roots = details._root_parents(conn, None, list(found))
++    out = {}
++    for task_id, card in found.items():
++        if card.get("status") in {"done", "archived", "blocked", "triage"}:
++            continue
++        blocked, upstream = details._walk(conn, task_id, None, root_parents=roots)
++        out[task_id] = {"blocked_upstream": blocked} if blocked is not None else (
++            {"upstream": upstream} if upstream is not None else {})
++    return out
++
++
++def test_upstream_walk_matches_the_old_walk_and_reads_shared_ancestors_once(monkeypatch):
++    monkeypatch.setattr(details, "_replica_for", lambda _conn: None)
++    statuses = ["todo", "ready", "running", "done", "archived", "blocked", "triage", "review"]
++    for seed in range(20):
++        rng = random.Random(seed)
++        conn = sqlite3.connect(":memory:")
++        conn.executescript("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, containment_episode TEXT);"
++                           "CREATE TABLE task_links (parent_id TEXT, child_id TEXT, PRIMARY KEY (parent_id, child_id));"
++                           "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, uid TEXT, kind TEXT, "
++                           "payload TEXT);")
++        ids = [f"t{i:02d}" for i in range(50)]
++        for i, t in enumerate(ids):
++            status = rng.choice(statuses)
++            conn.execute("INSERT INTO tasks VALUES (?, ?, ?)", (t, status, f"ep{i}" if status == "triage" else None))
++            if status == "triage":
++                conn.execute("INSERT INTO task_events (task_id, uid, kind, payload) VALUES (?, ?, 'contained', ?)",
++                             (t, f"ep{i}", json.dumps({"policy": {"authority": {"task_id": rng.choice(ids)}}})))
++            for parent in rng.sample(ids[i + 1:], min(len(ids) - i - 1, rng.randint(0, 3))):
++                conn.execute("INSERT INTO task_links VALUES (?, ?)", (parent, t))
++        found = {t: {"id": t, "status": rng.choice(statuses)} for t in ids[:30]}
++        old = _old_upstream(conn, found)
++        old_statements: list[str] = []
++        conn.set_trace_callback(old_statements.append)
++        _old_upstream(conn, found)
++        statements: list[str] = []
++        conn.set_trace_callback(statements.append)
++        details._add_blocked_upstream(conn, found)
++        conn.set_trace_callback(None)
++        got = {t: {k: c[k] for k in ("blocked_upstream", "upstream") if k in c} for t, c in found.items()
++               if c.get("status") not in {"done", "archived", "blocked", "triage"}}
++        assert got == old, seed
++        assert len(statements) <= len(old_statements)
++
++
++def test_cards_under_one_ancestor_chain_read_it_once(monkeypatch):
++    monkeypatch.setattr(details, "_replica_for", lambda _conn: None)
++    conn = sqlite3.connect(":memory:")
++    conn.executescript("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, containment_episode TEXT);"
++                       "CREATE TABLE task_links (parent_id TEXT, child_id TEXT, PRIMARY KEY (parent_id, child_id));")
++    chain = [f"a{i}" for i in range(10)]  # a0 <- a1 <- ... <- a9 (todo), every card a child of a0
++    conn.executemany("INSERT INTO tasks VALUES (?, 'todo', NULL)", [(a,) for a in chain])
++    conn.executemany("INSERT INTO task_links VALUES (?, ?)", list(zip(chain[1:], chain)))
++    found = {f"c{i}": {"id": f"c{i}", "status": "ready"} for i in range(30)}
++    conn.executemany("INSERT INTO tasks VALUES (?, 'ready', NULL)", [(c,) for c in found])
++    conn.executemany("INSERT INTO task_links VALUES ('a0', ?)", [(c,) for c in found])
++    old_statements: list[str] = []
++    conn.set_trace_callback(old_statements.append)
++    old = _old_upstream(conn, found)
++    statements: list[str] = []
++    conn.set_trace_callback(statements.append)
++    details._add_blocked_upstream(conn, found)
++    assert all(c.get("upstream") is None and "blocked_upstream" not in c for c in found.values()) and old == {
++        c: {} for c in found}
++    # Old: 30 cards x 10 ancestors x (status + edges) reads. Now each ancestor once, plus the batched roots.
++    assert len(old_statements) > 600 and len(statements) <= 2 + 10 * 3
+-- 
+2.43.0
+

@@ -1,0 +1,367 @@
+From 7df45147b5a635ecead608ff64520d6109013107 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 01:35:55 +0000
+Subject: [PATCH] [daveey] Persist handled process exits across status readers
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_state_session_status_snapshot.py       |   2 +-
+ .../test_process_status_durable_ack.py        | 157 ++++++++++++++++++
+ tools/process_registry.py                     |  16 +-
+ tools/process_registry_obligations.py         |   6 +-
+ tools/process_registry_results.py             |  43 +++++
+ 5 files changed, 213 insertions(+), 11 deletions(-)
+ create mode 100644 tests/hermes_state/test_process_status_durable_ack.py
+
+diff --git a/hermes_state_session_status_snapshot.py b/hermes_state_session_status_snapshot.py
+index f36e73066a3..ef263d6adb9 100644
+--- a/hermes_state_session_status_snapshot.py
++++ b/hermes_state_session_status_snapshot.py
+@@ -176,7 +176,7 @@ def _process_items(db: Any, tip: str) -> list[dict]:
+             state = "succeeded" if row.get("exit_code") == 0 else "failed"
+         item = {"kind": "process", "id": f"process:{row['session_id']}", "state": state,
+                 "at": float(row.get("exited_at") or 0)}
+-        if state == "failed" and process_registry.is_completion_consumed(row["session_id"]):
++        if state == "failed" and (row.get("acknowledged") or process_registry.is_completion_consumed(row["session_id"])):
+             item["acknowledged"] = True  # the agent read this exit (poll acknowledge / wait / log): handled
+         items.append(item)
+     return items
+diff --git a/tests/hermes_state/test_process_status_durable_ack.py b/tests/hermes_state/test_process_status_durable_ack.py
+new file mode 100644
+index 00000000000..546810af6b7
+--- /dev/null
++++ b/tests/hermes_state/test_process_status_durable_ack.py
+@@ -0,0 +1,157 @@
++"""Process acknowledgements must survive the process_manage caller's registry. [daveey]"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from tests.hermes_state import test_session_status_refresh as helpers
++from tools import process_registry as registry_module
++from tools import process_registry_results as results
++
++
++board = helpers.board
++receipts = helpers.receipts
++db = helpers.db
++
++
++@pytest.mark.parametrize("method", ["poll", "wait", "read_log"])
++def test_acknowledged_retained_failure_survives_a_fresh_registry(db, receipts, monkeypatch, method):
++    helpers.turn(db)
++    helpers.receipt(receipts, exit_code=1, pid="proc_retained")
++    assert [f["id"] for f in helpers.refresh(db)["failures"]] == ["process:proc_retained"]
++    monkeypatch.setenv("HERMES_SESSION_ID", "chat")
++    caller = registry_module.ProcessRegistry()
++    if method == "poll":
++        result = caller.poll("proc_retained", acknowledge=True)
++    else:
++        result = getattr(caller, method)("proc_retained")
++    assert result["status"] == "exited"
++    fresh = registry_module.ProcessRegistry()
++    monkeypatch.setattr(registry_module, "process_registry", fresh)
++    assert fresh._completion_consumed == set()
++    assert helpers.refresh(db)["failures"] == []
++
++
++def test_plain_poll_does_not_clear_a_retained_failure(db, receipts, monkeypatch):
++    helpers.turn(db)
++    helpers.receipt(receipts, exit_code=1, pid="proc_unhandled")
++    monkeypatch.setenv("HERMES_SESSION_ID", "chat")
++    assert registry_module.ProcessRegistry().poll("proc_unhandled")["status"] == "exited"
++    assert [f["id"] for f in helpers.refresh(db)["failures"]] == ["process:proc_unhandled"]
++
++
++def test_ack_does_not_apply_to_another_process_incarnation(db, receipts, monkeypatch):
++    helpers.turn(db)
++    path = helpers.receipt(receipts, exit_code=1, pid="proc_reused")
++    monkeypatch.setenv("HERMES_SESSION_ID", "chat")
++    caller = registry_module.ProcessRegistry()
++    assert caller.poll("proc_reused", acknowledge=True)["status"] == "exited"
++    record = json.loads(path.read_text())
++    record["started_at"] += 1
++    path.write_text(json.dumps(record))
++    monkeypatch.setattr(registry_module, "process_registry", registry_module.ProcessRegistry())
++    assert [f["id"] for f in helpers.refresh(db)["failures"]] == ["process:proc_reused"]
++
++
++def test_late_result_rewrite_cannot_erase_acknowledgement(db, receipts, monkeypatch):
++    helpers.turn(db)
++    helpers.receipt(receipts, exit_code=1, pid="proc_rewrite")
++    monkeypatch.setenv("HERMES_SESSION_ID", "chat")
++    caller = registry_module.ProcessRegistry()
++    session = caller.get("proc_rewrite")
++    assert caller.poll("proc_rewrite", acknowledge=True)["status"] == "exited"
++    results.save_completed_result(session)
++    monkeypatch.setattr(registry_module, "process_registry", registry_module.ProcessRegistry())
++    assert helpers.refresh(db)["failures"] == []
++
++
++def test_ack_for_another_owner_does_not_clear_failure(db, receipts, monkeypatch):
++    helpers.turn(db)
++    helpers.receipt(receipts, exit_code=1, pid="proc_owner")
++    monkeypatch.setenv("HERMES_SESSION_ID", "chat")
++    caller = registry_module.ProcessRegistry()
++    session = caller.get("proc_owner")
++    session.parent_session_id = "foreign"
++    results.record_consumed(session)
++    assert [f["id"] for f in helpers.refresh(db)["failures"]] == ["process:proc_owner"]
++
++
++def test_unreadable_ack_keeps_unknown_coverage_and_prior_failure(db, receipts):
++    helpers.turn(db)
++    helpers.receipt(receipts, exit_code=1, pid="proc_badack")
++    assert helpers.refresh(db)["failures"]
++    (receipts / "proc_badack.ack").write_text("not-json")
++    status = helpers.refresh(db)
++    assert status["coverage"]["state"] == "unknown"
++    assert [f["id"] for f in status["failures"]] == ["process:proc_badack"]
++
++
++def test_expired_ack_is_pruned_with_the_result(db, receipts, monkeypatch):
++    import os
++    import time
++    path = helpers.receipt(receipts, pid="proc_expired")
++    monkeypatch.setenv("HERMES_SESSION_ID", "chat")
++    caller = registry_module.ProcessRegistry()
++    assert caller.poll("proc_expired", acknowledge=True)["status"] == "exited"
++    ack = path.with_suffix(".ack")
++    old = time.time() - results.RESULT_RETENTION_SECONDS - 1
++    os.utime(path, (old, old))
++    os.utime(ack, (old, old))
++    results._result_paths()
++    assert not path.exists() and not ack.exists()
++
++
++def test_acknowledgement_from_another_interpreter_clears_retained_failure(db, receipts):
++    import os
++    import subprocess
++    import sys
++    helpers.turn(db)
++    helpers.receipt(receipts, exit_code=1, pid="proc_subprocess")
++    assert helpers.refresh(db)["failures"]
++    env = {**os.environ, "HERMES_HOME": str(receipts.parent.parent),
++           "HERMES_SESSION_ID": "chat", "PYTHONPATH": os.pathsep.join(sys.path)}
++    completed = subprocess.run([sys.executable, "-c", "from tools.process_registry import ProcessRegistry; "
++                               "assert ProcessRegistry().poll('proc_subprocess', acknowledge=True)['status'] == 'exited'"],
++                              env=env, capture_output=True, text=True, timeout=30, check=False)
++    assert completed.returncode == 0, completed.stderr
++    assert helpers.refresh(db)["failures"] == []
++
++
++def test_hosted_ack_never_writes_host_state(db, receipts, monkeypatch):
++    helpers.receipt(receipts, pid="proc_hosted")
++    monkeypatch.setenv("HERMES_SESSION_ID", "chat")
++    session = registry_module.ProcessRegistry().get("proc_hosted")
++    assert session is not None
++    session.sandbox_key = "hosted-fixture"
++    results.record_consumed(session)
++    assert not (receipts / "proc_hosted.ack").exists()
++
++
++def test_failed_ack_write_does_not_fabricate_a_durable_ack(db, receipts, monkeypatch, caplog):
++    helpers.turn(db)
++    helpers.receipt(receipts, exit_code=1, pid="proc_writefail")
++    monkeypatch.setenv("HERMES_SESSION_ID", "chat")
++    def failed_write(*args, **kwargs):
++        raise OSError("fixture disk failure")
++    monkeypatch.setattr(results, "atomic_json_write", failed_write)
++    assert registry_module.ProcessRegistry().poll("proc_writefail", acknowledge=True)["status"] == "exited"
++    assert "Could not retain process acknowledgement" in caplog.text
++    assert [f["id"] for f in helpers.refresh(db)["failures"]] == ["process:proc_writefail"]
++
++
++def test_orphan_ack_expires_but_a_live_receipts_ack_stays(db, receipts, monkeypatch):
++    import os
++    import time
++    path = helpers.receipt(receipts, pid="proc_oldack")
++    monkeypatch.setenv("HERMES_SESSION_ID", "chat")
++    assert registry_module.ProcessRegistry().poll("proc_oldack", acknowledge=True)["status"] == "exited"
++    ack = path.with_suffix(".ack")
++    old = time.time() - results.RESULT_RETENTION_SECONDS - 1
++    os.utime(ack, (old, old))
++    results._result_paths()
++    assert ack.exists()
++    path.unlink()
++    results._result_paths()
++    assert not ack.exists()
++
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index ccf6269c161..31e0498e028 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -1970,7 +1970,7 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+             if not finalizing:
+                 self._poll_observed.add(session.id)
+                 if acknowledge:
+-                    self._completion_consumed.add(session.id)
++                    self._consume_completion(session.id, session=session)
+         if session.detached and not session.output_log:
+             result.update(detached=True, note="Process recovered after restart -- output history unavailable")
+         return result
+@@ -2002,7 +2002,7 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+             **self._status_head(session), **(self._exit_fields(session) if exited else {}),
+             "output": "\n".join(selected), "total_lines": total_lines, "showing": f"{len(selected)} lines"}
+         if exited and observed_completion_output and not finalizing:
+-            self._consume_completion(session.id)
++            self._consume_completion(session.id, session=session)
+         return result
+ 
+     def wait(self, session_id: str, timeout: int | None = None) -> dict:
+@@ -2035,7 +2035,7 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+             self._reconcile_local_exit(session)  # orphaned-pipe reader guard
+             result = None
+             if session.exited and not self._reader_finalizing(session):
+-                self._consume_completion(session.id)
++                self._consume_completion(session.id, session=session)
+                 result = self._exit_snapshot(session, "exited")
+             elif _is_interrupted():
+                 result = {
+@@ -2111,7 +2111,7 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+             # Only suppress the autonomous turn after its output is present in
+             # the explicit kill result, matching wait/log consumption.
+             if consume_output and not finalizing:
+-                self._consume_completion(session.id)
++                self._consume_completion(session.id, session=session)
+             return result
+         try:
+             early = self._signal_kill(session, consume_output)
+@@ -2214,7 +2214,7 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+                 with session._lock:
+                     output = _completion_output(session)
+                 if consume_output:
+-                    self._consume_completion(session.id)
++                    self._consume_completion(session.id, session=session)
+                 # No waitable handle, so this is not a collected exit. Close the
+                 # entry without queueing a completion, and do not signal a PID
+                 # whose start time does not match.
+@@ -2323,7 +2323,7 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+         can discover a forgotten preview server that is blocking session reset (#29177).
+         """
+         # Retained reads are opt-in; routine status bars use the live registry.
+-        from tools.process_registry_results import registry_sessions
++        from tools.process_registry_results import registry_sessions, status_exit_fields
+         sessions = registry_sessions(self, include_retained, strict, owner_session_id, load_completed_results)
+         from tools.environments.sandbox_scope import sandbox_visible
+         all_sessions = list(sessions.values()) if strict else [
+@@ -2370,9 +2370,7 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+             if s.persist_on_release:
+                 entry["persist_on_release"] = True
+             if s.exited:
+-                entry["exit_code"] = s.exit_code
+-                entry["exited_at"] = s.exited_at
+-                entry["completion_reason"] = s.completion_reason
++                entry.update(status_exit_fields(s, strict=strict))
+             if s.detached:
+                 entry["detached"] = True
+             result.append(entry)
+diff --git a/tools/process_registry_obligations.py b/tools/process_registry_obligations.py
+index ebbbc0ba6cb..d9b5d13138a 100644
+--- a/tools/process_registry_obligations.py
++++ b/tools/process_registry_obligations.py
+@@ -202,11 +202,13 @@ class ProcessObligationMixin:
+     def _tui_owed_ids(self) -> set:
+         return vars(self).setdefault("_tui_owed", set())
+ 
+-    def _consume_completion(self, session_id: str) -> None:
++    def _consume_completion(self, session_id: str, *, session) -> None:
+         """The agent has the output (wait/log/kill): suppress the autonomous notice, here and across a restart.
+         Under ``self._lock`` so it cannot interleave with ``_move_to_finished``'s receipt write."""
+         with self._lock:
+             self._completion_consumed.add(session_id)
++            from tools.process_registry_results import record_consumed
++            record_consumed(session)
+             settle_quietly(session_id, "consumed via wait/log")
+ 
+     def settle_completion(self, session_id: str, how: str) -> bool:
+@@ -235,6 +237,8 @@ class ProcessObligationMixin:
+         from tools import process_registry as registry_module  # its save name (tests patch it there)
+         with self._lock:
+             if consume_output:
++                from tools.process_registry_results import record_consumed
++                record_consumed(session)
+                 settle_quietly(session.id, "consumed via kill")
+             registry_module.save_completed_result(session, None if consume_output else owed_still(session.id))
+ 
+diff --git a/tools/process_registry_results.py b/tools/process_registry_results.py
+index ba155647112..ec20da84284 100644
+--- a/tools/process_registry_results.py
++++ b/tools/process_registry_results.py
+@@ -31,6 +31,13 @@ def _result_paths(*, strict: bool = False):
+     directory = get_hermes_home() / "logs" / "process-results"
+     cutoff = time.time() - RESULT_RETENTION_SECONDS
+     retained = []
++    if not strict:
++        for ack in directory.glob("proc_*.ack"):
++            try:
++                if ack.stat().st_mtime < cutoff and not ack.with_suffix(".json").exists():
++                    ack.unlink(missing_ok=True)
++            except FileNotFoundError:
++                pass
+     if strict:
+         # Path.glob may suppress enumeration errors. An absent results directory
+         # is normal before the first completion; other errors are not absence.
+@@ -46,6 +53,7 @@ def _result_paths(*, strict: bool = False):
+             if modified < cutoff:
+                 if not strict:
+                     path.unlink(missing_ok=True)
++                    path.with_suffix(".ack").unlink(missing_ok=True)
+             else:
+                 retained.append((modified, path))
+         except FileNotFoundError:
+@@ -57,6 +65,7 @@ def _result_paths(*, strict: bool = False):
+             visible.append(path)
+         elif not strict:
+             path.unlink(missing_ok=True)
++            path.with_suffix(".ack").unlink(missing_ok=True)
+     return visible
+ 
+ 
+@@ -100,6 +109,40 @@ def save_completed_result(session, obligation: dict | None = None) -> None:
+         logger.warning("Could not retain completed process result %s", session.id, exc_info=True)
+ 
+ 
++def record_consumed(session) -> None:
++    """Persist an output acknowledgement separately: a late result rewrite cannot erase it."""
++    if session.sandbox_key:
++        return
++    directory = get_hermes_home() / "logs" / "process-results"
++    try:
++        make_user_dir(directory, mode=0o700, parents=True, exist_ok=True)
++        atomic_json_write(directory / f"{session.id}.ack", {
++            "id": session.id, "started_at": session.started_at,
++            "parent_session_id": session.parent_session_id,
++        }, mode=0o600)
++    except OSError:
++        logger.warning("Could not retain process acknowledgement %s", session.id, exc_info=True)
++
++
++def completion_consumed(session) -> bool:
++    """Only an exact process incarnation/owner acknowledgement clears a status failure."""
++    path = get_hermes_home() / "logs" / "process-results" / f"{session.id}.ack"
++    try:
++        record = json.loads(path.read_text(encoding="utf-8-sig"))
++    except FileNotFoundError:
++        return False
++    return record == {"id": session.id, "started_at": session.started_at,
++                      "parent_session_id": session.parent_session_id}
++
++
++def status_exit_fields(session, *, strict: bool) -> dict:
++    fields = {"exit_code": session.exit_code, "exited_at": session.exited_at,
++              "completion_reason": session.completion_reason}
++    if strict:
++        fields["acknowledged"] = completion_consumed(session)
++    return fields
++
++
+ def _owns_result(owner: str, parent: str | None) -> bool:
+     if not parent:
+         return False
+-- 
+2.43.0
+

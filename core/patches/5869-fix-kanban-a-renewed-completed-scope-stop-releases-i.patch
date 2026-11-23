@@ -1,0 +1,139 @@
+From 40ed1ec475e72027489784b438ae5d8aa8bfd79d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 02:14:58 +0000
+Subject: [PATCH] fix(kanban): a renewed, completed scope stop releases its
+ dependents [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_containment_terminal.py     | 30 ++++++++-
+ .../test_kanban_actionability_dependencies.py | 65 +++++++++++++++++++
+ 2 files changed, 93 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_containment_terminal.py b/hermes_cli/kanban_containment_terminal.py
+index f0c2510bade..5a828dc87d2 100644
+--- a/hermes_cli/kanban_containment_terminal.py
++++ b/hermes_cli/kanban_containment_terminal.py
+@@ -118,6 +118,26 @@ def archive_local(conn, task, *, comment=None, precondition=None, via=None, even
+     return True
+ 
+ 
++_COVERED = "hermes_scope_renewal_covers"
++
++
++def _register_covered(conn) -> bool:
++    """Expose ``kanban_scope_renewal.covered`` to SQL on ``conn``; any read failure is uncovered (fail closed)."""
++    from hermes_cli import kanban_scope_renewal as renewal
++
++    def covers(task_id, key):
++        # A reader schema without comments/renewal columns (minimal mirrors) cannot prove coverage: restrictive.
++        try:
++            return 1 if str(key) in renewal.covered(conn, str(task_id)) else 0
++        except (sqlite3.Error, KeyError, IndexError, TypeError, ValueError):
++            return 0
++    try:
++        sqlite3.Connection.create_function(conn, _COVERED, 2, covers)
++    except (sqlite3.Error, TypeError):
++        return False
++    return True
++
++
+ def parent_status_sql(conn, alias="", *, table="tasks"):
+     """Effective dependency state, never terminal success for an execution-restricted scope.
+ 
+@@ -132,10 +152,16 @@ def parent_status_sql(conn, alias="", *, table="tasks"):
+     columns = {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
+     if {"task_id", "kind", "payload"} <= columns:
+         live = " AND de.deleted_at IS NULL" if "deleted_at" in columns else ""
++        cause = "CASE WHEN json_valid(de.payload) THEN json_extract(de.payload,'$.cause') END"
++        # A scope stop a valid renewal froze (kanban_scope_renewal.covered: exact uid, unedited mandate) no longer
++        # restricts, exactly as execution readers treat it; safety evidence is never renewable.
++        renewed = ""
++        if "id" in columns and _register_covered(conn):
++            key = "COALESCE(de.uid, CAST(de.id AS TEXT))" if "uid" in columns else "CAST(de.id AS TEXT)"
++            renewed = f" AND NOT ({cause}='scope_stopped' AND {_COVERED}(de.task_id, {key}))"
+         clauses.append(f"EXISTS (SELECT 1 FROM task_events de WHERE de.task_id={prefix}id "
+                        "AND de.kind IN ('spend_budget_triaged','decision_hold_restricted') "
+-                       "AND CASE WHEN json_valid(de.payload) THEN json_extract(de.payload,'$.cause') END "
+-                       f"IN ('safety_refusal','scope_stopped'){live})")
++                       f"AND {cause} IN ('safety_refusal','scope_stopped'){live}{renewed})")
+     if not clauses:
+         return prefix + "status"
+     return (f"CASE WHEN {prefix}status IN ('done','archived') AND ({' OR '.join(clauses)}) "
+diff --git a/tests/hermes_cli/test_kanban_actionability_dependencies.py b/tests/hermes_cli/test_kanban_actionability_dependencies.py
+index 94635a1581d..13481dd6d8b 100644
+--- a/tests/hermes_cli/test_kanban_actionability_dependencies.py
++++ b/tests/hermes_cli/test_kanban_actionability_dependencies.py
+@@ -92,3 +92,68 @@ def test_foreign_parent_mirrors_preserve_actual_archived_stop(board, monkeypatch
+         assert rows == {parent: 'triage', ordinary: 'archived', unrelated: 'archived'}
+     finally:
+         live.close()
++
++
++# Review on eeb369b4 (P1): a validly renewed, promoted and completed scope kept projecting triage to its children.
++from tests.hermes_cli import test_kanban_scope_renewal as scope
++
++
++def renewed_and_done(board, monkeypatch):
++    parent, _, episode = scope.stopped(board, monkeypatch)
++    scope.link(board, parent)
++    comment = scope.mandate(board, parent)
++    scope.renew(board, parent, episode, comment)
++    child = kb.create_task(board, title='Waits on the renewed scope', assignee='default', parents=[parent])
++    promoted, refusal = kb.promote_task(board, parent, actor='fixture', reason='renewed scope')
++    assert promoted is True, refusal
++    assert kb.complete_task(board, parent, summary='Renewed scope delivered')
++    return parent, child, episode, comment
++
++
++def test_renewed_promoted_completed_scope_releases_its_child(board, monkeypatch):
++    parent, child, _, _ = renewed_and_done(board, monkeypatch)
++    assert kb.get_task(board, parent).status == 'done'
++    assert kb.parent_states(board, child) == [(parent, 'done')]
++    kb.recompute_ready(board)
++    assert kb.get_task(board, child).status == 'ready'
++
++
++def test_edited_mandate_new_stop_or_safety_keep_the_child_waiting(board, monkeypatch):
++    for spoil in ('edit', 'stop', 'safety'):
++        parent, child, episode, comment = renewed_and_done(board, monkeypatch)
++        with kb.write_txn(board):
++            if spoil == 'edit':
++                board.execute("UPDATE task_comments SET body='Do everything' WHERE id=?", (comment,))
++            else:
++                cause = 'scope_stopped' if spoil == 'stop' else 'safety_refusal'
++                kb._append_event(board, parent, 'decision_hold_restricted', {'cause': cause, 'episode': episode})
++        assert kb.parent_states(board, child) == [(parent, 'triage')], spoil
++
++
++@pytest.mark.parametrize('incremental', [False, True])
++def test_foreign_mirrors_release_a_renewed_completed_parent(board, monkeypatch, incremental):
++    import sqlite3
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_parent_refresh as refresh
++    from hermes_cli import kanban_move_parent_evidence as evidence
++    parent, _, _, _ = renewed_and_done(board, monkeypatch)
++    stopped = kb.create_task(board, title='Unrenewed stop control', assignee='default')
++    restrict(board, stopped)
++    assert kb.archive_task(board, stopped)
++    live = sqlite3.connect(':memory:', isolation_level=None)
++    live.row_factory = sqlite3.Row
++    live.executescript('CREATE TABLE tasks(id TEXT PRIMARY KEY,status TEXT);'
++                       'CREATE TABLE task_links(parent_id TEXT,child_id TEXT);'
++                       'CREATE TABLE kanban_sync_remote_parents(parent_id TEXT PRIMARY KEY,status TEXT,refreshed_at INTEGER);'
++                       "INSERT INTO tasks VALUES('child','todo');")
++    live.executemany("INSERT INTO task_links VALUES(?,'child')", [(parent,), (stopped,)])
++    monkeypatch.setattr(evidence, 'prepare', lambda *a, **kw: ({}, {}))
++    monkeypatch.setattr(evidence, 'stored', lambda *a: {parent: None, stopped: None})
++    try:
++        if incremental:
++            refresh._refresh_rows(live, board, {parent, stopped}, scoped={})
++        else:
++            sync.refresh_remote_parents(live, board, scoped={})
++        assert dict(kb.parent_states(live, 'child', remote=True)) == {parent: 'done', stopped: 'triage'}
++    finally:
++        live.close()
+-- 
+2.43.0
+

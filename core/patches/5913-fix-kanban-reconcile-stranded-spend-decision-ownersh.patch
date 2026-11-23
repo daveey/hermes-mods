@@ -1,0 +1,218 @@
+From 91dd5d06eb67f3b1788d78cd164db4305604b390 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 10:26:59 +0000
+Subject: [PATCH] fix(kanban): reconcile stranded spend-decision ownership
+ [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_spend_decision.py           |  34 +++++-
+ hermes_cli/kanban_triage_sweep.py             |   6 +-
+ .../test_kanban_spend_route_repair.py         | 110 ++++++++++++++++++
+ 3 files changed, 145 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_spend_route_repair.py
+
+diff --git a/hermes_cli/kanban_spend_decision.py b/hermes_cli/kanban_spend_decision.py
+index ea9b4c63a6a..ed7c7858174 100644
+--- a/hermes_cli/kanban_spend_decision.py
++++ b/hermes_cli/kanban_spend_decision.py
+@@ -25,15 +25,39 @@ def ensure_producer(conn, task_id: str) -> None:
+         scope = execution_restricted(conn, task_id) and not safety
+         prior = json.loads(previous[0]) if previous else None
+         cause = 'safety_refusal' if safety else 'scope_stopped' if scope else None
+-        if prior and (cause is None or prior.get('cause') == cause):
++        route = prior.get('producer') if isinstance(prior, dict) else None
++        live = _live_route(conn, route)
++        if live and (cause is None or prior.get('cause') == cause):
+             return
+         if cause:
+             payload['cause'] = cause
+-        route = prior['producer'] if prior else producer(conn, task_id, payload.get('reason') or 'Spend budget reached')
++        if not live:
++            route = producer(conn, task_id, payload.get('reason') or 'Spend budget reached')
+         kb._append_event(conn, task_id, NOTICE, {**payload, "episode": episode, "producer": route})
+ 
+ 
+ 
++def _live_route(conn, route) -> bool:
++    """A notice is not ownership when its decision executor has closed or disappeared."""
++    if not isinstance(route, dict):
++        return False
++    if route.get('kind') == 'supervisor':
++        task = kb.get_task(conn, route.get('task_id'))
++        return task is not None and task.status not in ('done', 'archived')
++    # Explicit administrative exhaustion is a terminal routing boundary, not
++    # permission to recurse into another decision owner or release the root hold.
++    return route.get('kind') in ('chats', 'unavailable')
++
++
++def repair_triage_routes(conn, *, skip: set[str]) -> None:
++    """Repair ownership independently of idle/release eligibility; never change task status."""
++    rows = conn.execute("SELECT t.id FROM tasks t WHERE t.status='triage' AND EXISTS "
++                        "(SELECT 1 FROM task_events e WHERE e.task_id=t.id AND e.kind=?)", (EVENT,)).fetchall()
++    for row in rows:
++        if row[0] not in skip:
++            safe_ensure_producer(conn, row[0])
++
++
+ def safe_ensure_producer(conn, task_id: str) -> None:
+     import logging
+     try:
+@@ -265,7 +289,11 @@ def _route(conn, task_id, task, own, active, bind, note, dead) -> dict:
+         conn, title=forwarded_title(f"Spend budget decision: {task.title}"[:200], f"Spend budget decision: {task_id}"),
+         body=f"Card {task_id} has stopped. No chat owns its decision.\n\n"
+              + "Source title and stop reason (historical evidence):\n" + forwarded_text(task.title) + "\n"
+-             + forwarded_text(note) + "\n\n" + guidance + action,
++             + forwarded_text(note) + "\n\n" + guidance + action
++             + "\n\nApply the disposition on the source before completing this decision card; a recommendation or "
++             "completion alone does not change its hold. If authority/capability is unavailable, retain this "
++             "decision card as a non-executing owner with the exact prerequisite instead of completing and "
++             "leaving the source ownerless. Never renew spend or bypass safety/scope gates implicitly.",
+         assignee=_supervisor_profile(), created_by="kanban-spend-budget", workspace_kind="scratch",
+         idempotency_key=f"spend-budget-decision:{task_id}:{episode}", tenant=task.tenant)
+     stop = pending_episode(conn, task_id)
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index 95a35d2e8db..f70434f6e89 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -291,8 +291,11 @@ def sweep_stale_triage(
+ 
+     # Retained executor copies have no triage policy authority. Local cap keys cannot
+     # arbitrate supervisor creation across gateways, even when neither has synced yet.
+-    from hermes_cli.kanban_spend_decision import pending as spend_decision_pending, safe_ensure_producer
++    from hermes_cli.kanban_spend_decision import pending as spend_decision_pending, repair_triage_routes
+     copies = foreign_ids(conn)
++    # Decision ownership needs repair even while execution is gated, fresh, capped
++    # or contained. Only the home board may publish its replacement route.
++    repair_triage_routes(conn, skip=copies)
+     try:
+         # After the foreign-copy fence. A retained worker copy must not create a supervisor card.
+         escalate_stranded_contained(conn, now=now, skip=copies)
+@@ -303,7 +306,6 @@ def sweep_stale_triage(
+         if row["id"] in copies or containment_held(conn, row["id"]):
+             continue
+         if spend_decision_pending(conn, row["id"]):
+-            safe_ensure_producer(conn, row["id"])
+             continue
+         if row["human_request"] or open_recovery_card(conn, row["id"]) or current_park(conn, row['id']):
+             continue  # a human owns it, or its kernel recovery card is its producer
+diff --git a/tests/hermes_cli/test_kanban_spend_route_repair.py b/tests/hermes_cli/test_kanban_spend_route_repair.py
+new file mode 100644
+index 00000000000..ce9e69bc8d7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_route_repair.py
+@@ -0,0 +1,110 @@
++"""Spend ownership repair is independent of execution-release eligibility. [daveey]"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli import kanban_triage_sweep as sweep
++from tests.hermes_cli import test_kanban_spend_budget as helpers
++
++kanban_home = helpers.kanban_home
++
++
++def _stop(conn, cause=None):
++    tid = kb.create_task(conn, title="Retained work", assignee="default")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++        kb._append_event(conn, tid, decision.EVENT, {"reason": "stop", **({"cause": cause} if cause else {})})
++    return tid
++
++
++def _route(conn, tid):
++    return helpers._events(conn, tid, decision.NOTICE)[-1].payload["producer"]
++
++
++@pytest.mark.parametrize("status", ["done", "archived", "missing", "null"])
++@pytest.mark.parametrize("cause", [None, "scope_stopped", "safety_refusal"])
++def test_closed_or_null_producer_is_replaced_without_execution_release(kanban_home, status, cause):
++    with kbc.connect_closing() as conn:
++        tid = _stop(conn, cause)
++        decision.ensure_producer(conn, tid)
++        old = _route(conn, tid)["task_id"]
++        with kb.write_txn(conn):
++            if status == "null":
++                episode = decision.pending_episode(conn, tid)
++                kb._append_event(conn, tid, decision.NOTICE, {
++                    "episode": episode.get("uid") or str(episode["id"]), "producer": None})
++            elif status == "missing":
++                conn.execute("DELETE FROM tasks WHERE id=?", (old,))
++            else:
++                conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, old))
++        decision.ensure_producer(conn, tid)
++        route = _route(conn, tid)
++        assert route["kind"] == "supervisor"
++        assert route["task_id"] != old
++        assert kb.get_task(conn, route["task_id"]).status not in ("done", "archived")
++        count = len(helpers._events(conn, tid, decision.NOTICE))
++        decision.ensure_producer(conn, tid)
++        assert len(helpers._events(conn, tid, decision.NOTICE)) == count
++        assert kb.get_task(conn, tid).status == "triage"
++        assert decision.pending(conn, tid)
++        assert decision.execution_restricted(conn, tid) == bool(cause)
++
++
++@pytest.mark.parametrize("filter", ["fresh", "gated", "contained", "capped", "foreign"])
++def test_sweep_repairs_missing_routes_before_release_filters(kanban_home, monkeypatch, filter):
++    from hermes_cli import kanban_containment_connections as containment
++    from hermes_cli import kanban_wake_check as wake
++    with kbc.connect_closing() as conn:
++        tid = _stop(conn, "scope_stopped")
++        kb.add_comment(conn, tid, "diagnostic", "frequent fresh diagnostic does not defer decision ownership")
++        if filter == "gated":
++            monkeypatch.setattr(sweep, "_gate_exclusion", lambda: "AND 0 ")
++        if filter == "contained":
++            monkeypatch.setattr(containment, "held", lambda c, t: t == tid)
++        if filter == "capped":
++            with kb.write_txn(conn):
++                kb._append_event(conn, tid, "triage_sweep_capped", {})
++        if filter == "foreign":
++            monkeypatch.setattr(wake, "foreign_ids", lambda c: {tid})
++        assert sweep.sweep_stale_triage(conn) == []
++        notices = helpers._events(conn, tid, decision.NOTICE)
++        assert bool(notices) == (filter != "foreign")
++        if notices:
++            assert kb.get_task(conn, _route(conn, tid)["task_id"]).status == "ready"
++        assert kb.get_task(conn, tid).status == "triage"
++        assert decision.execution_restricted(conn, tid)
++
++
++def test_failed_publication_retries_and_does_not_starve_other_stops(kanban_home, monkeypatch):
++    real = decision.producer
++    with kbc.connect_closing() as conn:
++        first, second = _stop(conn), _stop(conn)
++        def fail_one(c, tid, note):
++            if tid == first:
++                raise RuntimeError("injected publication failure")
++            return real(c, tid, note)
++        monkeypatch.setattr(decision, "producer", fail_one)
++        sweep.sweep_stale_triage(conn)
++        assert not helpers._events(conn, first, decision.NOTICE)
++        assert _route(conn, second)["kind"] == "supervisor"
++        monkeypatch.setattr(decision, "producer", real)
++        sweep.sweep_stale_triage(conn)
++        owner = kb.get_task(conn, _route(conn, first)["task_id"])
++        assert "retain this decision card" in owner.body
++        assert "instead of completing" in owner.body
++        assert kb.get_task(conn, first).status == "triage"
++
++
++def test_resolved_episode_does_not_reopen_closed_producer(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = _stop(conn)
++        decision.ensure_producer(conn, tid)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='done' WHERE id=?", (_route(conn, tid)["task_id"],))
++        assert kb.promote_task(conn, tid, actor="operator", reason="bounded new phase")[0]
++        count = len(helpers._events(conn, tid, decision.NOTICE))
++        decision.ensure_producer(conn, tid)
++        assert len(helpers._events(conn, tid, decision.NOTICE)) == count
+-- 
+2.43.0
+

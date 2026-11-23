@@ -1,0 +1,220 @@
+From f028b96ec8aa524f8143551cd9bdb6e98867112d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 10:03:21 +0000
+Subject: [PATCH] fix(kanban): surface owner device waits instead of hiding
+ them [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_awaiting.py                 |  6 ++
+ hermes_cli/kanban_wait_info.py                | 49 +++++++++-
+ .../test_kanban_owner_device_wait.py          | 91 +++++++++++++++++++
+ 3 files changed, 142 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_owner_device_wait.py
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 16038db1ebe..801413f3380 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -759,6 +759,12 @@ def resolve(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Op
+     data (a hub refusal, an exception). The prose checks (``text_wall``, ``soak_wait``) judge an agent's own words
+     and are skipped; the declared clock still needs its why."""
+     # [daveey] A probe that matches comment authors misses relayed replies (hub:gw:<gw>): author_probe.
++    from hermes_cli.kanban_wait_info import owner_device_step
++    step = owner_device_step(wake_check)
++    if step and not system:
++        raise AwaitingError(HUMAN_WAIT, (
++            f"{step} Use kanban_block(kind='needs_input', human_request={{...}}) with a physical "
++            "step and resolved_check; an availability probe is not an external producer."))
+     from hermes_cli.kanban_comment_origin import check_park
+     check_park(conn, task_id, wake_check)
+     declared = normalize(awaiting)
+diff --git a/hermes_cli/kanban_wait_info.py b/hermes_cli/kanban_wait_info.py
+index cc087d2fdb0..1af36b5feb9 100644
+--- a/hermes_cli/kanban_wait_info.py
++++ b/hermes_cli/kanban_wait_info.py
+@@ -9,7 +9,8 @@ names the producer of each wait and marks the ones only an agent can end:
+   or, for older parks, from the wake check (``hermes kanban wait-check task t_x`` -> ``card t_x``).
+ - ``agent_owned``: nothing outside the agents will end this wait. Transient/capability/assignment blocks, triage
+   (gave up / block loop), continuation_exhausted, and a schedule with no named producer.
+-- ``wait_state``: ``human`` (a validated ask: the user's move), ``stalled`` (agent-owned for longer than
++- ``wait_state``: ``human`` (a validated ask, or legacy device-access attention with ``owner_step``;
++  attention is not approval/consent), ``stalled`` (agent-owned for longer than
+   ``STALL_AFTER_S``), or ``waiting`` (anything else parked).
+ - ``premise``: a stable key of the reason (status, kind and the reason text, never timestamps), so a wake that
+   fires "once per premise" does not fire again when the same card re-parks on the same reason.
+@@ -22,6 +23,7 @@ from __future__ import annotations
+ import hashlib
+ import json
+ import re
++import shlex
+ import time
+ from typing import Any, Optional
+ 
+@@ -100,6 +102,34 @@ def _clock_label(wake_at: float) -> str:
+     return "the clock until " + time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(wake_at))
+ 
+ 
++def owner_device_step(wake_check: Any) -> Optional[str]:
++    """Recognize legacy paired-device availability probes, not passive capture producers.
++
++    This is a compatibility classification, not a claim that unlocking fixes a transport.
++    New owner-device waits must use a validated human_request with a resolved_check.
++    Do not inspect arbitrary scripts or execute the probe while deriving attention.
++    """
++    if not isinstance(wake_check, str):
++        return None
++    try:
++        tokens = shlex.split(wake_check)
++    except ValueError:
++        return None
++    if not tokens:
++        return None
++    executable = tokens[0].rsplit("/", 1)[-1]
++    if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", executable):
++        tokens = tokens[1:]
++        while tokens and tokens[0] in ("-S", "-I", "-B", "-u", "-E", "-s", "-O", "-OO"):
++            tokens = tokens[1:]
++    if tokens and "://" not in tokens[0] and re.fullmatch(
++            r"probe_(?:paired_)?(?:phone|iphone|ipad|device)_(?:available|visibility)\.py",
++            tokens[0].rsplit("/", 1)[-1]):
++        return ("Confirm paired-device access for the phone/device, or report that this availability "
++                "check is wrong. Unlocking or proximity alone may not make it visible.")
++    return None
++
++
+ def producer_from_wake_check(cmd: Any) -> Optional[tuple[str, str]]:
+     """``(kind, ref)`` named by a legacy wake check: a wait-check on a card (or a probe that reads one card's
+     status), a CI read, or an opaque probe."""
+@@ -177,6 +207,17 @@ def describe_contained(info: dict[str, Any], *, now: Optional[float] = None) ->
+             "premise": f"contained:{hashlib.sha1(key.encode()).hexdigest()[:12]}"}
+ 
+ 
++def _human_attention(status: str, human: bool, payload: dict, since: Any) -> Optional[dict[str, Any]]:
++    step = owner_device_step(payload.get("wake_check")) if status == "scheduled" and not human else None
++    if not human and not step:
++        return None
++    result = {"wait_state": "human", "waiting_on": "you", "waiting_since": since, "agent_owned": False,
++              "agent_owned_certain": True, "premise": None}
++    if step:
++        result.update(waiting_on="you: " + step, owner_step=step)
++    return result
++
++
+ def describe(status: Any, *, block_kind: Any = None, human: bool = False, park: Any = None,
+              park_kind: Any = None, since: Any = None, awaiting: Any = None, reason: Any = None,
+              now: Optional[float] = None) -> Optional[dict[str, Any]]:
+@@ -205,9 +246,9 @@ def describe(status: Any, *, block_kind: Any = None, human: bool = False, park:
+                 "waiting_since": since_s, "agent_owned": agent_owned, "agent_owned_certain": certain,
+                 "premise": premise_key(state_kind, status, reason, awaited, reason_code) if agent_owned else None}
+ 
+-    if human:
+-        return {"wait_state": "human", "waiting_on": "you", "waiting_since": since_s, "agent_owned": False,
+-                "agent_owned_certain": True, "premise": None}
++    attention = _human_attention(status, human, payload, since_s)
++    if attention is not None:
++        return attention
+     if exhausted and status in ("blocked", "triage"):
+         return out("continuation_exhausted", "an agent to split the work (continuation budget exhausted)", True)
+     if status == "triage":
+diff --git a/tests/hermes_cli/test_kanban_owner_device_wait.py b/tests/hermes_cli/test_kanban_owner_device_wait.py
+new file mode 100644
+index 00000000000..f7320cec875
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_owner_device_wait.py
+@@ -0,0 +1,91 @@
++"""An owner-controlled device is not an external producer. [daveey]"""
++import pytest
++
++from hermes_cli import kanban_awaiting as awaiting
++from hermes_cli import kanban_wait_info as waits
++from tests.hermes_cli import test_kanban_awaiting as helpers
++
++kanban_home = helpers.kanban_home
++
++
++PHONE = "python3 /workspace/probe_phone_available.py"
++PARK = {"wake_check": PHONE, "awaiting": {"kind": "external", "ref": "paired-phone",
++        "why": "Wait for natural paired-phone visibility"}}
++
++
++def test_legacy_phone_visibility_park_exposes_owner_step_without_mutation():
++    info = waits.describe("scheduled", park=PARK, since=100, now=200)
++    assert info["wait_state"] == "human"
++    assert info["owner_step"]
++    assert "phone" in info["owner_step"].lower()
++    assert not info["agent_owned"]
++    assert waits.describe("scheduled", park=PARK, since=100, now=10000)["owner_step"] == info["owner_step"]
++    assert "owner_step" not in PARK
++
++
++def test_replica_uses_same_phone_visibility_classification():
++    row = {"status": "scheduled", **PARK}
++    assert waits.describe_replica(row)["wait_state"] == "human"
++
++
++@pytest.mark.parametrize("declared", [None, PARK["awaiting"], {"kind": "clock", "why": "device window"}])
++def test_admission_refuses_phone_probe_before_reading_or_writing_board(declared):
++    with pytest.raises(awaiting.AwaitingError, match="human_wait.*human_request"):
++        awaiting.resolve(None, "t_abcdef1234567890", awaiting=declared,
++                         reason="Wait for natural paired-phone visibility", wake_check=PHONE)
++
++
++@pytest.mark.parametrize("probe", ["python3 probe_ci_available.py", "python3 probe_phone_captures.py",
++                                  "echo probe_phone_available.py", "printf '%s' probe_phone_available.py",
++                                  "python3 -c 'probe_phone_available.py'", "curl -o probe_phone_available.py",
++                                  "curl https://example.com/phone_available.py", "", "'", None])
++def test_unrelated_or_passive_producers_are_not_owner_steps(probe):
++    info = waits.describe("scheduled", park={"wake_check": probe, "awaiting": {
++        "kind": "external", "ref": "capture service", "why": "passive logs"}})
++    assert info["wait_state"] == "waiting"
++    assert "owner_step" not in info
++
++
++@pytest.mark.parametrize("op", ["schedule", "continue", "block"])
++def test_real_lifecycle_refuses_owner_probe_atomically(kanban_home, monkeypatch, op):
++    with helpers.kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        helpers._as_worker(monkeypatch, conn, tid)
++        args = {"reason": "Wait for natural paired-phone visibility; no repeated ask.",
++                "wake_check": PHONE, "awaiting": PARK["awaiting"]}
++        if op == "continue":
++            args["checkpoint"] = args.pop("reason")
++            args["resume_after_seconds"] = 900
++        elif op == "block":
++            args["kind"] = "time"
++        result = helpers._tool(op, args)
++        assert "human_wait" in result.get("error", ""), result
++        assert helpers.kb.get_task(conn, tid).status == "running"
++        assert helpers.kwc.get_state(conn, tid) is None
++        assert not [e for e in helpers.kb.list_events(conn, tid) if e.kind == "scheduled"]
++
++
++@pytest.mark.parametrize("probe", [PHONE, "/usr/bin/python3 -S /workspace/probe_phone_available.py",
++                                  "python3.14 -I -B '/some path/probe_paired_iphone_visibility.py'",
++                                  "/workspace/probe_device_available.py"])
++def test_known_legacy_probe_invocations(probe):
++    assert waits.owner_device_step(probe)
++
++
++def test_system_clock_requeue_is_not_a_new_device_ask(monkeypatch):
++    from hermes_cli import kanban_comment_origin
++    monkeypatch.setattr(kanban_comment_origin, "check_park", lambda *args: None)
++    declared = {"kind": "clock", "why": "system retry backoff"}
++    assert awaiting.resolve(None, "t_abcdef1234567890", awaiting=declared,
++                            reason="internal requeue", wake_check=PHONE, system=True) == declared
++
++
++def test_validated_human_ask_takes_precedence():
++    info = waits.describe("scheduled", human=True, park=PARK)
++    assert info["wait_state"] == "human"
++    assert "owner_step" not in info
++
++
++def test_other_statuses_do_not_resurrect_old_device_wait():
++    for status in ("running", "done", "ready", "review"):
++        assert waits.describe(status, park=PARK) is None
+-- 
+2.43.0
+

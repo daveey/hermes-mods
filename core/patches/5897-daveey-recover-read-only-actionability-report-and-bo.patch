@@ -1,0 +1,1442 @@
+From a51a6b430c817b99139127a65d0f6aca7b4be7a5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 05:44:58 +0000
+Subject: [PATCH] [daveey] recover read-only actionability report and bounded
+ card context
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban.py                          |   4 +
+ hermes_cli/kanban_actionability.py            | 177 ++++++++
+ hermes_cli/kanban_actionability_cli.py        |  87 ++++
+ hermes_cli/kanban_actionability_evidence.py   |  66 +++
+ hermes_cli/kanban_actionability_sources.py    | 267 +++++++++++
+ hermes_cli/kanban_db_context.py               |   3 +
+ hermes_cli/kanban_parser.py                   |   3 +
+ hermes_cli/kanban_shadow_view.py              |   6 +-
+ .../test_kanban_actionability_contract.py     | 279 ++++++++++++
+ .../test_kanban_actionability_report.py       | 415 ++++++++++++++++++
+ tools/kanban_show.py                          |   2 +
+ 11 files changed, 1307 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_actionability.py
+ create mode 100644 hermes_cli/kanban_actionability_cli.py
+ create mode 100644 hermes_cli/kanban_actionability_evidence.py
+ create mode 100644 hermes_cli/kanban_actionability_sources.py
+ create mode 100644 tests/hermes_cli/test_kanban_actionability_contract.py
+ create mode 100644 tests/hermes_cli/test_kanban_actionability_report.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 3c23308f294..e260e48096c 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -211,6 +211,8 @@ def kanban_command(args: argparse.Namespace) -> int:
+         board_scope = kb.scoped_current_board(normed)
+ 
+     with board_scope:
++        if action == "stranded":
++            return importlib.import_module("hermes_cli.kanban_actionability_cli").command(args)
+         # Maintenance handlers skip init_db; their connections still run schema setup.
+         if handler := {"repair": _cmd_repair, "recover": _cmd_recover,
+                        "correct-diagnostics": _cmd_correct_diagnostics}.get(action):
+@@ -741,6 +743,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
+ 
+     print(f"Task {task.id}: {task.title}")
+     field("status", kws.status_text(task.status, wakes))
++    from hermes_cli.kanban_actionability_evidence import render as render_actionability
++    field("actionability", render_actionability(details["actionability"]))
+     _shadow_view.print_remote(field, remote_home)
+     field("assignee", task.assignee or "-")
+     kqr.print_field(queue_reason, field)
+diff --git a/hermes_cli/kanban_actionability.py b/hermes_cli/kanban_actionability.py
+new file mode 100644
+index 00000000000..8590b6ef765
+--- /dev/null
++++ b/hermes_cli/kanban_actionability.py
+@@ -0,0 +1,177 @@
++"""Pure administrative actionability projection; never an admission/release decision. [daveey]"""
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++
++NONTERMINAL = ('todo', 'ready', 'running', 'scheduled', 'triage', 'blocked', 'review')
++
++
++def positive_time(value) -> int | None:
++    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
++        return None
++    return int(value)
++
++
++def owner(value) -> dict:
++    if isinstance(value, str) and value.strip():
++        return {'kind': 'assignee', 'refs': [value]}
++    return {'kind': 'unavailable', 'refs': []}
++
++
++def _block(row: dict, prerequisite: str, trigger: str, *, action: str) -> None:
++    row.update(action=action, instruction=trigger,
++               blocker={'prerequisite': prerequisite, 'trigger': trigger, 'evidence': row['source_refs']})
++
++
++def _decision(row: dict, facts: dict) -> None:
++    contract = facts.get('next_action') or {}
++    blocker = contract.get('blocker') if isinstance(contract.get('blocker'), dict) else {}
++    prerequisite = blocker.get('prerequisite')
++    trigger = blocker.get('trigger') or blocker.get('prerequisite')
++    instruction = contract.get('instruction')
++    _block(row, prerequisite if isinstance(prerequisite, str) and prerequisite.strip() else (
++        facts['stop'].get('cause') or 'Recorded spend decision'),
++        trigger if isinstance(trigger, str) and trigger.strip() else
++        'Administrative owner records a scoped decision; comments, timers and notices do not release work',
++        action='decide_scope')
++    if isinstance(instruction, str) and instruction.strip():
++        row['instruction'] = instruction
++    evidence = blocker.get('evidence')
++    if isinstance(evidence, list) and all(isinstance(ref, str) for ref in evidence):
++        row['blocker']['evidence'] = list(dict.fromkeys([*row['source_refs'], *evidence]))
++    release = contract.get('release')
++    if isinstance(release, dict) and isinstance(release.get('condition'), str) and release['condition'].strip():
++        row['release']['condition'] = release['condition']
++    row['release']['authority'] = 'unavailable'  # recorded conditions never grant release
++
++
++def _status(row: dict, facts: dict, now: int) -> None:
++    status = row['status']
++    if status not in NONTERMINAL:
++        row.update(action='no_open_action', instruction='n/a: terminal task has no open action')
++        row['release'] = {'authority': 'not_applicable', 'condition': 'No open action'}
++    elif facts.get('pending_command'):
++        _block(row, 'Exact canonical stop receipt reconciliation',
++               'Recover the original frozen request and verify its exact receipt; no replacement identity or fallback',
++               action='resolve_release_authority')
++        row['release']['authority'] = 'unavailable'
++        row['evidence_state'] = 'unknown'
++    elif facts.get('stop') and (not facts.get('containment') or
++                               facts['stop'].get('cause') in ('safety_refusal', 'scope_stopped')):
++        _decision(row, facts)
++    elif facts.get('containment'):
++        _block(row, 'Exact contained episode and live release authority',
++               'Resolve reconsideration ownership for this episode without resuming the held scope',
++               action='resolve_release_authority')
++        row['release']['authority'] = 'unavailable'
++    elif facts.get('human_step'):
++        _block(row, facts['human_step'], 'Supply the recorded human step: ' + facts['human_step'],
++               action='supply_recorded_human_step')
++    elif facts.get('dependencies'):
++        deps = facts['dependencies']
++        _block(row, '; '.join(f"{d['task_id']} ({d['status'] or 'unknown'})" for d in deps),
++               '; '.join(d['trigger'] for d in deps), action='satisfy_dependency')
++    elif status == 'scheduled':
++        _schedule(row, facts, now)
++    elif status == 'running':
++        run = facts.get('run') or {}
++        if not run or run.get('status') != 'running' or run.get('ended_at') is not None:
++            if facts.get('run_evidence_known'):
++                row['violations'].append('running_without_current_run')
++            else:
++                row['evidence_state'] = 'unknown'
++            _block(row, 'Current live executor/run witness',
++                   'Dispatcher verifies worker loss through existing reclaim APIs; preserve pending stop custody',
++                   action='repair_lifecycle_contract')
++        else:
++            row.update(action='execute_current_scope', instruction='Current executor continues its admitted scope')
++            # A persisted running row cannot prove process/lease liveness without a fresh witness.
++            row['evidence_state'] = 'unknown'
++    elif status in ('ready', 'review'):
++        row.update(action='review_current_scope' if status == 'review' else 'execute_current_scope',
++                   instruction='Assigned profile requests normal admission; all existing holds and review gates apply')
++        row['evidence_state'] = 'unknown'  # read-only database evidence is not live eligibility
++    elif status == 'todo':
++        row['violations'].append('dependency_transition_due')
++        _block(row, 'Existing recompute_ready transition',
++               'Dispatcher recomputes satisfied dependencies, preserving review phase and all execution holds',
++               action='repair_lifecycle_contract')
++    elif status == 'triage':
++        row.update(action='decide_scope', instruction='Assigned profile specifies or reviews scope before explicit promotion')
++    else:
++        row['violations'].append('lifecycle_contract_missing')
++        _block(row, 'Supported lifecycle transition', 'Assigned owner repairs the lifecycle contract without bypassing holds',
++               action='repair_lifecycle_contract')
++
++
++def _schedule(row: dict, facts: dict, now: int) -> None:
++    wake = positive_time(facts.get('wake_at'))
++    awaiting = facts.get('awaiting') or {}
++    probe = facts.get('probe')
++    if not wake:
++        row['violations'].append('scheduled_wake_missing')
++    elif now > wake + 600:
++        row['violations'].append('scheduled_wake_overdue')
++    trigger = f"Recorded clock reaches {wake}" if awaiting.get('kind') == 'clock' and wake else (
++        f"Recorded {awaiting.get('kind')} producer {awaiting.get('ref') or awaiting.get('why') or ''}" if awaiting else '')
++    if probe:
++        trigger = f'Recorded condition probe succeeds: {probe}'
++    if not trigger:
++        row['violations'].append('recovery_trigger_missing')
++    _block(row, trigger or 'Named finite producer and recovery condition',
++           trigger or 'Repair the missing wake/producer through existing scheduling APIs',
++           action='repair_lifecycle_contract' if row['violations'] else 'wait_for_named_producer')
++
++
++def project(facts: dict, *, now: int) -> dict:
++    """Project only supplied facts. `now` affects overdue display, never identity/deadline."""
++    task = facts['task']
++    identity = {key: facts.get(key) for key in ('source_uid', 'stop_episode', 'containment',
++                                              'administrative_owner')}
++    identity['dependencies'] = [{k: dep.get(k) for k in ('task_id', 'status', 'owner', 'stop_episode', 'containment')}
++                                for dep in facts.get('dependencies', [])]
++    command = facts.get('pending_command')
++    identity['pending_command'] = {k: command.get(k) for k in ('request_uid', 'request_sha256', 'run_uid', 'operation_kind')} if command else None
++    identity['stop_cause'] = (facts.get('stop') or {}).get('cause')
++    identity.update(task_id=task['id'], status=task['status'], assignee=task.get('assignee'))
++    key = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
++    first = positive_time(facts.get('source_at')) or positive_time(task.get('created_at'))
++    deadline = positive_time(facts.get('deadline_at'))
++    wake = positive_time(facts.get('wake_at'))
++    if task['status'] == 'scheduled' and wake and not any(
++            facts.get(k) for k in ('pending_command', 'stop', 'containment', 'human_step', 'dependencies')):
++        deadline = max(deadline or 0, wake + 600)
++    row = {'version': 1, 'task_id': task['id'], 'status': task['status'], 'contract_key': key,
++           'evidence_state': 'unknown' if facts.get('unknown') else 'known',
++           'owner': facts.get('administrative_owner') or owner(task.get('assignee')),
++           'action': 'repair_lifecycle_contract', 'instruction': '', 'blocker': None,
++           'release': {'authority': 'existing_lifecycle_gates', 'condition': 'Existing authenticated lifecycle policy'},
++           'escalation': {'at': deadline, 'route': 'existing_decision_requested', 'state': 'pending', 'receipt_uid': None},
++           'violations': [], 'source_refs': facts.get('source_refs', []),
++           'dependencies': facts.get('dependencies', []), 'first_observed': first,
++           'materialization': 'source_derived'}
++    _status(row, facts, now)
++    if task['status'] not in NONTERMINAL:
++        row['violations'] = []
++        row['escalation'].update(at=None, state='not_applicable')
++        return row
++    deps = row['dependencies']
++    if deps and all(d.get('restricted') and d.get('evidence_state') == 'known' for d in deps):
++        row['release']['authority'] = 'unavailable'
++        if all(d.get('administrative_owner', {}).get('kind') == 'unavailable' for d in deps):
++            row['violations'].append('dependency_recovery_unavailable')
++    if row['owner']['kind'] == 'unavailable':
++        row['violations'].append('owner_missing')
++    elif row['owner']['kind'] == 'unknown' or not row['owner'].get('refs'):
++        row['evidence_state'] = 'unknown'
++    if not deadline:
++        row['violations'].append('escalation_deadline_missing')
++        row['escalation']['state'] = 'unavailable'
++        row['evidence_state'] = 'unknown'
++    if row['blocker'] and deadline and now >= deadline:
++        row['violations'].append('escalation_overdue')
++    if facts.get('unknown'):
++        row['evidence_state'] = 'unknown'
++    return row
+diff --git a/hermes_cli/kanban_actionability_cli.py b/hermes_cli/kanban_actionability_cli.py
+new file mode 100644
+index 00000000000..272a9ccea0c
+--- /dev/null
++++ b/hermes_cli/kanban_actionability_cli.py
+@@ -0,0 +1,87 @@
++"""Read-only stranded-card report with exact streamed counts, no init/sync/network. [daveey]"""
++from __future__ import annotations
++
++from collections import Counter
++from contextlib import closing
++import json
++import sqlite3
++import sys
++import time
++
++from hermes_cli.kanban_actionability import NONTERMINAL
++from hermes_cli.kanban_actionability_sources import Reader, describe
++from hermes_cli.kanban_lockguard import connect
++
++
++def report(conn: sqlite3.Connection, *, limit: int = 100, after: str = '', now: int | None = None) -> dict:
++    """Counts cover the complete snapshot, pagination only limits displayed rows.
++
++    Unknown and violated are independent: a partial replica may already demonstrate
++    a violation without proving the absence of others. No zero-known-violation
++    result is evidence of an invariant while unknown_count is nonzero.
++    """
++    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
++        raise ValueError('limit must be between 1 and 1000')
++    now = int(time.time()) if now is None else int(now)
++    rows, count, violations, unknown, more = [], 0, 0, 0, False
++    per_status = Counter()
++    owned_transaction = not conn.in_transaction
++    if owned_transaction:
++        conn.execute('BEGIN')
++    try:
++        reader = Reader(conn)
++        cursor = ''
++        marks = ','.join('?' for _ in NONTERMINAL)
++        while True:
++            batch = conn.execute(f'SELECT id,status FROM tasks WHERE id>? AND status IN ({marks}) '
++                                 'ORDER BY id LIMIT 128', (cursor, *NONTERMINAL)).fetchall()
++            if not batch:
++                break
++            for task in batch:
++                tid, status = task
++                row = describe(conn, tid, now=now, reader=reader)
++                count += 1
++                per_status[status] += 1
++                violations += bool(row['violations'])
++                unknown += row['evidence_state'] == 'unknown'
++                if tid > after:
++                    if len(rows) < limit:
++                        rows.append(row)
++                    else:
++                        more = True
++            cursor = batch[-1][0]
++    finally:
++        if owned_transaction:
++            conn.rollback()  # close this read snapshot, never the caller's transaction
++    return {'version': 1, 'observed_at': now, 'total_nonterminal': count, 'scanned_count': count,
++            'known_violation_count': violations, 'unknown_count': unknown, 'per_status': dict(per_status),
++            'returned_count': len(rows), 'has_more': more,
++            'next_after': rows[-1]['task_id'] if more and rows else None, 'rows': rows,
++            'read_only': True, 'admission_authority': False}
++
++
++def command(args) -> int:
++    from hermes_cli import kanban_db as kb
++    path = kb.kanban_db_path()
++    try:
++        with closing(connect(path.absolute().as_uri() + '?mode=ro', uri=True)) as conn:
++            conn.row_factory = sqlite3.Row
++            conn.execute('PRAGMA query_only=ON')
++            result = report(conn, limit=args.limit, after=args.after or '')
++    except (sqlite3.Error, ValueError) as exc:
++        print(f'kanban stranded: {exc}', file=sys.stderr)
++        return 1
++    if args.json:
++        print(json.dumps(result, sort_keys=True))
++    else:
++        print(f"{result['total_nonterminal']} nonterminal; {result['known_violation_count']} with known violations; "
++              f"{result['unknown_count']} with unknown evidence (not invariant success)")
++        for row in result['rows']:
++            blocker = row['blocker']
++            step = blocker['trigger'] if blocker else row['instruction']
++            print(f"{row['task_id']} {row['status']} owner={row['owner']} {row['action']}: {step}; "
++                  f"deadline={row['escalation']['at']} evidence={row['evidence_state']} "
++                  f"violations={','.join(row['violations']) or 'none observed'}")
++        if result['has_more']:
++            print(f"More rows: --after {result['next_after']}")
++    return 0
+diff --git a/hermes_cli/kanban_actionability_evidence.py b/hermes_cli/kanban_actionability_evidence.py
+new file mode 100644
+index 00000000000..198802348d3
+--- /dev/null
++++ b/hermes_cli/kanban_actionability_evidence.py
+@@ -0,0 +1,66 @@
++"""Fault-contained, read-only reuse of lifecycle evidence; never a policy writer. [daveey]"""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++EVIDENCE_ERRORS = (sqlite3.Error, ValueError, TypeError, KeyError, AttributeError, OverflowError)
++
++
++class Rows:
++    """Give legacy policy readers named rows without mutating a caller's connection factory."""
++
++    def __init__(self, conn):
++        self.conn = conn
++
++    def execute(self, sql, params=()):
++        cursor = self.conn.cursor()
++        cursor.row_factory = sqlite3.Row
++        return cursor.execute(sql, params)
++
++
++def effective(reader, tid):
++    """Return (pending stop, execution restriction, unknown). Arrival order is LOCAL evidence."""
++    from hermes_cli import kanban_spend_decision as decision
++    conn = Rows(reader.conn)
++    try:
++        stop = decision.pending_episode(conn, tid)
++        restricted = decision.execution_restricted(conn, tid)
++        if stop:
++            stop = {**stop, 'data': json.loads(stop['payload'] or '{}')}
++            if not isinstance(stop['data'], dict):
++                return None, False, True
++            if restricted:
++                from hermes_cli.kanban_refusal_receipt import restricted as safety
++                stop['data']['cause'] = 'safety_refusal' if safety(conn, tid) else 'scope_stopped'
++        return stop, restricted, False
++    except EVIDENCE_ERRORS:
++        return None, False, True
++
++
++def fields(conn, task, *, replica=False):
++    """Optional per-card carriage. No whole-report scan, refresh or admission side effect."""
++    from hermes_cli.kanban_actionability_sources import describe
++    try:
++        row = describe(conn, task.id)
++    except EVIDENCE_ERRORS:
++        from hermes_cli.kanban_actionability import project
++        row = project({'task': {'id': task.id, 'status': task.status, 'assignee': task.assignee},
++                       'unknown': True}, now=0)
++        row['violations'] = ['evidence_unavailable']
++        row.update(action='repair_lifecycle_contract', instruction='Recover authoritative task evidence')
++    if replica and row['action'] != 'no_open_action':
++        row['evidence_state'] = 'unknown'
++    return {'actionability': row}
++
++
++def render(row):
++    """Bounded prompt/status line, not a generated executable original-scope instruction."""
++    return (f"Actionability: {row['action']}; owner={row['owner']}; "
++            f"{row['instruction']}; deadline={row['escalation']['at']} "
++            f"(null=unrecorded); evidence={row['evidence_state']}; "
++            f"violations={','.join(row['violations']) or 'none observed'}")[:1800]
++
++
++def context(lines, conn, task):
++    lines.append(render(fields(conn, task)['actionability']))
+diff --git a/hermes_cli/kanban_actionability_sources.py b/hermes_cli/kanban_actionability_sources.py
+new file mode 100644
+index 00000000000..60a8d0009e4
+--- /dev/null
++++ b/hermes_cli/kanban_actionability_sources.py
+@@ -0,0 +1,267 @@
++"""Read-only SQLite fact adapters for actionability. No migrations, refresh or side effects. [daveey]"""
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++
++from hermes_cli.kanban_actionability import owner, project
++from hermes_cli.kanban_actionability_evidence import EVIDENCE_ERRORS, effective
++
++KINDS = ('created', 'blocked', 'scheduled', 'continued', 'spend_budget_triaged',
++         'decision_hold_restricted', 'decision_retained', 'decision_protected_stopped',
++         'spend_budget_decision_ready', 'promoted_manual', 'archived', 'contained')
++
++
++def record(raw) -> dict:
++    if isinstance(raw, dict):
++        return raw
++    try:
++        value = json.loads(raw or '{}')
++    except (ValueError, TypeError):
++        return {}
++    return value if isinstance(value, dict) else {}
++
++
++def _human_step(raw) -> str | None:
++    request = record(raw)
++    required = ('action', 'why_human', 'scope', 'evidence')
++    if not all(isinstance(request.get(k), str) and request[k].strip() for k in required):
++        return None
++    return request['action'] if request.get('interaction') in ('approval', 'reply', 'user_terminal', 'physical', 'external') else None
++
++
++class Reader:
++    """Only fixed local schema names and parameterized coordinates; optional legacy tables are unknown."""
++
++    def __init__(self, conn: sqlite3.Connection):
++        self.conn = conn
++        self.tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
++        self.schema = {}
++        self.event_columns = self.columns('task_events')
++        self.events_complete = {'task_id', 'kind', 'payload', 'created_at', 'id'} <= self.event_columns
++        self.partial = not self.events_complete
++        self.malformed = set()
++        sync_columns = self.columns('kanban_sync_state')
++        self.synced = 'mode' in sync_columns and bool(conn.execute(
++            "SELECT 1 FROM kanban_sync_state WHERE mode!='off' LIMIT 1").fetchone())
++        self.partial |= 'kanban_sync_state' in self.tables and 'mode' not in sync_columns
++        shapes = {'task_runs': {'id', 'task_id', 'status', 'ended_at'},
++                  'task_wake_checks': {'task_id', 'cmd'},
++                  'kanban_failure_commands': {'task_id', 'run_uid', 'request_uid', 'operation_kind',
++                                             'delivery_state', 'canonical_receipt_json'}}
++        self.partial |= any(not required <= self.columns(table) for table, required in shapes.items())
++
++    def columns(self, table: str) -> set[str]:
++        if table not in self.schema:
++            self.schema[table] = {r[0] for r in self.conn.execute('SELECT name FROM pragma_table_info(?)', (table,))}
++        return self.schema[table]
++
++    def rows(self, sql: str, params=()) -> list[dict]:
++        cursor = self.conn.execute(sql, params)
++        names = [d[0] for d in cursor.description]
++        return [dict(zip(names, row)) for row in cursor]
++
++    def task(self, tid: str) -> dict | None:
++        rows = self.rows('SELECT * FROM tasks WHERE id=?', (tid,))
++        return rows[0] if rows else None
++
++    def events(self, tid: str) -> list[dict]:
++        if not self.events_complete:
++            return []
++        order = 'created_at DESC,uid DESC' if 'uid' in self.event_columns else 'created_at DESC,id DESC'
++        marks = ','.join('?' for _ in KINDS)
++        live = ' AND deleted_at IS NULL' if 'deleted_at' in self.event_columns else ''
++        rows = self.rows(f'SELECT * FROM task_events WHERE task_id=? AND kind IN ({marks}){live} ORDER BY {order}',
++                         (tid, *KINDS))
++        for row in rows:
++            try:
++                payload = json.loads(row['payload'] or '{}')
++                if not isinstance(payload, dict) or any(
++                        payload.get(k) is not None and not isinstance(payload[k], str)
++                        for k in ('episode', 'episode_uid', 'cause')) or any(
++                        payload.get(k) is not None and not isinstance(payload[k], dict)
++                        for k in ('next_action', 'producer')):
++                    self.malformed.add(tid)
++            except (ValueError, TypeError):
++                self.malformed.add(tid)
++        return [{**r, 'data': record(r['payload'])} for r in rows]
++
++    def uid(self, event: dict) -> str | None:
++        if 'uid' in self.event_columns and event.get('uid'):
++            return event['uid']
++        return None if self.synced else str(event['id'])
++
++    def pending(self, tid: str) -> dict | None:
++        if 'kanban_failure_commands' not in self.tables:
++            return None
++        columns = self.columns('kanban_failure_commands')
++        if not {'task_id', 'run_uid', 'request_uid', 'operation_kind', 'delivery_state', 'canonical_receipt_json'} <= columns:
++            return None
++        rows = self.rows("SELECT * FROM kanban_failure_commands WHERE task_id=? AND operation_kind='retain' "
++                         "AND (delivery_state IS NULL OR delivery_state NOT IN ('confirmed','rejected')) "
++                         "ORDER BY run_uid,request_uid LIMIT 2", (tid,))
++        return {**rows[0], '_ambiguous': len(rows) > 1} if rows else None
++
++
++def _unresolved_receipt(events: list[dict]) -> dict | None:
++    promoted = False
++    for event in events:
++        if event['kind'] == 'promoted_manual':
++            promoted = True
++        if event['kind'] not in ('decision_retained', 'decision_protected_stopped'):
++            continue
++        disposition = record(event['data'].get('disposition'))
++        restricted = event['kind'] == 'decision_protected_stopped' or disposition.get('reason') == 'scope_stopped' or event['data'].get('superseded_by_safety_stop') is True
++        if restricted or not promoted:
++            return event
++    return None
++
++
++def _state(reader, tid, events):
++    stop, restricted, unknown = effective(reader, tid)
++    try:
++        from hermes_cli.kanban_scope_renewal import covered, renewals
++        from hermes_cli.kanban_actionability_evidence import Rows
++        renewed = covered(Rows(reader.conn), tid)
++        valid = renewals(Rows(reader.conn), tid)
++    except EVIDENCE_ERRORS:
++        renewed, valid, unknown = (), [], True
++    remaining = [e for e in events if e['data'].get('superseded_by_safety_stop') is True or (
++                 reader.uid(e) not in renewed and not any(
++                     e['data'].get('episode_uid') == r['payload']['episode'] and
++                     int(e['id']) < int(r['id']) for r in valid))]
++    receipt = None if stop else _unresolved_receipt(remaining)
++    return stop or receipt, restricted, reader.partial or unknown or bool(receipt) or tid in reader.malformed
++
++
++def _dependencies(reader: Reader, tid: str) -> tuple[list[dict], bool]:
++    if 'task_links' not in reader.tables:
++        return [], True
++    result, unknown = [], False
++    for (pid,) in reader.conn.execute('SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id', (tid,)):
++        parent = reader.task(pid)
++        if parent is None:
++            result.append({'task_id': pid, 'status': None, 'owner': owner(None),
++                           'trigger': f'Recover authoritative parent evidence for {pid}'})
++            unknown = True
++            continue
++        parent_events = reader.events(pid)
++        stop, restricted, partial = _state(reader, pid, parent_events)
++        unknown |= partial or reader.synced
++        contained = parent.get('containment_episode')
++        if parent['status'] in ('done', 'archived') and not stop and not contained and not partial:
++            continue
++        episode = (stop['data'].get('episode_uid') or stop['data'].get('episode') or reader.uid(stop)) if stop else None
++        admin, _ = _administration(reader, parent_events, episode)
++        step = _human_step(parent.get('human_request'))
++        result.append({'task_id': pid, 'status': parent['status'], 'owner': owner(parent.get('assignee')),
++                       'restricted': restricted, 'administrative_owner': admin,
++                       'evidence_state': 'unknown' if partial or reader.synced else 'known',
++                       'stop_episode': (stop['data'].get('episode_uid') or stop['data'].get('episode') or reader.uid(stop)) if stop else None,
++                       'containment': contained,
++                       'trigger': f'{pid}: {step}' if isinstance(step, str) and step.strip() else (
++                           f'{pid}: supported resolution of its protected episode' if stop or contained else
++                           f'{pid}: accountable owner completes its acceptance')})
++    return result, unknown
++
++
++def _route_owner(reader: Reader, route: dict) -> dict:
++    tid = route.get('task_id')
++    if not tid and route.get('kind') == 'task' and isinstance(route.get('refs'), list):
++        tid = next(iter(route['refs']), None)
++    if isinstance(tid, str):
++        task = reader.task(tid)
++        if not task or task['status'] in ('done', 'archived'):
++            return {'kind': 'unavailable', 'refs': [tid]}
++        stop, restricted, unknown = _state(reader, tid, reader.events(tid))
++        if unknown or reader.synced:
++            return {'kind': 'unknown', 'refs': [tid]}
++        held = stop or restricted or task.get('containment_episode')
++        return {'kind': 'unavailable' if held else 'task', 'refs': [tid]}
++    if route.get('kind') in ('chat', 'chats'):
++        return {'kind': 'chat', 'refs': []}  # route exists, exact counted/liveness evidence not loaded offline
++    return {'kind': 'unavailable', 'refs': []}
++
++
++def _administration(reader: Reader, events: list[dict], episode: str | None) -> tuple[dict, dict]:
++    scoped = [e for e in events if episode and (e['data'].get('episode') or e['data'].get('episode_uid')) == episode]
++    routes, deadlines = [], []
++    from hermes_cli.kanban_actionability import positive_time
++    for event in scoped:
++        p = event['data']
++        next_action = record(p.get('next_action'))
++        deadline = positive_time(next_action.get('escalate_at')) or positive_time(record(next_action.get('escalation')).get('at'))
++        if deadline:
++            deadlines.append(deadline)
++        route = p.get('producer') or next_action.get('owner')
++        if isinstance(route, dict):
++            routes.append(route)
++    admin = _route_owner(reader, routes[0]) if routes else {'kind': 'unavailable', 'refs': []}
++    contracts = [record(e['data'].get('next_action')) for e in scoped if record(e['data'].get('next_action'))]
++    return admin, {**(contracts[0] if contracts else {}), 'escalate_at': min(deadlines) if deadlines else None}
++
++
++def describe(conn: sqlite3.Connection, tid: str, *, now: int | None = None, reader: Reader | None = None) -> dict:
++    """One task and its immediate parents only; malformed optional evidence stays UNKNOWN."""
++    reader = reader or Reader(conn)
++    task = reader.task(tid)
++    if task is None:
++        raise ValueError(f'unknown task: {tid}')
++    now = int(time.time()) if now is None else now
++    try:
++        return _describe(conn, tid, now=now, reader=reader)
++    except EVIDENCE_ERRORS:
++        row = project({'task': task, 'unknown': True}, now=now)
++        if task['status'] in ('done', 'archived'):
++            return row
++        row['violations'] = ['evidence_unavailable']
++        row.update(action='repair_lifecycle_contract', instruction='Recover authoritative task evidence')
++        return row
++
++
++def _describe(conn, tid, *, now, reader):
++    """Source-derived diagnostics only. Foreign/canonical freshness is explicitly UNKNOWN."""
++    reader = reader or Reader(conn)
++    task = reader.task(tid)
++    if task is None:
++        raise ValueError(f'unknown task: {tid}')
++    events = reader.events(tid)
++    stop, _restricted, receipt_only = _state(reader, tid, events)
++    schedule = next((e for e in events if e['kind'] in ('scheduled', 'continued')), None)
++    # Notes/notices do not replace the material source or reset its deadline.
++    source = stop or (schedule if task['status'] == 'scheduled' else next(
++        (e for e in events if e['kind'] not in ('spend_budget_decision_ready', 'decision_retained',
++                                             'decision_protected_stopped')), None))
++    deps, missing = _dependencies(reader, tid)
++    episode = (stop['data'].get('episode') or stop['data'].get('episode_uid') or reader.uid(stop)) if stop else None
++    episode = episode if isinstance(episode, str) and episode else None
++    root = next((e for e in events if reader.uid(e) == episode), stop) if episode else stop
++    admin, next_action = _administration(reader, events, episode) if stop else (None, {})
++    stop_data = stop['data'] if stop else {}
++    cause = stop_data.get('cause')
++    cause = cause if isinstance(cause, str) and cause.strip() else 'spend_budget'
++    facts = {'task': task, 'stop': {**stop_data, 'cause': cause} if stop else None,
++             'stop_episode': episode, 'dependencies': deps,
++             'administrative_owner': admin, 'next_action': next_action,
++             'source_uid': reader.uid(source) if source else None,
++             'source_at': ((root if stop else source) or {}).get('created_at'),
++             'source_refs': [reader.uid(source)] if source and reader.uid(source) else [],
++             'deadline_at': next_action.get('escalate_at') or record(next_action.get('escalation')).get('at'),
++             'containment': task.get('containment_episode'), 'pending_command': reader.pending(tid),
++             'human_step': _human_step(task.get('human_request')),
++             'unknown': reader.synced or reader.partial or missing or bool(receipt_only) or bool(source and not reader.uid(source))
++                        or bool(task.get('human_request') and not _human_step(task['human_request']))}
++    if schedule:
++        facts.update(wake_at=schedule['data'].get('wake_at'), awaiting=record(schedule['data'].get('awaiting')))
++    wake_columns = reader.columns('task_wake_checks')
++    if {'task_id', 'cmd'} <= wake_columns:
++        probe = conn.execute('SELECT cmd FROM task_wake_checks WHERE task_id=?', (tid,)).fetchone()
++        facts['probe'] = probe[0] if probe else None
++    run_columns = reader.columns('task_runs')
++    facts['run_evidence_known'] = {'id', 'task_id', 'status', 'ended_at'} <= run_columns and 'current_run_id' in task
++    if facts['run_evidence_known'] and task.get('current_run_id') is not None:
++        runs = reader.rows('SELECT * FROM task_runs WHERE id=? AND task_id=?', (task['current_run_id'], tid))
++        facts['run'] = runs[0] if runs else None
++    facts['unknown'] |= bool(stop and not episode)
++    return project(facts, now=int(time.time()) if now is None else now)
+diff --git a/hermes_cli/kanban_db_context.py b/hermes_cli/kanban_db_context.py
+index 06c6289c8d6..4556c608b2b 100644
+--- a/hermes_cli/kanban_db_context.py
++++ b/hermes_cli/kanban_db_context.py
+@@ -121,6 +121,9 @@ def _ctx_header(lines: list[str], task: Task, *, conn: Optional[sqlite3.Connecti
+     lines.append("")
+     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
+     lines.append(f"Status:   {task.status}")
++    if conn is not None:
++        from hermes_cli.kanban_actionability_evidence import context
++        context(lines, conn, task)
+     if task.tenant:
+         lines.append(f"Tenant:   {task.tenant}")
+     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 5ea0ebfc351..1058a1e311c 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -204,6 +204,9 @@ _BOARD_SPECS = [
+ 
+ # Top-level ``hermes kanban <action>`` records, in ``--help`` order.
+ _SPECS = [
++    _cmd("stranded", [_json_flag(), _arg("--limit", type=int, default=100),
++                      _arg("--after", default='', metavar="TASK_ID")],
++         help="Read-only actionability report; unknown evidence is not permission or invariant success"),
+     _cmd("selfwork-producer", [
+         _arg("--operation", choices=["capabilities", "prepare", "advance"], required=True),
+         _arg("--request-file", default="-", help="Producer JSON snapshot ('-' = stdin)"),
+diff --git a/hermes_cli/kanban_shadow_view.py b/hermes_cli/kanban_shadow_view.py
+index 4a3f9e1ecf3..50c72a090d5 100644
+--- a/hermes_cli/kanban_shadow_view.py
++++ b/hermes_cli/kanban_shadow_view.py
+@@ -142,10 +142,12 @@ def mark(d: dict[str, Any], home: Optional[str]) -> dict[str, Any]:
+ 
+ def show_details(conn: sqlite3.Connection, task: Any, board: Optional[str], home: Optional[str]) -> dict[str, Any]:
+     """``show``'s queue/capacity fields. A remote card has no queue here: it waits on its home gateway."""
++    from hermes_cli.kanban_actionability_evidence import fields as actionability_fields
++    details = actionability_fields(conn, task, replica=home is not None)
+     if home is not None:
+-        return {"capacity_note": f"remote (read-only replica of {home})"}
++        return {**details, "capacity_note": f"remote (read-only replica of {home})"}
+     from hermes_cli import kanban_queue_position as kqp
+-    return kqp.detail_fields(conn, task, board)
++    return {**details, **kqp.detail_fields(conn, task, board)}
+ 
+ 
+ def print_remote(field: Any, home: Optional[str]) -> None:
+diff --git a/tests/hermes_cli/test_kanban_actionability_contract.py b/tests/hermes_cli/test_kanban_actionability_contract.py
+new file mode 100644
+index 00000000000..d7be270aa93
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_contract.py
+@@ -0,0 +1,279 @@
++"""Episode/deadline boundaries from bounded slice review; synthetic diagnostic fixtures. [daveey]"""
++from __future__ import annotations
++
++import sqlite3
++import json
++
++from hermes_cli.kanban_actionability import project
++from hermes_cli.kanban_actionability_sources import describe
++
++
++def fixture():
++    conn = sqlite3.connect(':memory:')
++    conn.row_factory = sqlite3.Row
++    conn.executescript('CREATE TABLE tasks(id TEXT,status TEXT,assignee TEXT,created_at INTEGER);'
++                       'CREATE TABLE task_events(id INTEGER PRIMARY KEY,uid TEXT,task_id TEXT,kind TEXT,payload TEXT,created_at INTEGER);'
++                       'CREATE TABLE task_links(parent_id TEXT,child_id TEXT);'
++                       "INSERT INTO tasks VALUES('root','triage','default',100);"
++                       "INSERT INTO tasks VALUES('owner','ready','default',100);")
++    return conn
++
++
++def event(conn, uid, kind, data, at):
++    conn.execute('INSERT INTO task_events(uid,task_id,kind,payload,created_at) VALUES(?,\'root\',?,?,?)',
++                 (uid, kind, json.dumps(data), at))
++
++
++def test_containment_precedes_ordinary_spend_but_not_protected_stop():
++    facts = {'task': {'id': 'root', 'status': 'triage', 'assignee': 'default', 'created_at': 100},
++             'containment': 'contained-a', 'stop': {'cause': 'spend_budget'}}
++    row = project(facts, now=200)
++    assert row['action'] == 'resolve_release_authority'
++    facts['stop']['cause'] = 'scope_stopped'
++    assert project(facts, now=200)['action'] == 'decide_scope'
++
++
++def test_dependency_display_words_do_not_change_material_identity():
++    facts = {'task': {'id': 'root', 'status': 'todo', 'assignee': 'default', 'created_at': 100},
++             'dependencies': [{'task_id': 'parent', 'status': 'blocked',
++                               'owner': {'kind': 'assignee', 'refs': ['default']}, 'trigger': 'first wording'}]}
++    before = project(facts, now=200)
++    facts['dependencies'][0]['trigger'] = 'reworded display only'
++    assert project(facts, now=200)['contract_key'] == before['contract_key']
++
++
++def test_receipt_only_archived_parent_is_unknown_not_satisfied():
++    conn = fixture()
++    conn.execute("UPDATE tasks SET status='archived' WHERE id='root'")
++    conn.execute("UPDATE tasks SET status='todo' WHERE id='owner'")
++    conn.execute("INSERT INTO task_links VALUES('root','owner')")
++    event(conn, 'receipt', 'decision_retained', {'episode_uid': 'stop',
++          'disposition': {'reason': 'scope_stopped'}}, 101)
++    row = describe(conn, 'owner', now=200)
++    assert row['dependencies'][0]['task_id'] == 'root'
++    assert row['evidence_state'] == 'unknown'
++    assert row['action'] == 'satisfy_dependency'
++    conn.close()
++
++
++def test_retained_actual_prerequisite_instruction_and_release_condition_are_visible():
++    conn = fixture()
++    event(conn, 'stop', 'spend_budget_triaged', {'cause': 'capability_unavailable'}, 100)
++    event(conn, 'receipt', 'decision_retained', {'episode_uid': 'stop', 'next_action': {
++        'owner': {'kind': 'task', 'refs': ['owner']}, 'instruction': 'Restore native pickup, then verify the claimed process',
++        'blocker': {'prerequisite': 'native kanban.sync.pickup on worker-x', 'trigger': 'Verified native pickup',
++                    'evidence': ['registry-snapshot']},
++        'release': {'authority': 'existing_owner', 'condition': 'Native process claimed and verified'},
++        'escalation': {'at': 500}}}, 101)
++    row = describe(conn, 'root', now=200)
++    assert row['blocker']['prerequisite'] == 'native kanban.sync.pickup on worker-x'
++    assert row['blocker']['trigger'] == 'Verified native pickup'
++    assert row['instruction'] == 'Restore native pickup, then verify the claimed process'
++    assert row['release']['condition'] == 'Native process claimed and verified'
++    assert row['release']['authority'] == 'unavailable'
++    conn.close()
++
++
++def test_diagnostic_notice_cannot_renew_retained_deadline():
++    conn = fixture()
++    event(conn, 'stop-a', 'spend_budget_triaged', {'cause': 'scope_stopped'}, 100)
++    event(conn, 'retained-a', 'decision_retained', {'episode_uid': 'stop-a',
++          'next_action': {'owner': {'kind': 'task', 'refs': ['owner']}, 'escalation': {'at': 500}}}, 101)
++    before = describe(conn, 'root', now=400)
++    event(conn, 'notice-a', 'spend_budget_decision_ready', {'episode': 'stop-a',
++          'producer': {'kind': 'supervisor', 'task_id': 'owner'}}, 102)
++    after = describe(conn, 'root', now=400)
++    assert before['contract_key'] == after['contract_key']
++    assert before['escalation']['at'] == after['escalation']['at'] == 500
++    conn.close()
++
++
++def test_unavailable_route_does_not_fall_back_to_workload_assignee():
++    conn = fixture()
++    event(conn, 'stop-a', 'spend_budget_triaged', {'cause': 'scope_stopped'}, 100)
++    event(conn, 'retained-a', 'decision_retained', {'episode_uid': 'stop-a',
++          'next_action': {'owner': {'kind': 'unavailable', 'refs': []}, 'escalation': {'at': 500}}}, 101)
++    row = describe(conn, 'root', now=400)
++    assert row['owner']['kind'] == 'unavailable'
++    assert row['escalation']['at'] == 500
++    assert 'owner_missing' in row['violations']
++    conn.close()
++
++
++def test_new_stop_cannot_reuse_prior_episode_owner():
++    conn = fixture()
++    event(conn, 'stop-a', 'spend_budget_triaged', {}, 100)
++    event(conn, 'notice-a', 'spend_budget_decision_ready', {'episode': 'stop-a',
++          'producer': {'kind': 'supervisor', 'task_id': 'owner'}}, 101)
++    event(conn, 'promoted', 'promoted_manual', {}, 102)
++    event(conn, 'stop-b', 'spend_budget_triaged', {}, 103)
++    row = describe(conn, 'root', now=104)
++    assert row['owner']['kind'] == 'unavailable'
++    assert 'owner_missing' in row['violations']
++    conn.close()
++
++
++def test_stale_future_schedule_cannot_extend_scope_stop_deadline():
++    facts = {'task': {'id': 'root', 'status': 'scheduled', 'assignee': 'default', 'created_at': 100},
++             'source_at': 100, 'stop': {'cause': 'scope_stopped'}, 'stop_episode': 'stop-a',
++             'wake_at': 1000000, 'awaiting': {'kind': 'clock'}}
++    row = project(facts, now=90000)
++    assert row['escalation']['at'] is None
++    assert 'escalation_deadline_missing' in row['violations']
++    assert 'escalation_overdue' not in row['violations']
++    assert row['release']['authority'] == 'unavailable'
++
++
++def test_delivery_state_is_not_material_contract_identity():
++    facts = {'task': {'id': 'root', 'status': 'running', 'assignee': 'default', 'created_at': 100},
++             'pending_command': {'request_uid': 'request-a', 'request_sha256': 'a' * 64,
++                                 'delivery_state': 'pending'}}
++    before = project(facts, now=200)
++    facts['pending_command']['delivery_state'] = 'unknown'
++    after = project(facts, now=300)
++    assert before['contract_key'] == after['contract_key']
++    assert before['escalation']['at'] == after['escalation']['at']
++
++
++def test_missing_restriction_page_preserves_hold_only_receipt_diagnostics():
++    conn = fixture()
++    conn.execute("UPDATE tasks SET status='ready' WHERE id='root'")
++    event(conn, 'receipt', 'decision_retained', {'episode_uid': 'not-yet-visible',
++          'disposition': {'reason': 'scope_stopped'}}, 101)
++    row = describe(conn, 'root', now=200)
++    assert row['evidence_state'] == 'unknown'
++    assert row['action'] == 'decide_scope'
++    assert row['release']['authority'] == 'unavailable'
++    conn.close()
++
++
++def test_explicit_promotion_can_supersede_ordinary_receipt_but_not_scope_stop():
++    for reason in ('capability_unavailable', 'scope_stopped'):
++        conn = fixture()
++        conn.execute("UPDATE tasks SET status='ready' WHERE id='root'")
++        event(conn, 'receipt', 'decision_retained', {'episode_uid': 'old', 'disposition': {'reason': reason}}, 101)
++        event(conn, 'promotion', 'promoted_manual', {}, 102)
++        row = describe(conn, 'root', now=200)
++        assert row['action'] == ('decide_scope' if reason == 'scope_stopped' else 'execute_current_scope')
++        conn.close()
++
++
++def test_synced_uidless_events_never_use_replica_local_integer_identity():
++    conn = fixture()
++    conn.executescript("CREATE TABLE kanban_sync_state(mode TEXT); INSERT INTO kanban_sync_state VALUES('primary');")
++    event(conn, None, 'spend_budget_triaged', {}, 100)
++    row = describe(conn, 'root', now=200)
++    assert row['evidence_state'] == 'unknown'
++    assert row['source_refs'] == []
++    conn.close()
++
++
++def test_protected_archived_dependency_remains_visible():
++    conn = fixture()
++    conn.execute("UPDATE tasks SET status='todo' WHERE id='owner'")
++    conn.execute("UPDATE tasks SET status='archived' WHERE id='root'")
++    conn.execute("INSERT INTO task_links VALUES('root','owner')")
++    event(conn, 'stop', 'spend_budget_triaged', {'cause': 'safety_refusal'}, 100)
++    row = describe(conn, 'owner', now=200)
++    assert row['action'] == 'satisfy_dependency'
++    assert row['dependencies'][0]['task_id'] == 'root'
++    conn.close()
++
++
++def test_report_denies_sql_writes_and_network(monkeypatch):
++    from hermes_cli.kanban_actionability_cli import report
++    import socket
++    conn = fixture()
++    def deny_network(*args, **kwargs):
++        raise AssertionError('read-only report attempted network')
++    monkeypatch.setattr(socket, 'create_connection', deny_network)
++    writes = []
++    denied = {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE,
++              sqlite3.SQLITE_CREATE_TABLE, sqlite3.SQLITE_CREATE_INDEX, sqlite3.SQLITE_ALTER_TABLE}
++    def authorize(action, *args):
++        if action in denied:
++            writes.append(action)
++            return sqlite3.SQLITE_DENY
++        return sqlite3.SQLITE_OK
++    conn.set_authorizer(authorize)
++    result = report(conn, now=200)
++    assert result['total_nonterminal'] == 2
++    assert not writes
++    conn.close()
++
++
++def test_uidless_stop_does_not_take_notice_timestamp_as_episode_root():
++    conn = fixture()
++    conn.executescript("CREATE TABLE kanban_sync_state(mode TEXT); INSERT INTO kanban_sync_state VALUES('primary');")
++    event(conn, None, 'spend_budget_triaged', {}, 100)
++    event(conn, None, 'spend_budget_decision_ready', {'producer': {'kind': 'unavailable'}}, 10000)
++    row = describe(conn, 'root', now=20000)
++    assert row['first_observed'] == 100
++    assert row['escalation']['at'] is None
++    assert 'escalation_deadline_missing' in row['violations']
++    assert row['evidence_state'] == 'unknown'
++    conn.close()
++
++
++def test_partial_optional_schemas_and_plain_tuple_connection_are_readable():
++    from hermes_cli.kanban_actionability_cli import report
++    conn = fixture()
++    conn.row_factory = None
++    conn.executescript('CREATE TABLE kanban_sync_state(board_id TEXT);'
++                       'CREATE TABLE task_wake_checks(task_id TEXT);'
++                       'CREATE TABLE task_runs(task_id TEXT);')
++    conn.execute("UPDATE tasks SET status='running' WHERE id='root'")
++    before = list(conn.iterdump())
++    result = report(conn, now=200)
++    row = next(r for r in result['rows'] if r['task_id'] == 'root')
++    assert row['evidence_state'] == 'unknown'
++    assert 'running_without_current_run' not in row['violations']
++    assert list(conn.iterdump()) == before
++    conn.close()
++
++
++def test_explicit_deadline_never_depends_on_source_age_and_terminal_is_na():
++    facts = {'task': {'id': 'x', 'status': 'blocked', 'created_at': 1}, 'source_at': 2}
++    row = project(facts, now=100000)
++    assert row['escalation']['at'] is None
++    assert row['escalation']['state'] == 'unavailable'
++    facts['deadline_at'] = 123
++    assert project(facts, now=100000)['escalation']['at'] == 123
++    assert 'escalation_overdue' in project(facts, now=100000)['violations']
++    facts['task']['status'] = 'done'
++    terminal = project(facts, now=100000)
++    assert terminal['action'] == 'no_open_action'
++    assert terminal['violations'] == [] and terminal['escalation']['at'] is None
++
++
++def test_null_uid_on_unsynced_history_keeps_local_source_identity():
++    conn = fixture()
++    event(conn, None, 'spend_budget_triaged', {}, 100)
++    assert describe(conn, 'root', now=200)['source_refs'] == ['1']
++    conn.close()
++
++
++def test_malformed_human_request_is_unknown_repair_not_human_ask():
++    conn = fixture()
++    conn.execute('ALTER TABLE tasks ADD COLUMN human_request TEXT')
++    conn.execute("UPDATE tasks SET status='blocked',human_request=? WHERE id='root'",
++                 (json.dumps({'action': {'bad': 'not text'}}),))
++    row = describe(conn, 'root', now=200)
++    assert row['evidence_state'] == 'unknown'
++    assert row['action'] == 'repair_lifecycle_contract'
++    conn.close()
++
++
++def test_pending_multiple_commands_have_stable_identity_and_unknown_custody():
++    conn = fixture()
++    conn.executescript('CREATE TABLE kanban_failure_commands(task_id TEXT,run_uid TEXT,request_uid TEXT,'
++                       'operation_kind TEXT,delivery_state TEXT,canonical_receipt_json TEXT);')
++    for uid in ('b', 'a'):
++        conn.execute("INSERT INTO kanban_failure_commands VALUES('root',?,?,'retain','unknown',NULL)", (uid, uid))
++    before = describe(conn, 'root', now=200)
++    conn.execute("UPDATE kanban_failure_commands SET delivery_state='pending' WHERE run_uid='a'")
++    after = describe(conn, 'root', now=300)
++    assert before['contract_key'] == after['contract_key']
++    assert after['evidence_state'] == 'unknown'
++    assert after['release']['authority'] == 'unavailable'
++    conn.close()
+diff --git a/tests/hermes_cli/test_kanban_actionability_report.py b/tests/hermes_cli/test_kanban_actionability_report.py
+new file mode 100644
+index 00000000000..a6509522923
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_actionability_report.py
+@@ -0,0 +1,415 @@
++"""Read-only real lifecycle report, never a readiness or release authority. [daveey]"""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sqlite3
++import subprocess
++import sys
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_continuation as kc
++from tests.hermes_cli import test_kanban_containment_actor as support
++
++board = support.board
++
++
++def start(conn, tid):
++    assert kb.claim_task(conn, tid, claimer='default') is not None
++    return kb.get_task(conn, tid).current_run_id
++
++
++def complete_evidence_schema(conn):
++    # A complete optional local custody schema; legacy absence is tested separately.
++    from hermes_cli.kanban_failure_release import _ensure_commands
++    _ensure_commands(conn)
++    if 'uid' not in {r[1] for r in conn.execute('PRAGMA table_info(task_runs)')}:
++        conn.execute('ALTER TABLE task_runs ADD COLUMN uid TEXT')
++
++
++def project(conn, tid, now=None):
++    from hermes_cli.kanban_actionability_sources import describe
++    return describe(conn, tid, now=now)
++
++
++def test_registered_report_bypasses_initialization(board, monkeypatch, capsys):
++    from hermes_cli.kanban import kanban_command
++    from hermes_cli.kanban_parser import build_parser
++    tid = kb.create_task(board, title='queued report control', assignee='default')
++    parser = build_parser(argparse.ArgumentParser().add_subparsers())
++    args = parser.parse_args(['stranded', '--json'])
++    monkeypatch.setattr(kb, 'init_db', lambda: pytest.fail('read-only report initialized the board'))
++    assert kanban_command(args) == 0
++    report = json.loads(capsys.readouterr().out)
++    assert report['total_nonterminal'] == report['scanned_count'] == 1
++    assert report['rows'][0]['task_id'] == tid
++    assert report['rows'][0]['owner'] == {'kind': 'assignee', 'refs': ['default']}
++    assert report['rows'][0]['action'] == 'execute_current_scope'
++    assert report['rows'][0]['evidence_state'] == 'unknown'  # no live admission evidence
++
++
++def test_stopped_scope_wins_over_status_comments_and_notices(board):
++    from hermes_cli import kanban_spend_budget as budget
++    from tests.hermes_cli import test_kanban_spend_budget as spend_helpers
++    tid = kb.create_task(board, title='stopped report fixture', assignee='default')
++    spend_helpers._runs(board, tid, 2, usage={'cache_read_tokens': 1})
++    assert budget.hold(board, tid, lim=budget.Limits(1, 1)) == 'triage'
++    with kb.write_txn(board):
++        kb._append_event(board, tid, 'decision_hold_restricted', {'cause': 'scope_stopped'})
++    before = project(board, tid)
++    kb.add_comment(board, tid, 'fixture', 'fresh comment is not progress')
++    with kb.write_txn(board):
++        kb._append_event(board, tid, 'decision_requested', {'reason': 'notice, not execution clearance'})
++    after = project(board, tid)
++    assert before['contract_key'] == after['contract_key']
++    assert before['escalation']['at'] == after['escalation']['at']
++    assert after['action'] == 'decide_scope'
++    assert after['release']['authority'] == 'unavailable'
++    assert kb.claim_task(board, tid) is None
++
++
++def test_scheduled_deadline_follows_finite_window_not_report_clock(board):
++    tid = kb.create_task(board, title='finite timer report', assignee='default')
++    run = start(board, tid)
++    result = kc.continue_task(board, tid, checkpoint='bounded clock window', resume_after_seconds=60,
++                              expected_run_id=run)
++    assert result['ok']
++    current = project(board, tid, now=result['wake_at'] - 1)
++    assert current['action'] == 'wait_for_named_producer'
++    assert current['blocker']['trigger']
++    overdue = project(board, tid, now=result['wake_at'] + 601)
++    assert 'scheduled_wake_overdue' in overdue['violations']
++    assert overdue['action'] == 'repair_lifecycle_contract'
++    assert current['contract_key'] == overdue['contract_key']
++    assert current['escalation']['at'] == overdue['escalation']['at']
++
++
++def test_missing_run_is_repair_not_execution_permission(board):
++    tid = kb.create_task(board, title='lost run report', assignee='default')
++    start(board, tid)
++    # Historical impossible row: inject only into this disposable board, do not mock the reader.
++    with kb.write_txn(board):
++        board.execute('UPDATE tasks SET current_run_id=NULL WHERE id=?', (tid,))
++    row = project(board, tid)
++    assert row['action'] == 'repair_lifecycle_contract'
++    assert 'running_without_current_run' in row['violations']
++
++
++def test_dependencies_name_human_parent_and_terminal_satisfaction(board):
++    complete_evidence_schema(board)
++    parent = kb.create_task(board, title='dependency source', assignee='default')
++    child = kb.create_task(board, title='dependency waiter', assignee='default', parents=[parent])
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='blocked',human_request=? WHERE id=?",
++                      (json.dumps({'action': 'Supply fixture step', 'why_human': 'fixture', 'scope': 'fixture',
++                                   'interaction': 'reply', 'evidence': 'fixture'}), parent))
++    row = project(board, child)
++    assert row['action'] == 'satisfy_dependency'
++    assert parent in row['blocker']['prerequisite']
++    assert 'Supply fixture step' in row['blocker']['trigger']
++    assert row['dependencies'][0]['owner']['refs'] == ['default']
++    assert kb.archive_task(board, parent)
++    assert project(board, child)['dependencies'] == []
++
++
++def test_ownerless_legacy_is_visible_and_never_gets_a_fresh_deadline(board):
++    tid = kb.create_task(board, title='legacy unassigned draft', triage=True)
++    with kb.write_txn(board):
++        board.execute('UPDATE tasks SET assignee=NULL WHERE id=?', (tid,))
++    first = project(board, tid, now=10000000000)
++    later = project(board, tid, now=10000001000)
++    assert first['owner']['kind'] == 'unavailable'
++    assert 'owner_missing' in first['violations']
++    assert first['contract_key'] == later['contract_key']
++    assert first['escalation']['at'] == later['escalation']['at']
++
++
++def test_report_exact_counts_pagination_and_full_database_no_writes(board):
++    from hermes_cli.kanban_actionability_cli import report
++    ids = sorted(kb.create_task(board, title=f'report row {n}', assignee='default') for n in range(5))
++    before = list(board.iterdump())
++    page = report(board, limit=2, now=10000000000)
++    assert page['total_nonterminal'] == page['scanned_count'] == 5
++    assert page['has_more'] is True and page['next_after'] == ids[1]
++    second = report(board, limit=2, after=page['next_after'], now=10000000000)
++    third = report(board, limit=2, after=second['next_after'], now=10000000000)
++    assert [r['task_id'] for p in (page, second, third) for r in p['rows']] == ids
++    assert third['has_more'] is False and third['next_after'] is None
++    assert page['per_status'] == {'ready': 5}
++    assert page['unknown_count'] == 5  # no fabricated admission observation
++    assert list(board.iterdump()) == before
++
++
++@pytest.mark.parametrize('json_output', [True, False])
++def test_subprocess_parser_report_preserves_database_bytes(board, tmp_path, json_output):
++    kb.create_task(board, title='subprocess report', assignee='default')
++    path = board.execute('PRAGMA database_list').fetchone()[2]
++    def digest():
++        from pathlib import Path
++        return {suffix: hashlib.sha256(Path(path + suffix).read_bytes()).hexdigest()
++                for suffix in ('', '-wal') if Path(path + suffix).exists()}
++    before = digest()
++    logical = list(board.iterdump())
++    # SQLite read-only readers may update SHM reader slots; SHM is not semantic database data.
++    arguments = ['stranded', '--json'] if json_output else ['stranded']
++    code = ('import argparse, socket; from hermes_cli.kanban_parser import build_parser; '
++            'from hermes_cli.kanban import kanban_command; from hermes_cli import kanban_db as kb; '
++            'defender=lambda *a, **kw: (_ for _ in ()).throw(AssertionError("init/network forbidden")); '
++            'kb.init_db=defender; socket.create_connection=defender; '
++            'p=build_parser(argparse.ArgumentParser().add_subparsers()); '
++            f'raise SystemExit(kanban_command(p.parse_args({arguments!r})))')
++    result = subprocess.run([sys.executable, '-c', code], env={**os.environ, 'HERMES_KANBAN_DB': path},
++                            capture_output=True, text=True, timeout=30, check=False)
++    assert result.returncode == 0, result.stderr
++    if json_output:
++        assert json.loads(result.stdout)['total_nonterminal'] == 1
++    else:
++        assert '1 nonterminal;' in result.stdout
++        assert 'deadline=None' in result.stdout and 'evidence=unknown' in result.stdout
++    assert digest() == before
++    assert list(board.iterdump()) == logical
++
++
++def test_legacy_missing_optional_tables_is_unknown_without_migration():
++    from hermes_cli.kanban_actionability_cli import report
++    conn = sqlite3.connect(':memory:')
++    conn.row_factory = sqlite3.Row
++    conn.executescript("CREATE TABLE tasks(id TEXT,status TEXT,assignee TEXT,created_at INTEGER);"
++                       "INSERT INTO tasks VALUES('legacy','scheduled','default',10);")
++    before = list(conn.iterdump())
++    result = report(conn, now=100)
++    assert result['unknown_count'] == 1
++    assert result['rows'][0]['action'] == 'repair_lifecycle_contract'
++    assert 'scheduled_wake_missing' in result['rows'][0]['violations']
++    assert list(conn.iterdump()) == before
++    conn.close()
++
++
++@pytest.mark.parametrize('cause', ['safety_refusal', 'scope_stopped'])
++@pytest.mark.parametrize('human_step', [False, True])
++def test_all_held_parents_have_no_recovery_carrier(board, cause, human_step):
++    from tests.hermes_cli import test_kanban_actionability_dependencies as deps
++    complete_evidence_schema(board)
++    parent = kb.create_task(board, title='Held prerequisite', assignee='default')
++    child = kb.create_task(board, title='Waiter', assignee='default', parents=[parent])
++    deps.restrict(board, parent)
++    with kb.write_txn(board):
++        kb._append_event(board, parent, 'decision_hold_restricted', {'cause': cause})
++        if human_step:
++            from tests.hermes_cli.test_kanban_actionability_counts import REQUEST
++            board.execute('UPDATE tasks SET human_request=? WHERE id=?', (json.dumps(REQUEST), child))
++    before = list(board.iterdump())
++    row = project(board, child)
++    assert 'dependency_recovery_unavailable' in row['violations']
++    assert row['dependencies'][0]['task_id'] == parent
++    assert row['dependencies'][0]['restricted'] is True
++    assert row['action'] == ('supply_recorded_human_step' if human_step else 'satisfy_dependency')
++    assert row['release']['authority'] == 'unavailable'
++    assert list(board.iterdump()) == before
++    assert kb.claim_task(board, child) is None
++
++
++def test_renewed_done_parent_is_not_stranded(board, monkeypatch):
++    complete_evidence_schema(board)
++    from tests.hermes_cli import test_kanban_actionability_dependencies as deps
++    parent, child, _, _ = deps.renewed_and_done(board, monkeypatch)
++    row = project(board, child)
++    assert row['dependencies'] == []
++    assert 'dependency_recovery_unavailable' not in row['violations']
++    assert project(board, parent)['action'] == 'no_open_action'
++
++
++@pytest.mark.parametrize('payload', ['[]', '{', 'null'])
++def test_malformed_parent_evidence_is_unknown_not_absence(board, payload):
++    parent = kb.create_task(board, title='Legacy parent', assignee='default')
++    child = kb.create_task(board, title='Legacy waiter', assignee='default', parents=[parent])
++    with kb.write_txn(board):
++        kb._append_event(board, parent, 'spend_budget_triaged', {'cause': 'scope_stopped'})
++        board.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='spend_budget_triaged'", (payload, parent))
++    row = project(board, child)
++    assert row['evidence_state'] == 'unknown'
++    assert row['dependencies'][0]['evidence_state'] == 'unknown'
++    assert 'dependency_recovery_unavailable' not in row['violations']
++
++
++@pytest.mark.parametrize('status', ['done', 'archived'])
++def test_terminal_show_context_projection_is_explicit(board, status):
++    from hermes_cli.kanban_shadow_view import show_details
++    tid = kb.create_task(board, title='Terminal diagnostics', assignee='default')
++    assert (kb.complete_task(board, tid, summary='done') if status == 'done' else kb.archive_task(board, tid))
++    task = kb.get_task(board, tid)
++    before = list(board.iterdump())
++    assert project(board, tid)['action'] == 'no_open_action'
++    assert show_details(board, task, None, 'remote')['actionability']['action'] == 'no_open_action'
++    assert 'no_open_action' in kb.build_worker_context(board, tid)
++    assert list(board.iterdump()) == before
++
++
++def test_report_snapshot_pins_counts_across_writer_commit(board):
++    from hermes_cli.kanban_actionability_cli import report
++    from hermes_cli.kanban_actionability_sources import Reader
++    from unittest.mock import patch
++    path = board.execute('PRAGMA database_list').fetchone()[2]
++    tid = kb.create_task(board, title='Snapshot original', assignee='default')
++    original = Reader.task
++    changed = False
++    def read(self, task_id):
++        nonlocal changed
++        if not changed:
++            changed = True
++            with sqlite3.connect(path) as writer:
++                writer.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
++        return original(self, task_id)
++    with patch.object(Reader, 'task', read):
++        result = report(board, now=777)
++    assert changed
++    assert result['observed_at'] == 777
++    assert result['per_status'] == {'ready': 1}
++    assert result['rows'][0]['status'] == 'ready'
++    assert project(board, tid)['status'] == 'done'
++
++
++def test_real_claim_loss_reclaim_and_stale_run_controls(board):
++    tid = kb.create_task(board, title='Disposable never-spawned worker', assignee='default')
++    run = start(board, tid)
++    assert project(board, tid)['action'] == 'execute_current_scope'
++    with kb.write_txn(board):
++        board.execute('UPDATE tasks SET claim_expires=1 WHERE id=?', (tid,))
++    assert kb.release_stale_claims(board, signal_fn=lambda *a: pytest.fail('no live worker may be signalled')) == 1
++    assert kb.get_task(board, tid).status == 'ready'
++    assert board.execute('SELECT ended_at FROM task_runs WHERE id=?', (run,)).fetchone()[0] is not None
++    assert project(board, tid)['action'] == 'execute_current_scope'
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='running',current_run_id=? WHERE id=?", (run, tid))
++    assert 'running_without_current_run' in project(board, tid)['violations']
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
++    assert 'running_without_current_run' not in project(board, tid)['violations']
++
++
++@pytest.mark.parametrize('carrier', ['open', 'held', 'closed', 'unknown'])
++def test_administrative_carrier_is_not_dependency_release(board, carrier):
++    complete_evidence_schema(board)
++    from tests.hermes_cli import test_kanban_actionability_dependencies as deps
++    parent = kb.create_task(board, title='Held root', assignee='default')
++    child = kb.create_task(board, title='Unfinished acceptance', assignee='default', parents=[parent])
++    owner = kb.create_task(board, title='Decision carrier', assignee='default')
++    deps.restrict(board, parent)
++    if carrier == 'held':
++        deps.restrict(board, owner)
++    elif carrier == 'closed':
++        assert kb.complete_task(board, owner, summary='administration ended')
++    elif carrier == 'unknown':
++        with kb.write_txn(board):
++            kb._append_event(board, owner, 'spend_budget_triaged', {})
++            board.execute("UPDATE task_events SET payload='[]' WHERE task_id=? AND kind='spend_budget_triaged'", (owner,))
++    episode = board.execute("SELECT id FROM task_events WHERE task_id=? AND kind='decision_hold_restricted'", (parent,)).fetchone()[0]
++    with kb.write_txn(board):
++        kb._append_event(board, parent, 'spend_budget_decision_ready', {
++            'episode': str(episode), 'producer': {'kind': 'supervisor', 'task_id': owner}})
++    row = project(board, child)
++    assert ('dependency_recovery_unavailable' in row['violations']) == (carrier in ('held', 'closed'))
++    assert row['dependencies'][0]['restricted'] is True
++    assert row['release']['authority'] == 'unavailable'
++    assert kb.unsatisfied_parents(board, child)
++    assert kb.get_task(board, child).status == 'todo'
++
++
++def test_show_and_worker_context_never_write_or_scan_report(board, monkeypatch):
++    from tools.kanban_show import _detail
++    from hermes_cli import kanban_actionability_cli as cli
++    monkeypatch.setattr(cli, 'report', lambda *a, **kw: pytest.fail('per-card path scanned report'))
++    tid = kb.create_task(board, title='Read-only writable connection', assignee='default')
++    task = kb.get_task(board, tid)
++    writes = []
++    denied = {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE,
++              sqlite3.SQLITE_CREATE_TABLE, sqlite3.SQLITE_CREATE_INDEX, sqlite3.SQLITE_ALTER_TABLE}
++    def authorize(action, *args):
++        if action in denied:
++            writes.append(action)
++            return sqlite3.SQLITE_DENY
++        return sqlite3.SQLITE_OK
++    before = list(board.iterdump())
++    board.set_authorizer(authorize)
++    for replica in (False, True):
++        detail = _detail(kb, board, task, {}, replica=replica)
++        assert detail['actionability']['task_id'] == tid
++        assert 'Actionability:' in detail['worker_context']
++    assert not writes
++    assert list(board.iterdump()) == before
++
++
++@pytest.mark.parametrize('corrupt', ['body', 'late_receipt', 'parent_table'])
++def test_real_policy_reader_failures_are_parent_unknown(board, monkeypatch, corrupt):
++    from tests.hermes_cli import test_kanban_actionability_dependencies as deps
++    parent, child, episode, comment = deps.renewed_and_done(board, monkeypatch)
++    with kb.write_txn(board):
++        if corrupt == 'body':
++            board.execute('UPDATE task_comments SET body=? WHERE id=?', (sqlite3.Binary(b'legacy bytes'), comment))
++        elif corrupt == 'late_receipt':
++            kb._append_event(board, parent, 'decision_retained', {'episode_uid': episode, 'disposition': {'reason': 'scope_stopped'}})
++        else:
++            board.execute('ALTER TABLE task_comments RENAME TO unavailable_comments')
++    before = list(board.iterdump())
++    row = project(board, child)
++    assert row['evidence_state'] == 'unknown'
++    assert row['dependencies'][0]['task_id'] == parent
++    assert row['dependencies'][0]['evidence_state'] == 'unknown'
++    assert 'dependency_recovery_unavailable' not in row['violations']
++    assert list(board.iterdump()) == before
++
++
++def test_report_covers_every_nonterminal_status_and_excludes_terminal(board):
++    from hermes_cli.kanban_actionability import NONTERMINAL
++    from hermes_cli.kanban_actionability_cli import report
++    for status in (*NONTERMINAL, 'done', 'archived'):
++        tid = kb.create_task(board, title='Status ' + status, assignee='default')
++        with kb.write_txn(board):
++            board.execute('UPDATE tasks SET status=? WHERE id=?', (status, tid))
++        assert project(board, tid)['status'] == status
++    result = report(board, limit=1, now=1000)
++    assert result['total_nonterminal'] == len(NONTERMINAL)
++    assert result['per_status'] == dict.fromkeys(NONTERMINAL, 1)
++    assert result['returned_count'] == 1 and result['has_more']
++
++
++@pytest.mark.parametrize('damage', ['nested_episode', 'missing_custody'])
++def test_parent_uncertainty_prevents_known_recovery_incident(board, damage):
++    from tests.hermes_cli import test_kanban_actionability_dependencies as deps
++    complete_evidence_schema(board)
++    parent = kb.create_task(board, title='Parent', assignee='default')
++    child = kb.create_task(board, title='Child', assignee='default', parents=[parent])
++    deps.restrict(board, parent)
++    with kb.write_txn(board):
++        if damage == 'nested_episode':
++            kb._append_event(board, parent, 'decision_hold_restricted',
++                             {'cause': 'scope_stopped', 'episode': ['invalid']})
++        else:
++            board.execute('ALTER TABLE kanban_failure_commands RENAME TO missing_custody')
++    row = project(board, child)
++    assert row['dependencies'][0]['evidence_state'] == 'unknown'
++    assert 'dependency_recovery_unavailable' not in row['violations']
++
++
++def test_unknown_carrier_with_recorded_deadline_is_not_known(board):
++    from tests.hermes_cli import test_kanban_actionability_dependencies as deps
++    complete_evidence_schema(board)
++    carrier = kb.create_task(board, title='Carrier with damaged evidence', assignee='default')
++    held = kb.create_task(board, title='Held scope', assignee='default')
++    deps.restrict(board, held)
++    with kb.write_txn(board):
++        kb._append_event(board, held, 'decision_hold_restricted', {'cause': 'scope_stopped', 'episode': 'episode'})
++        kb._append_event(board, held, 'decision_retained', {'episode': 'episode', 'next_action': {
++            'owner': {'kind': 'task', 'task_id': carrier}, 'escalate_at': 12345678900}})
++        kb._append_event(board, carrier, 'decision_retained', {})
++        board.execute("UPDATE task_events SET payload='[]' WHERE task_id=? AND kind='decision_retained'", (carrier,))
++    row = project(board, held)
++    assert row['owner'] == {'kind': 'unknown', 'refs': [carrier]}
++    assert row['escalation']['at'] == 12345678900
++    assert row['evidence_state'] == 'unknown'
++
++
+diff --git a/tools/kanban_show.py b/tools/kanban_show.py
+index 05fc0a4d658..affe0dd768d 100644
+--- a/tools/kanban_show.py
++++ b/tools/kanban_show.py
+@@ -83,8 +83,10 @@ def _detail(kb, conn, task, args, *, replica: bool) -> dict:
+     verdict = latest_verdict(conn, tid)
+     if verdict and details.get("queue_note"):
+         details["queue_note"] = f"{details['queue_note']} ({describe(verdict)})"
++    from hermes_cli.kanban_actionability_evidence import fields as actionability_fields
+     return {
+         "task": kt._fields(task, kt._TASK_FIELDS),
++        **actionability_fields(conn, task, replica=replica),
+         "source": "replica" if replica else "live",
+         **latest_receipt(kb.list_events(conn, tid)),
+         **capsule,
+-- 
+2.43.0
+

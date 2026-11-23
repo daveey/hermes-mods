@@ -17,10 +17,10 @@ The last public/private series reconciliation (what was already equivalent, what
 [Hostname normalization](hostname-normalization.md) documents the subsequent privacy
 repair, regex policy rules, fingerprint re-pins and successful 1923-entry replay.
 The [2253 regex escape repair](hostname-escape-repair.md) is a **mandatory post-replay
-overlay** in the Applying recipe below, re-bound to snapshot 5836 by `repair_hostname_escapes_5836.py` (snapshot 5437: `repair_hostname_escapes_5437.py`) (snapshot 5406: `repair_hostname_escapes_5406.py`) (snapshot 5039: `repair_hostname_escapes_5039.py`) (snapshot 5011: `repair_hostname_escapes_5011.py`) (snapshot 4059: `repair_hostname_escapes_4059.py`) (snapshot 3727: `repair_hostname_escapes_3727.py`) (snapshot 3713: `repair_hostname_escapes_3713.py`; snapshot 3689: `repair_hostname_escapes_3689.py`; snapshot 3652: `repair_hostname_escapes_3652.py`; snapshot 3622: `repair_hostname_escapes_3622.py`; snapshot 3577: `repair_hostname_escapes_3577.py`; snapshot 3555: `repair_hostname_escapes_3555.py`; snapshot 3529: `repair_hostname_escapes_3529.py`; snapshot 3501: `repair_hostname_escapes_3501.py`; snapshot 3491: `repair_hostname_escapes_3491.py`; snapshot 3473: `repair_hostname_escapes_3473.py`; snapshot 3423: `repair_hostname_escapes_3423.py`; snapshot 2926: `repair_hostname_escapes_2926.py`; snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
+overlay** in the Applying recipe below, re-bound to snapshot 5923 by `repair_hostname_escapes_5923.py` (snapshot 5836: `repair_hostname_escapes_5836.py`) (snapshot 5437: `repair_hostname_escapes_5437.py`) (snapshot 5406: `repair_hostname_escapes_5406.py`) (snapshot 5039: `repair_hostname_escapes_5039.py`) (snapshot 5011: `repair_hostname_escapes_5011.py`) (snapshot 4059: `repair_hostname_escapes_4059.py`) (snapshot 3727: `repair_hostname_escapes_3727.py`) (snapshot 3713: `repair_hostname_escapes_3713.py`; snapshot 3689: `repair_hostname_escapes_3689.py`; snapshot 3652: `repair_hostname_escapes_3652.py`; snapshot 3622: `repair_hostname_escapes_3622.py`; snapshot 3577: `repair_hostname_escapes_3577.py`; snapshot 3555: `repair_hostname_escapes_3555.py`; snapshot 3529: `repair_hostname_escapes_3529.py`; snapshot 3501: `repair_hostname_escapes_3501.py`; snapshot 3491: `repair_hostname_escapes_3491.py`; snapshot 3473: `repair_hostname_escapes_3473.py`; snapshot 3423: `repair_hostname_escapes_3423.py`; snapshot 2926: `repair_hostname_escapes_2926.py`; snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
 placement regexes; the original verifier proves historical fidelity, not regex validity.
 
-5836 patches, one entry per non-merge source commit through `33774b3fc6826f1bd028a60b5c31963caa99da8c`.
+5923 patches, one entry per non-merge source commit through `02ad53634badad70acff02e4b835df00f46b5d2b`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -41,6 +41,63 @@ The 4353–5011 append adds two source-derived bridges before entries 4353 and 4
 The 5040–5406 append retains 51 bridges and three ancestry-only markers. Its one feature-branch merge is tree-identical to the automatic merge, so no new bridge is required. Snapshot policy: [mirror-policy-5406.json](mirror-policy-5406.json); replay plan: [mirror-replay-5406.json](mirror-replay-5406.json); acceptance evidence: [mirror-5406-verification.md](mirror-5406-verification.md).
 
 The 5438–5836 append retains all 51 published bridges and three ancestry-only markers; its range contains no merges. Policy: [mirror-policy-5836.json](mirror-policy-5836.json); replay plan: [mirror-replay-5836.json](mirror-replay-5836.json); verification receipt: [mirror-5836-verification.md](mirror-5836-verification.md). All previously published patch and bridge bytes remain unchanged.
+
+## Mirror 5837–5923
+
+The 87-entry append retains all 51 published bridges and three ancestry-only markers; its range contains no merges. Frozen source: `02ad53634badad70acff02e4b835df00f46b5d2b`. Policy: [mirror-policy-5923.json](mirror-policy-5923.json); replay plan: [mirror-replay-5923.json](mirror-replay-5923.json); verification: [mirror-5923-verification.md](mirror-5923-verification.md). Previously published patch and bridge bytes are unchanged. Feature test lists describe source coverage, not source-suite execution in this mirror pass. No new hotkey is introduced.
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Typed courier refusals and pending adoption](mirror-5923-a-courier-refusals.md) | 5837–5838 | Settle definitive no-create responses; retain successful adoption and automatic pool routing |
+| [Byte-verified gzip transcript deltas and bounded recovery](mirror-5923-a-gzip-transcript-deltas.md) | 5839–5840 | Negotiate compressed-entity deltas and recover large valid transcripts with one bounded identity retry |
+| [Durable process-exit acknowledgements](mirror-5923-a-durable-process-acknowledgements.md) | 5841–5842 | Retain handled-exit state across independent status readers |
+| [Bounded dashboard histories and nonblocking count polls](mirror-5923-a-dashboard-bounded-history.md) | 5843, 5845–5848, 5856 | SQL history seals, display-bounded shadow hydration and trusted-cursor invalidation |
+| [Scope-renewal evidence from a read-only shadow](mirror-5923-a-shadow-scope-renewal.md) | 5844 | Resolve foreign-home authority without importing or mutating the foreign card |
+| [Restricted terminal parents remain dependency blockers](mirror-5923-a-restricted-parent-readiness.md) | 5849–5850, 5855, 5858 | Carry stop evidence through local readiness, worker selection, mirrors and lanes |
+| [Association-only receipt deduplication](mirror-5923-a-association-only-dedup.md) | 5851 | Keep local receipt dedup outside full sidebar enrichment |
+| [Reuse escalation successors by premise episode](mirror-5923-a-escalation-successor-episodes.md) | 5852–5854 | Use the source ledger and portable event clock to select the current owner |
+| [Unchanged-work fallback after a provider refusal](mirror-5923-a-provider-refusal-fallback.md) | 5857 | Try other eligible providers once while retaining refusal evidence |
+| [Administrative stop-only protection and frozen courier custody](mirror-5923-a-stop-only-protection.md) | 5859–5866 | Register scoped stop adoption with immutable evidence and truthful canonical settlement |
+| [Kanban connection factory refuses SQLite REPLACE on tasks and task_runs](mirror-5923-b-kanban-replace-guard.md) | 5867 | Guards execute/executemany/executescript and cursors so implicit REPLACE deletes cannot bypass protected-row fences. |
+| [Kanban connection factory refuses SQLite REPLACE on tasks and task_runs](mirror-5923-b-kanban-replace-guard.md) | 5868 | Lexer matches SQLite tokenization (BOM whitespace, non-ASCII identifiers); fixtures stop REPLACE-ing through the board. |
+| [Kanban scope renewal: dependents, owner links, foreign evidence and comments](mirror-5923-b-kanban-scope-renewal-foreign-evidence.md) | 5869 | Renewed, completed scope stop releases dependents (later folded into the mainline parent gate). |
+| [Kanban scope renewal: dependents, owner links, foreign evidence and comments](mirror-5923-b-kanban-scope-renewal-foreign-evidence.md) | 5870 | Defers dependency projection to the mainline parent_blocks gate; tests assert its labels. |
+| [Kanban scope renewal: dependents, owner links, foreign evidence and comments](mirror-5923-b-kanban-scope-renewal-foreign-evidence.md) | 5871 | Missing replica owner links are read from exact canonical Board created-link uids. |
+| [Replicated CI/deploy parks paint the light-blue external stripe](mirror-5923-b-replica-ci-deploy-external-stripe.md) | 5872 | Replica CI/deploy waits stamp unknown-external counts and the canonical external stripe in Desktop. |
+| [Kanban scope renewal: dependents, owner links, foreign evidence and comments](mirror-5923-b-kanban-scope-renewal-foreign-evidence.md) | 5873 | Renewal reads foreign replica evidence on primary as well as shadow boards. |
+| [Gateway busy count reconciled on heartbeat and deferred-worker release](mirror-5923-b-gateway-busy-count-heartbeat.md) | 5874 | Republishes the persisted active-agent count after deferred release and on a coalesced loop-side heartbeat recount. |
+| [Kanban scope renewal: dependents, owner links, foreign evidence and comments](mirror-5923-b-kanban-scope-renewal-foreign-evidence.md) | 5875 | CLI comments on replica-only cards append through the authenticated Board, preserving the writer gateway. |
+| [Origin ledger batched exact owner task reads](mirror-5923-b-origin-ledger-batch-reads.md) | 5876 | One exact-key replica read per phase instead of one per obligation; HERMES_ORIGIN_BATCH_READS switch. |
+| [Upgrade E2E fixtures: isolated class routes](mirror-5923-b-upgrade-fixture-class-routes.md) | 5877 | Upgrade fixtures configure loopback-only class routes so Kanban admission does not refuse with routing_disabled. |
+| [Shared facts core and loaded notification consumer](mirror-5923-b-shared-facts-core.md) | 5878 | Adds the change-feed/fact-store layer (mostly inert) and activates display.loaded_notification_f by default. |
+| [Fact demand channel and replica transport](mirror-5923-b-fact-demand-replica-transport.md) | 5879 | Bounded demand custody replayed on owner epoch change; also isolates unreadable boards in loaded notification discovery. |
+| [Replicated CI/deploy parks paint the light-blue external stripe](mirror-5923-b-replica-ci-deploy-external-stripe.md) | 5880 | Keeps replica external_unknown counts in the parked projection recompute. |
+| [Replicated CI/deploy parks paint the light-blue external stripe](mirror-5923-b-replica-ci-deploy-external-stripe.md) | 5881 | Manifest audit test registers the replica external annotation writer. |
+| [Fact demand channel and replica transport](mirror-5923-b-fact-demand-replica-transport.md) | 5882 | Owner epoch rides the handshake so demands never export fact snapshots. |
+| [Fact demand channel and replica transport](mirror-5923-b-fact-demand-replica-transport.md) | 5883 | Regression for burst demand delivery over 85,000 facts. |
+| [Loaded notification scheduling: isolation, deadlines, bounded retries](mirror-5923-b-loaded-notification-fact-schedule.md) | 5884 | Early report wakes keep legacy deadlines; incomplete reconciliation retries only positively linked chat keys. |
+| [Loaded notification scheduling: isolation, deadlines, bounded retries](mirror-5923-b-loaded-notification-fact-schedule.md) | 5885 | Remote hint/capture failures no longer block local notification delivery. |
+| [Fact demand channel and replica transport](mirror-5923-b-fact-demand-replica-transport.md) | 5886 | Per-subscriber capped backoff retry for failed replica callbacks on quiet owners. |
+| [Origin ledger batched exact owner task reads](mirror-5923-b-origin-ledger-batch-reads.md) | 5887 | CROSS JOIN keeps requested keys outermost in the replica query. |
+| [In-process links display facts at serve startup](mirror-5923-b-links-facts-startup.md) | 5888 | Serve startup fences the legacy refresher and routes stale display reads to an in-process fact publication (HERMES_FACTS_LINKS). |
+| [In-process links display facts at serve startup](mirror-5923-b-links-facts-startup.md) | 5889 | Auth burst test shares one serve lifespan across clients. |
+| [Recency ranking steps Python through the page, not the store](mirror-5923-b-recency-hot-rows.md) | 5890 | JSON-aggregate rebuild, SQL-side re-probe and relative-only re-rank cut GIL-bound row stepping. |
+| [Recency ranking steps Python through the page, not the store](mirror-5923-b-recency-hot-rows.md) | 5891 | Re-ranks rows with children so chain-shrinking writes cannot leave a stale root key. |
+| [Kanban explicit selectors, neutral readers and validation API](mirror-5923-b-kanban-explicit-selectors-validation-api.md) | 5892 | Exact class-selector and mandatory-flag validation at REST/review boundaries; restricted standing promotion. |
+| [Kanban explicit selectors, neutral readers and validation API](mirror-5923-b-kanban-explicit-selectors-validation-api.md) | 5893 | Publishes the strict validation names in the plugin API and isolates extraction tests. |
+| [Fact demand channel and replica transport](mirror-5923-b-fact-demand-replica-transport.md) | 5894 | Reserves handler capacity for authenticated demand-only channels beside eight stream slots. |
+| [Kanban readers: one row per probe, only rows that can win](mirror-5923-b-kanban-reader-hot-rows.md) | 5895 | Single-row schema probes and SQL-side selection for run models, card details, upstream walk and watch hosts. |
+| [Kanban readers: one row per probe, only rows that can win](mirror-5923-b-kanban-reader-hot-rows.md) | 5896 | Columns helper reads through execute only so connection wrappers keep working. |
+| [Read-only actionability and stranded-card reports](mirror-5923-c-actionability-report.md) | 5897–5905 | Source-derived next actions, exact report counts, uncertainty and bounded per-card context |
+| [Projection-local reader reuse and skipped upstream enrichment](mirror-5923-c-projection-read-cost.md) | 5906, 5916 | Reuse owner opens without pinned snapshots; avoid ineligible graph/replica reads |
+| [App-owned native session display captures](mirror-5923-c-native-sessions-captures.md) | 5907–5908 | Linux startup-owned list/sidebar/stamps captures; cold retryable responses and bounded demand |
+| [Delayed decision notices and stranded spend ownership](mirror-5923-c-decision-owner-reconciliation.md) | 5909, 5913 | Reconcile before waking; repair administrative ownership without releasing scope |
+| [Links inventory envelope and typed capture refusals](mirror-5923-c-links-capture-budget.md) | 5910–5911 | Independent bounded links inventory and retained refusal reasons |
+| [Paired-device waits expose owner attention](mirror-5923-c-owner-device-waits.md) | 5912 | Surface legacy device-access steps; refuse new hidden human waits |
+| [Hub-owned upstream-conflict reporting](mirror-5923-c-update-conflict-ownership.md) | 5914–5915 | Default integration custody at the hub; exact skip protocol and update CI dependencies |
+| [Owner-local inactive text compare-and-swap](mirror-5923-c-owner-text-cas.md) | 5917 | Exact audited title/body edits, replay receipts and unchanged lifecycle/admission |
+| [Light-blue timer waits and sidebar ETA readouts](mirror-5923-c-sidebar-wait-eta.md) | 5918–5921 | Waited/expected/left display, history estimates and single-snapshot replica carriage |
+| [Thread-local YAML reuse and lazy spend-routing imports](mirror-5923-c-yaml-reuse-lazy-routing.md) | 5922–5923 | Successful safe-loader reuse per thread/mode; keep routing catalogs and requests off cold diagnostics imports |
 
 ## Mirror 5438–5836
 
@@ -4390,16 +4447,16 @@ The 5407–5437 append retains 51 bridges and three ancestry-only markers and ad
 
 ## Applying
 
-For the current **5836-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply fifty-one bridges and three ancestry-only markers from `mirror-replay-5836.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **5923-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply fifty-one bridges and three ancestry-only markers from `mirror-replay-5923.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip 33774b3fc6826f1bd028a60b5c31963caa99da8c \
+  --source-tip 02ad53634badad70acff02e4b835df00f46b5d2b \
   --base ea405e49a5e281558b3eeb3a13af66c6116cd0f2 \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-5836.json" \
-  --replay-plan "$MODS/core/mirror-replay-5836.json"
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-5923.json" \
+  --replay-plan "$MODS/core/mirror-replay-5923.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -4561,12 +4618,12 @@ git commit -m 'Explicit upstream integration bridge before 4353'
 git am -3 --empty=keep "${patches[@]:4352:145}"
 git apply --index --3way "$MODS/core/bridges/mirror-5011-before-4498.diff"
 git commit -m 'Explicit redaction resolution bridge before 4498'
-git am -3 --empty=keep "${patches[@]:4497:1339}"
+git am -3 --empty=keep "${patches[@]:4497:1426}"
 # Mandatory additive repair: historical mails intentionally remain immutable.
-python3 -B "$MODS/core/repair_hostname_escapes_5836.py" --tree "$PWD"
+python3 -B "$MODS/core/repair_hostname_escapes_5923.py" --tree "$PWD"
 git add hermes_cli/kanban_placement.py
 git commit -m 'Repair historical hostname regex word boundaries'
-python3 -B "$MODS/core/repair_hostname_escapes_5836.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
+python3 -B "$MODS/core/repair_hostname_escapes_5923.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Use Git 2.51 or newer for the replay: Git 2.43's three-way merge conflicts on patch 0032 (`apps/shared/src/gateway-contract.openrpc.json`), which later Git versions merge cleanly. Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

@@ -1,0 +1,237 @@
+From 77c85ef2ef688fff69c0749a579669dc76e405f2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 01:53:25 +0000
+Subject: [PATCH] [daveey] Resolve foreign-home scope renewal evidence from the
+ read-only shadow
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_scope_renewal_cli.py        |  30 ++--
+ .../test_kanban_scope_renewal_shadow.py       | 133 ++++++++++++++++++
+ 2 files changed, 154 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_scope_renewal_shadow.py
+
+diff --git a/hermes_cli/kanban_scope_renewal_cli.py b/hermes_cli/kanban_scope_renewal_cli.py
+index 4f2797d78c9..c5cc0d96756 100644
+--- a/hermes_cli/kanban_scope_renewal_cli.py
++++ b/hermes_cli/kanban_scope_renewal_cli.py
+@@ -18,6 +18,7 @@ import json
+ import os
+ import re
+ import sqlite3
++from contextlib import ExitStack
+ from typing import Mapping, Optional, Sequence
+ 
+ from hermes_cli import kanban_scope_renewal as renewal
+@@ -102,7 +103,8 @@ def resolve_actor(conn: sqlite3.Connection, task_id: str, *, writer: tuple, envi
+     return Actor("agent", session, "chat", f"@session:{profile}@{gateway}/{session}", gateway, profile)
+ 
+ 
+-def _canonical(conn: sqlite3.Connection, board: str, task_id: str, payload: dict, mode: str) -> dict:
++def _canonical(conn: sqlite3.Connection, board: str, task_id: str, payload: dict, mode: str,
++               *, evidence: Optional[sqlite3.Connection] = None) -> dict:
+     """Ask the canonical Board to revalidate and write the event; project its exact row into this replica."""
+     from hermes_cli import kanban_db_sync as sync
+     from hermes_cli import kanban_sync_client as client
+@@ -114,7 +116,8 @@ def _canonical(conn: sqlite3.Connection, board: str, task_id: str, payload: dict
+                                  "nothing was changed. Retry after the Board deployment")
+         if mode == "primary":
+             client.push(conn, hub, board, hub.ident.gateway, primary=True)  # the mandate comment must be canonical
+-        body = conn.execute("SELECT body FROM task_comments WHERE id=?", (payload["mandate_comment_id"],)).fetchone()[0]
++        body = (evidence if evidence is not None else conn).execute(
++            "SELECT body FROM task_comments WHERE id=?", (payload["mandate_comment_id"],)).fetchone()[0]
+         event_uid = sync.uuid7()
+         audit = {k: payload[k] for k in ("actor_kind", "actor_session", "actor_profile", "authority_kind",
+                                          "authority_ref", "reason")}
+@@ -132,8 +135,10 @@ def _canonical(conn: sqlite3.Connection, board: str, task_id: str, payload: dict
+         if not isinstance(row, dict) or row.get("kind") != renewal.EVENT or row.get("task_id") != task_id:
+             raise RenewalRefused("board_unconfirmed", "the Board applied the renewal but its event could not be "
+                                  "read back; rerun `hermes kanban show` after the next sync")
+-        sync.apply_remote_changes(conn, [client._row_change("task_events", row)],
+-                                  new_cursor=sync.sync_state(conn)["cursor"], board=board)
++        if evidence is None or evidence is conn:
++            sync.apply_remote_changes(conn, [client._row_change("task_events", row)],
++                                      new_cursor=sync.sync_state(conn)["cursor"], board=board)
++        # Shadow-only targets stay absent from primary; normal sync delivers the canonical event to home.
+         return json.loads(row["payload"])
+     finally:
+         hub.close()
+@@ -144,7 +149,6 @@ def renew(conn: sqlite3.Connection, task_id: str, *, episode: str, comment_id: i
+           env: Optional[Mapping[str, str]] = None,
+           ancestry: Optional[Sequence[Mapping[str, str]]] = None) -> dict:
+     """``writer``/``env``/``ancestry`` are test seams; the command passes none and each is read from the process."""
+-    from hermes_cli import kanban_db_sync as sync
+     from hermes_cli.kanban_comment_writer import Inconclusive, ancestry_environs, cli_comment_writer
+     from hermes_cli.kanban_origin import gateway_names
+     from hermes_cli.profiles import get_active_profile_name
+@@ -155,15 +159,23 @@ def renew(conn: sqlite3.Connection, task_id: str, *, episode: str, comment_id: i
+             ancestry = ancestry_environs()
+         except Inconclusive as exc:
+             raise RenewalRefused("identity_unavailable", f"the caller's process ancestry could not be read ({exc})")
+-    actor = resolve_actor(conn, task_id, writer=writer, environs=[*(ancestry or ()), env],
+-                          gateway=gateway_names()[0], profile=get_active_profile_name() or "default")
++    with ExitStack() as scope:
++        from hermes_cli.kanban_shadow_view import open_card
++        _, evidence, _ = open_card(conn, scope, task_id)
++        actor = resolve_actor(evidence, task_id, writer=writer, environs=[*(ancestry or ()), env],
++                              gateway=gateway_names()[0], profile=get_active_profile_name() or "default")
++        return _renew(conn, evidence, task_id, episode, comment_id, reason, board, actor)
++
++
++def _renew(conn, evidence, task_id, episode, comment_id, reason, board, actor):
++    from hermes_cli import kanban_db_sync as sync
+     mode = sync.board_mode(conn)
+     if mode == "off" and not sync.sync_state(conn):
+         return renewal.renew_local(conn, task_id, episode=episode, comment_id=comment_id, reason=reason, actor=actor)
+     if mode == "off":
+         raise RenewalRefused("board_unavailable", "this board is synced but sync is not active in this process")
+-    payload = renewal.prepare(conn, task_id, episode=episode, comment_id=comment_id, reason=reason, actor=actor)
+-    return _canonical(conn, board or sync.sync_state(conn)["board_id"], task_id, payload, mode)
++    payload = renewal.prepare(evidence, task_id, episode=episode, comment_id=comment_id, reason=reason, actor=actor)
++    return _canonical(conn, board or sync.sync_state(conn)["board_id"], task_id, payload, mode, evidence=evidence)
+ 
+ 
+ def command(args: argparse.Namespace) -> int:
+diff --git a/tests/hermes_cli/test_kanban_scope_renewal_shadow.py b/tests/hermes_cli/test_kanban_scope_renewal_shadow.py
+new file mode 100644
+index 00000000000..97b3f7e5390
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scope_renewal_shadow.py
+@@ -0,0 +1,133 @@
++"""Foreign-home renewal reads shadow evidence; only the canonical Board may write it."""
++import argparse
++import hashlib
++import json
++import sqlite3
++from contextlib import nullcontext
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_scope_renewal_cli as cli
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_scope_renewal_synced as support
++
++live = support.live
++
++
++@pytest.fixture
++def foreign(live, monkeypatch, tmp_path):
++    hub = support.Hub({'scope_renewal': 1})
++    tid, episode, comment = support.stopped(live, monkeypatch, hub)
++    # The worker's home has a created link to the hub chat, not to a worker-local chat.
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET created_on='worker-home' WHERE id=?", (tid,))
++        live.execute("UPDATE task_chat_links SET chat_gateway='hub' WHERE task_id=?", (tid,))
++
++    from hermes_cli import kanban_origin
++    monkeypatch.setattr(kanban_origin, 'gateway_names', lambda: ('hub',))
++    primary = kbc.connect(tmp_path / 'hub.db')
++    client.ensure_identity(primary, 'default', 'hub')
++    sync.set_mode(primary, 'shadow')
++    path = tmp_path / 'replica.db'
++
++    def snapshot():
++        with sqlite3.connect(path) as dest:  # noqa: kanban-lockguard -- disposable replica fixture
++            live.backup(dest)
++
++    snapshot()
++    from hermes_cli import kanban_foreign_card
++    monkeypatch.setattr(kanban_foreign_card, 'replica_path', lambda db: path)
++    try:
++        yield primary, live, hub, tid, episode, comment, path, snapshot
++    finally:
++        primary.close()
++
++
++def invoke(monkeypatch, primary, tid, episode, comment):
++    monkeypatch.setattr(kbc, 'connect_closing', lambda: nullcontext(primary))
++    monkeypatch.setattr(cli, 'os', support.SimpleNamespace(environ={}))
++    from hermes_cli import kanban_comment_writer as writer
++    monkeypatch.setattr(writer, 'cli_comment_writer', lambda **kw: support.AGENT)
++    monkeypatch.setattr(writer, 'ancestry_environs', lambda: [{'HERMES_SESSION_ID': support.CHAT}])
++    return cli.command(argparse.Namespace(task_id=tid, episode=episode, mandate_comment=comment,
++                                          reason='authorized', json=True))
++
++
++def test_owner_chat_can_submit_foreign_home_renewal_without_writing_shadow(foreign, monkeypatch, capsys):
++    primary, home, hub, tid, episode, comment, path, _ = foreign
++    before = hashlib.sha256(path.read_bytes()).hexdigest()
++    assert not kb.get_task(primary, tid)
++    changes = primary.total_changes
++    assert invoke(monkeypatch, primary, tid, episode, comment) == 0
++    assert '"ok": true' in capsys.readouterr().out
++    wire, = hub.sent
++    assert wire['payload']['authority_ref'] == f'@session:default@hub/{support.CHAT}'
++    assert wire['op'] == 'renew_scope' and wire['episode'] == episode
++    assert wire['mandate_comment_uid'] == home.execute('SELECT uid FROM task_comments WHERE id=?', (comment,)).fetchone()[0]
++    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
++    # The normal sync consumer, not a CLI write to the shadow/home, projects the Board event on home.
++    assert primary.total_changes == changes
++    assert not kb.get_task(primary, tid)
++    proof = hub.row_evidence('default', 'task_events', wire['event_uid'])
++    sync.apply_remote_changes(home, [client._row_change('task_events', proof['row'])],
++                              new_cursor=sync.sync_state(home)['cursor'], board='default')
++    assert home.execute("SELECT uid FROM task_events WHERE task_id=? AND kind='scope_renewed'", (tid,)).fetchone()[0] == wire['event_uid']
++    assert kb.get_task(home, tid).status == 'triage'
++
++
++@pytest.mark.parametrize('damage,code', [('shepherd', 'not_scope_authority'),
++                                         ('writer', 'mandate_authority'),
++                                         ('safety', 'safety_restricted'),
++                                         ('released', 'not_scope_authority'),
++                                         ('gateway', 'not_scope_authority')])
++def test_foreign_home_refusals_before_board_submission(foreign, monkeypatch, capsys, damage, code):
++    primary, home, hub, tid, episode, comment, path, snapshot = foreign
++    def change_writer():
++        row = home.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='commented'", (tid,)).fetchone()
++        payload = json.loads(row['payload'])
++        payload['writer_session'] = 'different-principal'
++        home.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(payload), row['id']))
++
++    changes = {
++        'shepherd': lambda: home.execute("UPDATE task_chat_links SET kind='shepherd' WHERE task_id=?", (tid,)),
++        'released': lambda: home.execute('UPDATE task_chat_links SET released=1 WHERE task_id=?', (tid,)),
++        'gateway': lambda: home.execute("UPDATE task_chat_links SET chat_gateway='worker-home' WHERE task_id=?", (tid,)),
++        'writer': change_writer,
++        'safety': lambda: kb._append_event(home, tid, 'decision_hold_restricted',
++                                          {'episode': episode, 'cause': 'safety_refusal'}),
++    }
++    with kb.write_txn(home):
++        changes[damage]()
++    snapshot()
++    before = hashlib.sha256(path.read_bytes()).hexdigest()
++    assert invoke(monkeypatch, primary, tid, episode, comment) == 1
++    assert code in capsys.readouterr().out
++    assert not hub.sent
++    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
++
++
++@pytest.mark.parametrize('ancestry,code', [
++    ([{'HERMES_SESSION_ID': 'another-chat'}], 'identity_unavailable'),
++    ([{'HERMES_SESSION_ID': support.CHAT, 'HERMES_KANBAN_WORKER_TASK': 't_unrelated'}], 'not_scope_authority'),
++])
++def test_shadow_evidence_does_not_authorize_spoofed_process_identity(foreign, ancestry, code):
++    primary, _, hub, tid, episode, comment, _, _ = foreign
++    with pytest.raises(cli.RenewalRefused) as caught:
++        cli.renew(primary, tid, episode=episode, comment_id=comment, reason='authorized',
++                  writer=support.AGENT, env={'HERMES_SESSION_ID': support.CHAT}, ancestry=ancestry)
++    assert caught.value.code == code
++    assert not hub.sent
++
++
++def test_canonical_revalidation_can_refuse_stale_shadow_authority(foreign, monkeypatch, capsys):
++    primary, _, hub, tid, episode, comment, path, _ = foreign
++    hub.reply = {'status': 'rejected', 'reason': 'not_scope_authority'}
++    before = hashlib.sha256(path.read_bytes()).hexdigest()
++    assert invoke(monkeypatch, primary, tid, episode, comment) == 1
++    assert 'not_scope_authority' in capsys.readouterr().out
++    assert len(hub.sent) == 1
++    assert not primary.execute("SELECT 1 FROM task_events WHERE kind='scope_renewed'").fetchone()
++    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+-- 
+2.43.0
+

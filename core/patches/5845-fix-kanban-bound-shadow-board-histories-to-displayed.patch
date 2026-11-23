@@ -1,0 +1,774 @@
+From 53bbcc9834ff4eca2e9de4f1d982e148ea502d12 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 01:06:43 +0000
+Subject: [PATCH] fix(kanban): bound shadow-board histories to displayed cards
+ [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ plugins/kanban/dashboard/board_read.py      |  23 +-
+ plugins/kanban/dashboard/board_shadow.py    | 152 ++++++-----
+ tests/plugins/_kanban_shadow_oracle.py      | 114 +++++++++
+ tests/plugins/test_kanban_shadow_cost.py    | 106 ++++++++
+ tests/plugins/test_kanban_shadow_refresh.py | 265 ++++++++++++++++++++
+ 5 files changed, 572 insertions(+), 88 deletions(-)
+ create mode 100644 tests/plugins/_kanban_shadow_oracle.py
+ create mode 100644 tests/plugins/test_kanban_shadow_cost.py
+ create mode 100644 tests/plugins/test_kanban_shadow_refresh.py
+
+diff --git a/plugins/kanban/dashboard/board_read.py b/plugins/kanban/dashboard/board_read.py
+index 2e9e4d85224..c4d0566da8c 100644
+--- a/plugins/kanban/dashboard/board_read.py
++++ b/plugins/kanban/dashboard/board_read.py
+@@ -295,7 +295,7 @@ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_input
+ 
+ def materialize(conn, tenant, include_archived, workflow_template_id, current_step_key, done_limit, *,
+                 diagnostic_inputs: Callable = diagnostic_inputs, prev: Optional[dict] = None,
+-                changed=None) -> dict:
++                changed=None, selected_ids=None) -> dict:
+     """Everything the board payload reads from SQL, and nothing that depends on the clock,
+     config, profiles on disk or the replica. Retained across refreshes: never mutate it.
+ 
+@@ -305,15 +305,22 @@ def materialize(conn, tenant, include_archived, workflow_template_id, current_st
+     ``prev`` with ``changed`` (a frozenset of task ids from ``kanban_task_change.changed_since``, taken in the
+     same snapshot as this read) takes ``board_incremental.delta``: displayed IDs union marked IDs are
+     read by primary key, with bounded done history. ``changed`` omitted, ``FULL`` or a set the delta cannot vouch for reads in
+-    full, exactly as before."""
++    full, exactly as before. ``selected_ids`` is a shadow board's externally ranked,
++    collision-free display set; it bypasses the single-file window/delta, not filters.
++    """
+     filters = dict(tenant=tenant, include_archived=include_archived,
+                    workflow_template_id=workflow_template_id, current_step_key=current_step_key)
+-    if prev is not None and isinstance(changed, (set, frozenset)):
++    if selected_ids is None and prev is not None and isinstance(changed, (set, frozenset)):
+         from plugins.kanban.dashboard import board_incremental
+         rows = board_incremental.delta(conn, filters, done_limit, diagnostic_inputs, prev, changed)
+         if rows is not None:
+             return rows
+-    extra_where, extra_params, done_total, done_ids, done_window = _done_state(conn, filters, done_limit)
++    if selected_ids is None:
++        extra_where, extra_params, done_total, done_ids, done_window = _done_state(conn, filters, done_limit)
++    else:
++        extra_where = f"id IN ({_placeholders(selected_ids)})" if selected_ids else "0"
++        extra_params = list(selected_ids)
++        done_total, done_ids, done_window = 0, frozenset(), ()
+     old = (prev or {}).get("_memo")
+     old_tasks = old["tasks"] if old is not None else {}
+     parsed: dict[tuple, tuple] = {}
+@@ -351,7 +358,9 @@ def materialize(conn, tenant, include_archived, workflow_template_id, current_st
+     if old is not None and diag_ids:
+         by_id = {r["id"]: r for r in task_rows}
+         diag_rows = [by_id[tid] for tid in diag_ids if tid in by_id]
+-        diag_inputs, diag_memo = _incremental_diag_inputs(conn, diag_rows, old["diag"], diagnostic_inputs)
++        diag_inputs, diag_memo = _incremental_diag_inputs(
++            conn, diag_rows, old["diag"], diagnostic_inputs,
++            event_changed=changed if selected_ids is not None and isinstance(changed, (set, frozenset)) else None)
+     else:
+         marks = _event_marks(conn, diag_ids)  # before the events it vouches for
+         unmarked = _unmarked_event_marks(conn, diag_ids)
+@@ -382,7 +391,9 @@ def materialize(conn, tenant, include_archived, workflow_template_id, current_st
+     tenants = [r["tenant"] for r in conn.execute("SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant")]
+     from plugins.kanban.dashboard.board_incremental import filters_key
+     inc = None
+-    if raw_keys and int(done_limit or 0) > 0:  # what a later ``changed`` read starts from
++    if selected_ids is not None:
++        done_total = sum(t.status == "done" for t in tasks)
++    if selected_ids is None and raw_keys and int(done_limit or 0) > 0:  # a later single-file delta
+         inc = {"filters": filters_key(filters), "cap": int(done_limit), "done_ids": done_ids, "window": done_window,
+                "raw": {t.id: k for t, k in zip(tasks, raw_keys)}}
+     return {
+diff --git a/plugins/kanban/dashboard/board_shadow.py b/plugins/kanban/dashboard/board_shadow.py
+index f475746a920..d174222174c 100644
+--- a/plugins/kanban/dashboard/board_shadow.py
++++ b/plugins/kanban/dashboard/board_shadow.py
+@@ -1,61 +1,23 @@
+-"""``/board``: a shadow board's replica cards, merged read-only under the live ones. [daveey]
+-
+-``board_read.project`` renders the live file's rows. A board synced in ``shadow`` mode keeps the other gateways'
+-cards (the example application's queue) only in the replica, so this adds them to the projected payload: opened
+-read-only (``hermes_cli.kanban_shadow_view``), a live card wins on an id collision, each card is stamped
+-``remote`` / ``read_only`` / ``home_gateway``. Writes on those cards are already refused as ``foreign_card`` (409).
+-"""
++"""Read-only shadow cards, collision-filtered and capped before loading history. [daveey]"""
+ from __future__ import annotations
+ 
+-import os
+ import sqlite3
+-import threading
+ from contextlib import closing
+ from typing import Callable
+ 
++from hermes_cli import kanban_db
+ from hermes_cli import kanban_shadow_view as shadow_view
+-from plugins.kanban.dashboard import board_read
+-
+-_LOCK = threading.Lock()
+-_MEMO: dict[tuple, tuple[tuple, dict]] = {}
+-_MEMO_MAX = 16
+-
+-
+-def _signature(path: str) -> tuple:
+-    """Data files change on commits; shm read marks also change on reads, so exclude them."""
+-    sig = []
+-    for suffix in ("", "-wal"):
+-        try:
+-            st = os.stat(path + suffix)
+-            sig.append((st.st_mtime_ns, st.st_size))
+-        except OSError:
+-            sig.append(None)
+-    return tuple(sig)
+-
+-
+-def _remote_rows(key: tuple, replica_path: str, build: Callable[[], dict]) -> dict:
+-    sig = _signature(replica_path)
+-    with _LOCK:
+-        hit = _MEMO.get(key)
+-        if hit is not None and hit[0] == sig:
+-            return hit[1]
+-    rows = build()
+-    with _LOCK:
+-        if len(_MEMO) >= _MEMO_MAX:
+-            _MEMO.pop(next(iter(_MEMO)))
+-        _MEMO[key] = (sig, rows)
+-    return rows
++from plugins.kanban.dashboard import board_read, board_rows
++from plugins.kanban.dashboard.board_incremental import rank_key
+ 
+ 
+ def clear() -> None:
+-    with _LOCK:
+-        _MEMO.clear()
++    board_rows.clear()
+ 
+ 
+ def for_board(payload: dict, connect: Callable, query: tuple, diagnostic_inputs: Callable,
+               diagnostics_from_inputs: Callable) -> dict:
+-    """``merge`` on a fresh live connection; ``query`` = (tenant, include_archived, workflow_template_id,
+-    current_step_key, done_limit). A live-file failure leaves the payload as it was."""
++    """Merge against fresh live ownership, preserving the live payload on read failure."""
+     try:
+         with closing(connect()) as live:
+             return merge(payload, live, *query, diagnostic_inputs=diagnostic_inputs,
+@@ -64,51 +26,77 @@ def for_board(payload: dict, connect: Callable, query: tuple, diagnostic_inputs:
+         return payload
+ 
+ 
++def _selection(conn, filters, live_ids, live_done, cap):
++    """Narrow exact inventory; only displayed IDs reach full-row/history readers.
++
++    Parse completion times just as Task.from_row does (legacy SQLite values can be
++    text), and use the same combined ranking as the final done column.
++    """
++    rows = kanban_db.list_task_rows(conn, columns="id, status, completed_at", order_by="created", **filters)
++    remote = [r for r in rows if kanban_db._lossy_text(r['id']) not in live_ids]
++    done = [(kanban_db._lossy_text(r['id']), kanban_db._to_epoch(kanban_db._lossy_text(r['completed_at'])))
++            for r in remote if r['status'] == 'done']
++    keep = {tid for tid, _epoch in sorted([*done, *live_done], key=rank_key)[:cap]} if cap > 0 else None
++    ids = [kanban_db._lossy_text(r['id']) for r in remote
++           if r['status'] != 'done' or keep is None or kanban_db._lossy_text(r['id']) in keep]
++    return ids, len(done)
++
++
+ def merge(payload: dict, live, tenant, include_archived, workflow_template_id, current_step_key, done_limit, *,
+           diagnostic_inputs: Callable, diagnostics_from_inputs: Callable) -> dict:
+-    """``payload`` (``board_read.project`` of the live rows) plus the replica's cards the live file lacks."""
++    """Keep the exact remote total separately from its bounded display materialization."""
+     with shadow_view.open_shadow_replica(live) as replica:
+         if replica is None:
+             return payload
+-        live_file = shadow_view.db_file(live)
+-        replica_file = shadow_view.db_file(replica)
+-        key = (live_file, tenant, bool(include_archived), workflow_template_id, current_step_key, int(done_limit or 0))
+-        try:
+-            def build():
+-                # Filter collisions before the final cap: otherwise a live archived/done row
+-                # can consume a replica slot and hide the next remote card in the window.
+-                result = board_read.materialize(
+-                    replica, tenant, include_archived, workflow_template_id, current_step_key, 0,
+-                    diagnostic_inputs=diagnostic_inputs)
+-                result["homes"] = shadow_view.homes_of(replica, [t.id for t, _f, _x in result["cards"]])
+-                return result
++        live_file, replica_file = shadow_view.db_file(live), shadow_view.db_file(replica)
++        # Include even archived / filtered / capped-out live IDs: ownership precedes selection.
++        live_ids = frozenset(r[0] for r in live.execute('SELECT id FROM tasks'))
++        live_done = tuple((t['id'], t['completed_at']) for col in payload['columns']
++                          if col['name'] == 'done' for t in col['tasks'])
++        cap = int(done_limit or 0)
++        filters = dict(tenant=tenant, include_archived=include_archived,
++                       workflow_template_id=workflow_template_id, current_step_key=current_step_key)
++        key = (replica_file, 'shadow', live_file, tenant, bool(include_archived),
++               workflow_template_id, current_step_key, cap, live_ids, live_done)
+ 
+-            rows = _remote_rows(key, replica_file, build)
+-        except Exception:  # health: allow BLE001 -- an unreadable replica must not take the live board down with it
+-            shadow_view._log.warning("kanban: shadow replica board read failed", exc_info=True)
++        def build(conn, prev=None, changed=None):
++            ids, total = _selection(conn, filters, live_ids, live_done, cap)
++            result = board_read.materialize(
++                conn, tenant, include_archived, workflow_template_id, current_step_key, cap,
++                diagnostic_inputs=diagnostic_inputs, prev=prev, changed=changed, selected_ids=ids)
++            result['done_total'] = total
++            result['homes'] = shadow_view.homes_of(conn, ids)
++            return result
++
++        def fallback():
++            # No trusted observer/P2: still bounded, and all inputs share a read-only snapshot.
++            replica.execute('BEGIN')
++            try:
++                return build(replica)
++            finally:
++                replica.rollback()
++
++        try:
++            rows = board_rows.incremental(key, replica_file, build, fallback)
++        except Exception:  # health: allow BLE001 -- an unreadable replica must not take the live board down
++            shadow_view._log.warning('kanban: shadow replica board read failed', exc_info=True)
+             return payload
+-        homes = rows["homes"]
+-    live_ids = {t["id"] for col in payload["columns"] for t in col["tasks"]}
+-    live_ids |= shadow_view._live_ids(live, [i for i in homes if i not in live_ids])
+-    remote_ids = set(homes) - live_ids
+-    cards = tuple(c for c in rows["cards"] if c[0].id in remote_ids)
+-    done_remote = sum(1 for t, _f, _x in cards if t.status == "done")
+-    remote = board_read.project({**rows, "cards": cards, "done_total": done_remote}, include_archived,
+-                                diagnostics_from_inputs)
+-    by_name = {c["name"]: c for c in remote["columns"]}
+-    for col in payload["columns"]:
+-        extra = by_name.get(col["name"])
++    # Never retain projections: clock/config/profile diagnostics are current on every poll.
++    remote = board_read.project(rows, include_archived, diagnostics_from_inputs)
++    by_name = {c['name']: c for c in remote['columns']}
++    for col in payload['columns']:
++        extra = by_name.get(col['name'])
+         if extra is None:
+             continue
+-        col["tasks"] = col["tasks"] + [shadow_view.mark(t, homes.get(t["id"])) for t in extra["tasks"]]
+-        if col["name"] == "done":
+-            col["tasks"].sort(key=lambda d: d["id"], reverse=True)
+-            col["tasks"].sort(key=lambda d: (d["completed_at"] is None, -(d["completed_at"] or 0)))
+-            total = col.get("total", 0) + done_remote
+-            if int(done_limit or 0) > 0:
+-                col["tasks"] = col["tasks"][:int(done_limit)]
+-            col["total"] = total
+-            col["omitted"] = total - len(col["tasks"])
+-    payload["tenants"] = sorted(set(payload["tenants"]) | set(remote["tenants"]))
+-    payload["assignees"] = sorted(set(payload["assignees"]) | set(remote["assignees"]))
++        col['tasks'] = col['tasks'] + [shadow_view.mark(t, rows['homes'].get(t['id'])) for t in extra['tasks']]
++        if col['name'] == 'done':
++            col['tasks'].sort(key=lambda d: d['id'], reverse=True)
++            col['tasks'].sort(key=lambda d: (d['completed_at'] is None, -(d['completed_at'] or 0)))
++            total = col.get('total', 0) + rows['done_total']
++            if cap > 0:
++                col['tasks'] = col['tasks'][:cap]
++            col['total'] = total
++            col['omitted'] = total - len(col['tasks'])
++    payload['tenants'] = sorted(set(payload['tenants']) | set(remote['tenants']))
++    payload['assignees'] = sorted(set(payload['assignees']) | set(remote['assignees']))
+     return payload
+diff --git a/tests/plugins/_kanban_shadow_oracle.py b/tests/plugins/_kanban_shadow_oracle.py
+new file mode 100644
+index 00000000000..f475746a920
+--- /dev/null
++++ b/tests/plugins/_kanban_shadow_oracle.py
+@@ -0,0 +1,114 @@
++"""``/board``: a shadow board's replica cards, merged read-only under the live ones. [daveey]
++
++``board_read.project`` renders the live file's rows. A board synced in ``shadow`` mode keeps the other gateways'
++cards (the example application's queue) only in the replica, so this adds them to the projected payload: opened
++read-only (``hermes_cli.kanban_shadow_view``), a live card wins on an id collision, each card is stamped
++``remote`` / ``read_only`` / ``home_gateway``. Writes on those cards are already refused as ``foreign_card`` (409).
++"""
++from __future__ import annotations
++
++import os
++import sqlite3
++import threading
++from contextlib import closing
++from typing import Callable
++
++from hermes_cli import kanban_shadow_view as shadow_view
++from plugins.kanban.dashboard import board_read
++
++_LOCK = threading.Lock()
++_MEMO: dict[tuple, tuple[tuple, dict]] = {}
++_MEMO_MAX = 16
++
++
++def _signature(path: str) -> tuple:
++    """Data files change on commits; shm read marks also change on reads, so exclude them."""
++    sig = []
++    for suffix in ("", "-wal"):
++        try:
++            st = os.stat(path + suffix)
++            sig.append((st.st_mtime_ns, st.st_size))
++        except OSError:
++            sig.append(None)
++    return tuple(sig)
++
++
++def _remote_rows(key: tuple, replica_path: str, build: Callable[[], dict]) -> dict:
++    sig = _signature(replica_path)
++    with _LOCK:
++        hit = _MEMO.get(key)
++        if hit is not None and hit[0] == sig:
++            return hit[1]
++    rows = build()
++    with _LOCK:
++        if len(_MEMO) >= _MEMO_MAX:
++            _MEMO.pop(next(iter(_MEMO)))
++        _MEMO[key] = (sig, rows)
++    return rows
++
++
++def clear() -> None:
++    with _LOCK:
++        _MEMO.clear()
++
++
++def for_board(payload: dict, connect: Callable, query: tuple, diagnostic_inputs: Callable,
++              diagnostics_from_inputs: Callable) -> dict:
++    """``merge`` on a fresh live connection; ``query`` = (tenant, include_archived, workflow_template_id,
++    current_step_key, done_limit). A live-file failure leaves the payload as it was."""
++    try:
++        with closing(connect()) as live:
++            return merge(payload, live, *query, diagnostic_inputs=diagnostic_inputs,
++                         diagnostics_from_inputs=diagnostics_from_inputs)
++    except sqlite3.Error:
++        return payload
++
++
++def merge(payload: dict, live, tenant, include_archived, workflow_template_id, current_step_key, done_limit, *,
++          diagnostic_inputs: Callable, diagnostics_from_inputs: Callable) -> dict:
++    """``payload`` (``board_read.project`` of the live rows) plus the replica's cards the live file lacks."""
++    with shadow_view.open_shadow_replica(live) as replica:
++        if replica is None:
++            return payload
++        live_file = shadow_view.db_file(live)
++        replica_file = shadow_view.db_file(replica)
++        key = (live_file, tenant, bool(include_archived), workflow_template_id, current_step_key, int(done_limit or 0))
++        try:
++            def build():
++                # Filter collisions before the final cap: otherwise a live archived/done row
++                # can consume a replica slot and hide the next remote card in the window.
++                result = board_read.materialize(
++                    replica, tenant, include_archived, workflow_template_id, current_step_key, 0,
++                    diagnostic_inputs=diagnostic_inputs)
++                result["homes"] = shadow_view.homes_of(replica, [t.id for t, _f, _x in result["cards"]])
++                return result
++
++            rows = _remote_rows(key, replica_file, build)
++        except Exception:  # health: allow BLE001 -- an unreadable replica must not take the live board down with it
++            shadow_view._log.warning("kanban: shadow replica board read failed", exc_info=True)
++            return payload
++        homes = rows["homes"]
++    live_ids = {t["id"] for col in payload["columns"] for t in col["tasks"]}
++    live_ids |= shadow_view._live_ids(live, [i for i in homes if i not in live_ids])
++    remote_ids = set(homes) - live_ids
++    cards = tuple(c for c in rows["cards"] if c[0].id in remote_ids)
++    done_remote = sum(1 for t, _f, _x in cards if t.status == "done")
++    remote = board_read.project({**rows, "cards": cards, "done_total": done_remote}, include_archived,
++                                diagnostics_from_inputs)
++    by_name = {c["name"]: c for c in remote["columns"]}
++    for col in payload["columns"]:
++        extra = by_name.get(col["name"])
++        if extra is None:
++            continue
++        col["tasks"] = col["tasks"] + [shadow_view.mark(t, homes.get(t["id"])) for t in extra["tasks"]]
++        if col["name"] == "done":
++            col["tasks"].sort(key=lambda d: d["id"], reverse=True)
++            col["tasks"].sort(key=lambda d: (d["completed_at"] is None, -(d["completed_at"] or 0)))
++            total = col.get("total", 0) + done_remote
++            if int(done_limit or 0) > 0:
++                col["tasks"] = col["tasks"][:int(done_limit)]
++            col["total"] = total
++            col["omitted"] = total - len(col["tasks"])
++    payload["tenants"] = sorted(set(payload["tenants"]) | set(remote["tenants"]))
++    payload["assignees"] = sorted(set(payload["assignees"]) | set(remote["assignees"]))
++    return payload
+diff --git a/tests/plugins/test_kanban_shadow_cost.py b/tests/plugins/test_kanban_shadow_cost.py
+new file mode 100644
+index 00000000000..730aa434055
+--- /dev/null
++++ b/tests/plugins/test_kanban_shadow_cost.py
+@@ -0,0 +1,106 @@
++"""Shadow history must scale with displayed cards, including under replica churn."""
++from contextlib import closing
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from plugins.kanban.dashboard import board_read
++from tests.plugins.test_kanban_board_shadow import shadow_board as _shadow_board, _read, _cards, _column
++
++
++@pytest.fixture
++def shadow_board(tmp_path, monkeypatch):
++    yield from _shadow_board.__wrapped__(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def large_shadow(shadow_board):
++    env = shadow_board
++    with closing(kbc.connect(env['shadow'])) as conn, conn:
++        conn.execute('BEGIN')
++        ids = [f'history_{i:05d}' for i in range(1000)]
++        conn.executemany("INSERT INTO tasks (id,title,status,created_at,completed_at,created_on) "
++                         "VALUES (?,?,'done',1,?,'mini')", [(tid, tid, i) for i, tid in enumerate(ids)])
++        conn.executemany("INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,'test','{}',1)",
++                         [(tid,) for tid in ids for _ in range(20)])
++        conn.executemany("INSERT INTO task_runs(task_id,profile,status,started_at) VALUES (?,'default','done',1)",
++                         [(tid,) for tid in ids for _ in range(3)])
++    return env
++
++
++@pytest.mark.parametrize('mode', ['p2', 'legacy', 'unobservable'])
++def test_changing_replica_history_reads_are_display_bounded(large_shadow, monkeypatch, mode):
++    from hermes_cli import kanban_task_change
++    from plugins.kanban.dashboard import board_rows
++    env = large_shadow
++    if mode == 'legacy':
++        monkeypatch.setattr(kanban_task_change, 'changed_since', lambda *a: (None, None))
++    elif mode == 'unobservable':
++        monkeypatch.setattr(board_rows, 'version', lambda path: None)
++    original = board_read._rows_by_task
++    reads, trace, cpu = [], [], []
++
++    def measured(conn, table, ids):
++        if str(env['shadow']) == str(conn.execute('PRAGMA database_list').fetchone()[2]):
++            conn.set_trace_callback(trace.append)
++            reads.append((table, tuple(ids)))
++        return original(conn, table, ids)
++
++    monkeypatch.setattr(board_read, '_rows_by_task', measured)
++    for i in range(3):
++        with closing(kbc.connect(env['shadow'])) as conn, conn:
++            conn.execute('UPDATE tasks SET title=? WHERE id=?', (f'changed {i}', env['ready']))
++        start = time.thread_time()
++        body = _read(env, done_limit=3)
++        cpu.append(time.thread_time() - start)
++        assert _cards(body)[env['ready']]['title'] == f'changed {i}'
++        assert _column(body, 'done')['total'] == 1001
++    print(json.dumps({'cpu_seconds': cpu, 'history_queries': len(reads),
++                      'history_requested_ids': [len(ids) for _, ids in reads],
++                      'sql_statements': len(trace)}))
++    # Two open cards + three done, never 1000 hidden historical cards or the collision.
++    assert reads and max(len(ids) for _, ids in reads) <= 5
++    if mode == 'p2':
++        event_reads = [ids for table, ids in reads if table == 'task_events']
++        assert len(event_reads) == 1  # task-content edits leave all event histories reusable
++
++
++def test_live_done_window_bounds_replica_diagnostics(shadow_board, monkeypatch):
++    env = shadow_board
++    with closing(kbc.connect()) as live, live:
++        live.execute("UPDATE tasks SET status='done', completed_at=9999999999 WHERE id=?", (env['live_id'],))
++    calls = []
++    original = board_read._rows_by_task
++    def capture(conn, table, ids):
++        if str(conn.execute('PRAGMA database_list').fetchone()[2]) == str(env['shadow']):
++            calls.extend(ids)
++        return original(conn, table, ids)
++    monkeypatch.setattr(board_read, '_rows_by_task', capture)
++    body = _read(env, done_limit=1)
++    assert [t['id'] for t in _column(body, 'done')['tasks']] == [env['live_id']]
++    assert _column(body, 'done')['total'] == 2
++    assert env['done'] not in calls
++
++
++def test_large_history_paired_cpu_and_payload_parity(large_shadow, monkeypatch):
++    from plugins.kanban.dashboard import board_shadow
++    from tests.plugins import _kanban_shadow_oracle as oracle
++    env = large_shadow
++    monkeypatch.setattr(board_read.time, 'time', lambda: 1800000000)
++    current = board_shadow.merge
++    samples = []
++    for i in range(4):
++        with closing(kbc.connect(env['shadow'])) as conn, conn:
++            conn.execute('UPDATE tasks SET last_heartbeat_at=? WHERE id=?', (i, env['ready']))
++        pair, payloads = {}, []
++        for name in (('old', 'new') if i % 2 == 0 else ('new', 'old')):
++            with monkeypatch.context() as patch:
++                patch.setattr(board_shadow, 'merge', oracle.merge if name == 'old' else current)
++                start = time.thread_time()
++                payloads.append(_read(env, done_limit=3))
++                pair[name] = time.thread_time() - start
++        assert payloads[0] == payloads[1]
++        samples.append(pair)
++    print(json.dumps({'paired_thread_cpu_seconds': samples, 'payload_parity': True}))
+diff --git a/tests/plugins/test_kanban_shadow_refresh.py b/tests/plugins/test_kanban_shadow_refresh.py
+new file mode 100644
+index 00000000000..58da6e6ced5
+--- /dev/null
++++ b/tests/plugins/test_kanban_shadow_refresh.py
+@@ -0,0 +1,265 @@
++"""Parity against the frozen pre-repair shadow reader, plus changing-snapshot boundaries."""
++from concurrent.futures import ThreadPoolExecutor
++from contextlib import closing
++import threading
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from plugins.kanban.dashboard import board_read, board_rows, board_shadow
++from tests.plugins import _kanban_shadow_oracle as oracle
++from tests.plugins.test_kanban_board_shadow import shadow_board as _shadow_board, _read, _cards, _column
++
++
++@pytest.fixture
++def shadow_board(tmp_path, monkeypatch):
++    yield from _shadow_board.__wrapped__(tmp_path, monkeypatch)
++
++
++def _write(env, sql, args=()):
++    with closing(kbc.connect(env['shadow'])) as conn, conn:
++        conn.execute(sql, args)
++
++
++def _compare(env, monkeypatch, **kw):
++    current = board_shadow.merge
++    oracle.clear()
++    with monkeypatch.context() as patch:
++        patch.setattr(board_shadow, 'merge', oracle.merge)
++        expected = _read(env, **kw)
++    assert board_shadow.merge is current
++    actual = _read(env, **kw)
++    assert actual == expected
++    return actual
++
++
++@pytest.mark.parametrize('cap', [0, 1, 3, 80])
++@pytest.mark.parametrize('archived', [False, True])
++def test_payload_parity_with_legacy_reader(shadow_board, monkeypatch, cap, archived):
++    env = shadow_board
++    monkeypatch.setattr(board_read.time, 'time', lambda: 1800000000)
++    _write(env, "INSERT INTO tasks(id,title,status,created_at,completed_at,created_on,tenant,assignee) "
++                "VALUES ('old','old','done',1,'2020-01-01T00:00:00Z','mini','other','someone')")
++    _write(env, "INSERT INTO tasks(id,title,status,created_at,created_on) VALUES ('archive','archive','archived',1,'mini')")
++    _write(env, "UPDATE tasks SET status='done', completed_at=9999999999 WHERE id=?", (env['live_id'],))
++    _compare(env, monkeypatch, done_limit=cap, archived=archived)
++    _write(env, "UPDATE tasks SET title='new', body='changed content' WHERE id=?", (env['ready'],))
++    _compare(env, monkeypatch, done_limit=cap, archived=archived)
++    _write(env, 'DELETE FROM tasks WHERE id=?', (env['done'],))
++    _compare(env, monkeypatch, done_limit=cap, archived=archived)
++
++
++def test_live_collision_changes_without_replica_commit(shadow_board):
++    env = shadow_board
++    assert env['done'] in _cards(_read(env))
++    with closing(kbc.connect()) as live, live:
++        live.execute("INSERT INTO tasks(id,title,status,created_at) VALUES (?, 'local archived', 'archived',1)",
++                     (env['done'],))
++    assert env['done'] not in _cards(_read(env))
++    assert _column(_read(env), 'done')['total'] == 0
++    with closing(kbc.connect()) as live, live:
++        live.execute('DELETE FROM tasks WHERE id=?', (env['done'],))
++    assert env['done'] in _cards(_read(env))
++
++
++def test_all_replica_rows_collide_leaves_no_remote_cards(shadow_board):
++    env = shadow_board
++    with closing(kbc.connect()) as live, live:
++        for status in ('ready', 'running', 'done'):
++            live.execute("INSERT INTO tasks(id,title,status,created_at) VALUES (?, 'owned', 'archived',1)",
++                         (env[status],))
++    assert set(_cards(_read(env))) == {env['live_id']}
++    assert _column(_read(env), 'done')['total'] == 0
++
++
++def test_bookkeeping_and_exact_history_updates_stay_fresh(shadow_board, monkeypatch):
++    env = shadow_board
++    inputs = []
++    original = env['mod']._diagnostics_from_inputs
++
++    def capture(value):
++        inputs.append(value)
++        return original(value)
++
++    monkeypatch.setattr(env['mod'], '_diagnostics_from_inputs', capture)
++    tid = env['running']
++    _write(env, "INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,'test','{}',1)", (tid,))
++    _write(env, "INSERT INTO task_runs(task_id,profile,status,started_at) VALUES (?,'default','running',1)", (tid,))
++    _read(env)
++    first = inputs[-1][1][tid]
++    _write(env, 'UPDATE tasks SET last_heartbeat_at=12345, claim_expires=54321 WHERE id=?', (tid,))
++    body = _read(env)
++    assert _cards(body)[tid]['last_heartbeat_at'] == 12345
++    assert _cards(body)[tid]['claim_expires'] == 54321
++    assert inputs[-1][1][tid] is first  # bookkeeping does not rematerialize history
++    _write(env, "UPDATE task_events SET payload='{\"new\":true}' WHERE task_id=? AND kind='test'", (tid,))
++    _read(env)
++    assert inputs[-1][1][tid][-1]['payload'] == '{"new":true}'
++    _write(env, 'UPDATE task_runs SET last_heartbeat_at=23456 WHERE task_id=?', (tid,))
++    _read(env)
++    assert inputs[-1][2][tid][-1]['last_heartbeat_at'] == 23456
++    _write(env, "INSERT INTO task_events(task_id,kind,payload,created_at) VALUES (?,'heartbeat','{}',2)", (tid,))
++    _read(env)
++    assert inputs[-1][1][tid][-1]['kind'] == 'heartbeat'
++    _write(env, "DELETE FROM task_events WHERE task_id=? AND kind='test'", (tid,))
++    _read(env)
++    assert all(e['kind'] != 'test' for e in inputs[-1][1][tid])
++    _write(env, 'DELETE FROM task_runs WHERE task_id=?', (tid,))
++    _read(env)
++    assert not inputs[-1][2][tid]
++
++
++@pytest.mark.parametrize('fallback', ['observer', 'cursor'])
++def test_untrusted_reader_is_bounded_and_current(shadow_board, monkeypatch, fallback):
++    from hermes_cli import kanban_task_change
++    env = shadow_board
++    if fallback == 'observer':
++        monkeypatch.setattr(board_rows, 'version', lambda path: None)
++    else:
++        monkeypatch.setattr(kanban_task_change, 'changed_since', lambda *a: (None, None))
++    assert env['ready'] in _cards(_read(env))
++    _write(env, "UPDATE tasks SET title='fresh fallback' WHERE id=?", (env['ready'],))
++    assert _cards(_read(env))[env['ready']]['title'] == 'fresh fallback'
++    _write(env, 'DELETE FROM tasks WHERE id=?', (env['ready'],))
++    assert env['ready'] not in _cards(_read(env))
++
++
++def test_projection_is_fresh_and_payload_mutation_cannot_poison_cache(shadow_board, monkeypatch):
++    env = shadow_board
++    state = {'clock': 1800000000}
++    monkeypatch.setattr(board_read.time, 'time', lambda: state['clock'])
++    body = _read(env)
++    original_age = _cards(body)[env['ready']]['age']['created_age_seconds']
++    _cards(body)[env['ready']]['title'] = 'poison'
++    state['clock'] += 7
++    next_body = _read(env)
++    assert _cards(next_body)[env['ready']]['title'] == 'Mini ready'
++    assert _cards(next_body)[env['ready']]['age']['created_age_seconds'] == original_age + 7
++    assert next_body['now'] == state['clock']
++
++
++@pytest.mark.parametrize('fallback', [False, True])
++def test_concurrent_readers_do_not_publish_stale_build(shadow_board, monkeypatch, fallback):
++    env = shadow_board
++    if fallback:
++        monkeypatch.setattr(board_rows, 'version', lambda path: None)
++    entered, release = threading.Event(), threading.Event()
++    original = board_shadow._selection
++    first = True
++
++    def paused(conn, *args):
++        nonlocal first
++        result = original(conn, *args)  # snapshot established before the concurrent commit
++        if first:
++            first = False
++            entered.set()
++            assert release.wait(10)
++        return result
++
++    monkeypatch.setattr(board_shadow, '_selection', paused)
++    with ThreadPoolExecutor(max_workers=3) as pool:
++        old = pool.submit(_read, env)
++        try:
++            assert entered.wait(10)
++            _write(env, "UPDATE tasks SET title='concurrent commit' WHERE id=?", (env['ready'],))
++            new = pool.submit(_read, env)
++            other_query = pool.submit(_read, env, done_limit=1)
++        finally:
++            release.set()
++        assert _cards(old.result(timeout=15))[env['ready']]['title'] == 'Mini ready'
++        assert _cards(new.result(timeout=15))[env['ready']]['title'] == 'concurrent commit'
++        assert _cards(other_query.result(timeout=15))[env['ready']]['title'] == 'concurrent commit'
++    assert _cards(_read(env))[env['ready']]['title'] == 'concurrent commit'
++
++
++def test_clear_during_build_cannot_republish_old_rows(shadow_board, monkeypatch):
++    env = shadow_board
++    original, retire = board_shadow._selection, board_rows._retire
++    invalidated = threading.Event()
++    threads = []
++
++    def retiring(*observers):
++        if threading.current_thread().name == 'shadow-clear':
++            invalidated.set()  # registry already unpublished; close waits for borrower
++        return retire(*observers)
++
++    def selection(conn, *args):
++        result = original(conn, *args)
++        if not threads:
++            thread = threading.Thread(target=board_rows.clear, name='shadow-clear')
++            threads.append(thread)
++            thread.start()
++            assert invalidated.wait(10)
++        return result
++
++    monkeypatch.setattr(board_rows, '_retire', retiring)
++    monkeypatch.setattr(board_shadow, '_selection', selection)
++    try:
++        _read(env)
++    finally:
++        for thread in threads:
++            thread.join(10)
++            assert not thread.is_alive()
++    assert board_rows.stats()['entries'] == 0
++    _write(env, "UPDATE tasks SET title='after build' WHERE id=?", (env['ready'],))
++    assert _cards(_read(env))[env['ready']]['title'] == 'after build'
++
++
++def test_filtered_queries_retain_exact_legacy_payload(shadow_board, monkeypatch):
++    env = shadow_board
++    monkeypatch.setattr(board_read.time, 'time', lambda: 1800000000)
++    _write(env, "UPDATE tasks SET tenant='one', workflow_template_id='flow', current_step_key='step' WHERE id=?",
++           (env['ready'],))
++    current = board_shadow.merge
++    for tenant, template, step in [('one', None, None), (None, 'flow', 'step'), ('missing', None, None)]:
++        args = (tenant, False, None, template, step, 1)
++        oracle.clear()
++        with monkeypatch.context() as patch:
++            patch.setattr(board_shadow, 'merge', oracle.merge)
++            expected = env['mod']._get_board_uncached(*args)
++        assert board_shadow.merge is current
++        assert env['mod']._get_board_uncached(*args) == expected
++
++
++def test_different_boards_have_independent_replica_cache(shadow_board, monkeypatch, tmp_path):
++    from contextlib import contextmanager
++    from hermes_cli import kanban_shadow_view
++    env = shadow_board
++    second = tmp_path / 'second.db'
++    with closing(kbc.connect(env['shadow'])) as source, closing(kbc.connect(second)) as target:
++        source.backup(target)
++    with closing(kbc.connect(second)) as conn, conn:
++        conn.execute("UPDATE tasks SET title='other board' WHERE id=?", (env['ready'],))
++    original = kanban_shadow_view.open_shadow_replica
++    entered, release = threading.Event(), threading.Event()
++    select = board_shadow._selection
++
++    @contextmanager
++    def replicas(live):
++        if threading.current_thread().name.startswith('other-board'):
++            with closing(board_rows._open_reader(str(second))) as conn:
++                conn.row_factory = sqlite3.Row
++                yield conn
++        else:
++            with original(live) as conn:
++                yield conn
++
++    def paused(conn, *args):
++        result = select(conn, *args)
++        if kanban_shadow_view.db_file(conn) == str(env['shadow']):
++            entered.set()
++            assert release.wait(10)
++        return result
++
++    monkeypatch.setattr(kanban_shadow_view, 'open_shadow_replica', replicas)
++    monkeypatch.setattr(board_shadow, '_selection', paused)
++    with ThreadPoolExecutor(max_workers=1) as first, ThreadPoolExecutor(max_workers=1, thread_name_prefix='other-board') as other:
++        blocked = first.submit(_read, env)
++        try:
++            assert entered.wait(10)
++            independent = other.submit(_read, env)
++            assert _cards(independent.result(timeout=10))[env['ready']]['title'] == 'other board'
++        finally:
++            release.set()
++        assert _cards(blocked.result(timeout=15))[env['ready']]['title'] == 'Mini ready'
+-- 
+2.43.0
+

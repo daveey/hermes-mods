@@ -1,0 +1,321 @@
+From 22f35201c4bce31bef97e42f7b17a89e39447073 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 15:40:52 +0000
+Subject: [PATCH] fix(kanban): fence lazy-uid protection evidence, back off
+ unresolved courier rows, truthful refused detail, forward composed Board URL
+ in test runner
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_protect_guards.py           |  9 ++-
+ hermes_cli/kanban_protect_operator.py         | 13 ++-
+ hermes_cli/kanban_protect_stopped.py          |  6 +-
+ scripts/run_tests.sh                          |  2 +
+ .../test_kanban_protect_stopped_board.py      |  2 +
+ .../test_kanban_protect_stopped_local.py      | 80 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_protect_tool.py  | 44 ++++++++++
+ tools/kanban_protect_stopped_tools.py         |  3 +-
+ 8 files changed, 154 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_protect_guards.py b/hermes_cli/kanban_protect_guards.py
+index 4bfcfd326a9..589e8eea24f 100644
+--- a/hermes_cli/kanban_protect_guards.py
++++ b/hermes_cli/kanban_protect_guards.py
+@@ -13,12 +13,17 @@ def install(conn):
+                 "OR OLD.uid=json_extract(ps.payload,'$.source_event_uid') "
+                 "OR OLD.uid=json_extract(ps.payload,'$.episode_uid') "
+                 "OR (OLD.kind='decision_hold_restricted' AND json_extract(OLD.payload,'$.source_event_uid')="
+-                "json_extract(ps.payload,'$.source_event_uid'))))")
++                "json_extract(ps.payload,'$.source_event_uid')) "
++                "OR OLD.id=json_extract(ps.payload,'$.episode_row_id') "
++                "OR OLD.id=json_extract(ps.payload,'$.restriction_row_id')))")
++    # Lazy uid bootstrap on unsynced boards assigns NULL -> uid only; any other change stays fenced.
++    uid_only = ("(OLD.uid IS NULL AND NEW.uid IS NOT NULL AND NEW.task_id IS OLD.task_id AND NEW.kind IS OLD.kind "
++                "AND NEW.payload IS OLD.payload AND NEW.run_id IS OLD.run_id AND NEW.created_at IS OLD.created_at)")
+     runs = ("EXISTS (SELECT 1 FROM task_events ps WHERE ps.kind='decision_protected_stopped' "
+             "AND ps.task_id=OLD.task_id AND OLD.uid=json_extract(ps.payload,'$.source_run_uid'))")
+     links = f"OLD.parent_id IN ({protected}) OR OLD.child_id IN ({protected})"
+     changes = {
+-        'event_update': ('BEFORE UPDATE ON task_events', evidence),
++        'event_update': ('BEFORE UPDATE ON task_events', f'({evidence}) AND NOT {uid_only}'),
+         'event_delete': ('BEFORE DELETE ON task_events', evidence),
+         'run_update': ('BEFORE UPDATE ON task_runs', runs),
+         'run_delete': ('BEFORE DELETE ON task_runs', runs),
+diff --git a/hermes_cli/kanban_protect_operator.py b/hermes_cli/kanban_protect_operator.py
+index 986705ee2cc..1fc23903675 100644
+--- a/hermes_cli/kanban_protect_operator.py
++++ b/hermes_cli/kanban_protect_operator.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ 
+ import json
+ import logging
++import time
+ 
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_operator_call as courier
+@@ -10,6 +11,9 @@ from hermes_cli import kanban_protect_stopped as kernel
+ from hermes_cli import kanban_protect_transport as transport
+ 
+ _log = logging.getLogger(__name__)
++# Unresolvable pending rows back off per request (in-memory; a restart retries once, then backs off again).
++_BACKOFF: dict[str, tuple[float, float]] = {}
++_BACKOFF_START, _BACKOFF_MAX = 15.0, 900.0
+ ACTION = transport.KIND
+ 
+ 
+@@ -73,7 +77,8 @@ def _finish(conn, own, payload, result, *, outcome='applied'):
+         if old is None or old[0] is not None:
+             return
+         courier.log(conn, request_uid=uid, side='execute', outcome=outcome, finished=True,
+-                    detail='exact canonical stop receipt and held replica confirmed')
++                    detail=('exact canonical stop receipt and held replica confirmed' if outcome == 'applied'
++                            else 'canonical refusal recorded; no stop receipt'))
+         kb._append_event(conn, target, courier.RESULT_KIND, {
+             'request_uid': uid, 'action': ACTION, 'outcome': outcome, 'executor_gateway': own,
+             'detail': 'Administrative protection only; no execution authority', 'protection': result,
+@@ -103,6 +108,8 @@ def tick(conn, own, board):
+     done = []
+     for row in rows:
+         old = dict(row)
++        if _BACKOFF.get(old['request_uid'], (0.0, 0.0))[0] > time.monotonic():
++            continue
+         try:
+             wire = json.loads(old['request_json'])
+             from hermes_cli import kanban_protect_evidence as evidence
+@@ -119,11 +126,15 @@ def tick(conn, own, board):
+                 result = transport.confirm(conn, hub, board, old['request_uid'])
+             except transport.Rejected as exc:
+                 _finish(conn, own, payload, {'ok': False, 'canonical_refusal': exc.result}, outcome='refused')
++                _BACKOFF.pop(old['request_uid'], None)
+                 done.append((old['request_uid'], 'refused'))
+                 continue
+             _finish(conn, own, payload, result)
++            _BACKOFF.pop(old['request_uid'], None)
+             done.append((old['request_uid'], 'applied'))
+         except (ValueError, OSError, client.HubError) as exc:
++            delay = min(_BACKOFF_MAX, _BACKOFF.get(old['request_uid'], (0.0, _BACKOFF_START / 2))[1] * 2)
++            _BACKOFF[old['request_uid']] = (time.monotonic() + delay, delay)
+             _log.info('kanban: stop-only request %s pending canonical evidence: %s', old['request_uid'], exc)
+     return done
+ 
+diff --git a/hermes_cli/kanban_protect_stopped.py b/hermes_cli/kanban_protect_stopped.py
+index d05b7758752..0057a424e0a 100644
+--- a/hermes_cli/kanban_protect_stopped.py
++++ b/hermes_cli/kanban_protect_stopped.py
+@@ -126,6 +126,7 @@ def protect(conn, *, board, task_id, **args):
+                         "AND json_extract(payload,'$.source_event_uid')=?", (task_id, KIND, args['source_event_uid'])).fetchone():
+             raise ValueError('protection_already_recorded; recover original request, never renew deadline')
+         stop = eligible_target(conn, task_id, actor, args)
++        restriction_row = None
+         cause = {'cause': 'scope_stopped', 'accounting_boundary': False,
+                  'reason': 'Explicit home administrative stop adoption; legacy provider provenance unattested',
+                  'source_event_uid': args['source_event_uid'], 'source_run_uid': args['source_run_uid']}
+@@ -133,7 +134,9 @@ def protect(conn, *, board, task_id, **args):
+             kb._append_event(conn, task_id, decision.EVENT, cause)
+         elif not decision.execution_restricted(conn, task_id):
+             kb._append_event(conn, task_id, 'decision_hold_restricted', {**cause, 'episode': stop.get('uid') or str(stop['id'])})
++            restriction_row = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id=? AND kind='decision_hold_restricted'", (task_id,)).fetchone()[0]
+         stop = decision.pending_episode(conn, task_id)
++        episode_row = int(stop['id'])
+         episode = stop.get('uid') or str(stop['id'])
+         conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (task_id,))
+         result = {'ok': True, 'task_id': task_id, 'event_uid': uid, 'episode_uid': episode,
+@@ -141,7 +144,8 @@ def protect(conn, *, board, task_id, **args):
+                   'execution_authority': False}
+         kb._append_event(conn, task_id, KIND, {'version': 1, 'request_json': frozen,
+                           'source_event_uid': args['source_event_uid'], 'source_run_uid': args['source_run_uid'],
+-                          'episode_uid': episode, 'actor_task': actor.task, 'actor_run_uid': actor.run_uid,
++                          'episode_uid': episode, 'episode_row_id': episode_row, 'restriction_row_id': restriction_row,
++                          'actor_task': actor.task, 'actor_run_uid': actor.run_uid,
+                           'proof_class': 'administrative_adoption;historical_provider_unattested',
+                           'disposition': args, 'result': result})
+         conn.execute("UPDATE task_events SET uid=? WHERE id=(SELECT MAX(id) FROM task_events WHERE task_id=? AND kind=?)", (uid, task_id, KIND))
+diff --git a/scripts/run_tests.sh b/scripts/run_tests.sh
+index de0c94050ff..371ceb06020 100755
+--- a/scripts/run_tests.sh
++++ b/scripts/run_tests.sh
+@@ -254,6 +254,8 @@ exec env -i \
+   ${HERMES_RUN_SLOW_PET_TESTS:+HERMES_RUN_SLOW_PET_TESTS="$HERMES_RUN_SLOW_PET_TESTS"} \
+   ${HERMES_E2E_BROWSER:+HERMES_E2E_BROWSER="$HERMES_E2E_BROWSER"} \
+   ${HERMES_RUN_E2E:+HERMES_RUN_E2E="$HERMES_RUN_E2E"} \
++  ${B2_M1_LOCAL_BOARD_URL:+B2_M1_LOCAL_BOARD_URL="$B2_M1_LOCAL_BOARD_URL"} \
++  ${B2_M2_LOCAL_BOARD_URL:+B2_M2_LOCAL_BOARD_URL="$B2_M2_LOCAL_BOARD_URL"} \
+   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
+   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
+   "$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py" "$@"
+diff --git a/tests/hermes_cli/test_kanban_protect_stopped_board.py b/tests/hermes_cli/test_kanban_protect_stopped_board.py
+index dc9abdf66ad..b21e767660e 100644
+--- a/tests/hermes_cli/test_kanban_protect_stopped_board.py
++++ b/tests/hermes_cli/test_kanban_protect_stopped_board.py
+@@ -193,6 +193,8 @@ def test_actual_incoming_courier_lost_reply_restart_one_terminal_result(composed
+         with kbc.connect(c['home']/'kanban.db') as reopened:
+             monkeypatch.setattr(client.Hub, 'ops', original)
+             courier._MARK.clear()
++            from hermes_cli import kanban_protect_operator as _operator
++            _operator._BACKOFF.clear()  # a restart forgets in-memory backoff
+             assert (uid, 'applied') in courier.apply_incoming(reopened)
+             assert courier.apply_incoming(reopened) == []
+             results = reopened.execute("SELECT payload FROM task_events WHERE kind='operator_call_result'").fetchall()
+diff --git a/tests/hermes_cli/test_kanban_protect_stopped_local.py b/tests/hermes_cli/test_kanban_protect_stopped_local.py
+index 09dd424fd4b..6ebdad9aacb 100644
+--- a/tests/hermes_cli/test_kanban_protect_stopped_local.py
++++ b/tests/hermes_cli/test_kanban_protect_stopped_local.py
+@@ -143,3 +143,83 @@ def test_exact_latest_decision_owner_without_direct_parent(board, monkeypatch, c
+                 protect.protect(board, board='default', **args)
+         else:
+             assert protect.protect(board, board='default', **args)['ok']
++
++
++def add_target(conn, actor, args):
++    """A second ended legacy target under the same actor, same shape as `fixture`."""
++    from hermes_cli.kanban_containment_connections import bootstrap
++    target = kb.create_task(conn, title='second legacy target fixture', assignee='default')
++    assert kb.claim_task(conn, target, claimer='default')
++    old = kb.get_task(conn, target).current_run_id
++    kb._end_run(conn, target, outcome='crashed', status='crashed')
++    conn.execute("UPDATE tasks SET status='scheduled',current_run_id=NULL,claim_lock=NULL,claim_expires=NULL WHERE id=?", (target,))
++    kb.link_tasks(conn, actor, target)
++    bootstrap(conn)
++    run_uid = conn.execute('SELECT uid FROM task_runs WHERE id=?', (old,)).fetchone()[0]
++    kb._append_event(conn, target, 'failure_finalized', {'run_uid': run_uid, 'reason_code': 'provider_refusal', 'tripped': True,
++                     'final_status': 'triage', 'trigger_outcome': 'crashed'}, run_id=old)
++    bootstrap(conn)
++    source = conn.execute("SELECT uid FROM task_events WHERE task_id=? AND kind='failure_finalized'", (target,)).fetchone()[0]
++    return target, old, {**args, 'task_id': target, 'source_event_uid': source, 'source_run_uid': run_uid}
++
++
++def test_two_protections_on_one_unsynced_board(board, monkeypatch):
++    from hermes_cli import kanban_protect_stopped as protect
++    from hermes_cli.kanban_containment_connections import bootstrap
++    actor, _, session, first, _, args = fixture(board, monkeypatch)
++    second, _, args2 = add_target(board, actor, args)
++    with scoped_current_session_id(session):
++        one = protect.protect(board, board='default', **args)
++        two = protect.protect(board, board='default', **args2)
++        assert protect.protect(board, board='default', **args2) == two
++    assert one['event_uid'] != two['event_uid']
++    assert kb.get_task(board, first).status == kb.get_task(board, second).status == 'triage'
++    assert decision.execution_restricted(board, first) and decision.execution_restricted(board, second)
++    bootstrap(board)
++
++
++def test_existing_episode_protection_keeps_uid_bootstrap_and_containment_usable(board, monkeypatch):
++    import sqlite3
++    from hermes_cli import kanban_protect_stopped as protect
++    from hermes_cli.kanban_containment_connections import bootstrap
++    _, _, session, target, _, args = fixture(board, monkeypatch)
++    kb._append_event(board, target, decision.EVENT, {'cause': 'budget', 'accounting_boundary': False})
++    bootstrap(board)
++    args['expected_episode'] = decision.pending_episode(board, target)['uid']
++    # An unrelated unbootstrapped run/event on the board must still receive its uid after protection.
++    with scoped_current_session_id(session):
++        protect.protect(board, board='default', **args)
++    kb._append_event(board, target, 'diagnostic_after', {})
++    bootstrap(board)
++    bootstrap(board)
++    assert board.execute("SELECT COUNT(*) FROM task_events WHERE uid IS NULL").fetchone()[0] == 0
++    row = board.execute("SELECT id FROM task_events WHERE task_id=? AND kind='decision_hold_restricted'", (target,)).fetchone()
++    if row is not None:
++        with pytest.raises(sqlite3.IntegrityError, match='protect_evidence_immutable'):
++            board.execute('DELETE FROM task_events WHERE id=?', (row[0],))
++        with pytest.raises(sqlite3.IntegrityError, match='protect_evidence_immutable'):
++            board.execute("UPDATE task_events SET payload='{}' WHERE id=?", (row[0],))
++    episode = board.execute("SELECT id FROM task_events WHERE task_id=? AND kind=?", (target, decision.EVENT)).fetchone()[0]
++    with pytest.raises(sqlite3.IntegrityError, match='protect_evidence_immutable'):
++        board.execute('DELETE FROM task_events WHERE id=?', (episode,))
++    assert decision.execution_restricted(board, target)
++
++
++@pytest.mark.parametrize('bootstrapped', [False, True])
++def test_default_path_restriction_episode_is_fenced_by_row_and_child_stays_held(board, monkeypatch, bootstrapped):
++    import sqlite3
++    from hermes_cli import kanban_protect_stopped as protect
++    from hermes_cli.kanban_containment_connections import bootstrap
++    _, _, session, target, _, args = fixture(board, monkeypatch)
++    child = kb.create_task(board, title='held verifier fixture', assignee='default', parents=[target])
++    with scoped_current_session_id(session):
++        result = protect.protect(board, board='default', **args)
++    if bootstrapped:
++        bootstrap(board)
++    assert kb.archive_task(board, target)
++    row = board.execute("SELECT id FROM task_events WHERE task_id=? AND kind=?", (target, decision.EVENT)).fetchone()[0]
++    with pytest.raises(sqlite3.IntegrityError, match='protect_evidence_immutable'):
++        board.execute('DELETE FROM task_events WHERE id=?', (row,))
++    kb.recompute_ready(board)
++    assert kb.get_task(board, child).status == 'todo'
++    assert decision.execution_restricted(board, target) and result['dependency_satisfied'] is False
+diff --git a/tests/hermes_cli/test_kanban_protect_tool.py b/tests/hermes_cli/test_kanban_protect_tool.py
+index 0e85d08a836..385faa0ed87 100644
+--- a/tests/hermes_cli/test_kanban_protect_tool.py
++++ b/tests/hermes_cli/test_kanban_protect_tool.py
+@@ -42,3 +42,47 @@ def test_protect_operator_wire_has_closed_stop_only_fields(board, monkeypatch):
+         courier.normalize_op(0, {**raw, 'release': True})
+     with pytest.raises(ValueError, match='integer target clock'):
+         courier.normalize_op(0, {**raw, 'expected_updated_at': None})
++
++
++def _pending(board, monkeypatch, outcome_row=True):
++    _, _, _, target, _, _ = fixture(board, monkeypatch)
++    courier.log(board, request_uid='req-1', side='execute', outcome='accepted_pending_canonical',
++                op={'action': 'protect_stopped', 'task_id': target}, caller={'gateway': 'g', 'task_id': 'a'}, executor_gateway='g')
++    return target, {'request_uid': 'req-1', 'target_task_id': target, 'caller': {'gateway': 'g', 'task_id': 'a'}}
++
++
++def test_refused_protection_is_not_logged_as_confirmed_receipt(board, monkeypatch):
++    from hermes_cli import kanban_protect_operator as op
++    _, payload = _pending(board, monkeypatch)
++    op._finish(board, 'g', payload, {'ok': False, 'canonical_refusal': {'reason': 'x'}}, outcome='refused')
++    row = board.execute("SELECT outcome, detail FROM operator_calls WHERE request_uid='req-1'").fetchone()
++    assert row[0] == 'refused' and 'confirmed' not in row[1] and 'no stop receipt' in row[1]
++
++
++def test_applied_protection_logs_confirmed_receipt(board, monkeypatch):
++    from hermes_cli import kanban_protect_operator as op
++    _, payload = _pending(board, monkeypatch)
++    op._finish(board, 'g', payload, {'ok': True})
++    assert 'confirmed' in board.execute("SELECT detail FROM operator_calls WHERE request_uid='req-1'").fetchone()[0]
++
++
++def test_unresolvable_pending_row_backs_off_instead_of_requesting_every_tick(board, monkeypatch):
++    from hermes_cli import kanban_protect_operator as op
++    from hermes_cli import kanban_protect_evidence as evidence
++    from hermes_cli import kanban_sync_client as client
++    _pending(board, monkeypatch)
++    board.execute("CREATE TABLE IF NOT EXISTS kanban_protect_commands (request_uid TEXT, board TEXT, home TEXT, request_json TEXT, "
++                  "request_event_uid TEXT, delivery_state TEXT, canonical_receipt_json TEXT, request_sha256 TEXT)")
++    board.execute("CREATE TABLE IF NOT EXISTS kanban_protect_scan (board TEXT PRIMARY KEY, last_id INTEGER)")
++    board.execute("INSERT INTO kanban_protect_commands VALUES ('req-1','b','g','{}','e','pending',NULL,NULL)")
++    calls = []
++    monkeypatch.setattr(client, 'load_identity', lambda: object())
++    monkeypatch.setattr(client, 'Hub', lambda identity: object())
++    def unavailable(*a, **k):
++        calls.append(1)
++        raise OSError('capability route not deployed')
++    monkeypatch.setattr(evidence, 'frozen', unavailable)
++    op._BACKOFF.clear()
++    for _ in range(5):
++        assert op.tick(board, 'g', 'b') == []
++    assert len(calls) == 1
+diff --git a/tools/kanban_protect_stopped_tools.py b/tools/kanban_protect_stopped_tools.py
+index 413c7514d1a..c4a2eff3995 100644
+--- a/tools/kanban_protect_stopped_tools.py
++++ b/tools/kanban_protect_stopped_tools.py
+@@ -1,5 +1,6 @@
+ """Registered stop-only administrative protection; no original workload admission."""
+ import json
++import sqlite3
+ 
+ from tools.kanban_containment_tools import _schema
+ 
+@@ -33,6 +34,6 @@ def handle(args, **kwargs):
+             state = sync_state(conn)
+             slug = state['board_id'] if state else board_slug_for_path(conn.execute('PRAGMA database_list').fetchone()[2])
+             return json.dumps(service.request(conn, board=slug, **{k: v for k, v in args.items() if k != 'board'}))
+-    except (ValueError, ContainmentRefused, SupervisorRequestError, OSError) as exc:
++    except (ValueError, ContainmentRefused, SupervisorRequestError, OSError, sqlite3.IntegrityError) as exc:
+         return json.dumps({'ok': False, 'terminal_for_run': False, 'execution_authority': False,
+                            'error': str(exc), 'next_step': 'Preserve exact original request; resolve the stated canonical prerequisite.'})
+-- 
+2.43.0
+

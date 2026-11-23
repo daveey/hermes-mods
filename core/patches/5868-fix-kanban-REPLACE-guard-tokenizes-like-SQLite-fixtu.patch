@@ -1,0 +1,188 @@
+From 87e69434dce00343500fb3fa1bac69438da8968d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 00:26:45 +0000
+Subject: [PATCH] fix(kanban): REPLACE guard tokenizes like SQLite; fixtures
+ stop REPLACE-ing via the board [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_replace_guard.py            |  9 ++-
+ tests/hermes_cli/test_kanban_operator_call.py |  6 +-
+ .../test_kanban_replace_guard_lexer.py        | 58 +++++++++++++++++++
+ .../test_kanban_sync_status_origin.py         |  4 +-
+ tests/hermes_cli/test_kanban_task_change.py   |  5 +-
+ .../test_origin_native_lifecycle.py           |  5 +-
+ 6 files changed, 80 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_replace_guard_lexer.py
+
+diff --git a/hermes_cli/kanban_replace_guard.py b/hermes_cli/kanban_replace_guard.py
+index d6d7bc25f32..3a1a7ba7ea7 100644
+--- a/hermes_cli/kanban_replace_guard.py
++++ b/hermes_cli/kanban_replace_guard.py
+@@ -14,10 +14,17 @@ class ProtectedRowReplaceError(sqlite3.IntegrityError):
+     """A caller attempted destructive replacement of a task or run identity."""
+ 
+ 
++# Mirror SQLite's tokenizer (tokenize.c): whitespace is ASCII space/tab/LF/FF/CR plus
++# a UTF-8 BOM where a token starts (CC_BOM -> TK_SPACE). Inside an identifier every
++# non-ASCII character, the BOM included, is an identifier character: ``tasksé`` is one
++# identifier, while ``\ufefftasks`` is whitespace + ``tasks``.
++_WS = ' \t\n\f\r\ufeff'
++_ID_START = '[A-Za-z_\u0080-\ufefe\uff00-\U0010ffff]'
++_ID_CHAR = '[A-Za-z_0-9$\u0080-\U0010ffff]'
+ _TOKENS = re.compile(
+     r"--[^\n]*(?:\n|$)|/\*.*?(?:\*/|$)|"
+     r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^]]*\]|"
+-    r"[A-Za-z_][A-Za-z_0-9$]*|[^\s]", re.DOTALL,
++    + _ID_START + _ID_CHAR + "*|[^" + _WS + "]", re.DOTALL,
+ )
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_operator_call.py b/tests/hermes_cli/test_kanban_operator_call.py
+index 8db293380aa..b83894e94cc 100644
+--- a/tests/hermes_cli/test_kanban_operator_call.py
++++ b/tests/hermes_cli/test_kanban_operator_call.py
+@@ -57,8 +57,10 @@ class Fleet:
+                 for tid in own:
+                     row = src.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
+                     cols = row.keys()
+-                    self.rep.execute(f"INSERT OR REPLACE INTO tasks ({','.join(cols)}) VALUES "
+-                                     f"({','.join('?' * len(cols))})", tuple(row))
++                    # Upsert, not REPLACE: the board factory refuses REPLACE on tasks (PR4045).
++                    self.rep.execute(f"INSERT INTO tasks ({','.join(cols)}) VALUES "
++                                     f"({','.join('?' * len(cols))}) ON CONFLICT(id) DO UPDATE SET "
++                                     + ','.join(f"{c}=excluded.{c}" for c in cols if c != "id"), tuple(row))
+                     for r in src.execute("SELECT * FROM task_runs WHERE task_id = ?", (tid,)).fetchall():
+                         rc = [k for k in r.keys() if k != "id"]
+                         if not self.rep.execute("SELECT 1 FROM task_runs WHERE uid = ?", (r["uid"],)).fetchone():
+diff --git a/tests/hermes_cli/test_kanban_replace_guard_lexer.py b/tests/hermes_cli/test_kanban_replace_guard_lexer.py
+new file mode 100644
+index 00000000000..57a946409a1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replace_guard_lexer.py
+@@ -0,0 +1,58 @@
++"""PR4045 review on 8d09c5ee: the guard's lexer must tokenize like SQLite itself.
++
++P1: SQLite treats U+FEFF (BOM) as whitespace, so ``REPLACE INTO \ufefftasks`` targets ``tasks``.
++P2: SQLite treats other non-ASCII characters as identifier characters, so ``tasksé`` is another table.
++Each case is checked against real SQLite first (control), then against the guard.
++"""
++import sqlite3
++
++import pytest
++
++from hermes_cli.kanban_replace_guard import ProtectedRowReplaceError, reject_replace
++
++BOM = '\ufeff'
++PROTECTED = [
++    f'REPLACE INTO {BOM}tasks VALUES (1)',
++    f'INSERT OR REPLACE INTO {BOM}task_runs VALUES (1)',
++    f'REPLACE INTO{chr(10)}{BOM}tasks VALUES (1)',
++    f'{BOM}INSERT OR REPLACE INTO {BOM}{BOM}tasks VALUES (1)',
++    f'UPDATE OR REPLACE {BOM}tasks SET id = 1',
++    f'REPLACE INTO main.{BOM}tasks VALUES (1)',
++]
++UNRELATED = [
++    'REPLACE INTO tasksé VALUES (1)',
++    'INSERT OR REPLACE INTO task_runsé VALUES (1)',
++    'REPLACE INTO étasks VALUES (1)',
++    'UPDATE OR REPLACE tasks_é SET id = 1',
++    f'REPLACE INTO tasks{BOM} VALUES (1)',  # a trailing BOM is part of the identifier
++]
++
++
++def _raw():
++    db = sqlite3.connect(':memory:')
++    for name in ('tasks', 'task_runs', 'tasksé', 'task_runsé', 'étasks', 'tasks_é', 'tasks' + BOM):
++        db.execute(f'CREATE TABLE "{name}" (id PRIMARY KEY)')
++    return db
++
++
++@pytest.mark.parametrize('sql', PROTECTED)
++def test_bom_whitespace_is_still_a_protected_replace(sql):
++    db = _raw()
++    db.execute('INSERT INTO tasks VALUES (2)')
++    before = db.total_changes
++    db.execute(sql)  # control: SQLite accepts the spelling and writes a protected table
++    assert db.total_changes > before
++    assert db.execute('SELECT count(*) FROM tasks').fetchone()[0] + \
++        db.execute('SELECT count(*) FROM task_runs').fetchone()[0] >= 2 or sql.startswith('UPDATE')
++    with pytest.raises(ProtectedRowReplaceError):
++        reject_replace(sql)
++
++
++@pytest.mark.parametrize('sql', UNRELATED)
++def test_non_ascii_suffix_is_a_different_table(sql):
++    db = _raw()
++    db.execute('INSERT INTO "tasks_é" VALUES (1)')
++    db.execute(sql)  # control: SQLite runs it against the unrelated table
++    assert db.execute('SELECT count(*) FROM tasks').fetchone()[0] == 0
++    assert db.execute('SELECT count(*) FROM task_runs').fetchone()[0] == 0
++    reject_replace(sql)  # no false positive
+diff --git a/tests/hermes_cli/test_kanban_sync_status_origin.py b/tests/hermes_cli/test_kanban_sync_status_origin.py
+index 4e42a5c33e9..2c8350a63f8 100644
+--- a/tests/hermes_cli/test_kanban_sync_status_origin.py
++++ b/tests/hermes_cli/test_kanban_sync_status_origin.py
+@@ -1,5 +1,6 @@
+ """Real capture transactions associate status with their own lifecycle evidence."""
+ import json
++import sqlite3
+ 
+ import pytest
+ 
+@@ -113,7 +114,8 @@ def test_identity_replacement_revokes_capture_instead_of_transferring_it(board):
+     replacement = kb.create_task(conn, title="replacement")
+     assert conn.execute("SELECT COUNT(*) FROM kanban_sync_status_origins").fetchone()[0] == 2
+     conn.execute("PRAGMA recursive_triggers=OFF")
+-    conn.execute("UPDATE OR REPLACE tasks SET id=? WHERE id=?", (target, replacement))
++    # Raw sqlite3 writer: the board factory refuses REPLACE (PR4045).
++    sqlite3.Connection.execute(conn, "UPDATE OR REPLACE tasks SET id=? WHERE id=?", (target, replacement))
+     assert conn.execute("SELECT title FROM tasks WHERE id=?", (target,)).fetchone()[0] == "replacement"
+     assert conn.execute("SELECT COUNT(*) FROM kanban_sync_status_origins").fetchone()[0] == 0
+ 
+diff --git a/tests/hermes_cli/test_kanban_task_change.py b/tests/hermes_cli/test_kanban_task_change.py
+index 48e19508569..10d77ba6a92 100644
+--- a/tests/hermes_cli/test_kanban_task_change.py
++++ b/tests/hermes_cli/test_kanban_task_change.py
+@@ -100,7 +100,10 @@ def test_insert_or_replace_is_marked_by_the_insert_trigger(board):
+     row = dict(board.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+     row["title"] = "replaced"
+     cols = ", ".join(row)
+-    _write(board, f"INSERT OR REPLACE INTO tasks ({cols}) VALUES ({', '.join('?' * len(row))})", tuple(row.values()))
++    # Raw sqlite3 writer: the board factory refuses REPLACE (PR4045); the trigger must still mark it.
++    with kbc.write_txn(board):
++        sqlite3.Connection.execute(board, f"INSERT OR REPLACE INTO tasks ({cols}) VALUES ({', '.join('?' * len(row))})",
++                                   tuple(row.values()))
+     changed, _ = tc.changed_since(board, cursor)
+     assert changed == {tid}
+ 
+diff --git a/tests/hermes_cli/test_origin_native_lifecycle.py b/tests/hermes_cli/test_origin_native_lifecycle.py
+index f12b23ba450..b4404c75d19 100644
+--- a/tests/hermes_cli/test_origin_native_lifecycle.py
++++ b/tests/hermes_cli/test_origin_native_lifecycle.py
+@@ -53,7 +53,8 @@ def test_reused_task_id_does_not_resurrect_receipt(store):
+     _, conn, task, _ = store
+     # REPLACE's implicit delete does not run delete triggers unless recursive_triggers is on.
+     conn.execute("PRAGMA recursive_triggers=OFF")
+-    conn.execute("INSERT OR REPLACE INTO tasks SELECT * FROM tasks WHERE id=?", (task,))
++    # Raw sqlite3 writer: the board factory refuses REPLACE (PR4045); receipts must still hold.
++    sqlite3.Connection.execute(conn, "INSERT OR REPLACE INTO tasks SELECT * FROM tasks WHERE id=?", (task,))
+     assert native._receipt(conn, task) is None
+ 
+ 
+@@ -68,7 +69,7 @@ def test_update_replace_cannot_transfer_receipt(store):
+     _, conn, task, _ = store
+     other = kb.create_task(conn, title="untrusted replacement")
+     conn.execute("PRAGMA recursive_triggers=OFF")
+-    conn.execute("UPDATE OR REPLACE tasks SET id=? WHERE id=?", (task, other))
++    sqlite3.Connection.execute(conn, "UPDATE OR REPLACE tasks SET id=? WHERE id=?", (task, other))  # raw writer
+     assert native._receipt(conn, task) is None
+ 
+ 
+-- 
+2.43.0
+

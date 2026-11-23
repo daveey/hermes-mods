@@ -1,0 +1,204 @@
+From 2a45267e56aa3356e8d0cef660ad5aa988992ded Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 03:43:58 +0000
+Subject: [PATCH] fix(kanban): read missing scope owner links from canonical
+ Board [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_scope_renewal_cli.py        | 41 ++++++++-
+ .../test_kanban_scope_renewal_shadow.py       | 91 +++++++++++++++++++
+ .../test_kanban_scope_renewal_synced.py       |  2 +
+ 3 files changed, 131 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_scope_renewal_cli.py b/hermes_cli/kanban_scope_renewal_cli.py
+index c5cc0d96756..b917f6ee62c 100644
+--- a/hermes_cli/kanban_scope_renewal_cli.py
++++ b/hermes_cli/kanban_scope_renewal_cli.py
+@@ -73,7 +73,7 @@ def caller_identity(environs: Sequence[Mapping[str, str]]) -> tuple[set, set]:
+ 
+ 
+ def resolve_actor(conn: sqlite3.Connection, task_id: str, *, writer: tuple, environs: Sequence[Mapping[str, str]],
+-                  gateway: str, profile: str) -> Actor:
++                  gateway: str, profile: str, canonical_owner=None) -> Actor:
+     """The renewing authority, or :class:`RenewalRefused`. The stopped card's own runs are refused first."""
+     from hermes_cli.kanban_archive_scope import _creator_task_id
+     kind, session, evidence = writer
+@@ -97,12 +97,44 @@ def resolve_actor(conn: sqlite3.Connection, task_id: str, *, writer: tuple, envi
+         if own != creator or row is None or row[0] != "running" or session not in _sessions(conn, own):
+             raise RenewalRefused("not_scope_authority", f"task {own} is not {task_id}'s running creator task")
+         return Actor("agent", session, "creator_task", own, gateway, profile)
+-    if owning_link(conn, task_id, gateway=gateway, profile=profile, session=session) is None:
++    if (owning_link(conn, task_id, gateway=gateway, profile=profile, session=session) is None
++            and (canonical_owner is None or not canonical_owner(session))):
+         raise RenewalRefused("not_scope_authority", f"this session is not {task_id}'s owning chat (an unreleased "
+                              "created chat link); shepherd/touch subscriptions and unrelated agents cannot renew")
+     return Actor("agent", session, "chat", f"@session:{profile}@{gateway}/{session}", gateway, profile)
+ 
+ 
++def _canonical_owner(conn, board, task_id, gateway, profile, session) -> bool:
++    """Read missing replica authority, never synthesize/project a link or accept an observer.
++
++    Chat links can live only on the home and canonical Board. Legacy NULL profiles use a different UID
++    from explicit default profiles; both mean default, never a wildcard for another profile.
++    """
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_sync_client as client
++    from hermes_cli.kanban_chat_links import link_uid
++    state = sync.sync_state(conn)
++    if not state or sync.board_mode(conn) == "off":
++        return False
++    hub = client.Hub(client.load_identity())
++    try:
++        for candidate in ((profile, None) if profile == "default" else (profile,)):
++            uid = link_uid(task_id, gateway, candidate, session, "created")
++            proof = hub.row_evidence(board or state["board_id"], "task_chat_links", uid)
++            row = proof.get("row") if isinstance(proof, dict) and proof.get("state") == "live" else None
++            if (isinstance(row, dict) and row.get("uid") == uid and row.get("task_id") == task_id
++                    and row.get("kind") == "created" and row.get("released") == 0
++                    and row.get("deleted_at") is None and row.get("chat_gateway") == gateway
++                    and (row.get("chat_profile") or "default") == profile and row.get("chat_session") == session):
++                return True
++        return False
++    except (client.HubError, client.SyncUnavailable, OSError, TimeoutError) as exc:
++        raise RenewalRefused("board_unavailable", "canonical owning-chat evidence could not be read; "
++                             "nothing was renewed") from exc
++    finally:
++        hub.close()
++
++
+ def _canonical(conn: sqlite3.Connection, board: str, task_id: str, payload: dict, mode: str,
+                *, evidence: Optional[sqlite3.Connection] = None) -> dict:
+     """Ask the canonical Board to revalidate and write the event; project its exact row into this replica."""
+@@ -162,8 +194,11 @@ def renew(conn: sqlite3.Connection, task_id: str, *, episode: str, comment_id: i
+     with ExitStack() as scope:
+         from hermes_cli.kanban_shadow_view import open_card
+         _, evidence, _ = open_card(conn, scope, task_id)
++        gateway, profile = gateway_names()[0], get_active_profile_name() or "default"
+         actor = resolve_actor(evidence, task_id, writer=writer, environs=[*(ancestry or ()), env],
+-                              gateway=gateway_names()[0], profile=get_active_profile_name() or "default")
++                              gateway=gateway, profile=profile,
++                              canonical_owner=lambda session: _canonical_owner(
++                                  conn, board, task_id, gateway, profile, session))
+         return _renew(conn, evidence, task_id, episode, comment_id, reason, board, actor)
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_scope_renewal_shadow.py b/tests/hermes_cli/test_kanban_scope_renewal_shadow.py
+index 97b3f7e5390..a5f51ad995a 100644
+--- a/tests/hermes_cli/test_kanban_scope_renewal_shadow.py
++++ b/tests/hermes_cli/test_kanban_scope_renewal_shadow.py
+@@ -122,6 +122,97 @@ def test_shadow_evidence_does_not_authorize_spoofed_process_identity(foreign, an
+     assert not hub.sent
+ 
+ 
++@pytest.mark.parametrize('damage', [None, 'shepherd', 'session', 'released', 'gateway', 'profile', 'deleted', 'task'])
++def test_missing_replica_owner_uses_exact_canonical_created_link(foreign, monkeypatch, capsys, damage):
++    primary, home, hub, tid, episode, comment, path, snapshot = foreign
++    # Exact incident shape: home has legacy NULL-profile ownership; hub has only an observer.
++    owner = dict(home.execute('SELECT * FROM task_chat_links WHERE task_id=?', (tid,)).fetchone())
++    assert owner['chat_profile'] is None
++    with kb.write_txn(home):
++        home.execute("UPDATE task_chat_links SET kind='shepherd',chat_profile='default' WHERE task_id=?", (tid,))
++    snapshot()
++    with kb.write_txn(home):
++        home.execute("UPDATE task_chat_links SET kind='created',chat_profile=NULL WHERE task_id=?", (tid,))
++    from hermes_cli.kanban_chat_links import link_uid
++    uid = link_uid(tid, 'hub', None, support.CHAT, 'created')
++    owner.update(uid=uid, deleted_at=None)
++    mutations = {'session': ('chat_session', 'wrong'), 'gateway': ('chat_gateway', 'wrong'),
++                 'profile': ('chat_profile', 'wrong'), 'task': ('task_id', 'wrong'),
++                 'shepherd': ('kind', 'shepherd'), 'released': ('released', 1), 'deleted': ('deleted_at', 1)}
++    if damage is not None:
++        field, value = mutations[damage]
++        owner[field] = value
++    real = hub.row_evidence
++    reads = []
++
++    def evidence(board, table, key):
++        if table != 'task_chat_links':
++            return real(board, table, key)
++        reads.append(key)
++        return {'state': 'live', 'row': owner} if key == uid else {'state': 'absent'}
++
++    hub.row_evidence = evidence
++    before = hashlib.sha256(path.read_bytes()).hexdigest()
++    assert invoke(monkeypatch, primary, tid, episode, comment) == (0 if damage is None else 1)
++    assert ('"ok": true' if damage is None else 'not_scope_authority') in capsys.readouterr().out
++    assert uid in reads
++    assert len(hub.sent) == (1 if damage is None else 0)
++    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
++    assert not kb.get_task(primary, tid)
++
++
++@pytest.mark.parametrize('profile', [None, 'default', 'other'])
++@pytest.mark.parametrize('failure', [None, 'absent', 'offline', 'wrong-session', 'own-run', 'ambiguous'])
++def test_canonical_owner_lookup_preserves_process_and_transport_gates(foreign, monkeypatch, profile, failure):
++    primary, home, hub, tid, episode, comment, _, snapshot = foreign
++    with kb.write_txn(home):
++        home.execute("UPDATE task_chat_links SET kind='shepherd' WHERE task_id=?", (tid,))
++    snapshot()
++    from hermes_cli import profiles
++    from hermes_cli.kanban_chat_links import link_uid
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: profile or 'default')
++    session = 'wrong-chat' if failure == 'wrong-session' else support.CHAT
++    reads = []
++    closed = []
++    real = hub.row_evidence
++    uid = link_uid(tid, 'hub', profile, support.CHAT, 'created')
++
++    def evidence(board, table, key):
++        if table != 'task_chat_links':
++            return real(board, table, key)
++        reads.append(key)
++        if failure == 'offline':
++            raise client.SyncUnavailable('offline')
++        if failure == 'absent' or key != uid:
++            return {'state': 'absent'}
++        return {'state': 'live', 'row': dict(uid=uid, task_id=tid, chat_gateway='hub', chat_profile=profile,
++                                           chat_session=support.CHAT, kind='created', released=0, deleted_at=None)}
++
++    hub.row_evidence = evidence
++    hub.close = lambda: closed.append(True)
++    env = {'HERMES_SESSION_ID': session}
++    ancestry = [env]
++    if failure == 'own-run':
++        env['HERMES_KANBAN_WORKER_TASK'] = tid
++    elif failure == 'ambiguous':
++        ancestry = [{'HERMES_SESSION_ID': 'another-session'}]
++    kwargs = dict(episode=episode, comment_id=comment, reason='authorized',
++                  writer=('agent', session, '4242:HERMES_SESSION_ID'), env=env, ancestry=ancestry)
++    if failure is None:
++        assert cli.renew(primary, tid, **kwargs)['authority_kind'] == 'chat'
++        assert uid in reads and len(hub.sent) == 1
++    else:
++        with pytest.raises(cli.RenewalRefused) as caught:
++            cli.renew(primary, tid, **kwargs)
++        assert caught.value.code == {'offline': 'board_unavailable', 'own-run': 'own_run',
++                                     'ambiguous': 'identity_unavailable'}.get(failure, 'not_scope_authority')
++        assert not hub.sent
++        if failure in {'own-run', 'ambiguous'}:
++            assert not reads
++        else:
++            assert reads and closed
++
++
+ def test_canonical_revalidation_can_refuse_stale_shadow_authority(foreign, monkeypatch, capsys):
+     primary, _, hub, tid, episode, comment, path, _ = foreign
+     hub.reply = {'status': 'rejected', 'reason': 'not_scope_authority'}
+diff --git a/tests/hermes_cli/test_kanban_scope_renewal_synced.py b/tests/hermes_cli/test_kanban_scope_renewal_synced.py
+index c1345949bd5..3c6fc23693a 100644
+--- a/tests/hermes_cli/test_kanban_scope_renewal_synced.py
++++ b/tests/hermes_cli/test_kanban_scope_renewal_synced.py
+@@ -35,6 +35,8 @@ class Hub:
+         return {'results': [{'client_op_id': ops[0]['client_op_id'], 'status': 'applied'}]}
+ 
+     def row_evidence(self, board, table, uid):
++        if table == 'task_chat_links':
++            return {'state': 'absent'}
+         wire = self.sent[-1]
+         payload = {'version': 1, 'episode': wire['episode'], 'mandate_comment_uid': wire['mandate_comment_uid'],
+                    'mandate_body_sha256': hashlib.sha256(wire['mandate_body'].encode()).hexdigest(),
+-- 
+2.43.0
+

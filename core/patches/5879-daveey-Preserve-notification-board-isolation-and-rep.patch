@@ -1,0 +1,589 @@
+From d9878cd32c3cb92a80cd1ada2f918170f46c8709 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 05:01:43 +0000
+Subject: [PATCH] [daveey] Preserve notification board isolation and replay
+ accepted view demands
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/fact_demand.py                     | 115 ++++++++++++----
+ hermes_cli/fact_replica.py                    |   2 +
+ .../hermes_cli/test_fact_demand_transport.py  | 126 +++++++++++++++++
+ .../test_loaded_local_board_isolation.py      | 127 ++++++++++++++++++
+ tui_gateway/notification_loaded_f.py          |  29 +++-
+ tui_gateway/notification_loaded_local.py      |  44 ++++--
+ 6 files changed, 399 insertions(+), 44 deletions(-)
+ create mode 100644 tests/hermes_cli/test_fact_demand_transport.py
+ create mode 100644 tests/tui_gateway/test_loaded_local_board_isolation.py
+
+diff --git a/hermes_cli/fact_demand.py b/hermes_cli/fact_demand.py
+index 30b004b97de..86b43e59fe8 100644
+--- a/hermes_cli/fact_demand.py
++++ b/hermes_cli/fact_demand.py
+@@ -1,56 +1,113 @@
+-"""Bounded startup demand channel independent of the long-poll stream. [daveey]"""
++"""Bounded startup demand custody independent of the long-poll stream. [daveey]"""
++from dataclasses import dataclass
+ import queue
+ import threading
++from time import monotonic
+ 
+ from hermes_cli.fact_ipc import connect, receive, send
+-from hermes_cli.fact_wire import encoded_size
++from hermes_cli.fact_store import view_key
++from hermes_cli.fact_wire import decode, encode
++
++
++@dataclass
++class _Demand:
++    command: dict
++    expires: float
++    epoch: str | None = None
++    pending: bool = True
+ 
+ 
+ class DemandChannel:
+     def __init__(self, scope, endpoint):
+         self.scope, self.endpoint = scope, endpoint
+-        self.queue = queue.Queue(maxsize=64)
++        # One bound covers queued, in-flight, and accepted requests (<= 4 MiB).
++        self._active = {}
++        self._lock = threading.Lock()
++        self._epoch = None
+         self.stopped = threading.Event()
+         self.wake = threading.Event()
+-        # All access is authorized by explicit scope/token, never launch-profile env.
+         self.thread = threading.Thread(target=self.run, name="fact-demand", daemon=True)
+         self.thread.start()
+ 
++    def _expire(self):
++        now = monotonic()
++        for key, entry in list(self._active.items()):
++            if entry.expires <= now:
++                del self._active[key]
++
+     def put(self, view, selector):
+-        command = {"op": "demand", "view": view, "selector": dict(selector)}
+-        if encoded_size(command) > 64 * 1024:
++        wire = encode({"op": "demand", "view": view, "selector": dict(selector)})
++        if len(wire) > 64 * 1024:
+             raise ValueError("demand_budget_exceeded")
+-        self.queue.put_nowait(command)
++        command = decode(wire)  # Retain owned data, not the caller's nested selector.
++        key = view_key(self.scope, view, command["selector"])
++        with self._lock:
++            if self.stopped.is_set():
++                raise RuntimeError("demand_closed")
++            self._expire()
++            if key in self._active:
++                self._active[key].expires = monotonic() + 30
++            else:
++                if len(self._active) >= 64:
++                    raise queue.Full
++                self._active[key] = _Demand(command, monotonic() + 30)
+         self.wake.set()
+ 
+-    def run(self):
+-        while not self.stopped.is_set():
+-            self.wake.wait()
+-            self.wake.clear()
+-            while not self.stopped.is_set():
+-                try:
+-                    command = self.queue.get_nowait()
+-                except queue.Empty:
+-                    break
+-                self.deliver(command)
++    def owner_epoch(self, epoch):
++        with self._lock:
++            self._expire()
++            if epoch == self._epoch or self.stopped.is_set():
++                return
++            self._epoch = epoch
++            for entry in self._active.values():
++                entry.pending = entry.epoch != epoch
++        self.wake.set()
+ 
+-    def deliver(self, command):
++    def run(self):
+         while not self.stopped.is_set():
++            with self._lock:
++                self._expire()
++                entry = next((e for e in self._active.values() if e.pending), None)
++                observed = self._epoch
++                timeout = min((e.expires - monotonic() for e in self._active.values()), default=None)
++                self.wake.clear()
++            if entry is None:
++                self.wake.wait(None if timeout is None else max(0, timeout))
++                continue
+             try:
+-                with connect(self.endpoint.path) as sock:
+-                    sock.settimeout(1)
+-                    send(sock, {"version": 1, "token": self.endpoint.token, "after": None})
+-                    if receive(sock)["scope"] != self.scope:
+-                        raise ValueError("unauthorized_scope")
+-                    send(sock, command)
+-                    receive(sock)
+-                    return
++                epoch, accepted = self.deliver(entry.command)
+             except (OSError, EOFError, ValueError, TypeError, KeyError):
+-                if self.stopped.wait(.1):
+-                    return
++                self.stopped.wait(.1)
++                continue
++            with self._lock:
++                if accepted:
++                    entry.epoch = epoch
++                    # A new reset can arrive while the old owner's ACK is in flight.
++                    entry.pending = self._epoch != observed and self._epoch != epoch
++                else:
++                    key = view_key(self.scope, entry.command["view"], entry.command["selector"])
++                    if self._active.get(key) is entry:
++                        del self._active[key]
++
++    def deliver(self, command):
++        with connect(self.endpoint.path) as sock:
++            sock.settimeout(1)
++            send(sock, {"version": 1, "token": self.endpoint.token, "after": None})
++            if receive(sock)["scope"] != self.scope:
++                raise ValueError("unauthorized_scope")
++            # The v1 hello has no epoch. Read a reset identity on this same
++            # connection so an ACK is never attributed to a different owner.
++            send(sock, {"op": "next"})
++            pin = receive(sock)["pin"]
++            send(sock, {"op": "release", "token": pin["token"]})
++            receive(sock)
++            send(sock, command)
++            return pin["epoch"], receive(sock)["accepted"] is True
+ 
+     def close(self):
+-        self.stopped.set()
++        with self._lock:
++            self.stopped.set()
++            self._active.clear()
+         self.wake.set()
+         self.thread.join(5)
+         if self.thread.is_alive():
+diff --git a/hermes_cli/fact_replica.py b/hermes_cli/fact_replica.py
+index 9d853f6953f..2c56457e7ca 100644
+--- a/hermes_cli/fact_replica.py
++++ b/hermes_cli/fact_replica.py
+@@ -177,8 +177,10 @@ class ReplicaHandle:
+             result = receive(sock)
+             if "pin" in result:
+                 self._reset(sock, result["pin"])
++                self._demands.owner_epoch(result["pin"]["epoch"])
+             elif "delta" in result:
+                 self._apply(result["delta"])
++                self._demands.owner_epoch(result["delta"].epoch)
+             elif result.get("idle"):
+                 with self._store._condition:
+                     if not self._online:
+diff --git a/tests/hermes_cli/test_fact_demand_transport.py b/tests/hermes_cli/test_fact_demand_transport.py
+new file mode 100644
+index 00000000000..f5318c9726b
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_demand_transport.py
+@@ -0,0 +1,126 @@
++"""Demand custody across real Unix-socket owner lifetimes."""
++import socket
++import queue
++import threading
++from pathlib import Path
++
++import pytest
++
++from hermes_cli.fact_contract import Fact, Ready, Scope
++from hermes_cli.fact_host import FactHost, acquire
++from hermes_cli.fact_replica import Endpoint
++from hermes_cli.fact_store import FactStore, view_key
++from tests.waiting import wait_until
++
++
++@pytest.mark.platforms('posix')
++def test_accepted_demand_survives_owner_restart_not_same_owner_reconnect(tmp_path, monkeypatch):
++    scope = Scope('install', 'profile')
++    token = 't' * 32
++    monkeypatch.chdir(tmp_path)
++    directory = Path('owner')
++    calls = []
++
++    def start_owner():
++        store = FactStore()
++        def demand(got_scope, view, selector):
++            calls.append((store.snapshot(scope).epoch, view))
++            store.publish([Fact(view_key(got_scope, view, selector), {'encoded': b'{"ok":true}'}, health='fresh')])
++        return FactHost(directory, {token: scope}, store=store, demand=demand).start()
++
++    owner = start_owner()
++    handle = acquire(scope, endpoint=Endpoint(str(directory / 'facts.sock'), token))
++    try:
++        handle.demand('title', {})
++        assert wait_until(lambda: isinstance(handle.v1.snapshot(scope).view('title', {}), Ready), timeout=5)
++        first_epoch = owner.store.snapshot(scope).epoch
++        old_socket = handle._socket
++        old_socket.shutdown(socket.SHUT_RDWR)
++        assert wait_until(lambda: handle._socket is not None and handle._socket is not old_socket
++                          and handle._online, timeout=5)
++        # A barrier demand drains any erroneously replayed commands first.
++        handle.demand('barrier', {})
++        assert wait_until(lambda: isinstance(handle.v1.snapshot(scope).view('barrier', {}), Ready), timeout=5)
++        assert calls.count((first_epoch, 'title')) == 1
++        owner.close()
++        owner = start_owner()
++        second_epoch = owner.store.snapshot(scope).epoch
++        assert second_epoch != first_epoch
++        assert wait_until(lambda: handle.v1.snapshot(scope).epoch == second_epoch, timeout=5)
++        assert wait_until(lambda: isinstance(handle.v1.snapshot(scope).view('title', {}), Ready), timeout=5)
++        assert calls.count((second_epoch, 'title')) == 1
++    finally:
++        handle.close()
++        owner.close()
++
++
++@pytest.mark.platforms('posix')
++def test_old_ack_after_new_owner_reset_replays(tmp_path, monkeypatch):
++    from hermes_cli import fact_demand
++    scope = Scope('install', 'profile')
++    token = 't' * 32
++    monkeypatch.chdir(tmp_path)
++    ack_received, release_ack = threading.Event(), threading.Event()
++    original_receive = fact_demand.receive
++
++    def delayed_receive(sock):
++        result = original_receive(sock)
++        if isinstance(result, dict) and result.get('accepted') and not ack_received.is_set():
++            ack_received.set()
++            assert release_ack.wait(5)
++        return result
++
++    monkeypatch.setattr(fact_demand, 'receive', delayed_receive)
++    owner = FactHost('owner', {token: scope}, demand=lambda *args: None).start()
++    handle = acquire(scope, endpoint=Endpoint('owner/facts.sock', token))
++    replayed = threading.Event()
++    try:
++        handle.demand('title', {})
++        assert ack_received.wait(5)
++        owner.close()
++        owner = FactHost('owner', {token: scope}, demand=lambda *args: replayed.set()).start()
++        epoch = owner.store.snapshot(scope).epoch
++        assert wait_until(lambda: handle._demands._epoch == epoch, timeout=5)
++        release_ack.set()
++        assert replayed.wait(5)
++    finally:
++        release_ack.set()
++        handle.close()
++        owner.close()
++
++
++def test_active_demand_bound_expiry_rejection_and_shutdown(monkeypatch):
++    from hermes_cli import fact_demand
++    now = [0.0]
++    monkeypatch.setattr(fact_demand, 'monotonic', lambda: now[0])
++    calls = []
++    def deliver(self, command):
++        calls.append(command['view'])
++        return 'owner', command['view'] != 'rejected'
++    monkeypatch.setattr(fact_demand.DemandChannel, 'deliver', deliver)
++    channel = fact_demand.DemandChannel(Scope('install', 'profile'), None)
++    try:
++        channel.owner_epoch('owner')
++        for i in range(64):
++            channel.put(str(i), {})
++        assert wait_until(lambda: len(calls) == 64, timeout=5)
++        # ACK does not release the capacity reserved for replay custody.
++        with pytest.raises(queue.Full):
++            channel.put('overflow', {})
++        channel.put('0', {})  # Duplicate refresh is allowed even at capacity.
++        channel.owner_epoch('next')
++        assert wait_until(lambda: len(calls) == 128, timeout=5)
++        now[0] = 30.0
++        channel.owner_epoch('expired')
++        channel.put('rejected', {})
++        assert wait_until(lambda: not channel._active, timeout=5)
++        channel.put('barrier', {})
++        assert wait_until(lambda: calls[-1:] == ['barrier'], timeout=5)
++        assert calls.count('0') == 2  # Expired demand was not replayed.
++        assert calls.count('rejected') == 1
++    finally:
++        channel.close()
++    assert not channel.thread.is_alive()
++    assert not channel._active
++    with pytest.raises(RuntimeError, match='closed'):
++        channel.put('late', {})
+diff --git a/tests/tui_gateway/test_loaded_local_board_isolation.py b/tests/tui_gateway/test_loaded_local_board_isolation.py
+new file mode 100644
+index 00000000000..0ad8de52627
+--- /dev/null
++++ b/tests/tui_gateway/test_loaded_local_board_isolation.py
+@@ -0,0 +1,127 @@
++"""One unreadable local board must not abort loaded discovery for healthy boards.
++
++Real Scheduler, real kanban SQLite boards (``list_boards`` inventory), the canonical
++local collector (``_collect_kanban_notifications`` via ``_notif_poll_kanban``) and the
++real transcript/ACK delivery boundary; only model-turn admission is replaced.
++"""
++import contextlib
++import threading
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as kbn
++from tui_gateway import kanban_remote_notices as krn
++from tui_gateway import notification_loaded_f as loaded
++from tui_gateway import server
++
++CHAT = 'tui-loaded-local-a'
++OTHER = 'tui-loaded-local-b'
++
++
++def _subscribed_done(board, chat):
++    with contextlib.closing(kbc.connect(board=board)) as conn:
++        tid = kb.create_task(conn, title=f'notify {board}', assignee='worker')
++        kbn.add_notify_sub(conn, task_id=tid, platform='tui', chat_id=chat)
++        kb.complete_task(conn, tid, summary='all done')
++    return tid
++
++
++def _corrupt(board):
++    path = kb.kanban_db_path(board)
++    for suffix in ('-wal', '-shm'):
++        path.with_name(path.name + suffix).unlink(missing_ok=True)
++    path.write_bytes(b'not a sqlite database ' * 256)
++
++
++def _deliver_harness(tmp_path, monkeypatch, *chats):
++    from hermes_state import SessionDB
++    state = tmp_path / 'notice-state.db'
++    with SessionDB(state) as db:
++        for chat in chats:
++            db.create_session(chat, 'desktop')
++    monkeypatch.setattr(krn, 'hub_db_path', lambda: tmp_path / 'absent-replica.db')
++    monkeypatch.setattr(krn, 'ledger_path', lambda: tmp_path / 'absent-ledger.db')
++    monkeypatch.setattr(server, '_session_db', lambda *_: SessionDB(state))
++    monkeypatch.setattr(server, '_session_profile_runtime_scope', lambda *_: contextlib.nullcontext())
++    monkeypatch.setattr(server, '_kb_stray_delegate_keys', lambda *_: ())
++    monkeypatch.setattr(server, '_session_lineage', lambda *_: ())
++    monkeypatch.setattr(server, '_submit_row_target_key', lambda session, *_: session['session_key'])
++    monkeypatch.setattr(server, '_kb_gateway_owns', lambda *_: False)
++    monkeypatch.setattr(server, '_kb_settle_held', lambda *_: None)
++    monkeypatch.setattr(server, '_kb_owner_refusal', lambda *_: None)
++    monkeypatch.setattr(server, '_notif_claim_turn', lambda *_: True)
++    monkeypatch.setattr(server, '_notif_release_turn', lambda *_: None)
++    monkeypatch.setattr(server, '_emit', lambda *_: None)
++    submitted = []
++    monkeypatch.setattr(server, '_notif_submit', lambda *args, **kw: submitted.append((args, kw)) or True)
++    return state, submitted
++
++
++def _delivered(state, chat):
++    from hermes_state import SessionDB
++    with SessionDB(state) as db:
++        return '\n'.join(str(m.get('content') or '') for m in db.get_messages(chat))
++
++
++def _tick(action, sid, clock):
++    action.tick(sid, clock[0], clock[0] - 60, None, server._notif_poll_kanban)
++
++
++def test_bad_board_isolated_and_retried_on_next_reconcile(tmp_path, monkeypatch):
++    # Positive control (default board) and a healthy sibling sorted after the bad board.
++    kb.create_board('bad-board')
++    kb.create_board('zeta-board')
++    control = _subscribed_done(kb.DEFAULT_BOARD, CHAT)
++    sibling = _subscribed_done('zeta-board', CHAT)
++    stranded = _subscribed_done('bad-board', OTHER)
++    _corrupt('bad-board')
++    assert [m['slug'] for m in kb.list_boards(include_archived=False)] == ['default', 'bad-board', 'zeta-board']
++    state, submitted = _deliver_harness(tmp_path, monkeypatch, CHAT, OTHER)
++
++    clock = [100.0]
++    scheduler = loaded.Scheduler(clock=lambda: clock[0])
++    session = {'session_key': CHAT, 'profile_home': None, 'history_lock': threading.Lock()}
++    other = {'session_key': OTHER, 'profile_home': None, 'history_lock': threading.Lock()}
++    action = scheduler.add(session, 'default', lambda: None)
++    other_action = scheduler.add(other, 'default', lambda: None)
++
++    scheduler.step()
++    assert len(action.pending) == len(other_action.pending) == 1
++    _tick(action, 'ui-a', clock)  # real executor: due() -> canonical collector -> transcript + ACK
++    assert session['_notif_local_boards'] == ('default', 'zeta-board')
++    text = _delivered(state, CHAT)
++    assert control in text and sibling in text  # healthy boards delivered despite the failing board
++    assert len(submitted) == 1 and submitted[0][1]['display_kind'] == 'kanban_notice'
++    assert not session.get('_kanban_claims') and not session.get('_kanban_pending')  # ACKed, nothing in custody
++    scope = (None, 'default')
++    assert set(scheduler.local_incomplete[scope]) == {'bad-board'}  # explicit retry obligation
++    assert session['_notif_local_incomplete'] == other['_notif_local_incomplete'] == ('bad-board',)
++    _tick(other_action, 'ui-b', clock)
++    assert other['_notif_local_boards'] == ()  # failed board never handed to the collector
++    assert _delivered(state, OTHER) == '' and len(submitted) == 1
++
++    # Recovery: the obligation is not accelerated; it clears only at the next 30 s reconciliation.
++    kb.kanban_db_path('bad-board').unlink()
++    kb.init_db(board='bad-board')
++    stranded = _subscribed_done('bad-board', OTHER)
++    clock[0] += 29
++    scheduler.step()
++    assert set(scheduler.local_incomplete[scope]) == {'bad-board'}
++    assert not other_action.pending and not action.pending
++    clock[0] += 1
++    scheduler.step()
++    assert scope not in scheduler.local_incomplete
++    assert '_notif_local_incomplete' not in other and '_notif_local_incomplete' not in session
++    _tick(other_action, 'ui-b', clock)
++    assert other['_notif_local_boards'] == ('bad-board',)
++    assert stranded in _delivered(state, OTHER)
++    assert not other.get('_kanban_claims') and not other.get('_kanban_pending')
++    # Exactly once: chat A's earlier notices are not re-delivered by the recovered pass.
++    _tick(action, 'ui-a', clock)
++    assert session['_notif_local_boards'] == ('default', 'zeta-board')
++    text = _delivered(state, CHAT)
++    assert text.count(control) == 1 and text.count(sibling) == 1
++    assert len(submitted) == 2
++    action.close()
++    other_action.close()
++    assert '_notif_local_incomplete' not in session
+diff --git a/tui_gateway/notification_loaded_f.py b/tui_gateway/notification_loaded_f.py
+index bb475202e57..5321775f472 100644
+--- a/tui_gateway/notification_loaded_f.py
++++ b/tui_gateway/notification_loaded_f.py
+@@ -91,6 +91,7 @@ class Action:
+             self.pending.clear()
+         self.session.pop('_notif_remote_batch', None)
+         self.session.pop('_notif_local_boards', None)
++        self.session.pop('_notif_local_incomplete', None)
+         self.scheduler.event.set()
+ 
+ 
+@@ -104,6 +105,10 @@ class Scheduler:
+         self.dirty = set()
+         self.catchup = set()
+         self.known_keys = {}
++        # scope -> {board slug: reason} whose local discovery failed. An explicit
++        # incomplete/retry obligation, repaid only by the next unchanged 30s
++        # reconciliation (never an accelerated census); cleared on recovery.
++        self.local_incomplete = {}
+         self.next_reconcile = 0.0
+         self.stop = threading.Event()
+         self.thread = None
+@@ -218,10 +223,13 @@ class Scheduler:
+                 local = {}
+                 if reconcile:
+                     from tui_gateway.notification_loaded_local import capture
++                    failed = {}
+                     try:
+-                        local = first.context.run(capture, group)
++                        local, failed = first.context.run(capture, group)
+                     except (OSError, ValueError, RuntimeError, sqlite3.Error):
+                         log.warning('local notification discovery failed; retry next reconciliation', exc_info=True)
++                        failed = {'*': 'board inventory unavailable'}
++                    self._local_obligation(scope, group, failed)
+                 try:
+                     source = first.context.run(self._source_identity)
+                     if source in batches:
+@@ -262,6 +270,25 @@ class Scheduler:
+                 for action in live:
+                     action.wake()
+ 
++    def _local_obligation(self, scope, group, failed):
++        """Record or clear failed-board discovery; healthy boards were already delivered."""
++        marker = tuple(sorted(failed))
++        with self.lock:
++            if failed:
++                self.local_incomplete[scope] = dict(failed)
++            elif self.local_incomplete.pop(scope, None) is not None:
++                log.info('local notification discovery recovered for %s', scope)
++            for action in group:
++                if action.closed:
++                    continue
++                if marker:
++                    action.session['_notif_local_incomplete'] = marker
++                else:
++                    action.session.pop('_notif_local_incomplete', None)
++        if failed:
++            log.warning('local notification discovery incomplete for %s: %s; retry next reconciliation',
++                        scope, ', '.join(marker))
++
+     @staticmethod
+     def _source_identity():
+         from tui_gateway.kanban_remote_notices import hub_db_path, ledger_path
+diff --git a/tui_gateway/notification_loaded_local.py b/tui_gateway/notification_loaded_local.py
+index dd011d8375e..e079c7e60d1 100644
+--- a/tui_gateway/notification_loaded_local.py
++++ b/tui_gateway/notification_loaded_local.py
+@@ -1,17 +1,26 @@
+ """Process reconciliation discovery for loaded local subscription owners."""
+ from contextlib import closing
++import logging
+ import sqlite3
+ 
++log = logging.getLogger(__name__)
++
+ 
+ def capture(actions):
+     """One board inventory per profile pass, then bounded IN reads for loaded keys.
+ 
+     Claims remain in the canonical action executor. No retained SQLite readers
+     and no per-chat board census or board-signature scan.
++
++    Returns ``(boards_by_action, failed)``. Each board is read in isolation: an
++    unreadable board (locked, corrupt, missing) is recorded in ``failed``
++    (``{slug: reason}``) and contributes nothing, while every healthy board is
++    still discovered. A failed board's partial rows are discarded, never merged.
+     """
+     from hermes_cli import kanban_db
+     from tui_gateway import server
+     result = {action: [] for action in actions}
++    failed = {}
+     keys = {}
+     for action in actions:
+         key = action.session.get('session_key')
+@@ -19,23 +28,30 @@ def capture(actions):
+             for chat in (key, *server._kb_stray_delegate_keys(action.session, key)):
+                 keys.setdefault(chat, []).append(action)
+     if not keys:
+-        return result
++        return result, failed
+     boards = {}
+     for meta in kanban_db.list_boards(include_archived=False):
+         slug, path = server._kb_board_key(kanban_db, meta)
+         boards.setdefault(path, slug)
+     names = tuple(keys)
+     for path, slug in boards.items():
+-        with closing(sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=0.5)) as conn:
+-            conn.execute('BEGIN')
+-            for offset in range(0, len(names), 500):
+-                chunk = names[offset:offset + 500]
+-                marks = ','.join('?' for _ in chunk)
+-                rows = conn.execute(
+-                    f"SELECT DISTINCT chat_id FROM kanban_notify_subs WHERE platform='tui' AND chat_id IN ({marks})",
+-                    chunk)
+-                for (chat,) in rows:
+-                    for action in keys[chat]:
+-                        if slug not in result[action]:
+-                            result[action].append(slug)
+-    return result
++        try:
++            found = set()
++            with closing(sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=0.5)) as conn:
++                conn.execute('BEGIN')
++                for offset in range(0, len(names), 500):
++                    chunk = names[offset:offset + 500]
++                    marks = ','.join('?' for _ in chunk)
++                    rows = conn.execute(
++                        f"SELECT DISTINCT chat_id FROM kanban_notify_subs WHERE platform='tui' AND chat_id IN ({marks})",
++                        chunk)
++                    found.update(chat for (chat,) in rows)
++        except sqlite3.Error as exc:
++            log.warning('local notification discovery skipped board %s: %s', slug, exc)
++            failed[slug] = str(exc)
++            continue
++        for chat in found:
++            for action in keys[chat]:
++                if slug not in result[action]:
++                    result[action].append(slug)
++    return result, failed
+-- 
+2.43.0
+

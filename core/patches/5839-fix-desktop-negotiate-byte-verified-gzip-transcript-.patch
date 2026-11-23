@@ -1,0 +1,857 @@
+From 2239e7e35dfb8b3cb843cd6b398a88318e325537 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 01:05:38 +0000
+Subject: [PATCH] fix(desktop): negotiate byte-verified gzip transcript deltas
+ [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ .../desktop/electron/delta-reads-gzip.test.ts | 222 ++++++++++++++++++
+ apps/desktop/electron/delta-reads.test.ts     |   4 +-
+ apps/desktop/electron/delta-reads.ts          |  90 +++++--
+ .../electron/display-transcript.test.ts       |  12 +
+ apps/desktop/electron/display-transcript.ts   |   4 +-
+ hermes_cli/web_delta_response.py              |  37 ++-
+ scripts/bench_gzip_transcript_delta.py        |  84 +++++++
+ .../test_web_delta_response_gzip.py           | 197 ++++++++++++++++
+ 8 files changed, 620 insertions(+), 30 deletions(-)
+ create mode 100644 apps/desktop/electron/delta-reads-gzip.test.ts
+ create mode 100644 scripts/bench_gzip_transcript_delta.py
+ create mode 100644 tests/hermes_cli/test_web_delta_response_gzip.py
+
+diff --git a/apps/desktop/electron/delta-reads-gzip.test.ts b/apps/desktop/electron/delta-reads-gzip.test.ts
+new file mode 100644
+index 00000000000..adbecba7bc8
+--- /dev/null
++++ b/apps/desktop/electron/delta-reads-gzip.test.ts
+@@ -0,0 +1,222 @@
++import http from 'node:http'
++import type { AddressInfo } from 'node:net'
++import { gzipSync, zstdCompressSync } from 'node:zlib'
++
++import { afterEach, describe, expect, it } from 'vitest'
++
++import { destroyKeepaliveAgents, withRetry } from './api-transport'
++import { bodyHash, decodeDeltaBody, deltaBodyStore, DeltaBodyStore, DeltaRetryError, readEncodingHeaders } from './delta-reads'
++import { fetchJsonWith } from './json-fetch'
++
++const HUB = 'http://127.0.0.1:49921'
++const URL = `${HUB}/api/sessions/example/messages?include_compacted=true&limit=200&order=latest&profile=default`
++const ASK = 'X-Hermes-Delta-Accept'
++const BASE = 'X-Hermes-Delta-Base'
++const json = (version = 0) => JSON.stringify({ messages: [{ role: 'assistant', content: `héllo ${version}`.repeat(5000) }] })
++const entity = (version = 0) => gzipSync(json(version))
++
++const whole = (body: Buffer, headers: Record<string, string> = {}) => ({
++  statusCode: 200,
++  headers: { 'content-encoding': 'gzip', 'content-type': 'application/json', 'x-hermes-body-hash': bodyHash(body), ...headers }
++})
++
++const delta = (base: Buffer, next: Buffer, headers: Record<string, string> = {}) => ({
++  body: zstdCompressSync(next, { dictionary: base }),
++  response: { statusCode: 200, headers: {
++    'x-hermes-delta': 'zstd', 'x-hermes-delta-base': bodyHash(base), 'x-hermes-body-hash': bodyHash(next),
++    'x-hermes-delta-content-encoding': 'gzip', ...headers
++  } }
++})
++
++function bound() {
++  const store = new DeltaBodyStore()
++  store.bindRemote(HUB, 'gzip-test')
++
++  return store
++}
++
++afterEach(() => destroyKeepaliveAgents())
++
++describe('negotiated gzip transcript deltas', () => {
++  it('combines slim+gzip with the new capability only for remote transcript GETs', () => {
++    const store = bound()
++    expect(readEncodingHeaders('GET', URL, store)).toEqual({
++      'Accept-Encoding': 'gzip', 'X-Hermes-Display-Transcript': '1', [ASK]: 'zstd-gzip-v1'
++    })
++    expect(readEncodingHeaders(undefined, URL, store)[ASK]).toBe('zstd-gzip-v1')
++    expect(readEncodingHeaders('POST', URL, store)).toEqual({})
++    expect(readEncodingHeaders('GET', URL, new DeltaBodyStore())).toEqual({
++      'Accept-Encoding': 'gzip', 'X-Hermes-Display-Transcript': '1'
++    })
++    expect(readEncodingHeaders('GET', `${HUB}/api/sessions`, store)).toEqual({ [ASK]: 'zstd' })
++  })
++
++  it('whole gzip seeds exact compressed bytes, then unchanged and changed deltas yield exact JSON', () => {
++    const store = bound()
++    let base = entity()
++    expect(decodeDeltaBody(URL, whole(base), base, store)).toBe(json())
++    expect(store.get(store.keyFor(URL)!)!.body).toEqual(base)
++
++    for (const version of [0, 1]) {
++      const next = entity(version)
++      expect(readEncodingHeaders('GET', URL, store)[BASE]).toBe(bodyHash(base))
++      const encoded = delta(base, next)
++      expect(decodeDeltaBody(URL, encoded.response, encoded.body, store)).toBe(json(version))
++      expect(store.get(store.keyFor(URL)!)!.body).toEqual(next)
++      base = next
++    }
++  })
++
++  it('decodes a gzip-entity frame produced by Python compression.zstd with a prefix dictionary', () => {
++    const store = bound()
++    // Synthetic UTF-8 messages, gzip.compress(mtime=0), then web_delta_response.encode_delta.
++    const base = Buffer.from('H4sIAAAAAAAC/5XUPQ7CMAxA4asgzx2wzW+vgjpEKAKk0Eg4W9UDcQ4uRo/wsnl4kz/Zi7xzRHrkkPG2yKeWLKOkiFe0NDcZ5F7nlrdplOfvW0rd7WUdWKm4NFw6Lg+4POLyhMszLi+4vPLNdyBxJeVMyp2UQymXUk6l3Eo5lnIt41rWcVNcy7iWcS3jWsa1jGsZ1zKu5VzLuZZ3vECu5VzLuZZzLedazrV805rWP8w2XRS8BgAA', 'base64')
++    const frame = Buffer.from('KLUv/SC/fQUA9AkfiwgAAv+V1E0KwkAMQOGrlKy7MIm/cxVxUWRQYZyRTkFK6YE8hxfTI7zZZfFW+UgWecZah1usEs6LjCVFCTLU+qjTkCfp5VryFP9TkPv3k1LpNrL2rFRcGi4dl1tc7nC5x+UBl0dcnvjmG5C4knIm5U7KoZRLKadSbqUcS7mWcS1ruCmuZXIbXiAHWjm+uzG+0izrZf0BjVLgibwGAAAFACAAlhkIrsBnRLKACA==', 'base64')
++    const messages = Array.from({ length: 40 }, (_, i) => ({ role: 'assistant', content: `héllo ${i}` }))
++    decodeDeltaBody(URL, whole(base), base, store)
++    messages[39].content = 'new reply'
++    const response = delta(base, base).response
++    response.headers['x-hermes-body-hash'] = 'dc61b3ffd9cb0c93756bd4c29149e43e'
++    expect(decodeDeltaBody(URL, response, frame, store)).toBe(JSON.stringify({ messages }))
++  })
++
++  it('new client to old server decodes gzip without requiring a body hash', () => {
++    const store = bound()
++    expect(decodeDeltaBody(URL, { statusCode: 200, headers: { 'content-encoding': 'gzip' } }, entity(), store)).toBe(json())
++    expect(store.size).toBe(0)
++  })
++
++  it('does not cache whole gzip outside negotiated transcript reads or on non-200', () => {
++    const store = bound()
++    const body = entity()
++    decodeDeltaBody(`${HUB}/api/sessions`, whole(body), body, store)
++    decodeDeltaBody(URL, { ...whole(body), statusCode: 404 }, body, store)
++    expect(store.size).toBe(0)
++  })
++
++  it.each(['missing base', 'corrupt base', 'bad hash', 'missing hash', 'bad frame', 'unknown coding', 'outer coding', 'bad gzip'])('drops the base and retries for %s', async kind => {
++    const store = bound()
++    const base = entity()
++    decodeDeltaBody(URL, whole(base), base, store)
++    expect(store.get(store.keyFor(URL)!)?.body).toEqual(base)
++    let next = entity(1)
++    const headers: Record<string, string> = {}
++
++    if (kind === 'missing base') { store.delete(store.keyFor(URL)!) }
++
++    if (kind === 'corrupt base') { store.put(store.keyFor(URL)!, bodyHash(base), Buffer.from('damaged')) }
++
++    if (kind === 'bad hash') { headers['x-hermes-body-hash'] = 'f'.repeat(32) }
++
++    if (kind === 'missing hash') { headers['x-hermes-body-hash'] = '' }
++
++    if (kind === 'unknown coding') { headers['x-hermes-delta-content-encoding'] = 'br' }
++
++    if (kind === 'outer coding') { headers['content-encoding'] = 'gzip' }
++
++    if (kind === 'bad gzip') { next = Buffer.from('not gzip') }
++    const encoded = delta(base, next, headers)
++
++    if (kind === 'bad frame') { encoded.body = Buffer.from('invalid frame') }
++    expect(() => decodeDeltaBody(URL, encoded.response, encoded.body, store)).toThrow(DeltaRetryError)
++    expect(readEncodingHeaders('GET', URL, store)).not.toHaveProperty(BASE)
++    // Existing retry budget, no new retry loop: the second response is ordinary gzip.
++    let attempts = 0
++
++    const result = await withRetry(async () => {
++      attempts += 1
++
++      if (attempts === 1) { throw new DeltaRetryError(URL, 'injected') }
++
++      return decodeDeltaBody(URL, whole(entity(1)), entity(1), store)
++    }, { method: 'GET', retries: 1, baseDelayMs: 1 })
++
++    expect(result).toBe(json(1))
++    expect(attempts).toBe(2)
++  })
++
++  it('does not retain a whole entity with a corrupt hash', () => {
++    const store = bound()
++    const body = entity()
++    expect(() => decodeDeltaBody(URL, whole(body, { 'x-hermes-body-hash': 'f'.repeat(32) }), body, store)).toThrow(DeltaRetryError)
++    expect(store.size).toBe(0)
++  })
++
++  it('rejects gzip expansion past the decompressed budget, including within a verified delta', () => {
++    const store = bound()
++    const base = entity()
++    decodeDeltaBody(URL, whole(base), base, store)
++    const bomb = gzipSync(Buffer.alloc(16 * 1024 * 1024 + 1, 65))
++    const encoded = delta(base, bomb)
++    expect(() => decodeDeltaBody(URL, encoded.response, encoded.body, store)).toThrow(DeltaRetryError)
++    expect(store.size).toBe(0)
++  })
++
++  it('rejects reconstructed compressed entities above the entity budget', () => {
++    const store = bound()
++    const base = entity()
++    decodeDeltaBody(URL, whole(base), base, store)
++    const encoded = delta(base, Buffer.alloc(8 * 1024 * 1024 + 1, 65))
++    expect(() => decodeDeltaBody(URL, encoded.response, encoded.body, store)).toThrow('bad frame')
++    expect(store.size).toBe(0)
++  })
++
++  it('refuses gzip deltas on ordinary list reads even when a base is held', () => {
++    const store = bound()
++    const url = `${HUB}/api/sessions`
++    const base = entity()
++    store.put(store.keyFor(url)!, bodyHash(base), base)
++    const encoded = delta(base, entity(1))
++    expect(() => decodeDeltaBody(url, encoded.response, encoded.body, store)).toThrow('unexpected outer or original')
++    expect(store.size).toBe(0)
++  })
++
++  it('fetchJson negotiates over real HTTP, decodes gzip/deltas, and retries a bad delta without a base', async () => {
++    const requests: http.IncomingHttpHeaders[] = []
++    const v0 = entity()
++    const v1 = entity(1)
++
++    const server = http.createServer((req, res) => {
++      requests.push(req.headers)
++
++      if (requests.length === 2 || requests.length === 3) {
++        const frame = delta(v0, requests.length === 2 ? v0 : v1)
++
++        if (requests.length === 3) { frame.response.headers['x-hermes-body-hash'] = 'f'.repeat(32) }
++        res.writeHead(200, frame.response.headers)
++        res.end(frame.body)
++      } else {
++        const body = requests.length === 1 ? v0 : v1
++        res.writeHead(200, whole(body).headers)
++        res.end(body)
++      }
++    })
++
++    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
++    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
++    const url = `${origin}/api/sessions/example/messages?limit=200&order=latest`
++    const scope = 'gzip-http-test'
++    deltaBodyStore.bindRemote(origin, scope)
++    const deps = { remoteHeaders: () => ({}), nativeHeaders: async () => null }
++
++    try {
++      expect(await fetchJsonWith(deps, url, 'test')).toEqual(JSON.parse(json()))
++      expect(await fetchJsonWith(deps, url, 'test')).toEqual(JSON.parse(json()))
++      expect(await fetchJsonWith(deps, url, 'test')).toEqual(JSON.parse(json(1)))
++      expect(requests).toHaveLength(4)
++
++      for (const req of requests) {
++        expect(req['x-hermes-delta-accept']).toBe('zstd-gzip-v1')
++        expect(req['x-hermes-display-transcript']).toBe('1')
++        expect(req['accept-encoding']).toBe('gzip')
++      }
++
++      expect(requests.map(req => req['x-hermes-delta-base'])).toEqual([undefined, bodyHash(v0), bodyHash(v0), undefined])
++    } finally {
++      deltaBodyStore.delete(deltaBodyStore.keyFor(url)!)
++      deltaBodyStore.unbindScope(scope)
++      server.closeAllConnections()
++      await new Promise<void>(resolve => server.close(() => resolve()))
++    }
++  })
++})
+diff --git a/apps/desktop/electron/delta-reads.test.ts b/apps/desktop/electron/delta-reads.test.ts
+index 4c5e73005dc..3cb9a41e131 100644
+--- a/apps/desktop/electron/delta-reads.test.ts
++++ b/apps/desktop/electron/delta-reads.test.ts
+@@ -81,12 +81,12 @@ describe('asking for a delta', () => {
+     expect(deltaRequestHeaders('GET', `${HUB}/api/plugins/kanban/board?board=runners`, store)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd' })
+   })
+ 
+-  it('a transcript page read keeps its own slim+gzip ask and does not also ask for a delta', () => {
++  it('a remote transcript page retains slim+gzip and negotiates compressed-entity deltas', () => {
+     const store = bound()
+     const transcript = `${HUB}/api/sessions/20261112_185653_5ff5dc/messages?limit=120&order=latest`
+ 
+     expect(readEncodingHeaders('GET', transcript, store)).toMatchObject({ 'Accept-Encoding': 'gzip' })
+-    expect(readEncodingHeaders('GET', transcript, store)).not.toHaveProperty(DELTA_ACCEPT_HEADER)
++    expect(readEncodingHeaders('GET', transcript, store)[DELTA_ACCEPT_HEADER]).toBe('zstd-gzip-v1')
+     expect(readEncodingHeaders('GET', BOARD, store)).toEqual({ [DELTA_ACCEPT_HEADER]: 'zstd' })
+   })
+ 
+diff --git a/apps/desktop/electron/delta-reads.ts b/apps/desktop/electron/delta-reads.ts
+index e737908dba1..41294e33ac5 100644
+--- a/apps/desktop/electron/delta-reads.ts
++++ b/apps/desktop/electron/delta-reads.ts
+@@ -29,11 +29,13 @@ import fs from 'node:fs'
+ import path from 'node:path'
+ import { zstdDecompressSync } from 'node:zlib'
+ 
+-import { decodeResponseBody, displayTranscriptHeaders } from './display-transcript'
++import { decodeResponseBody, displayTranscriptHeaders, isDisplayTranscriptRead } from './display-transcript'
+ 
+ export const DELTA_ACCEPT_HEADER = 'X-Hermes-Delta-Accept'
+ export const DELTA_BASE_HEADER = 'X-Hermes-Delta-Base'
+ export const DELTA_ENCODING = 'zstd'
++export const DELTA_GZIP_CAPABILITY = 'zstd-gzip-v1'
++export const DELTA_MAX_ENTITY_BYTES = 8 * 1024 * 1024
+ export const DELTA_RETRY_CODE = 'HERMES_DELTA_RETRY'
+ export const DELTA_STORE_MAX_BYTES = 48 * 1024 * 1024
+ export const DELTA_STORE_MAX_ENTRIES = 96
+@@ -547,7 +549,7 @@ export function deltaRequestHeaders(
+ 
+ /**
+  * Every "how to encode the answer" request header fetchJson sends: the transcript slim/gzip ask and the delta ask.
+- * A transcript page read asks for gzip, which the gateway never delta-encodes, so the two do not combine.
++ * Only bound remote transcript reads negotiate compressed-entity deltas; local reads retain slim+gzip alone.
+  */
+ export function readEncodingHeaders(
+   method: string | undefined,
+@@ -556,7 +558,46 @@ export function readEncodingHeaders(
+ ): Record<string, string> {
+   const transcript = displayTranscriptHeaders(method, url)
+ 
+-  return Object.keys(transcript).length > 0 ? transcript : deltaRequestHeaders(method, url, store)
++  const delta = deltaRequestHeaders(method, url, store)
++
++  return Object.keys(transcript).length > 0
++    ? { ...transcript, ...delta, ...(delta[DELTA_ACCEPT_HEADER] ? { [DELTA_ACCEPT_HEADER]: DELTA_GZIP_CAPABILITY } : {}) }
++    : delta
++}
++
++/** A whole entity can seed a base only after both byte verification and entity decoding succeed. */
++function decodeWholeEntity(
++  response: { headers: Record<string, HeaderValue>; statusCode?: number },
++  body: Buffer,
++  store: DeltaBodyStore,
++  key: null | string,
++  gzipTranscript: boolean,
++  fail: (why: string) => never
++): string {
++  const { headers } = response
++  const hash = header(headers, 'x-hermes-body-hash')
++  const encoding = header(headers, 'content-encoding').toLowerCase()
++  // Hashes name entity bytes, before gunzip. Old servers supply no hash and remain usable.
++  const compressedBase = gzipTranscript && encoding === 'gzip' && hash && response.statusCode === 200
++
++  if (compressedBase && (body.length > DELTA_MAX_ENTITY_BYTES || bodyHash(body) !== hash)) {
++    return fail('whole gzip entity exceeds the budget or does not match its hash')
++  }
++
++  let text: string
++
++  try {
++    text = decodeResponseBody(body, headers['content-encoding'])
++  } catch (error) {
++    if (compressedBase) { return fail(`bad gzip entity: ${String(error).slice(0, 80)}`) }
++    throw error
++  }
++
++  if (key && hash && response.statusCode === 200 && (!encoding || compressedBase) && bodyHash(body) === hash) {
++    store.put(key, hash, body)
++  }
++
++  return text
+ }
+ 
+ /**
+@@ -573,38 +614,41 @@ export function decodeDeltaBody(
+   const hash = header(headers, 'x-hermes-body-hash')
+   const key = store.keyFor(url)
+ 
+-  if (header(headers, 'x-hermes-delta') !== DELTA_ENCODING) {
+-    // Whole body. Keep it as the next base only when the bytes we hold are exactly the bytes that were hashed.
+-    if (key && hash && response.statusCode === 200 && !header(headers, 'content-encoding') && bodyHash(body) === hash) {
+-      store.put(key, hash, body)
+-    }
+-
+-    return decodeResponseBody(body, headers['content-encoding'])
+-  }
++  const gzipTranscript = key !== null && isDisplayTranscriptRead('GET', url)
++  const encoding = header(headers, 'content-encoding').toLowerCase()
++  const originalEncoding = header(headers, 'x-hermes-delta-content-encoding').toLowerCase()
+ 
+-  // Every failure drops this read's copies, so the retry names no base and cannot fail the same way again.
++  // Every failure drops this read's copies, so the bounded transport retry names no base.
+   const fail = (why: string): never => {
+-    if (key) {
+-      store.delete(key)
+-    }
+-
++    if (key) { store.delete(key) }
+     throw new DeltaRetryError(url, why)
+   }
+ 
++  if (header(headers, 'x-hermes-delta') !== DELTA_ENCODING) {
++    return decodeWholeEntity(response, body, store, key, gzipTranscript, fail)
++  }
++
+   if (!key || !hash || response.statusCode !== 200) {
+     return fail('not a 200 with a hash from a bound remote backend')
+   }
+ 
++  if (encoding || (originalEncoding && (originalEncoding !== 'gzip' || !gzipTranscript))) {
++    return fail('unexpected outer or original content encoding')
++  }
++
+   const base = store.find(key, header(headers, 'x-hermes-delta-base'))
+ 
+-  if (!base) {
++  if (!base || bodyHash(base.body) !== base.hash) {
+     return fail('the base it was encoded against is not held')
+   }
+ 
+   let decoded: Buffer
+ 
+   try {
+-    decoded = zstdDecompressSync(body, { dictionary: base.body, maxOutputLength: DELTA_MAX_DECODED_BYTES })
++    decoded = zstdDecompressSync(body, {
++      dictionary: base.body,
++      maxOutputLength: originalEncoding ? DELTA_MAX_ENTITY_BYTES : DELTA_MAX_DECODED_BYTES
++    })
+   } catch (error) {
+     return fail(`bad frame: ${String((error as Error)?.message ?? error).slice(0, 80)}`)
+   }
+@@ -613,7 +657,15 @@ export function decodeDeltaBody(
+     return fail('decoded body does not match its hash')
+   }
+ 
++  let text: string
++
++  try {
++    text = decodeResponseBody(decoded, originalEncoding)
++  } catch (error) {
++    return fail(`bad reconstructed entity: ${String(error).slice(0, 80)}`)
++  }
++
+   store.put(key, hash, decoded)
+ 
+-  return decoded.toString('utf8')
++  return text
+ }
+diff --git a/apps/desktop/electron/display-transcript.test.ts b/apps/desktop/electron/display-transcript.test.ts
+index 1b739c97758..61e9934b103 100644
+--- a/apps/desktop/electron/display-transcript.test.ts
++++ b/apps/desktop/electron/display-transcript.test.ts
+@@ -26,6 +26,18 @@ describe('display transcript reads', () => {
+     expect(displayTranscriptHeaders('GET', 'http://h/api/sessions')).toEqual({})
+   })
+ 
++  it('matches one exact gzip coding, not a substring or a stacked encoding', () => {
++    const body = Buffer.from('{"ok":true}')
++    expect(decodeResponseBody(gzipSync(body), ' GZip ')).toBe(body.toString())
++    expect(decodeResponseBody(body, 'not-gzip')).toBe(body.toString())
++    expect(decodeResponseBody(body, 'gzip, br')).toBe(body.toString())
++  })
++
++  it('bounds gunzip output even for ordinary cold gzip responses', () => {
++    const bomb = gzipSync(Buffer.alloc(16 * 1024 * 1024 + 1, 65))
++    expect(() => decodeResponseBody(bomb, 'gzip')).toThrow()
++  })
++
+   it('decodes a gzipped page and passes an uncompressed one through (an older backend)', () => {
+     const json = JSON.stringify({ messages: [{ content: 'héllo', role: 'assistant' }] })
+ 
+diff --git a/apps/desktop/electron/display-transcript.ts b/apps/desktop/electron/display-transcript.ts
+index b725d791894..3a84d07fa71 100644
+--- a/apps/desktop/electron/display-transcript.ts
++++ b/apps/desktop/electron/display-transcript.ts
+@@ -31,7 +31,7 @@ export function displayTranscriptHeaders(method: string | undefined, url: string
+ 
+ /** The response body as text, gunzipped when the server compressed it. */
+ export function decodeResponseBody(body: Buffer, contentEncoding: string | string[] | undefined): string {
+-  const encoding = String(Array.isArray(contentEncoding) ? contentEncoding[0] : contentEncoding || '').toLowerCase()
++  const encoding = String(Array.isArray(contentEncoding) ? contentEncoding[0] : contentEncoding || '').trim().toLowerCase()
+ 
+-  return (encoding.includes('gzip') ? gunzipSync(body) : body).toString('utf8')
++  return (encoding === 'gzip' ? gunzipSync(body, { maxOutputLength: 16 * 1024 * 1024 }) : body).toString('utf8')
+ }
+diff --git a/hermes_cli/web_delta_response.py b/hermes_cli/web_delta_response.py
+index 04733040bb7..e8a88427817 100644
+--- a/hermes_cli/web_delta_response.py
++++ b/hermes_cli/web_delta_response.py
+@@ -17,6 +17,10 @@ apps/desktop/electron/delta-reads.ts).
+   again without a base.
+ - Everything else (no ask, other methods and statuses, streams, small or huge bodies, Python without
+   ``compression.zstd``) passes through untouched.
++- ``X-Hermes-Delta-Accept: zstd-gzip-v1`` additionally permits bounded gzip JSON entities. Hashes and bases
++  name their exact compressed bytes, without server decompression or another store. A whole answer keeps gzip;
++  a delta removes outer Content-Encoding and records ``X-Hermes-Delta-Content-Encoding: gzip`` so the client
++  verifies reconstructed entity bytes before gunzip. Plain ``zstd`` never opts into this representation.
+ - Every hashed or delta answer says ``Vary: X-Hermes-Delta-Accept, X-Hermes-Delta-Base`` (merged into the
+   handler's own Vary), and a delta drops the handler's ``ETag``: its bytes are a frame, not that entity. A caching
+   proxy in front of the gateway then cannot replay a delta to a client that did not ask for one. A delta also
+@@ -68,6 +72,8 @@ BASE_HEADER = "x-hermes-delta-base"
+ HASH_HEADER = "x-hermes-body-hash"
+ DELTA_HEADER = "x-hermes-delta"
+ ENCODING = "zstd"
++GZIP_CAPABILITY = "zstd-gzip-v1"
++CONTENT_ENCODING_HEADER = "x-hermes-delta-content-encoding"
+ DELTA_MEDIA_TYPE = "application/vnd.hermes.delta+zstd"
+ MIN_BYTES = 16 * 1024
+ MAX_BYTES = 8 * 1024 * 1024
+@@ -293,15 +299,17 @@ def default_disk_dir() -> Path:
+     return get_hermes_home() / "cache" / "delta-bodies"
+ 
+ 
+-def _eligible(message: Message) -> bool:
+-    """A complete, plain JSON 200 of a size worth encoding (a stream has no Content-Length)."""
++def _eligible(message: Message, allow_gzip: bool = False) -> bool:
++    """Bounded JSON entity bytes; gzip requires the explicit compressed-entity capability."""
+     if message["status"] != 200:
+         return False
+     headers = Headers(raw=message["headers"])
+     length = headers.get("content-length", "")
+     return (
+         headers.get("content-type", "").split(";", 1)[0].strip().lower() == "application/json"
+-        and "content-encoding" not in headers
++        and ("content-encoding" not in headers or (
++            allow_gzip and headers.get("content-encoding", "").strip().lower() == "gzip"
++        ))
+         and length.isascii()
+         and length.isdecimal()
+         and MIN_BYTES <= int(length) <= MAX_BYTES
+@@ -354,26 +362,30 @@ class DeltaResponseMiddleware:
+             await self.app(scope, receive, send)
+             return
+         request = Headers(scope=scope)
+-        if request.get(ACCEPT_HEADER, "").strip().lower() != ENCODING:
++        capability = request.get(ACCEPT_HEADER, "").strip().lower()
++        if capability not in (ENCODING, GZIP_CAPABILITY):
+             await self.app(scope, receive, send)
+             return
+-        held = _DeltaSend(send, request.get(BASE_HEADER, "").strip(), credential_namespace(request), self.store)
++        held = _DeltaSend(send, request.get(BASE_HEADER, "").strip(), credential_namespace(request), self.store,
++                          allow_gzip=capability == GZIP_CAPABILITY)
+         await self.app(scope, receive, held)
+ 
+ 
+ class _DeltaSend:
+     """The ``send`` of one asked request: holds an eligible response until its body is complete."""
+ 
+-    def __init__(self, send: Send, base_digest: str, namespace: str, store: BodyStore):
++    def __init__(self, send: Send, base_digest: str, namespace: str, store: BodyStore, *, allow_gzip: bool = False):
+         self._send = send
+         self._base_digest = base_digest
+         self._namespace = namespace
+         self._store = store
+         self._start: Optional[Message] = None
+         self._chunks: list[bytes] = []
++        self._allow_gzip = allow_gzip
++        self._size = 0
+ 
+     async def __call__(self, message: Message) -> None:
+-        if message["type"] == "http.response.start" and _eligible(message):
++        if message["type"] == "http.response.start" and _eligible(message, self._allow_gzip):
+             self._start = message
+             return
+         if self._start is None:
+@@ -390,6 +402,14 @@ class _DeltaSend:
+             await self._send(message)
+             return
+         self._chunks.append(message.get("body", b""))
++        self._size += len(message.get("body", b""))
++        if self._size > int(Headers(raw=self._start["headers"])["content-length"]):
++            # A dishonest length must not turn a bounded entity into an unbounded stream buffer.
++            start, chunks = self._start, self._chunks
++            self._start, self._chunks = None, []
++            await self._send(start)
++            await self._send({**message, "body": b"".join(chunks)})
++            return
+         if not message.get("more_body", False):
+             await self._finish(b"".join(self._chunks))
+ 
+@@ -413,6 +433,9 @@ class _DeltaSend:
+         headers[HASH_HEADER] = digest
+         _merge_vary(headers)
+         if frame is not None:
++            if "content-encoding" in headers:
++                headers[CONTENT_ENCODING_HEADER] = headers["content-encoding"].strip().lower()
++                del headers["content-encoding"]  # the outer zstd frame is not a gzip entity
+             del headers["etag"]  # the handler's validator names the whole body, not this frame
+             # Only the client holding this base can use it, and Cloudflare ignores the Vary names above.
+             del headers["cache-control"]
+diff --git a/scripts/bench_gzip_transcript_delta.py b/scripts/bench_gzip_transcript_delta.py
+new file mode 100644
+index 00000000000..d02d7dd767e
+--- /dev/null
++++ b/scripts/bench_gzip_transcript_delta.py
+@@ -0,0 +1,84 @@
++"""Synthetic, public gzip-entity delta benchmark (Python 3.14+).
++
++Run: scripts/hermes-python scripts/bench_gzip_transcript_delta.py
++Reports entity/frame body bytes (not HTTP/TLS overhead) and process CPU ms/op.
++JSON generation is outside measurement; gzip, server hash/store/encode and client
++zstd/hash/gunzip/JSON are measured separately. No production transcripts are read.
++"""
++from __future__ import annotations
++
++import gzip
++import json
++import random
++import statistics
++import time
++
++from hermes_cli import web_delta_response as wdr
++
++
++def page():
++    rng = random.Random(2026)
++    return {"messages": [{"id": i, "role": "assistant", "content":
++             "Synthetic transcript text. " * 30 + rng.randbytes(2500).hex()}
++             for i in range(200)]}
++
++
++def cpu_trial(fn, count=30):
++    samples = []
++    result = None
++    for _ in range(count):
++        start = time.process_time_ns()
++        result = fn()
++        samples.append((time.process_time_ns() - start) / 1e6)
++    return result, {"median": round(statistics.median(samples), 4), "max": round(max(samples), 4), "n": count}
++
++
++def main():
++    original = page()
++    appended = {"messages": [*original["messages"], {"id": 200, "role": "assistant", "content": "new synthetic message"}]}
++    changed = page()
++    changed["messages"][100]["content"] += " changed in the middle"
++    raw = [json.dumps(p, ensure_ascii=False, separators=(",", ":")).encode() for p in (original, appended, changed)]
++    entities = []
++    gzip_cpu = []
++    for body in raw:
++        entity, cpu = cpu_trial(lambda body=body: gzip.compress(body, mtime=0))
++        entities.append(entity)
++        gzip_cpu.append(cpu)
++    base = entities[0]
++    digest = wdr.body_hash(base)
++    results = []
++    for name, body, entity, gzip_ms in zip(("unchanged", "appended", "middle-edit"),
++                                         (raw[0], raw[1], raw[2]), entities, gzip_cpu):
++        store = wdr.BodyStore()
++        store.put(f"bench:{digest}", base)
++        # Fresh frame memo for each trial: measure first encode, not a disguised memo hit.
++        def cold():
++            store._frames.clear()
++            store._frames_bytes = 0
++            return wdr._encode(entity, digest, "bench", store)
++        (new_hash, frame), encode_ms = cpu_trial(cold)
++        _, memo_ms = cpu_trial(lambda: wdr._encode(entity, digest, "bench", store))
++        wire = entity if frame is None else frame
++
++        def client():
++            rebuilt = entity if frame is None else wdr._zstd.decompress(
++                frame, zstd_dict=wdr._zstd.ZstdDict(base, is_raw=True).as_prefix)
++            assert wdr.body_hash(rebuilt) == new_hash and rebuilt == entity
++            restored = gzip.decompress(rebuilt)
++            assert restored == body
++            return json.loads(restored)
++
++        decoded, decode_ms = cpu_trial(client)
++        assert decoded == json.loads(body)
++        _, whole_decode_ms = cpu_trial(lambda: json.loads(gzip.decompress(entity)))
++        results.append({"case": name, "json_bytes": len(body), "gzip_bytes": len(entity),
++                        "wire_bytes": len(wire), "delta": frame is not None,
++                        "gzip_cpu_ms": gzip_ms, "server_first_encode_cpu_ms": encode_ms,
++                        "server_memo_cpu_ms": memo_ms, "client_decode_verify_cpu_ms": decode_ms,
++                        "whole_gzip_client_cpu_ms": whole_decode_ms})
++    print(json.dumps({"units": "body bytes; process CPU milliseconds/op", "results": results}, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/hermes_cli/test_web_delta_response_gzip.py b/tests/hermes_cli/test_web_delta_response_gzip.py
+new file mode 100644
+index 00000000000..8489844d955
+--- /dev/null
++++ b/tests/hermes_cli/test_web_delta_response_gzip.py
+@@ -0,0 +1,197 @@
++"""Negotiated deltas name exact gzip entity bytes, never decompressed JSON."""
++from __future__ import annotations
++
++import asyncio
++import gzip
++import json
++import random
++
++import pytest
++from starlette.datastructures import Headers
++
++from hermes_cli import web_delta_response as wdr
++
++pytestmark = pytest.mark.skipif(wdr._zstd is None, reason="requires Python 3.14 zstd")
++ASK = {"x-hermes-delta-accept": "zstd-gzip-v1"}
++
++
++def transcript(version=0):
++    rng = random.Random(47)
++    rows = [{"role": "assistant", "content": rng.randbytes(400).hex()} for _ in range(200)]
++    rows[-1]["content"] += str(version)
++    return json.dumps({"messages": rows}, ensure_ascii=False).encode()
++
++
++async def request(body, store, headers=None, *, coding="gzip", status=200, method="GET", length=None, chunks=None):
++    start = {"type": "http.response.start", "status": status, "headers": [
++        (b"content-type", b"application/json"), (b"content-encoding", coding.encode()),
++        (b"vary", b"Accept-Encoding"), (b"etag", b'"entity"'),
++        (b"cache-control", b"private"),
++    ]}
++    if length != "stream":
++        start["headers"].append((b"content-length", str(len(body) if length is None else length).encode()))
++    sent = []
++
++    async def app(scope, receive, send):
++        await send(start)
++        parts = chunks if chunks is not None else [body]
++        for i, chunk in enumerate(parts):
++            await send({"type": "http.response.body", "body": chunk, "more_body": i < len(parts) - 1})
++
++    async def send(message):
++        sent.append(message)
++
++    scope = {"type": "http", "method": method, "path": "/api/sessions/example/messages",
++             "headers": [(k.encode(), v.encode()) for k, v in (headers or {}).items()]}
++    async def receive():
++        return {"type": "http.request", "body": b"", "more_body": False}
++
++    await wdr.DeltaResponseMiddleware(app, store=store)(scope, receive, send)
++    return Headers(raw=sent[0]["headers"]), b"".join(m.get("body", b"") for m in sent[1:]), sent
++
++
++def get(body, store, headers=ASK, **kwargs):
++    return asyncio.run(request(body, store, headers, **kwargs))
++
++
++def restore(frame, base):
++    return wdr._zstd.decompress(frame, zstd_dict=wdr._zstd.ZstdDict(base, is_raw=True).as_prefix)
++
++
++def test_gzip_whole_unchanged_changed_exact_bytes_and_json():
++    store = wdr.BodyStore()
++    raw = transcript()
++    entity = gzip.compress(raw, mtime=0)
++    h, wire, _ = get(entity, store)
++    assert wire == entity and h["content-encoding"] == "gzip"
++    assert h[wdr.HASH_HEADER] == wdr.body_hash(entity)
++    assert h["cache-control"] == "private" and h["etag"] == '"entity"'
++    for next_raw in (raw, transcript(1)):
++        next_entity = gzip.compress(next_raw, mtime=0)
++        h, wire, _ = get(next_entity, store, {**ASK, wdr.BASE_HEADER: wdr.body_hash(entity)})
++        assert h[wdr.DELTA_HEADER] == "zstd"
++        assert h["x-hermes-delta-content-encoding"] == "gzip"
++        assert "content-encoding" not in h and "etag" not in h
++        assert h["cache-control"] == "no-store"
++        assert {s.strip().lower() for s in h["vary"].split(",")} == {
++            "accept-encoding", "x-hermes-delta-accept", "x-hermes-delta-base"}
++        assert int(h["content-length"]) == len(wire) < len(next_entity)
++        assert restore(wire, entity) == next_entity
++        assert json.loads(gzip.decompress(restore(wire, entity))) == json.loads(next_raw)
++        assert h[wdr.HASH_HEADER] == wdr.body_hash(next_entity)
++        entity = next_entity
++
++
++@pytest.mark.parametrize("accept", [None, "zstd", "zstd-gzip-v2", "gzip"])
++def test_old_client_or_unknown_capability_keeps_original_gzip(accept):
++    entity = gzip.compress(transcript(), mtime=0)
++    store = wdr.BodyStore()
++    headers = {} if accept is None else {"x-hermes-delta-accept": accept}
++    h, wire, _ = get(entity, store, headers)
++    assert wire == entity and h["content-encoding"] == "gzip"
++    assert wdr.HASH_HEADER not in h and wdr.DELTA_HEADER not in h and len(store) == 0
++
++
++@pytest.mark.parametrize("case", ["missing", "corrupt", "other-credential", "rolled"])
++def test_gzip_base_credential_isolation_and_disk_verification(tmp_path, case):
++    entity = gzip.compress(transcript(), mtime=0)
++    root = tmp_path / "bases"
++    store = wdr.BodyStore(disk_dir=root)
++    alice = {**ASK, "authorization": "Bearer alice"}
++    h, _, _ = get(entity, store, alice)
++    digest = h[wdr.HASH_HEADER]
++    if case == "missing":
++        digest = "f" * 32
++    elif case == "corrupt":
++        [file] = list(root.iterdir())
++        file.write_bytes(b"damaged gzip")
++    headers = {**alice, wdr.BASE_HEADER: digest}
++    if case == "other-credential":
++        headers["authorization"] = "Bearer bob"
++    h, wire, _ = get(entity, wdr.BodyStore(disk_dir=root), headers)
++    if case == "rolled":
++        assert h[wdr.DELTA_HEADER] == "zstd" and restore(wire, entity) == entity
++    else:
++        assert wdr.DELTA_HEADER not in h and wire == entity
++    assert sum(p.stat().st_size for p in root.iterdir()) <= wdr.STORE_MAX_BYTES
++
++
++@pytest.mark.parametrize("extra", [0, 1])
++def test_compare_against_gzip_not_uncompressed_size(monkeypatch, extra):
++    entity = gzip.compress(transcript(), mtime=0)
++    store = wdr.BodyStore()
++    h, _, _ = get(entity, store)
++    monkeypatch.setattr(wdr, "encode_delta", lambda body, base: b"x" * (len(body) + extra))
++    h, wire, _ = get(entity, store, {**ASK, wdr.BASE_HEADER: h[wdr.HASH_HEADER]})
++    assert wire == entity and "content-encoding" in h and wdr.DELTA_HEADER not in h
++
++
++@pytest.mark.parametrize("kwargs", [
++    {"coding": "br"}, {"coding": "gzip, br"}, {"status": 206}, {"method": "POST"},
++    {"method": "HEAD"}, {"length": "stream"}, {"length": 12}, {"length": wdr.MAX_BYTES + 1},
++])
++def test_gzip_ineligible_passthrough(kwargs):
++    entity = gzip.compress(transcript(), mtime=0)
++    store = wdr.BodyStore()
++    h, wire, _ = get(entity, store, **kwargs)
++    assert wire == entity and wdr.HASH_HEADER not in h and len(store) == 0
++
++
++def test_encode_exception_is_original_gzip(monkeypatch):
++    entity = gzip.compress(transcript(), mtime=0)
++    store = wdr.BodyStore()
++    h, _, _ = get(entity, store)
++
++    def broken(body, base):
++        raise RuntimeError("injected encode failure")
++
++    monkeypatch.setattr(wdr, "encode_delta", broken)
++    h, wire, _ = get(entity, store, {**ASK, wdr.BASE_HEADER: h[wdr.HASH_HEADER]})
++    assert wire == entity and h["content-encoding"] == "gzip" and wdr.HASH_HEADER not in h
++
++
++def test_dishonest_length_stops_buffering_at_declared_bound():
++    """Even a never-ending oversized producer must release the held start before its last chunk."""
++    entity = gzip.compress(transcript(), mtime=0)
++    store = wdr.BodyStore()
++    h, wire, sent = get(entity, store, length=wdr.MIN_BYTES,
++                        chunks=[entity[:wdr.MIN_BYTES], entity[wdr.MIN_BYTES:], b"tail"])
++    assert wire == entity + b"tail" and wdr.HASH_HEADER not in h and len(store) == 0
++    assert sent[1]["more_body"] is True
++
++
++def test_gzip_small_and_no_zstd_passthrough(monkeypatch):
++    store = wdr.BodyStore()
++    entity = gzip.compress(b'{"ok":true}', mtime=0)
++    h, wire, _ = get(entity, store)
++    assert wire == entity and wdr.HASH_HEADER not in h and len(store) == 0
++    monkeypatch.setattr(wdr, "_zstd", None)
++    entity = gzip.compress(transcript(), mtime=0)
++    h, wire, _ = get(entity, store)
++    assert wire == entity and wdr.HASH_HEADER not in h and len(store) == 0
++
++
++def test_negotiated_gzip_eligibility_has_the_same_entity_bounds():
++    def eligible(length, coding="gzip", content_type="application/json"):
++        return wdr._eligible({"status": 200, "headers": [
++            (b"content-length", str(length).encode()), (b"content-type", content_type.encode()),
++            (b"content-encoding", coding.encode()),
++        ]}, allow_gzip=True)
++
++    assert eligible(wdr.MIN_BYTES) and eligible(wdr.MAX_BYTES)
++    assert eligible(wdr.MIN_BYTES, " GZip ", "application/json; charset=utf-8")
++    assert not eligible(wdr.MIN_BYTES - 1) and not eligible(wdr.MAX_BYTES + 1)
++    assert not eligible(wdr.MIN_BYTES, "br") and not eligible(wdr.MIN_BYTES, content_type="text/plain")
++
++
++def test_negotiated_gzip_uses_existing_body_and_frame_budgets(tmp_path):
++    entity = gzip.compress(transcript(), mtime=0)
++    store = wdr.BodyStore(max_bytes=len(entity), frames_max_bytes=1, disk_dir=tmp_path / "bases")
++    h, _, _ = get(entity, store)
++    h, wire, _ = get(entity, store, {**ASK, wdr.BASE_HEADER: h[wdr.HASH_HEADER]})
++    assert restore(wire, entity) == entity
++    assert store._bytes <= len(entity) and store._frames_bytes <= 1
++    changed = gzip.compress(transcript(1), mtime=0)
++    get(changed, store)
++    assert store._bytes <= len(entity)
++    assert sum(p.stat().st_size for p in (tmp_path / "bases").iterdir()) <= len(entity)
+-- 
+2.43.0
+

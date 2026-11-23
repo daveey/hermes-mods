@@ -1,0 +1,794 @@
+From 43069bf0d379ef2ea57f45295c9fcc00f72457e3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 09:18:38 +0000
+Subject: [PATCH] [daveey] compose native sessions display captures off request
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ docs/designs/sessions-display-facts.md        |  64 +++++++
+ hermes_cli/sessions_fact_routes.py            |   3 +
+ hermes_cli/sessions_native_source.py          | 174 +++++++++++++++++
+ hermes_cli/sessions_native_startup.py         | 148 +++++++++++++++
+ hermes_cli/web_server.py                      |   2 +
+ hermes_cli/web_server_app.py                  |   3 +-
+ .../hermes_cli/test_sessions_native_source.py | 132 +++++++++++++
+ .../test_sessions_native_startup.py           | 178 ++++++++++++++++++
+ 8 files changed, 703 insertions(+), 1 deletion(-)
+ create mode 100644 docs/designs/sessions-display-facts.md
+ create mode 100644 hermes_cli/sessions_native_source.py
+ create mode 100644 hermes_cli/sessions_native_startup.py
+ create mode 100644 tests/hermes_cli/test_sessions_native_source.py
+ create mode 100644 tests/hermes_cli/test_sessions_native_startup.py
+
+diff --git a/docs/designs/sessions-display-facts.md b/docs/designs/sessions-display-facts.md
+new file mode 100644
+index 00000000000..9dbe643f7c4
+--- /dev/null
++++ b/docs/designs/sessions-display-facts.md
+@@ -0,0 +1,64 @@
++# In-process sessions display facts
++
++`HERMES_FACTS_SESSIONS` defaults ON for Linux serve startup. `0`, `off`, `false`,
++or `no` selects the existing legacy coalesced HTTP path at the next natural boot.
++Other platforms remain legacy because the current native watch is Linux-only.
++Never restart a live serve to activate this change.
++
++## Data path
++
++The app owns one `SessionsRuntime`, `ChangeFeed`, native source watch, immutable
++`FactStore`, and the existing `InProcessFacts` delivery/expiry workers. Startup
++captures the launch-authorized profile roster and installs an app-local HTTP
++binding. A default sessions view must be published before release to facts mode.
++The startup hook belongs inside the annotation-owner lifespan: sessions capture
++must stop before its annotation inputs shut down.
++
++Session/config native hints invalidate the demanded views. The source adapter
++captures the canonical synchronous list/sidebar/stamps readers on the feed owner,
++including SQL filters/counts/pins/deep offsets and seven annotation families.
++This deliberately preserves existing serializers; it is NOT a pure reducer that
++performs I/O and is NOT a per-row `SessionFact` implementation. Source vectors
++identify these display captures, not a coherent multi-database cursor. Existing
++schema/source-vector/dedicated-host guarantees remain in the follow-through scope.
++
++HTTP only selects the startup binding, reads immutable bytes, touches in-memory
++LRU state, or enqueues a cold demand. Cold or stale views return retryable 503 and
++never scan synchronously. Invalid list enums retain 400. Named profiles outside
++the discovered authorized roster return 404. The roster reconciles in background;
++new profiles join that roster on a 30s reconciliation and get native watches at
++the next boot. Their intervening updates use reconciliation, not native freshness.
++
++## Bounds and failure behavior
++
++- At most 32 retained selectors per endpoint; read-touch LRU makes stamps churn
++  independent of list capacity. Encoded retained bodies share a 12 MiB cap.
++- Individual captures are limited to 4 MiB and checked against a five-second
++  elapsed budget. Oversized/slow views are unavailable, not truncated successes.
++  The elapsed check does not interrupt an in-flight Python/SQLite reader.
++- Dirty selectors are served fairly even under ongoing writes. Failed selectors
++  retain old bytes as stale and retry after five seconds without poisoning peers.
++- Capture is paced to at most five passes/second and no more than 50% serial
++  capture duty. This is wall-time duty, not a CPU guarantee or live performance
++  result. The live routed 20-sample p95 proof is still required.
++- Quiet external annotations/time/roster reconcile every 30s plus queue/capture
++  latency. `is_active` additionally schedules its captured 300s boundary. This is
++  not an assertion of subsecond upstream freshness. Native annotation binding
++  composition must be verified against the separately owned d activation.
++- Facts expire after 60s if publication stalls. The retained legacy route remains
++  available for explicit rollback, never as a hidden fallback on a facts miss.
++- Shutdown first closes facts admission through the existing consumer drain,
++  then joins capture/watch, releases binding/handle, and stops local workers.
++  Failed joins retain app custody and prevent a replacement owner from starting.
++
++## Evidence
++
++`test_sessions_native_startup.py` exercises actual SessionDB writes, canonical
++capture, mounted HTTP list/sidebar/stamps, real app lifespan/middleware, OFF and
++reentry, and warmed request I/O tripwires. Comparison freezes the wall clock so
++annotation observation timestamps are compared exactly rather than discarded.
++`test_sessions_native_source.py` covers scheduling, failure isolation, LRU,
++per-endpoint/byte limits, quiet reconciliation, deadline scheduling and closure.
++The native watcher bypass mutant must fail the real-write visibility assertion.
++Fixture success does not prove the deployed process, routed latency, complete
++native annotation coverage, or the combined cost target.
+diff --git a/hermes_cli/sessions_fact_routes.py b/hermes_cli/sessions_fact_routes.py
+index 7442d2794e3..51298d7aa8c 100644
+--- a/hermes_cli/sessions_fact_routes.py
++++ b/hermes_cli/sessions_fact_routes.py
+@@ -147,6 +147,9 @@ class SessionsFactRoutes:
+             self._condition.notify_all()
+ 
+     def response(self, name, selector):
++        touch = getattr(self._handle, 'touch', None)
++        if touch is not None:
++            touch(name, selector)  # Optional owner-memory LRU hint, never source I/O.
+         result = self._handle.v1.snapshot(self._scope).view(name, selector)
+         if isinstance(result, self._ready_type):
+             return Response(content=result.encoded, media_type="application/json")
+diff --git a/hermes_cli/sessions_native_source.py b/hermes_cli/sessions_native_source.py
+new file mode 100644
+index 00000000000..79cc7a22c84
+--- /dev/null
++++ b/hermes_cli/sessions_native_source.py
+@@ -0,0 +1,174 @@
++"""Native invalidation of demanded canonical session display captures. [daveey]
++
++The canonical reader runs on ChangeFeed, NOT inside a reducer or HTTP request.
++Source vectors identify captures, not a cross-database transaction. External
++annotations/time/roster have a disclosed 30s reconciliation bound. One fair queue
++retains trailing hints; a failed selector cannot starve unrelated selectors.
++"""
++from collections import OrderedDict
++from dataclasses import dataclass, replace
++import threading
++import time
++
++from hermes_cli.fact_capture import CaptureBudgetExceeded
++from hermes_cli.fact_contract import Fact
++from hermes_cli.fact_source_watch import NativeSourceWatch
++from hermes_cli.fact_store import view_key
++
++
++@dataclass(frozen=True)
++class SessionViewCapture:
++    after: int
++    next_deadline: float
++    fact: object = None
++
++
++class SessionsSource:
++    """Bounded per-endpoint inventories with read-touch LRU and fair dirty order."""
++    def __init__(self, store, source, paths, capture, *, max_views=32,
++                 max_bytes=12 * 1024 * 1024, refresh_seconds=30, reconcile=None):
++        self.store, self.source = store, source
++        self.paths, self.reader = tuple(paths), capture
++        self.max_views, self.max_bytes = max_views, max_bytes
++        self.refresh_seconds, self.reconcile = refresh_seconds, reconcile
++        self._lock = threading.Lock()
++        self._selectors = OrderedDict()
++        self._dirty = OrderedDict()
++        self._sizes, self._retry = {}, {}
++        self._retired = set()
++        self._watch = self._wake = None
++        self._closed = False
++        self._serial = 0
++        self._next_capture = 0
++        self._refresh = time.monotonic() + refresh_seconds
++
++    def watch(self, wake):
++        with self._lock:
++            if self._wake is not None or self._closed:
++                raise RuntimeError('sessions source already watched or closed')
++            self._wake = wake
++        self._watch = NativeSourceWatch(self.paths, self.invalidate)
++        return self
++
++    def _evict(self, key):
++        self._selectors.pop(key)
++        self._dirty.pop(key, None)
++        self._retry.pop(key, None)
++        self._retired.add(key)
++
++    def touch(self, name, selector):
++        key = view_key(self.source.scope, name, selector)
++        with self._lock:
++            if key in self._selectors:
++                self._selectors.move_to_end(key)
++
++    def demand(self, name, selector):
++        key = view_key(self.source.scope, name, selector)
++        with self._lock:
++            if self._closed:
++                raise RuntimeError('sessions source closed')
++            if key not in self._selectors:
++                peers = [k for k, (view, _) in self._selectors.items() if view == name]
++                if len(peers) >= self.max_views:
++                    self._evict(peers[0])
++                self._selectors[key] = (name, dict(selector))
++            self._selectors.move_to_end(key)
++            self._dirty.setdefault(key, None)
++            wake = self._wake
++        if wake is not None:
++            wake()  # ChangeFeed condition only; no file descriptor writes.
++
++    def invalidate(self):
++        with self._lock:
++            for key in self._selectors:
++                self._dirty.setdefault(key, None)
++            wake = self._wake
++        if wake is not None:
++            wake()
++
++    def refresh_at(self, wall_deadline):
++        with self._lock:
++            self._refresh = min(self._refresh, time.monotonic() + max(0, wall_deadline - time.time()))
++
++    def _deadline(self):
++        deadlines = [max(self._next_capture, self._retry.get(key, 0)) for key in self._dirty]
++        return min([self._refresh, *deadlines])
++
++    def capture(self, cursor, budget):
++        self._watch.check()
++        started = time.monotonic()
++        if started >= self._refresh and self.reconcile is not None:
++            self.reconcile()  # owner-only roster discovery, never demand/request
++        with self._lock:
++            if started >= self._refresh:
++                for key in self._selectors:
++                    self._dirty.setdefault(key, None)
++                self._refresh = started + self.refresh_seconds
++            key = next((key for key in self._dirty
++                        if started >= max(self._next_capture, self._retry.get(key, 0))), None)
++            if key is None:
++                return SessionViewCapture(self._serial, self._deadline())
++            self._dirty.pop(key)
++            name, selector = self._selectors[key]
++        observed = time.time()
++        self._serial += 1
++        try:
++            body = self.reader(name, selector)
++            if (not isinstance(body, bytes) or len(body) > min(budget.max_bytes, self.max_bytes)
++                    or time.monotonic() - started > budget.max_seconds):
++                raise CaptureBudgetExceeded('sessions view exceeds capture budget')
++            fact = Fact(key, {'encoded': body}, source_vector=((self.source, self._serial),),
++                        observed_at=observed, valid_until=observed + 2 * self.refresh_seconds,
++                        health='fresh')
++        except Exception:  # health: allow BLE001 -- isolate capture failures; unknown is not empty success
++            old = self.store.snapshot(self.source.scope).get(key)
++            fact = (replace(old, health='stale', error_code='sessions_capture_failed') if old is not None
++                    else Fact(key, {}, error_code='sessions_capture_failed'))
++            with self._lock:
++                if key in self._selectors:
++                    self._dirty.setdefault(key, None)
++                    self._retry[key] = time.monotonic() + 5
++        else:
++            with self._lock:
++                self._retry.pop(key, None)
++        with self._lock:
++            # <=50% capture duty under sustained hints, at most five passes/sec.
++            self._next_capture = time.monotonic() + max(.2, time.monotonic() - started)
++            due = self._deadline()
++        return SessionViewCapture(self._serial, due, fact)
++
++    def commit(self, capture):
++        with self._lock:
++            deleted = set(self._retired)
++            self._retired.clear()
++            fact = capture.fact
++            if fact is not None and fact.key not in self._selectors:
++                fact = None  # Evicted during capture.
++            for key in deleted:
++                self._sizes.pop(key, None)
++            if fact is not None:
++                size = len(fact.value.get('encoded', b''))
++                while sum(self._sizes.values()) - self._sizes.get(fact.key, 0) + size > self.max_bytes:
++                    victim = next(key for key in self._selectors if key != fact.key and key in self._sizes)
++                    self._evict(victim)
++                    self._sizes.pop(victim)
++                    deleted.add(victim)
++                self._sizes[fact.key] = size
++            self.store.publish([fact] if fact is not None else (), deleted_keys=deleted)
++
++    def failure(self):
++        # Watch/publication failure (not one selector failure) invalidates all.
++        snapshot = self.store.snapshot(self.source.scope)
++        with self._lock:
++            keys = tuple(self._selectors)
++            for key in keys:
++                self._dirty.setdefault(key, None)
++        stale = [replace(fact, health='stale', error_code='sessions_source_failed')
++                 for key in keys if (fact := snapshot.get(key)) is not None]
++        self.store.publish(stale)
++
++    def close(self):
++        with self._lock:
++            self._closed = True
++        if self._watch is not None:
++            self._watch.close()
+diff --git a/hermes_cli/sessions_native_startup.py b/hermes_cli/sessions_native_startup.py
+new file mode 100644
+index 00000000000..60859832a06
+--- /dev/null
++++ b/hermes_cli/sessions_native_startup.py
+@@ -0,0 +1,148 @@
++"""App-owned sessions display startup; HERMES_FACTS_SESSIONS=0 rolls back. [daveey]
++
++No configuration, discovery, capture or SQLite on the warm HTTP path. This is
++in-process rendered-field composition, not dedicated fact_host activation.
++"""
++import asyncio
++from contextlib import asynccontextmanager
++import inspect
++import os
++import sys
++from types import SimpleNamespace
++
++from fastapi import HTTPException
++
++from hermes_cli.fact_capture import CaptureBudget
++from hermes_cli.fact_contract import Scope, SourceId
++from hermes_cli.fact_feed import ChangeFeed
++from hermes_cli.fact_inprocess import IncrementalLifecycle, InProcessFacts
++from hermes_cli.fact_store import FactStore
++from hermes_cli.sessions_fact_routes import use
++from hermes_cli.sessions_native_source import SessionsSource
++
++
++class SessionsRuntime:
++    def __init__(self, profiles, targets):
++        self.profiles = profiles
++        self.targets = tuple(targets)
++        self.names = frozenset(name for name, _ in targets)
++        self.scope = Scope(str(targets[0][1]), 'sessions-display')
++        self.store = FactStore()
++        self.lifecycle = IncrementalLifecycle({(self.scope, 'sessions')})
++        self.feed = self.local = self.handle = self.binding = None
++        paths = [home / filename for _, home in targets for filename in ('state.db', 'config.yaml')]
++        self.source = SessionsSource(self.store, SourceId(self.scope, 'sessions.display', 'canonical'),
++                                     paths, self.capture, reconcile=self.reconcile)
++        self.generation = 0
++
++    def reconcile(self):
++        # Profiles introduced after boot use 30s reconciliation until next boot
++        # installs their native watches; do not claim native freshness for them.
++        targets = self.profiles._profile_targets('sessions facts reconciliation')
++        self.names = frozenset(name for name, _ in targets)
++
++    def capture(self, name, selector):
++        from hermes_cli.web_json_response import native_json_response
++        readers = {'sessions': self.profiles.get_profiles_sessions,
++                   'sessions_sidebar': self.profiles.get_profiles_sessions_sidebar,
++                   'sessions_stamps': self.profiles.get_profiles_session_stamps}
++        # Bypass the legacy request coalescer/TTL, but retain canonical SQL,
++        # ordering, projection and seven-family annotation implementations.
++        reader = readers[name]
++        if name == 'sessions_sidebar':
++            reader = reader.__wrapped__  # Skip TTL only; keep load accounting.
++        result = reader(**selector)
++        groups = [result.get('sessions', ())]
++        groups.extend(result.get(key, {}).get('sessions', ()) for key in ('recents', 'cron', 'messaging'))
++        for rows in groups:
++            for row in rows:
++                if row.get('is_active'):
++                    self.source.refresh_at(row.get('last_active', row.get('started_at', 0)) + 300)
++        return native_json_response(result).body
++
++    def demand(self, scope, name, selector):
++        if scope != self.scope or name not in ('sessions', 'sessions_sidebar', 'sessions_stamps'):
++            raise ValueError('unauthorized sessions demand')
++        profile = selector.get('recents_profile', selector.get('profile', 'all')) or 'all'
++        if profile != 'all' and profile not in self.names:
++            raise HTTPException(404, 'Profile not found')
++        self.source.demand(name, selector)
++
++    def start(self):
++        self.feed = ChangeFeed(lambda source, capture: source.commit(capture),
++                               lambda source, error: source.failure(),
++                               budget=CaptureBudget(max_bytes=4 * 1024 * 1024, max_seconds=5))
++        try:
++            self.feed.register(self.source)
++            self.local = InProcessFacts(self.store, [self.scope], demand=self.demand)
++            self.handle = self.local.acquire(self.scope, lifecycle=self.lifecycle)
++            binding_handle = SimpleNamespace(v1=self.handle.v1, demand=self.handle.demand,
++                                             touch=self.source.touch)
++            self.binding = self.profiles.bind_sessions_facts(binding_handle, self.scope)
++            from hermes_cli.sessions_fact_routes import selector_for
++            from hermes_cli.fact_contract import Ready
++            selector = selector_for(inspect.signature(self.profiles.get_profiles_sessions), (), {})
++            self.demand(self.scope, 'sessions', selector)
++            with self.store._condition:
++                if not self.store._condition.wait_for(
++                        lambda: isinstance(self.store.snapshot(self.scope).view('sessions', selector), Ready), timeout=15):
++                    raise TimeoutError('sessions bootstrap unavailable; activation refused')
++            self.lifecycle.report_ready('sessions', self.scope)
++            self.generation += 1
++            self.lifecycle.transition('sessions', self.scope, 'facts', self.generation)
++        except BaseException:
++            self.close()
++            raise
++        return self
++
++    def close(self):
++        if self.binding is not None:
++            self.generation += 1
++            self.lifecycle.transition('sessions', self.scope, 'legacy', self.generation)
++        if self.feed is not None:
++            self.feed.close()  # failed drain retains app custody; never start a replacement
++        if self.binding is not None:
++            self.binding.close()
++            self.binding = None
++        if self.handle is not None:
++            self.handle.close()
++            self.handle = None
++        if self.local is not None:
++            self.local.close()
++            self.local = None
++
++
++class SessionsMiddleware:
++    """Use only app-startup authority, never infer a binding from a query value."""
++    def __init__(self, app):
++        self.app = app
++
++    async def __call__(self, scope, receive, send):
++        if scope['type'] != 'http':
++            return await self.app(scope, receive, send)
++        runtime = getattr(scope['app'].state, 'sessions_facts', None)
++        with use(runtime.binding if runtime is not None else None):
++            await self.app(scope, receive, send)
++
++
++@asynccontextmanager
++async def lifespan(app):
++    from hermes_cli.web_routers import profiles
++    retained = getattr(app.state, 'sessions_facts', None)
++    if retained is not None:
++        raise RuntimeError('sessions startup custody retained')
++    # health: allow HX002 -- creator-defined startup rollback switch, never a credential
++    enabled = os.environ.get('HERMES_FACTS_SESSIONS', '1').strip().lower() not in ('0', 'off', 'false', 'no')
++    # NativeSourceWatch currently supports Linux only; keep other hosts legacy.
++    if not enabled or not sys.platform.startswith('linux'):
++        yield
++        return
++    targets = await asyncio.to_thread(profiles._profile_targets, 'sessions facts startup')
++    runtime = SessionsRuntime(profiles, targets)
++    app.state.sessions_facts = runtime  # custody survives a failed startup/unwind
++    try:
++        await asyncio.to_thread(runtime.start)
++        yield
++    finally:
++        await asyncio.to_thread(runtime.close)
++        app.state.sessions_facts = None
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index ba4098c2dd4..ab3478a1f1d 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -218,6 +218,8 @@ from hermes_cli.dashboard_auth.body_limit import AuthBodyLimitMiddleware
+ 
+ # Register first (innermost): auth gates run before this, JSON parsing after it.
+ app.add_middleware(AuthBodyLimitMiddleware)
++from hermes_cli.sessions_native_startup import SessionsMiddleware
++app.add_middleware(SessionsMiddleware)
+ 
+ 
+ # Memory-provider OAuth connect routes live in the memory layer, not here.
+diff --git a/hermes_cli/web_server_app.py b/hermes_cli/web_server_app.py
+index eaee9ddb8ad..6ae2394238e 100644
+--- a/hermes_cli/web_server_app.py
++++ b/hermes_cli/web_server_app.py
+@@ -317,8 +317,9 @@ async def app_lifespan(app: FastAPI):
+     host_attach.enable_stale_while_revalidate()
+     from hermes_cli.fact_plugin_mount import lifespan as plugin_lifespan
+     from hermes_cli.fact_links_startup import lifespan as links_lifespan
++    from hermes_cli.sessions_native_startup import lifespan as sessions_lifespan
+     try:
+-        async with links_lifespan(app), plugin_lifespan(app), lifespan(app):
++        async with links_lifespan(app), sessions_lifespan(app), plugin_lifespan(app), lifespan(app):
+             yield
+     finally:
+         host_attach.enable_stale_while_revalidate(False)
+diff --git a/tests/hermes_cli/test_sessions_native_source.py b/tests/hermes_cli/test_sessions_native_source.py
+new file mode 100644
+index 00000000000..3eecc2211a4
+--- /dev/null
++++ b/tests/hermes_cli/test_sessions_native_source.py
+@@ -0,0 +1,132 @@
++"""Fairness, bounded inventories, failure isolation and expiry controls."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli.fact_capture import CaptureBudget
++from hermes_cli.fact_contract import Ready, Scope, SourceId, Unavailable
++from hermes_cli.fact_store import FactStore, view_key
++from hermes_cli.sessions_native_source import SessionsSource
++
++
++@pytest.fixture
++def source(monkeypatch):
++    from hermes_cli import sessions_native_source as module
++    clock = [100.]
++    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
++    monkeypatch.setattr(module.time, 'time', lambda: clock[0])
++    store = FactStore()
++    scope = Scope('install', 'scope')
++    calls = []
++    def read(name, selector):
++        calls.append((name, selector['id']))
++        if selector['id'] == 'bad':
++            raise RuntimeError('annotation unavailable')
++        return selector['id'].encode()
++    result = SessionsSource(store, SourceId(scope, 'sessions.display', 'test'), [], read, max_views=2)
++    result._watch = SimpleNamespace(check=lambda: None, close=lambda: None)
++    result._wake = lambda: None
++    return result, clock, calls
++
++
++def step(source, clock):
++    capture = source.capture(None, CaptureBudget(max_bytes=4096, max_seconds=5))
++    source.commit(capture)
++    clock[0] += 1
++    return capture
++
++
++def test_hot_hints_do_not_starve_and_failure_is_per_selector(source):
++    owner, clock, calls = source
++    owner.demand('sessions', {'id': 'bad'})
++    owner.demand('sessions', {'id': 'good'})
++    step(owner, clock)
++    owner.invalidate()  # Continuous writer re-dirties the failed first key.
++    step(owner, clock)
++    assert calls == [('sessions', 'bad'), ('sessions', 'good')]
++    snap = owner.store.snapshot(owner.source.scope)
++    assert isinstance(snap.view('sessions', {'id': 'bad'}), Unavailable)
++    assert snap.view('sessions', {'id': 'good'}).encoded == b'good'
++    owner.invalidate()
++    step(owner, clock)
++    assert calls[-1] == ('sessions', 'good')  # bad is in per-key backoff
++    clock[0] += 5
++    owner.reader = lambda *_: b'recovered'
++    step(owner, clock)
++    assert owner.store.snapshot(owner.source.scope).view('sessions', {'id': 'bad'}).encoded == b'recovered'
++
++
++def test_lru_and_per_endpoint_capacity(source):
++    owner, clock, _ = source
++    for sid in ('one', 'two'):
++        owner.demand('sessions', {'id': sid})
++        step(owner, clock)
++    owner.touch('sessions', {'id': 'one'})
++    owner.demand('sessions', {'id': 'three'})
++    step(owner, clock)
++    snap = owner.store.snapshot(owner.source.scope)
++    assert isinstance(snap.view('sessions', {'id': 'one'}), Ready)
++    assert snap.get(view_key(owner.source.scope, 'sessions', {'id': 'two'})) is None
++    for sid in ('a', 'b', 'c'):
++        owner.demand('sessions_stamps', {'id': sid})
++        step(owner, clock)
++    assert owner.store.snapshot(owner.source.scope).view('sessions', {'id': 'one'}).encoded == b'one'
++    assert len(owner._selectors) == 4
++
++
++def test_cooldown_and_quiet_reconciliation(source):
++    owner, clock, calls = source
++    owner.demand('sessions', {'id': 'one'})
++    capture = owner.capture(None, CaptureBudget())
++    owner.commit(capture)
++    owner.invalidate()
++    assert owner.capture(None, CaptureBudget()).fact is None
++    assert len(calls) == 1
++    clock[0] += 31
++    observed = []
++    owner.reconcile = lambda: observed.append('roster')
++    step(owner, clock)
++    assert observed == ['roster']
++    assert len(calls) == 2
++
++
++def test_over_budget_and_eviction_during_capture(source):
++    owner, clock, _ = source
++    owner.reader = lambda *_: b'x' * 5000
++    owner.demand('sessions', {'id': 'large'})
++    step(owner, clock)
++    assert isinstance(owner.store.snapshot(owner.source.scope).view('sessions', {'id': 'large'}), Unavailable)
++    owner.reader = lambda *_: b'good'
++    owner.demand('sessions', {'id': 'ok'})
++    capture = owner.capture(None, CaptureBudget())
++    owner.demand('sessions', {'id': 'third'})
++    owner.demand('sessions', {'id': 'fourth'})
++    owner.commit(capture)
++    assert owner.store.snapshot(owner.source.scope).get(capture.fact.key) is None
++
++
++def test_time_boundary_and_total_bytes(source):
++    owner, clock, _ = source
++    owner.refresh_at(clock[0] + 2)
++    assert owner._refresh == clock[0] + 2
++    owner.max_bytes = 6
++    owner.max_views = 4
++    for sid in ('one', 'two', 'abc'):
++        owner.demand('sessions', {'id': sid})
++        step(owner, clock)
++    assert sum(owner._sizes.values()) <= 6
++    assert owner.store._fact_bytes <= owner.store._fact_limit
++
++
++def test_expiry_watch_failure_and_close(source):
++    owner, clock, _ = source
++    owner.demand('sessions', {'id': 'one'})
++    step(owner, clock)
++    owner.failure()
++    fact = owner.store.snapshot(owner.source.scope).get(view_key(owner.source.scope, 'sessions', {'id': 'one'}))
++    assert fact.health == 'stale' and fact.value['encoded'] == b'one'
++    owner.close()
++    with pytest.raises(RuntimeError, match='closed'):
++        owner.demand('sessions', {'id': 'two'})
++    with pytest.raises(RuntimeError, match='closed'):
++        owner.watch(lambda: None)
+diff --git a/tests/hermes_cli/test_sessions_native_startup.py b/tests/hermes_cli/test_sessions_native_startup.py
+new file mode 100644
+index 00000000000..6effed03034
+--- /dev/null
++++ b/tests/hermes_cli/test_sessions_native_startup.py
+@@ -0,0 +1,178 @@
++"""Real native source -> scoped store -> mounted HTTP, without request capture."""
++import asyncio
++import builtins
++import inspect
++import io
++import json
++from pathlib import Path
++import socket
++import sqlite3
++import subprocess
++import threading
++import time
++
++import httpx
++import pytest
++from fastapi import FastAPI
++
++from hermes_cli.sessions_fact_routes import ScopedSessionsRoutes, selector_for
++from hermes_cli.sessions_native_startup import SessionsMiddleware, SessionsRuntime, lifespan
++from hermes_cli.web_routers import profiles
++from tests.hermes_cli import test_profiles_sidebar_scope as helpers
++from tests.waiting import wait_until
++
++profiles_on_disk = helpers.profiles_on_disk
++
++
++@pytest.fixture
++def native(profiles_on_disk, monkeypatch):
++    monkeypatch.setattr(profiles, '_SIDEBAR_CACHE_TTL_SECONDS', 0)
++    for name, home in profiles_on_disk.items():
++        for i in range(4):
++            helpers._seed_session(home, f'{name}-{i}', source=('cli', 'cron', 'telegram', 'cli')[i], pinned=i == 0)
++    observed = time.time()
++    monkeypatch.setattr(time, 'time', lambda: observed)
++    runtime = SessionsRuntime(profiles, list(profiles_on_disk.items())).start()
++    try:
++        yield runtime
++    finally:
++        runtime.close()
++
++
++def app_for(runtime):
++    app = FastAPI()
++    app.state.sessions_facts = runtime
++    app.add_middleware(SessionsMiddleware)
++    app.include_router(profiles.sessions_router)
++    return app
++
++
++def selected(**kwargs):
++    return selector_for(inspect.signature(profiles.get_profiles_sessions), (), kwargs)
++
++
++def wait_ready(runtime, selector):
++    from hermes_cli.fact_contract import Ready
++    assert wait_until(lambda: isinstance(runtime.store.snapshot(runtime.scope).view('sessions', selector), Ready), timeout=10)
++
++
++@pytest.mark.asyncio
++async def test_native_capture_mutation_and_warmed_http_no_io(native, monkeypatch):
++    runtime = native
++    selector = selected(limit=2, profile='worker')
++    runtime.demand(runtime.scope, 'sessions', selector)
++    await asyncio.to_thread(wait_ready, runtime, selector)
++    expected = profiles.get_profiles_sessions(**selector)
++    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app_for(runtime)), base_url='http://test')
++    async with client:
++        first = await client.get('/api/profiles/sessions', params={'limit': 2, 'profile': 'worker'})
++        assert first.status_code == 200
++        assert first.json() == json.loads(json.dumps(expected)), [(k, row.get(k), expected['sessions'][i].get(k)) for i, row in enumerate(first.json()['sessions']) for k in row if row.get(k) != expected['sessions'][i].get(k)]
++        request_thread = threading.get_ident()
++        def guard(original):
++            def checked(*args, **kwargs):
++                assert threading.get_ident() != request_thread, 'request performed I/O or legacy capture'
++                return original(*args, **kwargs)
++            return checked
++        with monkeypatch.context() as patch:
++            for owner, names in ((builtins, ('open',)), (io, ('open',)),
++                                 (Path, ('stat', 'read_text', 'read_bytes', 'open', 'iterdir')),
++                                 (sqlite3, ('connect',)), (subprocess, ('Popen', 'run')),
++                                 (socket.socket, ('connect',)),
++                                 (profiles, ('_profile_targets', '_read_profile_db', '_read_serial_profile_db',
++                                             'annotate_kanban_activity', 'annotate_goal_activity', 'annotate_cron_activity',
++                                             'annotate_background_activity', 'annotate_turn_activity',
++                                             'annotate_subagent_activity', 'annotate_review_wait'))):
++                for name in names:
++                    patch.setattr(owner, name, guard(getattr(owner, name)))
++            for _ in range(20):
++                response = await client.get('/api/profiles/sessions', params={'limit': 2, 'profile': 'worker'})
++                assert response.status_code == 200
++                assert response.content == first.content
++        # Actual state.db write, no explicit source invalidation/demand afterward.
++        from hermes_state import SessionDB
++        home = dict(runtime.targets)['worker']
++        db = SessionDB(db_path=home / 'state.db')
++        try:
++            db.set_session_title('worker-0', 'native changed')
++            def changed():
++                answer = runtime.store.snapshot(runtime.scope).view('sessions', selector)
++                return hasattr(answer, 'encoded') and b'native changed' in answer.encoded
++            assert await asyncio.to_thread(wait_until, changed, timeout=10)
++        finally:
++            db.close()
++
++
++@pytest.mark.asyncio
++async def test_cold_demand_foreign_scope_and_rollback(native):
++    runtime = native
++    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_for(runtime)), base_url='http://test') as client:
++        response = await client.get('/api/profiles/sessions', params={'profile': 'worker', 'limit': 1})
++        assert response.status_code == 503
++        await asyncio.to_thread(wait_ready, runtime, selected(profile='worker', limit=1))
++        assert (await client.get('/api/profiles/sessions', params={'profile': 'worker', 'limit': 1})).status_code == 200
++        assert (await client.get('/api/profiles/sessions', params={'profile': 'foreign'})).status_code == 404
++        runtime.lifecycle.transition('sessions', runtime.scope, 'legacy', 10)
++        runtime.generation = 10
++        runtime.binding.on_mode('legacy', 10)
++        assert (await client.get('/api/profiles/sessions', params={'profile': 'worker', 'limit': 1})).status_code == 200
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('name,path,params,reader', [
++    ('sessions', '/api/profiles/sessions', {'offset': 3, 'limit': 1, 'min_messages': 1}, 'get_profiles_sessions'),
++    ('sessions', '/api/profiles/sessions', {'full': True, 'source': 'cli', 'order': 'created'}, 'get_profiles_sessions'),
++    ('sessions', '/api/profiles/sessions', {'archived': 'only', 'automated': 'exclude'}, 'get_profiles_sessions'),
++    ('sessions_sidebar', '/api/profiles/sessions/sidebar', {'recents_profile': 'worker'}, 'get_profiles_sessions_sidebar'),
++    ('sessions_sidebar', '/api/profiles/sessions/sidebar', {'recents_profile': 'all', 'cron_limit': 1}, 'get_profiles_sessions_sidebar'),
++    ('sessions_stamps', '/api/profiles/sessions/stamps', {'profile': 'worker', 'ids': 'worker-0,missing,worker-2'}, 'get_profiles_session_stamps'),
++])
++async def test_all_mounted_views_native_parity(native, name, path, params, reader):
++    from hermes_cli.fact_contract import Ready
++    fn = getattr(profiles, reader)
++    selector = selector_for(inspect.signature(fn), (), params)
++    expected = inspect.unwrap(fn)(**selector)
++    native.demand(native.scope, name, selector)
++    def ready():
++        return isinstance(native.store.snapshot(native.scope).view(name, selector), Ready)
++    assert await asyncio.to_thread(wait_until, ready, timeout=10)
++    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app_for(native)), base_url='http://test') as client:
++        response = await client.get(path, params=params)
++        assert response.status_code == 200
++        assert response.json() == json.loads(json.dumps(expected))
++
++
++@pytest.mark.asyncio
++async def test_lifespan_off_and_reentry(profiles_on_disk, monkeypatch):
++    monkeypatch.setattr(profiles, '_SESSION_FACT_ROUTES', ScopedSessionsRoutes())
++    monkeypatch.setenv('HERMES_FACTS_SESSIONS', '0')
++    app = FastAPI()
++    async with lifespan(app):
++        assert getattr(app.state, 'sessions_facts', None) is None
++    monkeypatch.setenv('HERMES_FACTS_SESSIONS', '1')
++    for _ in range(2):
++        async with lifespan(app):
++            assert app.state.sessions_facts.binding._mode == 'facts'
++        assert app.state.sessions_facts is None
++
++
++def test_real_app_lifespan_and_middleware(profiles_on_disk, monkeypatch):
++    from contextlib import asynccontextmanager
++    from fastapi.testclient import TestClient
++    from hermes_cli import web_server, web_server_app
++    @asynccontextmanager
++    async def quiet_services(app):
++        yield
++    # Only unrelated background services are suppressed; actual sessions lifespan
++    # and registered HTTP middleware must compose through the real app entry.
++    monkeypatch.setattr(web_server_app, 'standalone_lifespan', quiet_services)
++    monkeypatch.setenv('HERMES_FACTS_LINKS', '0')
++    monkeypatch.setenv('HERMES_FACTS_SESSIONS', '1')
++    helpers._seed_session(profiles_on_disk['default'], 'app-entry', source='cli')
++    with TestClient(web_server.app) as client:
++        client.headers[web_server._SESSION_HEADER_NAME] = web_server._SESSION_TOKEN
++        assert web_server.app.state.sessions_facts.binding._mode == 'facts'
++        response = client.get('/api/profiles/sessions')
++        assert response.status_code == 200
++        assert any(row['id'] == 'app-entry' for row in response.json()['sessions'])
++    assert web_server.app.state.sessions_facts is None
+-- 
+2.43.0
+

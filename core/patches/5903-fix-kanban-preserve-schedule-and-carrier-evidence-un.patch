@@ -1,0 +1,242 @@
+From 6176d48a93f0f31842fa5bbc65ad7e925d0d67c1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 08:42:40 +0000
+Subject: [PATCH] fix(kanban): preserve schedule and carrier evidence
+ uncertainty [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_actionability.py            | 29 +++++++-
+ hermes_cli/kanban_actionability_sources.py    |  8 +-
+ .../test_kanban_actionability_contract.py     | 74 +++++++++++++++++++
+ .../test_kanban_actionability_report.py       | 39 ++++++++++
+ 4 files changed, 144 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_actionability.py b/hermes_cli/kanban_actionability.py
+index 8590b6ef765..d3131058412 100644
+--- a/hermes_cli/kanban_actionability.py
++++ b/hermes_cli/kanban_actionability.py
+@@ -106,9 +106,34 @@ def _status(row: dict, facts: dict, now: int) -> None:
+                action='repair_lifecycle_contract')
+ 
+ 
++def valid_awaiting(value) -> bool:
++    """Validate recorded producer provenance without normalizing away malformed evidence."""
++    if value is None or value == {}:
++        return True  # absent provenance may still have a recorded condition probe
++    if not isinstance(value, dict):
++        return False
++    if any(value.get(k) is not None and not isinstance(value[k], str)
++           for k in ('ref', 'why', 'gateway', 'board')):
++        return False
++    kind = value.get('kind')
++    if kind == 'clock':
++        return True
++    field = {'card': 'ref', 'ci': 'ref', 'deploy': 'ref', 'chat': 'why', 'external': 'ref'}
++    if not isinstance(kind, str) or kind not in field:
++        return False
++    named = value.get(field[kind])
++    if kind == 'external' and not named:
++        named = value.get('why')
++    return isinstance(named, str) and bool(named.strip())
++
++
+ def _schedule(row: dict, facts: dict, now: int) -> None:
+     wake = positive_time(facts.get('wake_at'))
+-    awaiting = facts.get('awaiting') or {}
++    valid = valid_awaiting(facts.get('awaiting'))
++    awaiting = (facts.get('awaiting') or {}) if valid else {}
++    if not valid:
++        row['evidence_state'] = 'unknown'
++        row['violations'].append('schedule_producer_malformed')
+     probe = facts.get('probe')
+     if not wake:
+         row['violations'].append('scheduled_wake_missing')
+@@ -116,7 +141,7 @@ def _schedule(row: dict, facts: dict, now: int) -> None:
+         row['violations'].append('scheduled_wake_overdue')
+     trigger = f"Recorded clock reaches {wake}" if awaiting.get('kind') == 'clock' and wake else (
+         f"Recorded {awaiting.get('kind')} producer {awaiting.get('ref') or awaiting.get('why') or ''}" if awaiting else '')
+-    if probe:
++    if probe and valid:
+         trigger = f'Recorded condition probe succeeds: {probe}'
+     if not trigger:
+         row['violations'].append('recovery_trigger_missing')
+diff --git a/hermes_cli/kanban_actionability_sources.py b/hermes_cli/kanban_actionability_sources.py
+index 60a8d0009e4..0e950d6f48e 100644
+--- a/hermes_cli/kanban_actionability_sources.py
++++ b/hermes_cli/kanban_actionability_sources.py
+@@ -5,7 +5,7 @@ import json
+ import sqlite3
+ import time
+ 
+-from hermes_cli.kanban_actionability import owner, project
++from hermes_cli.kanban_actionability import owner, project, valid_awaiting
+ from hermes_cli.kanban_actionability_evidence import EVIDENCE_ERRORS, effective
+ 
+ KINDS = ('created', 'blocked', 'scheduled', 'continued', 'spend_budget_triaged',
+@@ -81,7 +81,7 @@ class Reader:
+                         payload.get(k) is not None and not isinstance(payload[k], str)
+                         for k in ('episode', 'episode_uid', 'cause')) or any(
+                         payload.get(k) is not None and not isinstance(payload[k], dict)
+-                        for k in ('next_action', 'producer')):
++                        for k in ('next_action', 'producer')) or not valid_awaiting(payload.get('awaiting')):
+                     self.malformed.add(tid)
+             except (ValueError, TypeError):
+                 self.malformed.add(tid)
+@@ -175,7 +175,7 @@ def _route_owner(reader: Reader, route: dict) -> dict:
+         if not task or task['status'] in ('done', 'archived'):
+             return {'kind': 'unavailable', 'refs': [tid]}
+         stop, restricted, unknown = _state(reader, tid, reader.events(tid))
+-        if unknown or reader.synced:
++        if unknown or reader.synced or reader.pending(tid):
+             return {'kind': 'unknown', 'refs': [tid]}
+         held = stop or restricted or task.get('containment_episode')
+         return {'kind': 'unavailable' if held else 'task', 'refs': [tid]}
+@@ -253,7 +253,7 @@ def _describe(conn, tid, *, now, reader):
+              'unknown': reader.synced or reader.partial or missing or bool(receipt_only) or bool(source and not reader.uid(source))
+                         or bool(task.get('human_request') and not _human_step(task['human_request']))}
+     if schedule:
+-        facts.update(wake_at=schedule['data'].get('wake_at'), awaiting=record(schedule['data'].get('awaiting')))
++        facts.update(wake_at=schedule['data'].get('wake_at'), awaiting=schedule['data'].get('awaiting'))
+     wake_columns = reader.columns('task_wake_checks')
+     if {'task_id', 'cmd'} <= wake_columns:
+         probe = conn.execute('SELECT cmd FROM task_wake_checks WHERE task_id=?', (tid,)).fetchone()
+diff --git a/tests/hermes_cli/test_kanban_actionability_contract.py b/tests/hermes_cli/test_kanban_actionability_contract.py
+index 442b939f072..c95515a7b6a 100644
+--- a/tests/hermes_cli/test_kanban_actionability_contract.py
++++ b/tests/hermes_cli/test_kanban_actionability_contract.py
+@@ -290,6 +290,80 @@ def test_effective_policy_adapts_actual_restriction_cause(cause):
+     conn.close()
+ 
+ 
++@pytest.mark.parametrize('awaiting,known', [
++    ([], False), ({'kind': 'ci'}, False),
++    ({'kind': 'not-a-producer', 'ref': 'r'}, False),
++    ({'kind': 'clock'}, True), ({'kind': 'ci', 'ref': 'run-17'}, True),
++])
++def test_review_schedule_provenance_composition(awaiting, known):
++    conn = complete_fixture()
++    conn.execute("UPDATE tasks SET status='scheduled' WHERE id='root'")
++    event(conn, 'schedule', 'scheduled', {'wake_at': 1000, 'awaiting': awaiting}, 101)
++    row = describe(conn, 'root', now=200)
++    assert row['evidence_state'] == ('known' if known else 'unknown')
++    assert row['action'] == ('wait_for_named_producer' if known else 'repair_lifecycle_contract')
++    assert ('schedule_producer_malformed' in row['violations']) is not known
++    conn.close()
++
++
++@pytest.mark.parametrize('delivery', ['pending', 'unknown', 'confirmed', 'rejected'])
++def test_review_carrier_pending_custody_composition(delivery):
++    conn = held_fixture()
++    conn.execute("UPDATE tasks SET status='running',current_run_id=1 WHERE id='owner'")
++    conn.execute("INSERT INTO task_runs VALUES(1,'run','owner','running',NULL)")
++    conn.execute("INSERT INTO kanban_failure_commands VALUES('owner','run','request','retain',?,NULL)", (delivery,))
++    carrier = describe(conn, 'owner', now=200)
++    row = describe(conn, 'root', now=200)
++    pending = delivery in ('pending', 'unknown')
++    assert row['owner']['kind'] == ('unknown' if pending else 'task')
++    assert row['evidence_state'] == ('unknown' if pending else 'known')
++    assert row['release']['authority'] == 'unavailable'
++    if pending:
++        assert carrier['action'] == 'resolve_release_authority'
++    conn.close()
++
++
++@pytest.mark.parametrize('value,valid', [
++    (None, True), ({}, True), ([], False), ('ci:run', False), (17, False),
++    ({'kind': []}, False), ({'kind': 'other', 'ref': 'r'}, False),
++    ({'kind': 'clock'}, True), ({'kind': 'clock', 'ref': 17}, False),
++    ({'kind': 'ci'}, False), ({'kind': 'ci', 'ref': ''}, False),
++    ({'kind': 'ci', 'ref': ' '}, False), ({'kind': 'ci', 'ref': 'r'}, True),
++    ({'kind': 'card', 'ref': 't'}, True), ({'kind': 'deploy', 'ref': 'd'}, True),
++    ({'kind': 'chat', 'why': 'question'}, True), ({'kind': 'chat', 'ref': 'chat'}, False),
++    ({'kind': 'external', 'ref': 'ticket'}, True),
++    ({'kind': 'external', 'why': 'vendor'}, True),
++    ({'kind': 'external', 'ref': '', 'why': 'vendor'}, True),
++    ({'kind': 'external'}, False), ({'kind': 'external', 'why': []}, False),
++    ({'kind': 'ci', 'ref': 'r', 'gateway': []}, False),
++    ({'kind': 'ci', 'ref': 'r', 'board': []}, False),
++    ({'kind': 'ci', 'ref': 'r', 'why': []}, False),
++    ({'kind': 'ci', 'ref': 'r', 'gateway': None, 'board': 'b'}, True),
++])
++def test_review_awaiting_shape_is_not_coerced(value, valid):
++    from hermes_cli.kanban_actionability import valid_awaiting
++    assert valid_awaiting(value) is valid
++
++
++@pytest.mark.parametrize('probe', [None, 'recorded-probe'])
++def test_review_malformed_producer_cannot_be_hidden_by_probe(probe):
++    row = project({'task': {'id': 'r', 'status': 'scheduled', 'assignee': 'default'},
++                   'wake_at': 1000, 'awaiting': [], 'probe': probe}, now=200)
++    assert row['evidence_state'] == 'unknown'
++    assert row['action'] == 'repair_lifecycle_contract'
++    assert 'schedule_producer_malformed' in row['violations']
++    assert 'Recorded condition probe' not in row['instruction']
++
++
++def test_review_malformed_historical_provenance_marks_source_unknown():
++    conn = held_fixture()
++    event(conn, 'old-bad', 'scheduled', {'awaiting': []}, 99)
++    row = describe(conn, 'root', now=200)
++    assert row['evidence_state'] == 'unknown'
++    assert row['release']['authority'] == 'unavailable'
++    conn.close()
++
++
+ def complete_fixture():
+     """Small complete local read schema: unknown predicates cannot hide each other."""
+     conn = fixture()
+diff --git a/tests/hermes_cli/test_kanban_actionability_report.py b/tests/hermes_cli/test_kanban_actionability_report.py
+index b7e8065beec..1c60b5d2bc8 100644
+--- a/tests/hermes_cli/test_kanban_actionability_report.py
++++ b/tests/hermes_cli/test_kanban_actionability_report.py
+@@ -52,6 +52,45 @@ def test_projection_fault_preserves_terminal_no_open_action(board, monkeypatch,
+         assert row['violations'] == []
+ 
+ 
++@pytest.mark.parametrize('awaiting,known', [
++    ([], False), ({'kind': 'ci'}, False), ({'kind': 'invalid', 'ref': 'r'}, False),
++    ({'kind': 'clock'}, True), ({'kind': 'ci', 'ref': 'run-17'}, True),
++])
++def test_review_report_counts_malformed_schedule_as_unknown(awaiting, known):
++    from tests.hermes_cli.test_kanban_actionability_contract import complete_fixture, event
++    from hermes_cli.kanban_actionability_cli import report
++    conn = complete_fixture()
++    conn.execute("UPDATE tasks SET status='scheduled' WHERE id='root'")
++    event(conn, 'schedule', 'scheduled', {'wake_at': 1000, 'awaiting': awaiting}, 101)
++    conn.commit()
++    before = list(conn.iterdump())
++    result = report(conn, now=200)
++    row = next(r for r in result['rows'] if r['task_id'] == 'root')
++    assert result['unknown_count'] == 1 + (not known)
++    assert row['evidence_state'] == ('known' if known else 'unknown')
++    assert row['action'] == ('wait_for_named_producer' if known else 'repair_lifecycle_contract')
++    assert list(conn.iterdump()) == before
++    conn.close()
++
++
++@pytest.mark.parametrize('delivery', ['pending', 'unknown', 'confirmed', 'rejected'])
++def test_review_report_propagates_carrier_receipt_custody(delivery):
++    from tests.hermes_cli.test_kanban_actionability_contract import held_fixture
++    from hermes_cli.kanban_actionability_cli import report
++    conn = held_fixture()
++    conn.execute("INSERT INTO kanban_failure_commands VALUES('owner','run','request','retain',?,NULL)", (delivery,))
++    conn.commit()
++    before = list(conn.iterdump())
++    result = report(conn, now=200)
++    row = next(r for r in result['rows'] if r['task_id'] == 'root')
++    pending = delivery in ('pending', 'unknown')
++    assert row['owner']['kind'] == ('unknown' if pending else 'task')
++    assert row['evidence_state'] == ('unknown' if pending else 'known')
++    assert row['release']['authority'] == 'unavailable'
++    assert list(conn.iterdump()) == before
++    conn.close()
++
++
+ def start(conn, tid):
+     assert kb.claim_task(conn, tid, claimer='default') is not None
+     return kb.get_task(conn, tid).current_run_id
+-- 
+2.43.0
+

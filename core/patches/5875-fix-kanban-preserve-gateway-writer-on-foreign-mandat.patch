@@ -1,0 +1,330 @@
+From 644df677fcd5b43f43925efb8664d3117681b2e6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 06:12:01 +0000
+Subject: [PATCH] fix(kanban): preserve gateway writer on foreign mandate
+ comments [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban.py                          |   7 +
+ hermes_cli/kanban_foreign_comment.py          |  87 ++++++++
+ .../hermes_cli/test_kanban_foreign_comment.py | 194 ++++++++++++++++++
+ 3 files changed, 288 insertions(+)
+ create mode 100644 hermes_cli/kanban_foreign_comment.py
+ create mode 100644 tests/hermes_cli/test_kanban_foreign_comment.py
+
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index 7d9e4b925a6..3c23308f294 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1053,6 +1053,13 @@ def _cmd_comment(args: argparse.Namespace) -> int:
+         writer_kind, writer_session, _evidence = cli_comment_writer(author=author)
+     with kbc.connect_closing() as conn:
+         try:
++            from hermes_cli.kanban_foreign_comment import append
++            uid = append(conn, args.task_id, author, body, writer_kind=writer_kind,
++                         writer_session=writer_session, origin_gateway=getattr(args, "origin_gateway", None))
++            if uid:
++                print(f"Comment added to {args.task_id} (canonical comment {uid}). "
++                      "Normal sync delivers it to the home and replica; read show after sync for its local ID.")
++                return 0
+             kb.add_comment(conn, args.task_id, author, body,
+                            origin_gateway=getattr(args, "origin_gateway", None),
+                            writer_kind=writer_kind, writer_session=writer_session)
+diff --git a/hermes_cli/kanban_foreign_comment.py b/hermes_cli/kanban_foreign_comment.py
+new file mode 100644
+index 00000000000..2d26623b25f
+--- /dev/null
++++ b/hermes_cli/kanban_foreign_comment.py
+@@ -0,0 +1,87 @@
++"""Append a CLI comment to a replica-only card through the authenticated Board. [daveey]
++
++Never import a foreign task or write its replica. Only the comment and its classified writer event
++are submitted. A lost/partial response is not retried: report both portable IDs for read-only recovery.
++"""
++from __future__ import annotations
++
++import json
++import os
++import time
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as client
++
++
++class CommentUnconfirmed(ValueError):
++    """The caller must reconcile the exact comment IDs, not submit a replacement."""
++
++
++def append(conn, task_id, author, body, *, writer_kind, writer_session, origin_gateway=None):
++    """Return the canonical comment UID, or None for the unchanged ordinary local path."""
++    from hermes_cli import kanban_foreign_card as foreign
++    from hermes_cli.kanban_db_connect import _main_db_file
++    if conn.execute('SELECT 1 FROM tasks WHERE id=?', (task_id,)).fetchone():
++        return None
++    state = sync.sync_state(conn)
++    if not state or sync.board_mode(conn) not in ('primary', 'shadow'):
++        return None
++    with foreign.open_replica(_main_db_file(conn)) as replica:
++        if replica is None or not replica.execute('SELECT 1 FROM tasks WHERE id=?', (task_id,)).fetchone():
++            return None
++    if not body.strip() or not author.strip():
++        raise ValueError('author and comment body are required')
++    hub = client.Hub(client.load_identity())
++    comment_uid, event_uid = sync.uuid7(), sync.uuid7()
++    try:
++        gateway = hub.ident.gateway
++        if origin_gateway is not None and origin_gateway != gateway:
++            raise ValueError('foreign comments cannot override the authenticated writer gateway')
++        proof = hub.row_evidence(state['board_id'], 'tasks', task_id)
++        row = proof.get('row') if proof.get('state') == 'live' else None
++        if not isinstance(row, dict) or row.get('id') != task_id or row.get('deleted_at') is not None:
++            raise ValueError('foreign comment target is not live on the Board')
++        payload = {'author': author, 'len': len(body.strip()), 'comment_uid': comment_uid}
++        if writer_kind:
++            payload['writer_kind'] = writer_kind
++            if writer_session:
++                payload['writer_session'] = writer_session
++        own = os.environ.get('HERMES_KANBAN_TASK') or os.environ.get('HERMES_KANBAN_WORKER_TASK')
++        if own:
++            payload['writer_task'] = own
++        now = int(time.time())
++        fields = [('task_comments', comment_uid, {'task_id': task_id, 'author': author.strip(),
++                   'body': body.strip(), 'created_at': now}),
++                  ('task_events', event_uid, {'task_id': task_id, 'run_uid': None, 'kind': 'commented',
++                   'payload': json.dumps(payload), 'created_at': now})]
++        with kb.write_txn(conn):
++            ops = [{'client_op_id': uid, 'op': 'upsert', 'table': table, 'uid': uid,
++                    'hlc': client._next_hlc(conn, gateway), 'fields': values}
++                   for table, uid, values in fields]
++        recovery = (f'comment {comment_uid}, writer event {event_uid}. Do not retry; reconcile these IDs '
++                    'through Board/replica readback before any replacement.')
++        try:
++            # The preflight GET may leave a reused socket. A fresh POST connection prevents the
++            # generic stale-socket request retry from replaying this non-journaled append.
++            hub.close()
++            reply = hub.ops(state['board_id'], ops)
++            results = reply.get('results') if isinstance(reply, dict) else None
++            if (not isinstance(results, list) or len(results) != 2
++                    or any(not isinstance(r, dict) or r.get('client_op_id') != op['client_op_id']
++                           or r.get('status') != 'applied' for r, op in zip(results, ops))):
++                raise CommentUnconfirmed('Board did not confirm both writes; ' + recovery)
++            for table, uid, values in fields:
++                proof = hub.row_evidence(state['board_id'], table, uid)
++                row = proof.get('row') if isinstance(proof, dict) and proof.get('state') == 'live' else None
++                if (not isinstance(row, dict) or row.get('uid') != uid
++                        or row.get('origin_gateway') != gateway or row.get('deleted_at') is not None
++                        or any(row.get(k) != v for k, v in values.items())):
++                    raise CommentUnconfirmed('Board readback did not match; ' + recovery)
++        except (client.HubError, client.SyncUnavailable, OSError, TimeoutError, json.JSONDecodeError, UnicodeError) as exc:
++            raise CommentUnconfirmed('Delivery outcome unknown; ' + recovery) from exc
++        return comment_uid
++    except (client.HubError, client.SyncUnavailable, OSError, TimeoutError) as exc:
++        raise ValueError('Board unavailable before comment submission; no comment was sent') from exc
++    finally:
++        hub.close()
+diff --git a/tests/hermes_cli/test_kanban_foreign_comment.py b/tests/hermes_cli/test_kanban_foreign_comment.py
+new file mode 100644
+index 00000000000..c42e0308b9d
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_foreign_comment.py
+@@ -0,0 +1,194 @@
++"""Foreign comments retain the requesting gateway's classified writer, not a home relay's."""
++import argparse
++import hashlib
++import json
++from contextlib import nullcontext
++
++import pytest
++
++from hermes_cli import kanban as cli
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_sync_client as client
++from tests.hermes_cli import test_kanban_scope_renewal_shadow as support
++
++foreign = support.foreign
++live = support.live
++
++
++class Board:
++    def __init__(self, task):
++        self.task = task
++        self.ident = support.support.SimpleNamespace(gateway='hub')
++        self.rows = {}
++        self.sent = []
++        self.failure = None
++        self.corrupt = False
++        self.closed = False
++        self.target_damage = None
++        self.result_damage = None
++        self.row_damage = None
++
++    def ops(self, board, ops):
++        assert self.closed  # the preflight connection was dropped before the nonreplayable POST
++        self.sent.extend(ops)
++        if self.failure == 'decode':
++            raise json.JSONDecodeError('truncated response', '', 0)
++        if self.failure == 'null':
++            return None
++        if self.failure == 'null-results':
++            return {'results': None}
++        if self.failure == 'null-entry':
++            return {'results': [None, None]}
++        if self.failure == 'transport':
++            raise client.SyncUnavailable('lost reply')
++        if self.failure == 'reject':
++            return {'results': [{'client_op_id': op['client_op_id'], 'status': 'rejected'} for op in ops]}
++        for op in ops:
++            self.rows[op['table'], op['uid']] = {**op['fields'], 'uid': op['uid'], 'origin_gateway': 'hub', 'deleted_at': None}
++        results = [{'client_op_id': op['client_op_id'], 'status': 'applied'} for op in ops]
++        if self.result_damage == 'missing':
++            results.pop()
++        if self.result_damage == 'identity':
++            results[0]['client_op_id'] = 'other'
++        return {'results': results}
++
++    def row_evidence(self, board, table, uid):
++        if table == 'tasks':
++            row = {'id': self.task, 'created_on': 'worker-home'}
++            if self.target_damage == 'transport':
++                raise client.SyncUnavailable('unavailable')
++            if self.target_damage:
++                row.update(self.target_damage)
++            return {'state': 'live', 'row': row}
++        row = self.rows.get((table, uid))
++        if row and self.row_damage:
++            row = {**row, **self.row_damage}
++        if row and self.corrupt:
++            row = {**row, 'origin_gateway': 'other'}
++        return {'state': 'live', 'row': row}
++
++    def close(self):
++        self.closed = True
++
++
++def invoke(monkeypatch, primary, tid):
++    monkeypatch.setattr(kbc, 'connect_closing', lambda: nullcontext(primary))
++    from hermes_cli import kanban_comment_writer as writer
++    monkeypatch.setattr(writer, 'cli_comment_writer', lambda **kw: support.support.AGENT)
++    return cli._cmd_comment(argparse.Namespace(task_id=tid, text=['New approved mandate'], max_len=None,
++                                              author='default', origin_gateway=None))
++
++
++def setup(monkeypatch, tid):
++    board = Board(tid)
++    monkeypatch.setattr(client, 'Hub', lambda *_: board)
++    return board
++
++
++def test_foreign_cli_comment_records_hub_writer_without_import(foreign, monkeypatch, capsys):
++    primary, _, _, tid, _, _, path, _ = foreign
++    board = setup(monkeypatch, tid)
++    before = hashlib.sha256(path.read_bytes()).hexdigest()
++    assert invoke(monkeypatch, primary, tid) == 0
++    assert 'canonical comment' in capsys.readouterr().out
++    assert not kb.get_task(primary, tid)
++    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
++    comment, event = board.sent
++    assert comment['table'] == 'task_comments' and event['table'] == 'task_events'
++    assert {op['op'] for op in board.sent} == {'upsert'}
++    payload = json.loads(event['fields']['payload'])
++    assert payload['comment_uid'] == comment['uid']
++    assert payload['writer_kind'] == 'agent'
++    assert payload['writer_session'] == support.support.CHAT
++    assert event['fields']['kind'] == 'commented'
++    assert board.closed
++
++
++@pytest.mark.parametrize('damage', [{'id': 'another'}, {'deleted_at': 1}, 'transport'])
++def test_foreign_target_must_be_canonical_and_live(foreign, monkeypatch, capsys, damage):
++    primary, _, _, tid, _, _, _, _ = foreign
++    board = setup(monkeypatch, tid)
++    board.target_damage = damage
++    assert invoke(monkeypatch, primary, tid) == 2
++    assert not board.sent
++    assert 'Comment added' not in capsys.readouterr().out
++    assert board.closed
++
++
++@pytest.mark.parametrize('damage', ['missing', 'identity', {'uid': 'other'}, {'task_id': 'other'},
++                                    {'body': 'changed'}, {'deleted_at': 1}])
++def test_foreign_comment_requires_exact_ack_and_readback(foreign, monkeypatch, capsys, damage):
++    primary, _, _, tid, _, _, _, _ = foreign
++    board = setup(monkeypatch, tid)
++    if isinstance(damage, str):
++        board.result_damage = damage
++    else:
++        board.row_damage = damage
++    assert invoke(monkeypatch, primary, tid) == 2
++    assert 'Do not retry' in capsys.readouterr().err
++    assert len(board.sent) == 2
++
++
++@pytest.mark.parametrize('kind,session,task', [('human', None, None), ('agent', 'different', None),
++                                             ('agent', 'worker-session', 't_worker')])
++def test_foreign_comments_preserve_nonowner_identity(foreign, monkeypatch, kind, session, task):
++    primary, _, _, tid, _, _, _, _ = foreign
++    board = setup(monkeypatch, tid)
++    from hermes_cli import kanban_foreign_comment as fc
++    if task:
++        monkeypatch.setenv('HERMES_KANBAN_WORKER_TASK', task)
++    assert fc.append(primary, tid, 'default', 'note', writer_kind=kind, writer_session=session)
++    payload = json.loads(board.sent[1]['fields']['payload'])
++    assert payload.get('writer_kind') == kind
++    assert payload.get('writer_session') == session
++    assert payload.get('writer_task') == task
++
++
++def test_foreign_comment_rejects_origin_override(foreign, monkeypatch):
++    primary, _, _, tid, _, _, _, _ = foreign
++    board = setup(monkeypatch, tid)
++    from hermes_cli import kanban_foreign_comment as fc
++    with pytest.raises(ValueError, match='cannot override'):
++        fc.append(primary, tid, 'default', 'note', writer_kind='agent', writer_session='s', origin_gateway='other')
++    assert not board.sent
++
++
++def test_new_hub_mandate_survives_sync_and_foreign_renewal(foreign, monkeypatch, capsys):
++    primary, home, renewal_hub, tid, episode, _, _, snapshot = foreign
++    board = setup(monkeypatch, tid)
++    assert invoke(monkeypatch, primary, tid) == 0
++    capsys.readouterr()
++    changes = []
++    for (table, _), row in board.rows.items():
++        remote = {**row, 'version': 1, 'updated_at': row['created_at'] * 1000,
++                  'hlc': f"{row['created_at'] * 1000:013d}-0000-hub"}
++        changes.append(client._row_change(table, remote))
++    from hermes_cli import kanban_db_sync as sync
++    sync.apply_remote_changes(home, changes, new_cursor=sync.sync_state(home)['cursor'], board='default')
++    snapshot()
++    comment_uid = board.sent[0]['uid']
++    cid = home.execute('SELECT id FROM task_comments WHERE uid=?', (comment_uid,)).fetchone()[0]
++    monkeypatch.setattr(client, 'Hub', lambda *_: renewal_hub)
++    assert support.invoke(monkeypatch, primary, tid, episode, cid) == 0
++    assert renewal_hub.sent[-1]['mandate_comment_uid'] == comment_uid
++    assert renewal_hub.sent[-1]['payload']['actor_session'] == support.support.CHAT
++    assert not kb.get_task(primary, tid)
++    assert kb.get_task(home, tid).status == 'triage'
++
++
++@pytest.mark.parametrize('failure', ['reject', 'transport', 'readback', 'decode', 'null', 'null-results', 'null-entry'])
++def test_foreign_comment_never_claims_success_on_uncertain_or_rejected_delivery(foreign, monkeypatch, capsys, failure):
++    primary, _, _, tid, _, _, path, _ = foreign
++    board = setup(monkeypatch, tid)
++    board.failure = failure
++    board.corrupt = failure == 'readback'
++    before = hashlib.sha256(path.read_bytes()).hexdigest()
++    assert invoke(monkeypatch, primary, tid) == 2
++    output = capsys.readouterr()
++    assert 'Comment added' not in output.out
++    assert 'Do not retry' in output.err
++    assert len(board.sent) == 2  # one submission, no replay or home relay
++    assert not kb.get_task(primary, tid)
++    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
++    assert board.closed
+-- 
+2.43.0
+

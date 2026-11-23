@@ -1,0 +1,213 @@
+From fa3f671a5b558411d476ee2965c0693b8664e32d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 07:26:27 +0000
+Subject: [PATCH] [daveey] isolate actionability source uncertainty and carrier
+ boundaries
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ .../test_kanban_actionability_contract.py     | 187 ++++++++++++++++++
+ 1 file changed, 187 insertions(+)
+
+diff --git a/tests/hermes_cli/test_kanban_actionability_contract.py b/tests/hermes_cli/test_kanban_actionability_contract.py
+index 0e606e15021..81fabfddaf6 100644
+--- a/tests/hermes_cli/test_kanban_actionability_contract.py
++++ b/tests/hermes_cli/test_kanban_actionability_contract.py
+@@ -254,6 +254,193 @@ def test_report_streams_multiple_batches_with_exact_pagination():
+     conn.close()
+ 
+ 
++@pytest.mark.parametrize('status', ['triage', 'done', 'archived'])
++@pytest.mark.parametrize('replica', [False, True])
++def test_fields_replica_changes_only_open_known_evidence(monkeypatch, status, replica):
++    from types import SimpleNamespace
++    from hermes_cli import kanban_actionability_sources as sources
++    from hermes_cli.kanban_actionability_evidence import fields
++    task = SimpleNamespace(id='r', status=status, assignee='default')
++    monkeypatch.setattr(sources, 'describe', lambda *a, **k: project({
++        'task': {'id': 'r', 'status': status, 'assignee': 'default'}, 'deadline_at': 500}, now=100))
++    row = fields(None, task, replica=replica)['actionability']
++    assert row['evidence_state'] == ('unknown' if replica and status == 'triage' else 'known')
++
++
++@pytest.mark.parametrize('violations,text', [([], 'none observed'), (['one', 'two'], 'one,two')])
++def test_render_preserves_exact_diagnostic_list_and_bound(violations, text):
++    from hermes_cli.kanban_actionability_evidence import render
++    row = project({'task': {'id': 'r', 'status': 'done'}}, now=100)
++    row['violations'] = violations
++    assert render(row).endswith('violations=' + text)
++    row['instruction'] = 'x' * 3000
++    assert len(render(row)) == 1800
++
++
++@pytest.mark.parametrize('cause', ['scope_stopped', 'safety_refusal'])
++def test_effective_policy_adapts_actual_restriction_cause(cause):
++    from hermes_cli.kanban_actionability_sources import Reader
++    from hermes_cli.kanban_actionability_evidence import effective
++    conn = complete_fixture()
++    event(conn, 's', 'spend_budget_triaged', {'cause': cause}, 100)
++    stop, restricted, unknown = effective(Reader(conn), 'root')
++    assert restricted is True and unknown is False
++    assert stop is not None
++    assert stop['data']['cause'] == cause
++    conn.close()
++
++
++def complete_fixture():
++    """Small complete local read schema: unknown predicates cannot hide each other."""
++    conn = fixture()
++    conn.executescript('ALTER TABLE tasks ADD COLUMN current_run_id INTEGER;'
++        'ALTER TABLE tasks ADD COLUMN containment_episode TEXT;'
++        'ALTER TABLE tasks ADD COLUMN human_request TEXT;'
++        'ALTER TABLE task_events ADD COLUMN run_id INTEGER;'
++        'ALTER TABLE task_events ADD COLUMN deleted_at INTEGER;'
++        'CREATE TABLE task_runs(id INTEGER,uid TEXT,task_id TEXT,status TEXT,ended_at INTEGER);'
++        'CREATE TABLE task_wake_checks(task_id TEXT,cmd TEXT);'
++        'CREATE TABLE kanban_failure_commands(task_id TEXT,run_uid TEXT,request_uid TEXT,'
++        'operation_kind TEXT,delivery_state TEXT,canonical_receipt_json TEXT);')
++    return conn
++
++
++def held_fixture():
++    conn = complete_fixture()
++    event(conn, 'stop', 'spend_budget_triaged', {'cause': 'scope_stopped'}, 100)
++    event(conn, 'receipt', 'decision_retained', {'episode_uid': 'stop', 'next_action': {
++        'owner': {'kind': 'task', 'task_id': 'owner'}, 'instruction': 'Original instruction',
++        'escalate_at': 500}}, 101)
++    row = describe(conn, 'root', now=200)
++    assert row['evidence_state'] == 'known', row
++    assert row['owner'] == {'kind': 'task', 'refs': ['owner']}
++    assert row['escalation']['at'] == 500
++    return conn
++
++
++@pytest.mark.parametrize('damage', ['missing_links', 'missing_runs', 'missing_wake', 'missing_commands',
++    'partial_sync', 'active_sync', 'bad_episode', 'bad_cause', 'bad_next_action', 'bad_producer',
++    'missing_uid', 'invalid_human'])
++def test_each_source_uncertainty_independently_changes_known_baseline(damage):
++    conn = held_fixture()
++    if damage.startswith('missing_') and damage != 'missing_uid':
++        table = {'missing_links': 'task_links', 'missing_runs': 'task_runs',
++                 'missing_wake': 'task_wake_checks', 'missing_commands': 'kanban_failure_commands'}[damage]
++        conn.execute('DROP TABLE ' + table)
++    elif damage == 'partial_sync':
++        conn.execute('CREATE TABLE kanban_sync_state(board_id TEXT)')
++    elif damage == 'active_sync':
++        conn.executescript("CREATE TABLE kanban_sync_state(mode TEXT); INSERT INTO kanban_sync_state VALUES('primary');")
++    elif damage == 'missing_uid':
++        conn.executescript("CREATE TABLE kanban_sync_state(mode TEXT); INSERT INTO kanban_sync_state VALUES('primary');")
++        conn.execute('UPDATE task_events SET uid=NULL')
++    elif damage == 'invalid_human':
++        conn.execute("UPDATE tasks SET human_request='{}' WHERE id='root'")
++    else:
++        field = {'bad_episode': 'episode', 'bad_cause': 'cause', 'bad_next_action': 'next_action',
++                 'bad_producer': 'producer'}[damage]
++        event(conn, 'damaged', 'created', {field: []}, 102)
++    assert describe(conn, 'root', now=200)['evidence_state'] == 'unknown'
++    conn.close()
++
++
++@pytest.mark.parametrize('raw', [None, ''])
++def test_empty_event_payload_is_valid_not_malformed(raw):
++    from hermes_cli.kanban_actionability_sources import Reader
++    conn = complete_fixture()
++    event(conn, 'created', 'created', {}, 100)
++    conn.execute('UPDATE task_events SET payload=?', (raw,))
++    reader = Reader(conn)
++    assert reader.events('root')[0]['data'] == {}
++    assert reader.malformed == set()
++    conn.close()
++
++
++def test_event_reader_uses_uid_tiebreak_and_excludes_deleted_rows():
++    from hermes_cli.kanban_actionability_sources import Reader
++    conn = complete_fixture()
++    for uid in ('z', 'a', 'deleted'):
++        event(conn, uid, 'created', {}, 100)
++    conn.execute("UPDATE task_events SET deleted_at=1 WHERE uid='deleted'")
++    assert [e['uid'] for e in Reader(conn).events('root')] == ['z', 'a']
++    conn.close()
++
++
++@pytest.mark.parametrize('mode,synced', [(None, False), ('off', False), ('primary', True)])
++def test_sync_reader_distinguishes_empty_off_and_active(mode, synced):
++    from hermes_cli.kanban_actionability_sources import Reader
++    conn = complete_fixture()
++    conn.execute('CREATE TABLE kanban_sync_state(mode TEXT)')
++    if mode is not None:
++        conn.execute('INSERT INTO kanban_sync_state VALUES(?)', (mode,))
++    reader = Reader(conn)
++    assert reader.synced is synced
++    assert reader.partial is False
++    conn.close()
++
++
++def test_same_episode_deadlines_minimum_and_latest_contract_survive_producer_notice():
++    conn = held_fixture()
++    event(conn, 'later', 'decision_retained', {'episode': 'stop', 'next_action': {
++        'owner': {'kind': 'task', 'refs': ['owner']}, 'instruction': 'Newest contract',
++        'escalation': {'at': 800}}}, 102)
++    event(conn, 'foreign', 'decision_retained', {'episode': 'foreign', 'next_action': {
++        'instruction': 'Wrong episode', 'escalate_at': 50}}, 103)
++    event(conn, 'notice', 'spend_budget_decision_ready', {'episode': 'stop',
++        'producer': {'kind': 'task', 'task_id': 'owner'}}, 104)
++    row = describe(conn, 'root', now=200)
++    assert row['instruction'] == 'Newest contract'
++    assert row['escalation']['at'] == 500
++    assert row['owner'] == {'kind': 'task', 'refs': ['owner']}
++    assert row['first_observed'] == 100
++    conn.close()
++
++
++@pytest.mark.parametrize('route,kind,refs', [
++    ({'kind': 'task', 'refs': ['owner']}, 'task', ['owner']),
++    ({'kind': 'chat'}, 'chat', []), ({'kind': 'chats'}, 'chat', []),
++    ({'kind': 'task', 'refs': 'owner'}, 'unavailable', []),
++    ({'kind': 'task', 'refs': [17]}, 'unavailable', []),
++    ({'task_id': 'missing'}, 'unavailable', ['missing']),
++    ({'kind': 'task', 'refs': []}, 'unavailable', []),
++])
++def test_route_owner_exact_fallback_and_invalid_identity(route, kind, refs):
++    from hermes_cli.kanban_actionability_sources import Reader, _route_owner
++    conn = complete_fixture()
++    assert _route_owner(Reader(conn), route) == {'kind': kind, 'refs': refs}
++    conn.close()
++
++
++@pytest.mark.parametrize('damage,kind', [('done', 'unavailable'), ('archived', 'unavailable'),
++    ('contained', 'unavailable'), ('scope', 'unavailable'), ('malformed', 'unknown'), ('synced', 'unknown')])
++def test_carrier_availability_is_only_administrative(damage, kind):
++    from hermes_cli.kanban_actionability_sources import Reader, _route_owner
++    conn = complete_fixture()
++    if damage in ('done', 'archived'):
++        conn.execute("UPDATE tasks SET status=? WHERE id='owner'", (damage,))
++    elif damage == 'contained':
++        conn.execute("UPDATE tasks SET containment_episode='held' WHERE id='owner'")
++    elif damage == 'synced':
++        conn.executescript("CREATE TABLE kanban_sync_state(mode TEXT); INSERT INTO kanban_sync_state VALUES('primary');")
++    else:
++        conn.execute("INSERT INTO task_events(uid,task_id,kind,payload,created_at) VALUES('s','owner','spend_budget_triaged',?,100)",
++                     ('[]' if damage == 'malformed' else '{"cause":"scope_stopped"}',))
++    assert _route_owner(Reader(conn), {'task_id': 'owner'}) == {'kind': kind, 'refs': ['owner']}
++    conn.close()
++
++
++@pytest.mark.parametrize('status,ended,exists', [('running', None, True), ('failed', None, True),
++                                              ('running', 100, True), ('running', None, False)])
++def test_current_run_evidence_requires_matching_live_row(status, ended, exists):
++    conn = complete_fixture()
++    conn.execute("UPDATE tasks SET status='running',current_run_id=1 WHERE id='root'")
++    if exists:
++        conn.execute("INSERT INTO task_runs VALUES(1,'r','root',?,?)", (status, ended))
++    row = describe(conn, 'root', now=200)
++    assert ('running_without_current_run' in row['violations']) is not (exists and status == 'running' and ended is None)
++    conn.close()
++
++
+ def fixture():
+     conn = sqlite3.connect(':memory:')
+     conn.row_factory = sqlite3.Row
+-- 
+2.43.0
+

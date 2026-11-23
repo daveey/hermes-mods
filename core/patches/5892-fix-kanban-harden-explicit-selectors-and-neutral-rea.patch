@@ -1,0 +1,2066 @@
+From c52f6a39d0ee029db86379c929f54242148e3562 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 07:25:22 +0000
+Subject: [PATCH] fix(kanban): harden explicit selectors and neutral readers
+ [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ agent/kanban_delegation_policy.py             |   3 +-
+ agent/model_routing.py                        |   5 +
+ agent/standing_instructions.py                |  37 +-
+ hermes_cli/kanban_db_context.py               |  17 +-
+ hermes_cli/kanban_model_neutral.py            |  59 +++
+ hermes_cli/kanban_model_tier.py               |   4 +
+ hermes_cli/kanban_provider_walls.py           |   4 +-
+ plugins/kanban/dashboard/plugin_api.py        |  41 +-
+ tests/extraction142_evidence_plugin.py        |  17 +
+ tests/test_kanban_extraction141_rest.py       | 414 ++++++++++++++++++
+ tests/test_kanban_extraction141_review.py     | 203 +++++++++
+ tests/test_kanban_extraction141_selectors.py  |  82 ++++
+ tests/test_kanban_extraction141_spawn_hook.py |  43 ++
+ tests/test_kanban_subset130_readers.py        | 266 +++++++++++
+ tests/test_kanban_subset130_standing.py       | 284 ++++++++++++
+ tests/tools/test_kanban_review_entry148.py    | 283 ++++++++++++
+ tools/kanban_tools.py                         |  30 +-
+ tools/kanban_tools_model_neutral.py           |  22 +
+ 18 files changed, 1765 insertions(+), 49 deletions(-)
+ create mode 100644 tests/extraction142_evidence_plugin.py
+ create mode 100644 tests/test_kanban_extraction141_rest.py
+ create mode 100644 tests/test_kanban_extraction141_review.py
+ create mode 100644 tests/test_kanban_extraction141_selectors.py
+ create mode 100644 tests/test_kanban_extraction141_spawn_hook.py
+ create mode 100644 tests/test_kanban_subset130_readers.py
+ create mode 100644 tests/test_kanban_subset130_standing.py
+ create mode 100644 tests/tools/test_kanban_review_entry148.py
+
+diff --git a/agent/kanban_delegation_policy.py b/agent/kanban_delegation_policy.py
+index 6638bbb172c..f079089840c 100644
+--- a/agent/kanban_delegation_policy.py
++++ b/agent/kanban_delegation_policy.py
+@@ -123,7 +123,8 @@ def parent_class(parent: Any) -> str:
+ 
+ 
+ def is_class(model: Any) -> bool:
+-    return isinstance(model, str) and model.startswith("class:") and model[len("class:"):] in CLASSES
++    from agent.model_routing import exact_class_selector
++    return exact_class_selector(model)
+ 
+ 
+ def _blank(value: Any) -> bool:
+diff --git a/agent/model_routing.py b/agent/model_routing.py
+index 0b52d2943f4..7f0e2b17b7c 100644
+--- a/agent/model_routing.py
++++ b/agent/model_routing.py
+@@ -25,6 +25,11 @@ def is_class_selector(model):
+     return isinstance(model, str) and model.startswith("class:")
+ 
+ 
++def exact_class_selector(model):
++    """Policy membership only; callers own normalization, never this predicate."""
++    return isinstance(model, str) and model in ('class:fast', 'class:standard', 'class:deep')
++
++
+ def _validate_route(route):
+     if not isinstance(route, dict):
+         raise ModelRoutingError("Route must be an exact provider/model/billing/weight/capabilities mapping")
+diff --git a/agent/standing_instructions.py b/agent/standing_instructions.py
+index 919e252e72f..2953c343918 100644
+--- a/agent/standing_instructions.py
++++ b/agent/standing_instructions.py
+@@ -14,7 +14,7 @@ share them so all three agree on what is standing.
+ from __future__ import annotations
+ 
+ import re
+-from typing import Iterable
++from typing import Callable, Iterable
+ 
+ STANDING_HEADING = "## Standing instructions (still in force)"
+ _MAX_LINES = 20
+@@ -85,6 +85,41 @@ def dedupe(lines: Iterable[str], limit: int = _MAX_LINES) -> list[str]:
+     return out[-limit:]
+ 
+ 
++def restricted_explicit_lines(text: str, keep: Callable[[str, str], bool]) -> list[tuple[str, str]]:
++    """Opt-in direct promotion: ``(raw_line, words)`` whose every representation ``keep`` accepts.
++
++    Unlike :func:`explicit_lines`, each ``str.splitlines()`` physical line is matched separately, so no
++    candidate crosses LF/CRLF/CR/VT/FF/FS/GS/RS/NEL/U+2028/U+2029. ``keep(raw_line, candidate)`` sees
++    the untruncated words, the collapsed words, the 400-character words and the rendered ``standing:``
++    line; one refusal discards the candidate before any dedupe/limit. Source text is never altered.
++    """
++    if not isinstance(text, str) or "standing:" not in text.lower():
++        return []
++    out: list[tuple[str, str]] = []
++    for raw in text.splitlines():
++        m = _STANDING_LINE.match(raw)
++        if not m:
++            continue
++        words = m.group("words")
++        collapsed = " ".join(words.split())
++        final = collapsed[:_MAX_CHARS]
++        if all(keep(raw, candidate) for candidate in (words, collapsed, final, f"standing: {final}")):
++            out.append((raw, final))
++    return out
++
++
++def dedupe_candidates(pairs: Iterable[tuple[str, str]], limit: int = _MAX_LINES) -> list[tuple[str, str]]:
++    """:func:`dedupe` over already-accepted ``(raw_line, words)``; keys never change emitted words."""
++    seen: set[str] = set()
++    out: list[tuple[str, str]] = []
++    for raw, words in pairs:
++        key = words.casefold().strip(" .")
++        if words and key not in seen:
++            seen.add(key)
++            out.append((raw, words))
++    return out[-limit:]
++
++
+ def says_dont_wait(lines: Iterable[str]) -> list[str]:
+     """The standing lines that forbid waiting/blocking on the user."""
+     return [line for line in lines if DONT_WAIT.search(line)]
+diff --git a/hermes_cli/kanban_db_context.py b/hermes_cli/kanban_db_context.py
+index 0ba2e83da7b..06c6289c8d6 100644
+--- a/hermes_cli/kanban_db_context.py
++++ b/hermes_cli/kanban_db_context.py
+@@ -29,16 +29,17 @@ _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
+ 
+ 
+ def _ctx_standing(lines: list[str], task: Task, comments: list) -> None:
+-    """Preserve explicit standing instructions even when comment history is capped."""
+-    from agent import standing_instructions as si
+-    found = si.explicit_lines(task.body or "")
+-    for c in comments:
+-        found += si.explicit_lines(c.body or "")
+-    found = si.dedupe(found)
+-    if not found:
++    """Preserve explicit standing instructions even when comment history is capped.
++
++    Direct promotion path: every candidate representation and the final formatted line must pass the
++    unchanged model-neutral recognizer. The raw body/comments still render below."""
++    from hermes_cli.kanban_model_neutral import standing_allowed, standing_candidates
++    found = standing_candidates(task.body or "", *(c.body or "" for c in comments))
++    rendered = [f"standing: {words}" for raw, words in found if standing_allowed(raw, f"standing: {words}")]
++    if not rendered:
+         return
+     lines.append("## Standing instructions (from the user; in force for this card)")
+-    lines += [f"standing: {line}" for line in found]
++    lines += rendered
+     lines.append("(These still govern this run: e.g. a standing \"don't wait\" means decide it yourself instead "
+                  "of blocking on the user, unless only a human can act — a credential, a physical step.)")
+     lines.append("")
+diff --git a/hermes_cli/kanban_model_neutral.py b/hermes_cli/kanban_model_neutral.py
+index 3243c348317..b2f10ad577c 100644
+--- a/hermes_cli/kanban_model_neutral.py
++++ b/hermes_cli/kanban_model_neutral.py
+@@ -91,6 +91,65 @@ def validate_selector(model=None, provider=None, *, mandatory=False):
+     return model, ('auto' if model else None)
+ 
+ 
++def validate_explicit_selector(model=None, provider=None, *, mandatory=False):
++    """Opt-in exact membership for local update and review request boundaries."""
++    from agent.model_routing import exact_class_selector
++    model, provider = validate_selector(model, provider, mandatory=mandatory)
++    if model and not exact_class_selector(model):
++        raise ValueError(ERROR)
++    return model, provider
++
++
++MANDATORY_FLAGS = ('pin_mandatory', 'model_pin_mandatory', 'require_model')
++
++
++def validate_update_flags(payload):
++    """Opt-in for local REST update/bulk only: null/false/integer zero are inert; anything else refuses.
++
++    Raises ordinary ``ValueError(ERROR)``; no typed wire protocol. Not used by create/DB/selfwork admission.
++    """
++    metadata = getattr(payload, 'metadata', None) or {}
++    values = [getattr(payload, key, None) for key in MANDATORY_FLAGS]
++    if isinstance(metadata, dict):
++        values += [metadata.get(key) for key in ('pin_mandatory', 'require_model')]
++    if not all(value is None or value is False or (type(value) is int and value == 0) for value in values):
++        raise ValueError(ERROR)
++
++
++def standing_allowed(*values):
++    """Direct standing promotion check: the UNCHANGED recognizer accepts every value."""
++    try:
++        validate_text(*values)
++    except ValueError:
++        return False
++    return True
++
++
++def standing_candidates(*texts):
++    """S1/S2 only: deduped (raw_line, words) accepted at every stage before dedupe/limit.
++
++    Raw body/comment bytes are untouched and remain visible elsewhere; the compactor and
++    the default helpers keep their own extraction.
++    """
++    from agent import standing_instructions as si
++    found = []
++    for text in texts:
++        found += si.restricted_explicit_lines(text, standing_allowed)
++    return si.dedupe_candidates(found)
++
++
++def standing_wait_words(texts, render, limit=3):
++    """S2: first ``limit`` don't-wait words whose quoted form and actual message ``render(words)`` pass."""
++    from agent import standing_instructions as si
++    chosen = []
++    for raw, words in standing_candidates(*texts):
++        if len(chosen) == limit:
++            break
++        if si.says_dont_wait([words]) and standing_allowed(raw, words, f'"{words}"', render([*chosen, words])):
++            chosen.append(words)
++    return chosen
++
++
+ def validate_text(*values):
+     """Reject positive machine directives and explicit named-model obligations.
+ 
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 41ce2018362..a834672e841 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -491,6 +491,10 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+         _lose_pace_offer(getattr(task, "id", ""), f"route resolution failed: {type(exc).__name__}")
+         logger.warning("kanban model tier: resolve failed for %s (%s)", getattr(task, "id", "?"), exc,
+                        exc_info=True)
++        # The run never inherits a raw legacy pin: in memory only, the stored row stays author evidence.
++        from hermes_cli.kanban_model_neutral import effective_selector
++        task.model_override, task.provider_override = effective_selector(task)
++        task.model_pin_mandatory = None
+         return "error"
+     if reason == "pinned" and not _str(getattr(task, "provider_override", None)):
+         # A row pinned before pin-time binding (concrete model, NULL provider) used to take its provider from
+diff --git a/hermes_cli/kanban_provider_walls.py b/hermes_cli/kanban_provider_walls.py
+index a224b76e9c9..30f7fd00a80 100644
+--- a/hermes_cli/kanban_provider_walls.py
++++ b/hermes_cli/kanban_provider_walls.py
+@@ -125,9 +125,7 @@ def record_wall_for_run(conn: sqlite3.Connection, task_id: str, run_id: Optional
+             "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'model_tier' "
+             "AND (run_id IS ? OR run_id IS NULL) ORDER BY id DESC LIMIT 1", (task_id, run_id)):
+             provider = _norm((json.loads(row[0] or "{}")).get("provider"))
+-        if not provider:
+-            row = conn.execute("SELECT provider_override FROM tasks WHERE id = ?", (task_id,)).fetchone()
+-            provider = _norm(row[0]) if row else ""
++        # Never the raw stored provider_override: a legacy row is author evidence, not the route this run used.
+     except Exception as exc:
+         logger.debug("kanban walls: provider lookup failed for %s (%s)", task_id, exc)
+     provider = provider or profile_provider()
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 8e9ed1b9152..6d9c4e5c53a 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -628,6 +628,10 @@ class UpdateTaskBody(BaseModel):
+     clear_model_override: bool = False
+     reasoning_effort: Optional[str] = None
+     clear_reasoning_effort: bool = False
++    # Validated, never applied: a mandatory pin is refused (see validate_update_flags).
++    pin_mandatory: Optional[Any] = None
++    model_pin_mandatory: Optional[Any] = None
++    require_model: Optional[Any] = None
+ 
+ 
+ class BulkTaskBody(BaseModel):
+@@ -656,6 +660,9 @@ class BulkTaskBody(BaseModel):
+     clear_model_override: bool = False
+     reasoning_effort: Optional[str] = None
+     clear_reasoning_effort: bool = False
++    pin_mandatory: Optional[Any] = None
++    model_pin_mandatory: Optional[Any] = None
++    require_model: Optional[Any] = None
+ 
+ 
+ class _StatusRejected(Exception):
+@@ -665,16 +672,22 @@ class _StatusRejected(Exception):
+ def _validate_request_entry(payload) -> None:
+     """Reject ignored or mixed evidence writes before any assignment/status mutation."""
+     from hermes_cli.kanban_human_request import validate_human_request
+-    from hermes_cli.kanban_model_neutral import validate_selector, validate_text, validate_review
++    from hermes_cli.kanban_model_neutral import (
++        MANDATORY_FLAGS, validate_explicit_selector, validate_text, validate_review, validate_update_flags)
+ 
+     with _value_error_400():
+-        validate_selector(getattr(payload, "model_override", None), getattr(payload, "provider_override", None))
++        validate_update_flags(payload)  # opt-in strict top-level and metadata pins, whatever the target status
++        validate_explicit_selector(getattr(payload, "model_override", None),
++                                   getattr(payload, "provider_override", None))
+         validate_text(getattr(payload, "title", None), getattr(payload, "body", None))
+         if getattr(payload, "status", None) == "review":
+-            validate_review(getattr(payload, "metadata", None) or {})
++            metadata = getattr(payload, "metadata", None) or {}
++            validate_explicit_selector(metadata.get("review_model"), metadata.get("review_provider"),
++                                       mandatory=metadata.get("pin_mandatory") or metadata.get("require_model"))
++            validate_review(metadata)
+         validate_human_request(payload.human_request, kind=payload.block_kind)
+         if payload.metadata_only:
+-            allowed = {"ids", "human_request", "metadata_only", "block_reason"}
++            allowed = {"ids", "human_request", "metadata_only", "block_reason", *MANDATORY_FLAGS}  # inert here
+             if payload.model_fields_set - allowed:
+                 raise ValueError("metadata-only classification cannot accompany other changes")
+             if "human_request" not in payload.model_fields_set or not (payload.block_reason or "").strip():
+@@ -1422,23 +1435,9 @@ def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), b
+ 
+ @router.get("/model-options")
+ def model_options():
+-    """Providers + curated models for the override dropdown via ``inventory.build_models_payload``
+-    (same substrate as the Models page) so it can't offer a pair Hermes rejects. Skips pricing
+-    and custom-provider probes: a slow/offline local endpoint must not hang the drawer."""
+-    try:
+-        from hermes_cli.inventory import build_models_payload, load_picker_context
+-
+-        payload = build_models_payload(
+-            load_picker_context(), explicit_only=True, canonical_order=True, probe_custom_providers=False)
+-        return {
+-            "providers": [
+-                {"slug": row.get("slug", ""), "label": row.get("label") or row.get("slug", ""),
+-                 "models": list(row.get("models") or [])}
+-                for row in payload.get("providers", [])
+-                if row.get("models")]}
+-    except Exception:
+-        log.exception("kanban model-options failed")
+-        return {"providers": []}  # empty catalog → the UI falls back to a free-text input
++    """Class-only choices in the existing dropdown shape; empty selection clears."""
++    classes = ('class:fast', 'class:standard', 'class:deep')
++    return {"providers": [{"slug": "auto", "label": "Auto (routing class)", "models": list(classes)}]}
+ 
+ 
+ # --- Boards CRUD (multi-project support) --------------------------------------
+diff --git a/tests/extraction142_evidence_plugin.py b/tests/extraction142_evidence_plugin.py
+new file mode 100644
+index 00000000000..1c557218cbd
+--- /dev/null
++++ b/tests/extraction142_evidence_plugin.py
+@@ -0,0 +1,17 @@
++"""Collection evidence only; explicitly loaded by the entry142 canonical runner."""
++import json
++from pathlib import Path
++
++
++def pytest_addoption(parser):
++    parser.addoption('--entry142-prefix', default=None)
++
++
++def pytest_collection_finish(session):
++    prefix = session.config.getoption('--entry142-prefix')
++    if prefix:
++        nodes = [item.nodeid for item in session.items]
++        name = Path(session.config.args[0]).name
++        path = Path(prefix + '-' + name + '.nodes.json')
++        with path.open('x') as stream:
++            json.dump(nodes, stream, indent=2)
+diff --git a/tests/test_kanban_extraction141_rest.py b/tests/test_kanban_extraction141_rest.py
+new file mode 100644
+index 00000000000..91ba3ee9343
+--- /dev/null
++++ b/tests/test_kanban_extraction141_rest.py
+@@ -0,0 +1,414 @@
++"""E3 local PATCH/bulk only. REST create remains unchanged and unprotected by the new flags."""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++from pathlib import Path
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++FLAGS = ("pin_mandatory", "model_pin_mandatory", "require_model")
++REFUSED_VALUES = (True, 1, 2, "true", "false", "no", "0", "", [], {}, 0.0, 1.0)
++ACCEPTED_VALUES = (None, False, 0)
++EXACT_CLASSES = ("class:fast", "class:standard", "class:deep")
++
++OTHER_BOARD = "unconventional-collab"
++B1_TITLE = ("Stage B1: run the frozen X/T tuning + confirmation matrix and external-anchor rescoring "
++            "on rented GPUs")
++DUP_TITLE = "Stage B: GPU calibration, bounded comparison campaign and verified report"
++DUP_BODY = ("Owner explicitly approved: 'approve stage b'. Execute frozen Stage B for "
++            "example/project-placeholder. Checked this turn: current PLAN.md read via gh.")
++QUOTED_BODY = 'Historical run instruction (superseded and not active): "require_model: true"'
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    h = tmp_path / ".hermes"
++    h.mkdir()
++    route = {"model": "claude-opus-5-5", "provider": "anthropic", "weight": 1,
++             "billing": "subscription", "eligible": True, "funding_verified": True,
++             "capabilities": {"tools": True, "streaming": True}}
++    (h / "config.yaml").write_text(json.dumps({"model_routing": {
++        "enabled": True, "routes": {level: [route] for level in ("fast", "standard", "deep")}}}))
++    monkeypatch.setenv("HERMES_HOME", str(h))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for var in ("HERMES_SESSION_ID", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(var, raising=False)
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_capability_registry as reg
++    monkeypatch.setattr(reg, "self_gateway", lambda: "hub")
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    return h
++
++
++@pytest.fixture
++def client(home):
++    from plugins.kanban.dashboard.plugin_api import router
++    app = FastAPI()
++    app.include_router(router)
++    with TestClient(app) as c:
++        yield c
++
++
++# --- isolated-board helpers ----------------------------------------------------------------------
++
++def _other_board_card() -> str:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_boards as kbb
++    from hermes_cli import kanban_db_connect as kbc
++    kbb.create_board(OTHER_BOARD)
++    with kbc.connect_closing(board=OTHER_BOARD) as conn:
++        return kb.create_task(conn, title=B1_TITLE, body="Stage B / B1 of 3 on rented GPUs.",
++                              assignee="default", session_id="20000101_000000_f6baf9")
++
++
++def _local_task(**kw) -> str:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing() as conn:
++        return kb.create_task(conn, title=kw.pop("title", "plain card"), assignee=kw.pop("assignee", "worker"), **kw)
++
++
++_TABLES = ("tasks", "task_events", "task_comments", "task_links", "task_attachments", "task_runs")
++
++
++def _snapshot() -> dict:
++    """Every relevant row on both isolated boards plus the overlap log."""
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_overlap
++    boards = [None] + ([OTHER_BOARD] if kb.board_exists(OTHER_BOARD) else [])
++    snap: dict = {}
++    for board in boards:
++        with kbc.connect_closing(board=board) as conn:
++            conn.row_factory = sqlite3.Row
++            for table in _TABLES:
++                rows = conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
++                snap[(board, table)] = [tuple(r) for r in rows]
++    path = kanban_overlap.log_path()
++    snap["overlap_log"] = path.read_text() if path.exists() else ""
++    return snap
++
++
++def _task_row(tid: str) -> dict:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing() as conn:
++        t = kb.get_task(conn, tid)
++        return {"status": t.status, "assignee": t.assignee, "model_override": t.model_override,
++                "provider_override": t.provider_override, "model_pin_mandatory": t.model_pin_mandatory,
++                "title": t.title, "body": t.body, "priority": t.priority}
++
++
++def _overlap_events(task_id: str) -> list:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing(board=OTHER_BOARD) as conn:
++        return [e.payload for e in kb.list_events(conn, task_id) if e.kind == "create_overlap"]
++
++
++def _record_create_kwargs(monkeypatch) -> list:
++    from hermes_cli import kanban_db as kb
++    real, seen = kb.create_task, []
++
++    def spy(conn, **kwargs):
++        seen.append(dict(kwargs))
++        return real(conn, **kwargs)
++    monkeypatch.setattr(kb, "create_task", spy)
++    return seen
++
++
++def _record_board_conn(monkeypatch) -> list:
++    """Recording spy delegating to the real connection: a refusal that wrongly opens the board is
++    reported by an ordinary assertion in the test body, never a BaseException inside the ASGI portal."""
++    from plugins.kanban.dashboard import plugin_api as api
++    real, opened = api._board_conn, []
++
++    def spy(*args, **kwargs):
++        opened.append((args, kwargs))
++        return real(*args, **kwargs)
++    monkeypatch.setattr(api, "_board_conn", spy)
++    return opened
++
++
++# --- REST create: BASELINE NO-CHANGE CONTROLS ONLY -------------------------------------------------
++# E3 deliberately leaves REST create unchanged. These assert base behaviour is retained; they are NOT
++# evidence that REST create is protected by the new flags or the exact-class predicate.
++
++def test_create_baseline_overlap_still_refused_and_recorded(client):  # baseline control
++    b1 = _other_board_card()
++    r = client.post("/tasks", json={"title": DUP_TITLE, "body": DUP_BODY, "assignee": "default"})
++    assert r.status_code == 409, r.text
++    assert len(_overlap_events(b1)) == 1
++
++
++def test_create_baseline_idempotency_unchanged(client):  # baseline control
++    body = {"title": "idem card", "assignee": "worker", "idempotency_key": "entry142-idem"}
++    first, second = client.post("/tasks", json=body), client.post("/tasks", json=body)
++    assert first.status_code == 200 and second.status_code == 200, (first.text, second.text)
++    assert first.json()["task"]["id"] == second.json()["task"]["id"]
++
++
++def test_create_baseline_ignores_flags_and_prefix_class(client, monkeypatch):  # baseline, NOT compliance
++    seen = _record_create_kwargs(monkeypatch)
++    r = client.post("/tasks", json={"title": "baseline card", "assignee": "worker",
++                                    "model_override": "class:bogus", **{flag: True for flag in FLAGS}})
++    assert r.status_code == 200, r.text
++    [kwargs] = seen
++    assert not set(FLAGS) & set(kwargs), kwargs
++    row = _task_row(r.json()["task"]["id"])
++    assert (row["model_override"], row["model_pin_mandatory"]) == ("class:bogus", None)
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++# --- C4 PATCH --------------------------------------------------------------------------------------
++
++STATUS_BRANCHES = (None, "todo", "ready", "triage", "blocked", "scheduled", "review", "done", "archived", "running")
++
++
++@pytest.mark.parametrize("status", STATUS_BRANCHES)
++@pytest.mark.parametrize("flag", FLAGS)
++def test_patch_top_level_flag_refused_without_mutation(client, status, flag):
++    tid = _local_task()
++    before = _snapshot()
++    body = {flag: True, "priority": 7, "assignee": "other"}
++    if status:
++        body["status"] = status
++    r = client.patch(f"/tasks/{tid}", json=body)
++    assert r.status_code == 400, r.text
++    assert "model-neutral" in r.text
++    assert _snapshot() == before
++
++
++@pytest.mark.parametrize("status", STATUS_BRANCHES)
++@pytest.mark.parametrize("key,value", [("pin_mandatory", True), ("require_model", "yes"),
++                                       ("pin_mandatory", "false"), ("require_model", 1)])
++def test_patch_metadata_flag_refused_for_every_status(client, status, key, value):
++    tid = _local_task()
++    before = _snapshot()
++    body = {"metadata": {key: value}, "summary": "s", "priority": 3}
++    if status:
++        body["status"] = status
++    r = client.patch(f"/tasks/{tid}", json=body)
++    assert r.status_code == 400, r.text
++    assert "model-neutral" in r.text
++    assert _snapshot() == before
++
++
++def test_patch_metadata_falsy_flags_accepted_on_done(client):
++    tid = _local_task()
++    r = client.patch(f"/tasks/{tid}", json={"status": "done", "summary": "finished",
++                                            "metadata": {"pin_mandatory": False, "require_model": 0}})
++    assert r.status_code == 200, r.text
++    assert _task_row(tid)["status"] == "done"
++
++
++@pytest.mark.parametrize("value", ACCEPTED_VALUES, ids=repr)
++def test_patch_falsy_top_level_flags_accepted(client, value):
++    tid = _local_task()
++    r = client.patch(f"/tasks/{tid}", json={"priority": 5, **{flag: value for flag in FLAGS}})
++    assert r.status_code == 200, r.text
++    assert _task_row(tid)["priority"] == 5
++
++
++def test_patch_review_model_metadata_validated_only_on_review(client):  # baseline control
++    tid = _local_task()
++    before = _snapshot()
++    r = client.patch(f"/tasks/{tid}", json={"status": "review", "summary": "s",
++                                            "metadata": {"review_model": "claude-opus-5-5"}})
++    assert r.status_code == 400, r.text
++    assert _snapshot() == before
++    # Non-review metadata is completion evidence, not a newly active review route.
++    r = client.patch(f"/tasks/{tid}", json={"status": "done", "summary": "s",
++                                            "metadata": {"review_model": "claude-opus-5-5",
++                                                         "review_provider": "anthropic"}})
++    assert r.status_code == 200, r.text
++    assert _task_row(tid)["status"] == "done"
++
++
++@pytest.mark.parametrize("model", EXACT_CLASSES)
++def test_patch_review_exact_class_metadata_accepted(client, model):  # positive control
++    tid = _local_task()
++    r = client.patch(f"/tasks/{tid}", json={"status": "review", "summary": "s",
++                                            "metadata": {"review_model": model, "review_provider": "auto"}})
++    assert r.status_code == 200, r.text
++    assert _task_row(tid)["status"] == "review"
++
++
++@pytest.mark.parametrize("bulk", [False, True], ids=["patch", "bulk"])
++def test_non_review_unknown_class_review_model_stays_inert(client, bulk):
++    """E3: review_model is only policy on status=review; elsewhere it is inert completion evidence."""
++    tid = _local_task()
++    body = {"status": "done", "summary": "s", "metadata": {"review_model": "class:bogus"}}
++    r = (client.post("/tasks/bulk", json={"ids": [tid], **body}) if bulk
++         else client.patch(f"/tasks/{tid}", json=body))
++    assert r.status_code == 200, r.text
++    assert _task_row(tid)["status"] == "done"
++
++
++def test_patch_legacy_whole_body_refusal_and_quoted_accept(client):  # baseline control
++    tid = _local_task()
++    before = _snapshot()
++    r = client.patch(f"/tasks/{tid}", json={"body": "do it\nrequire_model: true"})
++    assert r.status_code == 400, r.text
++    assert _snapshot() == before
++    r = client.patch(f"/tasks/{tid}", json={"body": QUOTED_BODY})
++    assert r.status_code == 200, r.text
++    assert _task_row(tid)["body"] == QUOTED_BODY
++
++
++def test_metadata_only_classification_ignores_falsy_flags(client):
++    """Retained metadata_only rule: an inert false flag is not an 'other change'."""
++    tid = _local_task()
++    plain = client.patch(f"/tasks/{tid}", json={"metadata_only": True, "status": "done"})
++    flagged = client.patch(f"/tasks/{tid}", json={"metadata_only": True, "pin_mandatory": False})
++    assert plain.status_code == 400 and "cannot accompany" in plain.text
++    assert flagged.status_code == 400 and "requires human_request" in flagged.text, flagged.text
++
++
++# --- C4 bulk ---------------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("patch", [
++    {"pin_mandatory": True}, {"model_pin_mandatory": "no"}, {"require_model": 1},
++    {"metadata": {"pin_mandatory": True}, "status": "done"},
++    {"metadata": {"require_model": "true"}, "status": "todo"},
++    {"model_override": "claude-opus-5-5"},
++], ids=["pin", "model_pin", "require", "meta-pin-done", "meta-require-todo", "concrete"])
++def test_bulk_invalid_shared_patch_touches_no_id(client, patch):
++    ids = [_local_task(title="a"), _local_task(title="b")]
++    before = _snapshot()
++    r = client.post("/tasks/bulk", json={"ids": ids + ["t_missing"], "priority": 9, "status": "todo", **patch})
++    assert r.status_code == 400, r.text
++    assert "results" not in r.text
++    assert _snapshot() == before
++
++
++def test_bulk_valid_partial_outcomes_preserved(client):  # baseline control (+ falsy flags accepted)
++    a = _local_task(title="a")
++    r = client.post("/tasks/bulk", json={"ids": [a, "t_missing"], "priority": 4,
++                                         "pin_mandatory": False, "require_model": None,
++                                         "model_pin_mandatory": 0,
++                                         "model_override": "class:fast", "provider_override": "auto"})
++    assert r.status_code == 200, r.text
++    results = {e["id"]: e for e in r.json()["results"]}
++    assert results[a]["ok"] is True
++    assert results["t_missing"] == {"id": "t_missing", "ok": False, "error": "not found"}
++    row = _task_row(a)
++    assert (row["priority"], row["model_override"], row["provider_override"]) == (4, "class:fast", "auto")
++
++
++# --- C7 model options ------------------------------------------------------------------------------
++
++def test_model_options_is_auto_group_of_exact_classes(client, monkeypatch):
++    from hermes_cli import inventory
++
++    def boom(*a, **k):  # concrete catalog must not be consulted or offered
++        raise AssertionError("concrete catalog consulted")
++    monkeypatch.setattr(inventory, "build_models_payload", boom, raising=False)
++    r = client.get("/model-options")
++    assert r.status_code == 200, r.text
++    data = r.json()
++    assert list(data) == ["providers"]
++    [group] = data["providers"]
++    assert set(group) == {"slug", "label", "models"}
++    assert group["slug"] == "auto" and group["label"]
++    assert group["models"] == list(EXACT_CLASSES)
++
++
++def test_every_model_option_pair_patches_and_empty_clears(client):
++    tid = _local_task()
++    [group] = client.get("/model-options").json()["providers"]
++    for model in group["models"]:
++        # Exactly what the bundled control sends for a picked pair (dist/index.js onPick).
++        r = client.patch(f"/tasks/{tid}", json={"provider_override": group["slug"], "model_override": model})
++        assert r.status_code == 200, (model, r.text)
++        row = _task_row(tid)
++        assert (row["model_override"], row["provider_override"]) == (model, "auto")
++    r = client.patch(f"/tasks/{tid}", json={"clear_model_override": True})  # the control's empty option
++    assert r.status_code == 200, r.text
++    row = _task_row(tid)
++    assert (row["model_override"], row["provider_override"]) == (None, None)
++    for model in group["models"]:
++        r = client.post("/tasks/bulk", json={"ids": [tid], "provider_override": "auto", "model_override": model})
++        assert r.status_code == 200 and r.json()["results"][0]["ok"], r.text
++
++
++@pytest.mark.parametrize('bulk', [False, True], ids=['patch', 'bulk'])
++@pytest.mark.parametrize('flag', FLAGS)
++@pytest.mark.parametrize('value', REFUSED_VALUES, ids=repr)
++def test_strict_flags_refuse_before_connection(client, monkeypatch, bulk, flag, value):
++    from plugins.kanban.dashboard import plugin_api as api
++    tid = _local_task()
++    before = _snapshot()
++    opened = _record_board_conn(monkeypatch)
++    body = {flag: value, 'priority': 7, 'assignee': 'other'}
++    response = (client.post('/tasks/bulk', json={'ids': [tid], **body}) if bulk
++                else client.patch(f'/tasks/{tid}', json=body))
++    assert response.status_code == 400, response.text
++    assert 'model-neutral' in response.text
++    assert opened == [], 'refused request opened board'
++    assert _snapshot() == before
++
++
++@pytest.mark.parametrize('bulk', [False, True], ids=['patch', 'bulk'])
++@pytest.mark.parametrize('metadata', [False, True], ids=['top-level', 'review'])
++def test_unknown_class_refuses_before_connection(client, monkeypatch, bulk, metadata):
++    from plugins.kanban.dashboard import plugin_api as api
++    tid = _local_task()
++    before = _snapshot()
++    opened = _record_board_conn(monkeypatch)
++    body = ({'status': 'review', 'metadata': {'review_model': 'class:bogus'}} if metadata
++            else {'model_override': 'class:bogus'})
++    body.update(priority=7, assignee='other', summary='s')
++    response = (client.post('/tasks/bulk', json={'ids': [tid], **body}) if bulk
++                else client.patch(f'/tasks/{tid}', json=body))
++    assert response.status_code == 400, response.text
++    assert 'model-neutral' in response.text
++    assert opened == [], 'refused request opened board'
++    assert _snapshot() == before
++
++
++@pytest.mark.parametrize('flag', ['pin_mandatory', 'require_model'])
++@pytest.mark.parametrize('value', (*ACCEPTED_VALUES, *REFUSED_VALUES), ids=repr)
++@pytest.mark.parametrize('bulk', [False, True], ids=['patch', 'bulk'])
++def test_metadata_flags_have_strict_rest_contract(client, monkeypatch, flag, value, bulk):
++    from plugins.kanban.dashboard import plugin_api as api
++    tid = _local_task()
++    before = _snapshot()
++    accepted = value is None or value is False or type(value) is int and value == 0
++    opened = _record_board_conn(monkeypatch)
++    body = {'metadata': {flag: value}, 'priority': 7}
++    response = (client.post('/tasks/bulk', json={'ids': [tid], **body}) if bulk
++                else client.patch(f'/tasks/{tid}', json=body))
++    assert response.status_code == (200 if accepted else 400), response.text
++    if not accepted:
++        assert opened == [], 'refused request opened board'
++        assert _snapshot() == before
++
++
++@pytest.mark.parametrize('bulk', [False, True], ids=['patch', 'bulk'])
++def test_absent_and_falsy_flags_not_stored(client, bulk):
++    tid = _local_task()
++    for extra in ({}, *({key: value for key in FLAGS} for value in ACCEPTED_VALUES)):
++        body = {'priority': 6, **extra}
++        response = (client.post('/tasks/bulk', json={'ids': [tid], **body}) if bulk
++                    else client.patch(f'/tasks/{tid}', json=body))
++        assert response.status_code == 200, response.text
++        assert _task_row(tid)['model_pin_mandatory'] is None
+diff --git a/tests/test_kanban_extraction141_review.py b/tests/test_kanban_extraction141_review.py
+new file mode 100644
+index 00000000000..743fb8f69b2
+--- /dev/null
++++ b/tests/test_kanban_extraction141_review.py
+@@ -0,0 +1,203 @@
++"""E4/T3: opt-in review-metadata guard on the real registered ``kanban_request_review`` tool.
++
++Scope is exactly the local request-review tool boundary, driven through ``registry.dispatch``. Transport
++callers are NOT exercised here. The MCP stdio server (agent/transports/hermes_tools_mcp_server.py) and the
++agent tool loop dispatch via ``model_tools.handle_function_call`` to this registry entry. acp_adapter/tools.py
++only renders tool events and hermes_cli/plugins_dispatch.py only runs plugin hooks: neither is a
++request-review dispatcher. ACP sessions and plugin-hook tool loops reach the handler only through the agent
++tool loop. Their transport proof, and any successful MCP handoff, remain unproven here.
++The tool keeps base truthiness for metadata pin_mandatory/require_model (N1); REST's strict rule is separate.
++No courier/selfwork result shape is introduced: a refusal is the ordinary ``tool_error`` body.
++"""
++from __future__ import annotations
++
++import json
++import sqlite3
++
++import pytest
++
++from tests.tools import test_kanban_tools as worker_fixtures
++
++worker_env = worker_fixtures.worker_env
++
++_TABLES = ("tasks", "task_events", "task_comments", "task_links", "task_attachments", "task_runs")
++
++REFUSED = [
++    {"review_model": "class:bogus"},
++    {"review_model": "class:"},
++    {"review_model": "class: deep"},
++    {"review_model": "Class:deep"},
++    {"review_model": "gpt-5"},
++    {"review_model": "class:fast", "review_provider": "anthropic"},
++    {"review_provider": "auto"},
++    {"require_model": True},
++    {"pin_mandatory": "false"},   # truthy under the tool's base truthiness rule (N1)
++    {"pin_mandatory": 1},
++    {"review_model": "class:deep", "require_model": "yes"},
++]
++REFUSED_IDS = ["bogus", "empty-suffix", "padded", "capital", "concrete", "concrete-provider", "provider-only",
++               "require-true", "pin-str-false", "pin-1", "class-plus-require"]
++# Falsy under base truthiness: accepted by the tool (REST alone applies the strict None/False/int0 rule).
++TRUTHINESS_ACCEPTED = [{"pin_mandatory": ""}, {"pin_mandatory": 0}, {"pin_mandatory": 0.0},
++                       {"require_model": []}, {"require_model": False}, {"pin_mandatory": None}]
++VALID = [None, {}, {"review_model": "class:fast"}, {"review_model": "class:standard", "review_provider": "auto"},
++         {"review_model": "class:deep", "review_provider": "auto"}]
++
++
++def _snapshot() -> dict:
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing() as conn:
++        conn.row_factory = sqlite3.Row
++        return {t: [tuple(r) for r in conn.execute(f"SELECT * FROM {t} ORDER BY rowid").fetchall()]
++                for t in _TABLES}
++
++
++def _status(tid: str) -> str:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing() as conn:
++        return kb.get_task(conn, tid).status
++
++
++def _dispatch(args: dict):
++    """The real registered handler via ``registry.dispatch``; no transport (agent loop, MCP, ACP) is exercised."""
++    import tools.kanban_tools  # registers the kanban toolset
++    from tools.registry import registry
++    out = registry.dispatch("kanban_request_review", args)
++    return json.loads(out) if isinstance(out, str) else out
++
++
++@pytest.fixture
++def effects(monkeypatch):
++    """Recording spies (delegating, never raising) on every pre-DB effect the guard must precede."""
++    from tools import kanban_tools as kt
++    from tools import kanban_tools_completion as ktc
++    from tools import kanban_tools_source as kts
++    seen: list[str] = []
++
++    def spy(owner, name):
++        real = getattr(owner, name)
++
++        def wrapper(*a, **kw):
++            seen.append(name)
++            return real(*a, **kw)
++        monkeypatch.setattr(owner, name, wrapper)
++
++    for owner, name in ((kt, "_worker_guard"), (kt, "_redact_metadata"), (kt, "_goal_gate"),
++                        (kt, "judge_goal"), (ktc, "park_unachievable"),
++                        (kts, "register_for_ending"), (kts, "stage_completion")):
++        if hasattr(owner, name):
++            spy(owner, name)
++    return seen
++
++
++def _error_keys() -> set:
++    from tools.registry import tool_error
++    return set(json.loads(tool_error("x")))
++
++
++@pytest.mark.parametrize("metadata", REFUSED, ids=REFUSED_IDS)
++def test_refused_before_any_effect(worker_env, effects, metadata):
++    before = _snapshot()
++    result = _dispatch({"summary": "Implemented and verified", "metadata": metadata,
++                        "artifacts": ["/fixture/report.txt"]})
++    assert "model-neutral" in result.get("error", ""), result
++    assert set(result) == _error_keys(), result  # ordinary tool_error, no courier/typed wire shape
++    assert effects == [], effects  # before worker guard, redaction, goal gate/judge/park, source, artifacts
++    assert _status(worker_env) == "running"
++    assert _snapshot() == before
++
++
++def test_refusal_precedes_missing_summary(worker_env, effects):  # N2 ordering
++    before = _snapshot()
++    result = _dispatch({"metadata": {"review_model": "class:bogus"}})
++    assert "model-neutral" in result.get("error", ""), result
++    assert effects == []
++    assert _snapshot() == before
++
++
++def test_missing_summary_without_bad_metadata_keeps_base_refusal(worker_env):  # baseline control
++    result = _dispatch({"metadata": {"review_model": "class:fast"}})
++    assert "summary is required" in result.get("error", ""), result
++    assert _status(worker_env) == "running"
++
++
++@pytest.mark.parametrize("metadata", ["class:bogus", ["review_model"], 7], ids=["str", "list", "int"])
++def test_non_dict_metadata_keeps_base_refusal(worker_env, metadata):  # baseline control
++    before = _snapshot()
++    result = _dispatch({"summary": "s", "metadata": metadata})
++    assert result.get("error", "").startswith("metadata must be an object/dict"), result
++    assert _snapshot() == before
++
++
++def _review_event(tid: str):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing() as conn:
++        events = [e for e in kb.list_events(conn, tid) if e.kind == "review_requested"]
++        return events, kb.get_task(conn, tid)
++
++
++@pytest.mark.parametrize("metadata", VALID, ids=["omitted", "empty", "fast", "standard-auto", "deep-auto"])
++def test_valid_classes_reach_ordinary_handoff(worker_env, effects, metadata, monkeypatch):
++    import os
++    run_id = int(os.environ["HERMES_KANBAN_RUN_ID"])
++    args = {"summary": "Implemented and verified"}
++    if metadata is not None:
++        args["metadata"] = metadata
++    result = _dispatch(args)
++    assert result.get("ok") is True, result
++    assert _status(worker_env) == "review"
++    assert {"_worker_guard", "_goal_gate", "register_for_ending", "stage_completion"} <= set(effects)
++    events, task = _review_event(worker_env)
++    assert len(events) == 1 and events[0].run_id == run_id  # independent run attribution retained
++    assert task.assignee == "test-worker"
++
++
++@pytest.mark.parametrize("metadata", TRUTHINESS_ACCEPTED, ids=repr)
++def test_tool_keeps_base_truthiness_for_mandatory_flags(worker_env, metadata):  # N1 pinned
++    result = _dispatch({"summary": "Implemented and verified", "metadata": metadata})
++    assert result.get("ok") is True, result
++    assert _status(worker_env) == "review"
++
++
++def test_invalid_replay_on_review_card_refused_before_effects(worker_env, effects):
++    assert _dispatch({"summary": "first handoff", "metadata": {"review_model": "class:fast"}}).get("ok") is True
++    effects.clear()
++    before = _snapshot()
++    result = _dispatch({"summary": "replay", "metadata": {"review_model": "class:bogus"}})
++    assert "model-neutral" in result.get("error", ""), result
++    assert effects == []
++    assert _snapshot() == before and _status(worker_env) == "review"
++
++
++def test_invalid_metadata_on_done_card_refused_before_effects(worker_env, effects):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing() as conn:
++        assert kb.complete_task(conn, worker_env, summary="done", force=True)
++    effects.clear()
++    before = _snapshot()
++    result = _dispatch({"summary": "late", "metadata": {"review_model": "gpt-5"}})
++    assert "model-neutral" in result.get("error", ""), result
++    assert effects == []
++    assert _snapshot() == before and _status(worker_env) == "done"
++
++
++def test_valid_replay_on_review_card_keeps_base_refusal(worker_env):  # baseline control
++    assert _dispatch({"summary": "first handoff"}).get("ok") is True
++    result = _dispatch({"summary": "replay", "metadata": {"review_model": "class:deep"}})
++    assert "error" in result and "model-neutral" not in result["error"], result
++    assert _status(worker_env) == "review"
++    events, _ = _review_event(worker_env)
++    assert len(events) == 1
++
++
++def test_registry_entry_is_the_guarded_handler():
++    """All registry callers resolve this one entry; the guard is inside the outer _kanban_handler."""
++    from tools import kanban_tools as kt
++    from tools.registry import registry
++    entry = registry.get_entry("kanban_request_review")
++    assert entry is not None and entry.handler is kt._handle_request_review
++    inner = kt._handle_request_review.__wrapped__  # functools.wraps chain: _kanban_handler -> guard
++    assert inner.__code__.co_qualname.startswith("model_neutral_review"), inner.__code__.co_qualname
+diff --git a/tests/test_kanban_extraction141_selectors.py b/tests/test_kanban_extraction141_selectors.py
+new file mode 100644
+index 00000000000..97e91c709b5
+--- /dev/null
++++ b/tests/test_kanban_extraction141_selectors.py
+@@ -0,0 +1,82 @@
++"""E1/E2 opt-in exact selectors; shared ingress intentionally retains baseline."""
++import json
++
++import pytest
++
++from agent import model_routing as routing
++from agent import kanban_delegation_policy as delegation
++from hermes_cli import kanban_model_neutral as neutral
++
++CLASSES = ('class:fast', 'class:standard', 'class:deep')
++INVALID = ('class:', 'class:bogus', 'class: deep', 'Class:deep', ' class:deep', 'class:deep ', '', None, 0, [], {})
++
++
++@pytest.mark.parametrize('value', (*CLASSES, *INVALID), ids=repr)
++def test_exact_selector_and_delegate_agree(value):
++    predicate = getattr(routing, 'exact_class_selector', None)
++    assert callable(predicate), 'missing exact class predicate'
++    expected = isinstance(value, str) and value in CLASSES
++    assert predicate(value) is expected
++    assert delegation.is_class(value) is expected
++
++
++def test_exact_set_equals_allocator_classes():
++    assert set(CLASSES) == {f'class:{c}' for c in routing.CLASSES}
++
++
++def test_delegation_uses_shared_predicate(monkeypatch):
++    predicate = getattr(routing, 'exact_class_selector', None)
++    assert callable(predicate), 'missing exact class predicate'
++    seen = []
++    def spy(value):
++        seen.append(value)
++        return predicate(value)
++    # Support either module-qualified or locally imported delegation.
++    monkeypatch.setattr(routing, 'exact_class_selector', spy)
++    if hasattr(delegation, 'exact_class_selector'):
++        monkeypatch.setattr(delegation, 'exact_class_selector', spy)
++    assert delegation.is_class('class:deep')
++    assert seen == ['class:deep']
++
++
++@pytest.mark.parametrize('value', ('class:', 'class:bogus', 'class: deep'))
++def test_generic_prefix_and_shared_validator_remain_baseline(value):
++    assert routing.is_class_selector(value)
++    assert neutral.validate_selector(value) == (value, 'auto')
++
++
++@pytest.mark.parametrize('value', CLASSES)
++def test_explicit_card_normalization(value):
++    validator = getattr(neutral, 'validate_explicit_selector', None)
++    assert callable(validator), 'missing opt-in validator'
++    assert validator('  ' + value + '\n', ' auto ') == (value, 'auto')
++    assert validator(' ', None) == (None, None)
++
++
++@pytest.mark.parametrize('model,provider,mandatory', [
++    ('class:', None, False), ('class:bogus', None, False), ('class: deep', None, False),
++    ('Class:deep', None, False), ('concrete', None, False), ([], None, False),
++    ('class:deep', 'anthropic', False), (None, 'auto', False),
++    ('class:deep', None, True), ('class:deep', None, 'false'),
++])
++def test_explicit_selector_refusal(model, provider, mandatory):
++    validator = getattr(neutral, 'validate_explicit_selector', None)
++    assert callable(validator), 'missing opt-in validator'
++    with pytest.raises(ValueError, match='model-neutral') as err:
++        validator(model, provider, mandatory=mandatory)
++    assert type(err.value) is ValueError
++
++
++def test_create_wrapper_unknown_class_is_baseline_not_compliance():
++    from tools.kanban_tools_model_neutral import model_neutral_create
++    seen = []
++    @model_neutral_create
++    def handler(args):
++        seen.append(args)
++        return 'baseline handler reached'
++    args = {'model': 'class:bogus'}
++    assert handler(args) == 'baseline handler reached'
++    assert seen == [args]
++    result = json.loads(handler({'model': 'concrete'}))
++    assert 'model-neutral' in result['error']
++    assert 'code' not in result
+diff --git a/tests/test_kanban_extraction141_spawn_hook.py b/tests/test_kanban_extraction141_spawn_hook.py
+new file mode 100644
+index 00000000000..efdbd69fbc1
+--- /dev/null
++++ b/tests/test_kanban_extraction141_spawn_hook.py
+@@ -0,0 +1,43 @@
++"""E5/N3: the generic tier-fault branch's in-memory task is what spawn AND the worker-spawned hook observe.
++
++Recording-fixture evidence only (dispatch_once with spawn_fn); not live canonical dispatcher proof.
++The stored row stays author evidence; the review fault branch is covered by the copied readers suite.
++"""
++from __future__ import annotations
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.test_kanban_subset130_readers import RAW_MODEL, RAW_PROVIDER, _fault, _legacy, _row, _spawn_once
++from tests.test_kanban_subset130_readers import board as board  # noqa: PLC0414 -- fixture re-export
++from tests.test_kanban_subset130_readers import wallfile as wallfile  # noqa: PLC0414 -- fixture re-export
++
++
++def _record_hook(monkeypatch) -> dict:
++    seen: dict = {}
++
++    def hook(conn, task, workspace_path, pid, *, board=None):
++        seen[task.id] = (task.model_override, task.provider_override, getattr(task, "model_pin_mandatory", None))
++    monkeypatch.setattr(kb, "_fire_worker_spawned_hook", hook)
++    return seen
++
++
++def test_fault_hook_sees_effective_selector_and_cleared_mandatory(board, wallfile, monkeypatch):
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="legacy", assignee="default")
++    _legacy(conn, tid, mandatory=1)
++    _fault(monkeypatch)
++    hooked = _record_hook(monkeypatch)
++    spawned = _spawn_once(conn)
++    assert spawned[tid] == hooked[tid] == ("class:standard", "auto", None)
++    assert _row(conn, tid) == (RAW_MODEL, RAW_PROVIDER, 1)  # stored author evidence untouched
++
++
++def test_fault_hook_on_neutral_card_matches_spawn(board, wallfile, monkeypatch):
++    """N3: neutral (no-override) cards also become class:standard/auto in memory on the fault branch."""
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="neutral", assignee="default")
++    _fault(monkeypatch)
++    hooked = _record_hook(monkeypatch)
++    spawned = _spawn_once(conn)
++    assert spawned[tid] == hooked[tid] == ("class:standard", "auto", None)
++    assert _row(conn, tid) == (None, None, None)
+diff --git a/tests/test_kanban_subset130_readers.py b/tests/test_kanban_subset130_readers.py
+new file mode 100644
+index 00000000000..f43546dcde8
+--- /dev/null
++++ b/tests/test_kanban_subset130_readers.py
+@@ -0,0 +1,266 @@
++"""C5 consequential readers: real disposable dispatch regressions adapted from the probe120 scenarios.
++
++Every board is the isolated tmp board of the ``board`` fixture. "Seeded" marks state written raw into the temp
++DB because ingress now refuses it (a FOREIGN legacy executor copy, which the retirement sweep skips). The
++route-resolution fault is injected: no natural trigger is known, so a live worker/natural fault stays unproven.
++"""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_model_tier as tier
++from hermes_cli import kanban_provider_walls as walls
++from tests.hermes_cli.test_kanban_model_tier import _review_source, _write_cfg
++from tests.hermes_cli.test_kanban_model_tier import board as board  # noqa: PLC0414 -- self-alias suppresses F811 for the fixture parameter
++
++RAW_MODEL, RAW_PROVIDER = "claude-opus-5-5", "anthropic"   # the only provider the fixture's class routes use
++QUOTA_LOG = "quota exhausted (429); retry after 7200s"
++
++
++def _legacy(conn, tid, model=RAW_MODEL, provider=RAW_PROVIDER, mandatory=None):
++    """Seeded legacy pin on a FOREIGN executor copy (home = other gateway): the retirement sweep skips it."""
++    from hermes_cli import kanban_sync_client as client
++    client.ensure_identity(conn, "default", "owner")
++    conn.execute("UPDATE tasks SET created_on=? WHERE id=?", ("other-gateway", tid))
++    conn.execute("UPDATE tasks SET model_override=?, provider_override=?, model_pin_mandatory=? WHERE id=?",
++                 (model, provider, mandatory, tid))
++    conn.commit()
++
++
++def _row(conn, tid):
++    return tuple(conn.execute("SELECT model_override, provider_override, model_pin_mandatory FROM tasks WHERE id=?",
++                              (tid,)).fetchone())
++
++
++def _events(conn, tid, kind):
++    return [e.payload for e in kb.list_events(conn, tid) if e.kind == kind]
++
++
++def _spawn_once(conn):
++    seen = {}
++    kbd.dispatch_once(conn, dry_run=False, spawn_fn=lambda task, ws: seen.__setitem__(
++        task.id, (task.model_override, task.provider_override, getattr(task, "model_pin_mandatory", None))))
++    return seen
++
++
++def _fault(monkeypatch):
++    def boom(*_a, **_k):
++        raise RuntimeError("subset130 injected route-resolution fault")
++    monkeypatch.setattr(tier, "resolve_dispatch_tier", boom)
++
++
++def _log(board):
++    path = board / "t.log"
++    path.write_text(QUOTA_LOG)
++    return path
++
++
++def _sibling_routes(conn):
++    from hermes_cli.kanban_class_walls import class_wall_routes
++    sib = kb.get_task(conn, kb.create_task(conn, title="neutral sibling", assignee="default"))
++    return class_wall_routes(sib, "class:standard", now=time.time())
++
++
++def _rate_limited(conn, tid, run_id, **fields):
++    """Seeded reaper classification of a rate-limited exit; ``fields`` adds the attempt's own quota receipt."""
++    if fields:
++        task = kb.get_task(conn, tid)
++        kb._append_event(conn, tid, "worker_result", {"pid": 71001, "claim_lock": task.claim_lock,
++                                                      "exit_code": kb.KANBAN_RATE_LIMIT_EXIT_CODE, **fields},
++                         run_id=run_id)
++    conn.execute("UPDATE task_runs SET outcome='rate_limited', status='rate_limited', ended_at=? WHERE id=?",
++                 (int(time.time()), run_id))
++    conn.commit()
++
++
++@pytest.fixture
++def wallfile(board, monkeypatch):
++    _write_cfg(board, sync={"enabled": True})
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    p = board / "kanban" / "provider_walls.json"
++    monkeypatch.setattr(walls, "walls_path", lambda: p)
++    monkeypatch.setattr(walls, "profile_provider", lambda: "")
++    return p
++
++
++# --- provider walls: raw stored provider_override fallback removed (P1/P5/P7) --------------------------------
++
++
++def test_no_receipt_wall_never_reads_raw_stored_provider(board, wallfile):
++    """P1+P7: no run receipt and no profile provider: nothing is walled and a neutral sibling keeps its route."""
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="x", assignee="default")
++    _legacy(conn, tid)
++    assert walls.record_wall_for_run(conn, tid, None, _log(board)) is None
++    assert walls.active_walls(path=wallfile) == {}
++    routes, known = _sibling_routes(conn)
++    assert [r["provider"] for r in routes] == [RAW_PROVIDER] and known == {}
++    assert _row(conn, tid) == (RAW_MODEL, RAW_PROVIDER, None)   # stored author evidence untouched
++
++
++def test_no_receipt_wall_falls_back_to_profile_provider(board, wallfile, monkeypatch):
++    """Profile fallback order kept: it may name a provider the run never used (no universal correct-wall claim)."""
++    monkeypatch.setattr(walls, "profile_provider", lambda: "xai")
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="x", assignee="default")
++    _legacy(conn, tid)
++    assert walls.record_wall_for_run(conn, tid, None, _log(board)) is not None
++    assert set(walls.active_walls(path=wallfile)) == {"xai"}
++
++
++def test_model_tier_receipt_still_precedes_profile(board, wallfile, monkeypatch):
++    """Control: the run's own model_tier receipt provider walls before the profile fallback."""
++    monkeypatch.setattr(walls, "profile_provider", lambda: "xai")
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="x", assignee="default")
++    _legacy(conn, tid)
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "model_tier", {"reason": "pinned", "model": "gpt-6-astra",
++                                                   "provider": "openai-codex", "lane": "ready"}, run_id=None)
++    walls.record_wall_for_run(conn, tid, None, _log(board))
++    assert set(walls.active_walls(path=wallfile)) == {"openai-codex"}
++
++
++def test_fault_without_episode_never_walls_raw_column(board, wallfile, monkeypatch):
++    """P5: fault receipt, no episode, no model_tier event: the stored xai pin is not walled."""
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="legacy", assignee="default")
++    _legacy(conn, tid, model="grok-4.7", provider="xai")
++    _fault(monkeypatch)
++    _spawn_once(conn)
++    run_id = kb.get_task(conn, tid).current_run_id
++    assert walls.record_wall_for_run(conn, tid, run_id, _log(board)) is None
++    assert walls.active_walls(path=wallfile) == {}
++
++
++# --- tier fault path: effective selector on the in-memory task, mandatory cleared (P3/P4) ----------------------
++
++
++def test_healthy_dispatch_receipts_unchanged(board, wallfile):
++    """P2 control: healthy admission of a legacy pin is already class/auto; nothing walls."""
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="x", assignee="default")
++    _legacy(conn, tid)
++    seen = _spawn_once(conn)
++    run_id = kb.get_task(conn, tid).current_run_id
++    assert seen[tid][:2] == ("class:standard", "auto")
++    mt, rr = _events(conn, tid, "model_tier"), _events(conn, tid, "run_route")
++    assert mt[-1]["provider"] == "auto" and rr[-1]["source"] == "class" and rr[-1]["provider"] is None
++    assert walls.record_wall_for_run(conn, tid, run_id, _log(board)) is None
++    assert walls.active_walls(path=wallfile) == {}
++
++
++def test_fault_spawn_uses_effective_selector_and_clears_mandatory(board, wallfile, monkeypatch):
++    """P3: injected fault (non-review): spawn and run_route carry the class selector, not the raw pin;
++    the stored row (pin and mandatory) is unchanged."""
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="x", assignee="default")
++    _legacy(conn, tid, mandatory=1)
++    _fault(monkeypatch)
++    seen = _spawn_once(conn)
++    task = kb.get_task(conn, tid)
++    assert seen[tid] == ("class:standard", "auto", None)
++    assert task.status == "running"
++    assert _row(conn, tid) == (RAW_MODEL, RAW_PROVIDER, 1)
++    assert _events(conn, tid, "model_tier") == []
++    rr = _events(conn, tid, "run_route")[-1]
++    assert (rr["model"], rr["provider"], rr["source"], rr["tier_reason"]) == ("class:standard", None, "class", "error")
++    from hermes_cli import kanban_shared_blockers as sb
++    assert sb._run_route(conn, tid, task.current_run_id)[:2] == ("class:standard", None)
++    assert tier.owner_model_pin(conn, task) == ("class:standard", "auto")
++
++
++def test_fault_receipt_gives_no_raw_episode_or_wall(board, wallfile, monkeypatch):
++    """P4: fault receipt + rate-limited end without an attempt receipt: the episode names no provider,
++    nothing is walled, and a neutral sibling keeps its class route."""
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="legacy", assignee="default")
++    _legacy(conn, tid)
++    _fault(monkeypatch)
++    _spawn_once(conn)
++    run_id = kb.get_task(conn, tid).current_run_id
++    _rate_limited(conn, tid, run_id)
++    from hermes_cli.kanban_quota_episode import episode, record_episode
++    state = episode(conn, tid)
++    assert state and state["run_id"] == run_id
++    assert state["provider"] is None and state["providers"] == [] and state["model"] == "class:standard"
++    with kb.write_txn(conn):
++        record_episode(conn, tid, run_id)
++    assert walls.record_wall_for_run(conn, tid, run_id, _log(board)) is None
++    assert walls.active_walls(path=wallfile) == {}
++    routes, known = _sibling_routes(conn)
++    assert routes and known == {}
++
++
++def test_fault_with_concrete_allocation_receipt_still_walls_genuine_provider(board, wallfile, monkeypatch):
++    """A real attempt receipt (the provider that actually ran) still establishes the wall; the stored foreign
++    xai pin is not added to the episode's providers."""
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="legacy", assignee="default")
++    _legacy(conn, tid, model="grok-4.7", provider="xai")
++    _fault(monkeypatch)
++    _spawn_once(conn)
++    run_id = kb.get_task(conn, tid).current_run_id
++    _rate_limited(conn, tid, run_id, route_provider=RAW_PROVIDER, route_model=RAW_MODEL,
++                  last_output="Anthropic usage limit resets in ~11h")
++    from hermes_cli.kanban_quota_episode import episode
++    state = episode(conn, tid)
++    assert state["provider"] == RAW_PROVIDER and state["providers"] == [RAW_PROVIDER]
++    assert walls.record_wall_for_run(conn, tid, run_id, _log(board)) is not None
++    assert set(walls.active_walls(path=wallfile)) == {RAW_PROVIDER}
++    assert _sibling_routes(conn)[0] == []
++
++
++def test_neutral_and_legacy_fault_receipts_match(board, wallfile, monkeypatch):
++    """DESIGN121 §5: a neutral card's fault receipt moves from unknown to class; legacy and neutral agree."""
++    conn = kbc.connect()
++    legacy = kb.create_task(conn, title="legacy", assignee="default")
++    _legacy(conn, legacy)
++    neutral = kb.create_task(conn, title="neutral", assignee="default")
++    _fault(monkeypatch)
++    seen = _spawn_once(conn)
++    assert seen[legacy] == seen[neutral] == ("class:standard", "auto", None)
++    receipts = [{k: v for k, v in _events(conn, tid, "run_route")[-1].items() if k != "ratio"}
++                for tid in (legacy, neutral)]
++    assert receipts[0] == receipts[1] == {"model": "class:standard", "provider": None, "lane": "ready",
++                                          "source": "class", "tier_reason": "error"}
++    assert kb.get_task(conn, neutral).model_override is None   # stored neutral row unchanged
++
++
++def test_unknown_route_receipt_still_unknown(board, wallfile, monkeypatch):
++    """Control: a receipt whose route cannot be resolved stays unknown (None), never a guess."""
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="x", assignee="default")
++    _fault(monkeypatch)
++
++    def unresolvable(_task):
++        raise RuntimeError("route unknown")
++    monkeypatch.setattr(tier, "effective_route", unresolvable)
++    _spawn_once(conn)
++    rr = _events(conn, tid, "run_route")[-1]
++    assert (rr["model"], rr["provider"], rr["source"]) == (None, None, "unknown")
++    from hermes_cli import kanban_shared_blockers as sb
++    assert sb._run_route(conn, tid, kb.get_task(conn, tid).current_run_id)[:2] == (None, None)
++
++
++def test_review_fault_still_refuses_without_receipt(board, monkeypatch):
++    """Control: the review exception is unchanged: a review resolution fault refuses, never an error route."""
++    from hermes_cli.kanban_review_model import ReviewModelUnavailable
++    conn = kbc.connect()
++    tid = kb.create_task(conn, title="implement", assignee="default")
++    _review_source(conn, tid)
++    task = kb.claim_review_task(conn, tid, claimer=kb._claimer_id())
++    assert task is not None
++    _fault(monkeypatch)
++    before = (task.model_override, task.provider_override)
++    with pytest.raises(ReviewModelUnavailable, match="Review model resolution failed"):
++        tier.apply_model_tier(conn, task, lane="review")
++    assert (task.model_override, task.provider_override) == before
++    assert [e for e in kb.list_events(conn, tid)
++            if e.kind == "run_route" and e.run_id == task.current_run_id] == []
+diff --git a/tests/test_kanban_subset130_standing.py b/tests/test_kanban_subset130_standing.py
+new file mode 100644
+index 00000000000..a497500afb0
+--- /dev/null
++++ b/tests/test_kanban_subset130_standing.py
+@@ -0,0 +1,284 @@
++"""MANIFEST130 S1/S2: direct standing promotion validates every emitted representation.
++
++Only ``_ctx_standing`` (worker context) and ``_standing_wait_guard`` (kanban_block hold) opt in. The
++compactor, retirement/forwarding and the default helpers keep their existing behavior; this module does
++not claim the retained historical A129 compactor observation is fixed. Cards live on an isolated board.
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from agent import standing_instructions as si
++from hermes_cli.kanban_model_neutral import validate_text
++
++MODEL = "claude-opus-5-5"
++SEPARATORS = ["\n", "\r\n", "\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
++ASK = {"action": "Pick when to restart the mini gateways. Unblock = restart; archive = skip.",
++       "why_human": "restart needs consent", "interaction": "reply", "scope": "mini launcher migration",
++       "evidence": "card comments"}
++BLOCK = {"reason": "1) Choose now, when idle or later for the restart. 2) Then unblock this card",
++         "kind": "needs_input", "human_request": ASK}
++# assessment121 counterexample 1: the catalog name ends exactly at character 400, suffix beyond it.
++SUFFIX_WORDS = "Do not wait " + "p" * 363 + f" must use {MODEL}xyz"
++SUFFIX_TRUNC = " ".join(SUFFIX_WORDS.split())[:400]
++# assessment121 counterexample 2: two physical lines that only refuse once joined.
++CR_TEXT = f"standing: Do not wait, must use\r{MODEL}"
++JOINED = f"Do not wait, must use {MODEL}"
++# Natural single-stage refusals (preconditions asserted below with the unchanged recognizer).
++RAW_ONLY = f"*standing: dont wait, {MODEL}* required"            # markdown pairing joins only the raw line
++RAW_ONLY_WORDS = f"dont wait, {MODEL}* required"
++WORDS_ONLY = f"standing: independent {MODEL} review, dont wait"   # bare named-review fullmatch on words
++WORDS_ONLY_WORDS = f"independent {MODEL} review, dont wait"
++COLLAPSED_ONLY = f"standing: dont wait, must use exact  head {MODEL}"  # double space defeats the qualifier
++COLLAPSED_ONLY_WORDS = f"dont wait, must use exact  head {MODEL}"
++
++
++def _refused(text: str) -> bool:
++    try:
++        validate_text(text)
++    except ValueError:
++        return True
++    return False
++
++
++@pytest.fixture
++def board(monkeypatch, tmp_path):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
++    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
++    from pathlib import Path
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++
++    def card(body: str = "", comments: tuple[str, ...] = ()) -> str:
++        conn = kbc.connect()
++        try:
++            tid = kb.create_task(conn, title="migrate launchers", body=body or None, assignee="test-worker")
++            kb.claim_task(conn, tid)
++            run_id = kb._current_run_id(conn, tid)
++            for text in comments:  # stored history: comments carry no ingress text policy
++                kb.add_comment(conn, tid, "coordinator", text)
++        finally:
++            conn.close()
++        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
++        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
++        return tid
++
++    return card
++
++
++def _context(tid: str) -> str:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    conn = kbc.connect()
++    try:
++        return kb.build_worker_context(conn, tid)
++    finally:
++        conn.close()
++
++
++def _standing(ctx: str) -> list[str]:
++    """The generated standing section's emitted lines, not raw body/comment text shown elsewhere."""
++    if "## Standing instructions" not in ctx:
++        return []
++    section = ctx.split("## Standing instructions", 1)[1].split("(These still govern", 1)[0]
++    return [line for line in section.split("\n")[1:] if line.startswith("standing: ")]
++
++
++def _block(tid: str):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_block(dict(BLOCK)))
++    conn = kbc.connect()
++    try:
++        status = kb.get_task(conn, tid).status
++        holds = [e.payload for e in kb.list_events(conn, tid) if e.kind == "standing_wait_hold"]
++    finally:
++        conn.close()
++    return out, status, holds
++
++
++def _source(tid: str):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    conn = kbc.connect()
++    try:
++        return kb.get_task(conn, tid).body, [c.body for c in kb.list_comments(conn, tid)]
++    finally:
++        conn.close()
++
++
++def _payload(raw):
++    return json.loads(raw) if isinstance(raw, str) else raw
++
++
++# --- recognizer preconditions: each case refuses at exactly the stage it names ------------------------
++
++def test_counterexample_preconditions_use_unchanged_recognizer():
++    assert not _refused(f"standing: {SUFFIX_WORDS}") and not _refused(SUFFIX_WORDS)
++    assert len(SUFFIX_TRUNC) == 400 and SUFFIX_TRUNC.endswith(MODEL) and _refused(SUFFIX_TRUNC)
++    assert not _refused(CR_TEXT) and _refused(JOINED)
++    assert _refused(RAW_ONLY) and not _refused(RAW_ONLY_WORDS)
++    assert not _refused(WORDS_ONLY) and _refused(WORDS_ONLY_WORDS)
++    assert not _refused(COLLAPSED_ONLY) and not _refused(COLLAPSED_ONLY_WORDS)
++    assert _refused(" ".join(COLLAPSED_ONLY_WORDS.split()))
++
++
++def test_default_helpers_remain_behavior_identical():
++    """Baseline control: the compactor/default extraction still sees the legacy view."""
++    assert si.explicit_lines(CR_TEXT) == [JOINED]
++    assert si.explicit_lines(f"standing: {SUFFIX_WORDS}") == [SUFFIX_TRUNC]
++    assert si.explicit_lines(RAW_ONLY) == [RAW_ONLY_WORDS]
++    assert si.extract(CR_TEXT, user_authored=True)[0] == JOINED
++    assert si.dedupe(["a", "A.", "b"]) == ["a", "b"]
++    assert si.render_section([JOINED]).count(f"standing: {JOINED}") == 1
++
++
++# --- restricted helper contract --------------------------------------------------------------------
++
++def test_restricted_helper_passes_raw_line_with_every_representation():
++    seen = []
++    out = si.restricted_explicit_lines("> standing:  keep   going \nother", lambda raw, c: seen.append((raw, c)) or True)
++    assert out == [("> standing:  keep   going ", "keep going")]
++    assert [c for _, c in seen] == ["keep   going", "keep going", "keep going", "standing: keep going"]
++    assert {raw for raw, _ in seen} == {"> standing:  keep   going "}
++
++
++def test_injected_rendered_line_refusal_drops_candidate():
++    """INJECTED keep double: refuses only the rendered ``standing:`` form to prove it is checked."""
++    out = si.restricted_explicit_lines("standing: keep going", lambda raw, c: not c.startswith("standing: "))
++    assert out == []
++
++
++# --- S1 worker context through real create -> build_worker_context ----------------------------------
++
++def test_suffix_truncation_is_not_promoted_to_worker_context(board):
++    tid = board(body=f"standing: {SUFFIX_WORDS}")  # ingress accepts the raw line
++    ctx = _context(tid)
++    assert f"standing: {SUFFIX_TRUNC}" not in _standing(ctx)
++    assert "## Standing instructions" not in ctx
++    assert SUFFIX_WORDS in ctx  # raw body stays visible, unfiltered
++    assert _source(tid)[0] == f"standing: {SUFFIX_WORDS}"
++
++
++@pytest.mark.parametrize("sep", SEPARATORS, ids=[repr(s) for s in SEPARATORS])
++def test_no_candidate_crosses_any_splitlines_boundary(board, sep):
++    text = f"standing: Do not wait, must use{sep}{MODEL}"
++    control = f"standing: keep going{sep}standing: no check-ins"
++    tid = board(body=text, comments=(control,))
++    emitted = _standing(_context(tid))
++    assert f"standing: {JOINED}" not in emitted
++    assert all(MODEL not in line for line in emitted)
++    assert emitted == ["standing: Do not wait, must use", "standing: keep going", "standing: no check-ins"]
++    assert _source(tid) == (text, [control])
++
++
++@pytest.mark.parametrize("raw", [RAW_ONLY, WORDS_ONLY, COLLAPSED_ONLY, f"standing: {SUFFIX_WORDS}"],
++                         ids=["raw-only", "words-only", "collapsed-only", "truncated-only"])
++def test_each_refusal_stage_is_dropped_from_context(board, raw):
++    tid = board(comments=(raw, "standing: keep the PR small"))
++    emitted = _standing(_context(tid))
++    # The refused candidate is dropped entirely (not merely re-rendered into a passing form).
++    assert emitted == ["standing: keep the PR small"]
++    assert _source(tid)[1] == [raw, "standing: keep the PR small"]
++
++
++def test_refused_candidates_never_evict_a_permitted_line(board):
++    refused = tuple(f"*standing: note {i} {MODEL}* required" for i in range(21))
++    assert all(_refused(r) and not _refused(r.split(": ", 1)[1]) for r in refused)
++    tid = board(comments=("standing: keep the PR small", *refused, "standing: no check-ins"))
++    assert _standing(_context(tid)) == ["standing: keep the PR small", "standing: no check-ins"]
++
++
++def test_limit_semantics_unchanged_for_permitted_lines(board):
++    """Control: newest-20 limit over permitted candidates is the existing dedupe contract."""
++    tid = board(comments=tuple(f"standing: keep item {i}" for i in range(25)))
++    assert _standing(_context(tid)) == [f"standing: keep item {i}" for i in range(5, 25)]
++
++
++def test_dedupe_keys_never_change_emitted_bytes_and_follow_filtering(board):
++    permitted_twin = RAW_ONLY.lstrip("*")  # same words, raw line without the refusing markdown pair
++    assert not _refused(permitted_twin)
++    tid = board(body="standing: Keep item 3.", comments=("standing: keep item 3", RAW_ONLY, permitted_twin))
++    # The body spelling is emitted unchanged once; the refused raw line does not hold the dedupe key.
++    assert _standing(_context(tid)) == ["standing: Keep item 3.", f"standing: {RAW_ONLY_WORDS}"]
++
++
++# --- S2 block hold through real kanban_block ----------------------------------------------------------
++
++def test_suffix_truncation_does_not_hold_block(board):
++    tid = board(body=f"standing: {SUFFIX_WORDS}")
++    out, status, holds = _block(tid)
++    assert "error" not in out, out
++    assert status == "blocked" and holds == []
++
++
++def test_lone_cr_holds_only_the_physical_line(board):
++    tid = board(comments=(CR_TEXT,))
++    out, status, holds = _block(tid)
++    blob = json.dumps(out)
++    assert "error" in out and status == "running"
++    assert MODEL not in blob
++    assert [_payload(h)["standing"] for h in holds] == [["Do not wait, must use"]]
++    assert _source(tid)[1] == [CR_TEXT]
++
++
++@pytest.mark.parametrize("raw", [RAW_ONLY, WORDS_ONLY, COLLAPSED_ONLY], ids=["raw-only", "words-only", "collapsed"])
++def test_refused_dont_wait_stage_lands_block_without_event(board, raw):
++    tid = board(comments=(raw,))
++    out, status, holds = _block(tid)
++    assert "error" not in out, out
++    assert status == "blocked" and holds == []
++
++
++def test_first_three_selected_after_refusal(board):
++    refused = tuple(f"*standing: dont wait {i}, {MODEL}* required" for i in range(3))
++    safe = ("standing: dont wait on me", "standing: never stop to ask", "standing: no check-ins",
++            "standing: do not pause")
++    tid = board(comments=(*refused, *safe))
++    out, status, holds = _block(tid)
++    assert status == "running" and len(holds) == 1
++    words = ["dont wait on me", "never stop to ask", "no check-ins"]
++    assert _payload(holds[0])["standing"] == words
++    assert '"dont wait on me"; "never stop to ask"; "no check-ins"' in out["error"]
++    assert MODEL not in json.dumps(out)
++    again, status, holds = _block(tid)  # existing once-per-run semantics: second call lands
++    assert "error" not in again and status == "blocked" and len(holds) == 1
++
++
++def test_quoted_join_keeps_separators_between_checked_lines(board):
++    tid = board(comments=("standing: dont wait, must use", f"standing: {MODEL} dont wait"))
++    out, status, holds = _block(tid)
++    assert status == "running"
++    assert _payload(holds[0])["standing"] == ["dont wait, must use", f"{MODEL} dont wait"]
++    message = out["error"]
++    assert f'"dont wait, must use"; "{MODEL} dont wait"' in message
++    assert f"must use {MODEL}" not in message
++
++
++def test_injected_emitted_message_refusal_skips_candidate(board, monkeypatch):
++    """INJECTED: a hold message that would refuse once a word is quoted drops that word before the event."""
++    from tools import kanban_tools as kt
++    real = kt._standing_hold_message
++    monkeypatch.setattr(kt, "_standing_hold_message",
++                        lambda words: real(words) + (f" must use {MODEL}" if "dont wait, bad" in words else ""))
++    tid = board(comments=("standing: dont wait, bad", "standing: dont wait, good"))
++    out, status, holds = _block(tid)
++    assert status == "running"
++    assert [_payload(h)["standing"] for h in holds] == [["dont wait, good"]]
++    assert "bad" not in out["error"] and MODEL not in out["error"]
++
++
++def test_ordinary_standing_dont_wait_still_holds(board):
++    tid = board(body="standing: dont block, dont wait")
++    out, status, holds = _block(tid)
++    assert "error" in out and status == "running"
++    assert [_payload(h)["standing"] for h in holds] == [["dont block, dont wait"]]
+diff --git a/tests/tools/test_kanban_review_entry148.py b/tests/tools/test_kanban_review_entry148.py
+new file mode 100644
+index 00000000000..738a41d2866
+--- /dev/null
++++ b/tests/tools/test_kanban_review_entry148.py
+@@ -0,0 +1,283 @@
++"""Entry148/150 bounded T3/N2/N5 controls; no production or courier changes.
++
++T3 has two separate groups:
++- Routing-disabled baseline (``test_stored_malformed_review_class_refuses_tier_admission``). The isolated
++  worker profile has no enabled ``model_routing``, so ``class_unroutable_reason`` returns a policy reason
++  (routing disabled) before it checks class membership. A valid class would refuse the same way, so this
++  group does NOT tell malformed from valid. It only pins that the unchanged baseline refuses.
++- Routing-enabled discrimination (``test_enabled_routing_stored_review_class_*``). One configured fixture
++  context, identical apart from the stored ``review_model`` value. A valid exact class gets its review
++  route through tier admission and dispatch. A malformed class refuses (``unknown_class``) before any
++  receipt, claim, run or spawn.
++
++MCP uses the real stdio server/client. It needs the optional ``[mcp]`` extra, so it is gated by the
++shared ``require_mcp_2_sdk`` fixture and skips (rather than errors) without it. It proves only refusal
++ordering; a successful MCP handoff is not exercised. acp_adapter/tools.py (event rendering) and
++hermes_cli/plugins_dispatch.py (plugin hooks) are not request-review dispatchers. No ACP session, LLM
++loop or plugin-hook tool loop is started here, so those transports remain unproven.
++
++Fixture coupling is confined to the block below. Fixtures and public helpers are imported from their
++owning modules. Snapshot, dispatch and two-gateway setup helpers are local to this module, so it does
++not depend on private helpers of other consumer test modules.
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++from pathlib import Path
++import sys
++
++import pytest
++
++# --- external fixture/helper coupling (owning modules only) -----------------------------------
++from tests import test_kanban_extraction141_review as review  # owns the ``effects`` spy fixture
++from tests.hermes_cli import test_kanban_review_model as routing  # enabled-routing config helpers
++from tests.hermes_cli import test_kanban_strong_tier as strong_tier  # owns the ``board`` fixture
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, WORKER, Gateway
++from tests.tools import test_kanban_tools as worker_fixtures  # owns the ``worker_env`` fixture
++
++worker_env = worker_fixtures.worker_env
++effects = review.effects
++board = strong_tier.board
++# -----------------------------------------------------------------------------------------------
++
++_TABLES = ("tasks", "task_events", "task_comments", "task_links", "task_attachments", "task_runs")
++
++
++def _snapshot() -> dict:
++    """Kanban rows of the current HERMES_HOME board."""
++    from hermes_cli import kanban_db_connect as kbc
++    with kbc.connect_closing() as conn:
++        return _tables(conn, _TABLES)
++
++
++def _tables(conn, names=None) -> dict:
++    """Every row of *names* (default: every table) on *conn*."""
++    if names is None:
++        names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' "
++                                            "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
++    return {t: [tuple(r) for r in conn.execute(f'SELECT * FROM "{t}" ORDER BY rowid')] for t in names}
++
++
++def _dispatch(args: dict):
++    """The real registered handler via ``registry.dispatch``; no transport is exercised."""
++    import tools.kanban_tools  # registers the kanban toolset
++    from tools.registry import registry
++    out = registry.dispatch("kanban_request_review", args)
++    return json.loads(out) if isinstance(out, str) else out
++
++
++@pytest.fixture
++def svc():
++    return FakeService(lease_runs=True)
++
++
++@pytest.fixture
++def gws(tmp_path, monkeypatch, svc):
++    """Two gateways on one fake Board service: the hub creates cards, worker-1 runs them under its lease."""
++    from hermes_cli import kanban_db_dispatch as kbd
++    from hermes_cli import kanban_db_sync as sync
++    from hermes_cli import kanban_worker_node as wn
++    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_BOARD",
++                "HERMES_KANBAN_DB"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    hub = Gateway(tmp_path, HUB, svc, monkeypatch, pickup=False)
++    worker = Gateway(tmp_path, WORKER, svc, monkeypatch, pickup="true")
++    yield hub, worker
++    for g in (hub, worker):
++        g.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _running_on_worker(hub, worker, svc):
++    """A hub card worker-1 claims and runs; the hub reads it running under worker-1's live lease."""
++    from hermes_cli import kanban_db as kb
++    hub.enter()
++    tid = kb.create_task(hub.conn, title="remote work", assignee="default", runs_on=["linux"])
++    hub.round()
++    worker.round()
++    worker.tick()
++    assert svc.board(BOARD)["leases"][tid]["holder"] == WORKER
++    worker.round()
++    hub.round()
++    row = hub.conn.execute("SELECT status, lease_holder, claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert (row["status"], row["lease_holder"], row["claim_lock"]) == ("running", WORKER, None)
++    return tid
++
++
++@pytest.mark.parametrize("model", ["class:bogus", "class:", "class: deep"])
++def test_stored_malformed_review_class_refuses_tier_admission(worker_env, model):
++    """Routing-DISABLED baseline only: the refusal is a policy reason checked before class membership.
++
++    A valid class refuses identically here, so this does not discriminate. See the enabled-routing group.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_model_tier as tier
++    from hermes_cli.kanban_review_model import ReviewModelUnavailable
++
++    assert _dispatch({"summary": "handoff"}).get("ok") is True
++    with kbc.connect_closing() as conn:
++        conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=? AND outcome='review_requested'",
++                     (json.dumps({"review_model": model}), worker_env))
++        conn.commit()
++    before = _snapshot()
++    with kbc.connect_closing() as conn:
++        task = kb.get_task(conn, worker_env)
++        with pytest.raises(ReviewModelUnavailable, match="Review model.*unroutable"):
++            tier.apply_model_tier(conn, task, lane="review", cfg={})
++    assert _snapshot() == before
++
++
++# Identical enabled-routing context for every case; only the stored review_model differs.
++STORED = ["class:deep", "class:bogus", "class:", "class: deep"]
++STORED_IDS = ["valid-deep", "bogus", "empty-suffix", "padded"]
++
++
++def _enabled_review_card(board, conn, stored):
++    """A real claimed handoff on the configured board; its latest handoff run then stores *stored* raw.
++
++    The raw write deliberately bypasses the new ingress guard: this models legacy/stored metadata.
++    """
++    from hermes_cli import kanban_db as kb
++    cfg = routing.config(board)
++    on_disk = json.loads(board.joinpath("config.yaml").read_text(encoding="utf-8"))
++    assert on_disk["model_routing"]["enabled"] is True
++    t = routing.task(conn)
++    assert t is not None
++    kb.claim_task(conn, t.id)
++    assert kb.request_review(conn, t.id, summary="fixture ready")
++    conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=? AND outcome='review_requested'",
++                 (json.dumps({"review_model": stored}), t.id))
++    conn.commit()
++    stored_task = kb.get_task(conn, t.id)
++    assert stored_task is not None
++    return cfg, stored_task
++
++
++def _events(conn, tid):
++    from hermes_cli import kanban_db as kb
++    return list(kb.list_events(conn, tid))
++
++
++@pytest.mark.parametrize("stored", STORED, ids=STORED_IDS)
++def test_enabled_routing_stored_review_class_tier_admission(board, stored):
++    """Valid exact class gets its review_override route; malformed refuses on class membership, no receipt."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_model_tier as tier
++    from hermes_cli.kanban_review_model import ReviewModelUnavailable
++
++    with kbc.connect() as conn:
++        cfg, t = _enabled_review_card(board, conn, stored)
++        before = _tables(conn, _TABLES)
++        count = len(_events(conn, t.id))
++        if stored == "class:deep":
++            assert tier.apply_model_tier(conn, t, lane="review", cfg=cfg) == "review_override"
++            assert (t.model_override, t.provider_override) == (routing.OPUS, "anthropic")
++            receipts = [e.payload or {} for e in _events(conn, t.id)[count:] if e.kind == "model_tier"]
++            assert len(receipts) == 1, receipts
++            assert (receipts[0]["reason"], receipts[0]["model"]) == ("review_override", routing.OPUS)
++            assert getattr(kb.get_task(conn, t.id), "model_override", None) == routing.SONNET  # row unchanged
++        else:
++            with pytest.raises(ReviewModelUnavailable, match=r"unroutable: unknown_class"):
++                tier.apply_model_tier(conn, t, lane="review", cfg=cfg)
++            assert _tables(conn, _TABLES) == before  # no model_tier/run_route receipt, no row change
++
++
++@pytest.mark.parametrize("stored", STORED, ids=STORED_IDS)
++def test_enabled_routing_stored_review_class_dispatch_admission(board, stored):
++    """Through dispatch_once: valid class spawns on its route; malformed refuses preclaim, no claim/run/spawn."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db_dispatch as dispatch
++
++    seen = []
++    with kbc.connect() as conn:
++        _, t = _enabled_review_card(board, conn, stored)
++        runs_before = kb.list_runs(conn, t.id)
++        count = len(_events(conn, t.id))
++        dispatch.dispatch_once(conn, dry_run=False, spawn_fn=lambda item, ws: seen.append(
++            (item.id, item.model_override, item.provider_override)))
++        after = kb.get_task(conn, t.id)
++        assert after is not None
++        new = _events(conn, t.id)[count:]
++        kinds = [e.kind for e in new]
++        if stored == "class:deep":
++            assert seen == [(t.id, routing.OPUS, "anthropic")]
++            assert "claimed" in kinds and "review_admission_refused" not in kinds, kinds
++        else:
++            assert seen == []
++            assert kb.list_runs(conn, t.id) == runs_before
++            assert not {"claimed", "model_tier", "run_route", "spawned"} & set(kinds), kinds
++            refused = [e.payload or {} for e in new if e.kind == "review_admission_refused"]
++            assert len(refused) == 1, kinds
++            assert refused[0]["preclaim"] is True and "unknown_class" in refused[0]["error"], refused
++            assert (after.status, after.claim_lock, after.consecutive_failures) == ("review", None, 0)
++            assert after.current_run_id == t.current_run_id
++
++
++@pytest.mark.parametrize("invalid", [True, False], ids=["invalid-class", "valid-class"])
++def test_misscoped_worker_ordering(worker_env, effects, invalid):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    with kbc.connect_closing() as conn:
++        other = kb.create_task(conn, title="other worker's card", assignee="test-worker")
++    before = _snapshot()
++    result = _dispatch({"task_id": other, "summary": "handoff",
++                        "metadata": {"review_model": "class:bogus" if invalid else "class:fast"}})
++    assert ("model-neutral" if invalid else "worker is scoped to task") in result.get("error", ""), result
++    assert effects == ([] if invalid else ["_worker_guard"])
++    assert _snapshot() == before
++
++
++@pytest.mark.parametrize("invalid", [True, False], ids=["invalid-class", "valid-class"])
++def test_foreign_live_lease_precedes_review_metadata(gws, svc, effects, invalid):
++    hub, worker = gws
++    tid = _running_on_worker(hub, worker, svc)
++    hub.enter()
++    before = _tables(hub.conn)
++    result = _dispatch({"task_id": tid, "summary": "handoff",
++                        "metadata": {"review_model": "class:bogus" if invalid else "class:fast"}})
++    assert result.get("code") == "remote_live_lease", result
++    assert result.get("rejection") == "live_claim"
++    assert result.get("holder") == WORKER
++    assert effects == []
++    assert _tables(hub.conn) == before
++
++
++async def _mcp_review(args, env):
++    from mcp import ClientSession, StdioServerParameters
++    from mcp.client.stdio import stdio_client
++
++    params = StdioServerParameters(command=sys.executable,
++                                   args=["-m", "agent.transports.hermes_tools_mcp_server"],
++                                   cwd=Path(__file__).resolve().parents[2], env=env)
++    async with asyncio.timeout(90):
++        async with stdio_client(params) as (read, write):
++            async with ClientSession(read, write, read_timeout_seconds=60) as session:
++                await session.initialize()
++                tools = await session.list_tools()
++                assert "kanban_request_review" in {tool.name for tool in tools.tools}
++                result = await session.call_tool("kanban_request_review", args)
++                assert not result.is_error, result
++                return json.loads(next(item.text for item in result.content if item.type == "text"))
++
++
++@pytest.mark.usefixtures("require_mcp_2_sdk")  # optional [mcp] extra: explicit skip when absent/stale
++@pytest.mark.parametrize("invalid", [True, False], ids=["invalid-class", "valid-class-base-refusal"])
++def test_mcp_stdio_review_entry_ordering(worker_env, tmp_path, invalid):
++    """Bad class wins over missing summary; valid class reaches unchanged summary check (no MCP success)."""
++    env = {**os.environ, "HOME": str(tmp_path), "HERMES_HOME": os.environ["HERMES_HOME"],
++           "HERMES_QUIET": "1", "HERMES_REDACT_SECRETS": "true"}
++    before = _snapshot()
++    result = asyncio.run(_mcp_review({"task_id": worker_env, "summary": "",
++                                     "metadata": {"review_model": "class:bogus" if invalid else "class:fast"}}, env))
++    assert ("model-neutral" if invalid else "summary is required") in result.get("error", ""), result
++    assert _snapshot() == before
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index a5bc3c2456e..0de879c1ca7 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -11,7 +11,7 @@ import functools
+ import json
+ 
+ from hermes_cli.kanban_published_worktree import publication_scope
+-from tools.kanban_tools_model_neutral import model_neutral_create
++from tools.kanban_tools_model_neutral import model_neutral_create, model_neutral_review
+ import logging
+ import os
+ import time
+@@ -1026,12 +1026,9 @@ def _standing_wait_guard(kb, conn, tid: str, kind: Optional[str], human_request:
+     """
+     if kind != "needs_input" and not human_request:
+         return
+-    from agent import standing_instructions as si
+-    task = kb.get_task(conn, tid)
+-    found = si.explicit_lines(getattr(task, "body", "") or "")
+-    for c in kb.list_comments(conn, tid):
+-        found += si.explicit_lines(c.body or "")
+-    dont_wait = si.says_dont_wait(si.dedupe(found))
++    from hermes_cli.kanban_model_neutral import standing_wait_words
++    texts = [getattr(kb.get_task(conn, tid), "body", "") or "", *(c.body or "" for c in kb.list_comments(conn, tid))]
++    dont_wait = standing_wait_words(texts, _standing_hold_message)  # every emitted form rechecked (S2)
+     if not dont_wait:
+         return
+     run_id = _worker_run_id(tid)
+@@ -1040,14 +1037,16 @@ def _standing_wait_guard(kb, conn, tid: str, kind: Optional[str], human_request:
+         return  # already held once this run: the agent re-confirmed a human-only need
+     with kb.write_txn(conn, allow_nested=True):
+         kb._append_event(conn, tid, STANDING_WAIT_EVENT,
+-                         {"kind": kind, "standing": dont_wait[:3], "reason": (reason or "")[:300]}, run_id=run_id)
+-    quoted = "; ".join(f'"{w}"' for w in dont_wait[:3])
+-    raise _Reject(
+-        f"Not blocked: this card carries the user's standing instruction {quoted}. Decide it yourself and keep "
+-        "going (pick the option the user's goal implies, record the choice in a kanban_comment). A timing or "
+-        "consent question is not a reason to wait. Only if this truly needs a human (a credential, a physical "
+-        "step, money beyond the approved budget) call kanban_block again with the same reason; that lands it.",
+-        "standing_dont_wait")
++                         {"kind": kind, "standing": dont_wait, "reason": (reason or "")[:300]}, run_id=run_id)
++    raise _Reject(_standing_hold_message(dont_wait), "standing_dont_wait")
++
++
++def _standing_hold_message(words: list[str]) -> str:
++    quoted = "; ".join(f'"{w}"' for w in words)
++    return (f"Not blocked: this card carries the user's standing instruction {quoted}. Decide it yourself and keep "
++            "going (pick the option the user's goal implies, record the choice in a kanban_comment). A timing or "
++            "consent question is not a reason to wait. Only if this truly needs a human (a credential, a physical "
++            "step, money beyond the approved budget) call kanban_block again with the same reason; that lands it.")
+ 
+ 
+ @_kanban_handler("kanban_block")
+@@ -1262,6 +1261,7 @@ def _handle_move(args: dict, **kw) -> str:
+ 
+ 
+ @_kanban_handler("kanban_request_review")
++@model_neutral_review
+ def _handle_request_review(args: dict, **kw) -> str:
+     """Move implementation into the first-class review phase."""
+     tid = _worker_guard("kanban_request_review", args)
+diff --git a/tools/kanban_tools_model_neutral.py b/tools/kanban_tools_model_neutral.py
+index ec4d0deb761..e38fa3e74b6 100644
+--- a/tools/kanban_tools_model_neutral.py
++++ b/tools/kanban_tools_model_neutral.py
+@@ -15,3 +15,25 @@ def model_neutral_create(fn):
+             return tool_error(str(exc))
+         return fn(args, **kwargs)
+     return create
++
++
++def model_neutral_review(fn):
++    """Opt-in review-metadata guard before worker guard, goal gate, source registration and staging.
++
++    Ordinary ``tool_error`` refusal (no typed code); metadata flags keep base truthiness (N1).
++    """
++    @wraps(fn)
++    def review(args, **kwargs):
++        from hermes_cli.kanban_model_neutral import validate_explicit_selector, validate_review
++        from tools.registry import tool_error
++        metadata = args.get('metadata')
++        if isinstance(metadata, dict):
++            try:
++                validate_explicit_selector(
++                    metadata.get('review_model'), metadata.get('review_provider'),
++                    mandatory=metadata.get('pin_mandatory') or metadata.get('require_model'))
++                validate_review(metadata)
++            except ValueError as exc:
++                return tool_error(str(exc))
++        return fn(args, **kwargs)
++    return review
+-- 
+2.43.0
+

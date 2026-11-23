@@ -1,0 +1,156 @@
+From 360d0c3f4a88fac4a57e69045c08e3412981fe82 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 01:08:17 +0000
+Subject: [PATCH] fix(kanban): settle typed courier refusals and pool auto
+ creates [daveey]
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/kanban_hub_admission_placement.py  |  3 +-
+ hermes_cli/kanban_origin_owner.py             |  4 +++
+ .../test_kanban_courier_refusals.py           | 30 ++++++++++++++++
+ tests/hermes_cli/test_kanban_pool_queue.py    | 35 ++++++++++++++++++-
+ tools/kanban_tools_placement.py               |  7 ++++
+ 5 files changed, 77 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_courier_refusals.py
+
+diff --git a/hermes_cli/kanban_hub_admission_placement.py b/hermes_cli/kanban_hub_admission_placement.py
+index 3a5f9b96e52..6368b91d6d4 100644
+--- a/hermes_cli/kanban_hub_admission_placement.py
++++ b/hermes_cli/kanban_hub_admission_placement.py
+@@ -89,7 +89,8 @@ def courier_plan(conn, args, runs_on, *, cfg=None, gateway=None, request_id=None
+     if prior is not None:
+         return prior or None
+     # validate_creation's own fences: a worker-first card cannot carry a host workspace, board or project.
+-    pinned = (runs_on is not None or (args.get("workspace_kind") or "scratch") != "scratch"
++    pinned = (bool(runs_on) or str(args.get("placement") or "auto").strip().lower() != "auto"
++              or (args.get("workspace_kind") or "scratch") != "scratch"
+               or args.get("workspace_path") or args.get("project_id")
+               or args.get("board") not in (None, "", "default"))
+     if conn is not None and conn.in_transaction:
+diff --git a/hermes_cli/kanban_origin_owner.py b/hermes_cli/kanban_origin_owner.py
+index fab53c500ad..40acd1b769f 100644
+--- a/hermes_cli/kanban_origin_owner.py
++++ b/hermes_cli/kanban_origin_owner.py
+@@ -92,6 +92,10 @@ def _dispatch_result(raw_result):
+         result = json.loads(raw_result) if isinstance(raw_result, str) else None
+     except ValueError:
+         result = None
++    if (isinstance(result, dict) and result.get('created') is False
++            and isinstance(result.get('code'), str) and result['code'].strip()):
++        # Definitive no-write refusals cannot be repaired by replaying this envelope.
++        return {**result, 'status': 'rejected', 'handoff_complete': False}
+     if not isinstance(result, dict) or result.get('handoff_complete') is not False:
+         # Dispatch catches exceptions itself. An untyped error may follow a
+         # committed write: keep the exact request retryable, never infer absence.
+diff --git a/tests/hermes_cli/test_kanban_courier_refusals.py b/tests/hermes_cli/test_kanban_courier_refusals.py
+new file mode 100644
+index 00000000000..2b10b4c31ba
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_courier_refusals.py
+@@ -0,0 +1,30 @@
++"""Immutable courier refusals settle; empty auto lease labels are not a hub pin."""
++import json
++
++import pytest
++
++from hermes_cli.kanban_origin_owner import _dispatch_result
++
++
++@pytest.mark.parametrize('code', ['placement_unavailable', 'create_overlap', 'requires_declaration_missing'])
++@pytest.mark.parametrize('handoff', [{}, {'handoff_complete': False}])
++def test_typed_no_create_is_terminal(code, handoff):
++    raw = {'error': 'No card was created', 'created': False, 'code': code, **handoff}
++    result = _dispatch_result(json.dumps(raw))
++    assert result['status'] == 'rejected'
++    assert result['code'] == code
++    assert result['created'] is False
++    assert result['handoff_complete'] is False
++
++
++@pytest.mark.parametrize('raw', [
++    'not JSON', 'null', '[]', json.dumps({'error': 'exception after unknown write'}),
++    json.dumps({'code': 'placement_unavailable'}),
++    json.dumps({'created': False}), json.dumps({'created': False, 'code': ''}),
++    json.dumps({'created': False, 'code': 17}),
++    json.dumps({'created': 0, 'code': 'placement_unavailable'}),
++    json.dumps({'created': True, 'code': 'placement_unavailable'}),
++])
++def test_unknown_write_stays_retryable(raw):
++    assert _dispatch_result(raw) == {
++        'status': 'pending', 'code': 'origin_dispatch_pending', 'handoff_complete': False}
+diff --git a/tests/hermes_cli/test_kanban_pool_queue.py b/tests/hermes_cli/test_kanban_pool_queue.py
+index 656262beda7..6634fb8ce59 100644
+--- a/tests/hermes_cli/test_kanban_pool_queue.py
++++ b/tests/hermes_cli/test_kanban_pool_queue.py
+@@ -752,6 +752,36 @@ def test_courier_create_denied_by_hub_admission_joins_the_pool_queue(hub, judge,
+     assert len(judge.calls) == 1
+ 
+ 
++@pytest.mark.parametrize("queued", [True, False])
++def test_selfwork_auto_empty_labels_denial_persists_pool_route(hub, judge, monkeypatch, queued):
++    """swf-7c606: intake owns storage; runs_on=[] must not become a hub pin."""
++    from tools import kanban_tools as kt
++    monkeypatch.setattr(kp, "config", lambda: {**CFG, "worker_pools": {HUB: ["worker-1"]}})
++    machines = [{**m, "labels": [*m["labels"], "capability:hub-write", "capability:hub-read"]}
++                if m["name"] == "worker-2" else m
++                for m in _machines(held=("worker-1",) if queued else ("worker-1", "worker-2")).values()]
++    wn.set_registry_fetch(lambda: {"me": HUB, "machines": seen_now(machines)})
++    judge.admit_next = False
++    args = {"title": "Unstick dedupe work", "body": "Read hub evidence and verify existing owner.",
++            "assignee": "default", "placement": "auto", "runs_on": [],
++            "requires": ["terminal", "git", "hub:read"]}
++    intent = _intent("swf-7c606dc77bfa7767ebe18a8de3e2e75b28f7b5980c94265e1613b150b2187543")
++    out = json.loads(kt._handle_create(dict(args), origin_intent=intent))
++    assert out.get("created") is True, out
++    tid = out["task_id"]
++    task = kb.get_task(hub.conn, tid)
++    assert {"terminal", "git", "hub:read"} <= set(task.requires)
++    if queued:
++        assert POOL in _runs_on(hub.conn, tid)
++        assert task.placement_policy is None
++    else:
++        assert _runs_on(hub.conn, tid) is None
++        assert task.placement_policy == "worker-first-v1"
++    again = json.loads(kt._handle_create(dict(args), origin_intent=intent))
++    assert again.get("task_id") == tid, again
++    assert len(judge.calls) == 1
++
++
+ def test_courier_create_keeps_worker_first_only_without_a_live_queue_label(hub, judge, monkeypatch):
+     from tools import kanban_tools as kt
+     monkeypatch.setattr(kp, "config", lambda: {**CFG, "worker_pools": {HUB: ["worker-1"]}})
+@@ -784,7 +814,10 @@ def test_courier_explicit_machine_pin_still_wins(hub, judge, monkeypatch):
+     assert judge.calls == [] and kb.get_task(hub.conn, out["task_id"]).placement_policy is None
+ 
+ 
+-@pytest.mark.parametrize("extra", [{"runs_on": [f"machine:{HUB}"]}, {"workspace_kind": "dir", "workspace_path": "/srv/x"}])
++@pytest.mark.parametrize("extra", [
++    {"runs_on": [f"machine:{HUB}"]}, {"workspace_kind": "dir", "workspace_path": "/srv/x"},
++    {"placement": "hub", "runs_on": []}, {"placement": "local", "runs_on": []},
++])
+ def test_courier_create_pinned_to_the_hub_is_refused_when_denied(hub, judge, monkeypatch, extra):
+     # A denied hub pin (or a host workspace) cannot move to the queue: the creator re-places it; no card is made.
+     from tools import kanban_tools as kt
+diff --git a/tools/kanban_tools_placement.py b/tools/kanban_tools_placement.py
+index 48f15a60ea7..70274d0f24b 100644
+--- a/tools/kanban_tools_placement.py
++++ b/tools/kanban_tools_placement.py
+@@ -45,6 +45,13 @@ def _landing_placement(conn, args, origin, origin_intent, marker, runs_on, *, ti
+     """
+     marker = _origin_enrollment(args, origin, marker, **effective)
+     marker = _courier_landing(conn, args, origin_intent, marker, runs_on, title=title, **effective)
++    if (origin_intent is not None and runs_on == []
++            and str(args.get("placement") or "auto").strip().lower() == "auto"
++            and ((marker or {}).get("hub_admission") or {}).get("admit") is False
++            and ((marker or {}).get("runs_on") or (marker or {}).get("placement_policy"))):
++        # Empty courier labels are not a hub pin: persist admission's pool route.
++        # Else retain [] and its normal sync/lease validation on non-hub intakes.
++        runs_on = None
+     if runs_on is None and (marker or {}).get("runs_on"):
+         runs_on = list(marker["runs_on"])
+     return marker, runs_on
+-- 
+2.43.0
+

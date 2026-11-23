@@ -1,0 +1,400 @@
+From 2f705e6c636ab1ec2a1aaf7e105fc72bc046853d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 01:43:04 +0000
+Subject: [PATCH] [daveey] perf(recency): step Python through the page, not the
+ store, under the store lock
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_state_rank_memo.py                   |  20 ++-
+ hermes_state_recency.py                     |  62 +++++--
+ tests/hermes_state/test_recency_hot_rows.py | 186 ++++++++++++++++++++
+ 3 files changed, 251 insertions(+), 17 deletions(-)
+ create mode 100644 tests/hermes_state/test_recency_hot_rows.py
+
+diff --git a/hermes_state_rank_memo.py b/hermes_state_rank_memo.py
+index 64941501b3a..e80e6dc7332 100644
+--- a/hermes_state_rank_memo.py
++++ b/hermes_state_rank_memo.py
+@@ -22,7 +22,9 @@ SQLite's order) no lower than before, the new page is the top of ``R``. Proof: a
+ on the previous page, so it was not admitted or ranked strictly below the previous boundary, and none of
+ its inputs moved (its own row, its parent, its chain's rows and messages); the previous page rows alone
+ still fill the page at or above that boundary. Otherwise (a page row removed or lowered) the exact query
+-runs. A params change is a different key, so a fresh entry from the exact query.
++runs. A params change is a different key, so a fresh entry from the exact query. SQLite ranks only
++dirty's relatives (``_rerank``): a page row outside them moved none of its inputs either, so the memo's sort
++key for it IS its exact one, and it is merged back in SQLite's order.
+ 
+ Previews. ``_preview_raw`` (the first eligible user message, ~95% of the page projection on the hub) is
+ cached per store as ``{session_id: (transcript_revision, raw)}`` and used in SQL only when the row's
+@@ -186,6 +188,7 @@ class _Entry:
+     ids: list  # ranked page ids, best first
+     keys: dict  # id -> sort key
+     eff: dict  # id -> effective_last_active as SQLite returned it
++    started: dict  # id -> started_at as SQLite returned it (rebuilds a kept row's sort key)
+     dirty: set = field(default_factory=set)
+ 
+ 
+@@ -265,7 +268,7 @@ class RankMemo:
+ 
+     def put(self, key: tuple, rows: list) -> _Entry:
+         entry = _Entry([r[0] for r in rows], {r[0]: sort_key(r[3], r[1], r[0]) for r in rows},
+-                       {r[0]: r[3] for r in rows})
++                       {r[0]: r[3] for r in rows}, {r[0]: r[1] for r in rows})
+         self.entries[key] = entry
+         self.entries.move_to_end(key)
+         while len(self.entries) > _MAX_ENTRIES:
+@@ -322,6 +325,17 @@ def _account(outcome: str) -> None:
+         logger.debug("rank memo pass accounting failed", exc_info=True)
+ 
+ 
++def _rerank(entry: _Entry, relatives: set, restricted_ids) -> list:
++    """The exact ranking of ``R`` = previous page ∪ ``relatives``, best first, stepping SQLite only through
++    ``relatives``: a previous page row outside them moved none of its inputs (module doc), so its sort key
++    and effective_last_active are the memo's. Merged in SQLite's order (``sort_key``, a total order: ids are
++    unique). Re-ranking the whole previous page brought every row of a 2000-row tree page back to Python on
++    each refresh, under the store lock, for the few rows a write touched."""
++    fresh = list(restricted_ids(sorted(relatives))) if relatives else []
++    kept = [(sid, entry.started[sid], None, entry.eff[sid]) for sid in entry.ids if sid not in relatives]
++    return sorted(kept + fresh, key=lambda r: sort_key(r[3], r[1], r[0]), reverse=True)
++
++
+ def ranked_ids(conn, memo: RankMemo, key: tuple, need: int, exact_ids, restricted_ids) -> list:
+     """``[(id, started_at, last_active, effective_last_active)]`` of the top ``need`` rows, from the memo
+     when provable, else ``exact_ids()``. ``restricted_ids(ids)`` is the exact ranking of ``ids`` alone.
+@@ -340,7 +354,7 @@ def ranked_ids(conn, memo: RankMemo, key: tuple, need: int, exact_ids, restricte
+         return [(sid, None, None, entry.eff[sid]) for sid in entry.ids]
+     dirty = json.dumps(sorted(entry.dirty))
+     relatives = {sid for (sid,) in conn.execute(_RELATIVES_SQL, (dirty,)) if sid is not None}
+-    rows = restricted_ids(sorted(set(entry.ids) | relatives))
++    rows = _rerank(entry, relatives, restricted_ids)
+     got = {r[0]: sort_key(r[3], r[1], r[0]) for r in rows}
+     for sid in entry.ids:
+         if sid not in got:
+diff --git a/hermes_state_recency.py b/hermes_state_recency.py
+index 2f46390fa4c..8119e5b9997 100644
+--- a/hermes_state_recency.py
++++ b/hermes_state_recency.py
+@@ -121,6 +121,8 @@ def ranked_query(where_sql: str, outer_where: str, seed_from: str, select_head:
+ # Every session with a bound >= ? (three binds of the threshold, then the JSON list of sessions whose
+ # cached message max reaches it), plus all their ancestors: a chain root ranks by its members.
+ # UNION ALL keeps each arm on its own index (a UNION merge scanned the PK instead); ``up`` dedupes.
++# One JSON row, handed back verbatim as the restricted ranking's ``json_each`` bind: Python never steps
++# through the ~7.5k candidate rows (hub, 2000-row tree page), each of which dropped and re-took the GIL.
+ _CANDIDATES_SQL = f"""
+     WITH RECURSIVE
+     seed(id) AS (
+@@ -133,7 +135,30 @@ _CANDIDATES_SQL = f"""
+         UNION SELECT s.parent_session_id FROM up JOIN sessions s ON s.id = up.id
+         WHERE s.parent_session_id IS NOT NULL
+     )
+-    SELECT id FROM up"""
++    SELECT json_group_array(id) FROM up"""
++
++# [daveey] The full rebuild as ONE aggregate row instead of one Python row per session (27k on the hub):
++# Python's sqlite3 releases the GIL around every step, and on the ~190-thread Desktop backend each re-take
++# could wait the 5 ms switch interval, all under the store lock. JSON renders a REAL with 15 significant
++# digits, so a REAL max travels as two exact integers [trunc(m), (m - trunc(m)) * 2**52]: for m >= 1 the
++# subtraction is exact (Sterbenz) and every fraction bit is >= ulp(m) >= 2**-52, so ``a + n / 2**52`` is m
++# again, bit for bit. A REAL below 1 (a pre-1970 stamp inside the window) travels as 1.0: still an upper
++# bound, which is all the cache claims. ``LIMIT -1`` keeps SQLite from flattening the subquery into the
++# aggregate, which would re-run the probe once per reference to ``m``.
++_FRAC = 1 << 52
++_REAL_HEAD = "CASE WHEN typeof(m) != 'real' THEN m WHEN m >= 1 THEN CAST(m AS INTEGER) ELSE 1 END"
++_REAL_FRAC = (f"CASE WHEN typeof(m) != 'real' THEN NULL WHEN m >= 1 THEN "
++              f"CAST((m - CAST(m AS INTEGER)) * {float(_FRAC)!r} AS INTEGER) ELSE 0 END")
++_REBUILD_SQL = (f"SELECT json_group_array(json_array(id, {_REAL_HEAD}, {_REAL_FRAC})) FROM ("
++                f"SELECT s.id AS id, {_msg_max_sql('s.id')} AS m FROM sessions s LIMIT -1) WHERE m IS NOT NULL")
++
++
++def _rebuilt_maxima(conn) -> dict[str, Any]:
++    """``{session_id: in-window MAX(messages.timestamp)}`` of every session with a message, exact."""
++    out: dict[str, Any] = {}
++    for sid, head, frac in json.loads(conn.execute(_REBUILD_SQL).fetchone()[0] or "[]"):
++        out[sid] = head if frac is None else head + frac / _FRAC
++    return out
+ 
+ 
+ class _StoreRecency:
+@@ -158,6 +183,19 @@ class _StoreRecency:
+             else:
+                 self.msg_max[sid] = value
+ 
++    def drop_below(self, conn, ids: list, threshold) -> None:
++        """Re-probe ``ids`` (cached at or above ``threshold``), stepping only through the rows whose max
++        fell below it or vanished. A row still at or above keeps its cached value: still an upper bound,
++        and it lands in the same candidate set either way. (Every row of a 2000-row tree page's ~5.5k
++        legitimately high sessions came back to Python on each fallback before.)"""
++        for sid, value in conn.execute(
++                f"SELECT id, m FROM (SELECT j.value AS id, {_msg_max_sql('j.value')} AS m FROM json_each(?) j"
++                " LIMIT -1) WHERE m IS NULL OR m < ?", (json.dumps(ids), threshold)).fetchall():
++            if value is None:
++                self.msg_max.pop(sid, None)
++            else:
++                self.msg_max[sid] = value
++
+     def refresh(self, conn) -> bool:
+         """Fold this snapshot's new messages in; False when ids cannot carry a watermark."""
+         seq_row = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'messages'").fetchone()
+@@ -166,10 +204,7 @@ class _StoreRecency:
+             return False  # ids may be reused (no AUTOINCREMENT): a watermark proves nothing
+         high = max(int(seq_row[0]) if seq_row else 0, int(max_id or 0))
+         if self.watermark is None or self.stale or high < self.watermark:
+-            self.msg_max, self.stale = {}, False
+-            for sid, value in conn.execute(f"SELECT s.id, {_msg_max_sql('s.id')} FROM sessions s").fetchall():
+-                if value is not None:
+-                    self.msg_max[sid] = value
++            self.msg_max, self.stale = _rebuilt_maxima(conn), False
+         elif high > self.watermark:
+             # NOT INDEXED: walk the rowid range, never the whole (session_id, timestamp) index.
+             self.probe(conn, {sid for (sid,) in conn.execute(
+@@ -199,8 +234,8 @@ def clear() -> None:
+         _STORES.clear()
+ 
+ 
+-def _candidates(conn, store, where_clauses, params, need) -> Optional[list[str]]:
+-    """Session ids that contain the page (module doc), or None to read unrestricted."""
++def _candidates(conn, store, where_clauses, params, need) -> Optional[str]:
++    """The JSON array of session ids that contain the page (module doc), or None to read unrestricted."""
+     if not store.refresh(conn):
+         return None
+     # Among rows with an in-window last_activity_at the index key IS last_activity_at. CASE keeps the
+@@ -217,10 +252,9 @@ def _candidates(conn, store, where_clauses, params, need) -> Optional[list[str]]
+     high = [sid for sid, value in store.msg_max.items() if value >= threshold]
+     if len(high) > 2 * need + 64:
+         # Cached maxima a delete lowered stay high until probed again: re-probe them once.
+-        store.probe(conn, high)
++        store.drop_below(conn, high, threshold)
+         high = [sid for sid in high if store.msg_max.get(sid, threshold - 1) >= threshold]
+-    return [sid for (sid,) in conn.execute(
+-        _CANDIDATES_SQL, (threshold, threshold, json.dumps(high))).fetchall()]
++    return conn.execute(_CANDIDATES_SQL, (threshold, threshold, json.dumps(high))).fetchone()[0]
+ 
+ 
+ def ranked_rows(db, where_clauses: list[str], params: list, select_head: str, prompt_join: str,
+@@ -266,7 +300,7 @@ def ranked_rows(db, where_clauses: list[str], params: list, select_head: str, pr
+                 if picked is None:
+                     return conn.execute(query, query_params).fetchall()
+                 narrowed = _where_sql([*where_clauses, "s.id IN (SELECT value FROM json_each(?))"])
+-                narrowed_params = [*params, json.dumps(picked)]
++                narrowed_params = [*params, picked]
+                 return conn.execute(ranked_query(narrowed, narrowed, seed_from, select_head, prompt_join),
+                                     narrowed_params + narrowed_params + [limit, offset]).fetchall()
+             finally:
+@@ -287,9 +321,9 @@ def _memo_rows(db, store, rank_memo, where_sql, where_clauses, params, outer_whe
+     ids_head = rank_memo._IDS_HEAD
+     key = (where_sql, repr(tuple(params)), seed_from, need)
+ 
+-    def restricted(ids, limit):
++    def restricted(ids_json: str, limit):
+         narrowed = _where_sql([*where_clauses, "s.id IN (SELECT value FROM json_each(?))"])
+-        narrowed_params = [*params, json.dumps(ids)]
++        narrowed_params = [*params, ids_json]
+         return conn.execute(ranked_query(narrowed, narrowed, seed_from, ids_head, ""),
+                             narrowed_params + narrowed_params + [limit, 0]).fetchall()
+ 
+@@ -310,7 +344,7 @@ def _memo_rows(db, store, rank_memo, where_sql, where_clauses, params, outer_whe
+         try:
+             with store.lock:
+                 ids_rows = rank_memo.ranked_ids(conn, store.rank_memo, key, need, exact_ids,
+-                                                lambda ids: restricted(ids, -1))
++                                                lambda ids: restricted(json.dumps(ids), -1))
+                 generation = store.rank_memo.generation
+             if not ids_rows:
+                 return []
+diff --git a/tests/hermes_state/test_recency_hot_rows.py b/tests/hermes_state/test_recency_hot_rows.py
+new file mode 100644
+index 00000000000..855675f3753
+--- /dev/null
++++ b/tests/hermes_state/test_recency_hot_rows.py
+@@ -0,0 +1,186 @@
++"""The recency path steps Python through few SQLite rows (hermes_state_recency, hermes_state_rank_memo).
++
++Python's sqlite3 drops and re-takes the GIL around every row it steps; on the hub's ~190-thread Desktop
++backend each re-take could wait the 5 ms switch interval, all while the store lock queued every other
++session list and project tree behind it. A 60 s profile put ~57 thread-s/min here: the full message-max
++rebuild (one row per session, 27k), the candidate list (~7.5k rows for the 2000-row tree page), the
++re-probe of every legitimately high session (~5.5k) and the re-rank of the whole previous page. These
++tests pin the pages to the exact ranking and the rows each read steps through.
++"""
++
++import random
++import sqlite3
++from contextlib import contextmanager
++
++import pytest
++
++import hermes_state_rank_memo as memo
++import hermes_state_recency as recency
++from hermes_state import SessionDB
++
++_BASE = 1_700_000_000.0
++
++
++@pytest.fixture
++def db(tmp_path):
++    recency.clear()
++    memo.OUTCOMES.clear()
++    database = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        yield database
++    finally:
++        database.close()
++        recency.clear()
++
++
++def _write(db, sql, params=()):
++    db._execute_write(lambda conn: conn.execute(sql, params))
++
++
++def _seed(db, count, *, source="cli", prefix="s", messages=1):
++    def seed(conn):
++        conn.executemany(
++            "INSERT INTO sessions (id, source, started_at, last_activity_at, message_count) VALUES (?, ?, ?, ?, 1)",
++            [(f"{prefix}{i:05d}", source, _BASE + i, _BASE + i + 0.5) for i in range(count)])
++        conn.executemany("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'x', ?)",
++                         [(f"{prefix}{i:05d}", _BASE + i + 0.25 + k) for i in range(count) for k in range(messages)])
++    db._execute_write(seed)
++
++
++class _Cursor:
++    def __init__(self, cursor, sql, log):
++        self._cursor, self._sql, self._log = cursor, sql, log
++
++    def fetchall(self):
++        rows = self._cursor.fetchall()
++        self._log.append((self._sql, len(rows)))
++        return rows
++
++    def fetchone(self):
++        row = self._cursor.fetchone()
++        self._log.append((self._sql, int(row is not None)))
++        return row
++
++    def __iter__(self):
++        for row in self._cursor:
++            self._log.append((self._sql, 1))
++            yield row
++
++
++class _Conn:
++    """A read connection that logs ``(sql, rows Python stepped through)`` per statement."""
++
++    def __init__(self, conn, log):
++        self._conn, self._log = conn, log
++
++    def __getattr__(self, name):
++        return getattr(self._conn, name)
++
++    def execute(self, sql, *args):
++        return _Cursor(self._conn.execute(sql, *args), sql, self._log)
++
++
++@contextmanager
++def _stepped(db):
++    log: list = []
++    borrow = db._read_ctx
++
++    @contextmanager
++    def counted(*args, **kwargs):
++        with borrow(*args, **kwargs) as conn:
++            yield conn if conn is None else _Conn(conn, log)
++
++    db._read_ctx = counted  # type: ignore[method-assign]
++    try:
++        yield log
++    finally:
++        del db._read_ctx
++
++
++def _rows(log, needle=""):
++    return sum(n for sql, n in log if needle in sql)
++
++
++def _page(db, **kwargs):
++    return db.list_sessions_rich(order_by_last_active=True, compact_rows=True, min_message_count=1, **kwargs)
++
++
++def _exact(db, monkeypatch, **kwargs):
++    monkeypatch.setattr(recency, "ENABLED", False)
++    try:
++        return _page(db, **kwargs)
++    finally:
++        monkeypatch.setattr(recency, "ENABLED", True)
++
++
++def test_rebuild_carries_every_maximum_exactly_in_one_row(tmp_path):
++    rng = random.Random(7)
++    conn = sqlite3.connect(tmp_path / "m.db")
++    conn.executescript("CREATE TABLE sessions (id TEXT PRIMARY KEY);"
++                       "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, timestamp);"
++                       "CREATE INDEX idx_messages_session ON messages (session_id, timestamp);")
++    stamps = [_BASE + rng.random() * 1e8 for _ in range(3000)]
++    stamps += [rng.uniform(1, 4.2e9) for _ in range(2000)] + [rng.randrange(1, 4_200_000_000) for _ in range(500)]
++    stamps += [1.0, 1.5, 4_199_999_999.999999, 4_200_000_000.0, 1_700_000_000, 1_700_000_000.0, 0.0, 0.25]
++    garbage = [5.49e246, "not-a-timestamp", -3.0, None]
++    rows = [(f"s{i}", ts) for i, ts in enumerate(stamps)] + [(f"g{i}", ts) for i, ts in enumerate(garbage)]
++    conn.executemany("INSERT INTO sessions (id) VALUES (?)", [(sid,) for sid, _ in rows] + [("empty",)])
++    conn.executemany("INSERT INTO messages (session_id, timestamp) VALUES (?, ?)", rows)
++    conn.execute("INSERT INTO messages (session_id, timestamp) VALUES ('s0', ?)", (stamps[0] - 5,))
++    native = {sid: v for sid, v in conn.execute(f"SELECT s.id, {recency._msg_max_sql('s.id')} FROM sessions s")
++              if v is not None}
++    log: list = []
++    rebuilt = recency._rebuilt_maxima(_Conn(conn, log))
++    assert log == [(recency._REBUILD_SQL, 1)]
++    assert set(rebuilt) == set(native) and "empty" not in rebuilt and "g1" not in rebuilt
++    for sid, value in native.items():
++        if isinstance(value, float) and value < 1:
++            assert rebuilt[sid] == 1.0  # an upper bound, all the cache claims
++        else:
++            assert rebuilt[sid] == value and type(rebuilt[sid]) is type(value), (sid, value, rebuilt[sid])
++
++
++def test_cold_and_lowered_reads_step_through_the_page_not_the_store(db, monkeypatch):
++    _seed(db, 3000)
++    with _stepped(db) as log:
++        cold = _page(db, limit=50)
++    assert cold == _exact(db, monkeypatch, limit=50)
++    # No statement steps more than the page (the ranked ids, then the projection); the rebuild alone
++    # stepped 3000 rows and the candidate list ~100 before. (A cold read also opens and probes the store.)
++    assert max(n for _, n in log) == 50
++    _write(db, "DELETE FROM messages WHERE session_id = 's02999'")  # bumps the lowered counter
++    with _stepped(db) as log:
++        lowered = _page(db, limit=50)
++    assert lowered == _exact(db, monkeypatch, limit=50)
++    assert max(n for _, n in log) == 50 and _rows(log) <= 50 + 50 + 20, _rows(log)
++    assert memo.OUTCOMES["fallback/lowered"] == 1
++
++
++def test_reprobe_of_legitimately_high_sessions_steps_through_none(db, monkeypatch):
++    """Sessions outside the page's filter can hold most fresh messages: the re-probe finds them still high
++    and must not bring them back to Python one row each."""
++    _seed(db, 100)
++    _seed(db, 600, source="cron", prefix="c")
++    _write(db, "UPDATE messages SET timestamp = timestamp + 100000 WHERE session_id LIKE 'c%'")
++    _page(db, limit=10, exclude_sources=["cron"])
++    for offset in (5, 6):  # offset > 0: the candidate path on every read
++        with _stepped(db) as log:
++            got = _page(db, limit=10, offset=offset, exclude_sources=["cron"])
++        assert got == _exact(db, monkeypatch, limit=10, offset=offset, exclude_sources=["cron"])
++        reprobes = [(sql, n) for sql, n in log if "m IS NULL OR m < ?" in sql]
++        assert reprobes and _rows(log, "m IS NULL OR m < ?") == 0
++        assert _rows(log) <= 10 + 20, _rows(log)
++
++
++def test_rerank_steps_only_through_the_rows_a_write_touched(db, monkeypatch):
++    _seed(db, 1500)
++    _page(db, limit=1000)
++    _write(db, "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s00010', 'user', 'y', ?)",
++           (_BASE + 50_000,))
++    _write(db, "UPDATE sessions SET last_activity_at = ? WHERE id = 's01400'", (_BASE + 60_000,))
++    with _stepped(db) as log:
++        rows = _page(db, limit=1000)
++    assert memo.OUTCOMES["reranked"] == 1
++    assert rows == _exact(db, monkeypatch, limit=1000)
++    assert [r["id"] for r in rows[:2]] == ["s01400", "s00010"]
++    assert _rows(log, "chain_max AS") <= 4  # the two touched rows; was the whole 1000-row page
+-- 
+2.43.0
+

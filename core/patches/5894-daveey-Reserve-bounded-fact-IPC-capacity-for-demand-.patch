@@ -1,0 +1,192 @@
+From 194deab7e955b2e91cc4daf17ae543077e415987 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 08:22:48 +0000
+Subject: [PATCH] [daveey] Reserve bounded fact IPC capacity for demand
+ channels
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ hermes_cli/fact_demand.py                     |   2 +-
+ hermes_cli/fact_host.py                       |  19 +++-
+ .../hermes_cli/test_fact_demand_admission.py  | 100 ++++++++++++++++++
+ 3 files changed, 118 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_fact_demand_admission.py
+
+diff --git a/hermes_cli/fact_demand.py b/hermes_cli/fact_demand.py
+index 2afeedff309..8b08e81c392 100644
+--- a/hermes_cli/fact_demand.py
++++ b/hermes_cli/fact_demand.py
+@@ -92,7 +92,7 @@ class DemandChannel:
+     def deliver(self, command):
+         with connect(self.endpoint.path) as sock:
+             sock.settimeout(1)
+-            send(sock, {"version": 1, "token": self.endpoint.token, "after": None})
++            send(sock, {"version": 1, "token": self.endpoint.token, "channel": "demand"})
+             hello = receive(sock)
+             if hello["scope"] != self.scope:
+                 raise ValueError("unauthorized_scope")
+diff --git a/hermes_cli/fact_host.py b/hermes_cli/fact_host.py
+index a0173ffebb5..fa00d632617 100644
+--- a/hermes_cli/fact_host.py
++++ b/hermes_cli/fact_host.py
+@@ -48,18 +48,28 @@ class _Handler(socketserver.BaseRequestHandler):
+         pins = set()
+         owner = self.server.owner
+         scope = None
++        stream_slot = False
+         try:
+             hello = receive(self.request)
+             if hello.get("version") != 1:
+                 raise ValueError("unsupported_contract")
+             scope = owner.authorize(hello["token"])
+-            subscription = owner.store.subscribe(scope, (), None, hello.get("after"), lambda _: None)
++            channel = hello.get("channel", "stream")
++            if channel not in ("stream", "demand"):
++                raise ValueError("unknown_channel")
++            if channel == "stream":
++                stream_slot = self.server.stream_slots.acquire(blocking=False)
++                if not stream_slot:
++                    raise ValueError("stream_capacity_exceeded")
++                subscription = owner.store.subscribe(scope, (), None, hello.get("after"), lambda _: None)
+             self.request.settimeout(60)
+             send(self.request, {"scope": scope, "epoch": owner.store.snapshot(scope).epoch})
+             while not owner.closed.is_set():
+                 command = receive(self.request)
+                 if owner.closed.is_set():
+                     return
++                if channel == "demand" and command["op"] != "demand":
++                    raise ValueError("demand_channel_only")
+                 handlers = {"next": self._next, "page": self._page,
+                             "release": self._release, "demand": self._demand}
+                 handler = handlers.get(command["op"])
+@@ -72,6 +82,8 @@ class _Handler(socketserver.BaseRequestHandler):
+         finally:
+             if subscription is not None:
+                 subscription.close()
++            if stream_slot:
++                self.server.stream_slots.release()
+             for token in pins:
+                 owner.pages.release(token, scope)
+ 
+@@ -159,7 +171,10 @@ class FactHost:
+             self._server = _Server(str(path), _Handler)
+             path.chmod(0o600)
+             self._server.owner = self
+-            self._server.slots = threading.BoundedSemaphore(8)
++            # At most eight streaming clients; keep bounded handshake/control
++            # capacity available even when every stream is in a long poll.
++            self._server.slots = threading.BoundedSemaphore(16)
++            self._server.stream_slots = threading.BoundedSemaphore(8)
+             self._thread = threading.Thread(target=self._server.serve_forever, name="fact-host-ipc", daemon=True)
+             self._thread.start()
+             self._expiry = ExpiryWorker(self.store)
+diff --git a/tests/hermes_cli/test_fact_demand_admission.py b/tests/hermes_cli/test_fact_demand_admission.py
+new file mode 100644
+index 00000000000..f80867f976f
+--- /dev/null
++++ b/tests/hermes_cli/test_fact_demand_admission.py
+@@ -0,0 +1,100 @@
++"""Demand admission remains available at the stream connection limit."""
++import threading
++
++import pytest
++
++from hermes_cli.fact_contract import Scope
++from hermes_cli.fact_demand import DemandChannel
++from hermes_cli.fact_host import FactHost, acquire
++from hermes_cli.fact_ipc import connect, receive, send
++from hermes_cli.fact_replica import Endpoint
++from tests.waiting import wait_until
++
++
++@pytest.mark.platforms('linux')
++def test_eight_healthy_replicas_do_not_starve_demands(tmp_path_factory):
++    scope = Scope('fixture', 'alpha')
++    token = 'demand-fixture-capability-token-000000'
++    delivered = threading.Event()
++    seen = []
++
++    def demand(actual_scope, view, selector):
++        seen.append((actual_scope, view, selector))
++        delivered.set()
++
++    host = FactHost(tmp_path_factory.mktemp('admit'), {token: scope}, demand=demand).start()
++    endpoint = Endpoint(str(host.directory / 'facts.sock'), token)
++    replicas = []
++    channel = None
++    try:
++        for _ in range(8):
++            replica = acquire(scope, endpoint=endpoint)
++            replicas.append(replica)
++            assert wait_until(lambda: replica._online, timeout=5)
++        channel = DemandChannel(scope, endpoint)
++        channel.put('annotations', {'session': 'one'})
++        assert delivered.wait(3), 'eight healthy streams must leave demand capacity'
++        assert seen == [(scope, 'annotations', {'session': 'one'})]
++        assert all(replica._online for replica in replicas)
++    finally:
++        if channel is not None:
++            channel.close()
++        host.close()
++        for replica in replicas:
++            replica.close()
++
++
++@pytest.mark.platforms('linux')
++@pytest.mark.parametrize('channel,token_ok,op', [
++    ('demand', True, 'next'), ('demand', True, 'page'),
++    ('demand', True, 'release'), ('unknown', True, None),
++    ('demand', False, None),
++])
++def test_control_channel_cannot_bypass_scope_or_stream_limits(tmp_path_factory, channel, token_ok, op):
++    scope = Scope('fixture', 'alpha')
++    token = 'control-fixture-capability-token-0000'
++    host = FactHost(tmp_path_factory.mktemp('ctrl'), {token: scope}).start()
++    try:
++        with connect(str(host.directory / 'facts.sock')) as sock:
++            sock.settimeout(2)
++            send(sock, {'version': 1, 'token': token if token_ok else 'wrong', 'channel': channel})
++            if op is not None:
++                assert receive(sock)['scope'] == scope
++                send(sock, {'op': op})
++            with pytest.raises((EOFError, ConnectionResetError)):
++                receive(sock)
++    finally:
++        host.close()
++
++
++@pytest.mark.platforms('linux')
++@pytest.mark.parametrize('channel,limit', [('stream', 8), ('demand', 16)])
++def test_admission_is_bounded_and_disconnect_releases_capacity(tmp_path_factory, channel, limit):
++    scope = Scope('fixture', 'alpha')
++    token = 'bounded-fixture-capability-token-0000'
++    host = FactHost(tmp_path_factory.mktemp('bound'), {token: scope}).start()
++    path = str(host.directory / 'facts.sock')
++    sockets = []
++
++    def open_channel():
++        sock = connect(path)
++        sockets.append(sock)
++        sock.settimeout(2)
++        send(sock, {'version': 1, 'token': token, 'channel': channel})
++        return sock
++
++    try:
++        for _ in range(limit):
++            assert receive(open_channel())['scope'] == scope
++        with pytest.raises((EOFError, ConnectionResetError, BrokenPipeError)):
++            receive(open_channel())
++        sockets[0].close()
++        # Inspect capacity only to synchronize the real disconnect handler;
++        # the next real handshake below proves the admission is reusable.
++        semaphore = host._server.stream_slots if channel == 'stream' else host._server.slots
++        assert wait_until(lambda: semaphore._value > 0, timeout=2)
++        assert receive(open_channel())['scope'] == scope
++    finally:
++        for sock in sockets:
++            sock.close()
++        host.close()
+-- 
+2.43.0
+

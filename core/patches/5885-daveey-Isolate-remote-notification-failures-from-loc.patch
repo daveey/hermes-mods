@@ -1,0 +1,243 @@
+From 494f4b1f546819599523e0cb4899f6a2c06465c3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 07:21:34 +0000
+Subject: [PATCH] [daveey] Isolate remote notification failures from local
+ delivery
+
+Public mirror of the source commit; see the accompanying feature documentation.
+
+---
+ .../tui_gateway/test_loaded_notification_f.py |  5 +-
+ .../test_loaded_remote_failure_recovery.py    | 66 +++++++++++++++++++
+ .../test_loaded_remote_local_isolation.py     | 39 +++++++++++
+ tui_gateway/notification_loaded_f.py          | 48 +++++++++-----
+ 4 files changed, 139 insertions(+), 19 deletions(-)
+ create mode 100644 tests/tui_gateway/test_loaded_remote_failure_recovery.py
+ create mode 100644 tests/tui_gateway/test_loaded_remote_local_isolation.py
+
+diff --git a/tests/tui_gateway/test_loaded_notification_f.py b/tests/tui_gateway/test_loaded_notification_f.py
+index fbde403aaa2..3dedcff2d9f 100644
+--- a/tests/tui_gateway/test_loaded_notification_f.py
++++ b/tests/tui_gateway/test_loaded_notification_f.py
+@@ -329,7 +329,7 @@ def test_wake_and_reconcile_share_discovery_without_duplicate_delivery(tmp_path,
+     assert late.due(legacy_due=False)
+ 
+     # Even a failed full capture consumes the interval. Failed keyed work is
+-    # retained for retry, never upgraded to a full scan.
++    # marked unknown for the next 30s reconciliation, without delaying locals.
+     attempts = []
+     capture = scheduler._capture
+     def fail_capture(profile, keys):
+@@ -346,7 +346,8 @@ def test_wake_and_reconcile_share_discovery_without_duplicate_delivery(tmp_path,
+     scheduler.invalidate([('hub', card['key'])])
+     scheduler.step()
+     assert attempts[-1] == (('hub', card['key']),)
+-    assert scheduler.dirty == {('hub', card['key'])}
++    assert not scheduler.dirty
++    assert scheduler.remote_incomplete
+     monkeypatch.setattr(scheduler, '_capture', capture)
+     clock[0] = 192
+     scheduler.step()
+diff --git a/tests/tui_gateway/test_loaded_remote_failure_recovery.py b/tests/tui_gateway/test_loaded_remote_failure_recovery.py
+new file mode 100644
+index 00000000000..1a64c9c91ee
+--- /dev/null
++++ b/tests/tui_gateway/test_loaded_remote_failure_recovery.py
+@@ -0,0 +1,66 @@
++import sqlite3
++import threading
++import pytest
++from tests.tui_gateway import test_loaded_local_board_isolation as f
++from tui_gateway import notification_loaded_f as loaded, kanban_remote_notices as krn, server
++
++@pytest.mark.parametrize('mode', ['legacy', 'missing', 'corrupt', 'bad_capture'])
++def test_healthy_local_survives_remote_failure(tmp_path, monkeypatch, mode):
++    tid = f._subscribed_done(f.kb.DEFAULT_BOARD, f.CHAT)
++    state, submitted = f._deliver_harness(tmp_path, monkeypatch, f.CHAT)
++    path = tmp_path / 'replica.db'
++    if mode in ('legacy', 'corrupt'):
++        path.write_bytes(b'not sqlite')
++    elif mode == 'bad_capture':
++        with sqlite3.connect(path) as conn:
++            conn.execute('CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)')
++            conn.executemany('INSERT INTO meta VALUES (?,?)', [('gateway','local'),('cursor','1'),('head','1')])
++    monkeypatch.setattr(krn, 'hub_db_path', lambda: path)
++    session = {'session_key': f.CHAT, 'profile_home': None, 'history_lock': threading.Lock()}
++    if mode == 'legacy':
++        server._notif_poll_kanban('ui', session)
++    else:
++        clock = [100.0]
++        scheduler = loaded.Scheduler(clock=lambda: clock[0])
++        action = scheduler.add(session, 'default', lambda: None)
++        errors = []
++        scope = (None, 'default')
++        remembered = {('remote', 'default/t_old'): (f.CHAT,)}
++        scheduler.known_keys[scope] = remembered.copy()
++        try:
++            for at in [100.0, 130.0, 160.0]:
++                clock[0] = at
++                try:
++                    scheduler.step()
++                except sqlite3.Error as exc:
++                    errors.append(str(exc))
++                f._tick(action, 'ui', clock)
++            assert tid in f._delivered(state, f.CHAT), (errors, len(action.pending), submitted)
++            assert not errors
++            assert scheduler.next_reconcile == 190.0
++            if mode in ('corrupt', 'bad_capture'):
++                assert scope in scheduler.remote_incomplete
++                assert scheduler.hint_incomplete is (mode == 'corrupt')
++                assert scheduler.known_keys[scope] == remembered
++                # Failed keyed capture remains unknown until the 30s pass.
++                scheduler.invalidate([('remote', 'default/t_old')])
++                clock[0] = 161.0
++                scheduler.step()
++                f._tick(action, 'ui', clock)
++                assert not scheduler.dirty
++                assert scope in scheduler.remote_incomplete
++                assert scheduler.next_reconcile == 190.0
++                # Removing the unavailable replica is a real absent-source
++                # recovery. The next clock clears unknown state, not before.
++                path.unlink()
++                clock[0] = 190.0
++                scheduler.step()
++                f._tick(action, 'ui', clock)
++                assert scope not in scheduler.remote_incomplete
++                assert not scheduler.hint_incomplete
++                assert scheduler.known_keys[scope] == {}
++                assert not scheduler.dirty
++        finally:
++            action.close()
++    assert tid in f._delivered(state, f.CHAT)
++    assert len(submitted) == 1
+diff --git a/tests/tui_gateway/test_loaded_remote_local_isolation.py b/tests/tui_gateway/test_loaded_remote_local_isolation.py
+new file mode 100644
+index 00000000000..10e1bac73da
+--- /dev/null
++++ b/tests/tui_gateway/test_loaded_remote_local_isolation.py
+@@ -0,0 +1,39 @@
++import sqlite3
++import threading
++import pytest
++from tests.tui_gateway import test_loaded_local_board_isolation as f
++from tui_gateway import notification_loaded_f as loaded, kanban_remote_notices as krn, server
++
++@pytest.mark.parametrize('mode', ['legacy', 'missing', 'corrupt', 'bad_capture'])
++def test_healthy_local_survives_remote_failure(tmp_path, monkeypatch, mode):
++    tid = f._subscribed_done(f.kb.DEFAULT_BOARD, f.CHAT)
++    state, submitted = f._deliver_harness(tmp_path, monkeypatch, f.CHAT)
++    path = tmp_path / 'replica.db'
++    if mode in ('legacy', 'corrupt'):
++        path.write_bytes(b'not sqlite')
++    elif mode == 'bad_capture':
++        with sqlite3.connect(path) as conn:
++            conn.execute('CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)')
++            conn.executemany('INSERT INTO meta VALUES (?,?)', [('gateway','local'),('cursor','1'),('head','1')])
++    monkeypatch.setattr(krn, 'hub_db_path', lambda: path)
++    session = {'session_key': f.CHAT, 'profile_home': None, 'history_lock': threading.Lock()}
++    if mode == 'legacy':
++        server._notif_poll_kanban('ui', session)
++    else:
++        clock = [100.0]
++        scheduler = loaded.Scheduler(clock=lambda: clock[0])
++        action = scheduler.add(session, 'default', lambda: None)
++        errors = []
++        try:
++            for at in [100.0, 130.0, 160.0]:
++                clock[0] = at
++                try:
++                    scheduler.step()
++                except sqlite3.Error as exc:
++                    errors.append(str(exc))
++                f._tick(action, 'ui', clock)
++            assert tid in f._delivered(state, f.CHAT), (errors, len(action.pending), submitted)
++        finally:
++            action.close()
++    assert tid in f._delivered(state, f.CHAT)
++    assert len(submitted) == 1
+diff --git a/tui_gateway/notification_loaded_f.py b/tui_gateway/notification_loaded_f.py
+index 2fae094ca38..e986bb2091d 100644
+--- a/tui_gateway/notification_loaded_f.py
++++ b/tui_gateway/notification_loaded_f.py
+@@ -120,6 +120,8 @@ class Scheduler:
+         # incomplete/retry obligation, repaid only by the next unchanged 30s
+         # reconciliation (never an accelerated census); cleared on recovery.
+         self.local_incomplete = {}
++        self.remote_incomplete = {}  # scope failures remain unknown until capture recovers
++        self.hint_incomplete = False
+         self.next_reconcile = 0.0
+         self.stop = threading.Event()
+         self.thread = None
+@@ -205,7 +207,14 @@ class Scheduler:
+                 scan = bool(self.actions) and (self.source_dirty or now >= self.next_reconcile)
+                 self.source_dirty = False
+             if scan:
+-                self.invalidate(self._changed_keys())
++                try:
++                    self.invalidate(self._changed_keys())
++                    self.hint_incomplete = False
++                except (OSError, ValueError, RuntimeError, sqlite3.Error):
++                    # A remote hint is not authority over local discovery. Retry
++                    # on the next native hint or unchanged reconciliation clock.
++                    self.hint_incomplete = True
++                    log.warning('remote notification hints unavailable', exc_info=True)
+             with self.lock:
+                 reconcile = now >= self.next_reconcile
+                 if not self.actions or (not reconcile and not self.dirty and not self.catchup):
+@@ -251,25 +260,16 @@ class Scheduler:
+                     else:
+                         batch = first.context.run(self._capture, first.profile, keys)
+                         batches[source] = batch
++                    self.remote_incomplete.pop(scope, None)
+                 except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                     log.warning('loaded notification capture failed: %s', exc)
+-                    with self.lock:
+-                        if keys is not None:
+-                            self.dirty.update(keys)  # retry keyed work without a census
+-                    continue
++                    self.remote_incomplete[scope] = str(exc)
++                    # Unknown remote work is retried by the unchanged 30s
++                    # reconciliation; never accelerate a broken source census.
++                    batch = ()  # local delivery only, never fall back to a source scan
+                 with self.lock:
+-                    from tui_gateway.kanban_remote_notices import _linked_chats
+-                    captured = ({(gw, key): tuple(sid for profile, sid in _linked_chats(task, batch.me)
+-                                                  if profile == first.profile)
+-                                 for gw, key, task in json.loads(batch.rows)}
+-                                if hasattr(batch, 'rows') else {})
+-                    if keys is None:
+-                        self.known_keys[scope] = captured
+-                    else:
+-                        known = self.known_keys.setdefault(scope, {})
+-                        for key in keys:
+-                            known.pop(key, None)
+-                        known.update(captured)
++                    if scope not in self.remote_incomplete:
++                        self._remember(scope, first.profile, batch, keys)
+                     live = [a for a in group if not a.closed]
+                     for action in live:
+                         self.catchup.discard(action)
+@@ -281,6 +281,20 @@ class Scheduler:
+                 for action in live:
+                     action.wake()
+ 
++    def _remember(self, scope, profile_name, batch, keys):
++        from tui_gateway.kanban_remote_notices import _linked_chats
++        captured = ({(gw, key): tuple(sid for profile, sid in _linked_chats(task, batch.me)
++                                      if profile == profile_name)
++                     for gw, key, task in json.loads(batch.rows)}
++                    if hasattr(batch, 'rows') else {})
++        if keys is None:
++            self.known_keys[scope] = captured
++        else:
++            known = self.known_keys.setdefault(scope, {})
++            for key in keys:
++                known.pop(key, None)
++            known.update(captured)
++
+     def _local_obligation(self, scope, group, failed):
+         """Record or clear failed-board discovery; healthy boards were already delivered."""
+         marker = tuple(sorted(failed))
+-- 
+2.43.0
+
