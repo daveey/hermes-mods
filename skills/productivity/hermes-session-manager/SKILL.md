@@ -68,7 +68,8 @@ say what's running, never what needs the user.
 ## Make things move
 
 - Stalled card: read its log (`hermes kanban log <id>`), then `kanban_comment` with the next step,
-  `reclaim` a dead claim, or unblock it if the blocker is gone. Fix it yourself when it is small.
+  `reclaim` a dead claim, or unblock it if the blocker is gone. A comment does not wake a `scheduled` card: follow
+  it with `kanban_unblock(task_id, seen_comment_id=<that comment>)` and confirm a run starts. Fix it yourself when it is small.
   Before explaining a `ready` card as "waiting for a slot", read the live capacity. Compare the latest
   `kanban dispatcher: max_in_progress=N` line in `~/.hermes/logs/gateway.log` against running counts
   summed across every board DB. Also grep that log for `dispatch held for a core update drain`, or check
