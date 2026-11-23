@@ -3266,6 +3266,15 @@ class ActionStore:
                         or op.get('error') not in (BUSY_ERROR, OWNER_WAIT_ERROR)
                         or any(ref['type'] == 'kanban' for ref in op['intent']['request']['aliases'])):
                     continue
+                if op['dispatchState'] == 'pending':
+                    # Older writers retained a prior refusal across new receiver
+                    # I/O. A released lease proves no live writer, NOT that a
+                    # dead writer never admitted/cancelled the decision. Only a
+                    # refusal recorded after the latest attempt can qualify.
+                    started = op.get('dispatchStartedAt')
+                    refused = (op.get('lastError') or {}).get('at')
+                    if not started or not refused or refused < started:
+                        continue
                 # No external admission: the durable inbox is the receiver for
                 # this turn. Reuse dispatch's readback and request-state settlement.
                 results.append(self._dispatch(owner, oid, inbox))
@@ -3293,6 +3302,9 @@ class ActionStore:
             from datetime import datetime, timezone
             op['dispatchStartedAt'] = datetime.now(timezone.utc).isoformat()
             op['dispatchState'] = 'pending'
+            # The previous refusal says nothing about this attempt's external
+            # I/O. A crash must leave uncertainty, not reusable refusal evidence.
+            op.pop('error', None); op.pop('lastError', None)
             c.execute('UPDATE operations SET body=? WHERE id=?', (_json(op), oid))
         receipt = None
         confirmed = False
