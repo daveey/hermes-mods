@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import fcntl
 import glob
-import json
 import logging
 import math
 import os
@@ -31,7 +30,7 @@ import time
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
-from .store import RETENTION_S, Store, minute_of
+from .store import RETENTION_S, Store, batch_rows, minute_of
 
 log = logging.getLogger("hermes.plugins.throughput")
 
@@ -113,32 +112,14 @@ _MODELS_SQL = ("SELECT session_id, COALESCE(NULLIF(TRIM(model),''),'unknown'), "
 
 
 def _batch_rows(c: sqlite3.Connection, sql: str, width: int, parameters=()):
-    """Transfer a numeric/text result with one SQLite/Python boundary.
+    """Transfer a numeric/text result with one SQLite/Python boundary (``store.batch_rows``).
 
     fetchall still releases/reacquires the GIL for every SQLite row. In a busy
     process with other SQLite readers that dominates the full snapshot's CPU.
-    Keep the original SELECT (including its aggregation and NULL semantics) and
-    decode its rows in one batch. json.loads preserves integer precision.
-    Older SQLite builds, legacy BLOB identifiers and REAL results retain the
-    original path: SQLite's JSON float formatting can change Python int rounding,
-    including when addition of INTEGER token columns overflows into REAL.
+    REAL results (addition of INTEGER token columns can overflow into REAL) keep
+    their exact value: see ``store.batch_rows``.
     """
-    columns = ','.join(f'c{i}' for i in range(width))
-    has_real = ' OR '.join(f"typeof(c{i})='real'" for i in range(width))
-    query = (f'WITH data({columns}) AS ({sql}) '
-             f'SELECT CASE WHEN MAX({has_real}) THEN NULL ELSE '
-             f'json_group_array(json_array({columns})) END FROM data')
-    try:
-        encoded = c.execute(query, parameters).fetchone()[0]
-        if encoded is None:
-            return c.execute(sql, parameters).fetchall()
-        return json.loads(encoded)
-    except sqlite3.OperationalError as exc:
-        message = str(exc).lower()
-        if not (message.startswith('no such function: json_') or
-                'json cannot hold blob values' in message):
-            raise
-        return c.execute(sql, parameters).fetchall()
+    return batch_rows(c, sql, width, parameters)
 
 
 def model_capable(c: sqlite3.Connection) -> bool:

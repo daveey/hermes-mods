@@ -11,6 +11,8 @@ covered instead of being lost.
 from __future__ import annotations
 
 import contextlib
+import json
+import math
 import sqlite3
 import threading
 from pathlib import Path
@@ -29,6 +31,79 @@ CREATE TABLE IF NOT EXISTS counters (
     PRIMARY KEY (gateway, metric)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
+
+# Power-of-two scales tried for a REAL (see batch_rows). A double x with 2**e <= |x| < 2**(e+1) has 53 significant
+# bits, so x * 2**K is an integer below 2**63 for every K in [52 - e, 62 - e]: steps of 10 always hit one for
+# 2**-38 <= |x| < 2**63 (timestamps, percentages, token sums); smaller values fit when they have fewer low bits.
+REAL_SCALES = tuple(range(0, 100, 10))
+
+
+def _scaled(col: str, k: int) -> str:
+    """SQL for ``col * 2**k`` as products of exact integer literals (each power of two, at most 2**60)."""
+    return f"({col} * {2 ** min(k, 60)}" + (f" * {2 ** (k - 60)})" if k > 60 else ")")
+
+
+def _real_sql(col: str) -> str:
+    """``'K:m'`` with ``col == m * 2**-K`` exactly, or NULL when no ``REAL_SCALES`` K makes it an int64."""
+    tries = ", ".join(f"CASE WHEN {_scaled(col, k)} = CAST({_scaled(col, k)} AS INTEGER) "
+                      f"THEN '{k}:' || CAST({_scaled(col, k)} AS INTEGER) END" for k in REAL_SCALES)
+    return f"COALESCE({tries})"
+
+
+def batch_query(sql: str, width: int) -> str:
+    """The single-row query ``batch_rows`` runs for ``sql`` (``decode_batch`` reads its value)."""
+    columns = ','.join(f'c{i}' for i in range(width))
+    flags = "''||" + '||'.join(f"(typeof(c{i})='real')" for i in range(width))  # '0010': column 2 is REAL
+    values = ','.join(f"CASE WHEN typeof(c{i})='real' THEN {_real_sql(f'c{i}')} ELSE c{i} END" for i in range(width))
+    unsent = ' OR '.join(f"(substr(f, {i + 1}, 1) = '1' AND v{i} IS NULL)" for i in range(width))
+    return (f"WITH data({columns}) AS ({sql}), "
+            f"enc(f, {','.join(f'v{i}' for i in range(width))}) AS (SELECT {flags}, {values} FROM data) "
+            f"SELECT CASE WHEN MAX({unsent}) THEN NULL ELSE "
+            f"json_group_array(json_array(f, {','.join(f'v{i}' for i in range(width))})) END FROM enc")
+
+
+def decode_batch(encoded: str) -> list:
+    out = []
+    for flags, *values in json.loads(encoded):
+        if '1' in flags:
+            values = [v if f != '1' else _real(v) for f, v in zip(flags, values)]
+        out.append(values)
+    return out
+
+
+def _real(text: str) -> float:
+    k, m = text.split(':')
+    return math.ldexp(float(int(m)), -int(k))  # m has at most 53 significant bits: both steps are exact
+
+
+def batch_rows(c: sqlite3.Connection, sql: str, width: int, parameters=()) -> list:
+    """``c.execute(sql, parameters).fetchall()``'s values, transferred as ONE SQLite row.
+
+    Every SQLite row a cursor returns releases and re-takes the GIL. Inside the busy Desktop backend (one process,
+    ~190 threads) each re-take can wait a whole switch interval (5 ms), so a read of a few thousand rows that takes
+    40 ms standalone takes seconds there. Here the original SELECT (filtering, aggregation and NULL semantics
+    unchanged) runs inside ``json_group_array`` and Python decodes one JSON text without releasing the GIL per row.
+
+    Values keep their Python types and values: INTEGER (any size; json.loads keeps integer precision) -> int,
+    TEXT -> str, NULL -> None, REAL -> float. No decimal text carries a REAL (JSON keeps 15 digits, and SQLite's
+    printf/quote are not correctly rounded on every build: 3.50.4 misrenders ~10 % of random doubles): a REAL x
+    travels as integers ``K:m`` with ``x == m * 2**-K``, found in SQL with exact operations only (scaling by a
+    power of two, integer CAST, SQLite's exact INTEGER/REAL comparison). If some REAL fits no ``REAL_SCALES`` K
+    (|x| >= 2**63, infinities, values with bits below 2**-90) the whole result takes the row path. A REAL -0.0
+    comes back as 0.0: callers read REAL-affinity columns (SQLite stores -0.0 there as integer 0) or sums of them,
+    which never produce -0.0. BLOB values, and SQLite without JSON functions, also use the row path. Rows come back
+    in the statement's order, as lists (tuples on the row path)."""
+    try:
+        encoded = c.execute(batch_query(sql, width), parameters).fetchone()[0]
+        if encoded is None:
+            return c.execute(sql, parameters).fetchall()
+        return decode_batch(encoded)
+    except sqlite3.OperationalError as exc:
+        message = str(exc).lower()
+        if not (message.startswith('no such function: json_') or
+                'json cannot hold blob values' in message):
+            raise
+        return c.execute(sql, parameters).fetchall()
 
 
 def minute_of(t: float) -> int:
@@ -235,14 +310,18 @@ class Store:
 
     def bucketed_sampled(self, since: int, until: int, bucket_s: int):
         """``(sums, sampled)``: ``bucketed`` plus ``{(gateway, metric): [sampled minutes per bucket]}``, so a
-        partly sampled bucket's rate can be its sum over the sampled minutes, not over the whole bucket."""
+        partly sampled bucket's rate can be its sum over the sampled minutes, not over the whole bucket.
+
+        One (gateway, metric, bucket) group per result row: thousands of rows (7d: ~4.6k, 1h: ~1.9k on the hub),
+        so they cross into Python as one ``batch_rows`` row."""
         n = (until - since) // bucket_s
         out: dict[tuple[str, str], list[Optional[float]]] = {}
         cover: dict[tuple[str, str], list[int]] = {}
         with self._conn() as c:
-            rows = c.execute(
-                "SELECT gateway, metric, (minute - ?) / ?, SUM(value), COUNT(value) FROM minutes "
-                "WHERE minute >= ? AND minute < ? AND metric NOT GLOB '*:*' GROUP BY 1, 2, 3", (since, bucket_s, since, until)).fetchall()
+            rows = batch_rows(
+                c, "SELECT gateway, metric, (minute - ?) / ?, SUM(value), COUNT(value) FROM minutes "
+                "WHERE minute >= ? AND minute < ? AND metric NOT GLOB '*:*' GROUP BY 1, 2, 3", 5,
+                (since, bucket_s, since, until))
         for g, m, b, total, sampled in rows:
             arr = out.setdefault((g, m), [None] * n)
             cov = cover.setdefault((g, m), [0] * n)

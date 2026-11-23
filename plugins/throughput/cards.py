@@ -14,7 +14,10 @@
 
 The replica ``tasks`` tables have no index on created_at/completed_at; one scan of ~10k rows is ~20 ms and the
 result is cached for 30 s. The per-card last-claim lookup uses ``idx_events_task (task_id, created_at)`` and is
-memoized per completed card (a completed card's last claim never changes).
+memoized per completed card (a completed card's last claim never changes). Every read crosses into Python as one
+``store.batch_rows`` row (the hub's 8-day window is ~5k created + ~5k done cards: per-row transfers cost seconds
+of GIL waits inside the Desktop backend), and the claims of not-yet-memoized cards come in one batched statement
+in the same read snapshot as the done rows.
 """
 from __future__ import annotations
 
@@ -28,7 +31,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from .sampler import ro_connect
-from .store import RETENTION_S, minute_of
+from .store import RETENTION_S, batch_rows, minute_of
 
 EPHEMERAL = "ephemeral"
 UNATTRIBUTED = "unattributed"
@@ -110,10 +113,20 @@ def learn_boot_map(votes: Iterable[tuple[str, Optional[str]]], known: Optional[s
     return out
 
 
-def _last_claim(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='claimed' "
-                       "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
-    return row[0] if row else None
+_CLAIM_CHUNK = 500  # bound parameters per statement (old SQLite builds allow 999)
+
+
+def _last_claims(conn: sqlite3.Connection, task_ids: list[str]) -> dict[str, Optional[str]]:
+    """``{task_id: payload of its last 'claimed' event or None}`` for tasks of this replica, one batched statement
+    per ``_CLAIM_CHUNK`` ids (a first build looks up every done card of the window: ~5k on the hub board)."""
+    out: dict[str, Optional[str]] = {}
+    for i in range(0, len(task_ids), _CLAIM_CHUNK):
+        part = task_ids[i:i + _CLAIM_CHUNK]
+        marks = ",".join("?" * len(part))
+        out.update((tid, payload) for tid, payload in batch_rows(
+            conn, "SELECT t.id, (SELECT payload FROM task_events WHERE task_id=t.id AND kind='claimed' "
+                  f"ORDER BY created_at DESC, id DESC LIMIT 1) FROM tasks t WHERE t.id IN ({marks})", 2, part))
+    return out
 
 
 class Cards:
@@ -164,15 +177,17 @@ class Cards:
             except sqlite3.Error:
                 continue
             try:
-                for t, on in c.execute("SELECT created_at, created_on FROM tasks WHERE created_at >= ?", (since,)):
-                    created.append((t, on))
-                for tid, t, on in c.execute(
-                        "SELECT id, completed_at, created_on FROM tasks WHERE completed_at >= ? "
-                        "AND status IN ('done','archived')", (since,)):
+                c.execute("BEGIN")  # one read snapshot: the done rows and the claims looked up for them
+                created.extend((t, on) for t, on in batch_rows(
+                    c, "SELECT created_at, created_on FROM tasks WHERE created_at >= ?", 2, (since,)))
+                done = batch_rows(c, "SELECT id, completed_at, created_on FROM tasks WHERE completed_at >= ? "
+                                     "AND status IN ('done','archived')", 3, (since,))
+                fresh = _last_claims(c, [tid for tid, t, _ in done if (str(db), tid, float(t)) not in self._claims])
+                for tid, t, on in done:
                     key = (str(db), tid, float(t))
                     claim = self._claims.get(key)
                     if claim is None:
-                        claim = self._claims[key] = parse_claim(_last_claim(c, tid))
+                        claim = self._claims[key] = parse_claim(fresh.get(tid))
                     done_raw.append((t, claim))
                     if boot_uuid(claim[1]) and not claim[0]:
                         votes.append((boot_uuid(claim[1]), on))
