@@ -394,17 +394,61 @@ def test_turn_and_dispatch_share_delivery_lease_and_replay_once(turn_delivery, m
         assert c.execute('SELECT COUNT(*) FROM deliveries WHERE id=?', (oid,)).fetchone()[0] == 1
 
 
-def test_pending_after_interrupted_refused_retry_joins_next_turn(turn_delivery):
+def test_interrupted_retry_is_uncertain_not_a_fresh_refusal(turn_delivery):
     plugin, s = turn_delivery
     r = s.create(OWNER, request())
     oid = s.decide(OWNER, decision(r))['operation']['operationId']
     s.dispatch(OWNER, oid, BusyReceiver())
     class Interrupted:
-        def deliver(self, op): raise SystemExit('process exited before admission')
+        def deliver(self, op): raise SystemExit('process exited during admission')
     with pytest.raises(SystemExit): s.dispatch(OWNER, oid, Interrupted())
-    assert s.operation(OWNER, oid)['operation']['dispatchState'] == 'pending'
-    assert plugin.pre_llm_call(session_id='session-a', platform='desktop')['context'].count(oid) == 1
-    assert s.operation(OWNER, oid)['operation']['dispatchState'] == 'delivered'
+    before = s.operation(OWNER, oid)
+    assert before['operation']['dispatchState'] == 'pending'
+    assert plugin.pre_llm_call(session_id='session-a', platform='desktop') is None
+    assert s.operation(OWNER, oid) == before
+
+
+@pytest.mark.parametrize('later_attempt', [False, True])
+def test_legacy_pending_refusal_must_follow_latest_attempt(turn_delivery, later_attempt):
+    plugin, s = turn_delivery
+    r = s.create(OWNER, request())
+    oid = s.decide(OWNER, decision(r))['operation']['operationId']
+    op = s.dispatch(OWNER, oid, BusyReceiver())['operation']
+    # Historical writer: queueing a refused operation vs crashing after starting
+    # another attempt with the old error still persisted.
+    op['dispatchState'] = 'pending'
+    if later_attempt: op['dispatchStartedAt'] = '9999-01-01T00:00:00+00:00'
+    with s._tx() as c:
+        c.execute('UPDATE operations SET body=? WHERE id=?', (json.dumps(op), oid))
+    note = (plugin.pre_llm_call(session_id='session-a', platform='desktop') or {}).get('context', '')
+    assert (oid in note) is (not later_attempt)
+    assert s.operation(OWNER, oid)['operation']['dispatchState'] == ('pending' if later_attempt else 'delivered')
+
+
+@pytest.mark.parametrize('cancelled', [True, False])
+def test_crash_after_admission_never_reuses_old_busy_refusal(turn_delivery, cancelled):
+    plugin, s = turn_delivery
+    r = s.create(OWNER, request())
+    oid = s.decide(OWNER, decision(r))['operation']['operationId']
+    s.dispatch(OWNER, oid, BusyReceiver())
+    class Runs:
+        def deliver(self, op): return dict(deliveryId=op['operationId'], terminalCancelled=cancelled)
+        def readback(self, op, receipt): return receipt['deliveryId'] == op['operationId']
+    delivery = plugin.cards_mod.DecisionDelivery(runs=Runs())
+    class Interrupted:
+        def deliver(self, op):
+            receipt = delivery.deliver(op)
+            assert delivery.readback(op, receipt)
+            raise SystemExit('after canonical admission, before local settlement')
+    with pytest.raises(SystemExit): s.dispatch(OWNER, oid, Interrupted())
+    before = s.operation(OWNER, oid)
+    note = (plugin.pre_llm_call(session_id='session-a', platform='desktop') or {}).get('context', '')
+    assert oid not in note
+    assert s.operation(OWNER, oid) == before
+    # Only the canonical composite may recover its accepted/cancelled receipt.
+    done = s.dispatch(OWNER, oid, delivery)
+    assert done['operation']['dispatchState'] == ('cancelled' if cancelled else 'delivered')
+    assert done['operation']['receipt']['destination'] == 'canonical_decision_delivery'
 
 
 @pytest.mark.parametrize('choice,state,text', [('revise', 'superseded', 'Change the plan'),

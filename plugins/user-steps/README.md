@@ -777,14 +777,17 @@ not live, `pre_llm_call` attaches all such operations to that exact gateway,
 profile and stored session's next turn. It takes an exclusive delivery lease
 (conflicting with in-flight admission), records the existing operation identity in
 the durable inbox, verifies readback and uses dispatch's request-state transition
-with `destination=turn_context`. No second turn is admitted. An interrupted pending
-retry is eligible only after its lease is released and only if it retains the
-busy/owner-wait classification; fresh pending operations and unrelated transport
-failures are not acknowledged. Kanban aliases remain on their qualified delivery
+with `destination=turn_context`. No second turn is admitted. A queued legacy pending
+retry is eligible only after its lease is released and its refusal timestamp
+covers its latest started attempt. Starting receiver I/O clears earlier refusal
+evidence: a crash after admission is uncertain and must recover via canonical
+composite readback, never by assuming an old busy error is still authoritative.
+Fresh pending operations and unrelated transport failures are not acknowledged.
+Kanban aliases remain on their qualified delivery
 path. Existing canonical receipts stay visible without duplicate inbox rows or
 repeat delivery. Tests in `test_decisions.py` cover alternating busy/closed owners,
-all decisions in one turn, owner isolation, both lease directions and interrupted
-retry recovery. `open_steps` also follows an exact owner-qualified `user_step`
+all decisions in one turn, owner isolation, both lease directions, legacy queued
+refusals and crash-after-admission/cancellation recovery. `open_steps` also follows an exact owner-qualified `user_step`
 alias when a legacy session-outcome ledger step lacks `requestId`: a decided or
 retired canonical request no longer leaves that step in the outcome's human asks.
 This is read-only projection, not a synthetic model decision or ledger mutation;
