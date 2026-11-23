@@ -3,10 +3,17 @@ import threading
 
 import pytest
 
-from test_core_readers import api, board, kanban_db, readers_for
+from test_core_readers import api, board, kanban_db, readers_for as core_readers_for
 from test_feed import feedmod
 from test_snapshot_acquisition import acquisition
 from test_partial_projection_core import action_core
+
+
+def readers_for(api, path, monkeypatch):
+    # Core's hub_db_path does not follow HERMES_HOME. Real replica-stat changes
+    # on the executing worker are genuine renewing inputs, not quiet retries.
+    monkeypatch.setenv('HERMES_HUB_STATE', str(path.parent / 'hub-state'))
+    return core_readers_for(api, path, monkeypatch)
 
 
 @pytest.mark.parametrize('retirement', ['withdraw', 'deleted_session', 'approve'])
@@ -140,7 +147,7 @@ def test_source_failure_budget_survives_full_and_beat_without_false_fresh(api, b
             now[0] += 30
             f.beat()
             assert 'S' not in pushes[-1]['fresh']
-        assert len(calls) == 4, 'full/beat renewed an exhausted strict-source budget'
+        assert len(calls) == 4, ('full/beat renewed an exhausted strict-source budget', calls)
         assert lane.store.pin(lane.chats['S'])[1].missing_scopes
         resumed_pushes = []
         resumed = feedmod.Feed(r, emit=resumed_pushes.append, clock=lambda: now[0]).resume(f)
