@@ -205,14 +205,15 @@ class SwapCLI(unittest.TestCase):
         self.assertIn('row loss in session_change', result.stderr)
 
 
-    def test_throughput_cursor_policy_without_core(self):
+    def test_derived_cursor_policy_without_core(self):
         # Public CI has no core. Exercise the exact-name policy there as well as
         # the real SessionDB/recovery/CLI integration below on core-equipped hosts.
         spec = importlib.util.spec_from_file_location('swap_policy_fixture', SCRIPT)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        for table in ('throughput_revision', 'throughput_anchors', 'throughput_changes'):
+        for table in ('throughput_revision', 'throughput_anchors', 'throughput_changes',
+                      'session_content_change', 'session_content_revision'):
             with self.subTest(table=table):
                 self.add(self.db, f'CREATE TABLE {table}(id TEXT); INSERT INTO {table} VALUES("old"),("history");')
                 self.add(self.replacement, f'CREATE TABLE {table}(id TEXT); INSERT INTO {table} VALUES("new");')
@@ -224,12 +225,16 @@ class SwapCLI(unittest.TestCase):
                 with self.assertRaisesRegex(module.Refusal, 'replacement lacks durable/unknown tables'):
                     module._policy(self.db, self.replacement, recovered=False, ack=True)
                 self.add(self.db, f'DROP TABLE {table};')
-        self.add(self.db, 'CREATE TABLE throughput_unknown(id TEXT); INSERT INTO throughput_unknown VALUES("durable");')
-        with self.assertRaisesRegex(module.Refusal, 'replacement lacks durable/unknown tables'):
-            module._policy(self.db, self.replacement, recovered=True, ack=True)
-        self.add(self.replacement, 'CREATE TABLE throughput_unknown(id TEXT); INSERT INTO throughput_unknown VALUES("changed");')
-        with self.assertRaisesRegex(module.Refusal, 'content changed in throughput_unknown'):
-            module._policy(self.db, self.replacement, recovered=True, ack=True)
+        for table in ('throughput_unknown', 'session_content_unknown'):
+            with self.subTest(unknown=table):
+                self.add(self.db, f'CREATE TABLE {table}(id TEXT); INSERT INTO {table} VALUES("durable");')
+                with self.assertRaisesRegex(module.Refusal, 'replacement lacks durable/unknown tables'):
+                    module._policy(self.db, self.replacement, recovered=True, ack=True)
+                self.add(self.replacement, f'CREATE TABLE {table}(id TEXT); INSERT INTO {table} VALUES("changed");')
+                with self.assertRaisesRegex(module.Refusal, 'content changed in ' + table):
+                    module._policy(self.db, self.replacement, recovered=True, ack=True)
+                for path in (self.db, self.replacement):
+                    self.add(path, f'DROP TABLE {table};')
 
     @needs_proc
     def test_absent_session_cursor_tables_allowed_in_recovered_state(self):
@@ -455,6 +460,12 @@ class SwapCLI(unittest.TestCase):
             self.assertNotEqual(old_epoch, new.execute('SELECT epoch FROM throughput_revision').fetchone()[0])
             self.assertGreater(old.execute('SELECT count(*) FROM throughput_anchors').fetchone()[0],
                                new.execute('SELECT count(*) FROM throughput_anchors').fetchone()[0])
+            # Older supported cores predate the independent content cursor.
+            if old.execute("SELECT 1 FROM sqlite_master WHERE name='session_content_revision'").fetchone():
+                self.assertNotEqual(old.execute('SELECT epoch FROM session_content_revision').fetchone(),
+                                    new.execute('SELECT epoch FROM session_content_revision').fetchone())
+                self.assertNotEqual(old.execute('SELECT * FROM session_content_change').fetchall(),
+                                    new.execute('SELECT * FROM session_content_change').fetchall())
         self.successful(self.cli('--recovered-state', '--ack-runtime-loss'))
         with contextlib.closing(sqlite3.connect(self.db)) as con:
             self.assertEqual(con.execute('SELECT id FROM sessions').fetchall(), [('fixture-session',)])
