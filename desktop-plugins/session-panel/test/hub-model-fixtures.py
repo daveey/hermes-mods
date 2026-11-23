@@ -41,6 +41,7 @@ for choice in bound['choices']:
     choice['effect'] = 'answer'
 cases['bound_source'] = f.bundle(requests=[bound], gateway='source-gateway', gateway_aliases=['install:fixture-owner'])
 cases['bound_foreign'] = f.bundle(requests=[bound], gateway='other-gateway', gateway_aliases=['install:other'])
+cases['bound_partial_identity'] = f.bundle(requests=[bound], gateway='source-gateway', gateway_aliases=[])
 approval = f.request()
 approval.update(kind='approval', limits=[{'key': 'Runtime', 'value': 'LIMIT-4-HOURS', 'permissionRequired': True}],
                 exclusions=['EXCLUDED-SPEND'], outcomes={'approve': 'Stage A only', 'decline': 'No execution'})

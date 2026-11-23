@@ -757,6 +757,29 @@ test('connected foreign install owner uses real gateway-name lookup and verified
    assert.deepEqual(reads, [current.connectionId, 'foreign'])
  } finally { delete window.__sessionTasks; window.localStorage.clear(); m.resetFeedForTests() }
 })
+test('partial local identity retains verified discovery on the source connection', async () => {
+ window.localStorage.clear()
+ const q = structuredClone(publicCases.bound_partial_identity.model.sections.needs_you[0])
+ q.request_revision += 1950
+ const a = q.actions.find(a => a.kind === 'decide'); a.revision = q.request_revision
+ assert.equal(a.source_owner, false, 'missing installation aliases cannot establish source ownership')
+ const reads = [], posts = []
+ try {
+   await m.chooseModelOption(q, q.options[0], current, { call: async (path, opts) => {
+     if (path.endsWith('/decision-refresh')) return {}
+     if (!path.endsWith('/decisions')) {
+       reads.push(opts.connectionId)
+       return { request: { requestId: q.request_id, owner: a.owner } }
+     }
+     posts.push(opts)
+     return { request: { owner: a.owner, requestId: q.request_id, revision: q.request_revision, resolution: { operationId: 'partial-op' } },
+       operation: { operationId: 'partial-op', dispatchState: 'delivered', idempotencyKey: opts.body.idempotencyKey } }
+   } })
+   assert.deepEqual(reads, [current.connectionId])
+   assert.equal(posts.length, 1)
+   assert.equal(posts[0].connectionId, current.connectionId)
+ } finally { window.localStorage.clear(); m.resetFeedForTests() }
+})
 test('canonical click admission preserves foreign routing and rejects incomplete or changed bindings', async () => {
  let index = 0
  for (const variant of ['foreign', 'disconnected', 'scope', 'state', 'resolved', 'choice', 'effect', 'malformed', 'revision', 'server-stale', 'lost-post']) {
