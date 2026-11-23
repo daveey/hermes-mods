@@ -21,7 +21,10 @@ alone can hold many) and by chat-level asks (`us_*` item ids) that are not cards
 Remote cards are commented and unblocked on their own host; `cross_task` only reads and comments. The Desktop
 "For you" panel lists asks from every gateway; read another gateway's cards with `cross_task`, not this host's sqlite.
 - Macs: `tailnet_exec` with the tailnet host (`mbp`, `mini`), not the gateway name.
-- Workers: `~/.hermes/bin/hub-worker-exec worker-N -- bash -lc "hermes kanban comment <id> -- '...' && hermes kanban unblock <id>"`.
+- Workers: answer a parked decision with `cross_task` action=comment (hub courier). It wakes the card, and a
+  worker-local `hermes kanban comment` can leave a creator-decision park asleep. Unblock/promote run on the
+  worker: `~/.hermes/bin/hub-worker-exec worker-N -- bash -lc "hermes kanban unblock <id>"`. Rerun with the printed
+  `--seen <n>`; a `live lease` refusal means a run already claimed it, so leave it alone.
   A `foreign_card: ... was created on worker-aN and lives there` refusal on archive/edit is the same route:
   `hub-worker-exec worker-aN -- 'hermes kanban archive <id>'` (the `--` is required).
 - Live counts across gateways (the inventory printed `unreachable ...`, or the report needs this turn's statuses):

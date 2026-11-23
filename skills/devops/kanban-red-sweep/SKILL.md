@@ -61,8 +61,10 @@ Record gateway-local blocked-event IDs: replica event IDs are not owner event ID
 
 Classify decision-session items alongside cards. Re-test stale `us_*` premises and withdraw
 through the supported user-steps/action_request withdrawal route; never edit `state.db`.
-Operate remote cards on their owner gateway with supported tools/courier. Cross_task reads
-and (where live owner transport permits) comments; it does not unblock cards. Headless workers
+Operate remote cards on their owner gateway with supported tools/courier. To answer a parked
+card's decision, comment with `cross_task` (hub courier): a card waiting on its creator wakes on a
+courier-delivered comment, and a comment written locally on the worker can leave it parked.
+Unblock, promote, archive and edit still run on the owner host (`hub-worker-exec`); cross_task cannot. Headless workers
 must route missing host access to a capability owner rather than shelling around tool fences.
 
 Boards: `$HERMES_HOME/kanban.db` plus `$HERMES_HOME/kanban/boards/*/kanban.db`.
