@@ -725,7 +725,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         if row.get('unfinished') and state not in ACTIVE:
             state = 'unknown'
         row['status'] = state
-        if state in TERMINAL:
+        if state in TERMINAL and not (row.get('stale') or row.get('partial_source_unknown')):
             continue
         seen.add(k)
         v = row_view(row)
@@ -937,7 +937,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             sections['running' if ev.get('state') == 'running' else 'waiting'].append(v)
     done_seen = set()
     for row in sorted(bundle.get('done') or [], key=lambda r: number(r.get('completed_at')), reverse=True):
-        if row.get('status') not in ('done', 'archived') or row.get('unfinished') or row.get('stale'):
+        if row.get('status') not in ('done', 'archived') or row.get('unfinished') or row.get('stale') or row.get('partial_source_unknown'):
             continue
         k = key(row)
         if k in done_seen or k in seen:

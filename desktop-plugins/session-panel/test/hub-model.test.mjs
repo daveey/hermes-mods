@@ -136,6 +136,32 @@ test('ordinary waits and stale/blocked chip controls keep pips', async () => {
  assert.equal(stale.waitEta,null)
  for (const wait_state of ['human','stalled']) assert.notEqual(tasksEta.waitLook({wait_state,wait_kind:'clock',waiting_on:'the clock until tomorrow'}),'delivery')
 })
+const producerCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./status-producer-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
+test('real core status producer available for composed acceptance', { skip: !process.env.HERMES_CORE_SOURCE }, () => {
+ assert.equal(Object.keys(producerCases).length, 9)
+})
+for (const [name, { model, now, status }] of Object.entries(producerCases)) {
+ test(`real refresh_outcome through panel and mounted DOM: ${name}`, async () => {
+  await paint(m.renderModel(model, { now }))
+  assert.equal(model.header.source, 'canonical')
+  assert.deepEqual(model.header.status, status)
+  const active = name === 'active_local_turn', recovered = name === 'recovered_running', done = name === 'recovered_done'
+  const header = document.querySelector('[data-session-status]')
+  if (done) assert.equal(header, null, 'confirmed zero unfinished work hides the panel')
+  else assert.equal(header.textContent, model.header.label || model.header.state)
+  assert.equal(status.kind, done ? 'done' : active || recovered ? 'running' : ['LinksUnavailable', 'TimeoutError', 'expired_lease'].includes(name) ? 'unresolved' : 'waiting')
+  if (!active && !recovered && !done) {
+   assert.equal(status.coverage.state, 'unknown')
+   assert.ok(!['done', 'waiting', 'attention'].includes(status.presentation.stripe))
+   assert.equal(model.sections.running.length, 0)
+   assert.equal(model.sections.waiting[0].evidence_state, 'unknown')
+   assert.equal(document.querySelectorAll('[data-choice-id]').length, 0)
+   assert.ok(!document.querySelector('[data-session-status]').textContent.includes('interrupted'))
+  }
+  if (active) assert.ok(document.querySelector('[data-session-status]').textContent.includes('this chat’s agent is replying'))
+  if (recovered || done) assert.equal(status.coverage.state, 'complete')
+ })
+}
 const partialCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./partial-projection-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
 for (const kind of ['ci', 'deploy', 'clock']) {
  test(`held canonical ${kind} stays producer light-blue`, async () => {
