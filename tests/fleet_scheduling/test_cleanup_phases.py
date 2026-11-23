@@ -71,9 +71,13 @@ def box(tmp_path, monkeypatch):
     kernel_signals = []
     runner._kernel_signals = kernel_signals
     pidfd_send = signal.pidfd_send_signal
+    runner._kernel_identities = []
 
     def kernel_spy(*args, **kwargs):
         kernel_signals.append(args)
+        fields = dict(line.split(":", 1) for line in Path(f"/proc/self/fdinfo/{args[0]}").read_text().splitlines())
+        pid = int(fields["Pid"].strip())
+        runner._kernel_identities.append((pid, identity(pid), args[1]))
         return pidfd_send(*args, **kwargs)
 
     def spy(registry, pid, sig):
@@ -176,6 +180,41 @@ def test_cwd_change_after_registration_is_declared_relaxation(box, monkeypatch, 
     assert result["errors"] == [], result
     assert child.wait(timeout=5) == -signal.SIGKILL
     assert set(calls) == {parent.pid, child.pid}
+
+
+def test_nondumpable_after_registration_uses_pinned_identity(box, monkeypatch):
+    runner, root, spawn, calls, send = box
+    parent, child = spawn(marker=True), spawn()
+    birth = identity(child.pid)
+    pinned = []
+
+    def seam(registry, pid, sig):
+        calls.append(pid)
+        if pid == child.pid:
+            pinned.append((pid, registry.births[pid], sig))
+        send(registry, pid, sig)
+        if pid == parent.pid:
+            child.stdin.write(b"private\n")
+            child.stdin.flush()
+            assert child.stdout.readline() == b"private\n"
+            with pytest.raises(PermissionError):
+                os.readlink(f"/proc/{child.pid}/cwd")
+
+    monkeypatch.setattr(OwnedProcesses, "send", seam)
+    result = runner.cleanup_processes(root)
+    child_signals = [row for row in runner._kernel_identities if row[0] == child.pid]
+    if os.environ.get("FLEET_CLEANUP_RUNNER"):
+        # Historical control validates the exact old error and survivor before
+        # reaping our producer; the final assertions deliberately remain RED.
+        assert result["errors"] == [f"fixture descendant {child.pid} lost ownership marker; not signalled"]
+        assert child.poll() is None and pinned == [] and child_signals == []
+        child.kill()
+    assert child.wait(timeout=5) == -signal.SIGKILL
+    assert result["errors"] == [], result
+    assert pinned == [(child.pid, birth, signal.SIGKILL)]
+    assert child_signals == [(child.pid, birth, signal.SIGKILL)]
+    assert calls.count(child.pid) == 1
+    assert result["fixture_processes_remaining"] == []
 
 
 def test_registers_every_candidate_before_first_signal(box, monkeypatch):
