@@ -54,6 +54,38 @@ def observed(row, kind='card', state='running'):
     return {**row, 'execution_observations': [{'identity': {'kind': kind, 'work_id': row['id'], 'gateway': row.get('gateway'), 'profile': row.get('profile'), 'board': row.get('board')}, 'state': state}]}
 
 
+def test_click_admission_is_canonical_owner_bound_and_revisioned():
+    r = request()
+    r['owner']['gatewayId'] = 'install:source'
+    r['scope']['complete'] = True
+    r['choices'][0]['effect'] = 'answer'
+    b = bundle(requests=[r], gateway='source', gateway_aliases=['install:source'])
+    original = copy.deepcopy(b)
+    first = model.reduce_panel(b, now=NOW)
+    action = first['sections']['needs_you'][0]['actions'][-1]
+    assert action['source_owner'] is True
+    assert action['owner'] == r['owner']
+    assert action['admission'] == {
+        'state': 'open', 'resolved': False, 'scope_complete': True,
+        'choices': [{'id': c['id'], 'effect': c.get('effect'), 'label': c['label']} for c in r['choices']]}
+    assert b == original
+    unbound = model.reduce_panel(bundle(requests=[r]), now=NOW)
+    assert 'admission' not in unbound['sections']['needs_you'][0]['actions'][-1]
+    assert first['revision'] == model.reduce_panel(b, now=NOW)['revision']
+    b['gateway_aliases'] = ['install:foreign']
+    foreign = model.reduce_panel(b, now=NOW)
+    assert foreign['sections']['needs_you'][0]['actions'][-1]['source_owner'] is False
+    assert foreign['revision'] != first['revision']
+    for invalid in (False, None, 'true'):
+        r['scope']['complete'] = invalid
+        assert model.reduce_panel(b, now=NOW)['sections']['needs_you'][0]['actions'][-1]['admission']['scope_complete'] is False
+    r['scope'].update(complete=True, markdown=' ')
+    assert model.reduce_panel(b, now=NOW)['sections']['needs_you'][0]['actions'][-1]['admission']['scope_complete'] is False
+    r['state'] = 'resolved'
+    r['resolution'] = {'operationId': 'done'}
+    assert not model.reduce_panel(b, now=NOW)['sections']['needs_you']
+
+
 def test_own_letter_ask_eve_shape_and_canonical_ids():
     b = bundle(task(human_request=human(), wait={'wait_state': 'human'}), requests=[request()])
     m = model.reduce_panel(b, now=NOW)

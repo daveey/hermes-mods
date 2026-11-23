@@ -612,16 +612,33 @@ const modelApi = (path, opts) => window.hermesDesktop.api({ path, timeoutMs: 10_
 export async function chooseModelOption(row, option, sourceRoute, { call = modelApi } = {}) {
   const clicked = performance.now()
   const action = row.actions.find(a => a.kind === 'decide')
-  if (!row.request_id || !action?.owner || action.request_id !== row.request_id || action.revision !== row.request_revision || !option.choice_id) throw Error('No canonical decision binding')
+  if (!row.request_id || !action?.owner || !['gatewayId', 'profile', 'storedSessionId'].every(k => typeof action.owner[k] === 'string' && action.owner[k]) || !Number.isSafeInteger(action.revision) || action.revision < 0 || action.request_id !== row.request_id || action.revision !== row.request_revision || !option.choice_id) throw Error('No canonical decision binding')
   const key = modelDecisionKey(row)
   if (modelDecisionStatus(row)?.locked) return
   modelDecisions.set(key, { locked: true, text: 'Checking decision owner…' }); modelChanged()
   try {
-    const { route, request } = await modelRequestRoute(action, sourceRoute, call)
+    // Modern models already contain canonical owner/revision/consent facts.
+    // Routing that published binding is local; the POST still revalidates it.
+    // Only old producers need the owner GET, never a fallback for corrupt facts.
+    let route, choices, state, resolved, scopeComplete, revision
+    if (action.admission !== undefined) {
+      const a = action.admission
+      if (!a || !Array.isArray(a.choices) || typeof a.scope_complete !== 'boolean' || typeof a.resolved !== 'boolean') throw Error('Invalid decision binding. Refresh the panel before choosing.')
+      const connectionId = action.source_owner === true ? sourceRoute.connectionId : tasksBridge()?.connectionForHubGateway?.(action.owner.gatewayId)
+      if (!connectionId) throw Error('The gateway that holds this question is not connected. Nothing was sent.')
+      route = { connectionId, profile: action.owner.profile, session: action.owner.storedSessionId }
+      ;({ choices, state, resolved } = a); scopeComplete = a.scope_complete; revision = action.revision
+    } else {
+      const found = await modelRequestRoute(action, sourceRoute, call)
+      route = found.route
+      const request = found.request
+      ;({ choices, state, revision } = request); resolved = !!request.resolution
+      scopeComplete = !!request.scope?.complete && !!request.scope.markdown?.trim()
+    }
     feedLog(`decision owner-ready elapsed_ms=${(performance.now()-clicked).toFixed(1)}`)
-    const choice = request.choices?.find(c => c.id === option.choice_id)
-    if (request.revision !== action.revision || request.state !== 'open' || request.resolution || !choice) throw Error('Request changed. Refresh the panel before choosing.')
-    if (['approve', 'answer'].includes(choice.effect) && (!request.scope?.complete || !request.scope.markdown?.trim())) throw Error('The complete scope is not available. No decision posted.')
+    const choice = choices?.find(c => c.id === option.choice_id)
+    if (revision !== action.revision || state !== 'open' || resolved || !choice || !['approve', 'answer', 'revise', 'decline'].includes(choice.effect)) throw Error('Request changed. Refresh the panel before choosing.')
+    if (['approve', 'answer'].includes(choice.effect) && !scopeComplete) throw Error('The complete scope is not available. No decision posted.')
     if (['revise'].includes(choice.effect) || choice.id === 'answer-text') throw Error('This choice needs text. Answer from the existing decision queue.')
     const decision = { session: route.session, expectedRevision: action.revision, choiceId: option.choice_id,
       ...(choice.effect === 'answer' ? { revisionText: choice.label } : {}), idempotencyKey: globalThis.crypto.randomUUID() }

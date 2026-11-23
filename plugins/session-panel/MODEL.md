@@ -270,7 +270,17 @@ order. Diagnostics distinguish unavailable extra inputs from a known empty sourc
 An `open_card` action has `target:{id,gateway,profile,board}`. A `decide` action
 has `request_id`, `revision`, `owner:{gatewayId,profile,storedSessionId}`. The
 renderer must route to that exact owner and use the existing user-steps decision
-POST, including its own idempotency key and revision check. It must not execute
+POST, including its own idempotency key and revision check. New producers also
+publish `source_owner` (a boolean established from the serving gateway's trusted
+install-id aliases) and `admission:{state,resolved,scope_complete,choices}`.
+`choices` contains canonical `{id,effect,label}` only; `scope_complete` requires
+literal true and nonblank canonical scope. Full consent text remains in Details.
+The renderer routes source-owned asks to the model's connection/profile; foreign
+asks require an already-known gateway connection. It does not discover an owner
+on the network on click. Missing admission from an older producer retains the
+verified GET path; malformed admission never falls back. This is a snapshot, not
+authority: the owner POST revalidates current revision, scope, choices and state.
+The renderer must not execute
 card scope, choice text, or arbitrary commands. Card asks not yet mirrored carry
 null request/choice IDs and no decide action: P3 widens the mirror. They retain
 Open card, never a fabricated answer binding.
