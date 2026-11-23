@@ -29,6 +29,8 @@ cases = {
     'subagents': f.bundle(subagents=[f.observed({'id': 'child', 'title': 'Research'}, 'subagent')]),
     'all_sections': f.bundle(f.task(human_request=f.human(), wait={'wait_state': 'human'}), f.task('t_stuck', status='scheduled', wait={'wait_state': 'stalled'}), f.task('t_ready', status='ready'), f.task('t_wait', status='blocked'), rentals=[{'id': 'box', 'name': 'Machine'}], done=[f.task('t_done', status='done')], outcome_json={'state': 'needs_user'}),
 }
+for state in ('dismissed', 'answered', 'withdrawn', 'open'):
+    cases['shared_human_' + state] = f.shared_human_bundle(state)
 parent, leaf = 't_1111111111111111', 't_2222222222222222'
 for name in ('agent_held_local', 'agent_held_replica', 'agent_held_spend'):
     cases[name]['cards']['t_abc123']['detail']['events'][0]['created_at'] = f.NOW - (5 * 3600 + 20 * 60)

@@ -942,8 +942,15 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
                                 terminal=TERMINAL, prefixes=dependency_prefixes)
     for group in groups:
         card = {**group, **obj(obj(obj(obj(bundle.get('cards')).get(group['id'])).get('detail')).get('task'))}
-        if human_owned(card) or live_request(card):
+        matches = [r for r in requests if any(_matches(card, a, same_gateway) for a in _aliases(r))]
+        # Canonical retirement outranks a preserved board human_request, just as
+        # for ordinary rows. Groups must never revive dismissed attention.
+        if live_request(card) or (human_owned(card) and not matches):
             group.update(section='needs_you', detail='waiting on you to answer the current request')
+        elif human_owned(card) and matches:
+            state = matches[0].get('state') or 'dismissed'
+            group.update(section='waiting', wait_kind='agent',
+                         detail=f"request {state} · waiting on this chat's agent to continue")
         elif not card.get('stale') and wait_info(card, now, wire=wire).get('kind'):
             group.update(section='waiting', wait_kind=wait_info(card, now, wire=wire)['kind'],
                          detail=wait_info(card, now, wire=wire)['text'])

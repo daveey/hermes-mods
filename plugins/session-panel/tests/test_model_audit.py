@@ -128,7 +128,7 @@ def test_reported_running_never_masks_real_expired_or_nonrunning_observation(obs
 
 def test_parked_remote_rows_show_their_true_state_without_a_provenance_tail():
     pytest.importorskip('hermes_cli.execution_observations')
-    for status, shown in (('scheduled', 'scheduled · its owner has not published what wakes it'), ('triage', 'in triage · waiting to be specified and promoted'),
+    for status, shown in (('scheduled', 'scheduled · its owner has not published what wakes it'), ('triage', "waiting on this chat's agent to decide: review the held scope and choose the next step · in triage · entry time unavailable"),
                           ('todo', 'not started')):
         row = task(f't_{status}', status, gateway='worker-a1', remote=True, source='replica', synced_at=NOW - 5)
         row['execution_observations'] = [placeholder(row)]
