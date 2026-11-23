@@ -1,5 +1,7 @@
 # Scope and dependency pitfalls
 
+- For silent triage reports, inspect the original stop, producer-ready event, owner publication envelope and destination transcript separately. A canonical `decision_retained.next_action` naming a chat does not prove a `spend_budget_decision_ready` was emitted or that the replica notice consumer admits triage. Check whether repair is behind stale-age/activity filtering before saying notification machinery is absent. Preserve restricted dependency edges: notifying a waiter must not convert incomplete parent acceptance into success. When tightening creation authority, seed genuine recorded creator/session provenance in compatibility fixtures; never globally monkeypatch the authority check off or strip its argument from subprocess creates to make unrelated tests pass.
+
 Reference for skill `five-whys`: its SKILL.md links this file from the step that needs it.
 
 ## Pitfalls
