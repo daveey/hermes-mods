@@ -477,6 +477,23 @@ def test_alias_projection_never_closes_unrelated_step(turn_delivery, mismatch):
     assert step['id'] in [v['id'] for v in plugin.core.open_steps('session-a', lg)]
 
 
+def test_session_outcome_provider_drops_migrated_alias_only_step(turn_delivery, monkeypatch):
+    plugin, s = turn_delivery
+    outcome = load_module('turn_outcome_provider', ROOT.parent / 'session-outcome' / '__init__.py')
+    monkeypatch.setattr(outcome, '_user_steps', lambda: plugin.core)
+    lg = plugin.core.Ledger()
+    step = plugin.core.add_step('session-a', 'Choose a configuration', ['One', 'Two'], ledger=lg)
+    r = s.migrate_step(OWNER, step)
+    assert not lg.read('session-a')['steps'][0].get('requestId')
+    assert outcome.provider('session-a')['decision_items'][0]['id'] == step['id']
+    label = r['choices'][0]['label']
+    oid = s.decide(OWNER, decision(r, choice=r['choices'][0]['id'], text=label))['operation']['operationId']
+    s.dispatch(OWNER, oid, BusyReceiver())
+    assert oid in plugin.pre_llm_call(session_id='session-a', platform='desktop')['context']
+    assert s.get(OWNER, r['requestId'])['state'] == 'resolved'
+    assert outcome.provider('session-a') is None
+
+
 class BusyReceiver:
     """Models the owning runtime refusing admission while the session is mid-turn."""
     def __init__(self): self.busy = True; self.delivered = []
