@@ -23,10 +23,7 @@ metadata:
 A broken chat has work no active producer can resolve. `plugins/session-repair` in hermes-mods scans these
 `BS-...` patterns every 15 min on the hub and sends findings to **Session repair**.
 
-Use it two ways:
-- **Diagnose one chat** the user points at: run the scanner (below), read the finding's evidence, apply the
-  section's fix. No finding but the chat is clearly stuck? Collect the evidence and add a pattern (last section).
-- **Act on the repair chat's findings**: each finding names its section; follow "Safe automatic fix" or "Fix card".
+Run the scanner for a stuck chat; follow the finding's fix section. If none matches, collect evidence before adding a pattern.
 - **Panel says "needs you" / blocked on the user, but no one asked anything**: check what core says before
   touching the card. Core's verdict is the session feed's `wait_state`/`waiting_on` (`hermes_cli.kanban_session_activity.session_tasks`)
   and, for scheduled cards, `kanban_wake_summary.wakes(conn, task)["blocks_for_human"]`. If core says agent-owned
@@ -61,7 +58,7 @@ any day, or a card the turns reported creating for that fingerprint, directly or
 `fix.open_fix_card`: comment there, never file a second card.
 
 Rules for every fix:
-- Re-read the card and nominated producer (`kanban_show <id>`); archived producers cannot deliver. Moved on = do nothing.
+- Re-read the card, producer and newer decisions: archived producers cannot deliver; answered asks need no duplicate wake. Report original-goal progress separately from chat activity or administrative repair—“running again” alone does not mean product progress.
 - For primary/local-board custody refusals, follow [board-custody diagnosis](references/board-custody-diagnosis.md) before delegating.
 - Use the Kanban tools/CLI only. Never edit a database, delete or archive a card, or kill/reclaim a live worker.
 - A safe fix that did not take becomes a fix card, and counts against the card cap.
