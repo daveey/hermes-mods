@@ -489,6 +489,21 @@ class Feed:
     def reducer(bundle, *, now):
         return _model().reduce_panel(bundle, now=now, wire=True)
 
+    def compose_board_sources(self, reader_factory, *, gateway, profile):
+        """Explicit disposable composition only; normal startup remains UNACTIVATED.
+
+        All board/full/catch-up routes share this owner once composed. No thread
+        starts until step/full/start_service. Rollback must close it first.
+        """
+        if getattr(self, '_source_coordinator', None) is not None:
+            return self._source_coordinator
+        modules = self.readers.snapshot_modules()
+        import importlib
+        module = importlib.import_module(modules.__package__ + '.source_coordinator')
+        owner = module.SourceCoordinator(self, reader_factory, gateway=gateway, profile=profile)
+        self._source_coordinator = self._board_lane = owner
+        return owner
+
     def project_board(self, store, chat, *, canonical_base, pin=None, seq=None, external_capture=()):
         """Explicit unactivated board/full/catch-up injection seam; no live reads.
 
@@ -519,6 +534,9 @@ class Feed:
         return results
 
     def compute(self, session: str, *, seq: Optional[int] = None, readers=None, base=None, stages=None) -> dict:
+        owner = getattr(self, '_source_coordinator', None)
+        if owner is not None and readers is None:
+            return owner.full([session])[session]
         seq = next(self._seq) if seq is None else seq  # assigned before the pass's first shared read
         read_at = self.clock()
         r = self.readers if readers is None else readers
@@ -702,6 +720,9 @@ class Feed:
         Reserve each session immediately before its reads, never queued behind unrelated sessions.
         Join after owned work so overlapping passes cannot form a cycle. Results stay joinable until publication.
         """
+        owner = getattr(self, '_source_coordinator', None)
+        if owner is not None:
+            return owner.full(list(dict.fromkeys(sessions)))
         owned, joined, out = {}, {}, {}
         ident = threading.get_ident()
         finished = False
@@ -878,6 +899,12 @@ class Feed:
                  age_only: bool = False, observations: Optional[dict] = None, watch_tokens=None,
                  _projections=None, _snapshot_store=None, _results=None, authoritative: bool = False) -> dict[str, dict]:
         """Store what was computed and push one batch (or a heartbeat when nothing changed and one is due)."""
+        owner = getattr(self, '_source_coordinator', None)
+        if owner is not None and not canonical_only and not age_only and _projections is None:
+            selected = {s: getattr(b, 'projection') for s, b in computed.items() if hasattr(b, 'projection')}
+            if selected:
+                _projections, _snapshot_store, _results = selected, owner.store, {}
+                computed = {s: b for s, b in computed.items() if s not in selected}
         # Resolve source-backed modules before borrowing the store publication
         # lock. Only immutable inputs and loaded pure helpers enter that borrow.
         projection_module = _projection() if _projections is not None else None
@@ -1245,6 +1272,44 @@ class Feed:
             self._admission_retry_at = self.clock() + RETRY_EVERY_S
             raise
 
+    def _producer_admission(self, watched, source_seen, redo, source_dirty, panel_dirty, now, *, lineage=None):
+        """Shared legacy/snapshot canonical admission; source reads never authorize consent.
+
+        Keep source-before-write, owed/deferred scopes and the 60s ceiling on
+        REAL source changes. Snapshot callers supply acquired lineage, not another
+        per-chat board hydration or a newer synthetic source clock.
+        """
+        read_lineage = self.readers.lineage if lineage is None else lineage
+        moved = source_seen != self._producer_seen
+        known = self.__dict__.setdefault('_producer_lineage', {})
+        safety = float(getattr(self.readers, 'reconcile_safety_s', 0))
+        timed_producer = {s for s in watched
+                          if (s in self._producer_pending and now >= self._producer_pending[s])
+                          or (safety and now - self._producer_at.get(s, now) >= safety)}
+        admitted = (set(redo) | timed_producer | set(source_dirty)
+                    | {s for s in watched if s not in self._reconcile_stamps}
+                    | (getattr(self, '_producer_carry', set()) & set(watched)))
+        owed = self.__dict__.setdefault('_producer_owed', set())
+        owed.update(panel_dirty)
+        lineages = {}
+        if moved:
+            admitted |= {s for s in watched
+                         if now - self._producer_at.get(s, float('-inf')) >= PRODUCER_FULL_EVERY_S}
+            with self.lock:
+                admitted |= self._reconcile_deferred
+                admitted |= {s for s in owed if s in self.interest}
+            lineages = {s: tuple(read_lineage(s) or [s]) for s in watched}
+            admitted |= {s for s, ids in lineages.items() if known.get(s) != ids}
+        else:
+            lineages = {s: tuple(read_lineage(s) or [s]) for s in admitted if s not in known}
+        if admitted or moved:
+            self._produce(watched, source_seen, admitted)
+            owed.difference_update(admitted)
+            with self.lock:
+                known.update((s, ids) for s, ids in lineages.items() if s in self.interest)
+            return self._panel_dirty(watched)
+        return set()
+
     def tick(self) -> int:
         """Settle a source pass atomically, with finite recovery of unread changes."""
         import copy
@@ -1297,6 +1362,9 @@ class Feed:
         Stored and pushed in chunks, the chats a reader is waiting for first: a click on a chat with no bundle is
         answered after its own compute, not after a whole sweep (requests arriving mid-pass are taken in between
         chunks)."""
+        owner = getattr(self, '_source_coordinator', None)
+        if owner is not None:
+            return owner.tick()
         now = self._last_pass = self.clock()
         self._wake.clear()  # before the drain: a request or write after this point wakes the next pass
         self._cold.clear()
@@ -1419,44 +1487,7 @@ class Feed:
         dirty.update(retry)
         dirty.update(panel_dirty)
         if scoped:
-            # Only chats whose own inputs moved are reconciled. `source_seen` was captured before the reads
-            # above, so a write that landed in between is already consumed into `source_dirty` although the
-            # stamp this pass holds predates it: those chats are admitted whether or not the stamp had moved.
-            moved = source_seen != self._producer_seen
-            known = self.__dict__.setdefault('_producer_lineage', {})
-            admitted = (set(redo) | timed_producer | source_dirty | {s for s in watched if s not in self._reconcile_stamps}
-                        | (getattr(self, '_producer_carry', set()) & set(watched)))
-            # A chat whose outcome/request stamp moved is reconciled with the source write behind it. When
-            # the stamp this pass holds predates that write, it is owed to the pass that sees the stamp move
-            # (a request-store write alone is not a source event and never runs the producer).
-            owed = self.__dict__.setdefault('_producer_owed', set())
-            owed.update(panel_dirty)
-            lineages = {}
-            if moved:
-                # The canonical producer reads clock/courier state and has a 60 s local-mirror
-                # fallback for inputs outside its key. Settling an unaffected source stamp must
-                # not starve those paths forever. Preserve their old source-event liveness with
-                # a per-chat ceiling, never an idle timer or an every-write global reconcile.
-                admitted |= {s for s in watched
-                             if now - self._producer_at.get(s, float('-inf')) >= PRODUCER_FULL_EVERY_S}
-                # Any source write re-admits producer work still owed after its retries ran out.
-                with self.lock:
-                    admitted |= self._reconcile_deferred
-                    admitted |= {s for s in owed if s in self.interest}
-                # Lineage changes (compression/membership) have no held-input signal. Compared with the
-                # lineage each chat was last reconciled under, not the held bundle's: a recompute may have
-                # adopted the new lineage in a pass whose stamp predated the write.
-                lineages = {s: tuple(self.readers.lineage(s) or [s]) for s in watched}
-                admitted |= {s for s, ids in lineages.items() if known.get(s) != ids}
-            else:
-                lineages = {s: tuple(self.readers.lineage(s) or [s]) for s in admitted if s not in known}
-            if admitted or moved:
-                self._produce(watched, source_seen, admitted)
-                owed.difference_update(admitted)
-                with self.lock:
-                    known.update((s, ids) for s, ids in lineages.items() if s in self.interest)
-                # The producer's own request writes must reach the presentation of the chats it reconciled.
-                dirty.update(self._panel_dirty(watched))
+            dirty.update(self._producer_admission(watched, source_seen, redo, source_dirty, panel_dirty, now))
         if not dirty:
             return len(self._publish({}, heartbeat=True))
         started = time.monotonic()

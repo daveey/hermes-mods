@@ -42,12 +42,26 @@ The model is a presentation snapshot, not authorization or execution authority.
 ## Unactivated snapshot acquisition capability
 
 [BOARD_SNAPSHOT.md](BOARD_SNAPSHOT.md) documents the memory-only `board-snapshot/1`
-store, scope-certified canonical acquisition seams and strict pure readers. This
-capability has no production consumer, scheduler, switch or activation. It does
+store, scope-certified canonical acquisition seams and strict pure readers. By
+default this capability has no production consumer, scheduler or activation. It does
 not replace the active freshness behavior below. Consumer integration must preserve
 canonical decisions and explicitly merge unknown source parts; strict snapshot
 readers raise on missing coverage rather than attest empty. No live latency or CPU
 acceptance follows from acquisition-only tests.
+
+## Unactivated reserved source composition
+
+[SOURCE_COORDINATOR.md](SOURCE_COORDINATOR.md) documents an explicitly composed
+coordinator which reallocates the existing four work slots to one local source,
+one strict external source and two pure projections. Once explicitly composed,
+board/compute/full/tick/catch-up share B1 acquisition and B2a immutable projection
+and publication fences. No deployed startup or handler composes it: the default
+runtime below is unchanged. Canonical requests/reconciliation remain independently
+owned and ordered; neither snapshot success nor a newer computation sequence is
+consent. Missing source coverage remains unknown and excluded from freshness.
+Genuine predecessor/reload, complete inclusion/lifecycle acceptance and B3
+activation/performance/native verification remain required, not implied by this
+capability. No wire version or Desktop classification changes.
 
 ## Board-source freshness
 

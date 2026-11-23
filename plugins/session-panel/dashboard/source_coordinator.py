@@ -1,0 +1,503 @@
+"""Explicitly composed, UNACTIVATED shared-source coordinator.
+
+Four existing work slots, reserved by role: local acquisition, strict external
+acquisition, and two pure projections. The service is completion driven and does
+no SQL. No default runtime caller composes this owner before activation review.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import logging
+import queue
+import threading
+import time
+
+log = logging.getLogger('session-panel')
+
+
+class BoardBundle(dict):
+    """In-process value carrying the exact projection to Feed's writer fence."""
+    def __init__(self, projection, module):
+        super().__init__(module.thaw(projection.bundle))
+        self.projection = projection
+
+
+@dataclass
+class Attempt:
+    stamp: object = None
+    demands: object = None
+    count: int = 0
+    retry_at: float | None = None
+
+
+@dataclass
+class Ticket:
+    ready: threading.Event = field(default_factory=threading.Event)
+    bundle: object = None
+    error: Exception | None = None
+
+
+class SourceCoordinator:
+    capacity = 2
+    visible_only = False
+
+    def __init__(self, feed, reader_factory, *, gateway, profile):
+        self.feed, self.reader_factory = feed, reader_factory
+        self.gateway, self.profile = gateway, profile
+        modules = feed.readers.snapshot_modules()
+        self.capture, self.module = modules, modules.snapshot
+        self.store = self.module.SnapshotStore()
+        self.sources = tuple(self.module.SourceKey(gateway, profile, board, 'local', str(path))
+                             for board, path in feed.readers.boards())
+        self.external = self.module.SourceKey(gateway, profile, 'default', 'hub-links',
+                                             str(feed.readers.state_db().parent))
+        for source in (*self.sources, self.external):
+            self.store.add_source(source)
+        self.lock = threading.RLock()
+        self.completed = queue.SimpleQueue()
+        self.pending, self.active, self.acquiring = {}, {}, {}
+        self.attempts = {s: Attempt() for s in (*self.sources, self.external)}
+        self.scope_attempts = {s: {} for s in self.attempts}
+        self.registration_attempt = Attempt()
+        self.projection_attempts = {}
+        self.chats, self.tokens, self.bases, self.tickets = {}, {}, {}, {}
+        self.canonical_dirty = {}
+        self._change_seq = 0
+        self.service_wake = threading.Event()
+        self.service_stop = threading.Event()
+        self.service_worker = None
+        self._local_stamp = self._external_stamp = None
+        self._local_requested = self._external_requested = True
+        self.closed = False
+
+    def start_service(self):
+        with self.lock:
+            if self.service_worker is not None or self.closed or self.feed.stopped.is_set():
+                return
+            self.service_worker = threading.Thread(target=self._serve,
+                name='session-panel-card-service', daemon=True)
+            self.service_worker.start()
+        self.service_wake.set()
+
+    def _serve(self):
+        while not self.service_stop.is_set() and not self.feed.stopped.is_set():
+            at = self.retry_at()
+            self.service_wake.wait(None if at is None else max(0., at - self.feed.clock()))
+            self.service_wake.clear()
+            if not self.service_stop.is_set() and not self.feed.stopped.is_set():
+                self.step()
+
+    def retry_at(self):
+        with self.lock:
+            ats = [a.retry_at for a in self.attempts.values() if a.retry_at is not None]
+            ats += [a.retry_at for a in self.projection_attempts.values() if a.retry_at is not None]
+            if self.registration_attempt.retry_at is not None:
+                ats.append(self.registration_attempt.retry_at)
+            return min(ats) if ats else None
+
+    def _queue(self, sessions):
+        for s in sessions:
+            if s in self.chats:
+                admission = self.store.pin(self.chats[s])[1]
+                signature = (admission.required_versions, admission.required_scopes,
+                             admission.required_failures, admission.missing_versions)
+                previous = self.projection_attempts.get(s)
+                if previous is None or previous.demands != signature:
+                    self.projection_attempts[s] = Attempt(demands=signature)
+                self.pending.setdefault(s, time.monotonic_ns())
+                self.feed._board_failures.add(s)
+
+    def _register(self, rd):
+        # Runs only in the single local acquisition slot. Lineage is source
+        # acquisition, never part of per-chat board projection.
+        with self.feed.lock:
+            wanted = dict(self.feed._watch_tokens)
+        lineages = {s: tuple(rd.lineage(s) or [s]) for s in wanted}
+        with self.lock:
+            if self.closed:
+                return
+            for s in list(self.chats):
+                if wanted.get(s) is not self.tokens[s]:
+                    chat = self.chats.pop(s)
+                    watch = self.store.pin(chat)[0].watches[chat]
+                    self.store.forget(chat, watch.opaque_watch_token)
+                    self.tokens.pop(s, None)
+                    self.bases.pop(s, None)
+                    self.pending.pop(s, None)
+                    self.projection_attempts.pop(s, None)
+            for s, token in wanted.items():
+                if self.feed._watch_tokens.get(s) is not token:
+                    continue
+                ids = lineages[s]
+                chat = self.module.ChatKey(self.gateway, self.profile, s)
+                changed = self.store.register([self.module.Watch(chat, '', ids, 0)])
+                self.chats[s], self.tokens[s] = chat, token
+                if changed:
+                    self._queue([s])
+                    self._changed([s])
+
+    def require(self, session, refs):
+        """Exact owner-qualified dependency expansion, never an ID-only lookup."""
+        with self.lock:
+            changed = self.store.require(self.chats[session], refs)
+            if changed:
+                self._queue([session])
+                self._local_requested = self._external_requested = True
+        self.service_wake.set()
+        self.feed._board.set()
+        return changed
+
+    def _changed(self, sessions):
+        for s in sessions:
+            self._change_seq += 1
+            self.canonical_dirty[s] = self._change_seq
+        self.feed._wake.set()
+
+    def _eligible(self, source, stamp):
+        demands = self.store.demands(source)
+        a = self.attempts[source]
+        scopes = self.scope_attempts[source]
+        for sid in set(scopes) - set(demands):
+            scopes.pop(sid)
+        for sid, demand in demands.items():
+            previous = scopes.get(sid)
+            if previous is None or previous.stamp != stamp or previous.demands != demand:
+                scopes[sid] = Attempt(stamp=stamp, demands=demand)
+        a.stamp, a.demands = stamp, demands
+        return any(v.count == 0 or (v.retry_at is not None and self.feed.clock() >= v.retry_at)
+                   for v in scopes.values())
+
+    def _settle_attempts(self, source, attempted, unknown):
+        scopes = self.scope_attempts[source]
+        for sid, attempt in scopes.items():
+            if sid not in unknown:
+                attempt.retry_at = None
+            elif sid in attempted:
+                attempt.retry_at = self.feed._backoff(attempt.count)
+        retries = [v.retry_at for v in scopes.values() if v.retry_at is not None]
+        self.attempts[source].retry_at = min(retries) if retries else None
+
+    def step(self):
+        if self.closed or self.feed.stopped.is_set():
+            return
+        self.feed._board.clear()
+        self.service()
+        rd = self.feed.readers
+        local_stamp = rd.board_stamps()
+        external_stamp = (local_stamp, rd.external_stamps())
+        state_stamp = rd._stat(rd.state_db())
+        with self.feed.lock:
+            membership = dict(self.feed._watch_tokens)
+        with self.lock:
+            if self.closed:
+                return
+            registration_stamp = (local_stamp, state_stamp, tuple(membership.items()))
+            reg = self.registration_attempt
+            if reg.stamp != registration_stamp:
+                reg.stamp, reg.count, reg.retry_at = registration_stamp, 0, None
+                self._local_requested = True
+            if external_stamp != self._external_stamp:
+                self._external_requested = True
+            self._local_stamp, self._external_stamp = local_stamp, external_stamp
+            self._launch('local', self._local_requested, self._acquire_local)
+            # Local registration establishes the frozen scope set first. It does
+            # not wait for external capture and subsequent local work is independent.
+            if self.chats:
+                self._launch('external', self._external_requested, self._acquire_external)
+        self.service()
+
+    def _launch(self, role, requested, target):
+        if role in self.acquiring:
+            return
+        if role == 'local':
+            reg = self.registration_attempt
+            if reg.count and (reg.retry_at is None or self.feed.clock() < reg.retry_at):
+                return
+            requested = requested or reg.retry_at is not None
+        sources = self.sources if role == 'local' else (self.external,)
+        stamp = self._local_stamp if role == 'local' else self._external_stamp
+        due = any(a.retry_at is not None and self.feed.clock() >= a.retry_at
+                  for s, a in self.attempts.items() if s in sources)
+        missing = any(self.store.pending(s) and self.attempts[s].demands != self.store.demands(s)
+                      for s in sources)
+        if not requested and not due and not missing:
+            return
+        if role == 'local':
+            self._local_requested = False
+        else:
+            self._external_requested = False
+        worker = threading.Thread(target=self._acquisition, args=(role, target, stamp),
+                                  name='session-panel-source-' + role, daemon=True)
+        self.acquiring[role] = worker
+        worker.start()
+
+    def _acquisition(self, role, target, stamp):
+        rd = None
+        try:
+            rd = self.reader_factory()
+            if role == 'local':
+                self._register(rd)
+                with self.lock:
+                    self.registration_attempt.count = 0
+                    self.registration_attempt.retry_at = None
+            target(rd, stamp)
+        except Exception as exc:
+            log.warning('session-panel %s acquisition failed', role, exc_info=True)
+            self.completed.put(('registration_error', role, exc))
+        finally:
+            if rd is not None:
+                rd.release()
+            self.completed.put(('acquisition_done', role, None))
+            self.service_wake.set()
+            self.feed._board.set()
+
+    def _capture_one(self, rd, source, stamp):
+        with self.lock:
+            if self.closed or not self._eligible(source, stamp):
+                return
+            demands = self.store.demands(source)
+            if not demands:
+                return
+            snapshot = self.store.pin(next(iter(demands)).chat)[0]
+            previous = snapshot.parts.get(source)
+            prior = self.store.version(source)
+            hint = self.capture.CaptureHints(prior, self.store.owner_token(source), self.feed.clock())
+            a = self.attempts[source]
+            a.count += 1
+            a.retry_at = None
+            attempted = set()
+            for sid, attempt in self.scope_attempts[source].items():
+                if attempt.count == 0 or (attempt.retry_at is not None and self.feed.clock() >= attempt.retry_at):
+                    attempted.add(sid)
+                    attempt.count += 1
+                    attempt.retry_at = None
+        try:
+            if source == self.external:
+                parts = rd.capture_external(demands, {}, snapshot.parts, hints={source: hint})
+                part, = parts
+                _, admissions = self.store.accept_external(part, prior)
+            else:
+                part = rd.capture_local(source, previous, demands, hint)
+                _, admissions = self.store.accept_local(part, prior)
+            with self.lock:
+                # Success does not renew a failure budget; only changed source /
+                # exact demand does. Unknown returned coverage is failed work.
+                unknown = self.store.pending(source)
+                self._settle_attempts(source, attempted, unknown)
+                if source == self.external:
+                    self.feed._board_capture_failures.update(sid.chat.session_id for sid in unknown)
+                self._queue(ad.chat.session_id for ad in admissions)
+                self._changed(ad.chat.session_id for ad in admissions)
+                self.completed.put(('source', source, part))
+        except Exception as exc:
+            with self.lock:
+                if not self.closed:
+                    accepted = self.store.fail(source, prior.source_generation, exc, demands, prior_version=prior)
+                    self._settle_attempts(source, attempted, set(demands))
+                    if accepted:
+                        self._queue(d.id.chat.session_id for d in demands.values())
+                        if source == self.external:
+                            self.feed._board_capture_failures.update(d.id.chat.session_id for d in demands.values())
+            log.warning('session-panel source capture failed: %s', source.producer, exc_info=True)
+
+    def _acquire_local(self, rd, stamp):
+        for source in self.sources:
+            if self.closed or self.feed.stopped.is_set():
+                break
+            self._capture_one(rd, source, stamp)
+
+    def _acquire_external(self, rd, stamp):
+        self._capture_one(rd, self.external, stamp)
+
+    def service(self):
+        with self.lock:
+            if self.closed or self.feed.stopped.is_set():
+                return
+            while True:
+                try:
+                    kind, key, value = self.completed.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == 'acquisition_done':
+                    self.acquiring.pop(key, None)
+                elif kind == 'projection_done':
+                    self.active.pop(key, None)
+                elif kind == 'registration_error':
+                    self.feed._board_capture_failures.update(self.feed.interest)
+                    if key == 'local':
+                        self.registration_attempt.count += 1
+                        self.registration_attempt.retry_at = self.feed._backoff(self.registration_attempt.count)
+                elif kind == 'source':
+                    if key == self.external:
+                        completed = {sid.chat.session_id for sid in value.receipt.coverage.completed_scopes}
+                        self.feed._board_capture_failures.difference_update(completed)
+            for s, attempt in self.projection_attempts.items():
+                if attempt.retry_at is not None and self.feed.clock() >= attempt.retry_at:
+                    self.pending.setdefault(s, time.monotonic_ns())
+                    attempt.retry_at = None
+            for s in sorted(self.pending, key=lambda s: (self.pending[s], s)):
+                if len(self.active) >= self.capacity:
+                    break
+                if s in self.active or s not in self.chats:
+                    continue
+                self.pending.pop(s)
+                worker = threading.Thread(target=self._project, args=(s,),
+                                          name='session-panel-projection-' + s[:12], daemon=True)
+                self.active[s] = worker
+                worker.start()
+
+    def _base(self, s, lineage):
+        with self.feed.lock:
+            held = self.feed.bundles.get(s, {}).get('bundle')
+        base = self.bases.get(s) or held
+        if base is not None and tuple(base['lineage']) == lineage:
+            return base
+        # Unknown canonical inputs are not a synthesized successful empty read.
+        self.feed._wake.set()
+        return {'session': s, 'lineage': list(lineage), 'canonical_seq': 0,
+                'requests': [], 'outcome_json': None, 'input_errors': ['canonical inputs unavailable']}
+
+    def _project(self, s):
+        tickets = []
+        try:
+            with self.lock:
+                chat = self.chats[s]
+                if self.tokens[s] is not self.feed._watch_tokens.get(s):
+                    return  # old store scope cannot adopt a replacement Feed token
+                pin = self.store.pin(chat)
+                lineage = pin[0].watches[chat].lineage_tuple
+                base = self._base(s, lineage)
+                tickets = self.tickets.pop(s, [])
+            projection = self.feed.project_board(self.store, chat, canonical_base=base, pin=pin)
+            results = self.feed.publish_projections(self.store, {s: projection})
+            result = results[s]
+            bundle = BoardBundle(projection, self.module)
+            with self.lock:
+                if result.disposition == 'superseded':
+                    self._queue([s])
+                elif (not projection.missing_scopes and s not in self.pending
+                      and self.store.current(projection.admission)):
+                    self.feed._board_failures.discard(s)
+                    self.feed._retry.discard(s)
+                if (result.disposition != 'superseded' and s not in self.pending
+                        and self.store.current(projection.admission)):
+                    self.projection_attempts.pop(s, None)
+            for ticket in tickets:
+                ticket.bundle = bundle
+        except Exception as exc:
+            self.feed._board_failures.add(s)
+            with self.lock:
+                attempt = self.projection_attempts.setdefault(s, Attempt())
+                attempt.count += 1
+                attempt.retry_at = self.feed._backoff(attempt.count)
+            for ticket in tickets:
+                ticket.error = exc
+            log.warning('session-panel pure projection failed: %s', s, exc_info=True)
+        finally:
+            for ticket in tickets:
+                ticket.ready.set()
+            self.completed.put(('projection_done', s, None))
+            self.service_wake.set()
+            self.feed._board.set()
+
+    def tick(self):
+        f = self.feed
+        now = f._last_pass = f.clock()
+        f._wake.clear()
+        f._cold.clear()
+        f._drain()
+        with f.lock:
+            f._expire(now)
+            watched = list(f.interest)
+            before = {s: f.bundles.get(s, {}).get('rev') for s in watched}
+        if not watched:
+            return 0
+        rd = f.readers
+        # Capture BEFORE asynchronous acquisition and canonical producer writes.
+        source_stamp = getattr(rd, 'reconciliation_stamp', None)
+        source_seen = source_stamp() if callable(source_stamp) else None
+        self.step()
+        with self.lock:
+            local = self.acquiring.get('local')
+        if local:
+            local.join()
+        self.service()
+        panel_dirty = f._panel_dirty(watched)
+        with self.lock:
+            captured_dirty = dict(self.canonical_dirty)
+            lineages = {s: self.store.pin(self.chats[s])[0].watches[self.chats[s]].lineage_tuple
+                        for s in watched if s in self.chats}
+        redo = set()
+        if f._reconcile_retry_at is not None and now >= f._reconcile_retry_at:
+            redo, f._reconcile_retry_at = set(f._reconcile_deferred), None
+        reconcile = getattr(rd, 'reconcile_sources', None)
+        if callable(reconcile) and callable(source_stamp):
+            if getattr(rd, 'reconcile_scoped', False):
+                panel_dirty.update(f._producer_admission(watched, source_seen, redo,
+                    set(captured_dirty), panel_dirty, now, lineage=lambda s: lineages.get(s, (s,))))
+            else:
+                f._produce(watched, source_seen, redo)
+        with self.lock:
+            # Do not consume another same-chat source admission while reconcile
+            # was blocked. A source result after this frozen read is still owed.
+            for s, version in captured_dirty.items():
+                if self.canonical_dirty.get(s) == version:
+                    self.canonical_dirty.pop(s, None)
+        with f.lock:
+            dirty = set(captured_dirty) | panel_dirty | f._retry.intersection(watched)
+            dirty.update(s for s in watched if s not in f.bundles)
+        if dirty:
+            f._attempted.update(dirty)
+            f._publish(self.full([s for s in watched if s in dirty]), heartbeat=True)
+        else:
+            f._publish({}, heartbeat=True)
+        with f.lock:
+            return sum(f.bundles.get(s, {}).get('rev') != before[s] for s in watched)
+
+    def full(self, sessions):
+        self.feed.watch(sessions)
+        self.step()
+        # Wait for owned LOCAL acquisition only. Strict external is deliberately
+        # never joined; unknown external coverage remains explicit in projection.
+        with self.lock:
+            local = self.acquiring.get('local')
+        if local:
+            local.join()
+        self.service()
+        rd = self.feed.readers
+        tickets = {}
+        try:
+            for s in sessions:
+                with self.lock:
+                    chat = self.chats[s]
+                    pin = self.store.pin(chat)
+                    lineage = pin[0].watches[chat].lineage_tuple
+                seq = next(self.feed._seq)  # before canonical read, never after
+                inputs = rd.panel_inputs(s, list(lineage))
+                base = {'session': s, 'lineage': list(lineage), 'canonical_seq': seq, **inputs}
+                with self.lock:
+                    self.bases[s] = base
+                    ticket = tickets[s] = Ticket()
+                    self.tickets.setdefault(s, []).append(ticket)
+                    self._queue([s])
+            self.service()
+            for ticket in tickets.values():
+                while not ticket.ready.wait(.1):
+                    if self.closed or self.feed.stopped.is_set():
+                        raise RuntimeError('snapshot owner stopped')
+                    self.service()
+            return {s: t.bundle for s, t in tickets.items() if t.error is None}
+        finally:
+            rd.release()
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            self.service_stop.set()
+            self.pending.clear()
+            workers = [*self.acquiring.values(), *self.active.values()]
+        self.service_wake.set()
+        for worker in [self.service_worker, *workers]:
+            if worker is not None and worker is not threading.current_thread():
+                worker.join(2)
+        self.store.close(self.store.epoch)
