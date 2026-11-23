@@ -418,7 +418,7 @@ export function formatClockText(parts, now = Date.now() / 1000) {
 }
 export function clockRow(row, now = Date.now() / 1000) {
   const result = { ...row }
-  for (const key of ['detail', 'text']) if (row.clock_text?.[key]) result[key] = formatClockText(row.clock_text[key], now)
+  for (const key of ['detail', 'nested_detail', 'text']) if (row.clock_text?.[key]) result[key] = formatClockText(row.clock_text[key], now)
   if (row.clock_text?.details) result.details = row.clock_text.details.map(parts => formatClockText(parts, now))
   if (row.decision) result.decision = clockRow(row.decision, now)
   return result
@@ -510,6 +510,41 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
       jsx('span', { style: { display: 'flex', gap: 8, paddingTop: 2 }, children: openLinks(row, own) })
     ] }, row.key)
   }
+  // The backend owns parent/depth. Keep classification/counts on the original
+  // section while drawing each row only once, beneath its published parent.
+  const entries = MODEL_SECTIONS.flatMap(([section]) => model.sections[section].map(row => ({ row, section })))
+  const nodes = new Map(entries.map(entry => [entry.row.key, entry]))
+  for (const row of model.groups || []) nodes.set(row.key, { row, section: row.section || 'waiting' })
+  const children = new Map()
+  for (const entry of entries) {
+    const parent = entry.row.parent
+    if (parent && nodes.has(parent)) children.set(parent, [...(children.get(parent) || []), entry])
+  }
+  const drawTree = ({ row: raw, section }, visited = new Set()) => {
+    if (visited.has(raw.key)) return null
+    const row = clockRow(raw, now)
+    if (raw.parent && nodes.has(raw.parent) && typeof row.nested_detail === 'string') row.detail = row.nested_detail
+    const next = new Set([...visited, raw.key])
+    return jsxs('div', { 'data-tree-node': row.key, 'data-tree-depth': row.depth || 0,
+      'data-tree-parent': row.parent || undefined, children: [
+      section === 'needs_you' ? askRow(row) : lineRow(row, section),
+      children.has(row.key) && jsx('div', { 'data-tree-guide': '', style: {
+        marginLeft: 9, paddingLeft: 15, borderLeft: '1px solid var(--border)', minWidth: 0
+      }, children: children.get(row.key).map(child => drawTree(child, next)) })
+    ] }, row.key)
+  }
+  const roots = new Map(MODEL_SECTIONS.map(([section]) => [section, []]))
+  const placedGroups = new Set()
+  for (const entry of entries) {
+    if (!entry.row.parent || !nodes.has(entry.row.parent)) roots.get(entry.section).push(entry)
+    else {
+      const parent = nodes.get(entry.row.parent)
+      if (parent.row.kind === 'blocker' && !placedGroups.has(parent.row.key)) {
+        roots.get(entry.section).push(parent)
+        placedGroups.add(parent.row.key)
+      }
+    }
+  }
   return jsxs('section', { 'data-session-panel': '', 'data-hub-model': model.revision, 'aria-label': 'Session status',
     'data-collapsed': collapsed ? '' : undefined,
     style: { minWidth: 0, width: '100%', color: 'var(--foreground)', maxHeight: '55vh', overflowY: 'auto', padding: collapsed ? '6px 12px 4px' : '6px 12px 8px', boxSizing: 'border-box',
@@ -535,9 +570,9 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
       ...MODEL_SECTIONS.map(([section]) => jsx('span', { 'data-model-count': section, hidden: true, children: model.header.counts[section] }, section))
     ] }),
     ...MODEL_SECTIONS.map(([section, label]) => {
-      if (collapsed || !model.sections[section].length) return false
+      if (collapsed || !roots.get(section).length) return false
       const heading = jsx('h3', { 'data-section': section.replaceAll('_', '-'), style: { display: 'inline', fontSize: 11, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', margin: 0, color: section === 'needs_you' ? ALERT_TEXT : section === 'stuck' ? SECTION_COLOR.stuck : 'var(--muted-foreground)' }, children: `${label} · ${model.header.counts[section]}` })
-      const rows = model.sections[section].map(raw => { const row = clockRow(raw, now); return section === 'needs_you' ? askRow(row) : lineRow(row, section) })
+      const rows = roots.get(section).map(entry => drawTree(entry))
       // Finished history stays one click away (closed by default), as before the cutover.
       if (section === 'done') return jsxs('details', { 'data-model-section': section, style: { marginTop: 12 }, children: [
         jsx('summary', { style: { margin: '0 0 6px', listStylePosition: 'inside', color: 'var(--muted-foreground)' }, children: heading }), ...rows

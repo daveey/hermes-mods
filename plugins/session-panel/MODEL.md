@@ -176,6 +176,33 @@ This fallback neither asserts canonical coverage nor authorizes execution or gre
 Desktop renders the backend state/label only for canonical or explicitly derived
 headers; older unmarked missing-status models retain the conservative unknown label.
 
+## Dependency outline (additive v1)
+
+Counted rows remain in their original section arrays, with optional `parent`
+(another node's owner-qualified key, or null) and `depth` (0–4). The pure reducer
+uses the same hydrated next-hop resolver as the blocking-card label: explicit
+primary producers win, canonical clock/CI/deploy waits are never replaced with
+graph ancestry, and no additional I/O occurs. Waiting, stuck, ready and needs-you
+cards attach to the nearest displayed dependency in any section. Walks are bounded
+to 80 visits; cycles and inconclusive bounded walks remain flat. Overflow at depth
+five starts a new root rather than hiding a row or inventing a shortcut edge.
+
+`groups` is an optional top-level array of non-counted `kind="blocker"` row nodes
+for at least two dependents sharing the nearest off-list blocker. They carry its
+hydrated title, status, gateway/location, exact open-card action and backend-authored
+state-square `section`. Their key is `blocker:` plus the owner-qualified card key.
+A single off-list dependent stays flat. Groups appear at the first child's section;
+cross-section children retain their own state squares and header counts/pips.
+
+New Desktop clients render each root and its children once, with indents and tree
+guides, moving children under displayed running/stuck parents. Panel collapse hides
+whole trees. Session-tasks chips may stay flat. The fallback `detail` is unchanged
+for old Desktop and flat consumers. Optional `nested_detail` suppresses only an
+exact repeated parent label in the nested view; other blockers, status, warnings,
+reasons and ages remain. `clock_text.nested_detail` uses the existing local-clock
+template contract. Missing parent fields render flat. Parent and depth are backend
+presentation, never execution/decision authority; ask bindings stay unchanged.
+
 ## Contract
 
 ```json
@@ -188,6 +215,7 @@ headers; older unmarked missing-status models retain the conservative unknown la
     "version": {"const": 1},
     "revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "diagnostics": {"type": "array", "items": {"type": "string"}},
+    "groups": {"$ref": "#/$defs/rows"},
     "header": {
       "type": "object", "required": ["state", "status", "source", "counts", "pips"],
       "properties": {
@@ -226,7 +254,12 @@ headers; older unmarked missing-status models retain the conservative unknown la
       "required": ["id", "key", "kind", "gateway", "profile", "board", "title", "detail", "details", "actions"],
       "properties": {
         "id": {"type": "string"}, "key": {"type": "string"},
-        "kind": {"enum": ["card", "question", "subagent", "process", "machine"]},
+        "kind": {"enum": ["card", "question", "subagent", "process", "machine", "decision", "blocker"]},
+        "parent": {"type": ["string", "null"]},
+        "depth": {"type": "integer", "minimum": 0, "maximum": 4},
+        "nested_detail": {"type": "string"},
+        "status": {"type": "string"},
+        "section": {"enum": ["needs_you", "stuck", "running", "waiting", "ready", "done"]},
         "gateway": {"type": "string"}, "profile": {"type": "string"}, "board": {"type": "string"},
         "title": {"type": "string"}, "detail": {"type": "string"},
         "details": {"type": "array", "items": {"type": "string"}},

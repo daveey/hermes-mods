@@ -1,6 +1,7 @@
 """Public structural goldens through the real P1 reducer, never private chat text."""
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 path = Path(__file__).resolve().parents[3] / 'plugins/session-panel/tests/test_model.py'
@@ -61,5 +62,16 @@ cases['relative_clock'] = f.bundle(f.observed(f.task('t_clock', status='running'
 decided = f.request(state='resolved')
 decided['resolution'] = {'operationId': 'instant-op', 'choiceId': 'card-0', 'revision': 3}
 cases['instant_decision'] = f.bundle(f.task(human_request=f.human(), wait={'wait_state': 'human'}), requests=[decided])
+sys.path.insert(0, str(path.parent))
+from test_hierarchy import outline_case
+cases.update({
+    'tree_direct': outline_case({'t_a': ['t_b']}),
+    'tree_multihop': outline_case({'t_a': ['t_b'], 't_b': ['t_c']}, displayed=['t_a', 't_c']),
+    'tree_cross_section': outline_case({'t_a': ['t_b']}, running=['t_b']),
+    'tree_group': outline_case({'t_a': ['t_f'], 't_b': ['t_f'], 't_c': ['t_f']}, displayed=['t_a', 't_b', 't_c']),
+    'tree_single': outline_case({'t_a': ['t_f']}, displayed=['t_a']),
+    'tree_cycle': outline_case({'t_a': ['t_b'], 't_b': ['t_a']}),
+    'tree_depth': outline_case({f't_{i:x}': [f't_{i+1:x}'] for i in range(10)}),
+})
 print(json.dumps({name: {'model': f.model.reduce_panel(b, now=f.NOW, projector=f.project,
     wire=name == 'relative_clock'), 'now': f.NOW} for name, b in cases.items()}))
