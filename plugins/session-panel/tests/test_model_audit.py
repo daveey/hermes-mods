@@ -138,6 +138,42 @@ def test_parked_remote_rows_show_their_true_state_without_a_provenance_tail():
         assert any('Reported by worker-a1' in d for d in out['details'])
 
 
+@pytest.mark.parametrize('status', ['scheduled', 'blocked', 'triage', 'review', 'ready', 'todo'])
+@pytest.mark.parametrize('age', [30, 60, 120])
+def test_parked_board_status_survives_old_bundle_with_explicit_age(status, age):
+    row = task(status=status)
+    row['execution_observations'] = [placeholder(row)]
+    project = lambda r, **kw: {'state': 'unknown', 'unknown_reason': 'no_run_identity'}
+    result = model.reduce_panel(bundle(row, computed_at=NOW - age), now=NOW, projector=project)
+    out = next(r for s in result['sections'].values() for r in s)
+    assert out['parked'] is True
+    assert 'status unknown' not in out['detail']
+    assert ('panel data' in out['detail']) is (age > 60)
+    assert out['evidence_state'] == 'unknown'
+    if age > 60:
+        assert 'as of ' in out['detail'] and '2m old' in out['detail']
+        assert 'wait_kind' not in out  # historical producer, not a live delivery
+        wire = model.reduce_panel(bundle(row, computed_at=NOW - age), now=NOW, projector=project, wire=True)
+        later = model.reduce_panel(bundle(row, computed_at=NOW - age), now=NOW + 10, projector=project, wire=True)
+        assert wire['revision'] == later['revision']
+
+
+@pytest.mark.parametrize('status, reason, read_at', [
+    ('running', 'no_run_identity', NOW - 120),
+    ('scheduled', 'source_expired', NOW - 120),
+    ('scheduled', 'clock_inconsistent', NOW - 120),
+    ('scheduled', 'ambiguous_execution_identity', NOW - 120),
+    ('unknown', 'no_run_identity', NOW - 120),
+    ('scheduled', 'no_run_identity', NOW + 120),
+])
+def test_old_parked_status_does_not_hide_contradictions(status, reason, read_at):
+    row = task(status=status, execution_observations=[placeholder(task(status=status))])
+    result = model.reduce_panel(bundle(row, computed_at=read_at), now=NOW,
+                                projector=lambda r, **kw: {'state': 'unknown', 'unknown_reason': reason})
+    out = result['sections']['waiting'][0]
+    assert 'status unknown' in out['detail'] and not out.get('parked')
+
+
 # ---- 4. waiting text -------------------------------------------------------------------------------------------
 
 def waiting(on, **kw):

@@ -38,6 +38,27 @@ const root = createRoot(document.getElementById('root'))
 const paint = tree => React.act(async () => root.render(tree))
 const publicCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./hub-model-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
 const privateCases = process.env.HERMES_PANEL_GOLDENS ? JSON.parse(readFileSync(process.env.HERMES_PANEL_GOLDENS, 'utf8')) : {}
+test('aged parked board data keeps its status and age in the panel and task chip', async () => {
+  const { model, now } = publicCases.aged_parked
+  const row = model.sections.waiting[0]
+  await paint(m.renderModel(model, { now }))
+  const detail = document.querySelector('[data-row-detail]').textContent
+  assert.match(detail, /waiting on CI/)
+  assert.match(detail, /as of .*panel data 2m old/)
+  assert.doesNotMatch(detail, /status unknown/)
+  assert.equal(row.evidence_state, 'unknown')
+  assert.equal(row.wait_kind, undefined)
+  const tasks = await import('../../session-tasks/plugin.js')
+  window.__sessionPanel = { clockRow: m.clockRow }
+  const [chip] = tasks.withModelDisplay([{ kind: 'kanban', id: row.id, gateway: row.gateway,
+    profile: row.profile, board: row.board, state: 'scheduled', observations: [], title: 'Card' }], model, now)
+  assert.equal(chip.display.detail, detail)
+  await paint(React.createElement(tasks.Chip, { chip, now: now * 1000 }))
+  assert.match(document.querySelector('[data-session-task]').title, /panel data 2m old/)
+  assert.doesNotMatch(document.querySelector('[data-session-task]').title, /status unknown/)
+  delete window.__sessionPanel
+})
+
 const cases = { ...publicCases, ...privateCases }
 for (const name of ['agent_held_local', 'agent_held_replica', 'agent_held_spend', 'agent_held_human']) {
  test(`real reducer ${name}: actor text and human-only red`, async () => {
