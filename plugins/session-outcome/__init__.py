@@ -862,18 +862,18 @@ def provider(session_id: str) -> Optional[dict]:
         # the reply undeclared, and the chat fell to unresolved{no_summary} once that same reply resolved them
         # (macbook 20261026_205117_f67f0d, two "answered in chat" steps closed 1 s after the gate passed).
         return None
-    try:
-        steps = us.open_steps(session_id)
-    except Exception:
-        log.debug("session-outcome provider failed", exc_info=True)
-        return None
-    if not steps:
+    # Read outbox obligations even after the request leaves open_steps. A saved
+    # choice is not delivery, and a failed read is not a successful empty source.
+    steps, pending = _load_sibling("session_outcome_decision_obligations",
+                                   "session-outcome/decision_obligations.py").collect(
+                                       us, session_id, us.open_steps(session_id))
+    if not steps and not pending:
         return None
     items = []
     for s in steps:
         choices = s.get("choices") or [{"label": o, "value": o} for o in s.get("options") or []]
         items.append({"id": s["id"], "question": s.get("text", ""), "choices": choices, "state": "open"})
-    return {"decision_items": items, "waiting_on": []}
+    return {"decision_items": items, "waiting_on": pending}
 
 
 def person_provider(session_id: str) -> Optional[dict]:
