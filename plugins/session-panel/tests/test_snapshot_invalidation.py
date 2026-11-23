@@ -1,5 +1,6 @@
 """Additional canonical invalidation and generation reset differentials."""
 import pytest
+
 from test_snapshot_acquisition import acquisition, acquire
 from test_core_readers import api, board, kanban_db
 
@@ -48,6 +49,40 @@ def test_partial_capture_cannot_advance_cursor_over_stale_carried_rows(acquisiti
     key = m.CardKey('fixture', 'default', 'default', b)
     assert current.rows[key] == fresh.rows[key]
     assert current.details[key] == fresh.details[key]
+
+
+@pytest.mark.parametrize('membership', ['creator', 'subscriber'])
+@pytest.mark.parametrize('intermediate', [False, True])
+def test_partial_capture_revokes_empty_omitted_membership(acquisition, membership, intermediate):
+    r, cap, m, source, store, conn = acquisition
+    kanban_db.create_task(conn, title='A', session_id='A')
+    target = kanban_db.create_task(conn, title='Unlinked', session_id='other')
+    chats = [m.ChatKey('fixture', 'default', sid) for sid in ('A', 'B')]
+    store.register([m.Watch(chat, '', (chat.session_id,), 0) for chat in chats])
+    previous, _ = acquire(acquisition)
+    empty_admission = store.pin(chats[1])[1]
+    assert not empty_admission.missing_scopes
+    demand = store.demand(source, chats[0])
+    if intermediate:
+        hint = cap.CaptureHints(store.version(source), store.owner_token(source), 1800000000.0)
+        partial = r.capture_local(source, previous, {demand.id: demand}, hint)
+        snapshot, _ = store.accept_local(partial, hint.prior_version)
+        previous = snapshot.parts[source]
+        assert store.current(empty_admission)  # unchanged observation may carry empty coverage
+    with conn:
+        if membership == 'creator':
+            conn.execute('UPDATE tasks SET session_id=? WHERE id=?', ('B', target))
+        else:
+            conn.execute("INSERT INTO kanban_notify_subs(task_id,platform,chat_id,created_at) VALUES (?,'tui','B',1)", (target,))
+    hint = cap.CaptureHints(store.version(source), store.owner_token(source), 1800000000.0)
+    partial = r.capture_local(source, previous, {demand.id: demand}, hint)
+    snapshot, admissions = store.accept_local(partial, hint.prior_version)
+    assert chats[1] in {item.chat for item in admissions}
+    assert store.pin(chats[1])[1].missing_scopes
+    assert not store.current(empty_admission)
+    successor, final = acquire(acquisition, snapshot.parts[source])
+    assert not store.pin(chats[1])[1].missing_scopes
+    assert [row['id'] for row in m.SnapshotReaders(final, chats[1]).linked(['B'])] == [target]
 
 
 def test_terminal_capture_does_not_recertify_old_detail_after_reset(acquisition):

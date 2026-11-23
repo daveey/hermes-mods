@@ -31,6 +31,12 @@ membership and dependency keys drive invalidation. SourcePart.invalidated_keys
 carries cursor-observed changes even outside the captured membership; it revokes
 carried certificates without deleting last-known payload. Reuse requires current
 capture or same-cursor scope provenance, not mere presence in a merged part.
+At the store's single admission boundary, advancing the source cursor or remote-
+parent observation revokes every omitted scope certificate, even certified-empty
+membership; these scopes are admitted missing and retain last-known payload until
+an exact current ScopeDemand is transactionally reacquired. A key-overlap check
+alone cannot prove an omitted scope's membership is unchanged. Same-observation
+partial captures preserve unaffected coverage.
 
 `pin(chat)` returns Snapshot plus Admission, preserving first unserved clocks,
 receipt IDs, required scopes, certified source versions, missing scopes, failure

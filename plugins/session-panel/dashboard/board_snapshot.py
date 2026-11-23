@@ -502,10 +502,17 @@ class SnapshotStore:
             stale = {k: v for k, v in (old.stale_scope_keys.items() if old else ()) if k in demands}
             scoped_members = {k: v for k, v in (old.scope_memberships.items() if old else ()) if k in demands}
             scoped_rows = {k: v for k, v in (old.scope_rows.items() if old else ()) if k in demands}
-            # Changed shared rows cannot be certified by a carried scope's old receipt.
+            # A changed source observation is not evidence about any omitted
+            # scope, including one previously certified empty. Only the exact
+            # transaction-completed scope set can certify the new observation.
+            observation_changed = bool(old and (
+                old.receipt.cursor != receipt.cursor
+                or old.receipt.remote_parent_digest != receipt.remote_parent_digest))
+            revoked = set()
             for sid in set(receipts) - completed:
-                if changed.intersection(keys.get(sid, ())):
+                if observation_changed or changed.intersection(keys.get(sid, ())):
                     receipts.pop(sid)
+                    revoked.add(sid)
             unknown = {sid for sid in receipt.coverage.unknown_scopes
                        if demands.get(sid) == receipt.coverage.captured_demands[sid]}
             for sid in unknown:
@@ -549,7 +556,7 @@ class SnapshotStore:
             for sid, demand in demands.items():
                 old_keys = old.scope_keys.get(sid, ()) if old else ()
                 new_keys = keys.get(sid, ())
-                if sid in renewed or sid in unknown or changed.intersection(set(old_keys) | set(new_keys) | demand.refs):
+                if sid in renewed or sid in unknown or sid in revoked or changed.intersection(set(old_keys) | set(new_keys) | demand.refs):
                     self._admit(sid.chat, 'source_accepted', receipt, changed)
                     affected.add(sid.chat)
             return self._snapshot(), tuple(self._admissions[c] for c in sorted(affected))
