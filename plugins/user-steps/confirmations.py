@@ -1,6 +1,7 @@
-"""Conservative recovery for explicit confirmation of a same-message plan.
+"""Fail-closed recovery of one final, top-level confirmation after a plan.
 
-No transcript lookup, model-invented scope, or approval is performed here.
+This is deliberately a small accepted grammar, not a Markdown interpreter.
+Anything outside it must use an explicit action_request with a complete scope.
 """
 import re
 
@@ -9,52 +10,41 @@ _CONFIRM = re.compile(r"\b(?:say|reply|answer|click)\s+[\s*`\"']*(?:go|yes)\b|\b
 
 
 def preceding_plan(reply, span):
-    """Return exact preceding prose only for an unambiguous structured plan.
+    """Freeze the exact plan only for an unambiguous final prose block.
 
-    Bare promises, fenced examples, multiple asks, and missing/ambiguous spans
-    remain incomplete. Refuse oversize input rather than dropping limits.
+    Reject ambiguous Markdown altogether instead of trying to strip examples
+    and accidentally manufacturing authority from their remaining text.
     """
     if not isinstance(reply, str) or len(reply) > 65536 or not span or reply.count(span) != 1:
         return None
-    if not _CONFIRM.search(span):
+    # Count across the whole raw message, including examples and the selected
+    # span itself. A model-selected span is evidence, never parser authority.
+    matches = list(_CONFIRM.finditer(reply))
+    if len(matches) != 1:
         return None
-    start = reply.index(span)
-    end = start + len(span)
-    prefix = reply[:start].strip()
-    suffix = reply[end:].strip()
-    # Every surrounding ask makes recovery ambiguous, on either side. Never
-    # fold a second approval into the selected request's execution authority.
-    surrounding = prefix + '\n' + suffix
-    if _CONFIRM.search(surrounding) or '::user-step{' in surrounding or '?' in surrounding:
+    blocks = re.split(r'\n[ \t]*\n', reply.rstrip())
+    if len(blocks) < 2 or blocks[-1] != span or '\n' in span or '\r' in span:
         return None
-    # Markdown fences close only with the same character and at least the
-    # opening length. Interior shorter fences are data, not delimiters.
-    fence = None
-    visible_lines = []
-    offset = 0
-    for line in reply.splitlines(keepends=True):
-        marker = re.match(r'^ {0,3}(`{3,}|~{3,})(.*?)[\r\n]*$', line)
-        was_fenced = fence is not None
-        if fence:
-            if marker and marker[1][0] == fence[0] and len(marker[1]) >= fence[1] and not marker[2].strip():
-                fence = None
-        elif marker:
-            fence = (marker[1][0], len(marker[1]))
-        inert = was_fenced or marker is not None
-        if inert and offset < end and offset + len(line) > start:
-            return None
-        if offset < start and not inert:
-            visible_lines.append(line[:max(0, start - offset)])
-        offset += len(line)
-    if fence:
+    # The directive must begin the final block; inline-code, list, quote and
+    # example prefixes are not confirmations. Do not trim indentation here.
+    if not _CONFIRM.match(span):
         return None
-    visible = ''.join(visible_lines)
-    # Two concrete plan steps, or a named plan with substantive prose. All
-    # original text (including limits, exclusions and code) is frozen below.
-    steps = re.findall(r'^\s*(?:\d+[.)]|[-*])\s+(.+)', visible, re.M)
+    # Unsupported Markdown anywhere stays on the existing incomplete path.
+    # This also rejects unclosed containers and lazy blockquote/list continuations
+    # without extending a home-grown Markdown parser at an authorization boundary.
+    if (any(char in reply for char in ('`', '~', '<', '>'))
+            or re.search(r'^(?:[ \t]+\S|\s*(?:[-+*]|\d+[.)])\s+.*\b(?:say|reply|answer|click)\b)', reply, re.I | re.M)
+            or '::user-step{' in reply or '?' in reply[:reply.index(span)]
+            or re.search(r'\b(?:example|sample|quotation)(?:\s+only)?\s*:', reply, re.I)):
+        return None
+    prefix = reply[:reply.index(span)].rstrip()
+    adjacent = blocks[-2]
+    # The immediately preceding block must itself be substantive plan prose,
+    # not a dangling label after a plan several blocks earlier.
+    steps = re.findall(r'^(?:\d+[.)]|[-*])\s+(.+)', adjacent, re.M)
     structured = len([s for s in steps if len(s.split()) >= 4]) >= 2
-    prose = bool(re.search(r'^\s*#{1,6}\s+[^\n]*\bplan\b', visible, re.I | re.M)) and len(visible.split()) >= 25
+    prose = (bool(re.search(r'^#{1,6}\s+[^\n]*\bplan\b', prefix, re.I | re.M))
+             and len(adjacent.split()) >= 25)
     if not (structured or prose):
         return None
-    suffix = reply[reply.index(span) + len(span):].strip()
-    return prefix + ('\n\n' + suffix if suffix else '')
+    return prefix
