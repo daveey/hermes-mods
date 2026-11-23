@@ -668,7 +668,9 @@ def test_actual_board_loop_wakes_on_source_event_and_stops(monkeypatch):
         r.events = [('t_dddddd4', 'S2')]
         r.stamp += 1
         f._board.set()
-        deadline = time.monotonic() + 2
+        # The default-on mitigation admits a trailing source pass at >=3s.
+        # Keep this real-thread wake test valid regardless of the startup race.
+        deadline = time.monotonic() + 5
         while time.monotonic() < deadline and f.bundles['S2']['bundle']['tasks'][0]['status'] != 'ready':
             f._board.wait(.01)
         assert f.bundles['S2']['bundle']['tasks'][0]['status'] == 'ready'
