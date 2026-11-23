@@ -211,7 +211,12 @@ say what's running, never what needs the user.
   `session_outcome` that turn (`done` + `keep_crons=false`, or `wait` naming the exact card/cron/time), and
   unsubscribe it from cards you park for days. "Your request was not processed" with no reply: grep the logs
   for `agent build failed for session <ui> (<session id>): SubscriptionQuotaUnavailable` (route out of quota,
-  turn never started) before suspecting the chat.
+  turn never started) before suspecting the chat. Waiting though every listed card is done: run
+  `hermes kanban chat-tasks <chat> --json` and keep non-done/archived rows, because the ask-gate list and plain
+  `kanban show` cover only the default board (`no such task` = use `--board <b> show`). A coach card filed with
+  this chat as its origin (`via=created`, empty `notify-list`) can't be detached (`edit --session-id` refuses
+  empty); if it is lane-gated with no runner, move the defect to a HERMES-NOTE comment and archive it with
+  restore steps.
 - Verify completion with `hermes sessions outcome <id> --refresh --json`, then read it back; without
   `--refresh` the command only reads stored state. Live card links can restore `waiting` after a done declaration. Trace remote links to the
   owner's `kanban notify-list <task> --json` and the card's named canonical origin. Remove only a demonstrably
