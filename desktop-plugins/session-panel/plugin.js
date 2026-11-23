@@ -624,9 +624,14 @@ export async function chooseModelOption(row, option, sourceRoute, { call = model
     if (action.admission !== undefined) {
       const a = action.admission
       if (!a || !Array.isArray(a.choices) || typeof a.scope_complete !== 'boolean' || typeof a.resolved !== 'boolean') throw Error('Invalid decision binding. Refresh the panel before choosing.')
-      const connectionId = action.source_owner === true ? sourceRoute.connectionId : tasksBridge()?.connectionForHubGateway?.(action.owner.gatewayId)
-      if (!connectionId) throw Error('The gateway that holds this question is not connected. Nothing was sent.')
-      route = { connectionId, profile: action.owner.profile, session: action.owner.storedSessionId }
+      // Installation owners are not hub gateway names. Only the producer's
+      // source-owner proof binds an installation to this connection locally.
+      // Foreign owners retain verified discovery until a trusted install-id
+      // connection registry exists; never guess from the hub-name map.
+      route = action.source_owner === true
+        ? { connectionId: sourceRoute.connectionId, profile: action.owner.profile, session: action.owner.storedSessionId }
+        : (await modelRequestRoute(action, sourceRoute, call)).route
+      if (!route.connectionId) throw Error('The gateway that holds this question is not connected. Nothing was sent.')
       ;({ choices, state, resolved } = a); scopeComplete = a.scope_complete; revision = action.revision
     } else {
       const found = await modelRequestRoute(action, sourceRoute, call)

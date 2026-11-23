@@ -722,7 +722,36 @@ test('bound decision bypasses a two-second background owner read and leaves need
    assert.equal(calls.filter(p => p.endsWith('/decisions')).length, 1)
  } finally { clearTimeout(timer); release(); await paint(null); m.resetFeedForTests() }
 })
-test('canonical click admission preserves foreign routing and rejects incomplete or changed bindings without owner reads', async () => {
+test('connected foreign install owner uses real gateway-name lookup and verified discovery before POST', async () => {
+ window.localStorage.clear()
+ const { connectionForHubGateway } = await import('../../session-tasks/plugin.js')
+ const q = structuredClone(publicCases.bound_foreign.model.sections.needs_you[0])
+ q.request_revision += 1900
+ const a = q.actions.find(a => a.kind === 'decide'); a.revision = q.request_revision
+ assert.equal(a.source_owner, false)
+ assert.ok(a.owner.gatewayId.startsWith('install:'))
+ const storage = { getItem: () => JSON.stringify({ foreign: 'remote-gateway-name' }) }
+ window.__sessionTasks = { connectionForHubGateway: id => connectionForHubGateway(id, storage) }
+ assert.equal(window.__sessionTasks.connectionForHubGateway(a.owner.gatewayId), null)
+ const posts = [], reads = []
+ try {
+   await m.chooseModelOption(q, q.options[0], current, { call: async (path, opts) => {
+     if (path.endsWith('/decision-refresh')) return {}
+     if (!path.endsWith('/decisions')) {
+       reads.push(opts.connectionId)
+       return { request: { requestId: q.request_id, owner: opts.connectionId === 'foreign' ? a.owner : { ...a.owner, gatewayId: 'wrong' } } }
+     }
+     posts.push(opts)
+     return { request: { owner: a.owner, requestId: q.request_id, revision: q.request_revision, resolution: { operationId: 'real-foreign-op' } },
+       operation: { operationId: 'real-foreign-op', dispatchState: 'delivered', idempotencyKey: opts.body.idempotencyKey } }
+   } })
+   assert.equal(posts.length, 1, 'connected installation owner must not be reported disconnected')
+   assert.equal(posts[0].connectionId, 'foreign')
+   assert.equal(posts[0].body.session, a.owner.storedSessionId)
+   assert.deepEqual(reads, [current.connectionId, 'foreign'])
+ } finally { delete window.__sessionTasks; window.localStorage.clear(); m.resetFeedForTests() }
+})
+test('canonical click admission preserves foreign routing and rejects incomplete or changed bindings', async () => {
  let index = 0
  for (const variant of ['foreign', 'disconnected', 'scope', 'state', 'resolved', 'choice', 'effect', 'malformed', 'revision', 'server-stale', 'lost-post']) {
    window.localStorage.clear()
@@ -730,7 +759,6 @@ test('canonical click admission preserves foreign routing and rejects incomplete
    q.request_revision += 2000 + index++
    const a = q.actions.find(a => a.kind === 'decide'); a.revision = q.request_revision
    assert.equal(a.source_owner, false)
-   window.__sessionTasks = { connectionForHubGateway: gateway => variant !== 'disconnected' && gateway === a.owner.gatewayId ? 'exact-foreign' : null }
    if (variant === 'scope') a.admission.scope_complete = false
    if (variant === 'state') a.admission.state = 'withdrawn'
    if (variant === 'resolved') a.admission.resolved = true
@@ -741,7 +769,10 @@ test('canonical click admission preserves foreign routing and rejects incomplete
    const posts = []
    const call = async (path, opts) => {
      if (path.endsWith('/decision-refresh')) return {}
-     assert.ok(path.endsWith('/decisions'), 'no network discovery for new producer')
+     if (!path.endsWith('/decisions')) {
+       assert.ok(path.includes('?session='), 'only canonical owner discovery may precede POST')
+       return { request: { requestId: q.request_id, owner: variant !== 'disconnected' && opts.connectionId === 'foreign' ? a.owner : { ...a.owner, gatewayId: 'wrong' } } }
+     }
      posts.push(opts)
      if (variant === 'server-stale') throw Error('409: Request revision changed')
      if (variant === 'lost-post') throw Error('Response lost')
@@ -753,7 +784,7 @@ test('canonical click admission preserves foreign routing and rejects incomplete
    const sent = ['foreign', 'server-stale', 'lost-post'].includes(variant)
    assert.equal(posts.length, sent ? 1 : 0, variant)
    if (sent) {
-     assert.equal(posts[0].connectionId, 'exact-foreign')
+     assert.equal(posts[0].connectionId, 'foreign')
      assert.equal(posts[0].body.session, a.owner.storedSessionId)
      assert.equal(posts[0].body.expectedRevision, a.revision)
      assert.equal(posts[0].body.revisionText, a.admission.choices[0].label)
