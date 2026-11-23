@@ -69,6 +69,44 @@ test('boolean permissionRequired (the backend contract since 4affdc54) is valid 
  await show(null); delete window.hermesDesktop
 })
 
+test('queue timeout names the route, explains read-only recovery, and preserves locked cached asks', async () => {
+ const r = freshRequest({ title: 'Keep this pending ask' }), calls = []
+ let failure = false
+ window.hermesDesktop = { api: async ({ path, ...opts }) => {
+  calls.push({ path, ...opts })
+  if (path.endsWith('/ping')) return { ok: true, api: 2, features: [] }
+  if (failure) throw Error('Timed out connecting to Hermes backend after 10000ms')
+  return { requests: [r] }
+ } }
+ await show(React.createElement(m.ActionQueue, { key: 'queue-timeout-recovery' }))
+ await React.act(async () => { await m.refreshRequests(); await flush() })
+ failure = true
+ await React.act(async () => { await m.refreshRequests(); await flush() })
+ const alert = el().querySelector('[role="alert"]')
+ assert.ok(alert)
+ assert.match(alert.textContent, /C1.*default/)
+ assert.match(alert.textContent, /did not return the action queue in time/)
+ assert.match(alert.textContent, /Reload actions.*does not submit or resend a decision/)
+ assert.match(alert.textContent, /10000ms/)
+ assert.match(el().textContent, /Keep this pending ask/)
+ const decision = [...el().querySelectorAll('[data-decision-effect="approve"]')]
+ assert.ok(decision.every(b => b.disabled), 'cached ask has no enabled approval control')
+ failure = false
+ await click('Reload actions')
+ assert.equal(el().querySelector('[role="alert"]'), null)
+ assert.equal(calls.some(c => c.method === 'POST'), false, 'reload is only a read, not delivery retry')
+ await show(null); delete window.hermesDesktop
+})
+
+test('queue capacity refusal remains visible and explains that the read never started', async () => {
+ window.hermesDesktop = { api: async () => { throw Error('HTTP 503: {"detail":{"error":"lane_busy","lane":"feed","reason":"deadline","waited_s":0.75}}') } }
+ await show(React.createElement(m.ActionQueue, { key: 'queue-capacity' }))
+ await React.act(async () => { await m.refreshRequests(); await flush() })
+ assert.match(el().querySelector('[role="alert"]').textContent, /busy with other feed reads; this queue read did not start/)
+ assert.match(el().textContent, /Reload actions/)
+ await show(null); delete window.hermesDesktop
+})
+
 test('scoped approval preserves Go and Change plan labels and posts the bound Go choice', async () => {
  const r = freshRequest({ revision: 7, choices: [{ id: 'go', label: 'Go', effect: 'approve' }, { id: 'change-plan', label: 'Change plan', effect: 'revise' }] })
  const calls = []

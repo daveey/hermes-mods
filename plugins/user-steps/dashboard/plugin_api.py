@@ -490,7 +490,11 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
             retire_moot(st, own)
             presenter = mirror()
             return {'requests': [presenter.present(r) for r in st.views(own, include_withdrawn=include == 'withdrawn')]}
-        return await _on_lane('feed', run, action, request=request)
+        # Desktop's queue GET has a 10s total budget; the shared lane default is
+        # 25s. Refuse unstarted work promptly instead of consuming that budget
+        # waiting behind unrelated feed reads. This does not interrupt admitted
+        # reconciliation or turn an unavailable queue into an empty one.
+        return await _on_lane('feed', run, action, request=request, deadline=0.75)
 
     @router.get('/requests/{request_id}')
     async def request(request_id: str, session: str):
