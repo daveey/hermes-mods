@@ -1639,17 +1639,24 @@ export default {
     try { lastGateway = host.state.gateway?.get?.() } catch {}
     const onGateway = v => { const now = typeof v === 'string' ? v : host.state.gateway?.get?.(); if (now !== lastGateway) { lastGateway = now; onGatewayState() } }
     offEvents.push(host.state.gateway?.listen?.(onGateway) || host.state.gateway?.subscribe?.(onGateway))
-    window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute, warm, cachedSnapshot, ingestFeed, touchFeed, feedFresh, kanbanRows, activityLabel, connectionForHubGateway }
-    return () => {
+    const surface = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute, warm, cachedSnapshot, ingestFeed, touchFeed, feedFresh, kanbanRows, activityLabel, connectionForHubGateway }
+    const dispose = () => {
       for (const stop of stops) stop?.()
       for (const off of offEvents) if (typeof off === 'function') off()
       clearTimeout(rpcEventTimer)
       rpcEventTimer = null
       document.removeEventListener('visibilitychange', onVis)
-      document.getElementById(`${ID}-style`)?.remove()
-      delete window.__sessionTasks
+      if (Object.getOwnPropertyDescriptor(window, '__sessionTasks')?.value === surface) {
+        document.getElementById(`${ID}-style`)?.remove()
+        delete window.__sessionTasks
+      }
       if (timer) clearInterval(timer)
       timer = null
     }
+    // Cleanup custody must exist before the diagnostic hook can reject.
+    ctx.onDispose?.(dispose)
+    window.__sessionTasks = surface
+    ctx.bindSessionTasksDiagnostic?.(surface)
+    return dispose
   }
 }
