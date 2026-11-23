@@ -402,6 +402,18 @@ _structural_reads = _StructuralReads()
 
 
 def _cols(conn: sqlite3.Connection, table: str) -> set[str]:
+    """``table``'s column names, as ``PRAGMA table_info`` lists them, transferred as ONE SQLite row.
+
+    Each row a cursor returns releases and re-takes the GIL. state.db's ``sessions`` has ~70 columns, and
+    ``transcript_key`` probes it on every proof of every lineage: row by row, inside the busy Desktop backend
+    (~190 threads, up to a 5 ms switch interval per re-take) that probe was the plugin's largest cost. Names are
+    TEXT, so ``json_group_array`` carries them exactly; SQLite without JSON functions reads them row by row."""
+    try:
+        return set(json.loads(conn.execute("SELECT json_group_array(name) FROM pragma_table_info(?)",
+                                           (table,)).fetchone()[0]))
+    except sqlite3.OperationalError as exc:
+        if not str(exc).lower().startswith(("no such function: json_", "no such table: pragma_table_info")):
+            raise
     return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
 
 
