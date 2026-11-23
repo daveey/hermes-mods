@@ -9,11 +9,17 @@ PLAN = '## Build plan\n\n1. Update the example renderer to show the new control.
 ASK = 'Say **go** and I will start the build.'
 
 
-def publish(tmp_path, reply, *, kind='approve', source=None, span=ASK):
+def publish(tmp_path, reply, *, kind='approve', source=None, span=ASK, structured=False):
     ledger = core.Ledger(tmp_path / 'ledger', db=tmp_path / 'missing.db')
     store = core.ActionStore(tmp_path / 'actions.sqlite3')
+    with ledger.edit(ledger.root(OWNER['storedSessionId'])) as data:
+        data['publication_turn'] = 'test-turn'
+    attrs = ''
     if source:
-        core.add_step(OWNER['storedSessionId'], span, ['Go', 'Change plan'], ledger=ledger)
+        step = core.add_step(OWNER['storedSessionId'], span, ['Go', 'Change plan'], ledger=ledger)
+        attrs = f'id="{step["id"]}" s="{OWNER["storedSessionId"]}" '
+    if structured:
+        reply = reply.removesuffix(span) + '::user-step{' + attrs + 't="' + core.enc(span) + '"}'
     llm = lambda *_: json.dumps({'steps': [{'text': span, 'kind': kind, 'verbatim_span': span}], 'resolved': []})
     result = core.process_reply(reply, OWNER['storedSessionId'], ledger=ledger, llm=llm,
                                 action_store=store, action_owner=OWNER)
@@ -21,7 +27,7 @@ def publish(tmp_path, reply, *, kind='approve', source=None, span=ASK):
 
 
 def test_plan_then_say_go_freezes_scope_and_approval(tmp_path):
-    store, requests, result = publish(tmp_path, PLAN + '\n\n' + ASK)
+    store, requests, result = publish(tmp_path, PLAN + '\n\n' + ASK, structured=True)
     assert len(requests) == 1
     r = requests[0]
     assert r['kind'] == 'approval' and r['state'] == 'open'
@@ -44,7 +50,7 @@ def test_plan_then_say_go_freezes_scope_and_approval(tmp_path):
 
 
 def test_session_outcome_confirm_in_same_final_message(tmp_path):
-    _, requests, _ = publish(tmp_path, PLAN + '\n\n' + ASK, source='session_outcome')
+    _, requests, _ = publish(tmp_path, PLAN + '\n\n' + ASK, source='session_outcome', structured=True)
     assert len(requests) == 1
     assert requests[0]['kind'] == 'approval'
     assert requests[0]['scope']['complete'] is True
@@ -142,7 +148,7 @@ def test_closed_code_in_plan_preserves_limits(tmp_path):
 
 
 def test_change_plan_is_non_authorizing_and_retains_exact_plan(tmp_path):
-    store, requests, _ = publish(tmp_path, PLAN + '\n\n' + ASK)
+    store, requests, _ = publish(tmp_path, PLAN + '\n\n' + ASK, structured=True)
     op = store.decide(OWNER, decision(requests[0], choice='change-plan', text='Use a smaller patch'))['operation']
     assert op['intent']['executionAuthorized'] is False
     assert PLAN in op['intent']['request']['scope']['markdown']
@@ -179,3 +185,48 @@ def test_reviewer_probes_never_offer_authorizing_choice(tmp_path, source, block,
             op = store.decide(OWNER, decision(r, choice=r['choices'][0]['id'],
                                              text=r['choices'][0]['label']))['operation']
             assert not op['intent']['executionAuthorized']
+
+
+@pytest.mark.parametrize('source', [None, 'session_outcome'])
+@pytest.mark.parametrize('other', [
+    'Say _yes_ to also deploy production.', 'Reply __yes__ to deploy.',
+    'Say [yes](https://example.com) to deploy.', 'Reply **yes** to deploy.',
+    'Answer `yes` to deploy.', 'Click ✅ to deploy.', 'Confirm deployment.',
+    'Approve the rollout.', 'Tell me to start deployment.', 'Give the go-ahead.',
+    'Say _go_ for production.', 'Reply __go__ for production.',
+    'Reply [go](https://example.com) for production.', 'Answer affirmative to deploy.',
+])
+def test_underscore_and_other_prose_never_create_authority(tmp_path, source, other):
+    store, requests, _ = publish(tmp_path, other + '\n\n' + PLAN + '\n\n' + ASK, source=source)
+    assert not any(r['scope']['complete'] for r in requests)
+    assert not any(c['effect'] == 'approve' for r in requests for c in r['choices'])
+
+
+@pytest.mark.parametrize('wrapper', [
+    lambda d: '> ' + d,
+    lambda d: '- ' + d,
+    lambda d: '`' + d + '`',
+    lambda d: '```text\n' + d + '\n```',
+    lambda d: '<div>\n' + d + '\n</div>',
+    lambda d: d + '\n\nTrailing prose.',
+    lambda d: d + '\n\n' + d,
+    lambda d: 'Surrounding text ' + d,
+    lambda d: d[:-1],
+])
+def test_structured_parser_rejects_nonfinal_nested_multiple_and_malformed(tmp_path, wrapper):
+    directive = '::user-step{t="' + core.enc(ASK) + '"}'
+    _, requests, _ = publish(tmp_path, PLAN + '\n\n' + wrapper(directive))
+    assert not any(r['scope']['complete'] for r in requests)
+    assert not any(c['effect'] == 'approve' for r in requests for c in r['choices'])
+
+
+def test_parser_runtime_unavailable_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv('PATH', '/nonexistent')
+    _, requests, _ = publish(tmp_path, PLAN + '\n\n' + ASK, structured=True)
+    assert not any(r['scope']['complete'] for r in requests)
+
+
+def test_parser_source_drift_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv('HERMES_CORE_CHECKOUT', str(tmp_path))
+    assert core.structured_confirmation(PLAN + '\n\n::user-step{t="confirm"}') is None
+

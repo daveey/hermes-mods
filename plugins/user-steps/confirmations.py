@@ -1,50 +1,53 @@
-"""Fail-closed recovery of one final, top-level confirmation after a plan.
+"""Structured-only same-message confirmation binding through Desktop's parser.
 
-This is deliberately a small accepted grammar, not a Markdown interpreter.
-Anything outside it must use an explicit action_request with a complete scope.
+The shipped Node bundle uses the actual Desktop preprocessing and directive
+modules. Missing runtime, source drift and parse doubt mean no recovered scope.
 """
-import re
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
 
 
-_CONFIRM = re.compile(r"\b(?:say|reply|answer|click)\s+[\s*`\"']*(?:go|yes)\b|\b(?:shall|should) I (?:proceed|start)|\b(?:ready to proceed|confirm (?:the|this) plan)\b", re.I)
+def structured_confirmation(reply):
+    if not isinstance(reply, str) or len(reply) > 65536:
+        return None
+    directory = Path(__file__).with_name('parser')
+    try:
+        manifest = json.loads((directory / 'manifest.json').read_text())
+        core = Path(os.environ.get('HERMES_CORE_CHECKOUT') or Path.home() / '.hermes/hermes-agent')
+        for entry in manifest['modules']:
+            if hashlib.sha256((core / entry['path']).read_bytes()).hexdigest() != entry['sha256']:
+                return None
+        bundle = directory / 'scanner.mjs'
+        if hashlib.sha256(bundle.read_bytes()).hexdigest() != manifest['bundle_sha256']:
+            return None
+        result = subprocess.run(['node', str(bundle)], input=json.dumps({'reply': reply}),
+                                capture_output=True, text=True, timeout=3, check=True)
+        if len(result.stdout) > 200000:
+            return None
+        value = json.loads(result.stdout)
+        if not isinstance(value, dict) or not isinstance(value.get('plan'), str):
+            return None
+        attrs = value['ask']['attrs']
+        if not isinstance(attrs, dict) or not isinstance(attrs.get('t'), str):
+            return None
+        # Recovery is never a way to borrow another session or request's id.
+        if set(attrs) - {'t', 'id', 's'}:
+            return None
+        source = value['ask']['source']
+        if reply.count(source) != 1 or not reply.rstrip().endswith(source):
+            return None
+        # Freeze original bytes, not preprocessed display prose (which may hide
+        # reasoning/preview markup). No removed text can silently widen scope.
+        value['plan'] = reply[:reply.index(source)].rstrip()
+        return value
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        return None
 
 
 def preceding_plan(reply, span):
-    """Freeze the exact plan only for an unambiguous final prose block.
-
-    Reject ambiguous Markdown altogether instead of trying to strip examples
-    and accidentally manufacturing authority from their remaining text.
-    """
-    if not isinstance(reply, str) or len(reply) > 65536 or not span or reply.count(span) != 1:
-        return None
-    # Count across the whole raw message, including examples and the selected
-    # span itself. A model-selected span is evidence, never parser authority.
-    matches = list(_CONFIRM.finditer(reply))
-    if len(matches) != 1:
-        return None
-    blocks = re.split(r'\n[ \t]*\n', reply.rstrip())
-    if len(blocks) < 2 or blocks[-1] != span or '\n' in span or '\r' in span:
-        return None
-    # The directive must begin the final block; inline-code, list, quote and
-    # example prefixes are not confirmations. Do not trim indentation here.
-    if not _CONFIRM.match(span):
-        return None
-    # Unsupported Markdown anywhere stays on the existing incomplete path.
-    # This also rejects unclosed containers and lazy blockquote/list continuations
-    # without extending a home-grown Markdown parser at an authorization boundary.
-    if (any(char in reply for char in ('`', '~', '<', '>'))
-            or re.search(r'^(?:[ \t]+\S|\s*(?:[-+*]|\d+[.)])\s+.*\b(?:say|reply|answer|click)\b)', reply, re.I | re.M)
-            or '::user-step{' in reply or '?' in reply[:reply.index(span)]
-            or re.search(r'\b(?:example|sample|quotation)(?:\s+only)?\s*:', reply, re.I)):
-        return None
-    prefix = reply[:reply.index(span)].rstrip()
-    adjacent = blocks[-2]
-    # The immediately preceding block must itself be substantive plan prose,
-    # not a dangling label after a plan several blocks earlier.
-    steps = re.findall(r'^(?:\d+[.)]|[-*])\s+(.+)', adjacent, re.M)
-    structured = len([s for s in steps if len(s.split()) >= 4]) >= 2
-    prose = (bool(re.search(r'^#{1,6}\s+[^\n]*\bplan\b', prefix, re.I | re.M))
-             and len(adjacent.split()) >= 25)
-    if not (structured or prose):
-        return None
-    return prefix
+    """Compatibility helper: plain prose is never an authorizing ask."""
+    parsed = structured_confirmation(reply)
+    return parsed['plan'] if parsed and parsed['ask']['attrs'].get('t') == span else None

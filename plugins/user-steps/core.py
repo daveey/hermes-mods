@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 try:
-    from .confirmations import preceding_plan
+    from .confirmations import preceding_plan, structured_confirmation
 except ImportError:  # standalone plugin/spec loading
     import importlib.util
     _confirmation_spec = importlib.util.spec_from_file_location(
@@ -32,6 +32,7 @@ except ImportError:  # standalone plugin/spec loading
     _confirmations = importlib.util.module_from_spec(_confirmation_spec)
     _confirmation_spec.loader.exec_module(_confirmations)
     preceding_plan = _confirmations.preceding_plan
+    structured_confirmation = _confirmations.structured_confirmation
 
 KINDS = ("approve", "do", "choose", "input")
 MAX_NEW_PER_REPLY = 5
@@ -1353,6 +1354,7 @@ def add_step(session_id: str, question: str, options: list, *, ledger: Optional[
         step = {"id": new_step_id(), "text": q, "kind": kind, "verbatim_span": q,
                 "options": labels if kind == "choose" else [], "choices": choices, "status": "open",
                 "created": now or time.time(), "session": session_id, "source": "session_outcome",
+                "publication_turn": d.get("publication_turn"),
                 # literal_options() only turns labels found in the source paragraph into buttons
                 "paragraph": q + ("\n\nOptions: " + " / ".join(labels) if labels else "")}
         d["steps"].append(step)
@@ -1506,16 +1508,26 @@ def attach_confirmation_plans(reply, session_id, ledger, action_store=None, acti
     shape comparison prevents a later publication from losing its limits.
     """
     attached = []
+    parsed = structured_confirmation(reply)
+    if not parsed:
+        return attached
+    attrs = parsed['ask']['attrs']
+    if attrs.get('s') != session_id or not attrs.get('id'):
+        return attached
     with ledger.edit(ledger.root(session_id)) as data:
+        current = [s for s in data['steps'] if s.get('source') == 'session_outcome'
+                   and s.get('publication_turn') and s['publication_turn'] == data.get('publication_turn')]
+        if len(current) != 1 or current[0]['id'] != attrs['id']:
+            return attached
         for step in data['steps']:
-            if (step.get('session') != session_id or step.get('status') != 'open'
+            if (step.get('id') != attrs['id'] or step.get('session') != session_id or step.get('status') != 'open'
                     or step.get('source') != 'session_outcome'
                     or len(step.get('choices', [])) != 2
                     or step['choices'][0].get('label', '').lower() not in ('go', 'yes', 'approve')
                     or step['choices'][1].get('label', '').lower() not in ('change plan', 'revise', 'no')
                     or step['choices'][0].get('authorizes') is False):
                 continue
-            plan = preceding_plan(reply, step.get('verbatim_span'))
+            plan = parsed['plan'] if dec(attrs['t']) == step.get('verbatim_span') else None
             if not plan:
                 continue
             updated = dict(step, kind='approve', confirmation_plan=plan, options=[])
@@ -1574,11 +1586,24 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
     """
     now = now or time.time()
     root = ledger.root(session_id)
+    original_reply = reply
+    parsed_confirmation = structured_confirmation(original_reply)
     opened = ledger.open_steps(session_id)
     if any(s.get('source') == 'session_outcome' for s in opened):
-        attached = attach_confirmation_plans(reply, session_id, ledger, action_store, action_owner)
+        attached = attach_confirmation_plans(original_reply, session_id, ledger, action_store, action_owner)
         turn_requests = set(turn_requests) | set(attached)
         opened = ledger.open_steps(session_id)
+    # Only an ORIGINAL, id-free directive may become a newly extracted approval.
+    # Unwrap AFTER validation; frame() later cannot manufacture this provenance.
+    with ledger.edit(root) as data:
+        producer_asks = [s for s in data['steps'] if s.get('publication_turn')
+                         and s['publication_turn'] == data.get('publication_turn')
+                         and s.get('source') == 'session_outcome']
+    fresh_confirmation = (parsed_confirmation and not producer_asks
+                          and not parsed_confirmation['ask']['attrs'].get('id')
+                          and not parsed_confirmation['ask']['attrs'].get('s'))
+    if parsed_confirmation:
+        reply = original_reply.replace(parsed_confirmation['ask']['source'], dec(parsed_confirmation['ask']['attrs']['t']))
     if not opened and not _worth_asking(reply):
         return {"text": None, "steps": [], "resolved": [], "source": "skip",
                 "diagnostics": {"skipped": "not_worth_asking"}}
@@ -1749,10 +1774,9 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                 step = {**candidate, "id": new_step_id(), "status": "open", "created": now,
                         "session": session_id,
                         "paragraph": shown + ("\n\n" + candidate["payload"] if candidate.get("payload") else "")}
-                if step.get('kind') == 'approve':
-                    plan = preceding_plan(reply, candidate['verbatim_span'])
-                    if plan:
-                        step['confirmation_plan'] = plan
+                if (fresh_confirmation and step.get('kind') == 'approve'
+                        and candidate['verbatim_span'] == dec(parsed_confirmation['ask']['attrs']['t'])):
+                    step['confirmation_plan'] = parsed_confirmation['plan']
                 if step.get("kind") == "choose" and len(_menu_labels(step)) > MAX_OPTIONS:
                     # 2 derived alternatives plus extra literal model options: same rule as
                     # options-over-4 — free-text input, every label left in the paragraph.
