@@ -380,6 +380,12 @@ Order matters, matching Desktop `classify`:
    wait ownership suppresses preserved old human fields; a currently open owner-bound request
    remains an ask. Named CI/deploy/clock and running-card producers take precedence and paint
    light blue. Shared off-list held blockers use the same palette and actor wording.
+   Every triage row and triage dependency label includes time since its latest entry
+   into triage, derived from lifecycle event transitions, not `created_at`. Repeated
+   hold notices within one triage episode do not reset the age. Missing history says
+   `entry time unavailable`. Wire elapsed templates tick locally without revision
+   churn. Scope stops, run caps and retained decisions name their actual cause,
+   rather than pretending they are awaiting specification/promotion.
    Blocked upstream -> Waiting, unless core says stalled. Core stalled verdict
    precedes unknown execution evidence and fresh parked lifecycle.
 5. Fresh (<=60s) parked board lifecycle may explain ready/todo/review/triage/

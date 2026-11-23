@@ -450,6 +450,53 @@ def human_owned(row):
     return card_is_open_human_ask(state, row.get('block_kind'), hr)
 
 
+def triage_label(row, bundle, now, *, wire=False):
+    """Current triage entry from lifecycle events, never the card's creation clock."""
+    detail = obj(obj(obj(bundle.get('cards')).get(row.get('id'))).get('detail'))
+    phase, entered = None, None
+    fixed = {'spend_budget_triaged': 'triage', 'spend_budget_held': 'triage', 'decision_retained': 'triage',
+             'contained': 'triage', 'gave_up': 'triage', 'supervisor_escalated': 'triage',
+             'decision_protected_stopped': 'triage', 'block_loop_detected': 'triage', 'agent_block_escalated': 'triage',
+             'claimed': 'running', 'spawned': 'running', 'unblocked': 'ready', 'triage_swept': 'ready',
+             'scheduled': 'scheduled', 'continued': 'scheduled', 'blocked': 'blocked',
+             'completed': 'done', 'archived': 'archived', 'review_requested': 'review'}
+    for event in detail.get('events') or []:
+        if not isinstance(event, dict):
+            continue
+        kind, payload = event.get('kind'), obj(event.get('payload'))
+        if kind in ('promoted', 'promoted_manual', 'unblocked'):
+            landing = payload.get('status', 'ready')
+        else:
+            landing = payload.get('status') if kind in ('created', 'status', 'reopened', 'no_progress_escalated') else fixed.get(kind or '')
+        if landing is None:
+            continue
+        if landing == 'triage' and phase != 'triage':
+            value = event.get('created_at')
+            at = seconds(value) if type(value) in (int, float) else 0
+            entered = at if 0 < at <= now else None
+        elif landing != 'triage':
+            entered = None
+        phase = landing
+    age = (relative(entered, 'elapsed') if wire else short_dur(now - entered)) if entered else 'entry time unavailable'
+    return 'in triage · ' + age
+
+
+def held_cause(row, bundle):
+    detail = obj(obj(obj(bundle.get('cards')).get(row.get('id'))).get('detail'))
+    for event in reversed(detail.get('events') or []):
+        if not isinstance(event, dict):
+            continue
+        payload = obj(event.get('payload'))
+        if event.get('kind') == 'decision_retained':
+            return {'scope_stopped': 'scope stopped', 'decision_pending': 'decision held',
+                    'capability_unavailable': 'capability unavailable'}.get(text(obj(payload.get('disposition')).get('reason')), 'decision held')
+        if event.get('kind') == 'spend_budget_triaged':
+            return 'scope stopped' if payload.get('cause') == 'scope_stopped' else 'run cap used up' if payload.get('limit') == 'runs' else 'spend budget held'
+        if event.get('kind') in ('claimed', 'unblocked', 'completed', 'archived'):
+            break
+    return ''
+
+
 def agent_hold_text(row, bundle):
     authority = obj(obj(obj(row.get('wait')).get('contained')).get('authority'))
     if authority.get('id'):
@@ -462,7 +509,8 @@ def agent_hold_text(row, bundle):
     reason = flat(re.sub(r'https?://\S+|\b[0-9a-f]{12,64}\b', '', reason))
     if len(reason) > WAIT_MAX:
         reason = reason[:WAIT_MAX - 1].rstrip() + '…'
-    return "waiting on this chat's agent to decide: " + reason
+    cause = held_cause(row, bundle)
+    return (cause + ' · ' if cause else '') + "waiting on this chat's agent to decide: " + reason
 
 
 def ask(row, request=None):
@@ -628,6 +676,9 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     used, seen = set(), set()
     # The serving gateway's own names (board name + install owner id). Only these are equated, never a foreign one.
     same_gateway = frozenset(g for g in [bundle.get('gateway'), *(bundle.get('gateway_aliases') or [])] if g) if bundle.get('gateway') else frozenset()
+    def live_request(row):
+        return any(r.get('state') in ('open', 'needs_context') and not r.get('resolution')
+                   and any(_matches(row, a, same_gateway) for a in _aliases(r)) for r in requests)
     read_at = number(bundle.get('computed_at')) or now
     for raw in bundle.get('tasks') or []:
         if not isinstance(raw, dict) or not raw.get('id'):
@@ -692,7 +743,8 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             # The awaited card is often not this chat's own (a worker made it), so it has no row of its
             # own here: its live status rides on this line, or a running dependency reads as idle.
             dep_status = text(dependency.get('status'))
-            dep_state = f' ({dep_status})' if dep_status else ''
+            dep_label = triage_label(dependency, bundle, now, wire=wire) if dep_status == 'triage' else dep_status
+            dep_state = f' ({dep_label})' if dep_label else ''
             dependency_prefix = f'waiting on: {title}{dep_state}{location}'
             dependency_prefixes[k] = (key(dependency), dependency_prefix)
             dependency_text = dependency_prefix + (f' · {why}' if why else '') + age
@@ -744,6 +796,8 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             on = dependency_text + ' · ' + blocker_wait['text']
         elif dependency and dependency.get('status') in ('running', 'review') and not dependency.get('stale'):
             v['wait_kind'] = 'card'
+        elif dependency and live_request(blocker):
+            on = dependency_text + " · waiting on you to answer the parent's current request"
         elif not v.get('wait_kind') and agent_hold(blocker, bundle):
             v['wait_kind'] = 'agent'
             actor = agent_hold_text(blocker, bundle)
@@ -867,19 +921,30 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         result = clean(row.get('result'))
         v['detail'] = result if len(result) <= 80 else result[:79].rstrip() + '…'
         sections['done'].append(v)
+    for views in sections.values():
+        for view in views:
+            source_row = rows_by_key.get(view['key'], {})
+            if source_row.get('status') == 'triage':
+                age = triage_label(source_row, bundle, now, wire=wire)
+                view['detail'] = (view.get('detail', '') + ' · ' + age).strip(' ·')
+                view['details'].append(age)
     groups = _hierarchy.project(sections, rows_by_key, bundle, key=key, row_view=row_view,
                                 successors=lambda row: wait_parents(row, bundle),
                                 terminal=TERMINAL, prefixes=dependency_prefixes)
     for group in groups:
-        card = obj(obj(obj(bundle.get('cards')).get(group['id'])).get('detail')).get('task') or {}
-        if human_owned(card):
-            group['section'] = 'needs_you'
+        card = {**group, **obj(obj(obj(obj(bundle.get('cards')).get(group['id'])).get('detail')).get('task'))}
+        if human_owned(card) or live_request(card):
+            group.update(section='needs_you', detail='waiting on you to answer the current request')
         elif not card.get('stale') and wait_info(card, now, wire=wire).get('kind'):
             group.update(section='waiting', wait_kind=wait_info(card, now, wire=wire)['kind'],
                          detail=wait_info(card, now, wire=wire)['text'])
         elif agent_hold(card, bundle):
             group.update(section='waiting', wait_kind='agent',
                          detail=agent_hold_text(card, bundle))
+        if group.get('status') == 'triage':
+            age = triage_label(card, bundle, now, wire=wire)
+            group['detail'] += ' · ' + age
+            group['details'].append(age)
     outcome = obj(bundle.get('outcome_json') or bundle.get('outcome'))
     counts = {s: len(sections[s]) for s in SECTIONS}
     pips = [{'section': s, 'count': counts[s], 'label': {'needs_you': 'needs you', 'running': 'running'}.get(s, s)} for s in SECTIONS if counts[s]]

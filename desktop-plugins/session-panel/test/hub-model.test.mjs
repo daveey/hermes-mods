@@ -52,6 +52,9 @@ for (const name of ['agent_held_local', 'agent_held_replica', 'agent_held_spend'
    const pip = document.querySelector('[data-row-pip="waiting"]')
    assert.equal(window.getComputedStyle(pip).borderTopColor, 'rgb(59, 130, 246)')
    assert.ok(document.querySelector('[data-row-detail]').textContent.includes("waiting on this chat's agent to decide: "))
+   assert.ok(document.querySelector('[data-row-detail]').textContent.includes('in triage · 5h 20m'))
+   await paint(m.renderModel(model, { now: now + 120 }))
+   assert.ok(document.querySelector('[data-row-detail]').textContent.includes('in triage · 5h 22m'))
    assert.equal(document.querySelectorAll('[data-choice-id]').length, 0)
   }
  })
