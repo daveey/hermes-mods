@@ -161,6 +161,9 @@ class Feed:
         self.bundles: dict[str, dict] = {}   # session -> {rev, hash, bundle, refs, lineage}
         self.interest: dict[str, float] = {} # session -> expires at
         self._watch_tokens = {}             # rejects reads from forgotten/re-watched membership
+        self._panel_updates = queue.SimpleQueue()
+        self._panel_subscribers = {}  # mounted-panel id -> (session, lease expiry)
+        self._board_dirty = set()
         self._board_failures = set()
         self._board_capture_failures = set()  # only a successful strict recapture may clear these
         self._board = threading.Event()
@@ -249,14 +252,21 @@ class Feed:
             return str(v)
         return json.dumps(safe(value), ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode()
 
-    def changes_bytes(self, sessions, *, since=0, epoch=None):
+    def changes_bytes(self, sessions, *, since=0, epoch=None, subscriber=None, visible_session=None):
         """No locks, readers, computation or JSON conversion on the HTTP path.
 
         Cold sessions return no bundle until a background tick publishes one.
         Registration is an enqueue, not a synchronous interest-lock acquisition.
         """
         if self._successor is not None:
-            return self._current().changes_bytes(sessions, since=since, epoch=epoch)
+            return self._current().changes_bytes(sessions, since=since, epoch=epoch,
+                                                 subscriber=subscriber, visible_session=visible_session)
+        if subscriber:
+            self._panel_updates.put((subscriber, visible_session, self.clock() + 75.0))
+            self._board.set()
+            lane = getattr(self, '_board_lane', None)
+            if lane is not None:
+                lane.service_wake.set()
         wanted = tuple(dict.fromkeys(sessions))[:MAX_REQUEST]
         self._registrations.put(wanted)
         current, rev, entries, header = self._wire
@@ -288,6 +298,9 @@ class Feed:
             self.interest = dict(getattr(prev, 'interest', {}))
             self._watch_tokens = {s: object() for s in self.interest}
             self._registrations = getattr(prev, '_registrations', self._registrations)
+            self._panel_updates = getattr(prev, '_panel_updates', self._panel_updates)
+            self._panel_subscribers = dict(getattr(prev, '_panel_subscribers', {}))
+            self._board_dirty = set(getattr(prev, '_board_dirty', ()))
             for name in ('_wake', '_cold', '_decide', '_board'):
                 setattr(self, name, getattr(prev, name, getattr(self, name)))
             self.failures = {s: dict(f) for s, f in getattr(prev, 'failures', {}).items()}

@@ -1698,6 +1698,8 @@ _load_feed().RESTART = feed
 
 
 class ChangesBody(BaseModel):
+    subscriber: Optional[str] = Field(default=None, max_length=128)
+    visible_session: Optional[str] = Field(default=None, max_length=256)
     sessions: list[str] = Field(default_factory=list, max_length=200)
     since: int = 0
     epoch: Optional[str] = None
@@ -1748,7 +1750,8 @@ async def changes(body: ChangesBody, request: Request):
         start_publication()
         return Response(b'{"detail":"Session panel starting"}', status_code=503,
                         media_type='application/json', headers={'Retry-After': '1'})
-    wire = f.changes_bytes(body.sessions, since=body.since, epoch=body.epoch)
+    wire = f.changes_bytes(body.sessions, since=body.since, epoch=body.epoch,
+                           subscriber=body.subscriber, visible_session=body.visible_session)
     return Response(_WIRE_PREFIX + wire[1:], media_type='application/json')
 
 

@@ -21,6 +21,7 @@ class BoardLane:
         self.cooldown = 0.0 if os.environ.get(
             'HERMES_PANEL_BOARD_COALESCE', '1').lower() in ('0', 'false', 'off', 'no') else 3.0
         self.capacity = (1 if self.cooldown else 4) if capacity is None else capacity
+        self.visible_only = os.environ.get('HERMES_PANEL_BOARD_VISIBLE_ONLY', '1').lower() not in ('0', 'false', 'off', 'no')
         self.read_ends = {}
         self.cursor = self.stamp = None
         self.pending, self.active, self.retries = {}, {}, {}
@@ -100,6 +101,23 @@ class BoardLane:
             now = f.clock()
             while True:
                 try:
+                    subscriber, session, expires = f._panel_updates.get_nowait()
+                except queue.Empty:
+                    break
+                if session and expires > now:
+                    f._panel_subscribers[subscriber] = (session, expires)
+                else:
+                    f._panel_subscribers.pop(subscriber, None)
+            f._panel_subscribers = {k: v for k, v in f._panel_subscribers.items() if v[1] > now}
+            visible = {v[0] for v in f._panel_subscribers.values()}
+            f._board_dirty.intersection_update(f.interest)
+            for session in f._board_dirty & visible:
+                if session in f.interest and session in f.bundles:
+                    self.pending.setdefault(session, time.time())
+                    self.read_ends.pop(session, None)  # attach is immediately actionable
+            f._board_dirty.difference_update(self.pending)
+            while True:
+                try:
                     session, token, error, ended = self.completed.get_nowait()
                 except queue.Empty:
                     break
@@ -128,6 +146,11 @@ class BoardLane:
                 token = f._watch_tokens.get(session)
                 if session not in f.interest or not held or token is None:
                     self.pending.pop(session, None)
+                    continue
+                if self.visible_only and session not in visible:
+                    self.pending.pop(session, None)
+                    f._board_dirty.add(session)
+                    self.retries.pop(session, None)
                     continue
                 last = self.read_ends.get(session)
                 if last is not None and time.monotonic() < last[1] + self.cooldown:
@@ -234,7 +257,11 @@ class BoardLane:
     def _admit(self, sessions, at):
         with self.feed.lock:
             for session in sessions:
-                self.pending.setdefault(session, at)  # oldest outstanding generation wins service
+                if self.visible_only and not any(s == session and expires > self.feed.clock()
+                                                 for s, expires in self.feed._panel_subscribers.values()):
+                    self.feed._board_dirty.add(session)
+                else:
+                    self.pending.setdefault(session, at)  # oldest outstanding generation wins service
                 self.feed._board_failures.add(session)
                 self.retries.pop(session, None)
 

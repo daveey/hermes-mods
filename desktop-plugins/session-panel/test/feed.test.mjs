@@ -25,6 +25,21 @@ const target = (sessions = ['S1']) => ({ connectionId: 'C1', profile: 'default',
 const answer = (extra = {}) => ({ feed: 'hub:1', profile: 'default', epoch: 'E1', rev: 3, bundles: {}, ...extra })
 const push = extra => m.onFeedEvent({ payload: { feed: 'hub:1', profile: 'default', epoch: 'E1', bundles: {}, ...extra } })
 const settle = () => new Promise(r => setTimeout(r, 0))
+test('mounted panel leases only the focused chat and releases on unmount', async () => {
+ const off = m.watchPanel(route('FOCUSED', 'C2', 'work'))
+ await settle()
+ assert.equal(calls.length, 1)
+ assert.equal(calls[0].connectionId, 'C2')
+ assert.equal(calls[0].profile, 'work')
+ assert.deepEqual(calls[0].body.sessions, [])
+ assert.equal(calls[0].body.visible_session, 'FOCUSED')
+ const subscriber = calls[0].body.subscriber
+ off()
+ await settle()
+ assert.equal(calls.length, 2)
+ assert.equal(calls[1].body.subscriber, subscriber)
+ assert.equal(calls[1].body.visible_session, null)
+})
 let calls, reply
 beforeEach(() => {
  m.resetFeedForTests(); window.localStorage = memoryStorage(); calls = []; reply = () => answer()
