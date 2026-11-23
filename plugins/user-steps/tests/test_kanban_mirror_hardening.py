@@ -184,6 +184,8 @@ def test_projection_failure_does_not_hide_rest_queue(tmp_path, monkeypatch):
         raise sqlite3.OperationalError("projection unavailable")
 
     monkeypatch.setattr(mirror, "reconcile", fail)
+    # The Desktop poll enters through reconcile_poll (its remote pass runs in the background); fail it too.
+    monkeypatch.setattr(mirror, "reconcile_poll", lambda owner, fresh_s: fail(owner))
     api = load_module("mirror_failure_api", ROOT / "dashboard" / "plugin_api.py")
     api.RETRY_INTERVAL_S = 0
     app = FastAPI()

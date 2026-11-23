@@ -16,7 +16,12 @@ mirror_mod = load_module('feed_fresh_mirror', ROOT / 'kanban_mirror.py')
 def clean():
     mirror_mod._REMOTE_FRESH.clear()
     yield
+    assert mirror_mod._background_idle(5), 'background remote pass still running'
     mirror_mod._REMOTE_FRESH.clear()
+
+
+def idle():
+    assert mirror_mod._background_idle(5), 'background remote pass did not finish'
 
 
 def fake(remote_result=None, local_clean=True):
@@ -34,6 +39,7 @@ def fake(remote_result=None, local_clean=True):
     self = SimpleNamespace(core=SimpleNamespace(validate_owner=lambda owner: None),
                            remote=SimpleNamespace(reconcile=remote), _reconcile_local=local)
     self.reconcile = lambda owner, **kw: mirror_mod.Mirror.reconcile(self, owner, **kw)
+    self._reconcile_remote = lambda owner: mirror_mod.Mirror._reconcile_remote(self, owner)
     return self, remote_calls, local_calls
 
 
@@ -46,10 +52,12 @@ def test_poll_skips_remote_after_a_clean_strict_pass_but_runs_local():
     assert local[-1] == (OWNER, False)  # local still ran
 
 
-def test_poll_without_a_feed_pass_runs_everything():
+def test_poll_without_a_feed_pass_runs_local_now_and_remote_in_background():
     self, remote, local = fake()
     mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)
-    assert remote == [OWNER] and local == [(OWNER, False)]
+    assert local == [(OWNER, False)]
+    idle()
+    assert remote == [OWNER]
 
 
 def test_a_deferred_or_failed_strict_pass_is_not_fresh():
@@ -59,13 +67,15 @@ def test_a_deferred_or_failed_strict_pass_is_not_fresh():
         with pytest.raises(RuntimeError):
             mirror_mod.Mirror.reconcile(self, OWNER, strict=True)
         mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)
-        assert len(remote) == 2  # the poll ran the remote pass itself
+        idle()
+        assert len(remote) == 2  # the poll queued the remote pass
 
 
 def test_a_non_strict_pass_never_marks_fresh():
     self, remote, _ = fake()
     mirror_mod.Mirror.reconcile(self, OWNER)
     mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)
+    idle()
     assert len(remote) == 2
 
 
@@ -76,9 +86,11 @@ def test_freshness_expires_and_is_per_owner(monkeypatch):
     mirror_mod.Mirror.reconcile(self, OWNER, strict=True)
     other = dict(OWNER, storedSessionId='session-b')
     mirror_mod.Mirror.reconcile_poll(self, other, 15)
+    idle()
     assert remote[-1] == other  # another owner is not covered
     clock[0] += 15.5
     mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)
+    idle()
     assert remote[-1] == OWNER and len(remote) == 3  # expired: ran again
 
 
@@ -100,7 +112,9 @@ def test_requests_route_skips_remote_only_when_fresh(tmp_path):
         kanban_mirror=mirror))
     client = TestClient(app)
     first = client.get('/requests', params={'session': 'session-a'})
-    assert first.status_code == 200 and len(calls) == 1  # no feed pass yet: full reconcile
+    # The fixture mirror comes from its own copy of the module: wait on that copy's background worker.
+    assert type(mirror).reconcile_poll.__globals__['_background_idle'](5)
+    assert first.status_code == 200 and len(calls) == 1  # no feed pass yet: the poll queued the remote pass
     mirror.reconcile(dict(OWNER, storedSessionId='session-a'), strict=True)  # the feed's strict pass
     before = len(calls)
     second = client.get('/requests', params={'session': 'session-a'})
@@ -177,7 +191,8 @@ def test_a_failed_strict_pass_clears_an_earlier_fresh_mark():
     with pytest.raises(RuntimeError):
         mirror_mod.Mirror.reconcile(failing, OWNER, strict=True)
     mirror_mod.Mirror.reconcile_poll(self, OWNER, 60)
-    assert len(remote) == 2  # the poll ran the remote pass itself
+    idle()
+    assert len(remote) == 2  # the poll queued the remote pass
 
 
 def test_a_failed_local_strict_pass_clears_an_earlier_fresh_mark():
@@ -187,4 +202,137 @@ def test_a_failed_local_strict_pass_clears_an_earlier_fresh_mark():
     with pytest.raises(RuntimeError):
         mirror_mod.Mirror.reconcile(failing, OWNER, strict=True)
     mirror_mod.Mirror.reconcile_poll(self, OWNER, 60)
+    idle()
     assert len(remote) == 2
+
+
+def test_poll_never_waits_for_a_slow_remote_pass():
+    """Hub 2026-11-23: the inline strict pass took 3-21 s and starved the backend's web threads."""
+    import threading
+    started, release = threading.Event(), threading.Event()
+    self, remote, local = fake()
+
+    def slow(owner):
+        remote.append(owner)
+        started.set()
+        assert release.wait(5)
+    self.remote.reconcile = slow
+    try:
+        mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)  # returns while the remote pass is blocked
+        assert local == [(OWNER, False)]
+        assert started.wait(5)
+        mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)  # stale and already running: not queued twice
+        assert remote == [OWNER] and len(local) == 2
+    finally:
+        release.set()
+    idle()
+    assert remote == [OWNER]
+
+
+def test_a_clean_background_pass_marks_fresh_and_a_failed_one_does_not(caplog):
+    self, remote, _ = fake()
+    mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)
+    idle()
+    mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)
+    idle()
+    assert len(remote) == 1  # the clean background pass made the next poll skip
+
+    mirror_mod._REMOTE_FRESH.clear()
+    failing, failing_remote, _ = fake(remote_result=False)
+    mirror_mod.Mirror.reconcile_poll(failing, OWNER, 15)
+    idle()
+    mirror_mod.Mirror.reconcile_poll(failing, OWNER, 15)
+    idle()
+    assert len(failing_remote) == 2  # deferred: still stale, the next poll queued again
+    assert 'Background remote card pass failed' not in caplog.text  # a deferral is routine, not a traceback
+
+
+def test_fresh_window_zero_keeps_the_inline_full_pass():
+    self, remote, local = fake()
+    mirror_mod.Mirror.reconcile_poll(self, OWNER, 0)
+    assert remote == [OWNER] and local == [(OWNER, False)]  # synchronous, no worker
+
+
+def test_a_background_pass_older_than_a_failed_strict_pass_does_not_mark_fresh(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(mirror_mod.time, 'monotonic', lambda: clock[0])
+    key = mirror_mod.encoded(OWNER)
+    started = clock[0]  # a background pass starts
+    clock[0] += 1
+    mirror_mod._clear_remote_fresh(key)  # a newer strict pass fails
+    clock[0] += 1
+    mirror_mod._mark_remote_fresh(key, started)  # the older pass finishes clean
+    assert not mirror_mod._remote_fresh(key, 60)
+
+
+def test_a_dead_worker_gives_its_slot_back(monkeypatch):
+    """A BaseException inside a pass must not leave a counted worker that never drains again."""
+    import threading
+    died, hooked = [], threading.Event()
+
+    def hook(args):  # CPython calls it after the worker function returned: wait on it, not on idle()
+        died.append(args.exc_type)
+        hooked.set()
+    monkeypatch.setattr(mirror_mod.threading, 'excepthook', hook)  # the worker dies on purpose
+    self, _, _ = fake()
+
+    def die(owner):
+        raise KeyboardInterrupt  # BaseException, not Exception
+    self.remote.reconcile = die
+    mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)
+    assert hooked.wait(5)
+    idle()
+    assert died == [KeyboardInterrupt]
+    healthy, remote2, _ = fake()
+    mirror_mod.Mirror.reconcile_poll(healthy, OWNER, 15)
+    idle()
+    assert remote2 == [OWNER]  # a new worker ran it
+
+
+def test_thread_start_failure_is_retried_by_the_next_poll(monkeypatch, caplog):
+    self, remote, local = fake()
+    real_thread = mirror_mod.threading.Thread
+
+    class NoThread:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(mirror_mod.threading, 'Thread', NoThread)
+    mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)  # the poll itself still answers
+    assert local == [(OWNER, False)] and remote == []
+    assert 'Background remote card pass not started' in caplog.text
+    assert mirror_mod._BACKGROUND_WORKERS_ALIVE == 0  # no slot leaked
+    monkeypatch.setattr(mirror_mod.threading, 'Thread', real_thread)
+    mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)  # a duplicate poll still starts the missing worker
+    idle()
+    assert remote == [OWNER]
+
+
+def test_a_pass_queued_while_workers_exit_is_not_stranded(monkeypatch):
+    """Workers counted but leaving (queue seen empty) when a poll queues: the next poll must start one."""
+    self, remote, _ = fake()
+    monkeypatch.setattr(mirror_mod, '_BACKGROUND_WORKERS_ALIVE', mirror_mod.BACKGROUND_WORKERS)  # all mid-exit
+    assert mirror_mod._schedule_remote(self, OWNER) is True  # queued, no free slot
+    monkeypatch.setattr(mirror_mod, '_BACKGROUND_WORKERS_ALIVE', 0)  # they finished leaving
+    assert mirror_mod._schedule_remote(self, OWNER) is False  # duplicate, but it starts a worker
+    idle()
+    assert remote == [OWNER]
+
+
+def test_the_background_pass_runs_in_the_polls_context():
+    """Hub profiles are multiplexed through contextvars (HERMES_HOME overrides); a new thread would see the
+    process default, so the pass must run under the poll's captured context."""
+    import contextvars
+    profile = contextvars.ContextVar('profile', default='process-default')
+    seen = []
+    self, _, _ = fake()
+    self.remote.reconcile = lambda owner: seen.append(profile.get())
+    token = profile.set('profile-b')
+    try:
+        mirror_mod.Mirror.reconcile_poll(self, OWNER, 15)
+    finally:
+        profile.reset(token)
+    idle()
+    assert seen == ['profile-b']

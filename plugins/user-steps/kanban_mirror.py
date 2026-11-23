@@ -5,6 +5,7 @@ written by this producer can authorize the receiver, and the receiver rechecks t
 exact blocked ask and block generation under the board write transaction.
 """
 
+import contextvars
 import hashlib
 import importlib.util
 import inspect
@@ -40,12 +41,16 @@ _MEMO: dict = {}  # owner key -> (inputs key, monotonic time of the full pass th
 _MEMO_LOCK = threading.Lock()
 _MEMO_MAX = 256
 _REMOTE_FRESH: dict = {}  # owner key -> monotonic start of its last clean strict pass (``Mirror.reconcile``)
+_REMOTE_CLEARED: dict = {}  # owner key -> monotonic time a failed strict pass last cleared its fresh mark
 _REMOTE_FRESH_LOCK = threading.Lock()
 _REMOTE_FRESH_MAX = 512
 
 
 def _mark_remote_fresh(key, started):
     with _REMOTE_FRESH_LOCK:
+        # A pass that started before a later failed strict pass cleared the mark cannot re-mark the owner.
+        if started < _REMOTE_CLEARED.get(key, float('-inf')):
+            return
         if started >= _REMOTE_FRESH.get(key, float('-inf')):
             _REMOTE_FRESH.pop(key, None)
             _REMOTE_FRESH[key] = started
@@ -56,6 +61,91 @@ def _mark_remote_fresh(key, started):
 def _clear_remote_fresh(key):
     with _REMOTE_FRESH_LOCK:
         _REMOTE_FRESH.pop(key, None)
+        _REMOTE_CLEARED.pop(key, None)
+        _REMOTE_CLEARED[key] = time.monotonic()
+        while len(_REMOTE_CLEARED) > _REMOTE_FRESH_MAX:
+            del _REMOTE_CLEARED[next(iter(_REMOTE_CLEARED))]
+
+
+# Remote passes a Desktop poll found stale run off the request thread, on at most BACKGROUND_WORKERS daemon
+# threads, one queued or running pass per owner. Hub 2026-11-23: every poll of a chat without a fresh feed pass
+# ran the strict linked-card projection inline (3-21 s, queued on kanban_session_activity._links_lock), so each
+# poll held a web worker thread and the backend answered other Desktop calls with "Timed out connecting to Hermes
+# backend". A remote ask now reaches the queue when its owner's background pass finishes (queue wait included).
+BACKGROUND_WORKERS = 2
+_BACKGROUND_LOCK = threading.Condition()
+_BACKGROUND_PENDING: dict = {}  # owner key -> (mirror, owner, the poll's context), waiting for a worker
+_BACKGROUND_RUNNING: set = set()  # owner keys a worker is reconciling now
+_BACKGROUND_WORKERS_ALIVE = 0
+
+
+def _schedule_remote(mirror, owner):
+    """Queue one background remote pass for *owner*; False when it was already queued or running.
+
+    Every call, a duplicate included, starts a worker while passes are queued and a slot is free, so a queued
+    pass is never left without one (a worker exiting, dying or failing to start is replaced by the next poll)."""
+    global _BACKGROUND_WORKERS_ALIVE
+    key = encoded(owner)
+    with _BACKGROUND_LOCK:
+        queued = key not in _BACKGROUND_PENDING and key not in _BACKGROUND_RUNNING
+        if queued:
+            # Threads do not inherit contextvars: the pass must see the poll's profile (multiplexed HERMES_HOME
+            # overrides), exactly as the outbox worker runs under its captured context.
+            _BACKGROUND_PENDING[key] = (mirror, owner, contextvars.copy_context())
+        start = bool(_BACKGROUND_PENDING) and _BACKGROUND_WORKERS_ALIVE < BACKGROUND_WORKERS
+        if start:
+            _BACKGROUND_WORKERS_ALIVE += 1
+    if start:
+        try:
+            threading.Thread(target=_drain_remote, name='user-steps-remote-pass', daemon=True).start()
+        except BaseException as exc:  # e.g. "can't start new thread": give the slot back; the next poll starts one
+            with _BACKGROUND_LOCK:
+                _BACKGROUND_WORKERS_ALIVE -= 1
+                _BACKGROUND_LOCK.notify_all()
+            if not isinstance(exc, Exception):
+                raise
+            logging.getLogger('user-steps').warning('Background remote card pass not started', exc_info=True)
+    return queued
+
+
+def _background_idle(timeout):
+    """Wait until no background remote pass is queued or running (tests); True when idle."""
+    with _BACKGROUND_LOCK:
+        return _BACKGROUND_LOCK.wait_for(
+            lambda: not _BACKGROUND_WORKERS_ALIVE and not _BACKGROUND_PENDING and not _BACKGROUND_RUNNING, timeout)
+
+
+def _drain_remote():
+    global _BACKGROUND_WORKERS_ALIVE
+    log = logging.getLogger('user-steps')
+    released = False
+    try:
+        while True:
+            with _BACKGROUND_LOCK:
+                if not _BACKGROUND_PENDING:
+                    # Leave in the same critical section that saw the queue empty: a pass queued after this
+                    # point sees the freed slot and starts a worker.
+                    _BACKGROUND_WORKERS_ALIVE -= 1
+                    released = True
+                    _BACKGROUND_LOCK.notify_all()
+                    return
+                key, (mirror, owner, ctx) = next(iter(_BACKGROUND_PENDING.items()))
+                del _BACKGROUND_PENDING[key]
+                _BACKGROUND_RUNNING.add(key)
+            try:
+                if not ctx.run(mirror._reconcile_remote, owner):
+                    log.debug('Background remote card pass deferred; owner stays stale')
+            except Exception:  # a failed pass stays stale: the next poll queues another
+                log.warning('Background remote card pass failed', exc_info=True)
+            finally:
+                with _BACKGROUND_LOCK:
+                    _BACKGROUND_RUNNING.discard(key)
+                    _BACKGROUND_LOCK.notify_all()
+    finally:
+        if not released:  # died on a BaseException: give the slot back (the next poll starts a replacement)
+            with _BACKGROUND_LOCK:
+                _BACKGROUND_WORKERS_ALIVE -= 1
+                _BACKGROUND_LOCK.notify_all()
 
 
 def _remote_fresh(key, within_s):
@@ -774,10 +864,26 @@ class Mirror:
         waits on the linked-card projection (3-7 s per poll on the hub, 2026-11-23). An owner no feed covers, or
         whose last strict pass failed, is reconciled in full here as before."""
         self.core.validate_owner(owner)
-        if fresh_s > 0 and _remote_fresh(encoded(owner), fresh_s):
-            self._reconcile_local(owner, False)
+        if fresh_s <= 0:
+            self.reconcile(owner)
             return
-        self.reconcile(owner)
+        if not _remote_fresh(encoded(owner), fresh_s):
+            # Stale: the remote pass runs on a background worker, never on this request thread; a remote ask it
+            # mirrors shows on the first poll after that pass finishes. The local pass still answers this one.
+            _schedule_remote(self, owner)
+        self._reconcile_local(owner, False)
+
+    def _reconcile_remote(self, owner):
+        """One remote pass; True (and *owner* marked fresh for polls, as a clean strict pass does) when clean.
+
+        False when the projection deferred (an unknown snapshot, e.g. an unreachable owner gateway): routine and
+        possibly long-lived, so not an error; the owner stays stale. Real failures raise."""
+        key = encoded(owner)
+        started = time.monotonic()
+        if self.remote.reconcile(owner) is False:
+            return False
+        _mark_remote_fresh(key, started)
+        return True
 
     def reconcile(self, owner, *, strict=False):
         self.core.validate_owner(owner)

@@ -73,8 +73,13 @@ def test_real_requests_feed_isolates_malformed_action(tmp_path, action):
         action_store=store,owner_resolver=lambda sid:dict(OWNER,storedSessionId=sid),
         kanban_boards=[('default',path)],kanban_mirror=mirror))
     with TestClient(app,raise_server_exceptions=False) as client:
+        first=client.get('/requests',params={'session':'session-a'})
+        assert first.status_code==200,first.text
+        # The poll queues the remote pass on a background worker; the new remote ask shows once it finished.
+        assert type(mirror).reconcile_poll.__globals__['_background_idle'](5)
         response=client.get('/requests',params={'session':'session-a'})
         assert response.status_code==200,response.text
+        assert type(mirror).reconcile_poll.__globals__['_background_idle'](5)  # a deferral re-queues: let it end
         refs = [ref['id'] for item in response.json()['requests']
                 for ref in item['scope']['sourceRefs'] if ref.get('type') == 'kanban']
         assert 't_healthy' in refs
