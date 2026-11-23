@@ -4,9 +4,12 @@ import { loadPlugin, mount, React } from './sdk-mock.mjs'
 const P = await loadPlugin()
 const row = { name: 'work', target: .25, actual: .7, strip: { blocked: 11, running: 7, other: 127,
   cap: 2, in_share: 2, over: 5, cap_kind: 'fair share', fleet_running: 8,
-  idle_lanes: ['idle'], wait: { dep: 100, slot: 27 }, tokens: Array(36).fill(1000) } }
+  actual: .7, token_avg: 100, idle_lanes: ['idle'], wait: { dep: 100, slot: 27 }, tokens: Array(36).fill(1000) } }
 
 test('C2 squares, split capsule, amber outline, tooltip, and unchanged selection', async () => {
+  assert.match(P.laneTitle({ ...row, actual: .1, strip: { ...row.strip, token_avg: 321 } }), /321 tok\/m avg/)
+  assert.match(P.laneTitle({ ...row, actual: .1 }), /6 h actual 70%/)
+  assert.doesNotMatch(P.laneTitle({ ...row, strip: { ...row.strip, actual: undefined } }), /6 h actual/)
   const clicked = []
   const view = await mount(React.createElement(P.MiniPill, { row, scale: 2000, onToggle: n => clicked.push(n) }))
   try {

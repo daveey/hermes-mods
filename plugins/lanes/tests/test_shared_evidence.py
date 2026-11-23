@@ -22,6 +22,12 @@ def test_strip_tokens_share_canonical_snapshot_accounting(board):
     lane = result['lanes']['work']
     assert len(lane['strip']['tokens']) == 36
     assert sum(lane['strip']['tokens']) == lane['tokens'] == 205
+    assert lane['strip']['token_avg'] == 205 / 360
+    # Selecting a different panel window must not relabel that window as six hours.
+    for hours, window in ((1, '1h'), (24, '24h')):
+        changed = api.lane_view(hours, window, False)['lanes']['work']
+        assert changed['strip']['actual'] == lane['actual']
+        assert changed['strip']['token_avg'] == lane['strip']['token_avg']
 
 
 

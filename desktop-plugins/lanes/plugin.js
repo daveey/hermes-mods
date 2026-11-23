@@ -687,11 +687,11 @@ export function LaneSpark({ tokens, scale }) {
 export function laneTitle(row, selected) {
   const m = stripMeter(row), s = row.strip || {}
   const lines = [row.name]
-  if (Array.isArray(s.tokens)) lines[0] += `: ${compact(s.tokens.reduce((a, n) => a + n, 0) / 360)} tok/m avg over 6 h`
+  if (s.token_avg != null) lines[0] += `: ${compact(s.token_avg)} tok/m avg over 6 h`
   lines.push(`${m.blocked} blocked on you`)
   const cap = s.cap == null ? '' : s.cap_kind === 'max' ? ` · max ${s.cap}` : ` · fair share ${s.cap} of ${s.fleet_running} busy slots (${pct(row.target)} target)`
   lines.push(`${m.running} running${cap}`)
-  if (s.over > 0) lines.push(`OVER by ${s.over}: borrowing idle slots — ${(s.idle_lanes || []).join(', ') || 'other lanes'} have nothing ready; 6 h actual ${pct(row.actual)} vs ${pct(row.target)} target`)
+  if (s.over > 0) lines.push(`OVER by ${s.over}: borrowing idle slots — ${(s.idle_lanes || []).join(', ') || 'other lanes'} have nothing ready; ${s.actual == null ? 'actual' : '6 h actual'} ${pct(s.actual ?? row.actual)} vs ${pct(row.target)} target`)
   const mix = Object.entries(s.wait || {}).sort((a, b) => b[1] - a[1]).map(([r, n]) => `${n} ${reasonInfo(r).label}`).join(', ')
   lines.push(`${m.notReady} waiting${mix ? ` (${mix})` : ''}`, `Click to ${selected ? 'deselect' : 'select'} this lane`)
   return lines.join('\n')

@@ -127,6 +127,10 @@ def project(snap, raw, expanded):
             series = raw.get('strip_tokens', {}).get(name)
             if series is not None:
                 row['strip']['tokens'] = series
+                row['strip']['token_avg'] = sum(series) / 360
+            actual = raw.get('strip_actual', {}).get(name)
+            if actual is not None:
+                row['strip']['actual'] = actual
             row['status'] = {key: lane.get(key, 0) for key in STATUS}  # the strip's totals for a lane selection
         view['sessions'] = session_counts(raw['cards'])
     if not expanded:
