@@ -147,7 +147,11 @@ authority needed rather than treating every spent attempt as a new approval requ
   pick, the owning chat files the design as its own card (none of the refused approach). It links that card as a
   parent of each child waiting on the held card, and adds a `parents=[that card]` follow-up that archives the held
   card. The held card stays as the record: archiving withdraws it and never completes it. If no card carries the
-  pick, message the owning chat. A non-owner never files the carrier itself.
+  pick, message the owning chat. A non-owner never files the carrier itself. If the held card's own deliverable
+  already shipped through another card, the owning chat archives it itself after a live read: the merge SHA on the
+  hub core, exact-head CI on it, and no unpublished commits in the held card's workspace (`git cherry` against main).
+  The trail comment names what stays unclaimed. Archiving releases its `todo` children. A child held in `triage`
+  with a spend decision pending stays held, because `recompute_ready` promotes only `todo`/`blocked` cards.
 
 ## 5. Leave a trail
 
