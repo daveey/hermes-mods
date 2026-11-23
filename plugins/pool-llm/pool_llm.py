@@ -120,8 +120,8 @@ def with_rotation(call: Callable[[Any], Any], pool: Any, *, model: Optional[str]
 
 
 # ---------------------------------------------------------------------------------------------- runtime pieces --
-def managed_pins() -> Optional[dict]:
-    """{(provider, tier): model} from the managed routing registry, or None when it is off."""
+def managed_routes() -> Optional[dict]:
+    """Ordered subscription models by (provider, tier), or None when the registry is off."""
     try:
         from agent.model_routing import eligible_routes
         from agent.model_routing_managed import managed_config
@@ -135,23 +135,36 @@ def managed_pins() -> Optional[dict]:
     for level in policy.get("routes", {}):
         for route in eligible_routes(policy, level):
             if route.get("billing") == "subscription":
-                out.setdefault((route["provider"], level), route["model"])
+                models = out.setdefault((route["provider"], level), [])
+                if route["model"] not in models:
+                    models.append(route["model"])
     return out
+
+
+def managed_pins() -> Optional[dict]:
+    """First subscription model per (provider, tier), preserving the legacy shape."""
+    routes = managed_routes()
+    return None if routes is None else {key: models[0] for key, models in routes.items()}
 
 
 def resolve_model(provider: str, model: Optional[str] = None, tier: Optional[str] = None) -> str:
     provider = canonical_provider(provider)
-    pins = managed_pins() or DEFAULT_MODELS
-    allowed = sorted({m for (p, _), m in pins.items() if p == provider})
+    routes = managed_routes()
+    if routes is None:
+        routes = {key: [value] for key, value in DEFAULT_MODELS.items()}
+        managed = False
+    else:
+        managed = True
+    allowed = sorted({m for (p, _), models in routes.items() if p == provider for m in models})
     if model:
-        if managed_pins() is not None and model not in allowed:
+        if managed and model not in allowed:
             raise ValueError(f"{model!r} is not a subscription model the pool serves for {provider}; "
                              f"use one of {allowed} (or --tier {'/'.join(TIERS)})")
         return model
     tier = tier or "standard"
-    if (provider, tier) not in pins:
+    if (provider, tier) not in routes:
         raise ValueError(f"no {tier} model for {provider}; choose from {allowed}")
-    return pins[(provider, tier)]
+    return routes[(provider, tier)][0]
 
 
 def load_pool(provider: str):
@@ -287,22 +300,33 @@ def complete(messages: list, *, provider: str = "anthropic", model: Optional[str
     ``thinking`` is the Anthropic ``thinking`` field (e.g. ``{"type": "disabled"}`` for a short classifier answer,
     which adaptive thinking would otherwise eat); other providers ignore it."""
     provider = canonical_provider(provider)
-    model = resolve_model(provider, model, tier)
-    route: dict = {}
-    if provider == "anthropic":
-        body = _chat_to_anthropic(messages, max_tokens, model)
-        if thinking is not None:
-            body["thinking"] = thinking
-        resp = anthropic_messages(body, route=route)
-        text = "".join(b.get("text", "") for b in resp.get("content", []) if b.get("type") == "text")
-    else:
-        resp = codex_responses(_chat_to_responses(messages, model), route=route)
-        text = "".join(c.get("text", "") for it in resp.get("output", []) if it.get("type") == "message"
-                       for c in it.get("content", []) if c.get("type") == "output_text")
-    result = {"text": text, "provider": provider, "model": model, "route": route}
-    if provider == "anthropic":
-        result["stop_reason"] = resp.get("stop_reason")
-    return result
+    resolved = resolve_model(provider, model, tier)
+    models = [resolved] if model else (managed_routes() or {}).get((provider, tier or "standard"), [resolved])
+    failed: list[str] = []
+    for candidate in models:
+        route: dict = {}
+        try:
+            if provider == "anthropic":
+                body = _chat_to_anthropic(messages, max_tokens, candidate)
+                if thinking is not None:
+                    body["thinking"] = thinking
+                resp = anthropic_messages(body, route=route)
+                text = "".join(b.get("text", "") for b in resp.get("content", []) if b.get("type") == "text")
+            else:
+                resp = codex_responses(_chat_to_responses(messages, candidate), route=route)
+                text = "".join(c.get("text", "") for it in resp.get("output", []) if it.get("type") == "message"
+                               for c in it.get("content", []) if c.get("type") == "output_text")
+        except PoolExhausted as exc:
+            failed.append(candidate)
+            if len(failed) == len(models):
+                raise PoolExhausted(f"every subscription model refused (tried: {', '.join(failed)}); {exc}") from exc
+            continue
+        result = {"text": text, "provider": provider, "model": candidate, "route": route,
+                  "fallback_from": failed[0] if failed else None}
+        if provider == "anthropic":
+            result["stop_reason"] = resp.get("stop_reason")
+        return result
+    raise PoolExhausted(f"no subscription models available for {provider}/{tier or 'standard'}")
 
 
 class _Completions:
@@ -652,9 +676,12 @@ def main(argv: Optional[list] = None) -> int:
     args = ap.parse_args(argv)
 
     if args.cmd == "models":
-        pins = managed_pins() or DEFAULT_MODELS
-        for (p, t), m in sorted(pins.items()):
-            print(f"{p:13} {t:9} {m}")
+        routes = managed_routes()
+        if routes is None:
+            routes = {key: [value] for key, value in DEFAULT_MODELS.items()}
+        for (p, t), models in sorted(routes.items()):
+            for m in models:
+                print(f"{p:13} {t:9} {m}")
         return 0
     if args.cmd == "serve":
         serve(args.host, args.port)
@@ -677,6 +704,9 @@ def main(argv: Optional[list] = None) -> int:
     except (ValueError, PoolExhausted) as exc:
         print(f"hermes-pool-llm: {exc}", file=sys.stderr)
         return 2
+    if r.get("fallback_from"):
+        print(f"hermes-pool-llm: {r['fallback_from']} refused (pool exhausted); served by {r['model']}",
+              file=sys.stderr)
     print(json.dumps(r) if args.json else r["text"])
     stop_reason = r.get("stop_reason")
     if r["provider"] == "anthropic" and (

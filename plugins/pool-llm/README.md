@@ -18,6 +18,19 @@ $B ask --provider openai --tier fast --json - < prompt.txt   # {text, provider, 
 $B serve --port 8765                                         # local SDK-compatible endpoint
 ```
 
+`models` lists every eligible subscription route per provider and tier, in registry preference
+order (duplicates removed), not just the first model. Any listed model can be requested explicitly.
+
+Without an explicit model, `ask --tier deep` and `complete(..., tier="deep")` try the selected
+provider's subscription models in that tier's order. Each model first rotates through its eligible
+accounts; on `PoolExhausted`, the next model is tried (for example Fable → Opus). Fallback never
+crosses providers or uses metered routes. When all models refuse, the error names every model tried.
+`ask` prints one fallback notice on stderr, and `ask --json` / `complete()` include `fallback_from`
+(the first refused model, or null when no fallback occurred) and the actual served `model`.
+Explicit models (`--model`, `client(model=...)`, or a `serve` request's model) never fall back.
+With the managed registry off, the existing `DEFAULT_MODELS` tier choices remain unchanged.
+Regression coverage: `tests/test_tier_fallback.py` uses a fake registry, pool and clients, without network.
+
 `ask --json` includes Anthropic's `stop_reason`. A `refusal` (even with text), or
 `max_tokens` with empty/whitespace-only text, exits 2 and names the stop reason on stderr;
 stdout still contains the result in the requested format. These semantic failures are not
