@@ -622,6 +622,52 @@ def test_long_wait_human_ask_and_running_never_nudged(env):
     none(env, 'BS-long-wait', F.long_wait(env.conn, env.now, status='running'))
 
 
+@pytest.mark.parametrize('reason,waited_s,expected', [
+    ('deploy rollout: waiting for worker update window', 3000, 'deploy'),
+    ('CI run pending', 3000, 'ci'),
+    ('waiting for vendor ticket', 3000, None),
+    ('waiting for vendor ticket', 10900, 'external'),
+    ('deploy rollout pending', 1800, None),
+])
+def test_long_wait_legacy_probe_with_backstop(env, monkeypatch, reason, waited_s, expected):
+    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state':'pending','happened':False})
+    tid = F.legacy_probe_wait(env.conn, env.now, reason=reason, waited_s=waited_s)
+    fs = env.findings(rule='BS-long-wait', card=tid)
+    assert len(fs) == bool(expected)
+    if expected:
+        assert fs[0]['evidence']['kind'] == expected
+        assert fs[0]['evidence']['waited_s'] == waited_s
+
+
+def test_long_wait_legacy_deploy_wake_and_clock_exclusion(env, monkeypatch):
+    from sr_helpers import PLUGIN, load
+    from hermes_cli import kanban_db as kb
+    mod = load('_sr_legacy_wake', PLUGIN/'nudge.py')
+    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state':'pending','happened':False})
+    tid = F.legacy_probe_wait(env.conn, env.now)
+    f = one(env, 'BS-long-wait', tid)
+    text = mod.message(f, [])
+    cid = kb.add_comment(env.conn, tid, 'session-repair', text)
+    rec = {'comment_id':cid,'board':'default','card':tid}
+    assert mod.wake_owner(env.scan_mod, env.sources(), f, rec, text)['outcome'] == 'woken'
+    clock = F.long_wait(env.conn, env.now, kind='clock', waited_s=20000)
+    none(env, 'BS-long-wait', clock)
+    pure = F.legacy_probe_wait(env.conn, env.now, waited_s=20000, reason='deploy later', wake_check='')
+    none(env, 'BS-long-wait', pure)
+
+
+def test_long_wait_legacy_core_row_is_used_and_age_is_episode_fenced(env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state':'pending','happened':False})
+    tid = F.legacy_probe_wait(env.conn, env.now, reason='rollout pending')
+    task = kb.get_task(env.conn, tid)
+    row = {'wait':{'wait_state':'external_running','waiting_on':'deploy rollout PR42',
+                   'waiting_since':env.now-20000}}
+    card = env.scan_mod.Card(tid,'default',None,task,env.conn,row)
+    f = env.scan_mod.rule_long_wait(card,env.sources()).to_dict()
+    assert f['evidence']['kind']=='deploy' and f['evidence']['waited_s']==3000
+
+
 def nudge_target(env, monkeypatch):
     from sr_helpers import PLUGIN, load
     from hermes_cli import kanban_db as kb
@@ -667,6 +713,32 @@ def test_nudge_wake_transaction_refuses_changed_or_held_target(env, monkeypatch,
     result=mod.wake_owner(env.scan_mod,env.sources(),f,rec,text)
     assert result['outcome']=='wake_refused', result
     assert not env.scan_mod._events(env.conn,tid,kinds=('unblocked',),limit=1)
+
+
+def test_tick_recovers_committed_wake_without_candidates(env, monkeypatch):
+    from sr_helpers import PLUGIN, load
+    mod,tid,f,text,rec = nudge_target(env,monkeypatch)
+    run = load('_sr_recovery_tick',PLUGIN/'run.py')
+    sd = env.home/'session-repair'; sd.mkdir()
+    (sd/'config.json').write_text(json.dumps({'nudge_mode':'live'}))
+    # The comment and wake committed, but the caller lost the acknowledgement.
+    wake = mod.wake_owner(env.scan_mod,env.sources(),f,rec,text)
+    assert wake['outcome']=='woken'
+    path = sd/'nudges-live.json'
+    run._write_json(path, {'fps':{f['fingerprint']:{'times':[], 'pending':{
+        'at':env.now-10, 'text':text, 'finding':f}}}, 'sent':[env.now-10]})
+    monkeypatch.setattr(run,'load_scan',lambda:env.scan_mod)
+    monkeypatch.setattr(run,'load_nudge',lambda:mod)
+    result = {'findings':[], 'errors':[]}
+    run.tick(home=env.home,scanner=lambda:result,now=env.now,run_mode='off')
+    assert run._read_json(path,{})['fps'][f['fingerprint']]['pending']
+    out = run.tick(home=env.home,scanner=lambda:result,now=env.now,run_mode='shadow')
+    assert out['nudges'][0]['recovered']
+    assert out['nudges'][0]['wake']['event_id']==wake['event_id']
+    h = run._read_json(path,{})['fps'][f['fingerprint']]
+    assert 'pending' not in h and h['times']==[env.now-10]
+    assert len(env.scan_mod._events(env.conn,tid,kinds=('unblocked',),limit=10))==1
+    assert env.conn.execute('SELECT COUNT(*) FROM task_comments WHERE task_id=?',(tid,)).fetchone()[0]==1
 
 
 def test_probe_only_history_keeps_two_hour_cadence_and_escalation(env,monkeypatch):

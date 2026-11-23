@@ -268,6 +268,11 @@ already happened. Unlike a broken wake, this asks the owner to reassess; it neve
 **Detection** (`rule_long_wait`): open `scheduled`/`blocked`/`todo` cards, no live run, never a valid human ask,
 worker copy, repair-created card, containment or recovery hold. Core's newest `PARK_EVENT_KINDS` event, fenced by
 latest run admission, supplies `awaiting` through `kanban_wait_info.parse_awaiting` and the episode's age.
+When a legacy park has no `awaiting`, use core's derived wait plus `producer_from_wake_check`: a probe's
+future `wake_at` is only a backstop, not a clock wait. An untyped probe is external (3 h); derived wait/reason
+text naming deploy or CI selects 45 min. No probe and no producer remains excluded, as does an explicitly
+declared clock. Projected `waiting_since` is fenced at the newest current-episode park; scan, prewrite and
+transactional wake use the same producer resolver.
 Thresholds (`LONG_WAIT_S`): CI and deploy **45 min**, external/review **3 h**, card **4 h** only when the producer
 has had no event for **1 h**, resource **2 h**. Clock: never (`BS-overdue-wake` owns it). Canonical GitHub run/PR
 URLs get a bounded `gh` read through token-broker: a completed run, merged/closed/approved PR or nonempty all-green

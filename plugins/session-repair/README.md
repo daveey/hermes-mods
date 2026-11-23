@@ -103,7 +103,12 @@ paths, after re-reading the target and all exclusions. No raw board SQL writes. 
 scheduled cards: core's `unblock_task` API performs a guarded owner reassessment wake after the exact receipt,
 with transactional same-park/event checks, human/live-run/containment/spend/safety/recovery exclusions and parent
 re-gating. Pure clock waits are never woken. Record the `unblocked` event with `session_repair_nudge=<comment id>`;
-recovery reads that event rather than waking twice. A moved event or park cancels the action.
+recovery reads that event rather than waking twice, including on a tick with no fresh nudge findings (global
+`mode=off` still does no work). A moved event or park cancels the action.
+Legacy parks without `awaiting` use core's derived wait/probe reader: opaque probes are external (3h),
+with deploy/CI text selecting 45min. A future probe backstop is not a clock; explicit clock declarations and
+probe-less clock waits stay excluded. The current-episode park fences projected ages, and the same resolver
+runs inside the guarded wake.
 Each send has a durable pending identity and exact persisted comment/message receipt;
 an uncertain delivery remains pending for readback, never blindly repeated. Comments are capped at 1,000 chars
 including the receipt marker; producer state is a plain allowlisted summary, never the raw check/task JSON.

@@ -160,8 +160,7 @@ def wake_owner(scan, src, f, rec, text):
             if conn.execute("SELECT 1 FROM task_runs WHERE task_id=? AND status='running'", (tid,)).fetchone():
                 return 'owner running'
             park = scan.current_park(card)
-            from hermes_cli.kanban_wait_info import parse_awaiting
-            awaited = parse_awaiting(park['payload'].get('awaiting')) if park else None
+            awaited = scan.wait_producer(card, park, time.time())[0] if park else None
             if (not park or park['id'] != f['evidence']['park_id'] or not awaited
                     or awaited['kind'] not in scan.LONG_WAIT_S):
                 return 'park changed or clock wait'

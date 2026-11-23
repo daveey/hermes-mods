@@ -460,7 +460,7 @@ def _tick(*, home=None, scanner=None, runner=subprocess.run, now=None, run_mode=
         nm = load_nudge().config_mode(home)
         actions, escalations, nm = load_nudge().process(
             nudges,home=home,now=now,scan=load_scan(),runner=runner,argv=hermes_argv(),
-            read_json=_read_json,write_json=_write_json,append=_append) if nudges else ([],[],nm)
+            read_json=_read_json,write_json=_write_json,append=_append)
         ordinary = [f for f in findings if (f.get('fix') or {}).get('kind')!='nudge']
         out = _ordinary_tick(home=home,scanner=lambda:{**result,'findings':ordinary+(escalations if nm==m else [])},
                              now=now,run_mode=m,runner=runner)

@@ -49,6 +49,16 @@ def long_wait(conn, now, *, waited_s=3000, kind='ci', status='scheduled'):
     return tid
 
 
+def legacy_probe_wait(conn, now, *, waited_s=3000, reason='deploy rollout: waiting for worker update window',
+                      wake_check='python3 rollout_ready.py'):
+    """Legacy deploy park: no awaiting, an external probe and a future backstop."""
+    tid = card(conn, 'Waiting for rollout', status='scheduled')
+    age_all_events(conn, tid, now-waited_s)
+    event(conn, tid, 'scheduled', {'reason':reason, 'wake_check':wake_check,
+                                 'wake_at':now+2700}, at=now-waited_s)
+    return tid
+
+
 def ready_worker_free(conn, now, *, waited_s=2400):
     tid = card(conn, 'Ready, unclaimed, free slot', status='ready', ready_since=int((now - waited_s) * 1000))
     age_all_events(conn, tid, now - waited_s)
