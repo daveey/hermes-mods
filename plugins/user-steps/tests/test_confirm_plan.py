@@ -9,6 +9,22 @@ PLAN = '## Build plan\n\n1. Update the example renderer to show the new control.
 ASK = 'Say **go** and I will start the build.'
 
 
+@pytest.fixture
+def desktop_sources():
+    """Only absence is optional in public CI; drift/runtime errors must fail."""
+    import os
+    from pathlib import Path
+    root = Path(os.environ.get('HERMES_CORE_CHECKOUT') or Path.home() / '.hermes/hermes-agent')
+    if not (root / 'apps/desktop/src/lib/transcript-directives.ts').is_file():
+        pytest.skip('Desktop source is not installed in core-free public CI')
+    assert core.structured_confirmation(PLAN + '\n\n::user-step{t="' + core.enc(ASK) + '"}')
+
+
+def directive(step=None):
+    attrs = f'id="{step["id"]}" s="{OWNER["storedSessionId"]}" ' if step else ''
+    return '::user-step{' + attrs + 't="' + core.enc(ASK) + '"}'
+
+
 def publish(tmp_path, reply, *, kind='approve', source=None, span=ASK, structured=False):
     ledger = core.Ledger(tmp_path / 'ledger', db=tmp_path / 'missing.db')
     store = core.ActionStore(tmp_path / 'actions.sqlite3')
@@ -26,7 +42,7 @@ def publish(tmp_path, reply, *, kind='approve', source=None, span=ASK, structure
     return store, store.requests(OWNER), result
 
 
-def test_plan_then_say_go_freezes_scope_and_approval(tmp_path):
+def test_plan_then_say_go_freezes_scope_and_approval(tmp_path, desktop_sources):
     store, requests, result = publish(tmp_path, PLAN + '\n\n' + ASK, structured=True)
     assert len(requests) == 1
     r = requests[0]
@@ -49,7 +65,7 @@ def test_plan_then_say_go_freezes_scope_and_approval(tmp_path):
     assert 'No deployment or new spend' in params['text']
 
 
-def test_session_outcome_confirm_in_same_final_message(tmp_path):
+def test_session_outcome_confirm_in_same_final_message(tmp_path, desktop_sources):
     _, requests, _ = publish(tmp_path, PLAN + '\n\n' + ASK, source='session_outcome', structured=True)
     assert len(requests) == 1
     assert requests[0]['kind'] == 'approval'
@@ -85,9 +101,11 @@ def test_ambiguous_example_or_oversize_context_never_authorizes(reply, span):
 
 
 @pytest.mark.parametrize('state', ['revised', 'decided'])
-def test_final_reply_does_not_replace_producer_revision_or_decision(tmp_path, state):
+def test_final_reply_does_not_replace_producer_revision_or_decision(tmp_path, state, desktop_sources):
     ledger = core.Ledger(tmp_path / 'ledger', db=tmp_path / 'missing.db')
     store = core.ActionStore(tmp_path / 'actions.sqlite3')
+    with ledger.edit(ledger.root(OWNER['storedSessionId'])) as data:
+        data['publication_turn'] = 'test-turn'
     step = core.add_step(OWNER['storedSessionId'], ASK, ['Go', 'Change plan'], ledger=ledger)
     request = store.migrate_step(OWNER, step)
     if state == 'revised':
@@ -96,19 +114,23 @@ def test_final_reply_does_not_replace_producer_revision_or_decision(tmp_path, st
     else:
         store.decide(OWNER, decision(request, choice=request['choices'][0]['id'], text=request['choices'][0]['label']))
         request = store.get(OWNER, request['requestId'])
-    core.attach_confirmation_plans(PLAN + '\n\n' + ASK, OWNER['storedSessionId'], ledger, store, OWNER)
+    core.attach_confirmation_plans(PLAN + '\n\n' + directive(step), OWNER['storedSessionId'], ledger, store, OWNER)
     assert store.get(OWNER, request['requestId']) == request
 
 
-def test_repeated_final_transform_does_not_duplicate_confirmation(tmp_path):
+def test_repeated_final_transform_does_not_duplicate_confirmation(tmp_path, desktop_sources):
     ledger = core.Ledger(tmp_path / 'ledger', db=tmp_path / 'missing.db')
     store = core.ActionStore(tmp_path / 'actions.sqlite3')
-    core.add_step(OWNER['storedSessionId'], ASK, ['Go', 'Change plan'], ledger=ledger)
+    with ledger.edit(ledger.root(OWNER['storedSessionId'])) as data:
+        data['publication_turn'] = 'test-turn'
+    step = core.add_step(OWNER['storedSessionId'], ASK, ['Go', 'Change plan'], ledger=ledger)
     llm = lambda *_: json.dumps({'steps': [{'text': ASK, 'kind': 'approve', 'verbatim_span': ASK}], 'resolved': []})
     for _ in range(2):
-        core.process_reply(PLAN + '\n\n' + ASK, OWNER['storedSessionId'], ledger=ledger,
+        core.process_reply(PLAN + '\n\n' + directive(step), OWNER['storedSessionId'], ledger=ledger,
                            llm=llm, action_store=store, action_owner=OWNER)
     assert len(store.requests(OWNER)) == 1
+    request = store.requests(OWNER)[0]
+    assert request['scope']['complete'] and request['revision'] == 2
 
 
 def test_trailing_limits_are_frozen_too(tmp_path):
@@ -147,7 +169,7 @@ def test_closed_code_in_plan_preserves_limits(tmp_path):
     assert not requests[0]['scope']['complete']  # Adjacent block is code, not prose.
 
 
-def test_change_plan_is_non_authorizing_and_retains_exact_plan(tmp_path):
+def test_change_plan_is_non_authorizing_and_retains_exact_plan(tmp_path, desktop_sources):
     store, requests, _ = publish(tmp_path, PLAN + '\n\n' + ASK, structured=True)
     op = store.decide(OWNER, decision(requests[0], choice='change-plan', text='Use a smaller patch'))['operation']
     assert op['intent']['executionAuthorized'] is False
