@@ -6,7 +6,7 @@ no SQL. No default runtime caller composes this owner before activation review.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import logging
 import queue
 import threading
@@ -401,9 +401,15 @@ class SourceCoordinator:
                 worker.start()
 
     def _base(self, s, lineage):
+        # Never take Feed.lock while holding the coordinator lock: keyed
+        # admission owns Feed.lock before entering this coordinator. Snapshot
+        # immutable candidates separately; publication revalidates the pinned
+        # watch, lineage and source admission, including intervening forgets.
+        with self.lock:
+            owned = self.bases.get(s)
         with self.feed.lock:
             held = self.feed.bundles.get(s, {}).get('bundle')
-        candidates = [b for b in (self.bases.get(s), held)
+        candidates = [b for b in (owned, held)
                       if b is not None and tuple(b['lineage']) == lineage]
         if candidates:
             return max(candidates, key=lambda b: b.get('canonical_seq', 0))
@@ -418,12 +424,16 @@ class SourceCoordinator:
             with self.lock:
                 chat = self.chats[s]
                 tickets = self.tickets.pop(s, [])
-                if self.tokens[s] is not self.feed._watch_tokens.get(s):
+                token = self.tokens[s]
+                if token is not self.feed._watch_tokens.get(s):
                     raise RuntimeError('snapshot watch was replaced')
                 pin = self.store.pin(chat)
                 lineage = pin[0].watches[chat].lineage_tuple
-                base = self._base(s, lineage)
+            base = self._base(s, lineage)
             projection = self.feed.project_board(self.store, chat, canonical_base=base, pin=pin)
+            # Bind to the watch that owned this pin, never a same-name watch
+            # installed while base selection or pure projection was in flight.
+            projection = replace(projection, watch_token=token)
             results = self.feed.publish_projections(self.store, {s: projection})
             result = results[s]
             bundle = BoardBundle(projection, self.module)
