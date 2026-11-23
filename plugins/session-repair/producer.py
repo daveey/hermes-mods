@@ -6,7 +6,7 @@ import subprocess
 REF = re.compile(r'https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(actions/runs|pull)/(\d+)(?:[/?#].*)?\Z')
 
 def read_github(kind, ref, runner=subprocess.run):
-    m = REF.fullmatch(ref) if kind in ('ci', 'external') else None
+    m = REF.fullmatch(ref) if kind in ('ci', 'deploy', 'external') else None
     if not m:
         return {'state': 'not_resolvable', 'happened': False}
     repo, what, number = m.groups()

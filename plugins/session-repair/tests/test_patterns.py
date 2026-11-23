@@ -593,10 +593,28 @@ def test_long_wait_ci_boundary(env, monkeypatch, waited_s, expected):
         assert fs[0]['fix']['kind'] == 'nudge'
 
 
-def test_long_wait_completed_green_at_five_minutes(env, monkeypatch):
+@pytest.mark.parametrize('kind', ['ci', 'deploy', 'external'])
+def test_long_wait_completed_green_at_five_minutes(env, monkeypatch, kind):
     monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state':'completed green','happened':True})
-    f = one(env, 'BS-long-wait', F.long_wait(env.conn, env.now, waited_s=300))
+    f = one(env, 'BS-long-wait', F.long_wait(env.conn, env.now, kind=kind, waited_s=300))
     assert f['variant']=='event_happened' and f['fix']['kind']=='nudge'
+
+
+@pytest.mark.parametrize('state', ['pending', 'readback_failed'])
+@pytest.mark.parametrize('waited_s,expected', [(300, 0), (3000, 1)])
+def test_deploy_wait_readback_age_fallback(env, monkeypatch, state, waited_s, expected):
+    calls = []
+    def readback(self, kind, ref):
+        calls.append((kind, ref))
+        return {'state': state, 'happened': False}
+    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', readback)
+    tid = F.long_wait(env.conn, env.now, kind='deploy', waited_s=waited_s)
+    fs = env.findings(rule='BS-long-wait', card=tid)
+    assert calls and calls[0][0] == 'deploy'
+    assert len(fs) == expected
+    if fs:
+        assert fs[0]['variant'] == 'too_long'
+        assert fs[0]['evidence']['live_producer']['state'] == state
 
 
 def test_long_wait_human_ask_and_running_never_nudged(env):
