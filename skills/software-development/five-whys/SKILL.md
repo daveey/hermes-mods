@@ -126,6 +126,8 @@ When a restriction or release is recognized by joining an audit event with priva
 
 For a new durable restriction, distinguish mutation fencing from maintenance eligibility. A correct write fence can still abort a whole recompute transaction or alarm when candidate selection ignores the restriction. Use marker presence (including malformed custody) to skip automatic work before effects, without treating the marker as authority or catching failures after partial writes. Prove an expiring pending-delete neighbour in both edge directions cannot stop an independent lease expiry; execute the real alarm after Durable Object eviction, and preserve target history/edges and next-alarm scheduling.
 
+For bounded SQLite GC cursors, test many rows sharing the same timestamp, not only distinct timestamps. A tuple `(time,rowid) > (?,?)` against a time-only index can reread the entire tied prefix despite LIMIT. Measure actual late-page workerd cursor rowsRead and query plans; split equal-time rowid and later-time seeks when needed. Keep row deletion, tombstone bookkeeping, history floor and cursor changes in one transaction, and inject failures at the final metadata writes as well as mid-delete.
+
 ### 3. Branch where causes split
 
 One problem often has several independent causes. When one why has two true answers, branch and follow each.
