@@ -866,7 +866,10 @@ def provider(session_id: str) -> Optional[dict]:
     # choice is not delivery, and a failed read is not a successful empty source.
     steps, pending = _load_sibling("session_outcome_decision_obligations",
                                    "session-outcome/decision_obligations.py").collect(
-                                       us, session_id, us.open_steps(session_id))
+                                       us, session_id, [
+                                           {**us.public_step(s), **({'choices': s['choices']} if s.get('choices') else {})}
+                                           for s in sorted(us.Ledger().open_steps(session_id),
+                                                           key=lambda s: s.get('created', 0))])
     if not steps and not pending:
         return None
     items = []

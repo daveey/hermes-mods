@@ -327,7 +327,9 @@ def test_provider_returns_open_steps(plugin, fake):
     assert got["waiting_on"] == []
     [item] = got["decision_items"]
     assert item["question"] == "Which region?" and item["state"] == "open" and item["id"].startswith("us_")
-    assert item["choices"] == [{"label": "us-east", "value": "use1"}, {"label": "eu-west", "value": "euw1"}]
+    us = plugin._user_steps()
+    request = us.ActionStore(read_only=True).requests(us.server_owner('S1'))[0]
+    assert item['choices'] == [{'label': c['label'], 'value': c['id']} for c in request['choices']]
 
 
 # ---- judge --------------------------------------------------------------------------------------------

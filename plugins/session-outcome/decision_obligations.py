@@ -32,9 +32,8 @@ def collect(us, session_id, legacy):
             continue
         aliases = [a['id'] for a in r['aliases'] if a['type'] == 'user_step'
                    and a['gatewayId'] == owner['gatewayId'] and a['profile'] == owner['profile']]
-        prior = next((s for s in legacy if s['id'] in aliases), None)
-        opened.append(prior or {'id': aliases[0] if aliases else r['requestId'], 'text': r['title'],
-                               'choices': [{'label': c['label'], 'value': c['id']} for c in r['choices']]})
+        opened.append({'id': aliases[0] if aliases else r['requestId'], 'text': r['title'],
+                       'choices': [{'label': c['label'], 'value': c['id']} for c in r['choices']]})
     pending = []
     for op in operations:
         if op['owner'] != dict(owner, storedSessionId=op['owner']['storedSessionId']):
