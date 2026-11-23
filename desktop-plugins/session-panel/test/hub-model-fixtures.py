@@ -30,6 +30,8 @@ cases = {
     'all_sections': f.bundle(f.task(human_request=f.human(), wait={'wait_state': 'human'}), f.task('t_stuck', status='scheduled', wait={'wait_state': 'stalled'}), f.task('t_ready', status='ready'), f.task('t_wait', status='blocked'), rentals=[{'id': 'box', 'name': 'Machine'}], done=[f.task('t_done', status='done')], outcome_json={'state': 'needs_user'}),
 }
 parent, leaf = 't_1111111111111111', 't_2222222222222222'
+for name in ('agent_held_local', 'agent_held_replica', 'agent_held_spend'):
+    cases[name]['cards']['t_abc123']['detail']['events'][0]['created_at'] = f.NOW - (5 * 3600 + 20 * 60)
 for kind, on in [('ci', 'CI job 42'), ('deploy', 'deploy release 42'), ('clock', 'the clock until 2026-11-25 12:00 UTC')]:
     b = f.held_bundle()
     b['tasks'][0]['wait']['waiting_on'] = on
@@ -90,4 +92,4 @@ cases.update({
     'tree_depth': outline_case({f't_{i:x}': [f't_{i+1:x}'] for i in range(10)}),
 })
 print(json.dumps({name: {'model': f.model.reduce_panel(b, now=f.NOW, projector=f.project,
-    wire=name == 'relative_clock'), 'now': f.NOW} for name, b in cases.items()}))
+    wire=name == 'relative_clock' or name.startswith('agent_held_')), 'now': f.NOW} for name, b in cases.items()}))
