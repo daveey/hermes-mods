@@ -451,6 +451,98 @@ def test_crash_after_admission_never_reuses_old_busy_refusal(turn_delivery, canc
     assert done['operation']['receipt']['destination'] == 'canonical_decision_delivery'
 
 
+@pytest.mark.parametrize('cancelled', [True, False])
+@pytest.mark.parametrize('crash_first', [True, False])
+def test_overlapping_refusal_cannot_hide_uncertain_admission(turn_delivery, cancelled, crash_first):
+    import threading
+    plugin, s = turn_delivery
+    r = s.create(OWNER, request())
+    oid = s.decide(OWNER, decision(r))['operation']['operationId']
+    s.dispatch(OWNER, oid, BusyReceiver())
+    entered, release = threading.Event(), threading.Event()
+    errors = []
+    prompt = load_module('overlap_prompt', ROOT / 'prompt_delivery.py')
+    def rpc(method, params):
+        return dict(params, status='accepted', dispatch='cancelled' if cancelled else 'queued',
+                    user_row_id=1, message_uid='fixture-message')
+    delivery = plugin.cards_mod.DecisionDelivery(runs=prompt.PromptAdmission(rpc=rpc))
+    class Interrupted:
+        def deliver(self, op):
+            receipt = delivery.deliver(op)
+            assert receipt.get('terminalCancelled', False) is cancelled
+            raise SystemExit('after canonical admission before settlement')
+    class Slow:
+        def deliver(self, op):
+            entered.set()
+            assert release.wait(10)
+            return (Interrupted() if crash_first else BusyReceiver()).deliver(op)
+    def background():
+        try: s.dispatch(OWNER, oid, Slow())
+        except BaseException as exc: errors.append(exc)
+    thread = threading.Thread(target=background)
+    thread.start()
+    try:
+        assert entered.wait(10)
+        if crash_first:
+            s.dispatch(OWNER, oid, BusyReceiver())
+        else:
+            with pytest.raises(SystemExit): s.dispatch(OWNER, oid, Interrupted())
+    finally:
+        release.set()
+        thread.join(10)
+    assert not thread.is_alive()
+    assert len(errors) == (1 if crash_first else 0)
+    assert all(isinstance(exc, SystemExit) for exc in errors)
+    before = s.operation(OWNER, oid)
+    note = (plugin.pre_llm_call(session_id='session-a', platform='desktop') or {}).get('context', '')
+    assert oid not in note
+    assert s.operation(OWNER, oid) == before
+    done = s.dispatch(OWNER, oid, delivery)
+    assert done['operation']['dispatchState'] == ('cancelled' if cancelled else 'delivered')
+    assert done['operation']['receipt']['destination'] == 'canonical_decision_delivery'
+
+
+def test_overlapping_refusals_still_attach_when_both_settle(turn_delivery):
+    import threading
+    plugin, s = turn_delivery
+    r = s.create(OWNER, request())
+    oid = s.decide(OWNER, decision(r))['operation']['operationId']
+    entered, release = threading.Event(), threading.Event()
+    class SlowBusy:
+        def deliver(self, op):
+            entered.set()
+            assert release.wait(10)
+            return BusyReceiver().deliver(op)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(s.dispatch, OWNER, oid, SlowBusy())
+        try:
+            assert entered.wait(10)
+            s.dispatch(OWNER, oid, BusyReceiver())
+        finally: release.set()
+        future.result(timeout=10)
+    assert not s.operation(OWNER, oid)['operation']['uncertainAttempts']
+    assert oid in plugin.pre_llm_call(session_id='session-a', platform='desktop')['context']
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_uncertainty_survives_subsequent_busy_retry(turn_delivery, legacy):
+    plugin, s = turn_delivery
+    r = s.create(OWNER, request())
+    oid = s.decide(OWNER, decision(r))['operation']['operationId']
+    class Interrupted:
+        def deliver(self, op): raise SystemExit('unknown admission outcome')
+    with pytest.raises(SystemExit): s.dispatch(OWNER, oid, Interrupted())
+    if legacy:
+        op = s.operation(OWNER, oid)['operation']
+        op.pop('uncertainAttempts', None)
+        with s._tx() as c:
+            c.execute('UPDATE operations SET body=? WHERE id=?', (json.dumps(op), oid))
+    s.dispatch(OWNER, oid, BusyReceiver())
+    before = s.operation(OWNER, oid)
+    assert plugin.pre_llm_call(session_id='session-a', platform='desktop') is None
+    assert s.operation(OWNER, oid) == before
+
+
 @pytest.mark.parametrize('choice,state,text', [('revise', 'superseded', 'Change the plan'),
                                              ('decline', 'cancelled', None)])
 def test_turn_attachment_preserves_non_authorizing_state(turn_delivery, choice, state, text):
