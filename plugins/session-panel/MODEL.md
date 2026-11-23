@@ -35,6 +35,17 @@ acceptance follows from acquisition-only tests.
 
 ## Board-source freshness
 
+The **unactivated**, opt-in [board projection API](BOARD_PROJECTION.md) adds a pure
+partial consumer and exact source-vector/ScopeDemand publication CAS over the
+strict acquisition store. It starts no service and changes none of the production
+routes described below. Partial unknown sources remain explicit diagnostics and
+unserved acquisition custody, never certified empty input. Immutable shared
+materialization is selected without per-chat SQLite/network I/O; canonical
+requests/errors merge independently from board data. A later `computed_seq` is
+not authority to overwrite a newer source vector. PanelModel stays version 1;
+classification and consent remain backend-owned. Production cutover, reserved
+roles and live/contention/component acceptance remain separate obligations.
+
 A separate change-driven board lane observes the canonical task-change index and
 external hub/origin-ledger/replica source stamps, and publishes affected watched
 chats independently of full-sweep mirror reconciliation. External captures use the
