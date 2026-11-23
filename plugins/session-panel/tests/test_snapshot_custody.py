@@ -157,7 +157,7 @@ def test_unknown_disposition_revokes_old_coverage(owned):
     accept(owned, [chats[0]], unknown=True)
     assert store.pin(chats[0])[1].missing_scopes
     assert not store.current(old)
-    assert not store.pin(chats[1])[1].missing_scopes
+    assert store.pin(chats[1])[1].missing_scopes  # omitted scopes are never certified
 
 
 @pytest.mark.parametrize('expansion', ['refs', 'lineage'])

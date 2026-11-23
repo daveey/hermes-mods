@@ -497,22 +497,15 @@ class SnapshotStore:
                 changed.update(k for k in certified_keys if k in previous and k not in supplied)
             if old and old.remote_parents != part.remote_parents:
                 changed.update(old.rows)
-            receipts = {k: v for k, v in (old.scope_receipts.items() if old else ()) if k in demands}
+            # Only this capture's exact, still-current completed demands may
+            # hold certificates. Neither merged payload nor equal/null stamps
+            # attest membership of an omitted scope. Keep its payload, not trust.
+            receipts = {k: v for k, v in (old.scope_receipts.items() if old else ()) if k in completed}
+            revoked = {k for k in (old.scope_receipts if old else ()) if k in demands and k not in completed}
             keys = {k: v for k, v in (old.scope_keys.items() if old else ()) if k in demands}
             stale = {k: v for k, v in (old.stale_scope_keys.items() if old else ()) if k in demands}
             scoped_members = {k: v for k, v in (old.scope_memberships.items() if old else ()) if k in demands}
             scoped_rows = {k: v for k, v in (old.scope_rows.items() if old else ()) if k in demands}
-            # A changed source observation is not evidence about any omitted
-            # scope, including one previously certified empty. Only the exact
-            # transaction-completed scope set can certify the new observation.
-            observation_changed = bool(old and (
-                old.receipt.cursor != receipt.cursor
-                or old.receipt.remote_parent_digest != receipt.remote_parent_digest))
-            revoked = set()
-            for sid in set(receipts) - completed:
-                if observation_changed or changed.intersection(keys.get(sid, ())):
-                    receipts.pop(sid)
-                    revoked.add(sid)
             unknown = {sid for sid in receipt.coverage.unknown_scopes
                        if demands.get(sid) == receipt.coverage.captured_demands[sid]}
             for sid in unknown:

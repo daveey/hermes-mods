@@ -44,7 +44,7 @@ def test_scope_coverage_survives_partial_capture_without_certifying_new_watch():
     assert store.pin(second)[1].first_admitted_mono_ns > 0
 
 
-def test_partial_capture_does_not_invalidate_unqueried_unchanged_scope():
+def test_partial_capture_readmits_unqueried_unchanged_scope():
     m = load_snapshot()
     store = m.SnapshotStore()
     source = m.SourceKey('gateway', 'default', 'default', 'local', '/example/board.db')
@@ -62,10 +62,10 @@ def test_partial_capture_does_not_invalidate_unqueried_unchanged_scope():
     part, prior = capture(all_demands, {keys[0]: {'title': 'one'}, keys[1]: {'title': 'two'}},
                           {d.id: frozenset({keys[i]}) for i, d in enumerate(all_demands.values())})
     store.accept_local(part, prior)
-    second_receipt = store.pin(chats[1])[0].parts[source].scope_receipts[store.demand(source, chats[1]).id]
     first = store.demand(source, chats[0])
     part, prior = capture({first.id: first}, {keys[0]: {'title': 'changed'}}, {first.id: frozenset({keys[0]})})
     store.accept_local(part, prior)
     snapshot, second = store.pin(chats[1])
-    assert not second.missing_scopes, 'absence from a partial acquisition is not a changed shared row'
-    assert snapshot.parts[source].scope_receipts[store.demand(source, chats[1]).id] is second_receipt
+    assert second.missing_scopes, 'an unread scope cannot inherit a certificate'
+    assert store.demand(source, chats[1]).id not in snapshot.parts[source].scope_receipts
+    assert keys[1] in snapshot.parts[source].rows  # last-known payload, not coverage

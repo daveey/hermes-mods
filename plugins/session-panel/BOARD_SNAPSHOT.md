@@ -24,19 +24,20 @@ lineage generation; `require(chat, refs)` advances refs generation. Freeze exact
 `accept_local(part, prior_version)` and `accept_external(...)` CAS the source epoch,
 generation, revision and owner token. Only matching current completed ScopeDemands
 gain coverage. New/expanded/rewatched scopes remain missing at unchanged DB stamps.
-Carried scopes retain their original scope receipt/version; changed shared detail
-or edge payload revokes incompatible old coverage. Membership and tombstones apply
-only to certified scopes. Old tokens cannot recreate membership. Old/new union
-membership and dependency keys drive invalidation. SourcePart.invalidated_keys
-carries cursor-observed changes even outside the captured membership; it revokes
-carried certificates without deleting last-known payload. Reuse requires current
-capture or same-cursor scope provenance, not mere presence in a merged part.
-At the store's single admission boundary, advancing the source cursor or remote-
-parent observation revokes every omitted scope certificate, even certified-empty
-membership; these scopes are admitted missing and retain last-known payload until
-an exact current ScopeDemand is transactionally reacquired. A key-overlap check
-alone cannot prove an omitted scope's membership is unchanged. Same-observation
-partial captures preserve unaffected coverage.
+Only the exact current demands completed by the latest accepted capture can hold
+scope certificates. Every omitted scope loses coverage, including authoritative
+empty scopes and unchanged/null cursor or digest observations. Last-known payload
+is retained as missing/unknown and re-admitted; it cannot be projected as fresh.
+The single certification boundary is `SnapshotStore._accept`; adapters supply
+capture evidence but never certify merged payload. Lifecycle reset, forget and
+scope retirement can only remove certificates. Captured unchanged scopes may
+retain their original receipt/version; omitted scopes may not. Membership and
+tombstones apply only to captured scopes. SourcePart.invalidated_keys records
+cursor-observed changes outside the captured membership without deleting
+last-known payload. Local payload reuse is limited to the preceding capture's
+completed scope set, never inferred from equality with an older scope cursor.
+A future unchanged-observation optimisation requires its own reviewed proof and
+cost gate; none is implemented here.
 
 `pin(chat)` returns Snapshot plus Admission, preserving first unserved clocks,
 receipt IDs, required scopes, certified source versions, missing scopes, failure
