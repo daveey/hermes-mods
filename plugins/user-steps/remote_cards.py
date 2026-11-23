@@ -28,8 +28,18 @@ def linked_cards(owner):
     only those qualified targets from the courier's published owner records.
     """
     # Missing core is unavailable, never evidence that a prior remote ask departed.
+    # [daveey] Last good projection (stale_ok): the action queue (/user-steps/requests) must never wait on
+    # ``_links_lock`` while a links rebuild runs. Strict reads queued 10-60 s behind it on the hub (2026-11-23) and
+    # Desktop showed "Action queue unavailable" at its 10 s budget. The answer is the shared links facts snapshot
+    # (up to its ~90 s validity) or the warm links cache; membership changes can show late, card content does not
+    # (it comes from the hub view below).
     from hermes_cli.kanban_session_activity import _remote_cards
-    cards = _remote_cards([owner['storedSessionId']], ('blocked', 'triage'), False)
+    cards = _remote_cards([owner['storedSessionId']], ('blocked', 'triage'), True)
+    # A replica-only fallback (origin custody unreadable, e.g. the links facts not fresh) omits ledger-carried and
+    # other-profile asks. Absence in it is not departure evidence: raise so reconcile defers instead of withdrawing.
+    if any(card.get('partial_source_unknown') for card in cards):
+        raise OSError('Remote ask membership partial: ' + str(next(
+            c['partial_source_unknown'] for c in cards if c.get('partial_source_unknown'))))
     view_module = load_file(Path(__file__).resolve().parents[1] / 'hub-sync' / 'hubview.py')
     view = view_module.open_view()
     if view is None:

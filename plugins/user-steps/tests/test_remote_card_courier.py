@@ -329,6 +329,29 @@ def test_membership_hydrates_only_exact_chat_gateway_profile_board_target(tmp_pa
     assert closed == [True]
 
 
+def test_action_queue_reads_the_last_good_links_projection(tmp_path, monkeypatch):
+    """2026-11-23: a strict links read queued 10-60 s behind ``_links_lock`` and Desktop showed "Action queue
+    unavailable". ``linked_cards`` (the /user-steps/requests path) must ask for the last good projection."""
+    fixture(tmp_path)
+    module = load_module('remote_membership_stale', ROOT / 'remote_cards.py')
+    calls = []
+
+    def remote_cards(ids, statuses, stale_ok):
+        calls.append(stale_ok)
+        return []
+    try:
+        reader = importlib.import_module('hermes_cli.kanban_session_activity')
+        monkeypatch.setattr(reader, '_remote_cards', remote_cards)
+    except ImportError:
+        monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_session_activity',
+                            SimpleNamespace(_remote_cards=remote_cards))
+    view = SimpleNamespace(gateway='fixture-sync', rows=lambda coll, pick: [],
+                           conn=SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(module, 'load_file', lambda path: SimpleNamespace(open_view=lambda: view))
+    assert module.linked_cards(dict(OWNER, gatewayId='install:' + '0' * 32)) == []
+    assert calls == [True], 'the action queue waited for a strict links rebuild'
+
+
 @pytest.mark.parametrize('state', ['rejected', 'expired', 'failed'])
 def test_owner_refusal_retires_and_remints_without_retry(tmp_path, state):
     mirror, store, _, hr = fixture(tmp_path)
@@ -426,3 +449,35 @@ def test_delivered_other_remints_same_generation(tmp_path):
     mirror.remote.reconcile(OWNER)
     opens = [r for r in store.requests(OWNER) if r['state'] == 'open']
     assert len(opens) == 1 and opens[0]['requestId'] != old['requestId']
+
+
+def test_partial_links_membership_is_unavailable_not_departure(tmp_path, monkeypatch):
+    """A replica-only fallback (origin custody unreadable) is partial: an ask it omits must not be withdrawn.
+    ``linked_cards`` raises, and reconcile keeps the open request."""
+    mirror, store, _, hr = fixture(tmp_path)
+    module = load_module('remote_membership_partial', ROOT / 'remote_cards.py')
+    exact = dict(remote_row(hr), origin_gateway='fixture-sync', origin_profile=OWNER['profile'])
+    partial = [dict(exact, stale=True, partial_source_unknown='origin_ledger_unavailable')]
+    try:
+        reader = importlib.import_module('hermes_cli.kanban_session_activity')
+        monkeypatch.setattr(reader, '_remote_cards', lambda *args: partial)
+    except ImportError:
+        monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_session_activity',
+                            SimpleNamespace(_remote_cards=lambda *args: partial))
+    with pytest.raises(OSError, match='partial'):
+        module.linked_cards(dict(OWNER, gatewayId='install:' + '0' * 32))
+
+    # end to end: an open remote ask, then a pass whose membership read is partial (raises): kept, not withdrawn
+    mirror.remote.cards = lambda owner: [remote_row(hr)]
+    mirror.remote.reconcile(OWNER)
+    before = [r["requestId"] for r in store.requests(OWNER)]
+    assert before
+
+    def partial_read(owner):
+        raise OSError('Remote ask membership partial: origin_ledger_unavailable')
+    mirror.remote.cards = partial_read
+    try:
+        mirror.remote.reconcile(OWNER)
+    except OSError:
+        pass  # surfaced as unavailable to the caller is fine; what matters is no withdrawal
+    assert [r["requestId"] for r in store.requests(OWNER)] == before, 'a partial membership read withdrew an ask'
