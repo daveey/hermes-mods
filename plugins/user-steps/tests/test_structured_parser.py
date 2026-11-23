@@ -6,6 +6,7 @@ import shutil
 import subprocess
 
 import pytest
+from test_confirm_plan import desktop_sources
 
 PARSER = Path(__file__).resolve().parents[1] / 'parser'
 
@@ -24,7 +25,7 @@ def test_bundle_matches_recorded_provenance():
 
 
 @pytest.mark.parametrize('fault', ['stale-turn', 'multiple-decide', 'forged-id', 'wrong-session', 'mixed-raw'])
-def test_producer_identity_and_cardinality_never_authorize(tmp_path, fault):
+def test_producer_identity_and_cardinality_never_authorize(tmp_path, fault, desktop_sources):
     from test_confirm_plan import core, OWNER, PLAN, ASK, directive
     ledger = core.Ledger(tmp_path / 'ledger', db=tmp_path / 'missing.db')
     store = core.ActionStore(tmp_path / 'actions.sqlite3')

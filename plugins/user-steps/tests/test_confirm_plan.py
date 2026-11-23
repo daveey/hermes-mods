@@ -25,7 +25,7 @@ def directive(step=None):
     return '::user-step{' + attrs + 't="' + core.enc(ASK) + '"}'
 
 
-def publish(tmp_path, reply, *, kind='approve', source=None, span=ASK, structured=False):
+def publish(tmp_path, reply, *, kind='approve', source=None, span=ASK, structured=False, use_model=True):
     ledger = core.Ledger(tmp_path / 'ledger', db=tmp_path / 'missing.db')
     store = core.ActionStore(tmp_path / 'actions.sqlite3')
     with ledger.edit(ledger.root(OWNER['storedSessionId'])) as data:
@@ -37,13 +37,20 @@ def publish(tmp_path, reply, *, kind='approve', source=None, span=ASK, structure
     if structured:
         reply = reply.removesuffix(span) + '::user-step{' + attrs + 't="' + core.enc(span) + '"}'
     llm = lambda *_: json.dumps({'steps': [{'text': span, 'kind': kind, 'verbatim_span': span}], 'resolved': []})
-    result = core.process_reply(reply, OWNER['storedSessionId'], ledger=ledger, llm=llm,
+    result = core.process_reply(reply, OWNER['storedSessionId'], ledger=ledger, llm=llm if use_model else None,
                                 action_store=store, action_owner=OWNER)
     return store, store.requests(OWNER), result
 
 
-def test_plan_then_say_go_freezes_scope_and_approval(tmp_path, desktop_sources):
-    store, requests, result = publish(tmp_path, PLAN + '\n\n' + ASK, structured=True)
+@pytest.mark.parametrize('use_model', [True, False])
+def test_plan_then_say_go_freezes_scope_and_approval(tmp_path, desktop_sources, use_model):
+    store, requests, result = publish(tmp_path, PLAN + '\n\n' + ASK, structured=True, use_model=use_model)
+    if not use_model:
+        # The legacy fallback does not classify this wording. Never invent an
+        # approval from a structured ask whose approval kind was not established.
+        assert not any(r['scope']['complete'] for r in requests)
+        assert not any(c['effect'] == 'approve' for r in requests for c in r['choices'])
+        return
     assert len(requests) == 1
     r = requests[0]
     assert r['kind'] == 'approval' and r['state'] == 'open'
