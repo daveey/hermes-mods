@@ -546,3 +546,38 @@ def test_batched_panel_stamps_equal_the_per_chat_stamp_and_leave_no_connection_a
     assert r.panel_stamps(ids) == {s: r.panel_stamp(s) for s in ids} != single
     r.release()
     assert r._local.conns == {}
+
+
+def test_card_detail_reads_only_the_newest_events_and_latest_run(api, board, monkeypatch):
+    """Same events and run as filtering every event in Python, read through one LIMITed query. [daveey]"""
+    import dataclasses
+    path, conn = board
+    cid = kanban_db.create_task(conn, title='Busy card', initial_status='running', session_id='S1')
+    with conn:
+        for i in range(300):
+            kind = 'heartbeat' if i % 3 else ('commented' if i % 2 else 'blocked')
+            conn.execute('INSERT INTO task_events(task_id, kind, payload, created_at) VALUES (?,?,?,?)',
+                         (cid, kind, None, 1_000 + i // 2))
+        for i in range(3):
+            conn.execute('INSERT INTO task_runs(task_id, status, started_at) VALUES (?,?,?)', (cid, 'done', 5 + i))
+    expected_events = [dataclasses.asdict(e) for e in kanban_db.list_events(conn, cid)
+                       if e.kind != 'heartbeat'][-api.EVENTS_KEPT:]
+    expected_runs = [dataclasses.asdict(r) for r in kanban_db.list_runs(conn, cid)][-1:]
+    for run in expected_runs:
+        run.pop('last_heartbeat_at', None)
+    r = readers_for(api, path, monkeypatch)
+    sql = []
+    real_conn = r.conn
+
+    def traced(p):
+        c = real_conn(p)
+        if c is not None:
+            c.set_trace_callback(sql.append)
+        return c
+
+    monkeypatch.setattr(r, 'conn', traced)
+    d = r.card(cid, 'default')['detail']
+    assert d['events'] == expected_events and len(d['events']) == api.EVENTS_KEPT
+    assert d['runs'] == expected_runs
+    event_reads = [s for s in sql if 'FROM task_events WHERE task_id' in s]
+    assert event_reads and all('LIMIT' in s for s in event_reads), event_reads

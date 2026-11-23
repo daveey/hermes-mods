@@ -928,8 +928,9 @@ class CoreReaders:
             p = kanban_db.get_task(c, pid)
             if p is not None:
                 link_tasks.append({'id': p.id, 'title': p.title, 'status': p.status})
-        events = [dataclasses.asdict(e) for e in kanban_db.list_events(c, card_id) if e.kind != 'heartbeat'][-EVENTS_KEPT:]
-        runs = [dataclasses.asdict(r) for r in kanban_db.list_runs(c, card_id)][-1:]
+        events = [dataclasses.asdict(e) for e in _newest_events(c, card_id)]
+        latest = kanban_db.latest_run(c, card_id)
+        runs = [dataclasses.asdict(latest)] if latest is not None else []
         for r in runs:
             r.pop('last_heartbeat_at', None)
         out = {'task': d, 'events': events, 'runs': runs, 'links': {'parents': parents, 'children': []},
@@ -955,6 +956,19 @@ class CoreReaders:
             except Exception:
                 pass
         return out
+
+
+def _newest_events(c: sqlite3.Connection, card_id: str) -> list:
+    """The card's newest `EVENTS_KEPT` non-heartbeat events, oldest first (`list_events` order). [daveey]
+
+    SQLite picks them through `idx_events_task(task_id, created_at)`. Reading every event and filtering in Python cost
+    the hub backend ~75 thread-seconds a minute (2026-11-22): cards carry up to 9,302 events, most of them
+    heartbeats, and each row paid a GIL round trip in a ~190-thread process."""
+    from hermes_cli import kanban_db
+    rows = c.execute(
+        "SELECT * FROM task_events WHERE task_id = ? AND kind != 'heartbeat' "
+        "ORDER BY created_at DESC, id DESC LIMIT ?", (card_id, EVENTS_KEPT)).fetchall()
+    return [kanban_db.Event.from_row(r) for r in reversed(rows)]
 
 
 def _calm(rows):
