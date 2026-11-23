@@ -7,6 +7,32 @@ Agent progress remains separate and collapsed.
 
 ## Implementation status
 
+### Durable receipt before delivery
+
+`POST /requests/{id}/decisions` returns the committed operation snapshot, normally
+`dispatchState=pending`, before contacting an executor. HTTP success proves durable
+recording, not execution or delivery. Existing operation readback, Check status and
+Retry retain their exact owner, revision, operation ID and idempotency key.
+
+A process-owned worker per served profile/storage scope recovers the operations
+outbox, including hot mounts without lifespan startup. Events are coalesced hints;
+periodic scans recover lost hints. Mounts share custody across module reloads and
+release their lifetime tokens on teardown. Delivery remains serial within a scope:
+a slow receiver delays other delivery, but not new durable HTTP receipts. This is
+not an executor fairness or subsecond-delivery guarantee.
+
+Automatic scans respect durable per-operation `dispatchStartedAt` cadence while
+fresh operations remain immediately eligible. Manual Retry remains immediate.
+The existing retry interval of zero now retains a 15-second recovery scan rather
+than disabling durable outbox recovery. SQLite FULL-sync commits, operation leases,
+receiver idempotency, terminal retirement and unresolved receipt recovery remain
+required; notification failure never turns a committed decision into an HTTP error.
+
+Regression coverage: `test_receipt_latency.py`, `test_receipt_commit.py`,
+`test_outbox.py`, `test_outbox_cadence.py`, `test_outbox_crash.py`, and the real-core
+`test_mounted_runtime.py` controls. Run the latter through `run-core-integration.sh`
+with an isolated compatible core; standalone skips are not integration proof.
+
 ## Legacy ledgers without `revision` (migration note)
 
 Ledger files written before revisions existed have no `revision` key. They stay
