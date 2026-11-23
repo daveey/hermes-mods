@@ -488,14 +488,20 @@ absolute escalation-overdue label, never scheduled-wake-overdue.
 
 The renderer is unchanged: normal rows use existing tooltips; asks keep their
 Details disclosure. Old wire payloads without actionability remain supported.
-Within existing source capture, demand-only signatures cover wake-check commands,
-pending retain-command custody and sync mode (inputs outside the existing core
-revision cursor). Immediate-parent references participate in existing semantic
-invalidation, including when the parent was not hydrated. No new poller or source
-admission policy is introduced. The unactivated `board_capture.py` acquisition
-capability intentionally omits this unsupported enrichment on both fresh and
-reused details: it cannot certify complete incremental invalidation and remains
-unactivated.
+Within existing source capture, a stateless demand-only stale check covers wake-check
+commands, pending retain-command custody and sync mode (inputs outside the existing
+core revision cursor). Each local detail records `actionability_inputs` in the same
+query-only SQLite read snapshot as its diagnostic; a pre-existing caller snapshot
+is preserved. Capture compares current inputs with that hydration baseline, never
+with a previous capture's demand set. Bootstrap, new demand and rehydration cannot
+by themselves re-admit unrelated producers, while a first real write before the next
+capture is retained. The signature is acquisition metadata, not diagnostic authority
+or an observation clock. Immediate-parent and source-named administrative-owner
+references participate in existing semantic invalidation, including unhydrated
+parents. No new poller or source admission policy is introduced. The unactivated
+`board_capture.py` acquisition capability intentionally omits both the diagnostic
+and its signature on fresh and reused details: it cannot certify complete
+incremental invalidation and remains unactivated.
 
 Tests: `tests/test_actionability.py`, the persisted shared fixture helper, and
 `desktop-plugins/session-panel/test/actionability.test.mjs` exercise real

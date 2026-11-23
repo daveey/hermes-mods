@@ -357,7 +357,8 @@ def test_run_loop_writes_the_timing_file_after_every_pass_and_a_write_is_publish
 
 # ── real readers ─────────────────────────────────────────────────────────────────────────────────────────
 
-def test_core_readers_board_write_reconciles_only_the_chat_whose_card_it_touched(tmp_path, monkeypatch):
+@pytest.mark.parametrize('settle_capture', [False, True])
+def test_core_readers_board_write_reconciles_only_the_chat_whose_card_it_touched(tmp_path, monkeypatch, settle_capture):
     """CoreReaders' own `reconcile_scoped`, `reconciliation_stamp`, `board_changes` and `external_capture`
     over a board built by core: writes to one chat's card run the producer for that chat only."""
     kanban_db = pytest.importorskip('hermes_cli.kanban_db')
@@ -384,7 +385,8 @@ def test_core_readers_board_write_reconciles_only_the_chat_whose_card_it_touched
         f.tick()
         assert calls == [sorted(chats)], 'first sight reconciles every chat'
         assert all(cards[s] in [t['id'] for t in f.bundles[s]['bundle']['tasks']] for s in chats)
-        f.tick()
+        if settle_capture:
+            f.tick()
         calls.clear()
         for n in range(3):
             kanban_db.add_comment(conn, cards['S3'], 'tester', f'comment {n}')

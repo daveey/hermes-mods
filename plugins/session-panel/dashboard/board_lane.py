@@ -225,6 +225,9 @@ class BoardLane:
                         capture_timing['external_s'] = round(time.monotonic() - external_started, 4)
                     compare = getattr(rd, 'external_semantic', lambda value: value)
                     external_dirty = {s for s in held if compare(captured[s]) != compare(self.external_captures.get(s))}
+                    diagnostic_stale = getattr(rd, 'diagnostic_stale', None)
+                    if callable(diagnostic_stale):
+                        external_dirty.update(diagnostic_stale(held))
                     dirty.update(external_dirty)
                     if callable(getattr(rd, 'advance_external', None)):
                         observations = {s: (capture_seq, captured[s]) for s in held
