@@ -31,16 +31,29 @@ post-restart backlog.
 
 ## 3. Attribute the hot threads
 
-- Map high-switch thread ids to stacks with `sudo -n py-spy dump --nonblocking -p <pid>`.
+- Map high-switch thread ids to stacks with `sudo -n py-spy dump --nonblocking -p <pid>`. The dump header is
+  `Thread <native tid> (idle|active)` with no thread name, so join on the tid from `/proc/<pid>/task/<tid>`
+  (comm = name). Take about 10 dumps 0.4 s apart and count active/idle per tid; one dump can mislead.
+- Pool and per-session worker threads get new tids as they respawn. Sum context switches by thread name as
+  well as by tid, and re-sample at steady state (≥10 min after a restart, under real Desktop use). A sample
+  taken minutes after a restart can miss threads that only start once sessions are watched.
 - Record with `--gil` (GIL holders only) and with `--idle` (lock waits).
 - Look for:
   - background loops whose interval floor is shorter than their run time, which makes them busy loops;
   - connections opened and closed on every call;
   - per-request scans of every board or DB.
+  - a bounded worker pool that re-admits every item on each write: with N slots it runs N back-to-back
+    reads forever while the DB keeps changing.
+- Before choosing a wake source, count real changes against file churn over 60 s. Heartbeats, claims and
+  leases rewrite the DB and WAL constantly; row-level revision cursors (Hermes: `kanban_task_change`,
+  `session_change`) change far less often. A wake on mtime or inotify fires nonstop.
 - Fixes to propose:
-  - wake on data changes instead of a fixed poll;
-  - keep reader connections open per thread;
+  - wake on revision-cursor changes instead of a fixed poll or file stamps;
+  - batched reads: one short-lived read-only connection per DB per pass, set-based `IN (…)` queries, then
+    close; the user does not want long-held connections;
   - cache per DB by `PRAGMA data_version`;
-  - move producers out of the request-serving process.
+  - when several threads re-derive the same facts, propose one shared producer that turns changes into facts,
+    with consumers reading precomputed results. Per-thread throttles and floors tend to move the hot spot
+    without lowering the total: re-measure the whole-process total after one lands.
 - Acceptance should include a context-switch ceiling and a per-route p95, measured with the same scripts before
   and after.
