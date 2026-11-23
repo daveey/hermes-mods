@@ -13,8 +13,11 @@ plugin = helpers.plugin
 
 
 @pytest.fixture
-def action(plugin):
+def action(plugin, monkeypatch):
     us = plugin._user_steps()
+    monkeypatch.setattr(us, 'server_owner', lambda sid: dict(
+        gatewayId='example-install', profile='default', storedSessionId=sid))
+    monkeypatch.setattr(us, 'lineage', lambda sid, *args: [sid])
     owner = us.server_owner('S1')
     step = us.add_step('S1', 'Select a configuration', ['One', 'Two'])
     store = us.ActionStore()
