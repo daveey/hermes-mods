@@ -1595,10 +1595,10 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
         opened = ledger.open_steps(session_id)
     # Only an ORIGINAL, id-free directive may become a newly extracted approval.
     # Unwrap AFTER validation; frame() later cannot manufacture this provenance.
-    with ledger.edit(root) as data:
-        producer_asks = [s for s in data['steps'] if s.get('publication_turn')
-                         and s['publication_turn'] == data.get('publication_turn')
-                         and s.get('source') == 'session_outcome']
+    data = ledger.read(session_id)
+    producer_asks = [s for s in data['steps'] if s.get('publication_turn')
+                     and s['publication_turn'] == data.get('publication_turn')
+                     and s.get('source') == 'session_outcome']
     fresh_confirmation = (parsed_confirmation and not producer_asks
                           and not parsed_confirmation['ask']['attrs'].get('id')
                           and not parsed_confirmation['ask']['attrs'].get('s'))
