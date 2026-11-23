@@ -35,3 +35,25 @@ each call. Wrap a single cold call in `cProfile` and sort by cumulative time.
 
 A longer timeout hides the latency. The fix belongs on the hub request path: serve the last view
 while a recompute runs, or cut the cold cost.
+
+## 4. Verify stale-while-revalidate separately from cold-cost changes
+
+Keep completed REST views keyed by the full `(hours, window, expanded)` tuple across semantic
+revision invalidation. Allow only one refresh per key; never borrow another key's result. Preserve
+synchronous computation for callers that need it. Test that a GET returns the previous view while a
+refresh is deliberately blocked, and that a cold different key cannot receive that view.
+
+Read `stale_seconds` as snapshot age, not request duration. After a polling gap the first response can
+be old and still fast: a subsequent age drop proves a completed refresh. Record both age and latency;
+check revision or current card evidence separately when freshness is in question.
+
+For a five-minute latency proof, retain every request's timezone-aware start, HTTP status, duration,
+age and normal load. Space 20 starts across at least 300 seconds, not 20 intervals ending short of
+five minutes. Compute nearest-rank p95 from sorted raw durations and validate count, elapsed span,
+all-success responses and the maximum. Keep raw evidence off disposable workers before parking.
+
+Verify plugin activation, installed core ancestry and routed backend boot identity separately. A
+warm roller can retain the working old backend after a replacement fails startup; checkout ancestry
+and a fresh gateway do not prove the routed serve loaded a parser/import optimization. Read active
+route metadata and the selected backend's health/boot evidence; preserve natural-reload restrictions
+and report any activation gap rather than force-restarting a working backend.
