@@ -59,6 +59,7 @@ class SourceCoordinator:
         self.attempts = {s: Attempt() for s in (*self.sources, self.external)}
         self.scope_attempts = {s: {} for s in self.attempts}
         self.registration_attempt = Attempt()
+        self.role_attempts = {'local': self.registration_attempt, 'external': Attempt()}
         self.projection_attempts = {}
         self.chats, self.tokens, self.bases, self.tickets = {}, {}, {}, {}
         self.canonical_dirty = {}
@@ -89,11 +90,18 @@ class SourceCoordinator:
 
     def retry_at(self):
         with self.lock:
-            ats = [a.retry_at for a in self.attempts.values() if a.retry_at is not None]
-            ats += [a.retry_at for a in self.projection_attempts.values() if a.retry_at is not None]
-            if self.registration_attempt.retry_at is not None:
-                ats.append(self.registration_attempt.retry_at)
+            ats = [a.retry_at for s, a in self.attempts.items() if a.retry_at is not None
+                   and ('external' if s == self.external else 'local') not in self.acquiring]
+            ats += [a.retry_at for s, a in self.projection_attempts.items()
+                    if a.retry_at is not None and s not in self.active]
+            ats += [a.retry_at for role, a in self.role_attempts.items()
+                    if a.retry_at is not None and role not in self.acquiring]
             return min(ats) if ats else None
+
+    def _cancel_tickets(self, session, reason):
+        for ticket in self.tickets.pop(session, []):
+            ticket.error = RuntimeError(reason)
+            ticket.ready.set()
 
     def _queue(self, sessions):
         for s in sessions:
@@ -125,6 +133,7 @@ class SourceCoordinator:
                     self.bases.pop(s, None)
                     self.pending.pop(s, None)
                     self.projection_attempts.pop(s, None)
+                    self._cancel_tickets(s, 'snapshot watch was forgotten or replaced')
             for s, token in wanted.items():
                 if self.feed._watch_tokens.get(s) is not token:
                     continue
@@ -198,6 +207,10 @@ class SourceCoordinator:
                 self._local_requested = True
             if external_stamp != self._external_stamp:
                 self._external_requested = True
+            external_role = self.role_attempts['external']
+            external_role_stamp = (external_stamp, tuple(membership.items()))
+            if external_role.stamp != external_role_stamp:
+                external_role.stamp, external_role.count, external_role.retry_at = external_role_stamp, 0, None
             self._local_stamp, self._external_stamp = local_stamp, external_stamp
             self._launch('local', self._local_requested, self._acquire_local)
             # Local registration establishes the frozen scope set first. It does
@@ -209,11 +222,10 @@ class SourceCoordinator:
     def _launch(self, role, requested, target):
         if role in self.acquiring:
             return
-        if role == 'local':
-            reg = self.registration_attempt
-            if reg.count and (reg.retry_at is None or self.feed.clock() < reg.retry_at):
-                return
-            requested = requested or reg.retry_at is not None
+        reg = self.role_attempts[role]
+        if reg.count and (reg.retry_at is None or self.feed.clock() < reg.retry_at):
+            return
+        requested = requested or reg.retry_at is not None
         sources = self.sources if role == 'local' else (self.external,)
         stamp = self._local_stamp if role == 'local' else self._external_stamp
         due = any(a.retry_at is not None and self.feed.clock() >= a.retry_at
@@ -237,16 +249,21 @@ class SourceCoordinator:
             rd = self.reader_factory()
             if role == 'local':
                 self._register(rd)
-                with self.lock:
-                    self.registration_attempt.count = 0
-                    self.registration_attempt.retry_at = None
             target(rd, stamp)
+            rd.release()
+            rd = None
+            with self.lock:
+                self.role_attempts[role].count = 0
+                self.role_attempts[role].retry_at = None
         except Exception as exc:
             log.warning('session-panel %s acquisition failed', role, exc_info=True)
             self.completed.put(('registration_error', role, exc))
         finally:
             if rd is not None:
-                rd.release()
+                try:
+                    rd.release()
+                except Exception:
+                    log.warning('session-panel source reader release failed', exc_info=True)
             self.completed.put(('acquisition_done', role, None))
             self.service_wake.set()
             self.feed._board.set()
@@ -324,9 +341,9 @@ class SourceCoordinator:
                     self.active.pop(key, None)
                 elif kind == 'registration_error':
                     self.feed._board_capture_failures.update(self.feed.interest)
-                    if key == 'local':
-                        self.registration_attempt.count += 1
-                        self.registration_attempt.retry_at = self.feed._backoff(self.registration_attempt.count)
+                    attempt = self.role_attempts[key]
+                    attempt.count += 1
+                    attempt.retry_at = self.feed._backoff(attempt.count)
                 elif kind == 'source':
                     if key == self.external:
                         completed = {sid.chat.session_id for sid in value.receipt.coverage.completed_scopes}
@@ -349,9 +366,10 @@ class SourceCoordinator:
     def _base(self, s, lineage):
         with self.feed.lock:
             held = self.feed.bundles.get(s, {}).get('bundle')
-        base = self.bases.get(s) or held
-        if base is not None and tuple(base['lineage']) == lineage:
-            return base
+        candidates = [b for b in (self.bases.get(s), held)
+                      if b is not None and tuple(b['lineage']) == lineage]
+        if candidates:
+            return max(candidates, key=lambda b: b.get('canonical_seq', 0))
         # Unknown canonical inputs are not a synthesized successful empty read.
         self.feed._wake.set()
         return {'session': s, 'lineage': list(lineage), 'canonical_seq': 0,
@@ -362,19 +380,25 @@ class SourceCoordinator:
         try:
             with self.lock:
                 chat = self.chats[s]
+                tickets = self.tickets.pop(s, [])
                 if self.tokens[s] is not self.feed._watch_tokens.get(s):
-                    return  # old store scope cannot adopt a replacement Feed token
+                    raise RuntimeError('snapshot watch was replaced')
                 pin = self.store.pin(chat)
                 lineage = pin[0].watches[chat].lineage_tuple
                 base = self._base(s, lineage)
-                tickets = self.tickets.pop(s, [])
             projection = self.feed.project_board(self.store, chat, canonical_base=base, pin=pin)
             results = self.feed.publish_projections(self.store, {s: projection})
             result = results[s]
             bundle = BoardBundle(projection, self.module)
             with self.lock:
                 if result.disposition == 'superseded':
-                    self._queue([s])
+                    if self.tokens.get(s) is self.feed._watch_tokens.get(s) and s in self.feed.interest:
+                        self.tickets.setdefault(s, []).extend(tickets)
+                        tickets = []
+                        self._queue([s])
+                    else:
+                        for ticket in tickets:
+                            ticket.error = RuntimeError('snapshot watch was replaced')
                 elif (not projection.missing_scopes and s not in self.pending
                       and self.store.current(projection.admission)):
                     self.feed._board_failures.discard(s)
@@ -383,7 +407,21 @@ class SourceCoordinator:
                         and self.store.current(projection.admission)):
                     self.projection_attempts.pop(s, None)
             for ticket in tickets:
-                ticket.bundle = bundle
+                if result.disposition in {'stored', 'no_change'}:
+                    # The writer may have merged a newer canonical component
+                    # after this projection pinned its base. Return that actual
+                    # publication, not obsolete consent from the proposed value.
+                    with self.feed.lock:
+                        current = self.feed.bundles.get(s)
+                        if current is not None and self.tokens.get(s) is self.feed._watch_tokens.get(s):
+                            actual = BoardBundle(projection, self.module)
+                            actual.clear()
+                            actual.update(current['bundle'])
+                            ticket.bundle = actual
+                        else:
+                            ticket.error = RuntimeError('snapshot watch was replaced')
+                elif ticket.error is None:
+                    ticket.error = RuntimeError('snapshot publication refused: ' + result.disposition)
         except Exception as exc:
             self.feed._board_failures.add(s)
             with self.lock:
@@ -399,6 +437,28 @@ class SourceCoordinator:
             self.completed.put(('projection_done', s, None))
             self.service_wake.set()
             self.feed._board.set()
+
+    def _settle_local(self, sessions):
+        """Finish the owned local turn, including a registration admitted mid-turn."""
+        deadline = time.monotonic() + 3.
+        while True:
+            self.step()
+            with self.lock:
+                local = self.acquiring.get('local')
+            if local:
+                local.join(max(0., deadline - time.monotonic()))
+                if local.is_alive():
+                    raise TimeoutError('local source acquisition is still pending')
+            self.service()
+            with self.lock:
+                ready = all(s in self.chats and self.tokens[s] is self.feed._watch_tokens.get(s)
+                            for s in sessions)
+                if ready and not self._local_requested:
+                    return
+                if self.registration_attempt.count:
+                    raise RuntimeError('local source registration unavailable; bounded retry is pending')
+            if time.monotonic() >= deadline or self.closed or self.feed.stopped.is_set():
+                raise RuntimeError('local source registration was cancelled or remains pending')
 
     def tick(self):
         f = self.feed
@@ -416,12 +476,7 @@ class SourceCoordinator:
         # Capture BEFORE asynchronous acquisition and canonical producer writes.
         source_stamp = getattr(rd, 'reconciliation_stamp', None)
         source_seen = source_stamp() if callable(source_stamp) else None
-        self.step()
-        with self.lock:
-            local = self.acquiring.get('local')
-        if local:
-            local.join()
-        self.service()
+        self._settle_local(watched)
         panel_dirty = f._panel_dirty(watched)
         with self.lock:
             captured_dirty = dict(self.canonical_dirty)
@@ -456,14 +511,9 @@ class SourceCoordinator:
 
     def full(self, sessions):
         self.feed.watch(sessions)
-        self.step()
         # Wait for owned LOCAL acquisition only. Strict external is deliberately
         # never joined; unknown external coverage remains explicit in projection.
-        with self.lock:
-            local = self.acquiring.get('local')
-        if local:
-            local.join()
-        self.service()
+        self._settle_local(sessions)
         rd = self.feed.readers
         tickets = {}
         try:
@@ -495,6 +545,8 @@ class SourceCoordinator:
             self.closed = True
             self.service_stop.set()
             self.pending.clear()
+            for s in list(self.tickets):
+                self._cancel_tickets(s, 'snapshot owner stopped')
             workers = [*self.acquiring.values(), *self.active.values()]
         self.service_wake.set()
         for worker in [self.service_worker, *workers]:

@@ -31,12 +31,25 @@ def test_all_route_cutover_retains_real_current_actionstore_and_consent(acquisit
     f.watch(['S'])
     lane = compose(f, r)
     operation = None
+    read_entered, read_release = threading.Event(), threading.Event()
+    caller = None
+    returned = []
     try:
         f.changes(['S']); drain(lane)
         base = f.bundles['S']['bundle']
         ask = next(row for row in base['model']['sections']['needs_you'] if row.get('request_id') == rid)
         assert ask['options'] and base['requests'][0]['requestId'] == rid
         assert actions.get(owner, rid)['state'] == 'open' and not actions.get(owner, rid).get('resolution'), 'board acquisition executed consent'
+        original_inputs = r.panel_inputs
+        def held_inputs(*args):
+            value = original_inputs(*args)
+            if threading.current_thread().name == 'fixture-stale-full':
+                read_entered.set(); assert read_release.wait(5)
+            return value
+        monkeypatch.setattr(r, 'panel_inputs', held_inputs)
+        caller = threading.Thread(target=lambda: returned.append(f.compute('S')), name='fixture-stale-full')
+        caller.start()
+        assert read_entered.wait(2)
         if retirement == 'withdraw':
             core.withdraw_request(actions, None, owner, rid, by='agent', reason='fixture request is moot')
         elif retirement == 'deleted_session':
@@ -48,6 +61,8 @@ def test_all_route_cutover_retains_real_current_actionstore_and_consent(acquisit
         f.refresh_decisions()
         current = f.bundles['S']['bundle']['requests']
         assert not f.bundles['S']['bundle']['model']['sections']['needs_you']
+        read_release.set(); caller.join(3)
+        assert not caller.is_alive() and returned[0]['requests'] == current, 'full route returned obsolete consent'
         # A board-only publication from a held old canonical base cannot reopen
         # a recorded decision, clear canonical failure, or manufacture Running.
         with lane.lock:
@@ -64,6 +79,9 @@ def test_all_route_cutover_retains_real_current_actionstore_and_consent(acquisit
         elif retirement == 'withdraw':
             assert actions.get(owner, rid)['state'] == 'withdrawn'
     finally:
+        read_release.set()
+        if caller is not None:
+            caller.join(3)
         f.stopped.set(); lane.close(); r.release(); db.close()
 
 
@@ -116,7 +134,7 @@ def test_source_failure_budget_survives_full_and_beat_without_false_fresh(api, b
             now[0] = lane.retry_at()
             assert now[0] is not None
             drain(lane)
-        assert len(calls) == 4 and lane.retry_at() is None
+        assert len(calls) == 4 and lane.retry_at() is None, (now, lane.attempts, lane.scope_attempts, lane.role_attempts, lane.projection_attempts)
         for _ in range(3):
             f._publish(f._compute_all(['S']))
             now[0] += 30
@@ -158,7 +176,7 @@ def test_projection_failure_has_finite_completion_driven_retries(api, board, mon
             now[0] = lane.retry_at()
             assert now[0] is not None, 'projection failure stranded without finite retry'
             drain(lane)
-        assert len(calls) == 4 and lane.retry_at() is None
+        assert len(calls) == 4 and lane.retry_at() is None, (now, lane.attempts, lane.scope_attempts, lane.role_attempts, lane.projection_attempts)
         monkeypatch.setattr(f, 'project_board', original)
         conn.execute('UPDATE tasks SET title=?', ('Recovery source event',)); conn.commit()
         drain(lane)
@@ -172,6 +190,134 @@ def strict_empty(held, *, include_inventory=False):
     captured = {sid: () for sid in held}
     inventory = {'origin': [], 'history': [], 'replica': None, 'gateway': 'fixture', 'profile': 'default'}
     return (captured, inventory) if include_inventory else captured
+
+
+def test_changed_key_does_not_reproject_unrelated_chat(api, board, monkeypatch):
+    path, conn = board
+    r = readers_for(api, path, monkeypatch)
+    monkeypatch.setattr(r, 'external_capture', strict_empty)
+    task = kanban_db.create_task(conn, title='A original', session_id='A')
+    kanban_db.create_task(conn, title='B unrelated', session_id='B')
+    f = feedmod.Feed(r, emit=lambda _: None)
+    f.watch(['A', 'B']); lane = compose(f, r)
+    f.changes(['A', 'B']); drain(lane)
+    before = f.bundles['B']['bundle']
+    project = f.project_board
+    projected = []
+    def record(store, chat, **kwargs):
+        projected.append(chat.session_id)
+        return project(store, chat, **kwargs)
+    monkeypatch.setattr(f, 'project_board', record)
+    try:
+        conn.execute('UPDATE tasks SET title=? WHERE id=?', ('A changed', task)); conn.commit()
+        drain(lane)
+        assert 'A' in projected and 'B' not in projected
+        assert f.bundles['A']['bundle']['tasks'][0]['title'] == 'A changed'
+        assert f.bundles['B']['bundle']['computed_seq'] == before['computed_seq']
+    finally:
+        f.stopped.set(); lane.close(); r.release(); conn.close()
+
+
+def test_new_full_chat_during_older_local_registration_is_not_lost(api, board, monkeypatch):
+    path, conn = board
+    r = readers_for(api, path, monkeypatch)
+    monkeypatch.setattr(r, 'external_capture', strict_empty)
+    f = feedmod.Feed(r, emit=lambda _: None)
+    f.watch(['A']); lane = compose(f, r)
+    f.changes(['A']); drain(lane)
+    entered, release = threading.Event(), threading.Event()
+    lineage = r.lineage
+    def slow(s):
+        if s == 'A':
+            entered.set(); assert release.wait(5)
+        return lineage(s)
+    monkeypatch.setattr(r, 'lineage', slow)
+    task = kanban_db.create_task(conn, title='New B while A registers', session_id='B')
+    lane.step(); assert entered.wait(2)
+    values, errors = [], []
+    def compute():
+        try:
+            values.append(f.compute('B'))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            r.release()
+    caller = threading.Thread(target=compute)
+    caller.start()
+    try:
+        # watch() is the caller's first operation; explicitly register B before
+        # releasing A so the race does not depend on thread startup speed.
+        f.watch(['B'])
+        release.set(); caller.join(5)
+        assert not caller.is_alive() and not errors, errors
+        assert values[0]['tasks'][0]['id'] == task
+    finally:
+        release.set(); f.stopped.set(); lane.close(); caller.join(3); r.release(); conn.close()
+
+
+def test_forget_releases_waiting_full_ticket_instead_of_hanging(api, board, monkeypatch):
+    path, conn = board
+    r = readers_for(api, path, monkeypatch)
+    monkeypatch.setattr(r, 'external_capture', strict_empty)
+    f = feedmod.Feed(r, emit=lambda _: None)
+    f.watch(['S']); lane = compose(f, r)
+    f.changes(['S']); drain(lane)
+    lane.capacity = 0
+    queued, finished = threading.Event(), threading.Event()
+    queue_chat = lane._queue
+    def observe(sessions):
+        queue_chat(sessions)
+        if lane.tickets.get('S'):
+            queued.set()
+    monkeypatch.setattr(lane, '_queue', observe)
+    result = []
+    def full():
+        try:
+            result.append(lane.full(['S']))
+        finally:
+            r.release(); finished.set()
+    caller = threading.Thread(target=full)
+    caller.start()
+    try:
+        assert queued.wait(2)
+        with f.lock:
+            f._forget('S')
+        drain(lane)
+        assert finished.wait(2), 'forgotten full request retained an unserviceable ticket'
+        assert result == [{}]
+    finally:
+        f.stopped.set(); lane.close(); caller.join(3); r.release(); conn.close()
+
+
+def test_external_reader_factory_failure_cannot_spin_unbounded(api, board, monkeypatch):
+    path, conn = board
+    r = readers_for(api, path, monkeypatch)
+    monkeypatch.setattr(r, 'external_capture', strict_empty)
+    now = [1800000000.]
+    f = feedmod.Feed(r, emit=lambda _: None, clock=lambda: now[0])
+    f.watch(['S']); lane = compose(f, r)
+    f.changes(['S']); drain(lane)
+    calls = []
+    def factory():
+        if threading.current_thread().name.endswith('external'):
+            calls.append(1)
+            raise RuntimeError('external reader construction unavailable')
+        return r
+    lane.reader_factory = factory
+    try:
+        kanban_db.create_task(conn, title='Changed source', session_id='S')
+        lane.step()
+        for worker in list(lane.acquiring.values()):
+            worker.join(2)
+        lane.service()
+        assert lane.retry_at() is not None, 'reader construction failure had no finite retry'
+        for _ in range(3):
+            now[0] = lane.retry_at(); drain(lane)
+        for _ in range(8):
+            drain(lane)
+        assert len(calls) == 4 and lane.retry_at() is None, (now, lane.attempts, lane.scope_attempts, lane.role_attempts, lane.projection_attempts)
+    finally:
+        f.stopped.set(); lane.close(); r.release(); conn.close()
 
 
 def test_registration_failure_has_finite_source_owned_retry(api, board, monkeypatch):
