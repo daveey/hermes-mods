@@ -45,7 +45,11 @@ post-restart backlog.
 - Look for:
   - background loops whose interval floor is shorter than their run time, which makes them busy loops;
   - connections opened and closed on every call;
-  - per-request scans of every board or DB.
+  - per-request scans of every board or DB;
+  - per-row queries in a request handler: an anyio worker thread near 0% CPU with the highest switch rate is
+    usually one request doing one tiny SQLite read per row (each read is a GIL release/reacquire). A CPU profile
+    (`py-spy record`, inclusive share) ranks it near zero and points at background loops instead, so rank by
+    per-thread switches before choosing what to move or batch, and ask for a query-count test per request.
   - a bounded worker pool that re-admits every item on each write: with N slots it runs N back-to-back
     reads forever while the DB keeps changing.
 - Before choosing a wake source, count real changes against file churn over 60 s. Heartbeats, claims and
