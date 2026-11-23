@@ -68,7 +68,11 @@ def acquire(key, token, recover, retry, interval):
             worker = _WORKERS[key] = Worker(key, recover, retry, interval)
             worker.owners.update(prior_owners)
         else:
+            assert worker is not None
             worker.configure(recover, retry, interval)
+            # A hot mount can discover newly durable work after startup recovery.
+            # Reconfigure must admit a scan now, not wait the previous interval.
+            worker.wake.set()
         worker.owners.add(token)
         if new:
             try:
