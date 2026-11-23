@@ -8,16 +8,24 @@ import pytest
 import os
 
 
-def runtime_globals(server, module) -> dict:
-    """A private copy of the globals ``module``'s functions run on in production (method_ctx.bind_module
-    publishes them onto server.py and rebinds them there), with every own function rebound onto the copy."""
+def _rebind_globals(g, *sources):
+    """Copy all functions bound to these runtime namespaces, including split helpers.
+
+    Core publishes extracted helpers onto server with server globals. Filtering by
+    the facade's __module__ misses those helpers and leaks fixture overrides.
+    """
     from tui_gateway.method_ctx import rebind
-    g = {**vars(server), **vars(module)}
-    seen: dict = {}
-    for name, fn in vars(module).items():
-        if isinstance(fn, types.FunctionType) and fn.__module__ == module.__name__:
+    seen = {}
+    for name, fn in list(g.items()):
+        body = getattr(fn, '__wrapped__', fn)
+        if isinstance(body, types.FunctionType) and any(body.__globals__ is source for source in sources):
             g[name] = rebind(fn, g, seen)
     return g
+
+
+def runtime_globals(server, module) -> dict:
+    """Private runtime namespace, including helpers core extracted from the facade."""
+    return _rebind_globals({**vars(server), **vars(module)}, vars(server), vars(module))
 
 
 def _global_loads(code):
@@ -67,6 +75,11 @@ def consumer(owner, monkeypatch, request):
     import queue
     from tui_gateway import session_notifications as notifications
     from tools import async_delegation
+    from tui_gateway import notification_loaded_f
+    # These tests exercise goal/claim ownership, not the process-wide 30s
+    # discovery scheduler. Keep the real legacy poller and collector on the
+    # fixture's .01s cadence, without starting a shared scheduler across tests.
+    monkeypatch.setattr(notification_loaded_f, 'enabled', lambda: False)
     from tools.process_registry import process_registry
     from hermes_cli import kanban_db as kb
     if getattr(request, 'param', '') == 'unreadable':
@@ -81,7 +94,6 @@ def consumer(owner, monkeypatch, request):
     from contextlib import closing
     from hermes_state import SessionDB
     from tui_gateway import server
-    from tui_gateway.method_ctx import rebind
     # Bind the production function's code exactly as method_ctx.bind_module does at startup: the bodies run
     # on server.py's globals (sys, logger, _sessions, ...), not on session_notifications' own module dict.
     # Start from a copy of those globals, add the module's own names, and rebind the whole helper graph onto
@@ -101,13 +113,7 @@ def consumer(owner, monkeypatch, request):
         assert current['profile_home'] == str(owner[0].parent)
         return closing(SessionDB(owner[0].parent / 'state.db'))
 
-    collector_globals: dict = dict(g, Path=Path, _session_db=session_db)
-    # Bind the whole helper graph, not a hand-maintained list that drifts when
-    # core extracts/adds helpers. Use core's binder to preserve kw-only defaults
-    # and closures as well as positional defaults.
-    for name, fn in notifications.__dict__.items():
-        if isinstance(fn, types.FunctionType) and fn.__module__ == notifications.__name__:
-            collector_globals[name] = rebind(fn, collector_globals)
+    collector_globals = _rebind_globals(dict(g, Path=Path, _session_db=session_db), g)
     # Formatter is pure but its helper globals are rebound by the server too.
     collector_globals['_format_kanban_event_text'] = lambda sub, task, ev, slug: (
         f"{sub['chat_id']}:{task.id}:{ev.kind}" if ev.kind == 'completed' else None)
