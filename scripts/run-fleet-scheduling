@@ -104,36 +104,80 @@ def cleanup_processes(root):
     sys.path.insert(0, str(TEST_DIR))
     from conftest import OwnedProcesses, process_root
     root = Path(root).resolve()
-    signalled, errors = [], []
-    for _ in range(5):
+    signalled, errors, ownership_diagnostics = [], [], []
+
+    def snapshot(pid):
+        # Observation only: no diagnostic value is consulted by custody or verdicts.
+        result = {}
+        for name in ("cwd", "stat", "task_count"):
+            try:
+                if name == "cwd":
+                    value = os.readlink(f"/proc/{pid}/cwd")
+                elif name == "stat":
+                    fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+                    value = {"state": fields[0], "start_time": fields[19], "ppid": int(fields[1])}
+                else:
+                    value = len(list(Path(f"/proc/{pid}/task").iterdir()))
+                result[name] = value
+            except Exception as exc:  # noqa: BLE001 - diagnostics must not change cleanup
+                result[name] = {"exception_type": type(exc).__name__, "errno": getattr(exc, "errno", None),
+                                "message": str(exc)}
+        return result
+
+    def diagnostic(pid, phase, step, before, exc=None):
+        ownership_diagnostics.append({
+            "pid": pid, "pass": pass_number, "phase": phase, "step": step,
+            "exception_type": type(exc).__name__ if exc is not None else None,
+            "message": str(exc) if exc is not None else "marker outside fixture root",
+            "signals_sent": len(signalled) - signals_before,
+            "before": before, "after": snapshot(pid)})
+
+    for pass_number in range(1, 6):
         found = inventory(root)
         if not found:
             break
+        registered = []
+        signals_before = len(signalled)
+        # Check every candidate before killing any owner can change its descendants.
         for pid, env in found:
+            before = snapshot(pid)
             try:
                 marker = process_root(env, Path(f"/proc/{pid}/cwd").resolve())
-            except (OSError, KeyError, PermissionError):
+            except (OSError, KeyError, PermissionError) as exc:
                 errors.append(f"fixture descendant {pid} lost ownership marker; not signalled")
+                diagnostic(pid, 1, "process_root", before, exc)
                 continue
             if not marker.is_relative_to(root):
                 errors.append(f"fixture descendant {pid} lost ownership marker; not signalled")
+                diagnostic(pid, 1, "root_check", before)
                 continue
             registry = OwnedProcesses(marker)
             try:
                 registry.register(pid)
-                registry.send(pid, signal.SIGKILL)
-                signalled.append({"pid": pid, "start_identity": registry.births[pid]})
-            except (FileNotFoundError, ProcessLookupError):
-                pass
+                registered.append((pid, registry, before))
+            except (FileNotFoundError, ProcessLookupError) as exc:
+                diagnostic(pid, 1, "register", before, exc)
             except PermissionError as exc:
                 errors.append(f"pid {pid} refused: {exc}")
+                diagnostic(pid, 1, "register", before, exc)
+        # Registration pins birth; unchanged send rechecks it on both sides of pidfd_open.
+        for pid, registry, before in registered:
+            try:
+                registry.send(pid, signal.SIGKILL)
+                signalled.append({"pid": pid, "start_identity": registry.births[pid]})
+            except (FileNotFoundError, ProcessLookupError) as exc:
+                diagnostic(pid, 2, "send", before, exc)
+            except PermissionError as exc:
+                errors.append(f"pid {pid} refused: {exc}")
+                diagnostic(pid, 2, "send", before, exc)
         deadline = time.monotonic() + 2
         while inventory(root) and time.monotonic() < deadline:
             time.sleep(0.05)
     survivors = sorted({pid for pid, _ in inventory(root)})
     if survivors:
         errors.append(f"fixture descendants remain: {survivors}")
-    return {"fixture_processes_remaining": survivors, "signalled": signalled, "errors": errors}
+    return {"fixture_processes_remaining": survivors, "signalled": signalled, "errors": errors,
+            "ownership_diagnostics": ownership_diagnostics}
 
 
 def validate_group(value):
