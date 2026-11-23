@@ -8,6 +8,23 @@ import test_pr_projection as fixtures
 board = fixtures.board
 
 
+def test_strip_tokens_share_canonical_snapshot_accounting(board):
+    import time
+    api, connect, _calls = board
+    stamp = int(time.time())
+    with connect() as conn:
+        for tokens in (100, 200):
+            conn.execute("INSERT INTO task_events(task_id,kind,created_at,payload) VALUES('t_pr','worker_result',?,?)",
+                         (stamp, json.dumps({'usage': {'input_tokens': tokens, 'output_tokens': 5}})))
+        conn.commit()
+    result = api.lane_view(6, '6h', False)
+    assert result['configured'], result
+    lane = result['lanes']['work']
+    assert len(lane['strip']['tokens']) == 36
+    assert sum(lane['strip']['tokens']) == lane['tokens'] == 205
+
+
+
 @pytest.mark.parametrize('separate_evidence', [False, True])
 def test_context_and_snapshot_read_history_once(board, monkeypatch, separate_evidence):
     flow = pytest.importorskip('hermes_cli.kanban_lanes_flow')
