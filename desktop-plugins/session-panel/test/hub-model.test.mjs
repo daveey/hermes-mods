@@ -59,6 +59,9 @@ for (const name of ['tree_direct', 'tree_multihop', 'tree_cross_section', 'tree_
    if (row.parent) {
     assert.equal(node.parentElement.dataset.treeGuide, '')
     assert.equal(node.parentElement.style.paddingLeft, '15px')
+    const guideStyle = window.getComputedStyle(node.parentElement)
+    assert.equal(guideStyle.borderLeftWidth, '1px', 'mounted guide must have visible width, not only a data attribute')
+    assert.equal(guideStyle.borderLeftStyle, 'solid')
     assert.equal(node.parentElement.parentElement.dataset.treeNode, row.parent)
     assert.ok(drawn.indexOf(row.parent) < drawn.indexOf(row.key))
    }
