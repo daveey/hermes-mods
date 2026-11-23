@@ -23,6 +23,16 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+try:
+    from .confirmations import preceding_plan
+except ImportError:  # standalone plugin/spec loading
+    import importlib.util
+    _confirmation_spec = importlib.util.spec_from_file_location(
+        'user_steps_confirmations', Path(__file__).with_name('confirmations.py'))
+    _confirmations = importlib.util.module_from_spec(_confirmation_spec)
+    _confirmation_spec.loader.exec_module(_confirmations)
+    preceding_plan = _confirmations.preceding_plan
+
 KINDS = ("approve", "do", "choose", "input")
 MAX_NEW_PER_REPLY = 5
 MAX_NEW_PER_HOUR = 12
@@ -1489,6 +1499,44 @@ def retire_decided_reasks(store, ledger, owner, completion, llm, *, now=None):
         # Lookup/judge/CAS failure keeps human attention; never fail the final reply.
 
 
+def attach_confirmation_plans(reply, session_id, ledger, action_store=None, action_owner=None):
+    """Bind explicit session_outcome confirmations to this final message only.
+
+    Never rewrite a producer revision or a decided request. Exact initial legacy
+    shape comparison prevents a later publication from losing its limits.
+    """
+    attached = []
+    with ledger.edit(ledger.root(session_id)) as data:
+        for step in data['steps']:
+            if (step.get('session') != session_id or step.get('status') != 'open'
+                    or step.get('source') != 'session_outcome'
+                    or len(step.get('choices', [])) != 2
+                    or step['choices'][0].get('label', '').lower() not in ('go', 'yes', 'approve')
+                    or step['choices'][1].get('label', '').lower() not in ('change plan', 'revise', 'no')
+                    or step['choices'][0].get('authorizes') is False):
+                continue
+            plan = preceding_plan(reply, step.get('verbatim_span'))
+            if not plan:
+                continue
+            updated = dict(step, kind='approve', confirmation_plan=plan, options=[])
+            if action_store is not None:
+                ref = dict(gatewayId=action_owner['gatewayId'], profile=action_owner['profile'],
+                           type='user_step', id=step['id'])
+                original = legacy_request(action_owner, step, ref)
+                previous = action_store.migrate_step(action_owner, step)
+                original['requestId'] = previous['requestId']
+                if previous != original or previous['revision'] != 1:
+                    continue
+                replacement = legacy_request(action_owner, updated, ref)
+                replacement['requestId'] = previous['requestId']
+                canonical = action_store.revise(action_owner, previous['requestId'], 1, replacement)
+                updated.update(requestId=canonical['requestId'], requestOwner=canonical['owner'],
+                               requestRevision=canonical['revision'])
+                attached.append(canonical['requestId'])
+            step.update(updated)
+    return attached
+
+
 def process_reply(reply: str, session_id: str, *, user_msg: str = "", llm: Optional[LLM] = None,
                   ledger: Ledger, cards: Optional[Cards] = None, framed: bool = True,
                   session_ref: str = "", now: Optional[float] = None,
@@ -1527,6 +1575,10 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
     now = now or time.time()
     root = ledger.root(session_id)
     opened = ledger.open_steps(session_id)
+    if any(s.get('source') == 'session_outcome' for s in opened):
+        attached = attach_confirmation_plans(reply, session_id, ledger, action_store, action_owner)
+        turn_requests = set(turn_requests) | set(attached)
+        opened = ledger.open_steps(session_id)
     if not opened and not _worth_asking(reply):
         return {"text": None, "steps": [], "resolved": [], "source": "skip",
                 "diagnostics": {"skipped": "not_worth_asking"}}
@@ -1697,6 +1749,10 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                 step = {**candidate, "id": new_step_id(), "status": "open", "created": now,
                         "session": session_id,
                         "paragraph": shown + ("\n\n" + candidate["payload"] if candidate.get("payload") else "")}
+                if step.get('kind') == 'approve':
+                    plan = preceding_plan(reply, candidate['verbatim_span'])
+                    if plan:
+                        step['confirmation_plan'] = plan
                 if step.get("kind") == "choose" and len(_menu_labels(step)) > MAX_OPTIONS:
                     # 2 derived alternatives plus extra literal model options: same rule as
                     # options-over-4 — free-text input, every label left in the paragraph.
@@ -3207,6 +3263,8 @@ class ActionStore:
                              'executionAuthorized': effect == 'approve' or (
                                  effect == 'answer' and choice.get('authorizes') is True and text == choice['label']),
                              'permissionGrants': []}}
+            if (effect == 'approve' and choice['id'] == 'go' and choice['label'] == 'Go'):
+                op['intent']['userText'] = 'Go'
             bound = self._binding(c, owner, r['requestId'], r['revision'])
             if bound is not None:
                 if bound['scopeDigest'] != scope_digest(r): raise ActionError('Question binding does not match scope', 409)
@@ -4121,6 +4179,12 @@ def legacy_request(owner: dict, step: dict, ref: dict) -> dict:
         r['choices'] = [{'id': 'answer-done', 'label': 'Done', 'effect': 'answer'},
                         dict(ANSWER_TEXT, label="Can't do it / reply in your own words")]
         r['outcomes'] = {'answer': f'Tell the agent. {no_grant}'}
+    elif kind == 'approval' and step.get('confirmation_plan'):
+        r['scope']['markdown'] = step['confirmation_plan'] + '\n\n' + markdown
+        r['choices'] = [{'id': 'go', 'label': 'Go', 'effect': 'approve'},
+                        {'id': 'change-plan', 'label': 'Change plan', 'effect': 'revise'}]
+        r['outcomes'] = {'approve': 'Run only the exact plan above; all stated limits and exclusions apply.',
+                         'revise': 'Change the plan; no execution permission is granted.'}
     else:
         r['scope']['complete'] = False
         r['state'] = 'needs_context'

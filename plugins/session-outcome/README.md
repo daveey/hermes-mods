@@ -1,5 +1,15 @@
 # session-outcome
 
+For yes/go confirmation of a plan, publish **action_request**, not a free-text
+“say go” or `session_outcome(kind=decide)`. Supply the full plan in
+`scope.markdown` with `complete: true`, limits, exclusions and an approve choice
+labelled **Go** plus a revise choice labelled **Change plan**. Do not add a
+second user-step directive. Go authorizes only the frozen revision; Change plan
+keeps execution blocked. Legacy decide asks with Go / Change plan choices can
+recover a structured plan immediately preceding the exact question in the same
+final assistant reply, but this is a compatibility backstop, not guidance to omit
+scope from an approval publication.
+
 Every non-archived chat should have exactly one stored outcome, and the sidebar paints from it rather than from
 idleness. Core owns the storage and the derivation (`hermes_state_outcome`). This plugin lets the agent declare
 the outcome and feeds core the two things only plugins know: open user decisions and a summary judge.

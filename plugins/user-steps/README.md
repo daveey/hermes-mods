@@ -5,6 +5,27 @@ composer. This extends the existing user-steps ledger; it does not add a competi
 queue. Transcript directives are passive receipts retaining their original text.
 Agent progress remains separate and collapsed.
 
+## Confirmation asks
+
+For yes/go confirmation, use `action_request` with the full exact plan in
+`scope.markdown`, `complete: true`, explicit limits/exclusions, and choices
+`{id: "go", label: "Go", effect: "approve"}` plus
+`{id: "change-plan", label: "Change plan", effect: "revise"}`. Never tell the user
+“say go” in a free-text user-step, and never emit another directive for an ask
+already published by the tool.
+
+As a compatibility backstop, extracted explicit confirmations after a structured
+plan in the same assistant message freeze that preceding text into the approval
+scope. They show Go and Change plan; clicking Go records an exact-revision approval
+and delivers a Go user turn with canonical scope/receipt metadata. A standalone
+ask, a promised future plan, or a fenced example still grants no permission.
+Session-outcome confirmations with Go / Change plan choices use the same backstop
+when their exact question is restated after the plan in the final reply. Existing
+producer revisions and recorded decisions are not rewritten.
+
+Tests: `tests/test_confirm_plan.py` and
+`desktop-plugins/user-steps/test/decision-queue.test.mjs`.
+
 ## Implementation status
 
 ### Durable receipt before delivery
