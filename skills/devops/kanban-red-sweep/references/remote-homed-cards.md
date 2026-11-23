@@ -21,13 +21,21 @@ alone can hold many) and by chat-level asks (`us_*` item ids) that are not cards
 Remote cards are unblocked, promoted and archived on their own host; comment on them with `cross_task` (it reads and
 comments, never unblocks). The Desktop
 "For you" panel lists asks from every gateway; read another gateway's cards with `cross_task`, not this host's sqlite.
-- Macs: `tailnet_exec` with the tailnet host (`mbp`, `mini`), not the gateway name.
+- Macs: `tailnet_exec` with the tailnet host (`mbp`, `mini`), not the gateway name, and start the command with
+  `export PATH=$HOME/.local/bin:$PATH;` (the bare shell has no `hermes`). A Mac-homed card answers `not found`
+  to hub `promote`, and `kanban_supervisor_request spend_promote` refuses `not_foreign`; release a spend-triaged one
+  on the Mac: `hermes kanban spend-budget <id> --seen <cid> --runs <prior runs + N> --reason ...` (`--runs` is the
+  card's total limit, so an N-run window is prior runs + N; count them with `hermes kanban runs <id> --json`), then
+  `hermes kanban promote <id> --seen <cid> <reason>` (try `--dry-run` first) and read back `running`.
+  Then archive its spend-decision card there with a comment naming the new limit.
 - Workers: answer a parked decision with `cross_task` action=comment (hub courier). It wakes the card, and a
   worker-local `hermes kanban comment` can leave a creator-decision park asleep. Unblock/promote run on the
   worker: `~/.hermes/bin/hub-worker-exec worker-N -- bash -lc "hermes kanban unblock <id>"`. Rerun with the printed
   `--seen <n>`; a `live lease` refusal means a run already claimed it, so leave it alone.
   A `foreign_card: ... was created on worker-aN and lives there` refusal on archive/edit is the same route:
-  `hub-worker-exec worker-aN -- 'hermes kanban archive <id>'` (the `--` is required).
+  `hub-worker-exec worker-aN -- 'hermes kanban archive <id>'` (the `--` is required). For a multi-line comment
+  plus unblock, write a local script (body base64-embedded, `export PATH=$HOME/.local/bin:$PATH`) and pass its path:
+  `hub-worker-exec worker-aN --timeout 240 -- /path/script.sh`; nested quoting inline breaks.
 - Live counts across gateways (the inventory printed `unreachable ...`, or the report needs this turn's statuses):
   one read-only sqlite script looping over `kanban.db` and `kanban/boards/*/kanban.db`, copied to the hub and run
   there, on every online worker with `~/.hermes/bin/hub-worker-exec all --timeout 60 -- /tmp/<script>` (offline ones
