@@ -215,7 +215,11 @@ class SourceCoordinator:
         with self.lock:
             if self.closed:
                 return
-            registration_stamp = (local_stamp, state_stamp, tuple(membership.items()))
+            # A recovered reader role must be re-admitted for a genuinely new
+            # exact scope even when source files and membership stay unchanged.
+            # Source-owned per-scope attempts still retain unchanged peer budgets.
+            demand_stamp = frozenset(self.store.demands(self.external).values())
+            registration_stamp = (local_stamp, state_stamp, tuple(membership.items()), demand_stamp)
             reg = self.registration_attempt
             if reg.stamp != registration_stamp:
                 reg.stamp, reg.count, reg.retry_at = registration_stamp, 0, None
@@ -223,7 +227,7 @@ class SourceCoordinator:
             if external_stamp != self._external_stamp:
                 self._external_requested = True
             external_role = self.role_attempts['external']
-            external_role_stamp = (external_stamp, tuple(membership.items()))
+            external_role_stamp = (external_stamp, tuple(membership.items()), demand_stamp)
             if external_role.stamp != external_role_stamp:
                 external_role.stamp, external_role.count, external_role.retry_at = external_role_stamp, 0, None
             self._local_stamp, self._external_stamp = local_stamp, external_stamp

@@ -61,7 +61,11 @@ exhausted peer. Partial/failed acquisitions keep held known rows and explicit
 unknown coverage. Registration and pure-projection failures have finite retries
 as well; full/heartbeat do not clear failed strict capture custody. A source
 retry deadline is bounded by its reader role's eligibility; an exhausted role
-cannot busy-spin on an older source deadline. Unchanged full/catch-up reads
+cannot busy-spin on an older source deadline. Reader-role generations include
+current exact ScopeDemands as well as source/membership stamps, so a changed
+dependency scope can re-admit an exhausted recovered factory without requiring
+an unrelated file write or resetting unchanged peers' source-owned budgets.
+Unchanged full/catch-up reads
 settle their tickets with a retry error, rather than spending extra pure attempts
 while backoff is pending or exhausted. A genuinely changed acquired source or
 exact demand can renew that projection budget. Basic Feed
