@@ -343,12 +343,13 @@ def wait_parents(dep, bundle):
     if text(obj(dep.get('wait')).get('waiting_on')):
         primary = wait_target(dep, bundle, hydration)
         return [primary] if primary else []
-    primary = wait_target(dep, bundle, hydration)
-    if primary:
-        return [primary]
+    parents = obj(hydration.get('links')).get('parents') or []
+    if not parents:
+        primary = wait_target(dep, bundle, hydration)
+        return [primary] if primary else []
     linked = {t.get('id'): t for t in hydration.get('link_tasks') or [] if isinstance(t, dict)}
     result = []
-    for pid in obj(hydration.get('links')).get('parents') or []:
+    for pid in parents:
         rec = obj(obj(bundle.get('cards')).get(pid))
         detail = obj(rec.get('detail'))
         task = {**obj(linked.get(pid)), **obj(detail.get('task'))}

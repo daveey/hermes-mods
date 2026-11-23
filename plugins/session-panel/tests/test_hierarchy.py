@@ -111,6 +111,14 @@ def test_owner_coordinates_never_match_bare_id():
     assert rows(reduce(b))['t_a']['parent'] is None
 
 
+def test_unpublished_wait_keeps_all_hydrated_parents_not_only_upstream_hint():
+    b = outline_case({'t_a': ['t_b', 't_c'], 't_c': ['t_d']})
+    b['tasks'][0]['upstream'] = {'id': 't_b', 'title': 'Card t_b'}
+    r = rows(reduce(b))
+    assert r['t_a']['parent'] == r['t_b']['key'], 'nearest displayed ancestor'
+    assert 'Card t_d' in r['t_a']['detail'], 'deepest label must consider all hydrated parents'
+
+
 def test_randomized_exactly_once_counts_and_revision():
     rng = random.Random(401)
     for _ in range(60):
