@@ -143,6 +143,11 @@ def test_latch_stops_legacy_lanes_and_rollback_starts_once(monkeypatch):
     monkeypatch.delitem(sys.modules, '_session_panel_feed_loader', raising=False)
     api = load('_panel_facts_lifecycle_test', Path(__file__).resolve().parents[1] / 'dashboard/plugin_api.py')
     core = api._load_feed()
+    # This fixture owns readiness explicitly to test lifecycle idempotency. Do
+    # not race its manual report_ready(True) with the real readiness publisher:
+    # a refresh during facts_transition_pending legitimately reports False.
+    # Real asynchronous readiness/publication is exercised by the test above.
+    monkeypatch.setattr(core.PanelReadiness, 'start', lambda self: None)
     monkeypatch.setattr(api, 'CoreReaders', Readers)
     monkeypatch.setattr(api, 'save_snapshot', lambda *a, **k: True)
     monkeypatch.setattr(api, 'load_snapshot', lambda *a, **k: None)
