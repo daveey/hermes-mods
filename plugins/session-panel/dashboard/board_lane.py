@@ -1,12 +1,13 @@
 """Bounded, change-driven board hydration, independent of canonical reconciliation.
 
-The coordinator never joins a slow reader. At most four independently owned reader
-scopes run concurrently; one pending generation per watched chat coalesces writes.
+The coordinator never joins a slow reader. Urgent mitigation serializes readers
+and coalesces each watched chat until three seconds after its last read ends.
 No connections, transactions or source snapshots survive a worker invocation.
 """
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -15,9 +16,12 @@ log = logging.getLogger('session-panel')
 
 
 class BoardLane:
-    def __init__(self, feed, reader_factory, *, capacity=4):
+    def __init__(self, feed, reader_factory, *, capacity=None):
         self.feed, self.reader_factory = feed, reader_factory
-        self.capacity = capacity
+        self.cooldown = 0.0 if os.environ.get(
+            'HERMES_PANEL_BOARD_COALESCE', '1').lower() in ('0', 'false', 'off', 'no') else 3.0
+        self.capacity = (1 if self.cooldown else 4) if capacity is None else capacity
+        self.read_ends = {}
         self.cursor = self.stamp = None
         self.pending, self.active, self.retries = {}, {}, {}
         self.completed = queue.SimpleQueue()
@@ -55,7 +59,13 @@ class BoardLane:
 
     def _serve(self):
         while not self.service_stop.is_set():
-            self.service_wake.wait()
+            with self.feed.lock:
+                now = time.monotonic()
+                due = [end + self.cooldown for session, (token, end) in self.read_ends.items()
+                       if session in self.pending and session not in self.active
+                       and self.feed._watch_tokens.get(session) is token
+                       and len(self.active) < self.capacity]
+            self.service_wake.wait(max(0.0, min(due) - now) if due else None)
             self.service_wake.clear()
             if self.service_stop.is_set() or self.feed.stopped.is_set():
                 break
@@ -90,13 +100,14 @@ class BoardLane:
             now = f.clock()
             while True:
                 try:
-                    session, token, error = self.completed.get_nowait()
+                    session, token, error, ended = self.completed.get_nowait()
                 except queue.Empty:
                     break
                 self.active.pop(session, None)
                 if f._watch_tokens.get(session) is not token:
                     self.retries.pop(session, None)
                     continue
+                self.read_ends[session] = (token, ended)
                 if error:
                     count = self.retries.get(session, (0, None))[0] + 1
                     self.retries[session] = (count, f._backoff(count))
@@ -106,6 +117,8 @@ class BoardLane:
                 if at is not None and now >= at:
                     self.pending.setdefault(session, time.time())
                     self.retries[session] = (self.retries[session][0], None)
+            self.read_ends = {s: value for s, value in self.read_ends.items()
+                              if f._watch_tokens.get(s) is value[0]}
             for session in sorted(self.pending, key=self.pending.get):
                 if len(self.active) >= self.capacity:
                     break
@@ -116,6 +129,9 @@ class BoardLane:
                 if session not in f.interest or not held or token is None:
                     self.pending.pop(session, None)
                     continue
+                last = self.read_ends.get(session)
+                if last is not None and time.monotonic() < last[1] + self.cooldown:
+                    continue  # Retain oldest pending demand for one trailing read.
                 admitted_at = self.pending.pop(session)
                 worker = threading.Thread(target=self._read,
                     args=(session, token, held['bundle'], admitted_at),
@@ -253,6 +269,6 @@ class BoardLane:
         finally:
             if rd is not None:
                 rd.release()
-            self.completed.put((session, token, error))
+            self.completed.put((session, token, error, time.monotonic()))
             self.service_wake.set()
             f._board.set()
