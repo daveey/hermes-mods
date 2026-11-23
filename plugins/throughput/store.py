@@ -53,9 +53,14 @@ def _real_sql(col: str) -> str:
 def batch_query(sql: str, width: int) -> str:
     """The single-row query ``batch_rows`` runs for ``sql`` (``decode_batch`` reads its value)."""
     columns = ','.join(f'c{i}' for i in range(width))
-    flags = "''||" + '||'.join(f"(typeof(c{i})='real')" for i in range(width))  # '0010': column 2 is REAL
-    values = ','.join(f"CASE WHEN typeof(c{i})='real' THEN {_real_sql(f'c{i}')} ELSE c{i} END" for i in range(width))
-    unsent = ' OR '.join(f"(substr(f, {i + 1}, 1) = '1' AND v{i} IS NULL)" for i in range(width))
+    # One flag per column: '1' REAL (sent as 'K:m'), '2' BLOB (never handed to a JSON function: SQLite 3.45+ reads
+    # some BLOBs as JSONB, so x'00' would come back as null; any BLOB sends the whole result row by row), '0' other.
+    flags = "''||" + '||'.join(f"(CASE typeof(c{i}) WHEN 'real' THEN '1' WHEN 'blob' THEN '2' ELSE '0' END)"
+                               for i in range(width))
+    values = ','.join(f"CASE typeof(c{i}) WHEN 'real' THEN {_real_sql(f'c{i}')} WHEN 'blob' THEN NULL ELSE c{i} END"
+                      for i in range(width))
+    unsent = ' OR '.join(f"substr(f, {i + 1}, 1) = '2' OR (substr(f, {i + 1}, 1) = '1' AND v{i} IS NULL)"
+                         for i in range(width))
     return (f"WITH data({columns}) AS ({sql}), "
             f"enc(f, {','.join(f'v{i}' for i in range(width))}) AS (SELECT {flags}, {values} FROM data) "
             f"SELECT CASE WHEN MAX({unsent}) THEN NULL ELSE "
@@ -63,6 +68,7 @@ def batch_query(sql: str, width: int) -> str:
 
 
 def decode_batch(encoded: str) -> list:
+    """Rows of ``batch_query``'s value; raises ValueError/TypeError on anything it did not produce."""
     out = []
     for flags, *values in json.loads(encoded):
         if '1' in flags:
@@ -91,19 +97,22 @@ def batch_rows(c: sqlite3.Connection, sql: str, width: int, parameters=()) -> li
     power of two, integer CAST, SQLite's exact INTEGER/REAL comparison). If some REAL fits no ``REAL_SCALES`` K
     (|x| >= 2**63, infinities, values with bits below 2**-90) the whole result takes the row path. A REAL -0.0
     comes back as 0.0: callers read REAL-affinity columns (SQLite stores -0.0 there as integer 0) or sums of them,
-    which never produce -0.0. BLOB values, and SQLite without JSON functions, also use the row path. Rows come back
-    in the statement's order, as lists (tuples on the row path)."""
+    which never produce -0.0. Any BLOB in the result, SQLite without JSON functions, and a batch that cannot be read
+    back (an encoding or decode error) also use the row path, which then answers (or fails) exactly as a plain
+    fetchall; other SQLite errors (locked, I/O) propagate without a retry. Rows come back in the statement's order,
+    as lists (tuples on the row path)."""
     try:
         encoded = c.execute(batch_query(sql, width), parameters).fetchone()[0]
-        if encoded is None:
-            return c.execute(sql, parameters).fetchall()
-        return decode_batch(encoded)
+        if encoded is not None:
+            return decode_batch(encoded)
     except sqlite3.OperationalError as exc:
         message = str(exc).lower()
-        if not (message.startswith('no such function: json_') or
-                'json cannot hold blob values' in message):
+        if not (message.startswith('no such function: json_') or 'json cannot hold blob values' in message
+                or 'could not decode to utf-8' in message or 'malformed json' in message):
             raise
-        return c.execute(sql, parameters).fetchall()
+    except (ValueError, TypeError):  # json.loads / decode of an unexpected batch value
+        pass
+    return c.execute(sql, parameters).fetchall()
 
 
 def minute_of(t: float) -> int:

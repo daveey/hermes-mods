@@ -176,25 +176,27 @@ class Cards:
                 c = ro_connect(db)
             except sqlite3.Error:
                 continue
+            # All or nothing per replica: a read error anywhere below leaves this replica out of the build entirely
+            # (its created rows, done rows and new claim memos), and the other replicas still count.
             try:
                 c.execute("BEGIN")  # one read snapshot: the done rows and the claims looked up for them
-                created.extend((t, on) for t, on in batch_rows(
-                    c, "SELECT created_at, created_on FROM tasks WHERE created_at >= ?", 2, (since,)))
+                rows = batch_rows(c, "SELECT created_at, created_on FROM tasks WHERE created_at >= ?", 2, (since,))
                 done = batch_rows(c, "SELECT id, completed_at, created_on FROM tasks WHERE completed_at >= ? "
                                      "AND status IN ('done','archived')", 3, (since,))
                 fresh = _last_claims(c, [tid for tid, t, _ in done if (str(db), tid, float(t)) not in self._claims])
-                for tid, t, on in done:
-                    key = (str(db), tid, float(t))
-                    claim = self._claims.get(key)
-                    if claim is None:
-                        claim = self._claims[key] = parse_claim(fresh.get(tid))
-                    done_raw.append((t, claim))
-                    if boot_uuid(claim[1]) and not claim[0]:
-                        votes.append((boot_uuid(claim[1]), on))
             except sqlite3.Error:
-                pass
+                continue
             finally:
                 c.close()
+            created.extend((t, on) for t, on in rows)
+            for tid, t, on in done:
+                key = (str(db), tid, float(t))
+                claim = self._claims.get(key)
+                if claim is None:
+                    claim = self._claims[key] = parse_claim(fresh.get(tid))
+                done_raw.append((t, claim))
+                if boot_uuid(claim[1]) and not claim[0]:
+                    votes.append((boot_uuid(claim[1]), on))
         self._claims = {k: v for k, v in self._claims.items() if k[2] >= since}  # drop cards out of the window
         bmap = learn_boot_map(votes, known)
         self._advisory_known = None if known is None else frozenset(known)

@@ -59,6 +59,62 @@ def test_batch_rows_unencodable_real_takes_row_path(odd):
         _same(ST.batch_rows(c, "SELECT * FROM t", 4), c.execute("SELECT * FROM t").fetchall())
 
 
+BLOBS = [b"\x00", b"\x14\xf3", b"\xff\xfe\xfd", b"[1]", b"\x0c", b"", b"\xc3\x28"]
+
+
+@pytest.mark.parametrize("blob", BLOBS + ["random"])
+def test_batch_rows_any_blob_takes_row_path(blob):
+    """SQLite 3.45+ reads some BLOBs as JSONB (x'00' -> null, x'14f3' -> 0) or fails on others; a BLOB anywhere in
+    the result must never reach a JSON function: the whole result is read row by row."""
+    rnd = random.Random(5)
+    blobs = [rnd.randbytes(rnd.randint(1, 8)) for _ in range(2000)] if blob == "random" else [blob]
+    with closing(sqlite3.connect(":memory:")) as c:
+        c.execute("CREATE TABLE t (a, b)")
+        c.executemany("INSERT INTO t VALUES (?, ?)", [(i, b) for i, b in enumerate(blobs)] + [(1.5, "x"), (None, 2)])
+        assert c.execute(ST.batch_query("SELECT a, b FROM t", 2)).fetchone()[0] is None
+        _same(ST.batch_rows(c, "SELECT a, b FROM t", 2), c.execute("SELECT a, b FROM t").fetchall())
+        for b in blobs[:50]:  # one BLOB at a time, alone in its result
+            got = ST.batch_rows(c, "SELECT b FROM t WHERE b = ?", 1, (b,))
+            assert [tuple(r) for r in got] == c.execute("SELECT b FROM t WHERE b = ?", (b,)).fetchall()
+
+
+def test_batch_rows_invalid_utf8_text_answers_like_fetchall():
+    with closing(sqlite3.connect(":memory:")) as c:
+        c.execute("CREATE TABLE t (v)")
+        c.execute("INSERT INTO t VALUES (CAST(x'c328' AS TEXT))")
+        with pytest.raises(sqlite3.OperationalError) as plain:
+            c.execute("SELECT v FROM t").fetchall()
+        with pytest.raises(sqlite3.OperationalError) as batched:
+            ST.batch_rows(c, "SELECT v FROM t", 1)
+        assert str(batched.value) == str(plain.value)
+
+
+def test_batch_rows_undecodable_batch_falls_back(monkeypatch):
+    with closing(sqlite3.connect(":memory:")) as c:
+        c.execute("CREATE TABLE t (v)")
+        c.execute("INSERT INTO t VALUES (1)")
+
+        def bad(_):
+            raise json.JSONDecodeError("bad", "", 0)
+        monkeypatch.setattr(ST, "decode_batch", bad)
+        assert ST.batch_rows(c, "SELECT v FROM t", 1) == [(1,)]
+
+
+def test_cards_replica_read_error_contributes_nothing(tmp_path, monkeypatch):
+    d = build_fixture(tmp_path)
+    real = C.batch_rows
+
+    def failing(c, sql, width, parameters=()):
+        if "completed_at >=" in sql and c.execute("PRAGMA database_list").fetchone()[2].endswith("default.db"):
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(c, sql, width, parameters)
+    monkeypatch.setattr(C, "batch_rows", failing)
+    ev = C.Cards(tmp_path, clock=lambda: NOW, replica_dir=d).events()
+    # only bb.db counts: default.db's created rows are not kept when its done read fails
+    assert sorted(ev["created"]) == [(M + 5, "ephemeral"), (M + 6, "unattributed")]
+    assert len(ev["done"]) == 2
+
+
 def test_batch_rows_width_one_and_order():
     with closing(sqlite3.connect(":memory:")) as c:
         c.execute("CREATE TABLE t (v)")
