@@ -14,11 +14,12 @@ For yes/go confirmation, use `action_request` with the full exact plan in
 “say go” in a free-text user-step, and never emit another directive for an ask
 already published by the tool.
 
-As a compatibility backstop, exactly one explicit top-level prose confirmation,
-as the final block immediately after a substantive plan, freezes the preceding
-text into the approval scope. Unsupported Markdown (including code, quotes, HTML
-and indented text), multiple confirmations anywhere, trailing blocks and intervening
-non-plan text are not recovered. Use explicit `action_request` for richer plans.
+As a compatibility backstop, exactly one original `::user-step{t="..."}` directive,
+as the sole final top-level paragraph immediately after a substantive plan,
+freezes the preceding original text into the approval scope. Plain prose never
+creates recovery authority. The bundled actual Desktop parser counts/locates
+directives; nested asks, malformed input, trailing blocks, absent Node and source
+hash drift fail closed. See [parser provenance/build](parser/README.md).
 Eligible requests show Go and Change plan; clicking Go records an exact-revision approval
 and delivers a Go user turn with canonical scope/receipt metadata. A standalone
 ask, a promised future plan, or a fenced example still grants no permission.

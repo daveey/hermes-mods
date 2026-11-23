@@ -6,9 +6,12 @@ For yes/go confirmation of a plan, publish **action_request**, not a free-text
 labelled **Go** plus a revise choice labelled **Change plan**. Do not add a
 second user-step directive. Go authorizes only the frozen revision; Change plan
 keeps execution blocked. Legacy decide asks with Go / Change plan choices can
-recover a structured plan immediately preceding the exact question in the same
-final assistant reply, but this is a compatibility backstop, not guidance to omit
-scope from an approval publication.
+recover a plan only when the same-turn server-recorded item is the only decide
+item and is identified by the sole final top-level user-step directive (`id`, `s`,
+`t`). Plain prose questions never authorize recovery. Parser errors, missing Node,
+source drift, multiple/nested directives and older/revised/decided publications
+fail closed. This is a compatibility backstop, not guidance to omit scope from
+an approval publication; publish a complete action_request instead.
 
 Every non-archived chat should have exactly one stored outcome, and the sidebar paints from it rather than from
 idleness. Core owns the storage and the derivation (`hermes_state_outcome`). This plugin lets the agent declare
