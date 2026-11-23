@@ -421,7 +421,17 @@ def _capture_cursor():
         from hermes_cli import kanban_worker_node as wn
         # Cover configured replica creation/replacement even when opening it
         # fails transiently. Recovery must not depend on a local board write.
-        paths.append(str(wn._replica_path(conn)))
+        replica_path = str(wn._replica_path(conn))
+        paths.append(replica_path)
+        def incarnation(path):
+            try:
+                stat = os.stat(path)
+                return stat.st_dev, stat.st_ino
+            except FileNotFoundError:
+                return None
+        # Take identity before opening: never label an old SQLite handle with
+        # the replacement file's identity if an atomic rename races capture.
+        replica_identity = incarnation(replica_path)
         replica = cli._fleet(conn, local=False)
         try:
             for db in (conn, replica):
@@ -433,6 +443,13 @@ def _capture_cursor():
                     revision = activity.read_key(db, activity.tables_for(path))
                     cursors.append((path, revision if revision is not None else tuple(
                         db.execute("SELECT coalesce(max(id),0) FROM task_events WHERE kind != 'heartbeat'").fetchone())))
+            if incarnation(replica_path) != replica_identity:
+                # Source keeps failed captures pending, even after the native
+                # notification was consumed. Do not publish a mixed capture.
+                raise RuntimeError('replica replaced during lanes cursor capture')
+            # Stable through ordinary WAL/checkpoint writes, changes on replace
+            # even when the new database has exactly the same revision counters.
+            cursors.append(('replica-incarnation', replica_identity))
         finally:
             if replica is not None:
                 replica.close()
