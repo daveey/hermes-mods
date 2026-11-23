@@ -1313,6 +1313,9 @@ def _slice_word(word, start):
     return (False, word[1][start:], word[2][start:], '', len(word) > 4 and word[4])
 
 
+_TAMPER_PARAMETER = re.compile(r'\$(?:\{([A-Za-z_][A-Za-z_0-9]*|[0-9]+|[@*])\}|([A-Za-z_][A-Za-z_0-9]*|[0-9@*]))')
+
+
 def _tamper_words(text, scalars, *, structure=False, budget=None):
     """Yield command tokens (operator, value, glob mask), without evaluation.
 
@@ -1354,7 +1357,9 @@ def _tamper_words(text, scalars, *, structure=False, budget=None):
             word.extend(content); active.extend([False] * len(content))
             started = True; i = j + 1; continue
         if c == '$' and quote != "'":
-            m = re.match(r'\$(?:\{([A-Za-z_][A-Za-z_0-9]*|[0-9]+|[@*])\}|([A-Za-z_][A-Za-z_0-9]*|[0-9@*]))', text[i:])
+            # Match in place: slicing the remaining source at every '$' copies
+            # quadratic bytes on wide parameter lists, outside the work budget.
+            m = _TAMPER_PARAMETER.match(text, i)
             if not m and text.startswith('${', i) and not _legacy() and _precise_used():
                 # Complex expansion (${F%x}, ${F:-x}, ${!G}, ${F[0]}, ...):
                 # never decoded. A word built from one is uncertain when its

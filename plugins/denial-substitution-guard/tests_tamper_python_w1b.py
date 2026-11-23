@@ -40,6 +40,26 @@ class W1bReviewFindings(unittest.TestCase):
         # (documented precision cost); it must still be fast.
         self.assertIsNotNone(self.timed('python', code))
 
+    def test_parameter_tokenization_copies_only_linear_source_bytes(self):
+        class CountedText(str):
+            copied = 0
+
+            def __getitem__(self, key):
+                result = super().__getitem__(key)
+                if isinstance(key, slice):
+                    self.copied += len(result)
+                return result
+
+        for parameter in ('$a', '${a}', '$1', '${10}', '$@'):
+            with self.subTest(parameter=parameter):
+                text = CountedText((parameter + ' ') * 2000)
+                words = list(g._tamper_words(text, {'a': 'value', '1': 'one', '10': 'ten', '@': 'args'}))
+                self.assertEqual(len(words), 1)
+                self.assertEqual(len(words[0]), 2000)
+                expected = {'$a': 'value', '${a}': 'value', '$1': 'one', '${10}': 'ten', '$@': 'args'}[parameter]
+                self.assertTrue(all(word[1] == expected for word in words[0]))
+                self.assertLessEqual(text.copied, 2 * len(text))
+
     def test_b1_identical_shell_text_still_analyzed(self):
         # Repeated legitimate commands (below the node bound) do not exhaust anything; precise verdicts stay.
         code = "import os\n" + "os.system('ls /tmp')\n" * 3000 + "os.system('cat %s')\n" % G
