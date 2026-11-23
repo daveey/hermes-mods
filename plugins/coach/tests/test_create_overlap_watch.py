@@ -1,6 +1,7 @@
 """create_overlap_watch: counts kanban_create overlap overrides whose new card was archived (a duplicate let
 through); more than THRESHOLD in 7 days files ONE card per host+week; refusals, open cards and old events never count."""
 import importlib.util
+from contextlib import closing
 import json
 import sqlite3
 import time
@@ -27,6 +28,13 @@ def _board(path: Path, cards):
                    (tid, "create_overlap", json.dumps({"outcome": outcome, "reason": "separate",
                                                        "matches": [{"id": "t_owner"}]}),
                     int(NOW - age_days * 86400)))
+    db.execute("CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, body TEXT, created_at INTEGER)")
+    for tid, status, outcome, age_days in cards:
+        if status == "archived":
+            db.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+                       (tid, "archived", json.dumps({"source_status": "ready"}), int(NOW)))
+            db.execute("INSERT INTO task_comments (task_id, body, created_at) VALUES (?,?,?)",
+                       (tid, "Archived as duplicate of t_owner", int(NOW)))
     db.commit()
     db.close()
 
@@ -95,6 +103,7 @@ def test_fixtures_and_overrides_of_already_archived_matches_are_not_duplicates(t
     _board(tmp_path / "kanban.db", [(tid, "archived", "override", 1) for tid in cases])
     db = sqlite3.connect(tmp_path / "kanban.db")
     for tid, (title, reason) in cases.items():
+        db.execute("UPDATE task_comments SET body='Archived as duplicate of t_m' WHERE task_id=?", (tid,))
         db.execute("UPDATE tasks SET title=? WHERE id=?", (title, tid))
         db.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='create_overlap'",
                    (json.dumps({"outcome": "override", "reason": reason, "matches": [{"id": "t_m"}]}), tid))
@@ -103,3 +112,35 @@ def test_fixtures_and_overrides_of_already_archived_matches_are_not_duplicates(t
     db.commit()
     db.close()
     assert [f["id"] for f in cw.scan(str(tmp_path), now=NOW)] == ["dup"]
+
+
+def test_archive_requires_duplicate_disposition_not_just_archived_status(tmp_path):
+    cases = {
+        "placement": "Archived as moot by card GC: duplicate of t_owner, already being worked elsewhere.",
+        "review1": "ARCHIVE. PR #123 landed with independent review; nothing left to retro-review",
+        "review2": "ARCHIVE. PR #124 landed with independent review; nothing to fix forward",
+        "review3": "ARCHIVE. PR #125 landed with independent review; nothing left to retro-review",
+        "unknown": "Archived as obsolete",
+        "negated": "Not a duplicate of t_owner; archive because the fix already landed",
+        "unrelated": "Archived as duplicate of t_other",
+    }
+    _board(tmp_path / "kanban.db", [(tid, "archived", "override", 1) for tid in cases])
+    with closing(sqlite3.connect(tmp_path / "kanban.db")) as db, db:
+        for tid, body in cases.items():
+            db.execute("UPDATE task_comments SET body=? WHERE task_id=?", (body, tid))
+    assert [f["id"] for f in cw.scan(str(tmp_path), now=NOW)] == ["placement"]
+    calls = []
+    cw.main(["--home", str(tmp_path)], runner=lambda *a, **kw: calls.append(a), now=NOW)
+    assert calls == []
+
+
+def test_latest_archive_disposition_and_event_reason(tmp_path):
+    _board(tmp_path / "kanban.db", [(tid, "archived", "override", 1)
+                                    for tid in ("old", "future", "payload", "missing")])
+    with closing(sqlite3.connect(tmp_path / "kanban.db")) as db, db:
+        db.execute("UPDATE task_comments SET created_at=? WHERE task_id='old'", (int(NOW - 2 * 86400),))
+        db.execute("UPDATE task_comments SET created_at=? WHERE task_id='future'", (int(NOW + 10),))
+        db.execute("DELETE FROM task_comments WHERE task_id IN ('payload','missing')")
+        db.execute("UPDATE task_events SET payload=? WHERE task_id='payload' AND kind='archived'",
+                   (json.dumps({"source_status": "ready", "reason": "Archived as duplicate of t_owner"}),))
+    assert [f["id"] for f in cw.scan(str(tmp_path), now=NOW)] == ["payload"]

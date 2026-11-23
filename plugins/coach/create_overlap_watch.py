@@ -3,8 +3,9 @@
 
 kanban_create refuses a card when open cards on any board/gateway already cover the work (core
 `hermes_cli/kanban_overlap.py`). An agent can override with `distinct_from` + `distinct_reason`; each override is a
-`create_overlap` event (`outcome: override`) on the new card. An override whose card was later ARCHIVED (a
-coordinator closing it as a duplicate) means the override let a duplicate through. More than THRESHOLD of those in
+`create_overlap` event (`outcome: override`) on the new card. Count only archived overrides with an explicit
+archive disposition naming a matched card as the duplicate owner. Archived alone is not proof: obsolete work,
+already-satisfied reviews and unknown dispositions do not count. More than THRESHOLD confirmed duplicates in
 the last 7 days files ONE Kanban card for an agent to tighten the check or the guidance.
 
     create_overlap_watch.py [--dry-run] [--json] [--home PATH] [--days N]
@@ -52,6 +53,16 @@ def is_cleanup_archive(title: str, source_status: Optional[str], reason: Optiona
     """True when the archive is routine cleanup rather than a coordinator closing a duplicate."""
     return (source_status == "done" or bool(SCRATCH_TITLE.search(title or ""))
             or bool(GONE_MATCH_REASON.search(reason or "")))
+
+
+def duplicate_disposition(text: str, matched_ids: list) -> bool:
+    """Require an explicit archival duplicate-of link, not the creator's override rationale."""
+    if not re.search(r"\barchiv\w*\b", text, re.I):
+        return False
+    if re.search(r"\b(?:not|no|isn't|wasn't)\s+(?:a\s+)?duplicate\b", text, re.I):
+        return False
+    return any(re.search(r"\bduplicate\s+of\s+`?" + re.escape(tid) + r"(?![\w-])", text, re.I)
+               for tid in matched_ids if isinstance(tid, str) and tid)
 
 
 def hermes_home(home: Optional[str] = None) -> Path:
@@ -103,15 +114,30 @@ def scan(home: Optional[str] = None, days: float = 7, now: Optional[float] = Non
                 continue
             if p.get("outcome") == "override" and status == "archived":
                 try:
-                    arch = con2.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='archived' "
-                                        "ORDER BY created_at DESC LIMIT 1", (tid,)).fetchone()
-                    src = json.loads(arch[0] or "{}").get("source_status") if arch else None
-                except (sqlite3.Error, ValueError):
-                    src = None
-                if is_cleanup_archive(title, src, p.get("reason")):
+                    arch = con2.execute("SELECT payload, created_at FROM task_events WHERE task_id=? AND kind='archived' "
+                                        "ORDER BY created_at DESC, id DESC LIMIT 1", (tid,)).fetchone()
+                    archive_payload = json.loads(arch[0] or "{}") if arch else {}
+                    src = archive_payload.get("source_status")
+                except (sqlite3.Error, ValueError, AttributeError):
+                    continue  # missing/unreadable archive is not proof of duplication
+                if not arch or arch[1] < at or is_cleanup_archive(title, src, p.get("reason")):
+                    continue
+                matched_ids = [m.get("id") for m in p.get("matches") or []]
+                disposition = archive_payload.get("reason") or ""
+                if not isinstance(disposition, str):
+                    disposition = ""
+                if not disposition:
+                    try:
+                        comment = con2.execute(
+                            "SELECT body FROM task_comments WHERE task_id=? AND created_at>=? AND created_at<=? "
+                            "ORDER BY created_at DESC, id DESC LIMIT 1", (tid, at, arch[1])).fetchone()
+                        disposition = (comment[0] or "") if comment else ""
+                    except sqlite3.Error:
+                        disposition = ""  # legacy boards may have no comments table
+                if not duplicate_disposition(disposition, matched_ids):
                     continue
                 found.append({"board": board, "id": tid, "title": title, "at": at, "reason": p.get("reason"),
-                              "overrode": [m.get("id") for m in p.get("matches") or []]})
+                              "overrode": matched_ids, "archive_evidence": disposition})
         con.close()
     return sorted(found, key=lambda f: f["at"])
 
@@ -123,7 +149,7 @@ def card_key(host: str, now: Optional[float] = None) -> str:
 
 def card_body(host: str, findings: list) -> str:
     lines = "\n".join(f"- {f['id']} ({f['board']}): {f['title']!r}; overrode {', '.join(f['overrode'])}; "
-                      f"reason: {f['reason']!r}" for f in findings)
+                      f"reason: {f['reason']!r}; archive disposition: {f.get('archive_evidence', '')!r}" for f in findings)
     evidence = fence_evidence(f"Seen on {host}.\n{lines}")
     return f"""{len(findings)} kanban_create overlap overrides in the last 7 days were later archived (the
 override let a duplicate through). Threshold: more than {THRESHOLD}.

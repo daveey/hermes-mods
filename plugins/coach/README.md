@@ -1876,8 +1876,12 @@ Core `kanban_create` refuses a card that open cards on any board or gateway alre
 `core/kanban-create-overlap.md`); an agent overrides with `distinct_from` + `distinct_reason`, recorded as a
 `create_overlap` event with `outcome: override` on the new card. A hermes cron job on hermes-hub (no-agent, daily)
 runs `create_overlap_watch.py`: it reads every board on the host (`kanban.db` + `kanban/boards/*/kanban.db`,
-read-only) and counts overrides in the last 7 days whose new card is now archived (a coordinator closed it as a
-duplicate). More than 2 files ONE card per host and ISO week (`--idempotency-key
+read-only) and counts overrides in the last 7 days whose new card is now archived **with explicit duplicate
+archive evidence naming one of the matched cards**. Evidence comes from the latest archive event's reason, or,
+when absent, the last comment between override and archive. Missing evidence, negated duplicate dispositions,
+and unrelated owner IDs do not count; neither do completed-card cleanup and the existing probe/fixture exclusions.
+A review archived because its work was already satisfied is not necessarily a duplicate. Findings retain the
+archive evidence for audit. More than 2 files ONE card per host and ISO week (`--idempotency-key
 create-overlap-overrides:<host>:<year>-W<week>`) with the evidence, asking an agent to fix the refusal note,
 matcher or skill guidance that let them through. `--dry-run` prints the JSON and files nothing. Tests:
 `tests/test_create_overlap_watch.py` (only recent archived overrides count across boards; exactly 2 files nothing,
