@@ -42,6 +42,13 @@ def accept(owned, *args, **kwargs):
     return store.accept_local(part, prior)
 
 
+def test_reset_invalidates_an_already_missing_projection(owned):
+    _, store, source, chats, _ = owned
+    _, missing = store.pin(chats[0])
+    store.reset(source)
+    assert not store.current(missing)
+
+
 def test_missing_projection_loses_currency_after_success(owned):
     _, store, source, chats, _ = owned
     _, missing = store.pin(chats[0])

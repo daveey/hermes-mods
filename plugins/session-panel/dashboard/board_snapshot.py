@@ -259,10 +259,11 @@ class Admission:
     required_scopes: Mapping
     missing_scopes: Mapping
     required_failures: Mapping = field(default_factory=empty)
+    missing_versions: Mapping = field(default_factory=empty)
 
     def __post_init__(self):
         for name in ('required_versions', 'receipt_ids', 'reasons', 'dirty_keys',
-                     'required_scopes', 'missing_scopes', 'required_failures'):
+                     'required_scopes', 'missing_scopes', 'required_failures', 'missing_versions'):
             object.__setattr__(self, name, freeze(getattr(self, name)))
 
 
@@ -447,7 +448,7 @@ class SnapshotStore:
             old.first_admitted_wall_ns if old else time.time_ns(), freeze(versions), ids,
             (old.reasons if old else frozenset()) | {reason},
             (old.dirty_keys if old else frozenset()) | frozenset(dirty), freeze(scopes), freeze(missing),
-            freeze(self._scope_failures(scopes)))
+            freeze(self._scope_failures(scopes)), freeze({s: self._versions[s] for s in missing}))
 
     def _scope_failures(self, scopes):
         return {key: error for key, error in self._failures.items()
@@ -484,9 +485,12 @@ class SnapshotStore:
             old = self._parts.get(source)
             old_rows = old.rows if old else {}
             changed = set(part.tombstones)
+            certified_keys = set().union(*(part.scope_keys.get(sid, ()) for sid in completed))
             for name in ('rows', 'details', 'edges'):
                 previous = getattr(old, name) if old else {}
-                changed.update(k for k, value in getattr(part, name).items() if previous.get(k) != value)
+                supplied = getattr(part, name)
+                changed.update(k for k, value in supplied.items() if previous.get(k) != value)
+                changed.update(k for k in certified_keys if k in previous and k not in supplied)
             if old and old.remote_parents != part.remote_parents:
                 changed.update(old.rows)
             receipts = {k: v for k, v in (old.scope_receipts.items() if old else ()) if k in demands}
@@ -522,11 +526,11 @@ class SnapshotStore:
                 else:
                     scoped_rows.pop(sid, None)
                 self._failures.pop((source, current.source_generation, sid), None)
-            rows = dict(old_rows)
+            rows = {k: v for k, v in old_rows.items() if k not in certified_keys}
             rows.update(part.rows)
-            details = dict(old.details) if old else {}
+            details = {k: v for k, v in old.details.items() if k not in certified_keys} if old else {}
             details.update(part.details)
-            edges = dict(old.edges) if old else {}
+            edges = {k: v for k, v in old.edges.items() if k not in certified_keys} if old else {}
             edges.update(part.edges)
             # Tombstones only remove keys from the scopes this result actually covered.
             for sid in completed:
@@ -609,7 +613,8 @@ class SnapshotStore:
                         return False
                     if self._parts[source].scope_receipts[demand.id].version != admission.required_versions[source]:
                         return False
-                elif self._covered(source, demand):
+                elif (self._covered(source, demand)
+                        or self._versions[source] != admission.missing_versions.get(source)):
                     return False
             return True
 

@@ -53,6 +53,26 @@ def test_pending_remote_release_selection_matches_canonical(graph, monkeypatch, 
     assert m.SnapshotReaders(snapshot, chat).linked(['S0']) == old
 
 
+def test_profile_owned_remote_card_cannot_borrow_shared_shadow_detail(graph, monkeypatch):
+    from hermes_cli import kanban_db_sync as sync
+    r, local, remote, ksa = graph
+    row = next(row for row in r.linked(['S0']) if row['id'] == remote)
+    row.update(profile='other-profile', owner_profile='other-profile', ownership_state='qualified')
+    monkeypatch.setattr(sync, 'sync_config', lambda: {})
+    monkeypatch.setattr(ksa, 'remote_links_and_origin_rows', lambda **kwargs: ([row], []))
+    cap = r.snapshot_modules()
+    m, store = cap.snapshot, cap.snapshot.SnapshotStore()
+    source = m.SourceKey('local-test', 'default', 'default', 'hub-links', '/example/external')
+    chat = m.ChatKey('local-test', 'default', 'S0')
+    store.add_source(source)
+    store.register([m.Watch(chat, '', ('S0',), 0)])
+    hint = cap.CaptureHints(store.version(source), store.owner_token(source), 1800000000.0)
+    part = r.capture_external(store.demands(source), {}, {}, hints={source: hint})[0]
+    assert store.demand(source, chat).id in part.receipt.coverage.unknown_scopes
+    key = m.CardKey(row['gateway'], 'other-profile', row['board'], remote)
+    assert key not in part.details
+
+
 def test_external_capture_cannot_certify_an_overbudget_empty_success(graph, monkeypatch):
     r, _, _, _ = graph
     cap = r.snapshot_modules()
