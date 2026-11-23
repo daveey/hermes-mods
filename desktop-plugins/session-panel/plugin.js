@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v23-dependency-outline'
+const VERSION = 'session-panel-v24-visible-tree-guides'
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 // Emoji-presentation glyphs the Desktop fonts draw as tofu (a Hermes-bug title carried "⛔"); the model strips them
 // too, this covers a cached older model.
@@ -529,7 +529,10 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
       'data-tree-parent': row.parent || undefined, children: [
       section === 'needs_you' ? askRow(row) : lineRow(row, section),
       children.has(row.key) && jsx('div', { 'data-tree-guide': '', style: {
-        marginLeft: 9, paddingLeft: 15, borderLeft: '1px solid var(--border)', minWidth: 0
+        // Desktop publishes --dt-border, not the legacy --border alias. Keep
+        // geometry independent of color resolution so missing tokens cannot erase guides.
+        marginLeft: 9, paddingLeft: 15, borderLeftWidth: 1, borderLeftStyle: 'solid',
+        borderLeftColor: 'var(--dt-border, var(--border, #768390))', minWidth: 0
       }, children: children.get(row.key).map(child => drawTree(child, next)) })
     ] }, row.key)
   }
