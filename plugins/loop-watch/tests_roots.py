@@ -636,17 +636,34 @@ def test_a_thread_that_cannot_start_does_not_hold_the_claim(tmp_path, clean, mon
 def test_a_rewritten_arm_file_moves_the_window_and_can_exclude_this_kind(tmp_path, clean):
     now = [1000.0]
     _arm_file(tmp_path, {'until': 1010.0})
-    fast = dict(argv=GATEWAY, recheck_s=0.0, sleep=lambda s: time.sleep(0.01), wall=lambda: now[0])
+    waiting, proceed = threading.Semaphore(0), threading.Semaphore(0)
+
+    def poll_boundary(_seconds):
+        waiting.release()
+        assert proceed.acquire(timeout=10)
+
+    fast = dict(argv=GATEWAY, recheck_s=0.0, sleep=poll_boundary, wall=lambda: now[0])
     thread = r.start(tmp_path, **fast)
     assert thread is not None
-    _arm_file(tmp_path, {'until': 5000.0})
-    time.sleep(0.2)
-    now[0] = 2000.0  # past the first window, inside the rewritten one
-    time.sleep(0.2)
-    assert thread.is_alive()
-    _arm_file(tmp_path, {'until': 5000.0, 'kinds': ['serve']})
-    thread.join(10)
-    assert not thread.is_alive() and not hasattr(sys, r.SENTINEL)
+    try:
+        assert waiting.acquire(timeout=10)
+        # Renew between reads, not while read_arm owns the old inode: atomic
+        # replacement can drop that inode's nlink to zero and correctly disarm.
+        _arm_file(tmp_path, {'until': 5000.0})
+        proceed.release()
+        assert waiting.acquire(timeout=10)  # renewal was actually reread
+        now[0] = 2000.0  # past the first window, inside the rewritten one
+        proceed.release()
+        assert waiting.acquire(timeout=10)  # survived a poll past the old end
+        assert thread.is_alive()
+        _arm_file(tmp_path, {'until': 5000.0, 'kinds': ['serve']})
+        proceed.release()
+        thread.join(10)
+        assert not thread.is_alive() and not hasattr(sys, r.SENTINEL)
+    finally:
+        (tmp_path / r.SUBDIR / r.ARM).unlink(missing_ok=True)
+        proceed.release()
+        thread.join(10)
 
 
 def test_an_arm_file_that_is_not_private_does_not_arm(tmp_path, clean, caplog):
