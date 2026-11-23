@@ -184,5 +184,66 @@ class RestTests(unittest.TestCase):
             self.assertEqual(len(out['anthropic']['curve']), fc.HORIZON_H + 1)
 
 
+class PacingTransferTests(unittest.TestCase):
+    """The pacing-history read returns the plain query's values while transferring one SQLite row into Python
+    (each row a cursor returns re-takes the GIL: up to 5 ms apiece inside the busy Desktop backend)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        import random
+        rnd = random.Random(3)
+        self.rows = []
+        for i in range(3000):
+            reset = rnd.choice([None, NOW + rnd.random() * 150 * H, int(NOW + 100 * H)])
+            self.rows.append((NOW - rnd.random() * 30 * H, rnd.choice(['anthropic', 'openai-codex']),
+                              f'h{i % 7}"雪', rnd.choice(['seven_day', 'five_hour']), rnd.random() * 100 / 3, reset))
+        with sqlite3.connect(self.home / fc.PACING_DB) as db:
+            db.execute('CREATE TABLE samples (ts REAL NOT NULL, provider TEXT NOT NULL, account_hash TEXT NOT NULL, '
+                       'kind TEXT NOT NULL, used REAL NOT NULL, reset_at)')
+            db.executemany('INSERT INTO samples VALUES (?,?,?,?,?,?)', self.rows)
+        db.close()
+
+    def plain(self, provider, since):
+        with sqlite3.connect(self.home / fc.PACING_DB) as db:
+            rows = db.execute('SELECT ts, account_hash, used, reset_at FROM samples WHERE provider=? AND kind=? '
+                              'AND ts>=?', (provider, fc.WEEK_KIND, since)).fetchall()
+        db.close()
+        return [(float(t), a, float(u), r) for t, a, u, r in rows]
+
+    def test_same_samples_one_transferred_row(self):
+        connect = sqlite3.connect
+        transferred = []
+
+        def counting(*a, **kw):
+            conn = connect(*a, **kw)
+            conn.row_factory = lambda cursor, row: transferred.append(row) or row
+            return conn
+
+        since = NOW - 24 * H
+        expected = self.plain('openai-codex', since)
+        self.assertGreater(len(expected), 500)
+        with mock.patch.object(fc.sqlite3, 'connect', side_effect=counting):
+            got = fc.read_samples(self.home, 'openai-codex', since)
+        self.assertEqual(got, expected)
+        self.assertEqual([tuple(map(type, r)) for r in got], [tuple(map(type, r)) for r in expected])
+        # query_only PRAGMA returns no row; the samples cross as one batched row.
+        self.assertEqual(len(transferred), 1)
+
+    def test_a_real_without_an_exact_scale_reads_row_by_row(self):
+        with sqlite3.connect(self.home / fc.PACING_DB) as db:
+            db.execute("INSERT INTO samples VALUES (?, 'anthropic', 'h', 'seven_day', 1.0, 1e300)", (NOW - H,))
+        db.close()
+        since = NOW - 24 * H
+        expected = self.plain('anthropic', since)
+        self.assertIn(1e300, [r[3] for r in expected])
+        with sqlite3.connect(self.home / fc.PACING_DB) as db:
+            self.assertIsNone(db.execute(fc._batch_query(
+                'SELECT ts, account_hash, used, reset_at FROM samples', 4)).fetchone()[0])
+        db.close()
+        self.assertEqual(fc.read_samples(self.home, 'anthropic', since), expected)
+
+
 if __name__ == '__main__':
     unittest.main()

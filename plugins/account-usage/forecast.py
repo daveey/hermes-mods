@@ -144,6 +144,64 @@ def _ro_connect(db: Path) -> sqlite3.Connection:
     return conn
 
 
+# Power-of-two scales tried for a REAL (see _batch_rows). A double with 2**e <= |x| < 2**(e+1) times 2**K is an
+# integer below 2**63 for every K in [52 - e, 62 - e]: steps of 10 always hit one for 2**-38 <= |x| < 2**63.
+_REAL_SCALES = tuple(range(0, 100, 10))
+
+
+def _scaled(col: str, k: int) -> str:
+    return f"({col} * {2 ** min(k, 60)}" + (f" * {2 ** (k - 60)})" if k > 60 else ")")
+
+
+def _batch_query(sql: str, width: int) -> str:
+    cols = [f'c{i}' for i in range(width)]
+    flags = "''||" + '||'.join(f"(typeof({c})='real')" for c in cols)  # '0010': column 2 is REAL
+
+    def real(c):  # 'K:m' with c == m * 2**-K exactly, or NULL
+        return 'COALESCE(' + ', '.join(f"CASE WHEN {_scaled(c, k)} = CAST({_scaled(c, k)} AS INTEGER) "
+                                       f"THEN '{k}:' || CAST({_scaled(c, k)} AS INTEGER) END"
+                                       for k in _REAL_SCALES) + ')'
+    values = ','.join(f"CASE WHEN typeof({c})='real' THEN {real(c)} ELSE {c} END" for c in cols)
+    vs = ','.join(f'v{i}' for i in range(width))
+    unsent = ' OR '.join(f"(substr(f, {i + 1}, 1) = '1' AND v{i} IS NULL)" for i in range(width))
+    return (f"WITH data({','.join(cols)}) AS ({sql}), enc(f, {vs}) AS (SELECT {flags}, {values} FROM data) "
+            f"SELECT CASE WHEN MAX({unsent}) THEN NULL ELSE json_group_array(json_array(f, {vs})) END FROM enc")
+
+
+def _real(text: str) -> float:
+    k, m = text.split(':')
+    return math.ldexp(float(int(m)), -int(k))  # m has at most 53 significant bits: both steps are exact
+
+
+def _batch_rows(conn: sqlite3.Connection, sql: str, width: int, parameters=()) -> list:
+    """``conn.execute(sql, parameters).fetchall()``'s values, transferred as ONE SQLite row (the throughput plugin's
+    ``store.batch_rows``; this module stays stdlib-only and standalone).
+
+    Each SQLite row a cursor returns releases and re-takes the GIL; inside the busy Desktop backend (~190 threads)
+    a re-take can wait a whole 5 ms switch interval, so the ~5k weekly readings of a day took seconds there. The
+    SELECT runs unchanged inside ``json_group_array``; INTEGER, TEXT and NULL keep their JSON values. No decimal
+    text carries a REAL (JSON keeps 15 digits; SQLite 3.50.4's printf misrenders ~10 % of doubles): it travels as
+    integers ``K:m`` with ``x == m * 2**-K``, found with exact operations only. A REAL that fits no K (|x| >= 2**63,
+    infinities, bits below 2**-90), a BLOB, or SQLite without JSON functions sends the whole result row by row.
+    A REAL -0.0 reads as 0.0 (REAL-affinity columns already store it as 0; the forecast only compares and
+    subtracts these values)."""
+    try:
+        encoded = conn.execute(_batch_query(sql, width), parameters).fetchone()[0]
+        if encoded is None:
+            return conn.execute(sql, parameters).fetchall()
+    except sqlite3.OperationalError as exc:
+        message = str(exc).lower()
+        if not (message.startswith('no such function: json_') or 'json cannot hold blob values' in message):
+            raise
+        return conn.execute(sql, parameters).fetchall()
+    out = []
+    for flags, *values in json.loads(encoded):
+        if '1' in flags:
+            values = [v if f != '1' else _real(v) for f, v in zip(flags, values)]
+        out.append(values)
+    return out
+
+
 def read_samples(home: Path, provider: str, since: float) -> list[tuple[float, str, float, Optional[float]]]:
     """``(ts, account_hash, used, reset_at)`` weekly readings since ``since``, from both histories."""
     out = []
@@ -162,9 +220,9 @@ def read_samples(home: Path, provider: str, since: float) -> list[tuple[float, s
     if db.exists():
         try:
             with closing(_ro_connect(db)) as conn:
-                out += [(float(t), a, float(u), r) for t, a, u, r in conn.execute(
-                    "SELECT ts, account_hash, used, reset_at FROM samples WHERE provider=? AND kind=? AND ts>=?",
-                    (provider, WEEK_KIND, since))]
+                out += [(float(t), a, float(u), r) for t, a, u, r in _batch_rows(
+                    conn, "SELECT ts, account_hash, used, reset_at FROM samples WHERE provider=? AND kind=? AND ts>=?",
+                    4, (provider, WEEK_KIND, since))]
         except sqlite3.Error:
             pass
     return out
