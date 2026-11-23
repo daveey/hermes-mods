@@ -29,6 +29,20 @@ A bundle holds what the panel would otherwise fetch itself, in the same shapes:
 | `done` | `/api/plugins/user-steps/session-cards?ids=<lineage>` rows (finished cards and settled remote receipts) |
 | `cards` | `{id: {detail, board}}`: a slim `/api/plugins/kanban/tasks/<id>` for every card on a linked card's dependency chain (open parents and card ids named in waits, parks and asks; six hops, 80 cards, stopping at running or finished cards): the task row with `wake_check` and `ready_since`, parents with status, the newest 40 events, the last run, the queue note, and `owner` for a replica card. Left out because they move without changing anything the chain shows: heartbeat events, `last_heartbeat_at`, and the read-time-stamped `execution_observations` of the queue note (the card rows in `tasks` keep the evidence the panel judges). A full detail is ~48 KB and ~700 ms on the hub; this is a few KB and under 5 ms. |
 
+## Owner-controlled device waits
+
+Core's wait classifier can expose a legacy scheduled device-access probe as
+`wait_state: human` with an `owner_step`. The model renders that step in **Needs
+you** (the replacement for the For-you strip), keyed by the existing card rather
+than creating a decision request. Repeated probe ticks do not add asks; a current
+validated human request or canonical decision takes precedence. The visible step
+replaces a stale task title, without renaming the task or inventing approval
+buttons. This is attention, not consent or evidence that the suggested device
+operation fixes visibility. New physical prerequisites must use a validated
+`human_request` and, when useful, `resolved_check`. The compatibility classifier
+recognizes known paired-device probe invocation shapes, not arbitrary script
+semantics.
+
 ## How it stays current
 
 The feed thread starts on the first request (only `hermes serve`, which runs plugin routers and holds the Desktop sockets, ever serves one), one per process, and ticks every second until the plugin unloads (`register` stops it). `feed.py` lives under `dashboard/`, so hermes-sync's dashboard restart picks up a change to it.

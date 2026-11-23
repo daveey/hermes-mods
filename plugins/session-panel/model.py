@@ -431,6 +431,12 @@ def human_owned(row):
 def ask(row, request=None):
     request = request or {}
     hr = obj(row.get('human_request'))
+    step = text(obj(row.get('wait')).get('owner_step'))
+    if not hr and not request and step:
+        # Compatibility attention for a hidden physical wait, not a new consent request.
+        # Pure/keyed by the card: no request is posted again on each probe tick.
+        hr = {'action': step, 'why_human': 'Only you can: confirm device access or correct this wait.',
+              'scope': 'The card was scheduled on device availability without a visible owner step.'}
     scope = obj(request.get('scope'))
     if not hr:
         markdown = text(scope.get('markdown'))
