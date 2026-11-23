@@ -88,3 +88,27 @@ through owner materializers; finite ViewFact expiry readiness through authorized
 startup; final complete two-core suites; independent exact-head review and CI.
 Inert landing follows shared compatibility only. Combined live acceptance belongs
 to the coordinator.
+# Active release scope: native keyed hints
+
+The panel cutover uses the native indexed hub hint reader shipped with core
+loaded notifications, not a production fact-host publisher. `HERMES_FACTS_PANEL`
+defaults on; `0` restores unchanged file-event admission on the next plugin
+generation. Older cores without the adapter remain legacy. No serve signal is
+needed or permitted for rollout: wait for the normal reload.
+
+One existing watcher owns the 30-second missed-hint recovery clock. A hub-only
+event reads bounded indexed changed keys, maps current/previous chat membership
+and held dependencies, and admits only affected sessions. Missing index,
+unqualified/incomplete source, mixed-file event and watch overflow use legacy
+admission. Board hydration retains its bounded service and mounted-panel lease
+policy; hidden sessions retain dirty debt. Notification claim/ACK/observation
+writers are not called by this adapter. Canonical user-step reconciliation stays
+on the feed producer, with existing deferred retries. The wire publisher,
+epoch/cursor, restore/resume and heartbeat protocol are unchanged.
+
+Known fallback sources: local/shadow board files, state/lineage and action stores,
+origin ledger/work files, source inventory events, and ambiguous macOS vnode
+events retain legacy wakes. This is not complete source coverage or a measured
+performance claim. The historical replica design above remains inert and is not
+the current release acceptance target.
+

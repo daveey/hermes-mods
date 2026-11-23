@@ -1789,6 +1789,7 @@ class FileWatch:
         import select
         import struct
         until = time.monotonic() + timeout
+        self.changed_paths = set()
         while True:
             left = max(0.0, until - time.monotonic())
             if self._kq is not None:
@@ -1802,6 +1803,7 @@ class FileWatch:
                         and e.fflags & (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME)]
                 for p in gone:
                     os.close(self._fds.pop(p))
+                self.changed_paths = None  # directory/overflow ambiguity stays legacy
                 self._arm()  # a replaced or newly created file is watched from here on
                 return True
             if not select.select([self._fd], [], [], left)[0]:
@@ -1816,12 +1818,14 @@ class FileWatch:
                 name = data[at + 16:at + 16 + size].split(b'\0', 1)[0]
                 at += 16 + size
                 if mask & self._Q_OVERFLOW:
+                    self.changed_paths = None
                     hit = True  # events were dropped: any of ours may be among them
                 elif mask & self._IGNORED:
                     if wd in self._names:  # a watched directory went away (not our own rm_watch): its files with it
                         self._names.pop(wd)
                         self._dirs = {d: w for d, w in self._dirs.items() if w != wd}
                         self.stale = hit = True
+                        self.changed_paths = None
                 else:
                     decoded = os.fsdecode(name)
                     names = self._names.get(wd, ())
@@ -1830,6 +1834,11 @@ class FileWatch:
                     parent = next((d for d, w in self._dirs.items() if w == wd), None)
                     if inventory or decoded in getattr(self, '_rearm', {}).get(parent, ()):
                         self.stale = True
+                    if self.changed_paths is not None and (decoded in names or inventory):
+                        if parent is None:
+                            self.changed_paths = None
+                        else:
+                            self.changed_paths.add(Path(parent) / decoded)
                     hit = hit or decoded in names or bool(inventory)
             if hit:
                 return True  # anything else in those directories (logs, locks) is not ours
@@ -1850,6 +1859,16 @@ def _watch(f, watch: FileWatch, paths) -> None:
     """The feed's one watcher thread: a write to a source file makes a pass due on both lanes."""
     try:
         listed = None
+        hints = None
+        if _mitigation('HERMES_FACTS_PANEL'):
+            try:
+                spec = importlib.util.spec_from_file_location('_panel_keyed_hints', Path(__file__).with_name('keyed_hints.py'))
+                assert spec is not None and spec.loader is not None
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                hints = module.KeyedHints()
+            except ImportError:
+                pass  # older core retains every legacy lane
 
         def rearm():
             readers = f.readers
@@ -1868,11 +1887,35 @@ def _watch(f, watch: FileWatch, paths) -> None:
             if listed is None or watch.stale or time.monotonic() - listed >= WATCH_REFRESH_S:
                 rearm()
                 listed = time.monotonic()
-            if watch.wait(max(0.0, listed + WATCH_REFRESH_S - time.monotonic())) and not f.stopped.is_set():
+            deadline = listed + WATCH_REFRESH_S
+            if hints is not None:
+                deadline = min(deadline, hints.next_reconcile)
+                if hints.reader.source_dirty:
+                    deadline = time.monotonic()
+            hit = watch.wait(max(0.0, deadline - time.monotonic()))
+            recovery = hints is not None and hints.due()
+            if recovery:
+                with f.lock:
+                    f.queue_keyed(set(f.interest))
+            if (hit or (hints is not None and hints.reader.source_dirty)) and not f.stopped.is_set():
                 if watch.stale:
                     rearm()
                     listed = time.monotonic()
-                f._wake.set()
+                changed = getattr(watch, 'changed_paths', None)
+                hub_files = {Path(str(hints.path) + suffix) for suffix in ('', '-wal', '-shm', '-journal')} if hints else set()
+                if hints is not None and ((changed and changed <= hub_files) or (not hit and hints.reader.source_dirty)):
+                    try:
+                        with f.lock:
+                            held = {s: {'lineage': set(b['lineage']), 'refs': set(b['refs'])}
+                                    for s, b in f.bundles.items() if s in f.interest}
+                        f.queue_keyed(hints.sessions(held, LAUNCH_PROFILE))
+                        continue
+                    except Exception:
+                        hints.reader.source_dirty = False  # retry via next hint/clock, never a tight loop
+                        log.warning('panel keyed hint failed; legacy admission retained', exc_info=True)
+                with f.lock:
+                    f._legacy_wake = True
+                    f._wake.set()
                 f._decide.set()
                 board = getattr(f, '_board', None)
                 if board is not None:
@@ -2009,7 +2052,17 @@ def _run(f) -> None:
                 break
             started = last = time.monotonic()
             try:
-                f.tick()
+                with f.lock:
+                    keyed = f.__dict__.pop('_keyed_pending', set())
+                    keyed_only = bool(keyed) and not (
+                        getattr(f, '_legacy_wake', False) or f._cold.is_set() or f._retry)
+                    f._legacy_wake = False
+                    if keyed_only:
+                        f._wake.clear()  # arrivals after this boundary retain a trailing wake
+                if keyed:
+                    f.refresh_keyed(keyed)
+                if not keyed_only:
+                    f.tick()
             except Exception:
                 log.warning('session-panel feed tick failed', exc_info=True)
             f.readers.release()  # no connection outlives one pass

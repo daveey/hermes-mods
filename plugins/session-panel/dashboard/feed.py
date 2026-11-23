@@ -1094,6 +1094,51 @@ class Feed:
                                                       producer_chats=len(todo),
                                                       producer_readers=getattr(self.readers, 'reconcile_timings', []))
 
+    def queue_keyed(self, sessions):
+        with self.lock:
+            wanted = set(sessions) & set(self.interest)
+            if not wanted:
+                return
+            self.__dict__.setdefault('_keyed_pending', set()).update(wanted)
+            lane = getattr(self, '_board_lane', None)
+            if lane is not None:
+                lane._admit(wanted, time.time())
+                lane.service_wake.set()
+            self._wake.set()
+
+    def refresh_keyed(self, sessions=None):
+        """Hydrate only admitted keys, without consuming global source cursors.
+
+        Canonical reconciliation remains a writer on the feed thread, never a
+        reducer side effect. Publication retains the existing revision fence.
+        """
+        with self.lock:
+            if sessions is None:
+                sessions = self.__dict__.pop('_keyed_pending', set())
+            sessions = sessions & set(self.interest)
+            lane = getattr(self, '_board_lane', None)
+            if lane is not None and lane.visible_only:
+                visible = {s for s, expires in self._panel_subscribers.values() if expires > self.clock()}
+                self._board_dirty.update(sessions - visible)
+                self._board_failures.update(sessions - visible)
+                sessions &= visible
+        if not sessions:
+            return
+        try:
+            if callable(getattr(self.readers, 'reconcile_sources', None)):
+                self._produce(sorted(sessions), self._producer_seen, set(sessions))
+            self._publish(self._compute_all(sorted(sessions), refresh=True))
+            with self.lock:
+                self._retry.update(s for s in sessions if s in self.failures)
+                failed = self._retry.intersection(sessions)
+            if failed:
+                self._hydrate_retry_at = self._spend('hydrate', failed, keep=set(self._retry))
+        except Exception:
+            with self.lock:
+                self._retry.update(sessions)
+            self._admission_retry_at = self.clock() + RETRY_EVERY_S
+            raise
+
     def tick(self) -> int:
         """Settle a source pass atomically, with finite recovery of unread changes."""
         import copy
