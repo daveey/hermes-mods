@@ -28,6 +28,10 @@ _spec_tree = importlib.util.spec_from_file_location('_panel_hierarchy', Path(__f
 assert _spec_tree is not None and _spec_tree.loader is not None
 _hierarchy = importlib.util.module_from_spec(_spec_tree)
 _spec_tree.loader.exec_module(_hierarchy)
+_spec_action = importlib.util.spec_from_file_location('_panel_actionability', Path(__file__).with_name('actionability.py'))
+assert _spec_action is not None and _spec_action.loader is not None
+_actionability = importlib.util.module_from_spec(_spec_action)
+_spec_action.loader.exec_module(_actionability)
 
 SECTIONS = ('needs_you', 'stuck', 'running', 'waiting', 'ready', 'done')
 TERMINAL = {'done', 'archived', 'cancelled', 'canceled', 'resolved', 'withdrawn'}
@@ -706,6 +710,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
     """Return JSON-safe PanelModel v1. Inputs are snapshots, and are never mutated."""
     sections = {s: [] for s in SECTIONS}
     rows_by_key = {}
+    diagnostic_rows = {}
     dependency_prefixes = {}
     requests = list(requests if requests is not None else bundle.get('requests') or [])
     used, seen = set(), set()
@@ -727,6 +732,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
                 if not row.get(field) and bundle.get(field):
                     row[field] = bundle[field]
         row.setdefault('board', 'default')
+        diagnostic_row = dict(row)
         detail = obj(rec.get('detail'))
         # Detail is supplementary only. Current list/wait wins over preserved block_kind and old ask text.
         row = {**obj(detail.get('task')), **row}
@@ -736,6 +742,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         if k in seen:
             continue
         rows_by_key[k] = row
+        diagnostic_rows[k] = diagnostic_row
         state = row.get('status')
         if row.get('unfinished') and state not in ACTIVE:
             state = 'unknown'
@@ -962,6 +969,7 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
         result = clean(row.get('result'))
         v['detail'] = result if len(result) <= 80 else result[:79].rstrip() + '…'
         sections['done'].append(v)
+        diagnostic_rows[k] = row
     for views in sections.values():
         for view in views:
             source_row = rows_by_key.get(view['key'], {})
@@ -993,6 +1001,13 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             age = triage_label(card, bundle, now, wire=wire)
             group['detail'] += ' · ' + age
             group['details'].append(age)
+    # After all row/ask/group construction: no diagnostic can influence any
+    # classifier, decision binding, action, wait palette or hierarchy.
+    for view in [v for values in sections.values() for v in values] + groups:
+        if view.get('kind') == 'card':
+            source_row = diagnostic_rows.get(view['key'], view)
+            _actionability.present(view, source_row, obj(obj(bundle.get('cards')).get(view['id'])),
+                                   now=now, terminal=TERMINAL, serving=same_gateway)
     outcome = obj(bundle.get('outcome_json') or bundle.get('outcome'))
     counts = {s: len(sections[s]) for s in SECTIONS}
     pips = [{'section': s, 'count': counts[s], 'label': {'needs_you': 'needs you', 'running': 'running'}.get(s, s)} for s in SECTIONS if counts[s]]

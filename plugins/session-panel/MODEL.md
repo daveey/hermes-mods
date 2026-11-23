@@ -463,6 +463,50 @@ Order matters, matching Desktop `classify`:
 - Running rows without `run_model` use the current run's `run_route`, else `model_tier`, event model.
 - Titles lose emoji-presentation glyphs; Done rows carry no redundant `done` detail.
 
+## Optional actionability v1 diagnostics
+
+`CoreReaders._detail` optionally carries the frozen core
+`hermes_cli.kanban_actionability_sources.describe(connection, task_id, now=0)`
+projection. Zero is intentionally **time-neutral**, not an observation clock:
+absolute source deadlines, contract keys and first-observed evidence are retained;
+clock-derived scheduled/overdue action changes are not stored. Existing snapshot
+and observation clocks remain the only freshness authority. The call uses the
+existing query-only detail connection, one task and its immediate parents, never
+a report, lifecycle writer, migration or network refresh. Older cores and malformed
+optional evidence leave hydration intact.
+
+Backend `actionability.present` validates the diagnostic/detail/task identity and
+owner coordinates before adding `row.actionability` and `Actionability …` strings
+to `details[]`. It does not change classification, section/header counts, actions,
+ask/decision bindings, hierarchy, waits or execution evidence. Local rows require
+live local detail; replicas require matching board and recorded owner and always
+retain UNKNOWN evidence. Unhydrated, mismatched and unsupported inputs explicitly
+say unavailable. Ordinary terminal rows remain omitted; terminal detail/history
+consumers show n/a, never missing-owner violations. Deadline absence remains null
+and “deadline unavailable”; no timestamp is invented. Reducer `now` may add an
+absolute escalation-overdue label, never scheduled-wake-overdue.
+
+The renderer is unchanged: normal rows use existing tooltips; asks keep their
+Details disclosure. Old wire payloads without actionability remain supported.
+Within existing source capture, demand-only signatures cover wake-check commands,
+pending retain-command custody and sync mode (inputs outside the existing core
+revision cursor). Immediate-parent references participate in existing semantic
+invalidation, including when the parent was not hydrated. No new poller or source
+admission policy is introduced. The unactivated `board_capture.py` acquisition
+capability intentionally omits this unsupported enrichment on both fresh and
+reused details: it cannot certify complete incremental invalidation and remains
+unactivated.
+
+Tests: `tests/test_actionability.py`, the persisted shared fixture helper, and
+`desktop-plugins/session-panel/test/actionability.test.mjs` exercise real
+CoreReaders → reducer → actual DOM. The bounded fixture threshold is 65 SQL
+statements for one demanded detail (measured baseline 10 plus 34 projection
+statements for a child with one immediate parent; allowance for small schema
+variance). This is a statement-count/demand bound, **not** an absolute history-volume
+bound: core's per-task, kind-filtered events reader has no LIMIT. Read-only proof
+compares logical database state and main DB/WAL bytes; SQLite SHM reader slots may
+change.
+
 ## Tests and private replay
 
 Run `scripts/test-all --no-core --exact -k plugins/session-panel -k plugins/ask-gate
