@@ -409,7 +409,18 @@ def wait_phrase(row, now):
 
 
 def human_owned(row):
-    """block_kind survives old blocks. It alone is NEVER evidence of a current ask."""
+    """Use the same current-card attention contract as the lane totals."""
+    try:
+        from hermes_cli.kanban_open_asks import needs_you
+    except ImportError:
+        # Core-free public fixtures and rolling older installs only. Keep their
+        # legacy adapter until the companion core provides the shared predicate.
+        return _legacy_human_owned(row)
+    return needs_you(row)
+
+
+def _legacy_human_owned(row):
+    """Compatibility for cores predating the shared attention contract."""
     state = row.get('status')
     if state in TERMINAL or row.get('stale'):
         return False
