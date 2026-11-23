@@ -317,6 +317,22 @@ def test_source_unknown_label_is_not_an_interruption():
     assert 'remote' in row['detail']
 
 
+def test_terminal_last_known_status_is_unknown_until_owner_recovery():
+    for flag in ({'stale': True}, {'partial_source_unknown': 'origin_ledger_unavailable'}):
+        for status in ('done', 'archived'):
+            row = task(status=status, **flag)
+            value = model.reduce_panel(bundle(row, done=[row]), now=NOW)
+            assert not value['sections']['done']
+            assert len(value['sections']['waiting']) == 1
+            assert value['sections']['waiting'][0]['evidence_state'] == 'unknown'
+            assert status in value['sections']['waiting'][0]['detail']
+            # The authoritative terminal row returns to normal confirmed history after recovery.
+            row = task(status=status)
+            recovered = model.reduce_panel(bundle(done=[row]), now=NOW)
+            assert len(recovered['sections']['done']) == 1
+            assert not recovered['sections']['waiting']
+
+
 def test_running_precedence_explains_independent_own_turn():
     outcome = canonical_outcome('running')
     outcome['status']['presentation']['reason_codes'] = ['own_turn_active']
@@ -483,12 +499,14 @@ def test_retired_requests_dont_revive_but_blocked_owner_remains_visible():
     assert m['sections']['waiting'][0]['detail'] == 'blocked · request withdrawn'
 
 
-def test_terminal_stale_does_not_reopen_and_done_dedup_is_owner_qualified():
+def test_terminal_stale_retains_unknown_obligation_and_done_dedup_is_owner_qualified():
     one = task(status='done', completed_at=NOW - 3)
     two = {**one, 'gateway': 'other'}
     m = model.reduce_panel(bundle({**one, 'stale': True}, done=[one, one, two]), now=NOW)
-    assert not m['sections']['waiting']
-    assert m['header']['counts']['done'] == 2
+    assert len(m['sections']['waiting']) == 1
+    assert m['sections']['waiting'][0]['evidence_state'] == 'unknown'
+    assert m['header']['counts']['done'] == 1
+    assert m['sections']['done'][0]['gateway'] == 'other'
 
 
 def test_queued_mapped_ready_and_blocked_upstream_waiting():
