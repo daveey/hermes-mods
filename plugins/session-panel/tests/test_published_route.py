@@ -14,7 +14,7 @@ def test_http_read_matches_legacy_bytes_without_lane_json_or_compute(monkeypatch
     monkeypatch.setattr(core, 'PROCESS_FEED', f)
     out = f.changes(['S1'])
     # The wire is the in-process view minus the hub-only inputs (feed.WIRE_OMIT), byte for byte otherwise.
-    out = {**out, 'bundles': {s: core.wire_bundle(b) for s, b in out['bundles'].items()}}
+    out = {**out, 'bundles': {s: f._client_bundle(s, b, f._bundle_fresh(s, f.clock())) for s, b in out['bundles'].items()}}
     expected = JSONResponse(api.json_safe({'feed': api.FEED_ID, 'profile': api.LAUNCH_PROFILE, **out})).body
     def forbidden(*a, **kw):
         raise AssertionError('interactive read invoked compute, serialization or a lane')

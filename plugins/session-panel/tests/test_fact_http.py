@@ -69,7 +69,7 @@ def test_mounted_facts_routes_no_io_and_exact_wire(api, monkeypatch):
             armed = True
             result = client.post('/changes', json={'sessions': ['S1']})
             assert result.status_code == 200
-            assert result.json()['bundles']['S1'] == feedmod.wire_bundle(bundle)
+            assert result.json()['bundles']['S1'] == f._client_bundle('S1', bundle, f._bundle_fresh('S1', f.clock()))
             assert client.get('/status').json() == expected_status
             assert client.post('/decision-refresh', json={'session': 'S1'}).json() == expected
             assert client.post('/decision-refresh', json={'session': 'cold'}).status_code == 503

@@ -60,6 +60,29 @@ test('aged parked board data keeps its status and age in the panel and task chip
 })
 
 const cases = { ...publicCases, ...privateCases }
+for (const [name, trusted, age, vouched] of [
+ ['restored', false, 0, null], ['expired', true, 61, true],
+ ['unvouched', true, 0, false], ['fresh', true, 0, true]
+]) {
+ test(`running header ${name} uses source freshness, not transport age`, async () => {
+  const base = Object.values(cases).find(c => c.model?.sections?.running?.length)
+  assert.ok(base)
+  const now = 1000
+  const model = { ...base.model, header: { ...base.model.header, source: 'derived', state: 'running', label: 'running', status: null },
+   freshness: { trusted, computed_at: now - age, ttl_s: 60 } }
+  const before = JSON.stringify(model)
+  await paint(m.renderModel(model, { now, vouched }))
+  const stale = name !== 'fresh'
+  assert.equal(document.querySelector('[data-session-status]').textContent.includes('status unknown (stale'), stale)
+  if (stale) {
+   assert.equal(document.querySelector('[data-panel-status-stripe]').dataset.panelStatusStripe, 'none')
+   assert.equal(document.querySelector('[data-session-status]').title, 'unknown')
+   assert.ok(document.querySelector('[data-panel-status-stripe]').style.background.includes('muted-foreground'))
+  } else assert.equal(document.querySelector('[data-session-status]').textContent, 'running')
+  if (age) assert.ok(document.querySelector('[data-session-status]').textContent.includes('1m old'))
+  assert.equal(JSON.stringify(model), before)
+ })
+}
 for (const name of ['agent_held_local', 'agent_held_replica', 'agent_held_spend', 'agent_held_human']) {
  test(`real reducer ${name}: actor text and human-only red`, async () => {
   const { model, now } = cases[name]

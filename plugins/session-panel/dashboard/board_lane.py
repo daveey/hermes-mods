@@ -99,6 +99,7 @@ class BoardLane:
             if self.service_stop.is_set() or f.stopped.is_set():
                 return
             now = f.clock()
+            requested_now = set()
             while True:
                 try:
                     subscriber, session, expires = f._panel_updates.get_nowait()
@@ -106,12 +107,27 @@ class BoardLane:
                     break
                 if session and expires > now:
                     f._panel_subscribers[subscriber] = (session, expires)
+                    requested_now.add(session)
                 else:
                     f._panel_subscribers.pop(subscriber, None)
             f._panel_subscribers = {k: v for k, v in f._panel_subscribers.items() if v[1] > now}
             visible = {v[0] for v in f._panel_subscribers.values()}
+            while True:
+                try:
+                    sessions, expires = f._board_demands.get_nowait()
+                except queue.Empty:
+                    break
+                if expires > now:
+                    f._board_requested.update({s: expires for s in sessions})
+                    requested_now.update(sessions)
+            f._board_requested = {s: expires for s, expires in f._board_requested.items() if expires > now}
+            demanded = visible | set(f._board_requested)
+            # Old/restored bundles need a real board read, even without a new delta.
+            f._board_dirty.update(s for s in requested_now if s in f.bundles and
+                (s in f._carried or now - f.bundles[s]['bundle']['computed_at'] > f.full_every_s)
+                and s not in self.active and s not in self.pending)
             f._board_dirty.intersection_update(f.interest)
-            for session in f._board_dirty & visible:
+            for session in f._board_dirty & demanded:
                 if session in f.interest and session in f.bundles:
                     self.pending.setdefault(session, time.time())
                     self.read_ends.pop(session, None)  # attach is immediately actionable
@@ -137,7 +153,7 @@ class BoardLane:
                     self.retries[session] = (self.retries[session][0], None)
             self.read_ends = {s: value for s, value in self.read_ends.items()
                               if f._watch_tokens.get(s) is value[0]}
-            for session in sorted(self.pending, key=self.pending.get):
+            for session in sorted(self.pending, key=lambda s: (s not in visible, s not in demanded, self.pending[s])):
                 if len(self.active) >= self.capacity:
                     break
                 if session in self.active:
@@ -147,7 +163,7 @@ class BoardLane:
                 if session not in f.interest or not held or token is None:
                     self.pending.pop(session, None)
                     continue
-                if self.visible_only and session not in visible:
+                if self.visible_only and session not in demanded:
                     self.pending.pop(session, None)
                     f._board_dirty.add(session)
                     self.retries.pop(session, None)
@@ -269,7 +285,7 @@ class BoardLane:
     def _admit(self, sessions, at):
         with self.feed.lock:
             for session in sessions:
-                if self.visible_only and not any(s == session and expires > self.feed.clock()
+                if self.visible_only and self.feed._board_requested.get(session, 0) <= self.feed.clock() and not any(s == session and expires > self.feed.clock()
                                                  for s, expires in self.feed._panel_subscribers.values()):
                     self.feed._board_dirty.add(session)
                 else:

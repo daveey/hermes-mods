@@ -160,6 +160,7 @@ export function ingestBundle(connectionId, profile, b, version = null) {
 function confirmFeed(st, fresh, nowMs = Date.now()) {
   st.liveAt = nowMs
   st.fresh = Array.isArray(fresh) ? fresh : []
+  modelChanged()
 }
 
 /** The chats to watch, per gateway connection: the focused chat first, then warmTargets(). */
@@ -462,15 +463,24 @@ export function clockRow(row, now = Date.now() / 1000) {
   if (row.decision) result.decision = clockRow(row.decision, now)
   return result
 }
-export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck, collapsed = false, onToggle, now = Date.now() / 1000 } = {}) {
+/** One source clock for header and row freshness; heartbeats cannot renew computed_at. */
+export function modelFreshness(model, { now = Date.now() / 1000, vouched = null } = {}) {
+  const f = model?.freshness
+  if (!f) return { stale: vouched === false, age: null } // older producers
+  const age = Number.isFinite(f.computed_at) ? now - f.computed_at : null
+  const ttl = Number.isFinite(f.ttl_s) && f.ttl_s > 0 ? Math.min(60, f.ttl_s) : 60
+  return { stale: age === null || age < 0 || age > ttl || vouched === false || (vouched !== true && f.trusted !== true), age }
+}
+export function renderModel(model, { onChoose, onAction, decisionStatus = () => null, onCheck, collapsed = false, onToggle, now = Date.now() / 1000, vouched = null } = {}) {
   if (!validModel(model)) return null
   // Spec: hidden when there is neither open work nor finished history.
   if (!MODEL_SECTIONS.some(([section]) => model.sections[section].length)) return null
-  const status = model.header.status
+  const freshness = modelFreshness(model, { now, vouched })
+  const status = freshness.stale ? null : model.header.status
   const hasHeader = status || model.header.source === 'derived'
-  const state = hasHeader ? str(model.header.state) : 'unknown'
-  const label = hasHeader ? str(model.header.label) || state : 'unknown'
-  const stripe = status?.presentation?.stripe || 'attention'
+  const state = !freshness.stale && hasHeader ? str(model.header.state) : 'unknown'
+  const label = freshness.stale ? `status unknown (stale${freshness.age === null ? '' : ` · ${formatClockText([{ timestamp: model.freshness.computed_at, format: 'elapsed' }], now)} old`})` : hasHeader ? str(model.header.label) || state : 'unknown'
+  const stripe = freshness.stale ? 'none' : status?.presentation?.stripe || 'attention'
   // Presentation palette only: no local activity/count/kind classification.
   const statusColor = { done: 'var(--color-emerald-500)', stuck: 'var(--color-red-500)', attention: 'var(--color-amber-500)',
     blocked: 'var(--color-zinc-400)', waiting: hasHeader && model.header.wait_kind ? waitColor(model.header) : 'var(--color-zinc-400)', none: 'var(--muted-foreground)' }[stripe]
@@ -971,6 +981,7 @@ export function Panel() {
   if (!model) return jsx(PendingModel, { waiting: pending?.scope !== scope || pending.waiting, onRetry: () => setRetry(v => v + 1) })
   const collapsed = isCollapsed(model, readCollapsed(scope))
   return renderModel(model, {
+    vouched: feeds.get(connKey(route.connectionId, route.profile))?.liveAt ? feedVouches(route) : null,
     collapsed,
     onToggle: () => { writeCollapsed(scope, collapsed ? null : attentionKeys(model)); tick(v => v + 1) },
     onChoose: (row, option) => void chooseModelOption(row, option, route),

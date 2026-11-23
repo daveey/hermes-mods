@@ -220,6 +220,8 @@ class Feed:
         self._watch_tokens = {}             # rejects reads from forgotten/re-watched membership
         self._projection_owner = object()   # not transferred by resume or disk restore
         self._panel_updates = queue.SimpleQueue()
+        self._board_demands = queue.SimpleQueue()  # HTTP only enqueues; service owns expiry
+        self._board_requested = {}
         self._panel_subscribers = {}  # mounted-panel id -> (session, lease expiry)
         self._board_dirty = set()
         self._board_failures = set()
@@ -277,6 +279,23 @@ class Feed:
         self._wire = (self.epoch, self.rev, MappingProxyType({}), b'')
         self._publish_wire()
 
+    def _bundle_fresh(self, session, now):
+        return (getattr(self, '_watching', True) and session in self.interest
+                and session in self.bundles
+                and not any(session in values for values in (self.failures, self._retry, self._carried,
+                    self._decision_failures, self._board_failures, self._board_dirty, self._board_capture_failures))
+                and not self.bundles[session].get('source_stale')
+                and 0 <= now - self.bundles[session]['bundle']['computed_at'] <= self.full_every_s)
+
+    def _client_bundle(self, session, bundle, fresh):
+        out = wire_bundle(bundle)
+        if isinstance(out.get('model'), dict):
+            model = out['model']
+            out = {**out, 'model': {**model,
+                'freshness': {'trusted': bool(fresh), 'computed_at': bundle['computed_at'],
+                              'ttl_s': self.full_every_s}}}
+        return out
+
     def _publish_wire(self):
         """Writer-only: freeze JSON bytes before swapping the complete revision view.
 
@@ -285,13 +304,18 @@ class Feed:
         """
         entries = {}
         old_entries = self._wire[2]
+        sources = {}
+        now = self.clock()
         for s, held in self.bundles.items():
             old = old_entries.get(s)
-            if old and self._wire_sources.get(s) is held['bundle'] and old[0] == held['rev']:
+            fresh = self._bundle_fresh(s, now)
+            source = self._wire_sources.get(s)
+            sources[s] = (held['bundle'], fresh)
+            if old and isinstance(source, tuple) and source[0] is held['bundle'] and source[1] == fresh and old[0] == held['rev']:
                 entries[s] = old
             else:
-                entries[s] = (held['rev'], self._encode(s), self._encode(wire_bundle(held['bundle'])))
-        self._wire_sources = {s: b['bundle'] for s, b in self.bundles.items()}
+                entries[s] = (held['rev'], self._encode(s), self._encode(self._client_bundle(s, held['bundle'], fresh)))
+        self._wire_sources = sources
         header = b'{"epoch":' + self._encode(self.epoch) + b',"rev":' + str(self.rev).encode()
         self._wire = (self.epoch, self.rev, MappingProxyType(entries), header)
 
@@ -326,6 +350,10 @@ class Feed:
             if lane is not None:
                 lane.service_wake.set()
         wanted = tuple(dict.fromkeys(sessions))[:MAX_REQUEST]
+        self._board_demands.put((wanted, self.clock() + 75.0))
+        lane = getattr(self, '_board_lane', None)
+        if lane is not None:
+            lane.service_wake.set()
         self._registrations.put(wanted)
         readiness = getattr(self, '_facts_readiness', None)
         if readiness is not None:
@@ -362,6 +390,8 @@ class Feed:
             self._watch_tokens = {s: object() for s in self.interest}
             self._registrations = getattr(prev, '_registrations', self._registrations)
             self._panel_updates = getattr(prev, '_panel_updates', self._panel_updates)
+            self._board_demands = getattr(prev, '_board_demands', self._board_demands)
+            self._board_requested = dict(getattr(prev, '_board_requested', {}))
             self._panel_subscribers = dict(getattr(prev, '_panel_subscribers', {}))
             self._board_dirty = set(getattr(prev, '_board_dirty', ()))
             for name in ('_wake', '_cold', '_decide', '_board'):
@@ -908,20 +938,10 @@ class Feed:
                 with self.lock:
                     # The chats this push vouches for: held, watched, and last computed without a failure. Clients
                     # re-stamp only these (a dropped or failing chat is never confirmed by a heartbeat).
-                    fresh = sorted(s for s in self.interest if getattr(self, '_watching', True)
-                                   and s in self.bundles and s not in self.failures
-                                   and s not in self._retry and s not in self._carried
-                                   and s not in self._decision_failures
-                                   and s not in self._board_failures
-                                   and s not in self._board_dirty
-                                   and s not in self._board_capture_failures
-                                   and not self.bundles[s].get('source_stale')
-                                   and now - self.bundles[s]['bundle']['computed_at'] <= (
-                                       self.full_every_s if self.bundles[s]['bundle'].get('tasks')
-                                       else QUIET_FULL_EVERY_S))
+                    fresh = sorted(s for s in self.interest if self._bundle_fresh(s, now))
                 try:
                     self.emit({'epoch': self.epoch, 'prev': prev, 'rev': self.rev,
-                               'bundles': {s: wire_bundle(b) for s, b in changed.items()}, 'fresh': fresh,
+                               'bundles': {s: self._client_bundle(s, b, s in fresh) for s, b in changed.items()}, 'fresh': fresh,
                                **({} if changed else {'heartbeat': True})})
                     self.last_emit = now
                     if _results is not None:
@@ -1401,7 +1421,15 @@ class Feed:
 
     def status(self) -> dict:
         with self.lock:
+            now = self.clock()
+            ages = {s: round(max(0.0, now - b['bundle']['computed_at']), 3)
+                    for s, b in self.bundles.items()}
+            visible = {s for s, expires in self._panel_subscribers.values() if expires > now}
             return {'epoch': self.epoch, 'rev': self.rev, 'watched': len(self.interest), 'bundles': len(self.bundles),
+                    'oldest_bundle_age_s': max(ages.values(), default=None),
+                    'visible_chats': {s: {'age_s': ages.get(s),
+                        'computed_at': self.bundles.get(s, {}).get('bundle', {}).get('computed_at')}
+                        for s in sorted(visible)},
                     'board_visible_only': getattr(getattr(self, '_board_lane', None), 'visible_only', None),
                     'panel_subscribers': sum(expires > self.clock() for _, expires in self._panel_subscribers.values()),
                     'board_dirty': len(self._board_dirty),

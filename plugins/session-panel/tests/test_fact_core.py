@@ -88,7 +88,7 @@ def test_shared_fake_parity_and_ring_recovery():
         adapter.step()
         store.drain()
         adapter.step()
-        assert json.loads(f.changes_bytes(['S1']))['bundles']['S1'] == feedmod.wire_bundle(bundle)
+        assert json.loads(f.changes_bytes(['S1']))['bundles']['S1'] == f._client_bundle('S1', bundle, f._bundle_fresh('S1', f.clock()))
         held_epoch = f.epoch
         pos = store.position(store.snapshot(scope).epoch, store.snapshot(scope).rev)
         for n in range(8):

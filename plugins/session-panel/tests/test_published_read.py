@@ -6,14 +6,14 @@ from test_feed import feedmod, Readers
 Feed = feedmod.Feed
 
 
-def wire(out):
+def wire(f, out):
     """Feed.changes() (the in-process view) as a client receives it: server-only inputs dropped."""
-    return {**out, 'bundles': {s: feedmod.wire_bundle(b) for s, b in out['bundles'].items()}}
+    return {**out, 'bundles': {s: f._client_bundle(s, b, f._bundle_fresh(s, f.clock())) for s, b in out['bundles'].items()}}
 
 
 def test_published_read_is_byte_identical_without_compute_or_locks():
     f = Feed(Readers(), emit=lambda p: None)
-    expected = wire(f.changes(['S1', 'S2']))
+    expected = wire(f, f.changes(['S1', 'S2']))
     # Hold both locks in another thread; a read must finish before either is released.
     held, release = threading.Event(), threading.Event()
     def holder():
@@ -49,10 +49,10 @@ def test_restore_and_resume_publish_without_freshness_promotion():
     f = Feed(Readers(), emit=lambda p: None)
     f.changes(['S1'])
     restored = Feed(Readers(), emit=lambda p: None).restore(f.snapshot())
-    assert json.loads(restored.changes_bytes(['S1'])) == wire(restored.changes(['S1']))
+    assert json.loads(restored.changes_bytes(['S1'])) == wire(restored, restored.changes(['S1']))
     resumed = Feed(Readers(), emit=lambda p: None).resume(restored)
     assert json.loads(f.changes_bytes(['S1']))['bundles']
-    assert json.loads(resumed.changes_bytes(['S1'])) == wire(resumed.changes(['S1']))
+    assert json.loads(resumed.changes_bytes(['S1'])) == wire(resumed, resumed.changes(['S1']))
     assert 'S1' in resumed._carried
 
 
@@ -94,8 +94,10 @@ def test_wire_omits_server_only_inputs_but_keeps_what_clients_render():
     assert full['cards'] and 'done' in full, 'the held bundle keeps the inputs the model is reduced from'
     got = json.loads(f.changes_bytes(['S1']))['bundles']['S1']
     assert not feedmod.WIRE_OMIT & set(got), got.keys()
-    for k in ('session', 'lineage', 'tasks', 'model', 'computed_at'):
+    for k in ('session', 'lineage', 'tasks', 'computed_at'):
         assert got[k] == json.loads(json.dumps(full[k])), k
+    assert {k: v for k, v in got['model'].items() if k != 'freshness'} == json.loads(json.dumps(full['model']))
+    assert got['model']['freshness']['computed_at'] == full['computed_at']
     assert pushed and pushed[-1]['bundles'], 'computing S1 pushed it'
     for b in pushed[-1]['bundles'].values():
         assert not feedmod.WIRE_OMIT & set(b) and 'model' in b and 'tasks' in b

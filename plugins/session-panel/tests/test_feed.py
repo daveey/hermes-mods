@@ -67,6 +67,27 @@ def make(clock=None):
     return f, r, pushed, t
 
 
+def test_wire_trust_is_stale_after_restore_and_ttl_and_status_reports_ages():
+    import json
+    f, _, pushed, t = make()
+    f.changes(['S1'])
+    f._panel_subscribers['window'] = ('S1', t['now'] + 1000)
+    def wire(feed):
+        return json.loads(feed.changes_bytes(['S1']))['bundles']['S1']['model']['freshness']
+    assert wire(f) == {'trusted': True, 'computed_at': 1000, 'ttl_s': 60}
+    restored = feedmod.Feed(Readers(), emit=pushed.append, clock=lambda: t['now']).restore(f.snapshot())
+    assert wire(restored)['trusted'] is False
+    restored._publish(restored._compute_all(['S1']))
+    assert wire(restored)['trusted'] is True
+    t['now'] += 61
+    f._publish({}, heartbeat=True)
+    assert wire(f)['trusted'] is False
+    assert pushed[-1]['fresh'] == []
+    status = f.status()
+    assert status['oldest_bundle_age_s'] == 61
+    assert status['visible_chats'] == {'S1': {'age_s': 61, 'computed_at': 1000}}
+
+
 def test_a_bundle_holds_the_lineage_cards_done_and_the_whole_chain():
     f, r, _, _ = make()
     b = f.compute('S1')

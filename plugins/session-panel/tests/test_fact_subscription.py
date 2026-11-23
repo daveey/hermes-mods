@@ -70,7 +70,7 @@ def test_exact_legacy_bundle_wire_and_push(setup):
     transport.send(bundle)
     adapter.step()
     actual = json.loads(f.changes_bytes(['S1']))
-    assert actual['bundles']['S1'] == feedmod.wire_bundle(bundle)
+    assert actual['bundles']['S1'] == f._client_bundle('S1', bundle, f._bundle_fresh('S1', f.clock()))
     assert pushed[-1]['bundles'] == actual['bundles']
     assert pushed[-1]['prev'] == 0
     assert pushed[-1]['rev'] == actual['rev']
@@ -174,7 +174,7 @@ def test_warm_and_cold_reads_never_call_source_helpers(setup, monkeypatch):
                        (os, ('stat', 'open', 'listdir', 'scandir'))):
         for name in names:
             monkeypatch.setattr(obj, name, forbidden)
-    assert json.loads(f.changes_bytes(['S1']))['bundles']['S1'] == feedmod.wire_bundle(bundle)
+    assert json.loads(f.changes_bytes(['S1']))['bundles']['S1'] == f._client_bundle('S1', bundle, f._bundle_fresh('S1', f.clock()))
     assert f.status()['bundles'] == 1
     assert f.changes(['cold'])['bundles'] == {}
 

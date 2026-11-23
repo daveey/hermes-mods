@@ -122,7 +122,7 @@ def test_host_large_reset_recovers_panel_without_resubscription_loop(tmp_path, m
             adapter.step()
         assert adapter.generation == generation
         assert f.epoch == epoch
-        assert_request_no_io(f, readers, monkeypatch, feedmod.wire_bundle(large))
+        assert_request_no_io(f, readers, monkeypatch, f._client_bundle('S1', large, f._bundle_fresh('S1', f.clock())))
         with pytest.raises(ValueError, match='unauthorized_scope'):
             handle.v1.snapshot(OTHER)
         publish(pipe, large, health='stale')

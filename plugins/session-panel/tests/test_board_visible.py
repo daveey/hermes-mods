@@ -26,6 +26,45 @@ def settle(lane):
     lane.service()
 
 
+def test_requested_hidden_bundle_is_recomputed(monkeypatch):
+    f, lane, reads = setup(monkeypatch)
+    f._board_lane = lane
+    try:
+        lane._admit({'S1', 'S2'}, time.time())
+        f.changes_bytes(['S2'])
+        lane.service()
+        settle(lane)
+        assert reads == ['S2']
+        assert f._board_dirty == {'S1'}
+    finally:
+        lane.close()
+
+
+def test_visible_chat_precedes_forty_older_pending_chats(monkeypatch):
+    f, lane, reads = setup(monkeypatch, enabled=False)
+    lane.capacity = 1
+    gate = threading.Event()
+    real = f.compute
+    def compute(session, **kw):
+        assert gate.wait(2)
+        return real(session, **kw)
+    try:
+        for i in range(40):
+            sid = f'A{i:02}'
+            f.changes([sid])
+            lane.pending[sid] = i
+        f.compute = compute
+        lane.pending['S2'] = 100
+        f.changes_bytes([], subscriber='window', visible_session='S2')
+        lane.service()
+        assert list(lane.active) == ['S2']
+    finally:
+        lane.pending.clear()
+        gate.set()
+        settle(lane)
+        lane.close()
+
+
 def test_hidden_board_changes_do_zero_reads(monkeypatch):
     f, lane, reads = setup(monkeypatch)
     try:
