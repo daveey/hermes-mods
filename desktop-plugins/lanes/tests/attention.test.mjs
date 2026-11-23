@@ -2,6 +2,12 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { loadPlugin, mount, React } from './sdk-mock.mjs'
 
+const outcome = (stripe = 'stuck') => ({ status: {
+  status_version: 1, kind: 'decision', revision: 1, generation: 0,
+  identity: { gateway: 'example', profile: 'default', session_id: 'chat', owner_epoch: 'epoch' },
+  coverage: { state: 'complete', reasons: [] }, presentation: { stripe, reason_codes: [] }
+} })
+
 const P = await loadPlugin({
   SidebarSection: ({ label, count, children }) => React.createElement('section', null,
     React.createElement('h3', null, `${label} · ${count}`), children),
@@ -32,7 +38,7 @@ test('unlinked red rows share pushed snapshot, exclude linked asks and clear aft
 test('same snapshot covers linked scheduled and hidden-chat asks exactly once', () => {
   const rows = ['visible', 'scheduled', 'hidden', 'headless'].map(id => ({ id, unlinked: id === 'headless' }))
   const view = { attention: { available: true, rows }, status: { you: 4 } }
-  const sessions = [{ needs_you: [{ kind: 'card', ref: 'default/visible' }] },
+  const sessions = [{ outcome: outcome(), needs_you: [{ kind: 'card', ref: 'default/visible' }] },
     { id: 'legacy-device', kanban_blocked: 0 }]
   const missing = P.uncoveredAsks(view, sessions)
   assert.deepEqual(missing.map(row => row.id), ['scheduled', 'hidden', 'headless'])
@@ -43,12 +49,12 @@ test('same snapshot covers linked scheduled and hidden-chat asks exactly once', 
 
 test('qualified board identity never suppresses a different board ask', () => {
   const view = { attention: { available: true, rows: [{ id: 't_ask', target: { board: 'default' } }] } }
-  assert.equal(P.uncoveredAsks(view, [{ needs_you: [{ kind: 'card', ref: 'other/t_ask' }] }]).length, 1)
-  assert.equal(P.uncoveredAsks(view, [{ needs_you: [{ kind: 'card', ref: 'default/t_ask' }] }]).length, 0)
+  assert.equal(P.uncoveredAsks(view, [{ outcome: outcome(), needs_you: [{ kind: 'card', ref: 'other/t_ask' }] }]).length, 1)
+  assert.equal(P.uncoveredAsks(view, [{ outcome: outcome(), needs_you: [{ kind: 'card', ref: 'default/t_ask' }] }]).length, 0)
 })
 
 test('mounted lane filter preserves hidden-chat asks and clearing restores linked coverage without feedback', async () => {
-  const sessions = [{ id: 'chat', needs_you: [{ kind: 'card', ref: 'default/t_ask' }] }]
+  const sessions = [{ id: 'chat', outcome: outcome(), needs_you: [{ kind: 'card', ref: 'default/t_ask' }] }]
   const Q = await loadPlugin({ SESSION_FILTER_AREA: 'sessions.filter', useSidebarSessions: () => sessions,
     SidebarSection: ({ children }) => React.createElement('section', null, children),
     SidebarSectionRow: ({ label }) => React.createElement('span', { 'data-ask': '1' }, label) })
@@ -96,6 +102,69 @@ test('mounted lane filter preserves hidden-chat asks and clearing restores linke
     await strip.close()
     assert.equal(fallback(), 0, 'unmount clears only the lanes visibility filter')
   } finally { if (strip.container.isConnected) await strip.close(); await pane.close(); localStorage.clear() }
+})
+
+test('non-red canonical rows cannot suppress asks even with populated needs_you', () => {
+  const row = { id: 'ask', target: { board: 'default' } }
+  const view = { attention: { available: true, rows: [row] } }
+  const session = { needs_you: [{ kind: 'card', ref: 'default/ask' }] }
+  for (const stripe of ['waiting', 'none', 'attention', 'blocked', 'done', 'running', 'offline']) {
+    assert.deepEqual(P.uncoveredAsks(view, [{ ...session, outcome: outcome(stripe) }]), [row], stripe)
+  }
+  for (const extra of [{ offline_cached: true }, { archived: true }, { outcome: undefined },
+    { outcome: { status: { presentation: { stripe: 'stuck' } } } }]) {
+    assert.deepEqual(P.uncoveredAsks(view, [{ ...session, outcome: outcome(), ...extra }]), [row])
+  }
+  assert.deepEqual(P.uncoveredAsks(view, [{ ...session, outcome: outcome() }, { ...session, outcome: outcome() }]), [])
+  assert.deepEqual(P.uncoveredAsks(view, [{ ...session, outcome: outcome() }], () => false), [row])
+  assert.deepEqual(P.uncoveredAsks({ attention: { available: false, rows: [row] } }, [session]), [])
+})
+
+test('malformed red envelopes remain uncovered just like unknown canonical sidebar status', () => {
+  const view = { attention: { available: true, rows: [{ id: 'ask' }] } }
+  const invalid = [
+    { status_version: 2 }, { kind: 'future' }, { revision: -1 }, { generation: 0.5 },
+    { identity: { gateway: 'example' } }, { coverage: { state: 'bad', reasons: [] } },
+    { coverage: { state: 'complete', reasons: [1] } },
+    { presentation: { stripe: 'stuck', reason_codes: [1] } }
+  ]
+  for (const patch of invalid) {
+    const session = { outcome: { status: { ...outcome().status, ...patch } },
+      needs_you: [{ kind: 'card', ref: 'default/ask' }] }
+    assert.equal(P.uncoveredAsks(view, [session]).length, 1, JSON.stringify(patch))
+  }
+})
+
+test('mounted canonical presentation contract keeps four grey-linked asks red in fallback', async t => {
+  if (!process.env.HERMES_CORE_SOURCE) return t.skip('set HERMES_CORE_SOURCE for actual canonical selector')
+  const { pathToFileURL } = await import('node:url')
+  const { canonicalOutcomeStatus } = await import(pathToFileURL(
+    `${process.env.HERMES_CORE_SOURCE}/apps/desktop/src/lib/session-outcome.ts`).href)
+  const rows = Array.from({ length: 4 }, (_, i) => ({ id: `ask${i}`, key: `default/ask${i}`, title: `Ask ${i}` }))
+  const sessions = [{ id: 'chat', outcome: outcome('waiting'), needs_you: rows.map(row => ({ kind: 'card', ref: `default/${row.id}` })) }]
+  const Q = await loadPlugin({ useSidebarSessions: () => sessions,
+    SidebarSection: ({ children }) => React.createElement('section', null, children),
+    SidebarSectionRow: ({ label }) => React.createElement('span', { 'data-ask': '1' }, label) })
+  const ctx = {}
+  const snap = { status: { you: 4 }, attention: { available: true, rows } }
+  const store = Q.attentionStore(ctx)
+  Q.sourceFor(ctx).subscribe = () => Object.assign(() => {}, { update() {}, refresh() {} })
+  store.publish(snap)
+  const pane = await mount(React.createElement(Q.UnlinkedAsks, { ctx }))
+  try {
+    for (const [stripe, extra] of [['waiting', {}], ['none', {}], ['attention', {}],
+      ['blocked', {}], ['stuck', { offline_cached: true }], ['stuck', { archived: true }],
+      ['stuck', {}], ['waiting', {}]]) {
+      sessions[0] = { ...sessions[0], offline_cached: false, archived: false, outcome: outcome(stripe), ...extra }
+      await React.act(async () => store.publish({ ...snap }))
+      const session = sessions[0]
+      const paintedRed = !session.offline_cached && !session.archived && canonicalOutcomeStatus(session.outcome).stripe === 'stuck'
+      const fallback = pane.container.querySelectorAll('[data-ask]').length
+      assert.equal(fallback, paintedRed ? 0 : 4, `${stripe} ${JSON.stringify(extra)}`)
+      assert.equal((paintedRed ? new Set(session.needs_you.map(ask => ask.ref)).size : 0) + fallback, snap.status.you)
+      assert.equal(Q.hasRedAskCoverage(session), paintedRed, 'coverage agrees with actual core canonical selector')
+    }
+  } finally { await pane.close() }
 })
 
 test('sidebar owns the shared subscription without a strip; joining never starts a second reader', async () => {
