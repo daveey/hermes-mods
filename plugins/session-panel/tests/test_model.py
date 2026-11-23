@@ -147,6 +147,32 @@ def test_shared_triage_group_preserves_canonical_human_request_authority():
     assert all(row.get('wait_kind') != 'agent' for row in m['sections']['waiting'])
 
 
+def shared_human_bundle(state):
+    parent = task(status='triage', title='Decide the next stage', human_request=human(),
+                  wait={'wait_state': 'human'})
+    r = request(state)
+    if state == 'answered':
+        r['resolution'] = {'operationId': 'answer-op', 'choiceId': 'card-0', 'revision': 3}
+    return bundle(task('t_111111', status='todo', upstream=parent),
+                  task('t_222222', status='todo', upstream=parent), requests=[r],
+                  cards={parent['id']: {'detail': {'task': parent}}})
+
+
+def test_shared_human_group_respects_canonical_request_retirement():
+    for state in ('dismissed', 'answered', 'withdrawn', 'open'):
+        m = model.reduce_panel(shared_human_bundle(state), now=NOW)
+        group = m['groups'][0]
+        if state == 'open':
+            assert group['section'] == 'needs_you'
+            assert len(m['sections']['needs_you']) == 1
+        else:
+            assert not m['sections']['needs_you']
+            assert group['section'] == 'waiting'
+            assert group['wait_kind'] == 'agent'
+            assert f'request {state}' in group['detail']
+            assert "waiting on this chat's agent" in group['detail']
+
+
 def test_held_stale_source_remains_unknown_not_claimed_agent_custody():
     b = held_bundle(remote=True, stale=True)
     row = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]

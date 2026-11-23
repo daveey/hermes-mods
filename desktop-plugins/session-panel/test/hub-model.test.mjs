@@ -59,6 +59,29 @@ for (const name of ['agent_held_local', 'agent_held_replica', 'agent_held_spend'
   }
  })
 }
+for (const state of ['dismissed', 'answered', 'withdrawn', 'open']) {
+ test(`shared human group canonical ${state} controls red attention`, async () => {
+  const { model, now } = cases['shared_human_' + state]
+  const before = JSON.stringify(model)
+  await paint(m.renderModel(model, { now }))
+  assert.equal(document.querySelectorAll('[data-panel-row]').length, Object.values(model.sections).flat().length + model.groups.length)
+  assert.equal(JSON.stringify(model), before)
+  const group = model.groups[0]
+  const node = [...document.querySelectorAll('[data-panel-row]')].find(n => n.dataset.panelRow === group.key)
+  assert.ok(node)
+  const pip = node.querySelector('[data-row-pip]')
+  const style = window.getComputedStyle(pip)
+  assert.equal(state === 'open' ? style.backgroundColor : style.borderTopColor, state === 'open' ? 'rgb(248, 81, 73)' : 'rgb(59, 130, 246)')
+  if (state !== 'open') {
+   assert.equal(document.querySelectorAll('[data-choice-id], [data-choice-letter]').length, 0)
+   assert.ok(node.textContent.includes(`request ${state}`))
+   assert.ok(node.textContent.includes("waiting on this chat's agent"))
+  } else {
+   assert.ok(document.querySelectorAll('[data-choice-letter]').length > 0)
+   assert.ok(node.textContent.includes('waiting on you to answer the current request'))
+  }
+ })
+}
 const partialCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./partial-projection-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
 for (const kind of ['ci', 'deploy', 'clock']) {
  test(`held canonical ${kind} stays producer light-blue`, async () => {
@@ -318,7 +341,7 @@ for (const [name, fixture] of Object.entries(publicCases).filter(([name]) => nam
  })
 }
 
-for (const [name, fixture] of Object.entries(cases).filter(([name]) => !name.startsWith('retiring_') && !name.startsWith('tree_'))) {
+for (const [name, fixture] of Object.entries(cases).filter(([name]) => !name.startsWith('retiring_') && !name.startsWith('tree_') && !name.startsWith('shared_human_'))) {
  test(`hub model golden: ${name}`, async () => {
   const model = fixture.model || fixture.expected
   assert.ok(model, 'golden contains the P1 output model')
