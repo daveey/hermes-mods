@@ -83,6 +83,10 @@ def test_board_full_and_catchup_share_real_materialization_with_no_projection_io
         reads['details'] += 1
         return original(*args, **kwargs)
     monkeypatch.setattr(r, '_detail', detail)
+    # Receipt time is the projector's computation clock; strict compute uses
+    # the Feed clock. Pin both, rather than ageing a current real receipt by
+    # months on public cores whose execution annotations expose that gap.
+    monkeypatch.setattr(cap.time, 'time_ns', lambda: 1800000000_000000000)
     part, _ = acquire(acquisition)
     assert reads['details'] == part.metrics['details_materialized'] == 1
     f = feedmod.Feed(r, emit=lambda _: None, clock=lambda: 1800000000.)
