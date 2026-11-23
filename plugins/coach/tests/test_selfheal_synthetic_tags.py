@@ -123,6 +123,8 @@ def test_machine_signal_quote_is_not_withdrawn():
 NOTICE_LIT = re.compile(r"""(?<![\w\\])[fF]?["']\[([a-z][a-z0-9]+(?:-[a-z0-9]{2,})*)(?=[\] :,])""")
 # Bracket literals in plugin source that are not user-role notices (log prefixes, placeholders, markers).
 NOT_NOTICES = {
+    "object": "user-steps/parser/scanner.mjs: vendored JavaScript Object.prototype string tags, not user-role notices",
+    "counter-increment": "user-steps/parser/scanner.mjs: vendored CSS property token, not a user-role notice",
     "pid": "coach/signals.py: crash-log line prefix, never a user turn",
     "bot": "ship-only-guard/guard.py: GitHub login suffix (\"name[bot]\") in a reviewer-author check, never a user turn",
     "older": "coach/reply_check.py: '[older tool calls omitted]' placeholder inside a tool log",
