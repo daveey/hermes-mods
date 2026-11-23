@@ -3233,6 +3233,32 @@ class ActionStore:
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
+    def attach_to_turn(self, owner, inbox):
+        """Deliver refused chat decisions through this exact owner's already-starting turn.
+
+        Exclusive custody conflicts with both ordinary dispatchers' shared leases
+        and terminal reconcilers. Re-read after acquiring it: a concurrent admission
+        may have settled the candidate meanwhile. Never substitute for card delivery
+        or recover an unrelated/uncertain transport error.
+        """
+        results = []
+        for candidate in self.undelivered(owner['gatewayId'], owner['profile']):
+            if candidate['owner'] != owner:
+                continue
+            oid = candidate['operationId']
+            with self.delivery_lease(owner, oid) as held:
+                if not held:
+                    continue
+                op = self.operation(owner, oid)['operation']
+                if (op['dispatchState'] not in ('failed', 'pending')
+                        or op.get('error') not in (BUSY_ERROR, OWNER_WAIT_ERROR)
+                        or any(ref['type'] == 'kanban' for ref in op['intent']['request']['aliases'])):
+                    continue
+                # No external admission: the durable inbox is the receiver for
+                # this turn. Reuse dispatch's readback and request-state settlement.
+                results.append(self._dispatch(owner, oid, inbox))
+        return results
+
     def dispatch(self, owner, oid, receiver, *, early_tool_call_id=None, early_binding=None):
         # Generic idempotent receivers permit concurrent retries. Card mirrors
         # serialize terminal refusal settlement as well as receipt I/O, so a

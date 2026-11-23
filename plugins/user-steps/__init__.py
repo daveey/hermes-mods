@@ -2,8 +2,9 @@
 
 The action_request tool publishes explicit versioned scope. transform_llm_output
 only proposes incomplete requests; it cannot authorize work or resolve decisions.
-pre_llm_call projects confirmed decision receipts into a normal turn. It never
-acknowledges pending delivery or starts a concurrent agent turn.
+pre_llm_call projects confirmed decision receipts into a normal turn, attaching
+busy/closed-owner chat decisions under the delivery lease. It never starts a
+concurrent agent turn or acknowledges pending card work.
 Legacy rolling cards are not automatically created, unblocked or archived.
 Skipped: Kanban workers, subagents, cron/webhook. Off switch: HERMES_USER_STEPS_OFF=1.
 """
@@ -403,11 +404,13 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
             core.reconcile_moot(st, lg, own)
         except Exception:
             log.exception("user-steps moot reconciliation failed")
-        # A passive inbox is NOT a delivery receiver. Never acknowledge pending
-        # card/run work from this hook, nor wake a second writer inside a live turn.
-        # The owner API retries the persisted operation using the same key.
+        # Busy/closed-owner decisions can ride this owner's turn, without a
+        # second writer or a card transition. The delivery lease excludes an
+        # in-flight admission; ordinary pending/uncertain operations stay pending.
+        inbox = cards_mod.TurnContextInbox()
+        st.attach_to_turn(own, inbox)
         requests = st.requests(own)
-        receipts = cards_mod.DecisionInbox().context(own, requests)
+        receipts = inbox.context(own, requests)
         pending = [{k: v for k, v in r.items() if k != 'resolution'}
                    for r in requests if r['state'] in ('open', 'needs_context') and not r.get('resolution')]
         import json

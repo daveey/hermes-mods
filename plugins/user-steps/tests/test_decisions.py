@@ -300,6 +300,145 @@ def test_registered_producer_revise_and_consumer_hook(tmp_path, monkeypatch):
     assert 'error' in json.loads(plugin.publish_action_request({'request':dict(payload, owner=OWNER)}, session_id='session-a'))
 
 
+@pytest.fixture
+def turn_delivery(tmp_path, monkeypatch):
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
+    monkeypatch.delenv('HERMES_USER_STEPS_OFF', raising=False)
+    plugin = load_module('turn_delivery_plugin', ROOT / '__init__.py')
+    monkeypatch.setattr(plugin.core, 'home', lambda: tmp_path)
+    monkeypatch.setattr(plugin.core, 'server_owner', lambda sid: dict(OWNER, storedSessionId=sid))
+    monkeypatch.setattr(plugin.chat, 'reconcile', lambda *a: None)
+    plugin._BACKFILLED = True
+    return plugin, plugin.core.ActionStore()
+
+
+@pytest.mark.parametrize('refusal', ['exact session is busy or has pending input',
+                                   'exact session has no unique live owner'])
+def test_next_owner_turn_delivers_refused_decision(turn_delivery, refusal):
+    plugin, s = turn_delivery
+    r = s.create(OWNER, request())
+    op = s.decide(OWNER, decision(r))['operation']
+    class Refusing:
+        def deliver(self, operation): raise RuntimeError(refusal)
+    s.dispatch(OWNER, op['operationId'], Refusing())
+    note = (plugin.pre_llm_call(session_id='session-a', platform='desktop') or {}).get('context', '')
+    assert note.count(op['operationId']) == 1
+    done = s.operation(OWNER, op['operationId'])
+    assert done['operation']['dispatchState'] == 'delivered'
+    assert done['operation']['receipt']['destination'] == 'turn_context'
+    assert done['request']['state'] == 'resolved'
+    assert not [r for r in s.requests(OWNER) if r['state'] in ('open', 'needs_context')]
+
+
+@pytest.mark.parametrize('field', ['storedSessionId', 'profile', 'gatewayId'])
+def test_other_owner_turn_cannot_take_refused_decision(turn_delivery, monkeypatch, field):
+    plugin, s = turn_delivery
+    r = s.create(OWNER, request())
+    op = s.decide(OWNER, decision(r))['operation']
+    s.dispatch(OWNER, op['operationId'], BusyReceiver())
+    monkeypatch.setattr(plugin.core, 'server_owner', lambda sid: dict(OWNER, **{field: 'other'}))
+    note = (plugin.pre_llm_call(session_id='other', platform='desktop') or {}).get('context', '')
+    assert op['operationId'] not in note
+    assert s.operation(OWNER, op['operationId'])['operation']['dispatchState'] == 'failed'
+
+
+@pytest.mark.parametrize('kind', ['kanban', 'fresh', 'transport'])
+def test_turn_does_not_acknowledge_other_pending_work(turn_delivery, kind):
+    plugin, s = turn_delivery
+    aliases = [dict(gatewayId=OWNER['gatewayId'], profile=OWNER['profile'], type='kanban',
+                    board='example', id='card')] if kind == 'kanban' else []
+    r = s.create(OWNER, request(aliases=aliases))
+    op = s.decide(OWNER, decision(r))['operation']
+    if kind == 'kanban':
+        s.dispatch(OWNER, op['operationId'], BusyReceiver())
+    elif kind == 'transport':
+        s.dispatch(OWNER, op['operationId'], None)
+    before = s.operation(OWNER, op['operationId'])
+    note = (plugin.pre_llm_call(session_id='session-a', platform='desktop') or {}).get('context', '')
+    assert op['operationId'] not in note
+    assert s.operation(OWNER, op['operationId']) == before
+
+
+def test_turn_and_dispatch_share_delivery_lease_and_replay_once(turn_delivery, monkeypatch):
+    plugin, s = turn_delivery
+    r = s.create(OWNER, request())
+    oid = s.decide(OWNER, decision(r))['operation']['operationId']
+    s.dispatch(OWNER, oid, BusyReceiver())
+    # An admission already in flight excludes context attachment, even when
+    # persisted state still carries the previous refusal.
+    with s.delivery_lease(OWNER, oid, dispatch=True) as held:
+        assert held
+        assert plugin.pre_llm_call(session_id='session-a', platform='desktop') is None
+        assert s.operation(OWNER, oid)['operation']['dispatchState'] == 'failed'
+    original = plugin.cards_mod.TurnContextInbox.deliver
+    calls = []
+    def record_and_race(inbox, operation):
+        calls.append(operation['operationId'])
+        receiver = BusyReceiver(); receiver.busy = False
+        # Separate ActionStore/descriptor while the turn owns the exclusive lease.
+        other = plugin.core.ActionStore(s.path)
+        before_race = other.operation(OWNER, oid)
+        assert other.dispatch(OWNER, oid, receiver) == before_race
+        assert receiver.delivered == []
+        return original(inbox, operation)
+    monkeypatch.setattr(plugin.cards_mod.TurnContextInbox, 'deliver', record_and_race)
+    assert plugin.pre_llm_call(session_id='session-a', platform='desktop')['context'].count(oid) == 1
+    before = s.operation(OWNER, oid)
+    # Existing canonical receipt remains visible, but is neither re-delivered
+    # nor duplicated. Ordinary dispatch also becomes a no-op on this identity.
+    assert plugin.pre_llm_call(session_id='session-a', platform='desktop')['context'].count(oid) == 1
+    assert s.dispatch(OWNER, oid, BusyReceiver()) == before
+    assert calls == [oid]
+    with plugin.cards_mod.DecisionInbox()._connect() as c:
+        assert c.execute('SELECT COUNT(*) FROM deliveries WHERE id=?', (oid,)).fetchone()[0] == 1
+
+
+def test_pending_after_interrupted_refused_retry_joins_next_turn(turn_delivery):
+    plugin, s = turn_delivery
+    r = s.create(OWNER, request())
+    oid = s.decide(OWNER, decision(r))['operation']['operationId']
+    s.dispatch(OWNER, oid, BusyReceiver())
+    class Interrupted:
+        def deliver(self, op): raise SystemExit('process exited before admission')
+    with pytest.raises(SystemExit): s.dispatch(OWNER, oid, Interrupted())
+    assert s.operation(OWNER, oid)['operation']['dispatchState'] == 'pending'
+    assert plugin.pre_llm_call(session_id='session-a', platform='desktop')['context'].count(oid) == 1
+    assert s.operation(OWNER, oid)['operation']['dispatchState'] == 'delivered'
+
+
+@pytest.mark.parametrize('choice,state,text', [('revise', 'superseded', 'Change the plan'),
+                                             ('decline', 'cancelled', None)])
+def test_turn_attachment_preserves_non_authorizing_state(turn_delivery, choice, state, text):
+    plugin, s = turn_delivery
+    r = s.create(OWNER, request())
+    oid = s.decide(OWNER, decision(r, choice=choice, text=text))['operation']['operationId']
+    s.dispatch(OWNER, oid, BusyReceiver())
+    assert oid in plugin.pre_llm_call(session_id='session-a', platform='desktop')['context']
+    done = s.operation(OWNER, oid)
+    assert done['request']['state'] == state
+    assert done['operation']['intent']['executionAuthorized'] is False
+
+
+def test_alternating_busy_closed_chat_delivers_all_on_next_turn(turn_delivery):
+    plugin, s = turn_delivery
+    panel = load_module('turn_panel_model', ROOT.parent / 'session-panel' / 'model.py')
+    ids = []
+    class Closed:
+        def deliver(self, operation): raise RuntimeError('exact session has no unique live owner')
+    for i in range(3):
+        r = s.create(OWNER, request())
+        oid = s.decide(OWNER, decision(r, key=str(i)))['operation']['operationId']
+        ids.append(oid)
+        for receiver in [BusyReceiver(), Closed()] * 3:
+            s.dispatch(OWNER, oid, receiver)
+        assert panel.recorded(s.get(OWNER, r['requestId']))
+    note = plugin.pre_llm_call(session_id='session-a', platform='desktop')['context']
+    assert all(note.count(oid) == 1 for oid in ids)
+    assert all(s.operation(OWNER, oid)['operation']['dispatchState'] == 'delivered' for oid in ids)
+    assert not any(panel.recorded(r) for r in s.requests(OWNER))
+
+
 class BusyReceiver:
     """Models the owning runtime refusing admission while the session is mid-turn."""
     def __init__(self): self.busy = True; self.delivered = []
