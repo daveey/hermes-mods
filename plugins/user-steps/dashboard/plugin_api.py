@@ -308,15 +308,20 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         with recovery_lock:
             if key in recovered:
                 return
-            recover()
-            recovered.add(key)
+            # Register one coalescing outbox worker for this served profile.
+            # Recovery may contact an executor: it must never run on the HTTP
+            # admission path, even on a cold hot-mount.
             start_retrier(key)
+            recovered.add(key)
 
     @asynccontextmanager
     async def lifespan(app):
         # Never resume a cold owner or start a competing writer on restart.
         await run_in_threadpool(recover_once)
-        yield
+        try:
+            yield
+        finally:
+            await run_in_threadpool(stop_delivery)
 
     async def ensure_recovered():
         # A sync dependency would queue before the isolated endpoint can start.
@@ -412,22 +417,44 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
                 continue
         return done
 
-    retriers = set()
+    # Bounded by served profiles, not clicks or operations. Hints are a single
+    # coalescing bit; the FULL-sync ActionStore, never this memory, owns custody.
+    retriers = {}
 
     def start_retrier(key):
-        if RETRY_INTERVAL_S <= 0 or key in retriers: return
-        retriers.add(key)
-        ctx = contextvars.copy_context()  # keep the request's profile scope for owner/store resolution
+        if key in retriers:
+            return
+        wake, stopped = threading.Event(), threading.Event()
+        ctx = contextvars.copy_context()  # retain the authenticated profile scope
 
         def loop():
-            while True:
-                time.sleep(RETRY_INTERVAL_S)
-                try: ctx.run(retry_pending)
+            ctx.run(recover)
+            while not stopped.is_set():
+                wake.wait(RETRY_INTERVAL_S if RETRY_INTERVAL_S > 0 else None)
+                wake.clear()  # clear BEFORE scanning: a concurrent commit stays signalled
+                if stopped.is_set():
+                    return
+                try:
+                    ctx.run(retry_pending)
                 except Exception:
                     logging.getLogger('user-steps').warning('Decision delivery retry pass failed')
-        threading.Thread(target=loop, name='user-steps-retrier', daemon=True).start()
+        worker = threading.Thread(target=loop, name='user-steps-retrier', daemon=True)
+        retriers[key] = (wake, stopped, worker)
+        worker.start()
+
+    def hint_delivery():
+        key = str(_load('core').home().resolve())
+        retriers[key][0].set()
+
+    def stop_delivery():
+        for wake, stopped, worker in list(retriers.values()):
+            stopped.set()
+            wake.set()
+        for wake, stopped, worker in list(retriers.values()):
+            worker.join(timeout=5)
 
     router.retry_pending = retry_pending
+    router.stop_delivery = stop_delivery
 
     def retire_moot(st, own):
         # The queue is never staler than the board: settle-linked asks are withdrawn before listing.
@@ -489,12 +516,14 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
                         if payload['choiceId'] == 'answer-text' and producer.binding(own, request_id)
                         else st.decide(own, payload))  # durable commit BEFORE receiver effects
             committed = time.monotonic()
-            result = st.dispatch(own, recorded['operation']['operationId'], delivery())
+            # A committed operation is the receipt. Executor delivery is durable
+            # outbox work and may take seconds; a lost hint is recovered by scans.
+            hint_delivery()
             logging.getLogger('user-steps').info(
                 'Decision timing operation=%s queue_ms=%.1f record_ms=%.1f dispatch_ms=%.1f',
                 recorded['operation']['operationId'], (started-received)*1000,
                 (committed-started)*1000, (time.monotonic()-committed)*1000)
-            return result
+            return recorded
         return await _on_decision(run, action)
 
     @router.post('/client-timing')
