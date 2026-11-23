@@ -1122,7 +1122,7 @@ def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
         if at is None or src.now - at < PRODUCER_QUIET_S:
             return None
         live = {'state': producer, 'last_event_at': at, 'happened': False}
-    elif kind in ('ci', 'external'):
+    elif kind in ('ci', 'deploy', 'external'):
         live = src.producer_state(kind, ref)
     if not live.get('happened') and waited < threshold:
         return None
