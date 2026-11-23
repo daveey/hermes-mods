@@ -20,12 +20,8 @@ metadata:
 
 # Broken sessions: the catalog
 
-A chat is "broken" when one of its Kanban cards (or a card on its dependency chain) sits in a state nothing will
-move it out of: a ready card no worker takes although one is free, a wake that never fired, a block nobody can act
-on, a run whose worker is gone. The Desktop session panel shows these as odd waits; the user then fixes them by
-hand. This skill is the catalog of those patterns. Each has a stable id (`BS-...`), and the `session-repair`
-plugin (`plugins/session-repair` in hermes-mods) implements each id as a rule with the same detection: its
-scanner runs every 15 min on the hub and hands new findings to the chat titled **Session repair**.
+A broken chat has work no active producer can resolve. `plugins/session-repair` in hermes-mods scans these
+`BS-...` patterns every 15 min on the hub and sends findings to **Session repair**.
 
 Use it two ways:
 - **Diagnose one chat** the user points at: run the scanner (below), read the finding's evidence, apply the
@@ -65,7 +61,8 @@ any day, or a card the turns reported creating for that fingerprint, directly or
 `fix.open_fix_card`: comment there, never file a second card.
 
 Rules for every fix:
-- Re-read the card first (`kanban_show <id>`); findings can be 15 minutes old. Moved on = do nothing.
+- Re-read the card and nominated producer (`kanban_show <id>`); archived producers cannot deliver. Moved on = do nothing.
+- For primary/local-board custody refusals, follow [board-custody diagnosis](references/board-custody-diagnosis.md) before delegating.
 - Use the Kanban tools/CLI only. Never edit a database, delete or archive a card, or kill/reclaim a live worker.
 - A safe fix that did not take becomes a fix card, and counts against the card cap.
 - A finding with `fix.open_fix_card`: ONE comment on that card (outcome `commented`), never a second card.
