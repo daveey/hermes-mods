@@ -385,8 +385,7 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
         return None
     try:
         _TURN_PUBLISHED.pop(session_id, None)  # a new turn: earlier turns' publications are no provenance
-        with _ledger().edit(_ledger().root(session_id)) as data:
-            data['publication_turn'] = __import__('uuid').uuid4().hex
+        core.begin_publication_turn(_ledger(), session_id)
         _USER_MSG[session_id] = _turn_message(user_message, conversation_history)
         own = core.server_owner(session_id)
         st = core.ActionStore(timeout=HOOK_DB_TIMEOUT)

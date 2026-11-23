@@ -25,9 +25,13 @@ and delivers a Go user turn with canonical scope/receipt metadata. A standalone
 ask, a promised future plan, or a fenced example still grants no permission.
 Session-outcome confirmations with Go / Change plan choices use the same backstop
 when their exact question is restated after the plan in the final reply. Existing
-producer revisions and recorded decisions are not rewritten.
+producer revisions and recorded decisions are not rewritten. Both recovery paths
+also require process-local custody of a successfully written and read-back current
+turn marker. A missing, stale or unreadable marker, failed write, or process restart
+revokes recovery for that turn; restoring old disk bytes does not restore custody.
+A new successfully initialized turn is required. Explicit `action_request` is unchanged.
 
-Tests: `tests/test_confirm_plan.py` and
+Tests: `tests/test_confirm_plan.py`, `tests/test_review_turn_failure.py` and
 `desktop-plugins/user-steps/test/decision-queue.test.mjs`.
 
 ## Implementation status

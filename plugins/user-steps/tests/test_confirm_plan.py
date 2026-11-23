@@ -28,8 +28,7 @@ def directive(step=None):
 def publish(tmp_path, reply, *, kind='approve', source=None, span=ASK, structured=False, use_model=True):
     ledger = core.Ledger(tmp_path / 'ledger', db=tmp_path / 'missing.db')
     store = core.ActionStore(tmp_path / 'actions.sqlite3')
-    with ledger.edit(ledger.root(OWNER['storedSessionId'])) as data:
-        data['publication_turn'] = 'test-turn'
+    core.begin_publication_turn(ledger, OWNER['storedSessionId'])
     attrs = ''
     if source:
         step = core.add_step(OWNER['storedSessionId'], span, ['Go', 'Change plan'], ledger=ledger)
@@ -111,8 +110,7 @@ def test_ambiguous_example_or_oversize_context_never_authorizes(reply, span):
 def test_final_reply_does_not_replace_producer_revision_or_decision(tmp_path, state, desktop_sources):
     ledger = core.Ledger(tmp_path / 'ledger', db=tmp_path / 'missing.db')
     store = core.ActionStore(tmp_path / 'actions.sqlite3')
-    with ledger.edit(ledger.root(OWNER['storedSessionId'])) as data:
-        data['publication_turn'] = 'test-turn'
+    core.begin_publication_turn(ledger, OWNER['storedSessionId'])
     step = core.add_step(OWNER['storedSessionId'], ASK, ['Go', 'Change plan'], ledger=ledger)
     request = store.migrate_step(OWNER, step)
     if state == 'revised':
@@ -128,8 +126,7 @@ def test_final_reply_does_not_replace_producer_revision_or_decision(tmp_path, st
 def test_repeated_final_transform_does_not_duplicate_confirmation(tmp_path, desktop_sources):
     ledger = core.Ledger(tmp_path / 'ledger', db=tmp_path / 'missing.db')
     store = core.ActionStore(tmp_path / 'actions.sqlite3')
-    with ledger.edit(ledger.root(OWNER['storedSessionId'])) as data:
-        data['publication_turn'] = 'test-turn'
+    core.begin_publication_turn(ledger, OWNER['storedSessionId'])
     step = core.add_step(OWNER['storedSessionId'], ASK, ['Go', 'Change plan'], ledger=ledger)
     llm = lambda *_: json.dumps({'steps': [{'text': ASK, 'kind': 'approve', 'verbatim_span': ASK}], 'resolved': []})
     for _ in range(2):
