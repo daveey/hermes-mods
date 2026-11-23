@@ -266,6 +266,8 @@ class CoreReaders:
         Strict reads are essential here: stale-while-revalidate may return the old
         value and consume the only notification for a committed receipt.
         """
+        if not held:
+            return {}  # hidden panels do not admit a global ledger projection
         from hermes_cli import kanban_session_activity as ksa, kanban_db_sync as sync
         from hermes_cli import kanban_chat_links as links
         cards, history = ksa.remote_links_and_origin_rows(stale_ok=False)

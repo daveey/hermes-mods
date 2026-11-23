@@ -30,8 +30,31 @@ def capture(directory):
     return {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
 
 
+# Content is immutable only while its complete filesystem identity is unchanged.
+# Keep digests, never a cached True: another manifest must still compare its hash.
+_digests = {}
+
+
 def matches(manifest):
+    import os
+    cached = os.environ.get('HERMES_LANES_IDENTITY_STAT_CACHE', '1').lower() not in ('0', 'false', 'off', 'no')
     try:
-        return all(hashlib.sha256(Path(p).read_bytes()).hexdigest() == h for p, h in manifest.items())
+        for name, expected in manifest.items():
+            path = Path(name)
+            stat = path.stat()
+            token = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            hit = _digests.get(name) if cached else None
+            if hit is None or hit[0] != token:
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                after = path.stat()
+                if token != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                    return False  # a deployment raced the hash; never certify mixed bytes
+                if cached:
+                    _digests[name] = (token, digest)
+            else:
+                digest = hit[1]
+            if digest != expected:
+                return False
+        return True
     except OSError:
         return False

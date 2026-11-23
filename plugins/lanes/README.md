@@ -13,6 +13,16 @@ this plugin adds presentation projections, not scheduling behaviour.
 | `GET /api/plugins/lanes/v1/held?lane=x` | Cards at the lane gate |
 | `POST /api/plugins/lanes/v1/held/<card>/admit` | Release one: `{reason: "..."}` |
 
+## Reversible load mitigation
+
+`HERMES_LANES_CHANGE_ONLY` defaults on: native file notifications admit source
+reads, semantic board revisions (not WAL stamps or heartbeat events) admit
+projection, and starts remain at least three seconds apart with a trailing run.
+Set it to `0` to restore timer cursor reads and the one-second projection floor.
+`HERMES_LANES_IDENTITY_STAT_CACHE` defaults on: unchanged dev/inode/size/mtime/ctime
+reuse a content digest, while changed/missing/racing files still fail identity.
+Set it to `0` to rehash every checked file on each identity check.
+
 ## Render-only rule
 
 **All counts and grouping live on the hub.** `lane_view(hours, window, expanded)`
@@ -32,11 +42,12 @@ slider does not invent a client-side forecast.
 ## Push and compatibility
 
 The stream uses core's canonical WebSocket authorization (ticket/token/internal
-identity), failing closed with 1008. It watches the local and fleet-replica
-`task_events` cursor and policy/planner-note mtimes every 0.25 seconds. After quiet, the
-first tick that sees a change projects it at once (no trailing debounce). Changes during
-or just after a projection coalesce into one follow-up after a minimum 1 second idle
-gap from the previous projection's end; new changes do not reset that deadline. Counts
+identity), failing closed with 1008. Native notifications admit source reads; idle
+0.25-second stream wakes do not query boards. Semantic activity revisions exclude
+heartbeat and claim clocks, so WAL write stamps alone never request projection.
+Older/non-Linux cores use filesystem metadata admission instead. Changes during
+or just after a projection keep one trailing run after a minimum 3-second
+start-to-start gap; new events do not reset that deadline. Counts
 are computed on the hub by core, using request-local evidence shared by the strip and
 expanded flow; no cross-request card history memo is retained. Legacy read caches are
 invalidated once per revision, and a frame is sent only when the view/parameter hash
