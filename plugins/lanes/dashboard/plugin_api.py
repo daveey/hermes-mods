@@ -10,7 +10,9 @@ GET /api/plugins/lanes/v1/held?lane=x: cards waiting at a lane gate. POST /api/p
 Without lanes: ``GET /v1/lanes`` answers ``{"configured": false, "reason": ...}`` on a core without lanes support or
 with no lanes configured, so the panel can say why it is empty; every other route answers 409 in both cases.
 Reads are cached for 10 s per window; a write starts a new cache generation, so a read that began before it
-cannot be stored after it. `blocked_on_you` is whatever core's snapshot reports (human-request parks); older
+cannot be stored after it. REST views retain the last completed exact-parameter snapshot across revisions
+and expiry, return its age as ``stale_seconds``, and refresh single-flight in the background. A never-seen
+parameter key waits for its own initial snapshot. `blocked_on_you` is whatever core's snapshot reports (human-request parks); older
 cores omit it and the Desktop strip treats a missing count as 0.
 """
 from __future__ import annotations
@@ -362,17 +364,27 @@ def admit(card: str, reason: str) -> Dict[str, Any]:
     return {"admitted": done}
 
 
+def rest_view(hours, window, expanded):
+    """REST delivery retains last completed exact-parameter view across revisions."""
+    _validate_view(hours, window, expanded)
+    with _lock:
+        generation = _generation
+    return _shared_views().get_stale(
+        (hours, window, expanded), (generation, _observation_cursor()),
+        lambda: _lane_view(hours, window, expanded))
+
+
 @router.get("/v1/lanes")
 async def get_lanes(hours: float = Query(6.0), window: str = Query("6h"), expanded: bool = Query(False)) -> Dict[str, Any]:
     _validate_view(hours, window, expanded)
-    return await asyncio.to_thread(lane_view, hours, window, expanded)
+    return await asyncio.to_thread(rest_view, hours, window, expanded)
 
 
 @router.get("/v1/lanes/flow")
 async def get_flow(window: str = Query("6h")) -> Dict[str, Any]:
     if window not in FLOW_WINDOWS:
         raise HTTPException(status_code=400, detail=f"window must be one of {', '.join(FLOW_WINDOWS)}")
-    return await asyncio.to_thread(lane_view, dict(zip(FLOW_WINDOWS, WINDOWS))[window], window, True)
+    return await asyncio.to_thread(rest_view, dict(zip(FLOW_WINDOWS, WINDOWS))[window], window, True)
 
 
 @router.put("/v1/lanes/{lane}")

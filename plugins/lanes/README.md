@@ -13,6 +13,17 @@ this plugin adds presentation projections, not scheduling behaviour.
 | `GET /api/plugins/lanes/v1/held?lane=x` | Cards at the lane gate |
 | `POST /api/plugins/lanes/v1/held/<card>/admit` | Release one: `{reason: "..."}` |
 
+## REST stale-while-revalidate
+
+GET keeps the newest completed view for each exact `(hours, window, expanded)`
+key (at most 32 legal keys). Revision changes and ten-second expiry start one
+background refresh per key, without making readers wait behind it. Responses
+include `stale_seconds`, the nonnegative age since that snapshot completed;
+refresh failures retain the previous view and permit a later retry. A parameter
+combination with no completed view waits for its own initial computation; it
+never borrows another window or presentation variant. This is a delivery cache,
+not fresh admission evidence, and does not change the Desktop request timeout.
+
 ## Reversible load mitigation
 
 `HERMES_LANES_CHANGE_ONLY` defaults on: native file notifications admit source
