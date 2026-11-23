@@ -1322,6 +1322,55 @@ def _open_canonical_only(session_id: str, lg: "Ledger", opened: list[dict]) -> l
     return out
 
 
+# Process-local successful-write custody is required in addition to persisted
+# provenance. Disk alone can retain an old token after a failed turn reset.
+_PUBLICATION_TURNS = {}
+
+
+def _publication_key(ledger, session_id):
+    return (str(ledger.dir.absolute()), session_id)
+
+
+@contextmanager
+def _publication_edit(ledger, session_id):
+    try:
+        with ledger.edit(ledger.root(session_id)) as data:
+            yield data
+    except Exception:
+        _PUBLICATION_TURNS.pop(_publication_key(ledger, session_id), None)
+        raise
+
+
+def begin_publication_turn(ledger, session_id):
+    key = _publication_key(ledger, session_id)
+    _PUBLICATION_TURNS.pop(key, None)  # invalidate BEFORE any fallible I/O
+    token = uuid.uuid4().hex
+    with _publication_edit(ledger, session_id) as data:
+        data['publication_turn'] = token
+    # A successful context exit is necessary, but confirm the committed marker.
+    if ledger._read_strict(ledger.root(session_id)).get('publication_turn') != token:
+        raise ValueError('publication marker did not persist')
+    while len(_PUBLICATION_TURNS) >= 256:
+        _PUBLICATION_TURNS.pop(next(iter(_PUBLICATION_TURNS)))
+    _PUBLICATION_TURNS[key] = token
+    return token
+
+
+def current_publication_turn(ledger, session_id):
+    key = _publication_key(ledger, session_id)
+    token = _PUBLICATION_TURNS.get(key)
+    if not token:
+        return None
+    try:
+        if ledger._read_strict(ledger.root(session_id)).get('publication_turn') == token:
+            return token
+    except Exception:
+        pass
+    # Missing, stale and unreadable markers revoke custody until a NEW turn.
+    _PUBLICATION_TURNS.pop(key, None)
+    return None
+
+
 def add_step(session_id: str, question: str, options: list, *, ledger: Optional["Ledger"] = None,
              now: Optional[float] = None) -> dict:
     """Public helper (session-outcome): record one explicit ask, no extraction. ``options`` are labels or
@@ -1346,15 +1395,15 @@ def add_step(session_id: str, question: str, options: list, *, ledger: Optional[
     if len(labels) > MAX_OPTIONS:
         choices = []  # keep every label in the paragraph, never a partial button menu
     lg = ledger or Ledger()
-    root = lg.root(session_id)
-    with lg.edit(root) as d:
+    token = current_publication_turn(lg, session_id)
+    with _publication_edit(lg, session_id) as d:
         for s in d["steps"]:
             if s.get("status") == "open" and s.get("session") == session_id and _norm(s.get("text", "")) == _norm(q):
                 return dict(s)
         step = {"id": new_step_id(), "text": q, "kind": kind, "verbatim_span": q,
                 "options": labels if kind == "choose" else [], "choices": choices, "status": "open",
                 "created": now or time.time(), "session": session_id, "source": "session_outcome",
-                "publication_turn": d.get("publication_turn"),
+                "publication_turn": token if token == d.get("publication_turn") else None,
                 # literal_options() only turns labels found in the source paragraph into buttons
                 "paragraph": q + ("\n\nOptions: " + " / ".join(labels) if labels else "")}
         d["steps"].append(step)
@@ -1514,9 +1563,15 @@ def attach_confirmation_plans(reply, session_id, ledger, action_store=None, acti
     attrs = parsed['ask']['attrs']
     if attrs.get('s') != session_id or not attrs.get('id'):
         return attached
-    with ledger.edit(ledger.root(session_id)) as data:
+    token = current_publication_turn(ledger, session_id)
+    if not token:
+        return attached
+    with _publication_edit(ledger, session_id) as data:
+        if data.get('publication_turn') != token:
+            _PUBLICATION_TURNS.pop(_publication_key(ledger, session_id), None)
+            return attached
         current = [s for s in data['steps'] if s.get('source') == 'session_outcome'
-                   and s.get('publication_turn') and s['publication_turn'] == data.get('publication_turn')]
+                   and s.get('publication_turn') == token]
         if len(current) != 1 or current[0]['id'] != attrs['id']:
             return attached
         for step in data['steps']:
@@ -1568,6 +1623,7 @@ def process_reply(reply: str, session_id: str, *, user_msg: str = "", llm: Optio
                               retired=retired, action_store=action_store, action_owner=action_owner,
                               turn_requests=turn_requests, card_asks=card_asks)
     except Exception:
+        _PUBLICATION_TURNS.pop(_publication_key(ledger, session_id), None)
         if not retired:
             raise
         logging.getLogger("user-steps").exception("publication failed after retirement; preserving hold")
@@ -1599,7 +1655,8 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
     producer_asks = [s for s in data['steps'] if s.get('publication_turn')
                      and s['publication_turn'] == data.get('publication_turn')
                      and s.get('source') == 'session_outcome']
-    fresh_confirmation = (parsed_confirmation and not producer_asks
+    token = current_publication_turn(ledger, session_id)
+    fresh_confirmation = (token and parsed_confirmation and not producer_asks
                           and not parsed_confirmation['ask']['attrs'].get('id')
                           and not parsed_confirmation['ask']['attrs'].get('s'))
     if parsed_confirmation:

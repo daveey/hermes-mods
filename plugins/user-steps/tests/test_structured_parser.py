@@ -29,8 +29,7 @@ def test_producer_identity_and_cardinality_never_authorize(tmp_path, fault, desk
     from test_confirm_plan import core, OWNER, PLAN, ASK, directive
     ledger = core.Ledger(tmp_path / 'ledger', db=tmp_path / 'missing.db')
     store = core.ActionStore(tmp_path / 'actions.sqlite3')
-    with ledger.edit(ledger.root(OWNER['storedSessionId'])) as data:
-        data['publication_turn'] = 'first'
+    core.begin_publication_turn(ledger, OWNER['storedSessionId'])
     step = core.add_step(OWNER['storedSessionId'], ASK, ['Go', 'Change plan'], ledger=ledger)
     text = directive(step)
     if fault == 'stale-turn':
