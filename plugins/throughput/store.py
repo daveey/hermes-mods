@@ -61,8 +61,12 @@ def batch_query(sql: str, width: int) -> str:
                       for i in range(width))
     unsent = ' OR '.join(f"substr(f, {i + 1}, 1) = '2' OR (substr(f, {i + 1}, 1) = '1' AND v{i} IS NULL)"
                          for i in range(width))
+    # Keep enc as a coroutine rather than letting SQLite flatten it into the
+    # aggregate: each fallback predicate would otherwise inline the entire flags
+    # expression again (quadratic source work in width). OFFSET 0 prevents that
+    # flattening on older JSON-capable SQLite too, without an eager temp table.
     return (f"WITH data({columns}) AS ({sql}), "
-            f"enc(f, {','.join(f'v{i}' for i in range(width))}) AS (SELECT {flags}, {values} FROM data) "
+            f"enc(f, {','.join(f'v{i}' for i in range(width))}) AS (SELECT {flags}, {values} FROM data LIMIT -1 OFFSET 0) "
             f"SELECT CASE WHEN MAX({unsent}) THEN NULL ELSE "
             f"json_group_array(json_array(f, {','.join(f'v{i}' for i in range(width))})) END FROM enc")
 

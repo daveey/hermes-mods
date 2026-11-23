@@ -36,6 +36,26 @@ def _same(got, expected):
     assert [tuple(map(type, r)) for r in got] == [tuple(map(type, r)) for r in expected]
 
 
+@pytest.mark.parametrize("width", [1, 3, 6])
+def test_batch_encoding_does_not_expand_flags_per_output_column(width):
+    """Flag validation must not re-evaluate every source expression for every column."""
+    calls = []
+    with closing(sqlite3.connect(":memory:")) as c:
+        c.execute("CREATE TABLE t (v)")
+        c.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(10)])
+
+        def observe(value):
+            calls.append(value)
+            return value
+        c.create_function("observe", 1, observe)
+        sql = "SELECT " + ",".join("observe(v)" for _ in range(width)) + " FROM t"
+        assert ST.batch_rows(c, sql, width) == [[i] * width for i in range(10)]
+        # One type check for the flag, one for the payload and one payload read.
+        # Flattening enc duplicates the whole flag expression for each fallback
+        # predicate, making this O(width**2) instead of O(width) source work.
+        assert len(calls) <= 3 * width * 10
+
+
 def test_batch_rows_reals_exact_in_one_row():
     """Every double with 2**-38 <= |x| < 2**63 travels exactly, whatever this SQLite's printf does."""
     rnd = random.Random(7)
