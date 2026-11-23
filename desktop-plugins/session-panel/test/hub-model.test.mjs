@@ -102,6 +102,11 @@ test('mounted cold panel shows loading, retries the registered gap and removes t
  let release, calls = 0
  const model = cases.named_parent.model
  window.hermesDesktop = { api: async req => {
+   if (req.body?.subscriber) {
+     assert.deepEqual(req.body.sessions, [])
+     assert.ok(req.body.visible_session === 'cold-chat' || req.body.visible_session === null)
+     return {}
+   }
    calls++
    assert.deepEqual(req.body.sessions, ['cold-chat'])
    if (calls === 1) return new Promise(r => { release = r })
@@ -125,7 +130,8 @@ test('mounted cold panel offers explicit Retry after its bounded attempts, then 
  await paint(null); m.resetFeedForTests()
  current = { connectionId: 'retry', profile: 'default', session: 'retry-chat' }
  let calls = 0
- window.hermesDesktop = { api: async () => {
+ window.hermesDesktop = { api: async req => {
+   if (req.body?.subscriber) return {} // metadata lease is not a model-read attempt
    if (++calls <= 3) throw Error('timeout')
    return { feed: 'retry-feed', epoch: 'retry-epoch', rev: 1, bundles: { 'retry-chat': { session: 'retry-chat', model: cases.named_parent.model } } }
  } }
