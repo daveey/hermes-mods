@@ -53,6 +53,21 @@ def test_pending_remote_release_selection_matches_canonical(graph, monkeypatch, 
     assert m.SnapshotReaders(snapshot, chat).linked(['S0']) == old
 
 
+def test_external_local_ref_remains_with_local_source(graph):
+    r, local, remote, ksa = graph
+    cap = r.snapshot_modules()
+    m, store = cap.snapshot, cap.snapshot.SnapshotStore()
+    source = m.SourceKey('local-test', 'default', 'default', 'hub-links', '/example/external')
+    chat = m.ChatKey('local-test', 'default', 'S0')
+    store.add_source(source)
+    store.register([m.Watch(chat, '', ('S0',), 0)])
+    store.require(chat, [m.CardKey('local-test', 'default', 'default', local)])
+    hint = cap.CaptureHints(store.version(source), store.owner_token(source), 1800000000.0)
+    part = r.capture_external(store.demands(source), {}, {}, hints={source: hint})[0]
+    assert not part.receipt.coverage.unknown_scopes
+    assert all(key.gateway != 'local-test' for key in part.details)
+
+
 def test_profile_owned_remote_card_cannot_borrow_shared_shadow_detail(graph, monkeypatch):
     from hermes_cli import kanban_db_sync as sync
     r, local, remote, ksa = graph
