@@ -120,8 +120,10 @@ say what's running, never what needs the user.
   is queued, merge it yourself (`gh pr merge --rebase --match-head-commit <head>` via token-broker). Then
   `kanban_comment` each owner card that the merge step is done, so it resumes from the next step.
   A green PR left unmerged behind a queue is a stall, not progress. Hermes core repos (daveey-hermes) refuse
-  a direct `gh pr merge` (ship-only-guard): land via `hermes-core-wt ship <slug> --review-task <card>`, which
-  accepts only a done Kanban review card with verdict/reviewed_sha metadata. A subagent's PR review comment does
+  a direct `gh pr merge` (ship-only-guard): land via `token-broker exec --scope user/github --reason "<why>" -- hermes-core-wt ship <slug> --review-task <card>`
+  (no `--reason` = immediate refusal), which accepts only a done Kanban review card with verdict/reviewed_sha metadata.
+  Never pipe a backgrounded ship/merge job through `| tail`: the pipe's exit 0 makes the completion notice say
+  "completed normally" over a refusal; add `set -o pipefail` and read the output, not the exit line. A subagent's PR review comment does
   not satisfy it, so file that review card first, not after a subagent review.
 - Never archive or complete a card you don't own because its checkpoint condition looks met (a wait for CI to
   settle, later green runs): first read its current body and newest comments, since the owner may have rescoped
