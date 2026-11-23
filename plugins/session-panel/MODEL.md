@@ -23,6 +23,16 @@ existing offline consumers; every feed publication path uses wire mode.
 all existing bundle fields and add `bundle.model`. P1 does not change Desktop.
 The model is a presentation snapshot, not authorization or execution authority.
 
+## Unactivated snapshot acquisition capability
+
+[BOARD_SNAPSHOT.md](BOARD_SNAPSHOT.md) documents the memory-only `board-snapshot/1`
+store, scope-certified canonical acquisition seams and strict pure readers. This
+capability has no production consumer, scheduler, switch or activation. It does
+not replace the active freshness behavior below. Consumer integration must preserve
+canonical decisions and explicitly merge unknown source parts; strict snapshot
+readers raise on missing coverage rather than attest empty. No live latency or CPU
+acceptance follows from acquisition-only tests.
+
 ## Board-source freshness
 
 A separate change-driven board lane observes the canonical task-change index and

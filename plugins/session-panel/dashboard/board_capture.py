@@ -74,6 +74,10 @@ def capture_local(readers, source, prior_part, demands, hints):
     lineage = tuple(dict.fromkeys(s for d in demands.values() for s in d.lineage))
     statuses = tuple(LISTED_STATUSES) + ('done', 'archived')
     previous = prior_part
+    if previous and (previous.receipt.source != source
+            or previous.receipt.version.store_epoch_uuid != hints.prior_version.store_epoch_uuid
+            or previous.receipt.version.source_generation != hints.prior_version.source_generation):
+        previous = None  # a new source generation cannot inherit old acquisition trust
     with closing(sqlite3.connect(f'file:{path}?mode=rw', uri=True, timeout=0.5)) as conn:
         conn.row_factory = sqlite3.Row
         conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, hints.variable_limit)
@@ -85,12 +89,33 @@ def capture_local(readers, source, prior_part, demands, hints):
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         # All canonical columns are semantic: status-only digests lose reasons,
         # result changes, owner coordinates and execution refresh evidence.
-        remote = tuple(tuple(r) for r in conn.execute(
-            'SELECT * FROM kanban_sync_remote_parents ORDER BY parent_id')) if 'kanban_sync_remote_parents' in tables else ()
+        remote_rows = [dict(r) for r in conn.execute(
+            'SELECT * FROM kanban_sync_remote_parents ORDER BY parent_id')] if 'kanban_sync_remote_parents' in tables else []
+        remote = tuple(tuple(sorted(row.items())) for row in remote_rows)
         full = changed is changes.FULL or previous is None
         dirty = set(changed) if not full else set()
         if previous and previous.receipt.remote_parent_digest != remote:
             dirty.update(k.card_id for k in previous.details)
+        if previous and not full:
+            # Enrichment reads deeper than display hydration (including past a
+            # running node). Invalidate descendants in one set query rather than
+            # assuming the displayed depth/card-bounded detail graph is complete.
+            dirty.update(row[0] for row in conn.execute(
+                'WITH RECURSIVE affected(id) AS ('
+                'SELECT value FROM json_each(?) UNION '
+                'SELECT l.child_id FROM task_links l JOIN affected a ON l.parent_id=a.id) '
+                'SELECT id FROM affected', (json.dumps(sorted(dirty)),)))
+            # Child wait/enrichment/link_tasks also embeds explicit producer refs.
+            reverse = {}
+            for child, parents in previous.edges.items():
+                for parent in parents:
+                    reverse.setdefault(parent.card_id, set()).add(child.card_id)
+            queue = list(dirty)
+            while queue:
+                for child in reverse.get(queue.pop(), ()):
+                    if child not in dirty:
+                        dirty.add(child)
+                        queue.append(child)
         selected, pairs = select_listed_local_task_set(conn, lineage, statuses)
         metrics['membership_pairs'] = len(pairs)
         metrics['rows_returned'] += len(selected) + len(pairs) + len(remote)
@@ -132,7 +157,8 @@ def capture_local(readers, source, prior_part, demands, hints):
                     if detail is None:
                         continue
                     details[key] = freeze(detail)
-                    edges[key] = tuple(_key(source, p) for p in detail['links']['parents'])
+                    edges[key] = tuple(_key(source, p) for p in dict.fromkeys(
+                        list(detail['links']['parents']) + feed.chain_refs(raw.get(key), thaw(detail))))
                 detail = details[key]
                 reachable.add(key)
                 status = detail['task'].get('status')
@@ -163,7 +189,10 @@ def capture_local(readers, source, prior_part, demands, hints):
                       time.time_ns(), finish, start, finish, hints.owner_token)
     present = set().union(*per_scope.values())
     tombstones = frozenset(k for k in (previous.rows if previous else ()) if k not in present)
-    return SourcePart(receipt, rows, memberships, edges, {}, details, tombstones,
+    # The canonical remote-parent table has no owner column. Preserve its exact
+    # source coordinates rather than inventing the remote gateway from a bare ID.
+    remote_parents = {(source, row['parent_id']): row for row in remote_rows}
+    return SourcePart(receipt, rows, memberships, edges, remote_parents, details, tombstones,
                       scope_keys=per_scope, metrics=metrics)
 
 
@@ -264,6 +293,12 @@ def _external_closure(readers, rows, scope_keys, demands, hints, deadline):
                     continue
                 seen.add(key)
                 if key not in details:
+                    # shadow_path(board) is the canonical shared/default-profile
+                    # replica. Profile-owned boards have a different authority;
+                    # gateway equality alone cannot attest their detail identity.
+                    if key.profile != 'default':
+                        unknown.add(sid)
+                        continue
                     path = Path(readers.ksc.shadow_path(key.board))
                     if not path.is_file():
                         unknown.add(sid)

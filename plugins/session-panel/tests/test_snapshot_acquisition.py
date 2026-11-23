@@ -68,6 +68,64 @@ def test_real_union_acquisition_shared_materialization_and_999_bindings(acquisit
 
 
 
+def test_source_generation_reset_forces_real_rebuild(acquisition):
+    r, mod, m, source, store, conn = acquisition
+    kanban_db.create_task(conn, title='Work', session_id='S')
+    chat = m.ChatKey('fixture', 'default', 'S')
+    store.register([m.Watch(chat, '', ('S',), 0)])
+    first, _ = acquire(acquisition)
+    store.reset(source)
+    successor, _ = acquire(acquisition, first)
+    assert successor.metrics['full'] is True
+    assert successor.metrics['details_materialized'] == 1
+
+
+def test_parent_change_invalidates_child_enrichment_and_detail(acquisition):
+    r, mod, m, source, store, conn = acquisition
+    parent = kanban_db.create_task(conn, title='Original producer', initial_status='running')
+    child = kanban_db.create_task(conn, title='Dependent', session_id='S', parents=[parent])
+    chat = m.ChatKey('fixture', 'default', 'S')
+    store.register([m.Watch(chat, '', ('S',), 0)])
+    first, _ = acquire(acquisition)
+    with conn:
+        conn.execute('UPDATE tasks SET title=? WHERE id=?', ('Changed producer', parent))
+    successor, _ = acquire(acquisition, first)
+    fresh, _ = acquire(acquisition)
+    key = m.CardKey('fixture', 'default', 'default', child)
+    assert successor.rows[key] == fresh.rows[key]
+    assert successor.details[key] == fresh.details[key]
+
+
+@pytest.mark.parametrize('operation', ['insert', 'update', 'delete'])
+def test_remote_parent_projection_changes_invalidate_without_hydrated_parent(acquisition, operation):
+    r, cap, m, source, store, conn = acquisition
+    child = kanban_db.create_task(conn, title='Dependent', session_id='S')
+    with conn:
+        conn.execute('CREATE TABLE IF NOT EXISTS kanban_sync_remote_parents '
+                     '(parent_id TEXT PRIMARY KEY,status TEXT NOT NULL,refreshed_at INTEGER NOT NULL)')
+        conn.execute('INSERT INTO task_links(parent_id,child_id) VALUES (?,?)', ('remote-parent', child))
+        if operation != 'insert':
+            conn.execute('INSERT INTO kanban_sync_remote_parents VALUES (?,?,?)', ('remote-parent', 'running', 1))
+    chat = m.ChatKey('fixture', 'default', 'S')
+    store.register([m.Watch(chat, '', ('S',), 0)])
+    first, _ = acquire(acquisition)
+    with conn:
+        if operation == 'insert':
+            conn.execute('INSERT INTO kanban_sync_remote_parents VALUES (?,?,?)', ('remote-parent', 'running', 2))
+        elif operation == 'update':
+            conn.execute('UPDATE kanban_sync_remote_parents SET status=?,refreshed_at=?', ('done', 3))
+        else:
+            conn.execute('DELETE FROM kanban_sync_remote_parents')
+    changed, _ = acquire(acquisition, first)
+    fresh, _ = acquire(acquisition)
+    assert changed.receipt.remote_parent_digest != first.receipt.remote_parent_digest
+    assert changed.metrics['details_materialized'] >= 1
+    key = m.CardKey('fixture', 'default', 'default', child)
+    assert changed.rows[key] == fresh.rows[key]
+    assert changed.details[key] == fresh.details[key]
+    assert changed.remote_parents == fresh.remote_parents
+
+
 def test_unchanged_and_changed_only_detail_reuse(acquisition):
     r, mod, m, source, store, conn = acquisition
     tasks = [kanban_db.create_task(conn, title=name, session_id='S', initial_status='running') for name in ('one', 'two')]
