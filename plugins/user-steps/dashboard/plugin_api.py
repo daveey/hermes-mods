@@ -327,8 +327,8 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
         # A sync dependency would queue before the isolated endpoint can start.
         key = str(_load('core').home().resolve())
         if key not in recovered:
-            # Every cold reader awaits the same recovery, not a separate worker
-            # blocked on recovery_lock (which used all decision capacity).
+            # Every cold reader awaits the same bounded worker registration,
+            # never executor recovery or delivery I/O.
             tasks = recovery_tasks.setdefault(asyncio.get_running_loop(), {})
             task = tasks.get(key)
             if task is None or task.done():
@@ -417,41 +417,33 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
                 continue
         return done
 
-    # Bounded by served profiles, not clicks or operations. Hints are a single
-    # coalescing bit; the FULL-sync ActionStore, never this memory, owns custody.
+    # One process-owned worker per profile/storage scope, including hot mounts.
+    # Injected stores are isolated from other fixture/application instances.
     retriers = {}
+    runtime = _load('outbox')
+    token = runtime.Token()
+    router._delivery_token = token
 
     def start_retrier(key):
-        if key in retriers:
-            return
-        wake, stopped = threading.Event(), threading.Event()
-        ctx = contextvars.copy_context()  # retain the authenticated profile scope
-
-        def loop():
-            ctx.run(recover)
-            while not stopped.is_set():
-                wake.wait(RETRY_INTERVAL_S if RETRY_INTERVAL_S > 0 else None)
-                wake.clear()  # clear BEFORE scanning: a concurrent commit stays signalled
-                if stopped.is_set():
-                    return
-                try:
-                    ctx.run(retry_pending)
-                except Exception:
-                    logging.getLogger('user-steps').warning('Decision delivery retry pass failed')
-        worker = threading.Thread(target=loop, name='user-steps-retrier', daemon=True)
-        retriers[key] = (wake, stopped, worker)
-        worker.start()
+        scope = (key, str(ledger_dir), str(state_db), id(action_store) if action_store is not None else None)
+        retriers[key] = runtime.acquire(scope, token, recover, retry_pending, RETRY_INTERVAL_S)
 
     def hint_delivery():
-        key = str(_load('core').home().resolve())
-        retriers[key][0].set()
+        # Notification failure cannot turn a committed decision into HTTP failure.
+        # The process worker's periodic scan retains custody even if this hint is lost.
+        try:
+            key = str(_load('core').home().resolve())
+            retriers[key].wake.set()
+        except Exception:
+            logging.getLogger('user-steps').exception('Committed decision delivery hint deferred')
 
     def stop_delivery():
-        for wake, stopped, worker in list(retriers.values()):
-            stopped.set()
-            wake.set()
-        for wake, stopped, worker in list(retriers.values()):
-            worker.join(timeout=5)
+        with recovery_lock:
+            workers = list(retriers.values())
+            retriers.clear()
+            recovered.clear()
+        for worker in workers:
+            runtime.release(worker, token)
 
     router.retry_pending = retry_pending
     router.stop_delivery = stop_delivery
@@ -520,7 +512,7 @@ def create_router(ledger_dir: Optional[Path] = None, state_db: Optional[Path] = 
             # outbox work and may take seconds; a lost hint is recovered by scans.
             hint_delivery()
             logging.getLogger('user-steps').info(
-                'Decision timing operation=%s queue_ms=%.1f record_ms=%.1f dispatch_ms=%.1f',
+                'Decision timing operation=%s queue_ms=%.1f record_ms=%.1f hint_ms=%.1f',
                 recorded['operation']['operationId'], (started-received)*1000,
                 (committed-started)*1000, (time.monotonic()-committed)*1000)
             return recorded

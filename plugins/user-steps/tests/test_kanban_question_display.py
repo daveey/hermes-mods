@@ -141,7 +141,10 @@ def test_rest_other_roundtrip_keeps_identity_and_never_archives_typed_archive(tm
         reply = client.post(url, json=payload)
         assert reply.status_code == 200, reply.text
         op = reply.json()['operation']
-        assert op['dispatchState'] == 'delivered'
+        from async_receipt_support import await_operation
+        assert op['dispatchState'] == 'pending'
+        delivered = await_operation(store, OWNER, key='rest-other')
+        assert delivered['operation']['operationId'] == op['operationId']
         assert op['intent']['executionAuthorized'] is False
         assert client.post(url, json=payload).json()['operation']['operationId'] == op['operationId']
         current = client.get(f"/requests/{r['requestId']}", params={'session': 'session-a'}).json()['request']

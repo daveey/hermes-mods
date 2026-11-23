@@ -248,7 +248,11 @@ def test_desktop_queue_routes_card_decision_and_withdraws_on_archive(tmp_path):
     )
     response = client.post(f"/requests/{request['requestId']}/decisions", json=payload)
     assert response.status_code == 200, response.text
-    assert response.json()["operation"]["dispatchState"] == "delivered"
+    from async_receipt_support import await_operation
+    receipt = response.json()['operation']
+    assert receipt['dispatchState'] == 'pending'
+    delivered = await_operation(store, OWNER, key='api-blue')
+    assert delivered['operation']['operationId'] == receipt['operationId']
     with sqlite3.connect(path) as c:
         assert c.execute("SELECT status FROM tasks").fetchone()[0] == "ready"
         c.execute(

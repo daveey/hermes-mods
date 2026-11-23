@@ -59,7 +59,8 @@ def test_hot_mounted_router_recovers_pending_without_lifespan(owner, mounted, mo
     routes = web_server.app.router.routes
     routes[:] = [r for r in routes if not getattr(r, 'path', '').startswith('/api/plugins/user-steps/')]
     assert client.get('/api/plugins/user-steps/requests', params={'session': own['storedSessionId']}).status_code == 200
-    assert st.operation(own, oid=oid)['operation']['dispatchState'] == 'delivered'
+    from async_receipt_support import await_operation
+    await_operation(st, own, oid=oid)
     assert len(started) == 1
     assert len(db.get_messages(own['storedSessionId'])) == 1
     client.get('/api/plugins/user-steps/requests', params={'session': own['storedSessionId']})
@@ -128,7 +129,9 @@ def test_secondary_profile_recovers_only_its_outbox_and_routes_owner_events(owne
     monkeypatch.setattr(server, '_stdio_transport', stdio)
     response = client.get(f'{base}/operations/{oid}', params={'session': key, 'profile': 'secondary'})
     assert response.status_code == 200, response.text
-    assert response.json()['operation']['dispatchState'] == 'delivered', response.text
+    from async_receipt_support import await_operation
+    assert response.json()['operation']['operationId'] == oid
+    await_operation(st, own, oid=oid)
     assert len(started) == 1
     assert launch_db.get_messages(key) == []
     rows = db.get_messages_as_conversation(key, include_row_ids=True)
