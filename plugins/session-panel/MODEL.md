@@ -417,6 +417,9 @@ Order matters, matching Desktop `classify`:
   parent/release coordinates stay in `details[]`. No additional reader I/O is introduced.
 - Waiting text keeps a short category or specific blocker reason; URLs and hashes stay in Details, not inline.
   Own waits include their gateway, e.g. `waiting on CI · PR #3881 · 2m on remote`; URLs also go to an `open_url` action.
+  A CI wait's first URL action carries `inline: "CI"`: Desktop draws that word of the detail as the link instead of
+  an `Open CI` button. Waiting/Ready rows are one line (title left, detail right); `details[]` is the row tooltip,
+  not a Details disclosure.
 - Answered-but-undelivered asks are one `decision: {request_id, text}` line on the card they unblock (own row
   if card-less) and vanish when the request resolves; header `label` never reads "unresolved" for them.
 - Running rows without `run_model` use the current run's `run_route`, else `model_tier`, event model.

@@ -113,7 +113,8 @@ test('absolute timestamps render 38m and started 38 min ago at the local clock',
  const before = JSON.stringify(model)
  await paint(m.renderModel(model, { now: now + 120 }))
  assert.equal(document.querySelector('[data-run-meta]')?.textContent, 'worker · example-model · 38m')
- assert.ok(document.body.textContent.includes('started 38 min ago · last event tool 3 min ago'))
+ // Line rows carry details[] on hover (title tooltip), not in a Details disclosure.
+ assert.ok(document.querySelector('[data-line-row] [data-ask-title]').title.includes('started 38 min ago · last event tool 3 min ago'))
  await paint(m.renderModel(model, { now: now + 180 }))
  assert.equal(document.querySelector('[data-run-meta]')?.textContent, 'worker · example-model · 39m')
  assert.equal(JSON.stringify(model), before, 'local repaint never changes the cached wire model')
@@ -309,7 +310,12 @@ for (const [name, fixture] of Object.entries(cases).filter(([name]) => !name.sta
     const article = articles[i]
     assert.equal(article.querySelector('[data-ask-title]').textContent, row.title)
     if (row.detail) assert.ok(article.textContent.includes(row.detail))
-    if (row.details.length) assert.deepEqual([...article.querySelectorAll('details > div')].map(e => e.textContent), row.details)
+    if (row.details.length && section === 'needs_you') assert.deepEqual([...article.querySelectorAll('details > div')].map(e => e.textContent), row.details)
+    // Line rows are one line: details[] ride the title tooltip, never a Details disclosure.
+    if (section !== 'needs_you') {
+     assert.equal(article.querySelector('details'), null)
+     assert.equal(article.querySelector('[data-ask-title]').title, [row.title, ...row.details].join('\n'))
+    }
     if (section !== 'needs_you') continue
     if (row.situation) {
      const el = article.querySelector('[data-ask-situation]')

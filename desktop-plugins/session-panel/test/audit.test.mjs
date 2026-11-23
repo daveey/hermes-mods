@@ -73,6 +73,31 @@ test('defect 4: CI waits show the short phrase and an Open action that opens the
   assert.equal(document.querySelector('[data-open-url]'), null) // only http(s) links get a button
 })
 
+test('waiting rows are one line: no Details disclosure, detail right of the title, the word CI is the CI link', async () => {
+  const opened = []
+  const ci = { kind: 'open_url', label: 'Open CI', url: 'https://github.com/o/r/actions/runs/1', inline: 'CI' }
+  const parent = { kind: 'open_card', label: 'Open parent card', target: { id: 'p' } }
+  const waiting = row('a', { detail: 'waiting on CI \u00b7 PR #4126 \u00b7 7m on hub', details: ['Waiting on: ci https://github.com/o/r/actions/runs/1'], actions: [ci, parent] })
+  await paint(m.renderModel(model({ waiting: [waiting] }), { onAction: (r, a) => opened.push(a.label) }))
+  const el = document.querySelector('[data-panel-row]')
+  assert.equal(el.querySelector('details'), null, 'no Details disclosure on a line row')
+  const titleLine = el.querySelector('[data-ask-title]').parentElement
+  assert.equal(titleLine.querySelector('[data-row-detail]').textContent, 'waiting on CI \u00b7 PR #4126 \u00b7 7m on hub', 'detail on the title line')
+  assert.match(el.querySelector('[data-ask-title]').title, /Waiting on: ci https/, 'details stay reachable on hover')
+  const links = [...el.querySelectorAll('[data-open-url]')]
+  assert.deepEqual(links.map(b => [b.textContent, b.hasAttribute('data-inline-link')]), [['CI', true]], 'no separate Open CI button')
+  assert.ok(![...el.querySelectorAll('button')].some(b => b.textContent === 'Open CI'))
+  await React.act(async () => links[0].click())
+  assert.deepEqual(opened, ['Open CI'])
+  assert.ok([...el.querySelectorAll('[data-open-card]')].some(b => b.textContent === 'Open parent card'), 'other links keep their button')
+  // Older model (no `inline`): the Open CI button stays.
+  await paint(m.renderModel(model({ waiting: [row('a', { ...waiting, actions: [{ ...ci, inline: undefined }] })] })))
+  assert.deepEqual([...document.querySelectorAll('[data-open-url]')].map(b => b.textContent), ['Open CI'])
+  // Stuck keeps its reason on its own line.
+  await paint(m.renderModel(model({ stuck: [row('s', { detail: 'no progress 2h' })] })))
+  assert.equal(document.querySelector('[data-ask-title]').parentElement.querySelector('[data-row-detail]'), null)
+})
+
 test('an answered ask retains its one status line while a legacy header stays unknown', async () => {
   const decision = { request_id: 'req-9', text: 'Done \u00b7 delivers when this turn ends' }
   await paint(m.renderModel(model({ waiting: [row('a', { decision })] }, { state: 'unresolved', label: 'decision recorded' })))

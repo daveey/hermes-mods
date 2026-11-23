@@ -669,7 +669,10 @@ def reduce_panel(bundle, *, now, requests=None, subagents=None, processes=None, 
             v['wait_kind'] = wi['kind']
         if wi['raw'] and wi['raw'] != on:
             v['details'].append(f'Waiting on: {wi["raw"]}')
-        v['actions'].extend({'kind': 'open_url', 'label': 'Open CI' if wi['text'].startswith('waiting on CI') else 'Open link', 'url': u} for u in wi['urls'])
+        # A CI wait links its first run from the word "CI" in the detail line (`inline`), not a separate button.
+        ci = wi['text'].startswith('waiting on CI')
+        v['actions'].extend({'kind': 'open_url', 'label': 'Open CI' if ci else 'Open link', 'url': u,
+                             **({'inline': 'CI'} if ci and i == 0 else {})} for i, u in enumerate(wi['urls']))
         if state == 'unknown' and row.get('reported_status', raw.get('status')) in ('done', 'archived', 'done_pending_release'):
             v['detail'] = f'reported {row.get("reported_status") or "done"} by {row.get("gateway") or "another gateway"} · not confirmed by its owner'
             sections['waiting'].append(v)

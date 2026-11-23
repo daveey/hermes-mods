@@ -446,7 +446,7 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
   ] })
   // A line row's own card opens by double-clicking its state square, so its links skip that action.
   const ownCard = row => row.actions.find(action => action.kind === 'open_card' && str(action.target?.id) === str(row.id))
-  const openLinks = (row, skip) => row.actions.filter(action => action !== skip && (action.kind === 'open_card' || (action.kind === 'open_url' && /^https?:\/\//.test(str(action.url))))).map((action, i) => jsx('button', { type: 'button', 'data-open-card': action.kind === 'open_card' ? '' : undefined, 'data-open-url': action.kind === 'open_url' ? '' : undefined,
+  const openLinks = (row, ...skip) => row.actions.filter(action => !skip.includes(action) && (action.kind === 'open_card' || (action.kind === 'open_url' && /^https?:\/\//.test(str(action.url))))).map((action, i) => jsx('button', { type: 'button', 'data-open-card': action.kind === 'open_card' ? '' : undefined, 'data-open-url': action.kind === 'open_url' ? '' : undefined,
     style: { ...askLinkBtn, fontSize: 11.5, whiteSpace: 'nowrap', cursor: onAction ? 'pointer' : 'default' }, disabled: !onAction, onClick: () => onAction?.(row, action), children: action.label }, `open${i}`))
   const askRow = row => {
     const status = decisionStatus(row)
@@ -494,25 +494,39 @@ export function renderModel(model, { onChoose, onAction, decisionStatus = () => 
   const lineRow = (row, section) => {
     // A finished row is already under "Done": its own `done`/`archived` label says nothing.
     const detail = section === 'done' && /^(done|archived)$/i.test(str(row.detail).trim()) ? '' : str(row.detail)
-    const inline = (section === 'running' || section === 'done') && !!detail
+    // One line per row: title left, detail right. Only Stuck keeps its (orange) reason on a line of its own.
+    const inline = section !== 'stuck' && !!detail
+    const compact = section === 'waiting' || section === 'ready'
     const title = plain(row.title) || row.id
     const own = ownCard(row)
+    // The backend names the word of the detail that opens a link (`inline: "CI"`): that word is the link, no button.
+    const word = action => {
+      const w = str(action.inline).replace(/[^A-Za-z0-9 ]/g, '')
+      const m = w && new RegExp(`(^|[^A-Za-z0-9_])(${w})(?![A-Za-z0-9_])`).exec(detail)
+      return m ? { index: m.index + m[1].length, text: m[2] } : null
+    }
+    const linked = row.actions.find(action => action.kind === 'open_url' && /^https?:\/\//.test(str(action.url)) && word(action))
+    const hit = linked && word(linked)
+    const detailText = hit ? [detail.slice(0, hit.index),
+      jsx('button', { type: 'button', 'data-open-url': '', 'data-inline-link': '', title: linked.label, disabled: !onAction, onClick: () => onAction?.(row, linked),
+        style: { ...askLinkBtn, fontSize: 'inherit', padding: 0, cursor: onAction ? 'pointer' : 'default' }, children: hit.text }, 'inline'),
+      detail.slice(hit.index + hit.text.length)] : detail
+    const hover = [title, ...(row.details || [])].join('\n')
     return jsxs('article', { 'data-panel-row': row.key, 'data-line-row': '',
       style: { display: 'grid', gridTemplateColumns: '12px minmax(0,1fr) auto', columnGap: 8, alignItems: 'start', padding: '3px 4px', fontSize: 13, minWidth: 0 }, children: [
       jsx('span', { 'aria-hidden': true, 'data-row-pip': section, 'data-wait-kind': row.wait_kind || undefined, ...(own ? { 'data-open-own-card': '', title: 'Double-click to open card', onDoubleClick: () => onAction?.(row, own) } : {}),
         style: { ...box(section, row), justifySelf: 'center', marginTop: 5, ...(own && onAction ? { cursor: 'pointer' } : {}) } }),
       jsxs('div', { style: { minWidth: 0 }, children: [
         jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 10, minWidth: 0 }, children: [
-          jsx('strong', { 'data-ask-title': '', title, style: { flex: 1, minWidth: 0, fontWeight: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: title }),
+          jsx('strong', { 'data-ask-title': '', title: hover, style: { flex: 1, minWidth: 0, fontWeight: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: title }),
           inline && jsx('span', { 'data-row-detail': '', 'data-run-meta': '', title: row.details?.join('\n') || detail,
-            style: { ...muted, flex: 'none', whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums', ...(row.quiet ? { color: SECTION_COLOR.stuck } : {}) }, children: detail })
+            style: { ...muted, flex: compact ? '0 1 auto' : 'none', ...(compact ? { maxWidth: '60%', overflow: 'hidden', textOverflow: 'ellipsis' } : {}), whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums', ...(row.quiet ? { color: SECTION_COLOR.stuck } : {}) }, children: detailText })
         ] }),
         !inline && detail && jsx('div', { 'data-row-detail': '', style: { ...muted, overflowWrap: 'anywhere', ...(section === 'stuck' ? { color: SECTION_COLOR.stuck } : {}) }, children: detail }),
         // An answered ask: one status line on its own card ("Done · delivers when this turn ends"); gone once delivered.
-        row.decision?.text && jsx('div', { 'data-decision-status': row.decision.request_id || '', role: 'status', style: { ...muted, overflowWrap: 'anywhere' }, children: row.decision.text }),
-        details(row)
+        row.decision?.text && jsx('div', { 'data-decision-status': row.decision.request_id || '', role: 'status', style: { ...muted, overflowWrap: 'anywhere' }, children: row.decision.text })
       ] }),
-      jsx('span', { style: { display: 'flex', gap: 8, paddingTop: 2 }, children: openLinks(row, own) })
+      jsx('span', { style: { display: 'flex', gap: 8, paddingTop: 2 }, children: openLinks(row, own, hit ? linked : null) })
     ] }, row.key)
   }
   // The backend owns parent/depth. Keep classification/counts on the original

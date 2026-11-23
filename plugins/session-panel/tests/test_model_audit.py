@@ -148,6 +148,7 @@ def test_ci_wait_is_short_with_pr_and_a_link_action():
     r = waiting('ci https://github.com/softmax-universe/hermes/actions/runs/44951903463', pr_url='https://github.com/softmax-universe/hermes/pull/3881')
     assert r['detail'] == 'waiting on CI · PR #3881 · 2m on remote'
     assert [a['url'] for a in r['actions'] if a['kind'] == 'open_url'] == ['https://github.com/softmax-universe/hermes/actions/runs/44951903463']
+    assert [a.get('inline') for a in r['actions'] if a['kind'] == 'open_url'] == ['CI']
     assert 'Waiting on: ci https://github.com/softmax-universe/hermes/actions/runs/44951903463' in r['details']
     assert 'http' not in r['detail']
 
