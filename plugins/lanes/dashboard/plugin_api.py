@@ -296,6 +296,8 @@ def _project_evidence(mods, conn, evidence, hours, window, expanded, *, variants
             pol = mods[1].policy()
             if pol is not None:
                 raw['strip_tokens'] = token_series(evidence.conn, pol)
+                six_hour = snap if hours == 6 else mods[2].snapshot(conn, hours=6, evidence=evidence)
+                raw['strip_actual'] = {name: row['actual'] for name, row in six_hour['lanes'].items()}
         except Exception as exc:
             raw = {'configured': False, 'reason': f'lanes flow is unavailable: {exc}'}
     if variants:
