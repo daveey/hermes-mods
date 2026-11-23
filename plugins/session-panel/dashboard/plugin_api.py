@@ -260,7 +260,33 @@ class CoreReaders:
             return tuple(out)
         return tuple((str(p), data_stamp(p) or stat(p)) for p in self.files() + [self.state_db()]) + self.external_stamps()
 
-    def external_capture(self, held):
+    @staticmethod
+    def snapshot_modules():
+        """Explicit B1 acquisition capability; no production consumer calls it."""
+        import importlib
+        directory = Path(__file__).resolve().parent
+        digest = hashlib.sha256(str(directory).encode() +
+                                (directory / 'board_snapshot.py').read_bytes() +
+                                (directory / 'board_capture.py').read_bytes()).hexdigest()
+        name = f'_panel_acquisition_{digest}'
+        with _LOADER.lock:
+            if name not in sys.modules:
+                package = types.ModuleType(name)
+                package.__path__ = [str(directory)]
+                sys.modules[name] = package
+            return importlib.import_module(f'{name}.board_capture')
+
+    @staticmethod
+    def snapshot_feed_helpers():
+        return _load_feed()
+
+    def capture_local(self, source, prior_part, demands, hints):
+        return self.snapshot_modules().capture_local(self, source, prior_part, demands, hints)
+
+    def capture_external(self, demands, refs, prior_parts, *, hints):
+        return self.snapshot_modules().capture_external(self, demands, refs, prior_parts, hints)
+
+    def external_capture(self, held, *, include_inventory=False):
         """Materialize canonical external inputs once, then partition by chat.
 
         Strict reads are essential here: stale-while-revalidate may return the old
@@ -270,13 +296,17 @@ class CoreReaders:
         from hermes_cli import kanban_chat_links as links
         cards, history = ksa.remote_links_and_origin_rows(stale_ok=False)
         rows = list(cards) + list(history)
+        replica, gateway, profile = None, None, None
         if sync.sync_config().get('links_reader') == 'replica':
+            from hermes_cli.profiles import get_active_profile_name
+            gateway, profile = self.ksc.load_identity().gateway, get_active_profile_name()
             ids = list(dict.fromkeys(i for value in held.values() for i in value['lineage']))
             unreadable = []
-            rows.extend(links.replica_cards(
-                ids, self.ksc.load_identity().gateway,
+            replica = links.replica_cards(
+                ids, gateway,
                 tuple(ksa.LISTED_STATUSES) + ('done', 'archived'),
-                stale_ok=False, origin_cards=cards, unreadable_out=unreadable))
+                stale_ok=False, origin_cards=cards, unreadable_out=unreadable)
+            rows.extend(replica)
             if unreadable:
                 raise RuntimeError('session-panel external replica capture unavailable')
         # Held parents can belong to a different chat. Match their known owner
@@ -288,12 +318,36 @@ class CoreReaders:
                        for scope in refs[session].get(row.get('id'), ()))
         # Retain every field, including evidence timestamps: they affect lease
         # validity. No presentation classifier or guessed volatile-field filter.
-        return {s: tuple(sorted(json.dumps(row, sort_keys=True, separators=(',', ':'))
+        captured = {s: tuple(sorted(json.dumps(row, sort_keys=True, separators=(',', ':'))
                                 for row in rows
                                 if set(value['lineage']).intersection(
                                     (row.get('session'), row.get('origin_session'), row.get('resolved_session')))
                                 or refers(s, row)))
                 for s, value in held.items()}
+        if include_inventory:
+            return captured, {'origin': cards, 'history': history, 'replica': replica,
+                              'gateway': gateway, 'profile': profile}
+        return captured
+
+    def snapshot_select_external(self, inventory, ids, *, observed_at):
+        """Select from the one strict inventory using the existing canonical helpers."""
+        from hermes_cli import kanban_session_activity as ksa
+        from hermes_cli.kanban_origin_obligations import preserve_origin_obligations
+        from hermes_cli.kanban_execution_observations import add_cards
+        outputs = {}
+        for terminal in (False, True):
+            statuses = tuple(ksa.LISTED_STATUSES) + (('done', 'archived') if terminal else ())
+            if inventory['replica'] is None:
+                selected = inventory['origin']
+            else:
+                selected = preserve_origin_obligations(
+                    [c for c in inventory['replica'] if c['session'] in ids], inventory['origin'],
+                    gateway=inventory['gateway'], profile=inventory['profile'], ids=list(ids), statuses=statuses)
+            values = add_cards(_project_remote_listed(selected, ids, statuses), now=observed_at)
+            if terminal:
+                values = _load_feed().with_terminal_history(values, inventory['history'], ids)
+            outputs['done' if terminal else 'linked'] = _calm(values)
+        return outputs
 
     @staticmethod
     def _external_refs(held):
@@ -573,19 +627,7 @@ class CoreReaders:
                 for row in projected:
                     row.setdefault('key', f"{board}/{row['id']}")
                     out.append(row)
-            wanted, seen, remote = set(ids), set(), []
-            # Same projection as append_remote_listed_cards, applied before key dedup for EACH lineage.
-            for card in self._remote_inventory(scope, ids, statuses):
-                if (card['session'] in wanted or card.get('origin_session') in wanted) and (
-                        card.get('status') in statuses or (card.get('status') in PENDING_RELEASE_STATUSES
-                                                          and card.get('unfinished'))) and card['key'] not in seen:
-                    seen.add(card['key'])
-                    wait = ksa._remote_wait(card)
-                    row = {**copy.deepcopy(card), 'session_id': card['session']}
-                    if wait is not None:
-                        row['wait'] = wait
-                    remote.append(row)
-            annotate_remote_upstream(remote)
+            remote = _project_remote_listed(self._remote_inventory(scope, ids, statuses), ids, statuses)
             return add_cards(out + remote)
         except Exception:
             # Preserve stable per-lineage busy memos and per-session failure isolation on batch read failure.
@@ -897,7 +939,8 @@ class CoreReaders:
                     return {'detail': detail, 'board': slug}
         return None
 
-    def _detail(self, c: sqlite3.Connection, card_id: str, board: str, replica: bool):
+    def _detail(self, c: sqlite3.Connection, card_id: str, board: str, replica: bool,
+                *, snapshot_at=None, parent_connection=...):
         from hermes_cli import kanban_db
         task = kanban_db.get_task(c, card_id)
         if task is None:
@@ -905,7 +948,9 @@ class CoreReaders:
         d = dataclasses.asdict(task)
         try:
             from hermes_cli.kanban_session_wait_rows import _local_wait_info
-            d['wait'] = _local_wait_info(c, [card_id]).get(card_id, {})
+            d['wait'] = (_local_wait_info(c, [card_id]) if snapshot_at is None else
+                         _local_wait_info(c, [card_id], now=snapshot_at,
+                                          replica=parent_connection)).get(card_id, {})
         except (ImportError, sqlite3.Error):
             d['wait'] = {}
         # Heartbeats move these every minute without changing anything the chain shows: left out, so a heartbeat
@@ -969,6 +1014,26 @@ def _newest_events(c: sqlite3.Connection, card_id: str) -> list:
         "SELECT * FROM task_events WHERE task_id = ? AND kind != 'heartbeat' "
         "ORDER BY created_at DESC, id DESC LIMIT ?", (card_id, EVENTS_KEPT)).fetchall()
     return [kanban_db.Event.from_row(r) for r in reversed(rows)]
+
+
+def _project_remote_listed(cards, ids, statuses):
+    """Existing per-lineage remote selection, shared with the unactivated snapshot adapter."""
+    from hermes_cli import kanban_session_activity as ksa
+    from hermes_cli.kanban_session_activity_release import PENDING_RELEASE_STATUSES
+    from hermes_cli.kanban_session_activity_card_details import annotate_remote_upstream
+    wanted, seen, remote = set(ids), set(), []
+    for card in cards:
+        if (card['session'] in wanted or card.get('origin_session') in wanted) and (
+                card.get('status') in statuses or (card.get('status') in PENDING_RELEASE_STATUSES
+                                                  and card.get('unfinished'))) and card['key'] not in seen:
+            seen.add(card['key'])
+            wait = ksa._remote_wait(card)
+            row = {**copy.deepcopy(card), 'session_id': card['session']}
+            if wait is not None:
+                row['wait'] = wait
+            remote.append(row)
+    annotate_remote_upstream(remote)
+    return remote
 
 
 def _calm(rows):
