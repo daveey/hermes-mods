@@ -763,6 +763,14 @@ class CoreReaders:
         return [hub_db_path(), Path(get_hermes_home()) / 'kanban' / 'origin-ledger.db',
                 kanban_home() / 'origin-work.db']
 
+    @staticmethod
+    def publication_paths():
+        # remote_snapshot is a derived output of the canonical reader itself,
+        # not a new input. Keep it on older-core watches, but with keyed recovery
+        # its cache-only arrivals are covered by the existing 30s reconciliation.
+        from hermes_cli.kanban_db import kanban_home
+        return {kanban_home() / 'origin-work.db'}
+
     def watch_directories(self):
         from hermes_cli import kanban_db, kanban_db_sync
         root = kanban_db.kanban_home()
@@ -1790,6 +1798,7 @@ class FileWatch:
         import struct
         until = time.monotonic() + timeout
         self.changed_paths = set()
+        self.source_changed = False
         while True:
             left = max(0.0, until - time.monotonic())
             if self._kq is not None:
@@ -1804,6 +1813,7 @@ class FileWatch:
                 for p in gone:
                     os.close(self._fds.pop(p))
                 self.changed_paths = None  # directory/overflow ambiguity stays legacy
+                self.source_changed = True
                 self._arm()  # a replaced or newly created file is watched from here on
                 return True
             if not select.select([self._fd], [], [], left)[0]:
@@ -1818,19 +1828,21 @@ class FileWatch:
                 name = data[at + 16:at + 16 + size].split(b'\0', 1)[0]
                 at += 16 + size
                 if mask & self._Q_OVERFLOW:
+                    self.source_changed = True
                     self.changed_paths = None
                     hit = True  # events were dropped: any of ours may be among them
                 elif mask & self._IGNORED:
                     if wd in self._names:  # a watched directory went away (not our own rm_watch): its files with it
                         self._names.pop(wd)
                         self._dirs = {d: w for d, w in self._dirs.items() if w != wd}
-                        self.stale = hit = True
+                        self.stale = hit = self.source_changed = True
                         self.changed_paths = None
                 else:
                     decoded = os.fsdecode(name)
                     names = self._names.get(wd, ())
                     entry = mask & (0x40 | 0x80 | 0x100 | 0x200)
                     inventory = '*' in names and entry
+                    self.source_changed |= decoded in names
                     parent = next((d for d, w in self._dirs.items() if w == wd), None)
                     if inventory or decoded in getattr(self, '_rearm', {}).get(parent, ()):
                         self.stale = True
@@ -1855,31 +1867,42 @@ class FileWatch:
         self._fd, self._fds, self.ok = -1, {}, False
 
 
+def _keyed_hints():
+    if _mitigation('HERMES_FACTS_PANEL'):
+        try:
+            spec = importlib.util.spec_from_file_location('_panel_keyed_hints', Path(__file__).with_name('keyed_hints.py'))
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.KeyedHints()
+        except ImportError:
+            pass  # older core retains every legacy lane
+    return None
+
+
 def _watch(f, watch: FileWatch, paths) -> None:
     """The feed's one watcher thread: a write to a source file makes a pass due on both lanes."""
     try:
         listed = None
-        hints = None
-        if _mitigation('HERMES_FACTS_PANEL'):
-            try:
-                spec = importlib.util.spec_from_file_location('_panel_keyed_hints', Path(__file__).with_name('keyed_hints.py'))
-                assert spec is not None and spec.loader is not None
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                hints = module.KeyedHints()
-            except ImportError:
-                pass  # older core retains every legacy lane
+        hints = _keyed_hints()
+        listed_paths = None
 
         def rearm():
+            nonlocal listed_paths
             readers = f.readers
             invalidate = getattr(readers, 'invalidate_inventory', None)
             if callable(invalidate):
                 invalidate()
+            publications = getattr(readers, 'publication_paths', lambda: ())() if hints is not None else ()
+            current = tuple(p for p in paths() if p not in publications)
+            changed = listed_paths is not None and set(current) != set(listed_paths)
+            listed_paths = current
             roots = getattr(readers, 'watch_directories', None)
             if callable(roots):
-                watch.set_paths(paths(), directories=roots())
+                watch.set_paths(current, directories=roots())
             else:
-                watch.set_paths(paths())
+                watch.set_paths(current)
+            return changed
 
         while not f.stopped.is_set():
             # Periodic maintenance is filesystem-only; it never admits a DB pass.
@@ -1899,8 +1922,14 @@ def _watch(f, watch: FileWatch, paths) -> None:
                     f.queue_keyed(set(f.interest))
             if (hit or (hints is not None and hints.reader.source_dirty)) and not f.stopped.is_set():
                 if watch.stale:
-                    rearm()
+                    inventory_changed = rearm()
                     listed = time.monotonic()
+                    # Directory inventory hints only rediscover sources. Our own
+                    # SQLite sidecars/temp files are not application changes.
+                    # Exact source writes, lost coverage and new/removed sources
+                    # still own a trailing pass (never clear an existing wake).
+                    if not getattr(watch, 'source_changed', True) and not inventory_changed:
+                        continue
                 changed = getattr(watch, 'changed_paths', None)
                 hub_files = {Path(str(hints.path) + suffix) for suffix in ('', '-wal', '-shm', '-journal')} if hints else set()
                 if hints is not None and ((changed and changed <= hub_files) or (not hit and hints.reader.source_dirty)):
