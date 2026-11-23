@@ -947,7 +947,7 @@ const recommendedPill = { padding: '1px 7px', borderRadius: 999, fontSize: 11, f
 const needsText = c => c.effect === 'revise' || (c.effect === 'answer' && c.id === 'answer-text')
 // Missing plan/step = agent work. It never counts as something "for you".
 export const agentPending = r => !!r.resolution || !['choice','input'].includes(r.kind) && (!r.scope?.complete || !r.scope?.markdown?.trim() || r.state !== 'open' || (r.kind === 'approval' && !(r.choices || []).some(c => c.effect === 'approve')))
-const choiceLabel = (c, choices, kind) => kind !== 'approval' ? (c.authorizes === true ? `✓ ${c.label}` : c.label) : c.effect === 'approve' && choices.filter(x => x.effect === 'approve').length === 1 ? 'Approve' : c.effect === 'revise' && choices.filter(x => x.effect === 'revise').length === 1 ? 'Request changes' : c.label
+const choiceLabel = (c, choices, kind) => kind !== 'approval' ? (c.authorizes === true ? `✓ ${c.label}` : c.label) : c.effect === 'approve' && c.label !== 'Go' && choices.filter(x => x.effect === 'approve').length === 1 ? 'Approve' : c.effect === 'revise' && c.label !== 'Change plan' && choices.filter(x => x.effect === 'revise').length === 1 ? 'Request changes' : c.label
 const WITHDRAW_REASON = 'Dismissed in Desktop as not needed'
 const WITHDRAW_TITLE = 'Remove this ask without deciding; nothing is sent to the agent'
 const withdrawing = new Set() // tile keys with a withdraw POST in flight: one per tile, also across two mounted tiles

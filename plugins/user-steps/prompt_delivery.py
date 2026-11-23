@@ -73,6 +73,8 @@ class PromptAdmission:
                      'not_applied (with a reason) is only for declining before reserving, when nothing has '
                      'happened. Receipts grant nothing.'
                      % (op['operationId'], op['revision'], op['binding']['scopeDigest']))
+        if op['intent'].get('userText') == 'Go':
+            text = 'Go\n\n' + text
         sid = op['owner']['storedSessionId']
         digest = hashlib.sha256(encode({'stored_session_id': sid, 'text': text}).encode()).hexdigest()
         return dict(profile=op['owner']['profile'], stored_session_id=sid,

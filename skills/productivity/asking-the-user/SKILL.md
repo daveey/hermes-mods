@@ -56,6 +56,19 @@ Never tell the user a choice tile "is in your panel" because a user-steps row or
 When told “do it yourself,” remove discretionary blockers, not identity or explicit-deny boundaries. For an
 ambiguous acceptance tolerance, test a stricter sufficient bound without redefining the requirement to fit results.
 
+## Confirming a plan: one click, not a typed reply
+
+When only yes/go confirmation remains, publish `action_request` with kind `approval`,
+the **full exact plan** in `scope.markdown`, `scope.complete: true`, and choices
+`{id: "go", label: "Go", effect: "approve"}` and
+`{id: "change-plan", label: "Change plan", effect: "revise"}`.
+Include all limits, exclusions and expected outcomes. Go approves only that frozen
+revision; Change plan grants no execution permission. Never ask the user to type
+“say go” or use a free-text `::user-step` / `session_outcome(kind=decide)` as an
+approval substitute. Do not wrap the published ask in another user-step: that
+creates a duplicate. If a plan is missing, supply it yourself before asking.
+The runtime same-message recovery is a backstop, not the publication contract.
+
 ## Physical and sign-in asks
 
 Before filing a physical/on-device/sign-in ask, read `references/physical-asks.md`: search all boards and

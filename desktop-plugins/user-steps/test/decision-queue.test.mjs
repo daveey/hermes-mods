@@ -69,6 +69,29 @@ test('boolean permissionRequired (the backend contract since 4affdc54) is valid 
  await show(null); delete window.hermesDesktop
 })
 
+test('scoped approval preserves Go and Change plan labels and posts the bound Go choice', async () => {
+ const r = freshRequest({ revision: 7, choices: [{ id: 'go', label: 'Go', effect: 'approve' }, { id: 'change-plan', label: 'Change plan', effect: 'revise' }] })
+ const calls = []
+ const call = async (path, opts = {}) => { calls.push([path, opts]); return { request: r, operation: { operationId: 'go-label', dispatchState: 'pending' } } }
+ await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call }))
+ const labels = [...el().querySelectorAll('button')].map(b => b.textContent)
+ assert.ok(labels.includes('Go'))
+ assert.ok(labels.includes('Change plan'))
+ assert.ok(!labels.includes('Approve'))
+ assert.ok(!labels.includes('Request changes'))
+ await click('Go')
+ const posts = calls.filter(([, opts]) => opts.method === 'POST')
+ assert.equal(posts.length, 1)
+ const [path, opts] = posts[0]
+ assert.equal(path, `/api/plugins/user-steps/requests/${r.requestId}/decisions`)
+ assert.equal(opts.connectionId, route.connectionId)
+ assert.equal(opts.profile, route.profile)
+ assert.equal(opts.body.choiceId, 'go')
+ assert.equal(opts.body.expectedRevision, r.revision)
+ assert.equal(opts.body.session, route.session)
+ await show(null)
+})
+
 test('revise focuses inline, validates, Escape restores focus; keyboard submits durable revision', async () => {
  const calls = []; let op = null; const r = freshRequest()
  const call = async (path, opts = {}) => { calls.push([path,opts]); if (opts.method === 'POST') { op = { operationId: 'op-revise', state: 'pending' }; return { operation: op, request: r } } return { operation: op, request: r } }
