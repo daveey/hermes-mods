@@ -65,7 +65,10 @@ renewed scope and caps. The renewal compares the comment's `writer_session` with
 that chat's own terminal; a worker or relayed command is refused. In the mandate, name the stop refusals: Board,
 kanban, renewal, lease, and ship or landing guards. Workers read "any authority refusal" literally and retain when
 the tool policy refuses a single call (e.g. `execute_code` blocked in unattended mode). A tool-policy refusal means
-switching to a supported tool (`read_file`/`search_files`/`terminal`); it is not a stop. Never edit the mandate
+switching to a supported tool (`read_file`/`search_files`/`terminal`); it is not a stop. Make the list closed,
+never ending in a catch-all such as "any other guard refusal": workers then stop when the repo's own checks
+(`scripts/check` health, lint, tests) fail on lines their round just wrote. Allow a bounded number of such
+own-line fixes inside the round instead. Never edit the mandate
 after renewing, because its digest is frozen: put a clarification in a new comment, then promote.
 The owning chat is an unreleased `created` link, even an archived chat: wake it with cross_session. A shepherd or
 desk chat never qualifies, and `origin_session=None` does not mean the card has no owner: read `task_chat_links`.
