@@ -39,6 +39,24 @@ const paint = tree => React.act(async () => root.render(tree))
 const publicCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./hub-model-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
 const privateCases = process.env.HERMES_PANEL_GOLDENS ? JSON.parse(readFileSync(process.env.HERMES_PANEL_GOLDENS, 'utf8')) : {}
 const cases = { ...publicCases, ...privateCases }
+const partialCases = JSON.parse(execFileSync(process.env.HERMES_MODS_PYTHON || 'python3', [fileURLToPath(new URL('./partial-projection-fixtures.py', import.meta.url))], { encoding: 'utf8' }))
+for (const [name, { model, now, status }] of Object.entries(partialCases)) {
+ test(`real partial projector ${name}: unknown coverage never becomes empty or consent`, async () => {
+  assert.equal(model.header.state, 'unknown')
+  assert.equal(model.sections.needs_you.length, 0)
+  assert.ok(model.diagnostics.length > 0)
+  await paint(m.renderModel(model, { now }))
+  const rows = [...document.querySelectorAll('[data-panel-row]')]
+  assert.equal(rows.length, status ? 1 : 0)
+  if (status) {
+   assert.ok(document.body.textContent.includes('Known partial work'))
+   const view = model.sections.waiting[0]
+   const action = view.actions.find(a => a.kind === 'open_card')
+   assert.deepEqual(action.target, { id: 't_aaaaaa1', gateway: 'gateway', profile: 'default', board: 'default' })
+  }
+  assert.equal(document.querySelectorAll('[data-choice-id]').length, 0)
+ })
+}
 for (const name of ['tree_direct', 'tree_multihop', 'tree_cross_section', 'tree_group', 'tree_single', 'tree_cycle', 'tree_depth']) {
  test(`real reducer ${name}: outline order, guides and exactly-once rows`, async () => {
   const { model, now } = cases[name]

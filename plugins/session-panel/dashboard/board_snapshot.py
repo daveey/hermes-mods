@@ -7,6 +7,7 @@ accepts only still-current demand identities. A cursor is never coverage.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from threading import RLock
 from types import MappingProxyType
@@ -621,6 +622,17 @@ class SnapshotStore:
                         or self._versions[source] != admission.missing_versions.get(source)):
                     return False
             return True
+
+    @contextmanager
+    def publication(self, admission):
+        """Memory-only CAS borrow. Writer stores before release, emits AFTER.
+
+        Lock order is Feed.compute_lock -> Feed.lock -> this lock. Acquisition
+        never takes a Feed lock while holding this lock. No I/O or coverage
+        granting is allowed in the borrowed scope.
+        """
+        with self._lock:
+            yield self.current(admission)
 
     def acknowledge(self, admission):
         """Retire a successfully published exact vector, preserving superseded custody.

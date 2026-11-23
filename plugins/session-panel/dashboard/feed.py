@@ -38,6 +38,7 @@ import re
 import threading
 import time
 import uuid
+import sys
 from typing import Any, Callable, Iterable, Optional
 
 FULL_EVERY_S = 60.0          # a watched chat with open cards is recomputed at least this often (run evidence)
@@ -66,7 +67,7 @@ CARD_ID = re.compile(r'\bt_[0-9a-f]{6,}\b')
 # "switching sessions ... should be instant": a Desktop pulled ~45 MB per 2 min of them over its ssh tunnel, and
 # every transcript read on that tunnel queued behind them (cache paint 40 ms, reconcile 6-8 s). Pushes and
 # catch-ups carry wire_bundle(); the held bundle (and Feed.changes(), the in-process view) keeps everything.
-WIRE_OMIT = frozenset({'cards', 'done', 'requests', 'outcome_json'})
+WIRE_OMIT = frozenset({'cards', 'done', 'requests', 'outcome_json', 'board_errors'})
 
 
 def wire_bundle(bundle):
@@ -96,6 +97,26 @@ _board_spec = importlib.util.spec_from_file_location('_session_panel_board_lane'
 _board_module = importlib.util.module_from_spec(_board_spec)
 _board_spec.loader.exec_module(_board_module)
 BoardLane = _board_module.BoardLane
+
+_PROJECTION_LOCK = threading.Lock()
+
+
+def _projection():
+    # Lazy/content-qualified: importing Feed does not activate snapshot consumers.
+    path = Path(__file__).with_name('board_projection.py')
+    name = '_panel_projection_' + hashlib.sha256(path.read_bytes()).hexdigest()
+    with _PROJECTION_LOCK:
+        if name not in sys.modules:
+            spec = importlib.util.spec_from_file_location(name, path)
+            assert spec is not None and spec.loader is not None
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[name] = mod
+            try:
+                spec.loader.exec_module(mod)
+            except BaseException:
+                sys.modules.pop(name, None)
+                raise
+        return sys.modules[name]
 
 
 def _hash(bundle: dict) -> str:
@@ -161,6 +182,7 @@ class Feed:
         self.bundles: dict[str, dict] = {}   # session -> {rev, hash, bundle, refs, lineage}
         self.interest: dict[str, float] = {} # session -> expires at
         self._watch_tokens = {}             # rejects reads from forgotten/re-watched membership
+        self._projection_owner = object()   # not transferred by resume or disk restore
         self._panel_updates = queue.SimpleQueue()
         self._panel_subscribers = {}  # mounted-panel id -> (session, lease expiry)
         self._board_dirty = set()
@@ -373,6 +395,39 @@ class Feed:
             lane.pop(s, None)
 
     # ── computing ───────────────────────────────────────────────────────────
+    @staticmethod
+    def reducer(bundle, *, now):
+        return _model().reduce_panel(bundle, now=now, wire=True)
+
+    def project_board(self, store, chat, *, canonical_base, pin=None, seq=None, external_capture=()):
+        """Explicit unactivated board/full/catch-up injection seam; no live reads.
+
+        Callers acquire canonical inputs separately for this exact lineage. B2b
+        owns scheduling and production route cutover; this method starts no work.
+        """
+        return _projection().project(self, store, chat, canonical_base=canonical_base, pin=pin, seq=seq,
+                                     external_capture=external_capture)
+
+    def carry_board_observations(self, store, previous, captured):
+        """Pure, exact-parent-fenced canonical pull-clock carriage; no hydration."""
+        return _projection().observe(self, store, previous, captured)
+
+    def project_boards(self, store, canonical_bases, *, pins=None):
+        """Shared-store full/catch-up composition, with one immutable pin per chat."""
+        seq = next(self._seq)
+        return {chat.session_id: self.project_board(store, chat, canonical_base=base,
+                pin=(pins or {}).get(chat), seq=seq) for chat, base in canonical_bases.items()}
+
+    def publish_projections(self, store, projections):
+        """CAS and store under writer+scope fences; emit outside the store lock.
+
+        Results separate storage/no-change from transport success. This is not
+        the B3 authenticated model-inclusion receipt and never acknowledges work.
+        """
+        results = {}
+        self._publish({}, _projections=projections, _snapshot_store=store, _results=results)
+        return results
+
     def compute(self, session: str, *, seq: Optional[int] = None, readers=None, base=None, stages=None) -> dict:
         seq = next(self._seq) if seq is None else seq  # assigned before the pass's first shared read
         read_at = self.clock()
@@ -398,7 +453,8 @@ class Feed:
             if cid in seen:
                 continue
             seen.add(cid)
-            rec = timed('cards_s', r.card, cid, board)
+            qualified = getattr(r, 'card_ref', None)
+            rec = timed('cards_s', qualified, cid, board, row) if callable(qualified) else timed('cards_s', r.card, cid, board)
             if rec is None:
                 continue
             cards[cid] = rec
@@ -407,7 +463,9 @@ class Feed:
                 continue
             for ref in chain_refs(row, rec.get('detail')):
                 if ref not in seen:
-                    queue.append((ref, rec.get('board') or board, None, depth + 1))
+                    parent = (next((p for p in (rec.get('detail') or {}).get('link_tasks', ())
+                                   if p.get('id') == ref), None) if callable(qualified) else None)
+                    queue.append((ref, rec.get('board') or board, parent, depth + 1))
         bundle = {**(base or {}), 'session': session, 'lineage': lineage, 'tasks': tasks, 'done': done, 'cards': cards,
                   'computed_at': read_at, 'computed_seq': seq}
         panel_inputs = getattr(r, 'panel_inputs', None)
@@ -665,28 +723,38 @@ class Feed:
             self._publish_wire()
         return self
 
-    def _store(self, session: str, bundle: dict, *, canonical_only: bool = False) -> bool:
+    def _store(self, session: str, bundle: dict, *, canonical_only: bool = False, board_current: bool = False,
+               observation_only: bool = False) -> bool:
         """Keep `bundle`; True when it differs from what clients last got (it took a new revision)."""
         observation = (getattr(self, '_external_observations', None) or {}).get(session)
-        if observation and bundle.get('computed_seq', 0) <= observation[0]:
+        if observation and not board_current and bundle.get('computed_seq', 0) <= observation[0]:
             bundle = self.readers.advance_external(bundle, observation[1])
             bundle = {**bundle, 'model': _model().reduce_panel(bundle, now=self.clock(), wire=True)}
         prev = self.bundles.get(session)
         if canonical_only and (not prev or prev['bundle']['lineage'] != bundle['lineage']):
             return False  # expired/re-watched or reparented while the cheap read was in flight
-        board_refresh = not prev or bundle.get('computed_seq', 0) > prev['bundle'].get('computed_seq', 0)
+        board_refresh = not observation_only and (board_current or not prev or bundle.get('computed_seq', 0) > prev['bundle'].get('computed_seq', 0))
         merged = canonical_only
         if prev:
             old = prev['bundle']
-            if old.get('computed_seq', 0) > bundle.get('computed_seq', 0):
+            if prev.get('board_admission') and (canonical_only or not board_current):
+                # Once opted in, an unversioned full/legacy result has NO board
+                # authority, even with a later computed_seq. Canonical data is
+                # independently merged, including current source-read errors.
+                if old['lineage'] != bundle['lineage'] or old.get('canonical_seq', 0) >= bundle.get('canonical_seq', 0):
+                    return False
+                bundle = _projection().canonical_overlay(old, bundle)
+                board_refresh, merged = False, True
+            elif not board_current and old.get('computed_seq', 0) > bundle.get('computed_seq', 0):
                 if old.get('canonical_seq', 0) >= bundle.get('canonical_seq', 0) or old['lineage'] != bundle['lineage']:
                     return False
                 bundle = {**old, **{k: bundle[k] for k in ('canonical_seq', 'outcome_json', 'requests')}}
                 merged = True
             elif old.get('canonical_seq', 0) > bundle.get('canonical_seq', 0) and old['lineage'] == bundle['lineage']:
-                bundle = {**bundle, **{k: old[k] for k in ('canonical_seq', 'outcome_json', 'requests')}}
+                bundle = (_projection().canonical_overlay(bundle, old) if board_current else
+                          {**bundle, **{k: old[k] for k in ('canonical_seq', 'outcome_json', 'requests')}})
                 merged = True
-            if not board_refresh and bundle.get('canonical_seq') and all(bundle.get(k) == old.get(k) for k in ('outcome_json', 'requests')):
+            if not board_current and not board_refresh and bundle.get('canonical_seq') and all(bundle.get(k) == old.get(k) for k in ('outcome_json', 'requests', 'input_errors')):
                 prev['bundle'] = {**old, 'canonical_seq': max(old.get('canonical_seq', 0), bundle.get('canonical_seq', 0))}
                 return False  # no re-reduction of unchanged canonical data every second
             if merged and bundle.get('canonical_seq'):
@@ -698,8 +766,8 @@ class Feed:
         refs = set(bundle['cards']) | {str(t.get('id')) for t in rows if t.get('id')}
         # Core's busy fallback succeeds with last-observed rows, not an exception. Keep them visible,
         # but never vouch for that source as fresh; retry even when its file stamps/cursor stay unchanged.
-        source_stale = any(t.get('stale') or t.get('partial_source_unknown') or t.get('_execution_error') for t in rows)
-        if source_stale:
+        source_stale = bool(bundle.get('board_errors')) or any(t.get('stale') or t.get('partial_source_unknown') or t.get('_execution_error') for t in rows)
+        if source_stale and not board_current:
             self._retry.add(session)
         # Recomputed: its bundle is this feed's own now. One restored from another process takes a new revision even
         # when unchanged: a client may hold a newer copy the old process pushed after it saved (a restart's
@@ -713,14 +781,18 @@ class Feed:
             return False
         self.rev += 1
         self.bundles[session] = {'rev': self.rev, 'hash': h, 'bundle': bundle, 'refs': refs,
-                                 'lineage': set(bundle['lineage']), 'source_stale': source_stale}
+                                 'lineage': set(bundle['lineage']), 'source_stale': source_stale,
+                                 **({k: prev[k] for k in ('board_admission', 'board_projection') if k in prev} if prev else {})}
         return True
 
     def _publish(self, computed: dict[str, dict], *, heartbeat: bool = False, canonical_only: bool = False,
-                 age_only: bool = False, observations: Optional[dict] = None, watch_tokens=None) -> dict[str, dict]:
+                 age_only: bool = False, observations: Optional[dict] = None, watch_tokens=None,
+                 _projections=None, _snapshot_store=None, _results=None) -> dict[str, dict]:
         """Store what was computed and push one batch (or a heartbeat when nothing changed and one is due)."""
         with self.compute_lock:
             if self.stopped.is_set():
+                if _results is not None:
+                    _results.update({s: _projection().PublishResult('stopped') for s in _projections})
                 return {}  # stopped (and possibly resumed by a successor): its revision space is no longer ours
             prev = self.rev
             with self.lock:
@@ -758,6 +830,30 @@ class Feed:
                         if flight is not None and flight.bundle is b:
                             self._flights.pop(s)
                     changed = {s: self.bundles[s]['bundle'] for s, b in computed.items() if s in self.interest and self._store(s, b, canonical_only=canonical_only)}
+                    for s, projection in (_projections or {}).items():
+                        with _snapshot_store.publication(projection.admission) as current:
+                            held_projection = (self.bundles.get(s) or {}).get('board_projection')
+                            if (not current or s != projection.admission.chat.session_id
+                                    or projection.feed_epoch != self.epoch or projection.feed_owner is not self._projection_owner
+                                    or s not in self.interest or projection.watch_token is None
+                                    or self._watch_tokens.get(s) is not projection.watch_token
+                                    or (projection.observation_parent is not None and (held_projection is None
+                                        or held_projection.publication_token is not projection.observation_parent))
+                                    or (projection.observation_parent is None and held_projection is not None
+                                        and held_projection.observation_parent is not None
+                                        and held_projection.admission == projection.admission)):
+                                _results[s] = _projection().PublishResult('superseded')
+                                continue
+                            module = sys.modules[type(_snapshot_store).__module__]
+                            b = module.thaw(projection.bundle)
+                            did_change = self._store(s, b, board_current=True,
+                                                     observation_only=projection.observation_parent is not None)
+                            self.bundles[s]['board_admission'] = projection.admission
+                            self.bundles[s]['board_projection'] = projection
+                            _results[s] = _projection().PublishResult('stored' if did_change else 'no_change', did_change,
+                                revision=self.bundles[s]['rev'])
+                            if did_change:
+                                changed[s] = self.bundles[s]['bundle']
                 self._publish_wire()
             now = self.clock()
             if changed or (heartbeat and now - self.last_emit >= self.heartbeat_s):
@@ -780,6 +876,12 @@ class Feed:
                                'bundles': {s: wire_bundle(b) for s, b in changed.items()}, 'fresh': fresh,
                                **({} if changed else {'heartbeat': True})})
                     self.last_emit = now
+                    if _results is not None:
+                        for s in changed:
+                            if s in _results:
+                                prior_result = _results[s]
+                                _results[s] = _projection().PublishResult(prior_result.disposition, prior_result.changed,
+                                    True, prior_result.revision)
                     if changed:
                         self._note_publish(changed)
                 except Exception:  # no client / transport down: clients catch up, and see no heartbeat meanwhile
