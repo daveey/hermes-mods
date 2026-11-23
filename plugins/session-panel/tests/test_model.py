@@ -54,6 +54,124 @@ def observed(row, kind='card', state='running'):
     return {**row, 'execution_observations': [{'identity': {'kind': kind, 'work_id': row['id'], 'gateway': row.get('gateway'), 'profile': row.get('profile'), 'board': row.get('board')}, 'state': state}]}
 
 
+def held_bundle(status='triage', remote=False, kind='decision_retained', **kw):
+    row = task(status=status, remote=remote, source='replica' if remote else 'live',
+               wait={'wait_state': 'human'} if kw.get('human_request') else {'wait_state': 'waiting', 'waiting_on': 'triage'}, **kw)
+    payload = {'disposition': {'reason': 'scope_stopped', 'next_step': 'Reconcile the remaining allowance.'}} if kind == 'decision_retained' else {'reason': 'The stage allowance is exhausted.'}
+    return bundle(row, cards={row['id']: {'detail': {'task': dict(row), 'events': [{'kind': kind, 'payload': payload}]}}})
+
+
+def test_held_cards_name_agent_not_human_even_without_execution_evidence():
+    for status in ('triage', 'blocked'):
+        for remote in (False, True):
+            for kind in ('decision_retained', 'spend_budget_triaged', 'decision_requested'):
+                b = held_bundle(status, remote, kind)
+                m = model.reduce_panel(b, now=NOW)
+                row = m['sections']['waiting'][0]
+                assert not m['sections']['needs_you'] and not m['sections']['stuck']
+                assert row['wait_kind'] == 'agent'
+                assert row['detail'].startswith("waiting on this chat's agent to decide: ")
+                assert 'allowance' in row['detail']
+                assert row['gateway'] == 'remote'
+                assert m['header']['wait_kind'] == 'agent'
+                assert m == model.reduce_panel(b, now=NOW)
+                b['cards']['t_abc123']['detail']['events'][0]['payload'] = {'reason': 'Choose the next scope.'}
+                assert m['revision'] != model.reduce_panel(b, now=NOW)['revision']
+
+
+def test_triage_live_human_request_or_bound_open_request_is_red():
+    for with_card_ask in (False, True):
+        b = held_bundle(human_request=human() if with_card_ask else None, block_kind='needs_input')
+        if not with_card_ask:
+            b['requests'] = [request()]
+        m = model.reduce_panel(b, now=NOW)
+        assert len(m['sections']['needs_you']) == 1
+        assert not m['sections']['waiting']
+
+
+def test_held_stale_source_remains_unknown_not_claimed_agent_custody():
+    b = held_bundle(remote=True, stale=True)
+    row = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert 'status unknown' in row['detail']
+    assert row.get('wait_kind') != 'agent'
+
+
+def test_current_nonhuman_wait_does_not_revive_preserved_human_fields():
+    b = held_bundle(human_request=human(), block_kind='needs_input')
+    b['tasks'][0]['wait'] = {'wait_state': 'waiting', 'waiting_on': 'triage'}
+    m = model.reduce_panel(b, now=NOW)
+    assert not m['sections']['needs_you']
+    assert m['sections']['waiting'][0]['wait_kind'] == 'agent'
+
+
+def test_new_block_episode_supersedes_old_decision_evidence():
+    b = held_bundle(status='blocked')
+    b['tasks'][0]['wait'] = {'wait_state': 'stalled', 'waiting_on': 'external job'}
+    b['cards']['t_abc123']['detail']['events'].append({'kind': 'blocked', 'payload': {'reason': 'external job stopped'}})
+    m = model.reduce_panel(b, now=NOW)
+    assert not m['sections']['waiting']
+    assert m['sections']['stuck'][0].get('wait_kind') != 'agent'
+
+
+def test_stale_producer_does_not_vouch_for_header_and_overdue_clock_keeps_owner():
+    for on in ('CI job 42', 'deploy release 42', 'the clock until 2026-11-25 12:00 UTC'):
+        b = held_bundle(remote=True, stale=True)
+        b['tasks'][0]['wait']['waiting_on'] = on
+        m = model.reduce_panel(b, now=NOW)
+        assert 'wait_kind' not in m['sections']['waiting'][0]
+        assert 'wait_kind' not in m['header']
+    b = held_bundle()
+    b['tasks'][0]['wait']['waiting_on'] = 'the clock until 2026-11-20 12:00 UTC'
+    for wire in (False, True):
+        row = model.reduce_panel(b, now=NOW, wire=wire)['sections']['waiting'][0]
+        assert row['wait_kind'] == 'clock' and 'overdue' in row['detail']
+        assert 'agent to decide' not in row['detail']
+
+
+def test_shared_triage_producer_precedes_agent_hold():
+    for on, kind in (('CI job 42', 'ci'), ('deploy release 42', 'deploy'), ('the clock until 2026-11-25 12:00 UTC', 'clock')):
+        parent = task('t_abcdef', status='triage', title='Publish the release', wait={'wait_state': 'waiting', 'waiting_on': on})
+        b = bundle(task('t_111111', status='todo', upstream=parent),
+                   task('t_222222', status='todo', upstream=parent), cards={parent['id']: {'detail': {'task': parent}}})
+        m = model.reduce_panel(b, now=NOW)
+        assert all(row['wait_kind'] == kind for row in m['sections']['waiting'])
+        assert m['groups'][0]['wait_kind'] == kind
+        assert m['header']['wait_kind'] == kind
+
+
+def test_producer_waits_stay_light_blue_and_do_not_become_owner_decisions():
+    for on, kind in (('CI job 42', 'ci'), ('deploy release 42', 'deploy'),
+                     ('the clock until 2026-11-25 12:00 UTC', 'clock')):
+        b = held_bundle()
+        b['tasks'][0]['wait']['waiting_on'] = on
+        row = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+        assert row['wait_kind'] == kind
+        assert "agent to decide" not in row['detail']
+    parent = task('t_abcdef', status='running', title='Publish the release')
+    b = bundle(task(status='todo', upstream=parent),
+               cards={parent['id']: {'detail': {'task': parent}}})
+    row = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert row['wait_kind'] == 'card' and '(running)' in row['detail']
+
+
+def test_contained_hold_preserves_release_actor_and_shared_held_group():
+    b = held_bundle()
+    b['tasks'][0]['wait'] = {'wait_state': 'waiting', 'contained': {'authority': {'id': 't_abcdef'}},
+                            'waiting_on': 'release by card t_abcdef (todo)'}
+    row = model.reduce_panel(b, now=NOW)['sections']['waiting'][0]
+    assert row['wait_kind'] == 'agent'
+    assert 't_abcdef' in ' '.join([row['detail'], *row['details']])
+    parent = task('t_abcdef', status='triage', title='Decide the next stage')
+    b = bundle(task('t_111111', status='todo', upstream=parent),
+               task('t_222222', status='todo', upstream=parent),
+               cards={parent['id']: {'detail': {'task': parent}}})
+    m = model.reduce_panel(b, now=NOW)
+    assert len(m['groups']) == 1
+    assert m['groups'][0]['section'] == 'waiting'
+    assert m['groups'][0]['wait_kind'] == 'agent'
+    assert "this chat's agent" in m['groups'][0]['detail']
+
+
 def test_click_admission_is_canonical_owner_bound_and_revisioned():
     r = request()
     r['owner']['gatewayId'] = 'install:source'
