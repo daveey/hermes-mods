@@ -1094,7 +1094,8 @@ def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
     c = card.conn
     if c.execute("SELECT 1 FROM task_runs WHERE task_id=? AND status='running' LIMIT 1", (card.id,)).fetchone():
         return None
-    if _promotion_held(c, card):
+    from hermes_cli.kanban_spend_decision import pending, execution_refusal
+    if _promotion_held(c, card) or pending(c, card.id) or execution_refusal(c, card.id):
         return None  # containment, spend and independent recovery holds are not execution authority
     park = current_park(card)
     if not park:
@@ -1133,7 +1134,7 @@ def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
                      'live_producer': live, 'park_id': park['id'], 'park_at': park['at'],
                      'last_event': last[0] if last else None},
                     {'kind': 'nudge', 'action': 'ask the owner whether it is stuck and continue', 'commands': [],
-                     'why': 'long wait or producer event already happened; never forcibly unblock'})
+                     'why': 'long wait or producer event already happened; guarded owner reassessment wake'})
 
 
 def quiet_chat_findings(src: Sources, only: Optional[str] = None) -> list[Finding]:

@@ -19,6 +19,7 @@ def setup(tmp_path, monkeypatch, mode='shadow'):
     f = finding(); src = SimpleNamespace(open_fix_card=lambda fp: None)
     monkeypatch.setattr(nudge,'fresh',lambda scan, f:(dict(f), src))
     monkeypatch.setattr(nudge,'progress',lambda *a:7)
+    monkeypatch.setattr(nudge,'wake_owner',lambda *a:{'outcome':'woken','event_id':19})
     receipts = []
     monkeypatch.setattr(nudge,'receipt',lambda *a:receipts[-1] if receipts else None)
     calls=[]
@@ -123,6 +124,60 @@ def test_detached_chat_admission_does_not_wait_or_kill_owner(tmp_path,monkeypatc
     assert result[0][0]['receipt']=={'message_id':12}
     assert spawned[0][1]['start_new_session'] is True
     assert 'timeout' not in spawned[0][1]
+
+
+def test_probe_only_events_are_not_owner_progress(monkeypatch):
+    events = [{'id': i+2, 'kind': k, 'payload': {}, 'run_id': None}
+              for i,k in enumerate(('external_watch','wake_check_alive','wake_probe_unproven_notice'))]
+    events.append({'id':1,'kind':'scheduled','payload':{},'run_id':1})
+    scan = SimpleNamespace(_events=lambda *a,**kw: list(reversed(events[:-1])) + events[-1:])
+    assert nudge.progress(scan, SimpleNamespace(conn=lambda b:None), finding()) == 1
+
+
+def test_message_is_plain_and_bounded():
+    f = finding()
+    f['evidence']['live_producer'] = {'state':{'state':'MERGED','statusCheckRollup':[{'name':'x'*20000}]},'happened':True}
+    text = nudge.message(f, [10000,17201])
+    assert len(text) <= 850
+    assert 'MERGED' in text and 'statusCheckRollup' not in text
+    assert '\n' not in text and 'Nudge #3' in text
+
+
+def test_live_records_wake_receipt(tmp_path, monkeypatch):
+    f,tick,calls,sd=setup(tmp_path,monkeypatch,'live')
+    wakes=[]
+    def wake(scan, src, current, rec, text):
+        wakes.append((current,rec,text))
+        return {'outcome':'woken','event_id':19,'comment_id':11}
+    monkeypatch.setattr(nudge,'wake_owner',wake)
+    action=tick(10000)[0][0]
+    assert len(wakes)==1 and action['wake']['event_id']==19
+    assert json.loads((sd/'nudges-live.json').read_text())['fps'][f['fingerprint']]['wake']['event_id']==19
+    assert len(calls[0][-1]) <= 1000
+
+
+def test_probe_checkpoint_migration_preserves_recent_send(tmp_path,monkeypatch):
+    f,tick,calls,sd=setup(tmp_path,monkeypatch)
+    tick(10000)
+    path=sd/'nudges-shadow.json'
+    state=json.loads(path.read_text()); state['fps'][f['fingerprint']]['progress']=999
+    path.write_text(json.dumps(state))
+    assert not tick(11000)[0]
+    assert tick(17201)[0][0]['nudge_count']==2
+
+
+def test_unknown_wake_recovers_same_identity_without_second_comment(tmp_path,monkeypatch):
+    f,tick,calls,sd=setup(tmp_path,monkeypatch,'live')
+    monkeypatch.setattr(nudge,'wake_owner',lambda *a:{'outcome':'wake_unknown'})
+    tick(10000)
+    assert json.loads((sd/'nudges-live.json').read_text())['fps'][f['fingerprint']]['pending']
+    monkeypatch.setattr(nudge,'wake_owner',lambda *a:{'outcome':'woken','event_id':19})
+    # Recovery must run even when the successful-but-unacknowledged wake removed the finding.
+    result=nudge.process([],home=tmp_path,now=11000,scan=SimpleNamespace(Sources=lambda:None),runner=None,
+                         argv=[],read_json=run._read_json,write_json=run._write_json,append=run._append)
+    assert result[0][0]['recovered'] and result[0][0]['wake']['event_id']==19
+    history=json.loads((sd/'nudges-live.json').read_text())['fps'][f['fingerprint']]
+    assert history['times']==[10000] and 'pending' not in history and len(calls)==1
 
 
 def test_installer_changes_only_requested_mode(tmp_path,monkeypatch):

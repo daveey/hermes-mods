@@ -278,8 +278,13 @@ chat-closeout `owner-wake.db` fired premise is excluded, as for `BS-unexplained-
 **Evidence:** kind, ref, waited_s, threshold_s, live_producer, park id/time, last card event.
 **Safe automatic fix** (`nudge`, area card): re-read first; a moved park/event, human ask or running owner means no
 write. Add ONE `[session-repair]` comment asking whether it is stuck, showing duration/limit/live state, and
-asking it to continue, re-park with a fresh reason/wake, or block with the real reason. It wakes the owner through
-the normal comment path; no forced unblock. **Done when:** the owner takes a turn and reassesses its wait.
+asking it to continue, re-park with a fresh reason/wake, or block with the real reason. A comment alone does not
+wake scheduled cards: issue core's supported `unblock_task` with transactional eligibility checks, preserving
+parent gating. Never wake a clock, valid human ask, live run, containment, spend/safety or recovery hold. Record
+the exact `unblocked` event carrying `session_repair_nudge=<comment id>`; a replay reads that same event and does
+not wake twice. Keep the complete comment under **1,000 characters**, with one plain live-state line, not raw JSON.
+**Done when:** an owner run starts after this recorded wake and reassesses its wait; a card's independent
+`condition_met` probe is not nudge-caused proof.
 
 ## BS-quiet-chat: unresolved cardless chat with no executor
 
@@ -297,8 +302,11 @@ The Session repair chat is always excluded, by id and title. Unreadable guard in
 `config.json` **nudge_mode** is `shadow` (default) or `live`, independently of the existing fixes' `mode`;
 `mode=off` remains a global stop. Re-nudge the same fingerprint every **2 h**, not the other rules' 24 h seen
 window. Second and later messages include count and earlier UTC times. Three unanswered nudges (no subsequent
-non-nudge card/chat event) produce one normal area-card repair finding, never a fourth nudge. Replies/re-parks
-reset the unanswered sequence. Nudge limits: **15/run**, **100/rolling 24 h**, separate from fix-card caps.
+owner activity) produce one normal area-card repair finding, never a fourth nudge. Only owner-run events,
+owner-authored comments, status changes and re-parks reset the unanswered sequence. `external_watch`,
+`wake_check_alive`, `wake_probe_unproven_notice` and the nudge's own comment/wake never count as answers.
+Keep the send times/cooldown when migrating an older probe-inclusive checkpoint.
+Nudge limits: **15/run**, **100/rolling 24 h**, separate from fix-card caps.
 Durable write-ahead pending delivery prevents crash/timeout resend; exact comment/message readback is the receipt,
 and unknown delivery stays pending for recovery, not a blind retry. `nudges-<mode>.json[l]` holds cadence/receipts;
 shadow rows also go to `actions-shadow.jsonl`. Never copy live chat/card evidence into the public repository.

@@ -620,3 +620,71 @@ def test_deploy_wait_readback_age_fallback(env, monkeypatch, state, waited_s, ex
 def test_long_wait_human_ask_and_running_never_nudged(env):
     none(env, 'BS-long-wait', F.blocked_valid_ask(env.conn, env.now))
     none(env, 'BS-long-wait', F.long_wait(env.conn, env.now, status='running'))
+
+
+def nudge_target(env, monkeypatch):
+    from sr_helpers import PLUGIN, load
+    from hermes_cli import kanban_db as kb
+    mod = load('_sr_wake_patterns', PLUGIN/'nudge.py')
+    monkeypatch.setattr(env.scan_mod.Sources, 'producer_state', lambda *a: {'state':'pending','happened':False})
+    tid = F.long_wait(env.conn, env.now)
+    f = one(env, 'BS-long-wait', tid)
+    text = mod.message(f, []) + '\n[session-repair receipt test]'
+    cid = kb.add_comment(env.conn, tid, 'session-repair', text)
+    return mod, tid, f, text, {'comment_id':cid,'board':'default','card':tid}
+
+
+def test_scheduled_nudge_wakes_owner_with_exact_idempotent_receipt(env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    mod,tid,f,text,rec = nudge_target(env,monkeypatch)
+    result = mod.wake_owner(env.scan_mod, env.sources(), f, rec, text)
+    assert result['outcome']=='woken', result
+    assert kb.get_task(env.conn,tid).status=='ready'
+    event=env.conn.execute('SELECT payload FROM task_events WHERE id=?',(result['event_id'],)).fetchone()
+    assert json.loads(event[0])['session_repair_nudge']==rec['comment_id']
+    assert mod.wake_owner(env.scan_mod,env.sources(),f,rec,text)==result
+    assert len(env.scan_mod._events(env.conn,tid,kinds=('unblocked',),limit=10))==1
+
+
+@pytest.mark.parametrize('guard', ['human','running','clock','changed_park','new_comment','containment','spend','owner_event'])
+def test_nudge_wake_transaction_refuses_changed_or_held_target(env, monkeypatch, guard):
+    from hermes_cli import kanban_db as kb, kanban_spend_decision as spend
+    mod,tid,f,text,rec = nudge_target(env,monkeypatch)
+    if guard=='human':
+        monkeypatch.setattr(env.scan_mod,'_human_request',lambda t:({},True))
+    elif guard=='running':
+        env.conn.execute("UPDATE tasks SET status='running' WHERE id=?",(tid,)); env.conn.commit()
+    elif guard in ('clock','changed_park'):
+        F.event(env.conn,tid,'scheduled',{'awaiting':{'kind':'clock' if guard=='clock' else 'ci','ref':'other'}},at=env.now)
+    elif guard=='new_comment':
+        kb.add_comment(env.conn,tid,'owner','New instructions')
+    elif guard=='containment':
+        monkeypatch.setattr(env.scan_mod,'_promotion_held',lambda *a:'containment')
+    elif guard=='spend':
+        monkeypatch.setattr(spend,'pending',lambda *a:True)
+    elif guard=='owner_event':
+        F.event(env.conn,tid,'worker_bound',at=env.now)
+    result=mod.wake_owner(env.scan_mod,env.sources(),f,rec,text)
+    assert result['outcome']=='wake_refused', result
+    assert not env.scan_mod._events(env.conn,tid,kinds=('unblocked',),limit=1)
+
+
+def test_probe_only_history_keeps_two_hour_cadence_and_escalation(env,monkeypatch):
+    from sr_helpers import PLUGIN, load
+    mod,tid,f,text,rec = nudge_target(env,monkeypatch)
+    run = load('_sr_wake_run',PLUGIN/'run.py')
+    src=env.sources()
+    monkeypatch.setattr(mod,'fresh',lambda *a:(f,src))
+    sd=env.home/'session-repair'; sd.mkdir()
+    def tick(now):
+        return mod.process([f],home=env.home,now=now,scan=env.scan_mod,runner=None,argv=[],
+                           read_json=run._read_json,write_json=run._write_json,append=run._append)
+    base=env.now
+    assert tick(base)[0][0]['nudge_count']==1
+    for i,kind in enumerate(('external_watch','wake_check_alive','wake_probe_unproven_notice')):
+        F.event(env.conn,tid,kind,at=base+100+i)
+    assert not tick(base+18*60)[0]
+    assert not tick(base+7140)[0]
+    assert tick(base+7260)[0][0]['nudge_count']==2
+    assert tick(base+14520)[0][0]['nudge_count']==3
+    assert len(tick(base+21780)[1])==1
