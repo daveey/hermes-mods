@@ -100,6 +100,7 @@ def test_chat_nudge_uses_resume(tmp_path,monkeypatch):
 def test_modes_are_independent(tmp_path,monkeypatch):
     f,tick,calls,sd=setup(tmp_path,monkeypatch,'live')
     monkeypatch.setattr(run,'load_nudge',lambda:nudge)
+    monkeypatch.setattr(run,'load_scan',lambda:SimpleNamespace(Sources=lambda:None))
     monkeypatch.setattr(run,'hermes_argv',lambda:['hermes'])
     fake_runner=lambda argv,**kw: subprocess.CompletedProcess(argv,0,stdout='',stderr='')
     monkeypatch.setattr(nudge,'receipt',lambda *a:{'comment_id':11})
