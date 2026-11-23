@@ -78,6 +78,13 @@ def capture_local(readers, source, prior_part, demands, hints):
             or previous.receipt.version.store_epoch_uuid != hints.prior_version.store_epoch_uuid
             or previous.receipt.version.source_generation != hints.prior_version.source_generation):
         previous = None  # a new source generation cannot inherit old acquisition trust
+    reusable = set()
+    if previous:
+        for sid, keys in previous.scope_keys.items():
+            certificate = previous.scope_receipts.get(sid)
+            if (sid in previous.receipt.coverage.completed_scopes
+                    or certificate and certificate.cursor == previous.receipt.cursor):
+                reusable.update(keys)
     with closing(sqlite3.connect(f'file:{path}?mode=rw', uri=True, timeout=0.5)) as conn:
         conn.row_factory = sqlite3.Row
         conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, hints.variable_limit)
@@ -120,7 +127,8 @@ def capture_local(readers, source, prior_part, demands, hints):
         metrics['membership_pairs'] = len(pairs)
         metrics['rows_returned'] += len(selected) + len(pairs) + len(remote)
         refresh = {tid: row for tid, row in selected.items()
-                   if full or tid in dirty or _key(source, tid) not in previous.rows}
+                   if (full or tid in dirty or _key(source, tid) not in reusable
+                       or _key(source, tid) not in (previous.rows if previous else {}))}
         enrich_session_tasks(conn, path, refresh, observed_at=hints.observed_at, scope=scope, replica=None)
         raw = {}
         for tid, row in selected.items():
@@ -148,7 +156,7 @@ def capture_local(readers, source, prior_part, demands, hints):
                 seen.add(tid)
                 key = _key(source, tid)
                 if key not in details:
-                    if previous and not full and tid not in dirty and key in previous.details:
+                    if previous and not full and tid not in dirty and key in reusable and key in previous.details:
                         detail = previous.details[key]
                     else:
                         detail = readers._detail(conn, tid, source.board, False,
@@ -192,8 +200,10 @@ def capture_local(readers, source, prior_part, demands, hints):
     # The canonical remote-parent table has no owner column. Preserve its exact
     # source coordinates rather than inventing the remote gateway from a bare ID.
     remote_parents = {(source, row['parent_id']): row for row in remote_rows}
+    invalidated = (frozenset(previous.rows) | frozenset(previous.details) if previous and full
+                   else frozenset(_key(source, tid) for tid in dirty))
     return SourcePart(receipt, rows, memberships, edges, remote_parents, details, tombstones,
-                      scope_keys=per_scope, metrics=metrics)
+                      scope_keys=per_scope, metrics=metrics, invalidated_keys=invalidated)
 
 
 def capture_external(readers, demands, refs, prior_parts, hints):
@@ -213,10 +223,15 @@ def capture_external(readers, demands, refs, prior_parts, hints):
     deadline = time.monotonic() + hint.deadline_s
     before = readers.external_stamps()
     held = {}
+    local_boards = {board for board, _ in readers.boards()}
+    external_demands = {}
     for sid, demand in demands.items():
         owned_refs = frozenset(demand.refs) | frozenset(refs.get(sid, ()))
         if owned_refs != demand.refs:
             raise ValueError('external refs must be frozen in the ScopeDemand')
+        owned_refs = frozenset(key for key in owned_refs if not (
+            key.gateway == source.gateway and key.profile == source.profile and key.board in local_boards))
+        external_demands[sid] = replace(demand, refs=owned_refs)
         held[sid] = {'lineage': demand.lineage, 'refs': {key.card_id for key in owned_refs},
                      'bundle': {'tasks': [{'id': key.card_id, 'gateway': key.gateway,
                                           'profile': key.profile, 'board': key.board}
@@ -258,7 +273,7 @@ def capture_external(readers, demands, refs, prior_parts, hints):
                     memberships.add(member)
         scoped_memberships[sid] = tuple(members)
     prior = prior_parts.get(source)
-    details, edges, unknown = _external_closure(readers, rows, scope_keys, demands, hint, deadline)
+    details, edges, unknown = _external_closure(readers, rows, scope_keys, external_demands, hint, deadline)
     for sid, keys in scope_keys.items():
         scope_keys[sid] = frozenset(keys)
     receipt = Receipt(source, replace(hint.prior_version, source_revision=hint.prior_version.source_revision + 1),

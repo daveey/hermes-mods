@@ -29,6 +29,27 @@ def test_deep_enrichment_dependency_past_running_detail_stop(acquisition):
     assert successor.details[key] == fresh.details[key]
 
 
+def test_partial_capture_cannot_advance_cursor_over_stale_carried_rows(acquisition):
+    r, cap, m, source, store, conn = acquisition
+    a = kanban_db.create_task(conn, title='A', session_id='A')
+    b = kanban_db.create_task(conn, title='B old', session_id='B')
+    chats = [m.ChatKey('fixture', 'default', sid) for sid in ('A', 'B')]
+    store.register([m.Watch(chat, '', (chat.session_id,), 0) for chat in chats])
+    before, _ = acquire(acquisition)
+    with conn:
+        conn.execute('UPDATE tasks SET title=? WHERE id=?', ('B new', b))
+    hint = cap.CaptureHints(store.version(source), store.owner_token(source), 1800000000.0)
+    demands = store.demands(source)
+    part = r.capture_local(source, before, {store.demand(source, chats[0]).id: demands[store.demand(source, chats[0]).id]}, hint)
+    snapshot, _ = store.accept_local(part, hint.prior_version)
+    assert store.pin(chats[1])[1].missing_scopes
+    current, _ = acquire(acquisition, snapshot.parts[source])
+    fresh, _ = acquire(acquisition)
+    key = m.CardKey('fixture', 'default', 'default', b)
+    assert current.rows[key] == fresh.rows[key]
+    assert current.details[key] == fresh.details[key]
+
+
 def test_terminal_capture_does_not_recertify_old_detail_after_reset(acquisition):
     r, cap, m, source, store, conn = acquisition
     tid = kanban_db.create_task(conn, title='Initially ready', session_id='S')

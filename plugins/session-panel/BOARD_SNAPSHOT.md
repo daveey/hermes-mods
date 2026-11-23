@@ -27,7 +27,10 @@ gain coverage. New/expanded/rewatched scopes remain missing at unchanged DB stam
 Carried scopes retain their original scope receipt/version; changed shared detail
 or edge payload revokes incompatible old coverage. Membership and tombstones apply
 only to certified scopes. Old tokens cannot recreate membership. Old/new union
-membership and dependency keys drive invalidation.
+membership and dependency keys drive invalidation. SourcePart.invalidated_keys
+carries cursor-observed changes even outside the captured membership; it revokes
+carried certificates without deleting last-known payload. Reuse requires current
+capture or same-cursor scope provenance, not mere presence in a merged part.
 
 `pin(chat)` returns Snapshot plus Admission, preserving first unserved clocks,
 receipt IDs, required scopes, certified source versions, missing scopes, failure
@@ -90,7 +93,10 @@ uses short-lived query-only shadow snapshots and validates owner before hydratio
 these are separate observations, not one atomic strict-inventory transaction.
 Unavailable details mark scopes unknown. The shared shadow has no profile-specific
 board authority, so non-default-profile detail requests remain unknown rather than
-borrowing another profile's card. Deadlines apply even to empty results.
+borrowing another profile's card. Qualified refs owned by the serving profile's
+configured local boards stay with local capture, never enter remote shadow
+hydration, and do not make otherwise healthy external coverage unknown. Unresolved
+remote refs still refuse coverage. Deadlines apply even to empty results.
 
 ## Pure readers and consumer boundary
 

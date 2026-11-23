@@ -217,6 +217,9 @@ class SourcePart:
     stale_scope_keys: Mapping = field(default_factory=empty)
     scope_memberships: Mapping = field(default_factory=empty)
     scope_rows: Mapping = field(default_factory=empty)
+    # Cursor-observed changes outside the captured membership still revoke stale
+    # carried certificates; not tombstones and never delete last-known payload.
+    invalidated_keys: frozenset = frozenset()
 
     def __post_init__(self):
         for name in ('rows', 'edges', 'remote_parents', 'details', 'observations',
@@ -225,6 +228,7 @@ class SourcePart:
         for name in ('memberships', 'errors'):
             object.__setattr__(self, name, freeze(getattr(self, name)))
         object.__setattr__(self, 'tombstones', frozenset(self.tombstones))
+        object.__setattr__(self, 'invalidated_keys', frozenset(self.invalidated_keys))
 
 
 @dataclass(frozen=True)
@@ -484,7 +488,7 @@ class SnapshotStore:
                     raise SnapshotCapacity('unserved receipt custody capacity reached')
             old = self._parts.get(source)
             old_rows = old.rows if old else {}
-            changed = set(part.tombstones)
+            changed = set(part.tombstones) | set(part.invalidated_keys)
             certified_keys = set().union(*(part.scope_keys.get(sid, ()) for sid in completed))
             for name in ('rows', 'details', 'edges'):
                 previous = getattr(old, name) if old else {}
