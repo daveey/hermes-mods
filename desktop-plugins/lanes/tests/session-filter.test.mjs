@@ -94,7 +94,7 @@ test('tooltips name the colour and the count', async () => {
   assert.match(cat('run').title, /^Blue: running/)
   assert.match(cat('dep').title, /^Grey: waiting on other cards/)
   assert.match(cat('nocards').title, /^Dashed: sessions with no open cards, 2 sessions/)
-  assert.match(lane('product').title, /red 1 blocked on you · blue 1 running · grey 0 other/)
+  assert.match(lane('product').title, /1 blocked on you\n1 running\n0 waiting/)
   assert.match(all().title, /clear every lane and category selection/)
 })
 

@@ -672,20 +672,49 @@ export function stripMeter(row) {
   return { blocked: s.blocked || 0, running: s.running || 0, notReady: s.other || 0, total: (s.blocked || 0) + (s.running || 0) + (s.other || 0) }
 }
 
-function MiniPill({ row, onToggle, selected, dimmed }) {
-  const m = stripMeter(row)
-  const counts = laneCounts(row)
+export function tokenScale(list) {
+  return Math.max(1, ...list.flatMap((r) => r.strip?.tokens || []))
+}
+
+export function LaneSpark({ tokens, scale }) {
+  if (!Array.isArray(tokens) || tokens.length < 2) return null
+  const points = tokens.map((n, i) => `${(i * 34 / (tokens.length - 1)).toFixed(1)},${(13 - Math.min(1, Math.max(0, n) / Math.max(1, scale)) * 12).toFixed(1)}`).join(' ')
+  return h('svg', { className: 'hermes-lanes-spark', width: 34, height: 14, viewBox: '0 0 34 14', 'aria-hidden': true },
+    h('polygon', { points: `0,14 ${points} 34,14`, fill: '#3ddc97', fillOpacity: .18 }),
+    h('polyline', { points, fill: 'none', stroke: '#3ddc97', strokeWidth: 1.3, strokeLinejoin: 'round' }))
+}
+
+export function laneTitle(row, selected) {
+  const m = stripMeter(row), s = row.strip || {}
+  const lines = [row.name]
+  if (Array.isArray(s.tokens)) lines[0] += `: ${compact(s.tokens.reduce((a, n) => a + n, 0) / 360)} tok/m avg over 6 h`
+  lines.push(`${m.blocked} blocked on you`)
+  const cap = s.cap == null ? '' : s.cap_kind === 'max' ? ` · max ${s.cap}` : ` · fair share ${s.cap} of ${s.fleet_running} busy slots (${pct(row.target)} target)`
+  lines.push(`${m.running} running${cap}`)
+  if (s.over > 0) lines.push(`OVER by ${s.over}: borrowing idle slots — ${(s.idle_lanes || []).join(', ') || 'other lanes'} have nothing ready; 6 h actual ${pct(row.actual)} vs ${pct(row.target)} target`)
+  const mix = Object.entries(s.wait || {}).sort((a, b) => b[1] - a[1]).map(([r, n]) => `${n} ${reasonInfo(r).label}`).join(', ')
+  lines.push(`${m.notReady} waiting${mix ? ` (${mix})` : ''}`, `Click to ${selected ? 'deselect' : 'select'} this lane`)
+  return lines.join('\n')
+}
+
+export function MiniPill({ row, onToggle, selected, dimmed, scale = 1 }) {
+  const m = stripMeter(row), s = row.strip || {}
+  // Older hubs have neither capacity nor series: retain their counts without inventing an overage.
+  const inside = s.in_share ?? m.running, over = s.over || 0
   return h('button', {
-    type: 'button', className: 'hermes-lanes-pill', 'data-lane-pill': row.name,
-    title: `${row.name}: red ${m.blocked} blocked on you · blue ${m.running} running · grey ${m.notReady} other · ${m.total} open. Click to ${selected ? 'deselect' : 'select'} this lane`,
-    'aria-label': `${row.name}: ${m.blocked} blocked on you, ${m.running} running, ${m.notReady} other`,
+    type: 'button', className: `hermes-lanes-pill${over > 0 ? ' is-over' : ''}`, 'data-lane-pill': row.name,
+    title: laneTitle(row, selected),
+    'aria-label': `${row.name}: ${m.blocked} blocked on you, ${m.running} running, ${m.notReady} waiting`,
     'aria-pressed': selected, 'data-selected': selected ? '1' : '0', 'data-dimmed': dimmed ? '1' : '0',
     onClick: (event) => { event.stopPropagation(); onToggle(row.name) }
   },
     h('span', { className: 'hermes-lanes-pill-name' }, row.name),
-    counts.length
-      ? counts.map(([key, n]) => h('span', { key, className: 'hermes-lanes-n', 'data-count': key, style: { color: LANE_COUNT_COLORS[key] } }, n))
-      : h('span', { className: 'hermes-lanes-n hermes-lanes-dim', 'data-count': 'none' }, '0'))
+    h(LaneSpark, { tokens: s.tokens, scale }),
+    m.blocked > 0 ? h('span', { className: 'hermes-lanes-bd sq', 'data-count': 'blocked', style: { background: CARD_COLORS.you } }, m.blocked) : null,
+    m.running > 0 ? h('span', { className: 'hermes-lanes-bd cap', 'data-count': 'running' },
+      inside > 0 ? h('span', { style: { background: CARD_COLORS.run }, 'data-part': 'in-share' }, inside) : null,
+      over > 0 ? h('span', { style: { background: '#f59e0b' }, 'data-part': 'over' }, `+${over}`) : null) : null,
+    m.notReady > 0 ? h('span', { className: 'hermes-lanes-bd sq hollow', 'data-count': 'other' }, m.notReady) : null)
 }
 
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`
@@ -724,6 +753,25 @@ function StatusTotals({ status, scope, picked, noCards, noCardsCount, anySelecte
       h('span', { className: 'hermes-lanes-sw is-dashed', 'aria-hidden': 'true' }),
       h('span', { className: 'hermes-lanes-n' }, noCardsCount),
       h('span', { className: 'hermes-lanes-status-word' }, 'no cards')))
+}
+
+// Plugin-owned area: SDK versions before generic Slot export can still host a
+// contribution. Availability follows a mounted configured strip, never activation.
+export function stripArea() {
+  const key = Symbol.for('hermes.lanes.stripRight.v1')
+  return globalThis[key] ||= { hosts: new Set(), item: null, listeners: new Set(),
+    notify() { for (const fn of [...this.listeners]) fn() } }
+}
+export function StripRight() {
+  const area = stripArea(), token = useRef({}).current
+  const [, update] = useState(0)
+  useEffect(() => {
+    const changed = () => update((n) => n + 1)
+    area.listeners.add(changed); area.hosts.add(token); area.notify()
+    return () => { area.listeners.delete(changed); area.hosts.delete(token); area.notify() }
+  }, [area, token])
+  return h('span', { className: 'hermes-lanes-strip-right', 'data-slot': 'lanes.stripRight' },
+    area.hosts.values().next().value === token ? area.item?.render() : null)
 }
 
 export function Lanes({ ctx }) {
@@ -848,9 +896,10 @@ export function Lanes({ ctx }) {
   return h('div', { ref: stripRef, className: 'hermes-lanes-strip', 'data-slot': 'lanes-strip', 'data-open': open ? '1' : '0' },
     h('div', { className: 'hermes-lanes-mini', role: 'group', 'aria-label': 'Lanes' },
       shown.map((row) => h(MiniPill, {
-        key: row.name, row, onToggle: toggleLane,
+        key: row.name, row, onToggle: toggleLane, scale: tokenScale(list),
         selected: picked.includes(row.name), dimmed: picked.length > 0 && !picked.includes(row.name)
       })),
+      h(StripRight),
       h(StatusTotals, {
         status: selectedStatus(snap, picked), scope: picked.length ? picked.join(', ') : '', picked: statusPicked, noCards,
         noCardsCount: SESSION_FILTER_AREA ? noCardsCount : null, anySelected, onToggle: toggleStatus, onNoCards: toggleNoCards, onAll: clearAll
@@ -875,6 +924,16 @@ const CSS = `
 .hermes-lanes-mini{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:4px 8px;min-height:28px}
 .hermes-lanes-pill{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 8px;border:1px solid var(--ui-stroke-secondary);border-radius:999px;background:transparent;color:inherit;font:inherit;cursor:pointer}
 .hermes-lanes-pill-name{font-weight:600;font-size:12px}
+.hermes-lanes-pill{gap:7px;white-space:nowrap}
+.hermes-lanes-pill.is-over,.hermes-lanes-pill.is-over[data-selected="1"]{border-color:rgba(245,158,11,.7)}
+.hermes-lanes-spark{flex:none;opacity:.9}
+.hermes-lanes-bd{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;min-width:15px;height:15px;padding:0 3px;font-size:10.5px;font-weight:700;font-variant-numeric:tabular-nums;color:#fff;line-height:1}
+.hermes-lanes-bd.sq{border-radius:3px}
+.hermes-lanes-bd.hollow{background:transparent;border:1.3px solid #6b7079;color:#a1a1aa}
+.hermes-lanes-bd.cap{padding:0;border-radius:999px;overflow:hidden}
+.hermes-lanes-bd.cap span{display:inline-flex;align-items:center;height:15px;padding:0 4px}
+.hermes-lanes-strip-right{margin-left:auto;display:inline-flex;align-items:center}
+.hermes-lanes-strip-right+.hermes-lanes-status{margin-left:0}
 .hermes-lanes-pill[data-selected="1"]{border-color:var(--ui-text-tertiary);background:var(--ui-stroke-secondary)}
 .hermes-lanes-pill[data-dimmed="1"]{opacity:.45}
 .hermes-lanes-n{font-variant-numeric:tabular-nums;font-size:11.5px;font-weight:600}

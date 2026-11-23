@@ -17,7 +17,7 @@ test('pill, footer, Floor and Flow render server counts even with empty card lis
   const view = await mount(React.createElement(P.Lanes,{ctx:{rest:async()=>fixture}}))
   try {
     const pill = view.container.querySelector('[data-lane-pill=work]')
-    assert.equal(pill.getAttribute('aria-label'),'work: 9 blocked on you, 7 running, 42 other')
+    assert.equal(pill.getAttribute('aria-label'),'work: 9 blocked on you, 7 running, 42 waiting')
     assert.deepEqual([...pill.querySelectorAll('[data-count]')].map(n=>[n.dataset.count,n.textContent]),[['blocked','9'],['running','7'],['other','42']])
     assert.equal(pill.querySelector('.hermes-lanes-dot'),null)
     assert.match(view.container.textContent,/71 running · 93 open/)

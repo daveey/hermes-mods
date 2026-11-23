@@ -37,8 +37,8 @@ globalThis.__throughputSdk = sdk
 const sdkURL = `data:text/javascript;base64,${Buffer.from(
   Object.keys(sdk).map((k) => `export const ${k}=globalThis.__throughputSdk.${k}`).join(';')
 ).toString('base64')}`
-export async function loadPlugin() {
-  let source = await readFile(new URL('../plugin.js', import.meta.url), 'utf8')
+export async function loadPlugin(file = new URL('../plugin.js', import.meta.url)) {
+  let source = await readFile(file, 'utf8')
   source = source.replace(/from ['"](@hermes\/plugin-sdk|react)['"]/g,
     (_, s) => `from '${s === 'react' ? pathToFileURL(require.resolve('react')).href : sdkURL}'`)
   return import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)

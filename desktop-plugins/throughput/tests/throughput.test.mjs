@@ -457,11 +457,11 @@ test('no throttle endpoint (older backend): the panel renders without slider or 
 
 test('register: chip right after Runners, palette entry, CSS removed on dispose', () => {
   const regs = []
-  let dispose
-  P.default.register({ register: (r) => regs.push(r), onDispose: (f) => { dispose = f } })
+  const disposers = []
+  P.default.register({ register: (r) => regs.push(r), onDispose: (f) => { disposers.push(f) } })
   assert.deepEqual(regs.map((r) => [r.id, r.area, r.order]), [['chip', 'statusBar.right', 7], ['show-throughput', 'palette', undefined]])
   assert.ok([...document.head.querySelectorAll('style')].some((s) => s.textContent.includes('.hermes-tp-chart')))
-  dispose()
+  for (const dispose of disposers.reverse()) dispose()
   assert.ok(![...document.head.querySelectorAll('style')].some((s) => s.textContent.includes('.hermes-tp-chart')))
 })
 
