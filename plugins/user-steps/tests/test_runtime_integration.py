@@ -31,7 +31,11 @@ def test_rest_to_owning_runtime_once(owner, tmp_path, monkeypatch):
     client = TestClient(app)
     result = client.post(f"/requests/{r['requestId']}/decisions", json=body)
     assert result.status_code == 200, result.text
-    data = result.json()
+    receipt = result.json()
+    assert receipt['operation']['dispatchState'] == 'pending'
+    from async_receipt_support import await_operation
+    data = await_operation(st, own, oid=receipt['operation']['operationId'])
+    assert data['operation']['operationId'] == receipt['operation']['operationId']
     assert data['operation']['dispatchState'] == 'delivered', data
     opid = data['operation']['operationId']
     retry = client.post(f'/operations/{opid}/retry', params={'session': own['storedSessionId']})

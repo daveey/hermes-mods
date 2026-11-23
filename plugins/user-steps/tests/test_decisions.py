@@ -882,5 +882,6 @@ def test_client_timing_endpoint_logs_one_joinable_line(tmp_path, caplog):
                        dict(visible_ms=600001), dict(visible_ms=71.0), dict(painted_ms=50.0),
                        dict(refreshed_ms=50.0)]:
             assert client.post('/client-timing', json={**early, **change}).status_code == 422
-    assert caplog.records[-1].getMessage().endswith('refresh_ms=2000.0 paint_ms=0.0 total_ms=70.0 visible_ms=70.0')
+    lines = [r.getMessage() for r in caplog.records if r.name == 'user-steps' and r.getMessage().startswith('Decision client timing ')]
+    assert lines[-1].endswith('refresh_ms=2000.0 paint_ms=0.0 total_ms=70.0 visible_ms=70.0')
     assert s.operation(OWNER, op) == before

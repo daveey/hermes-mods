@@ -35,7 +35,11 @@ def test_failed_dispatch_rest_recovery_without_approval_leak(owner, tmp_path, mo
                 choiceId='approve', idempotencyKey='cancel-key')
     result = client.post(f"/requests/{r['requestId']}/decisions", json=body)
     assert result.status_code == 200, result.text
-    data = result.json()
+    receipt = result.json()
+    assert receipt['operation']['dispatchState'] == 'pending'
+    from async_receipt_support import await_operation
+    data = await_operation(st, own, oid=receipt['operation']['operationId'], state='cancelled')
+    assert data['operation']['operationId'] == receipt['operation']['operationId']
     assert data['operation']['dispatchState'] == 'cancelled', data
     assert data['request']['state'] == 'cancelled'
     oid = data['operation']['operationId']
