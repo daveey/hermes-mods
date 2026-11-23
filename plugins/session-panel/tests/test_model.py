@@ -313,7 +313,7 @@ def test_source_unknown_label_is_not_an_interruption():
     assert value['header']['counts']['running'] == 0
     row = value['sections']['waiting'][0]
     assert row['evidence_state'] == 'unknown'
-    assert 'not a request for you' in row['details'][-1]
+    assert 'not a request for you' in [s for s in row['details'] if not s.startswith('Actionability')][-1]
     assert 'remote' in row['detail']
 
 
@@ -474,7 +474,8 @@ def test_block_loop_triage_live_ask_but_no_block_kind_guessing():
     row = m['sections']['waiting'][0]
     assert row['detail'] == 'blocked · no reason published'
     assert not row['detail'].endswith('board status')
-    assert row['details'] == ['Board status; no live run evidence for this card.']  # provenance lives in Details only
+    assert [s for s in row['details'] if not s.startswith('Actionability')] == ['Board status; no live run evidence for this card.']  # unchanged provenance, additive diagnostics only
+    assert row['actionability']['evidence_state'] == 'unknown'
 
 
 def test_stale_human_block_kind_external_running_regression():

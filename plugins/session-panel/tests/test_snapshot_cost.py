@@ -108,8 +108,16 @@ def test_real_reader_through_reducer_matches_snapshot_projection(acquisition, mo
     base = {'lineage': ['S'], 'requests': [], 'outcome_json': None, 'rentals': [],
             'gateway': 'fixture', 'profile': 'default'}
     old = feed.compute('S', base=base)
+    # This unactivated adapter intentionally omits unsupported optional v1
+    # enrichment. Compare every original field and the exact reducer revision
+    # at the same input contract, not an enriched-vs-unenriched wire hash.
+    assert any('actionability' in rec.get('detail', {}) for rec in old['cards'].values())
+    for rec in old['cards'].values():
+        rec.get('detail', {}).pop('actionability', None)
+    old['model'] = feed.reducer(old, now=1800000000.0)
     _, snapshot = acquire(acquisition)
     sr = m.SnapshotReaders(snapshot, chat)
+    assert all('actionability' not in m.thaw(detail) for detail in snapshot.parts[source].details.values())
     new = feed.compute('S', readers=sr, base=base)
     assert new['model']['sections'] == old['model']['sections']
     assert new['model']['header'] == old['model']['header']

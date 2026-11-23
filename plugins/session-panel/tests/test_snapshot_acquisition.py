@@ -207,5 +207,8 @@ def test_real_canonical_local_differential_pinned_clock(acquisition, monkeypatch
         actual = m.SnapshotReaders(snapshot, chat).linked([chat.session_id])
         assert actual == baseline[chat]
         for row in actual:
-            assert m.SnapshotReaders(snapshot, chat).card(row['id'], 'default')['detail'] == r._detail(
-                conn, row['id'], 'default', False, snapshot_at=1800000000.0, parent_connection=None)
+            detail = r._detail(conn, row['id'], 'default', False, snapshot_at=1800000000.0, parent_connection=None)
+            assert detail.pop('actionability')['version'] == 1
+            captured = m.SnapshotReaders(snapshot, chat).card(row['id'], 'default')['detail']
+            assert 'actionability' not in captured, 'inactive acquisition must not certify diagnostics'
+            assert captured == detail

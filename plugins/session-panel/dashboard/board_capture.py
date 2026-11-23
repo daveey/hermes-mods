@@ -155,12 +155,21 @@ def capture_local(readers, source, prior_part, demands, hints):
                 if key not in details:
                     if previous and not full and tid not in dirty and key in reusable and key in previous.details:
                         detail = previous.details[key]
+                        if 'actionability' in detail:
+                            # This unactivated acquisition capability cannot attest
+                            # dirty coverage for every optional diagnostic input.
+                            detail = {k: v for k, v in detail.items() if k != 'actionability'}
                     else:
                         detail = readers._detail(conn, tid, source.board, False,
                                                  snapshot_at=hints.observed_at, parent_connection=None)
                         metrics['details_materialized'] += 1
                     if detail is None:
                         continue
+                    # Enrichment is unsupported throughout this unactivated
+                    # capability, including fresh captures; dropping it only on
+                    # reuse would create a spurious revision on the next pass.
+                    if 'actionability' in detail:
+                        detail = {k: v for k, v in detail.items() if k != 'actionability'}
                     details[key] = freeze(detail)
                     edges[key] = tuple(_key(source, p) for p in dict.fromkeys(
                         list(detail['links']['parents']) + feed.chain_refs(raw.get(key), thaw(detail))))

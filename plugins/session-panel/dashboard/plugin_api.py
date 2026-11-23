@@ -169,6 +169,9 @@ class BoardChanges:
         rows = list(bundle.get('tasks', [])) + list(bundle.get('done', []))
         rows += [dict(rec.get('detail', {}).get('task', {}), board=rec.get('board', 'default'))
                  for rec in bundle.get('cards', {}).values() if isinstance(rec, dict)]
+        rows += [dict(id=parent, board=rec.get('board', 'default'))
+                 for rec in bundle.get('cards', {}).values() if isinstance(rec, dict)
+                 for parent in _diagnostic_refs(rec.get('detail', {}))]
         # Local and replica sources may share a board slug. Keep their cursors
         # and changed IDs separate; conservatively match both against that board's
         # held inputs (legacy chain records don't always retain gateway scope).
@@ -337,9 +340,63 @@ class CoreReaders:
                                     (row.get('session'), row.get('origin_session'), row.get('resolved_session')))
                                 or refers(s, row)))
                 for s, value in held.items()}
+        inputs = self._actionability_inputs(held)
+        captured = {s: tuple(sorted((*value, *inputs.get(s, ())))) for s, value in captured.items()}
         if include_inventory:
             return captured, {'origin': cards, 'history': history, 'replica': replica,
                               'gateway': gateway, 'profile': profile}
+        return captured
+
+    def _actionability_inputs(self, held):
+        """Demand-only signatures for optional inputs outside core revision triggers.
+
+        This existing capture reads only already hydrated local identities. No
+        full-board task/history scan, new poller or eligibility certification.
+        """
+        paths = None
+        memo, modes, captured = {}, {}, {}
+        for session, value in held.items():
+            values = []
+            for tid, rec in value.get('bundle', {}).get('cards', {}).items():
+                detail = rec.get('detail', {})
+                if detail.get('source') != 'live' or detail.get('task', {}).get('id') != tid:
+                    continue
+                board = rec.get('board', 'default')
+                refs = tuple(sorted({tid, *_diagnostic_refs(detail)}))
+                identity = (board, tid, refs)
+                if identity not in memo:
+                    if paths is None:
+                        paths = dict(self.boards())
+                    c = self.conn(paths[board]) if board in paths else None
+                    facts = []
+                    if c is not None:
+                        if board not in modes:
+                            try:
+                                modes[board] = bool(c.execute("SELECT 1 FROM kanban_sync_state WHERE mode!='off' LIMIT 1").fetchone())
+                            except sqlite3.Error:
+                                modes[board] = 'unavailable'
+                        for query, params in (
+                            ('SELECT cmd FROM task_wake_checks WHERE task_id=?', (tid,)),
+                        ):
+                            try:
+                                facts.append([tuple(row) for row in c.execute(query, params)])
+                            except sqlite3.Error:
+                                facts.append('unavailable')
+                        for ref in refs:
+                            try:
+                                pending = c.execute("SELECT * FROM kanban_failure_commands WHERE task_id=? AND operation_kind='retain' "
+                                    "AND (delivery_state IS NULL OR delivery_state NOT IN ('confirmed','rejected')) "
+                                    'ORDER BY run_uid,request_uid LIMIT 2', (ref,))
+                                facts.append([ref, [{k: row[k] for k in row.keys() if k in (
+                                    'run_uid', 'request_uid', 'request_sha256', 'operation_kind',
+                                    'delivery_state', 'canonical_receipt_json')} for row in pending]])
+                            except sqlite3.Error:
+                                facts.append([ref, 'unavailable'])
+                        facts.append(modes[board])
+                    memo[identity] = json.dumps({'diagnostic_inputs': facts, 'board': board, 'id': tid},
+                                               sort_keys=True, separators=(',', ':'))
+                values.append(memo[identity])
+            captured[session] = tuple(sorted(values))
         return captured
 
     def snapshot_select_external(self, inventory, ids, *, observed_at):
@@ -1021,7 +1078,31 @@ class CoreReaders:
                 out.update(extra)
             except Exception:
                 pass
+        try:
+            from hermes_cli.kanban_actionability_sources import describe
+            diagnostic = describe(c, card_id, now=0)
+            if isinstance(diagnostic, dict):
+                out['actionability'] = {**diagnostic, 'evidence_state': 'unknown'} if replica else diagnostic
+        except Exception:
+            # Optional old-core/malformed evidence must not break hydration.
+            pass
         return out
+
+
+def _diagnostic_refs(detail):
+    """Only source-named immediate parents and administrative task owners, not a graph scan."""
+    refs = list(detail.get('links', {}).get('parents', ()))
+    diagnostic = detail.get('actionability')
+    if isinstance(diagnostic, dict):
+        owners = [diagnostic.get('owner')]
+        dependencies = diagnostic.get('dependencies')
+        owners += [dep.get('administrative_owner') for dep in dependencies if isinstance(dep, dict)] if isinstance(dependencies, (list, tuple)) else []
+        for owner in owners:
+            if isinstance(owner, dict) and owner.get('kind') in ('task', 'unknown', 'unavailable'):
+                named = owner.get('refs')
+                if isinstance(named, (list, tuple)):
+                    refs.extend(named)
+    return {ref for ref in refs if isinstance(ref, str) and ref}
 
 
 def _newest_events(c: sqlite3.Connection, card_id: str) -> list:
