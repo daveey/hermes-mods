@@ -22,6 +22,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -1088,6 +1089,32 @@ def current_park(card: Card) -> Optional[dict]:
     return park[0]
 
 
+def wait_producer(card: Card, park: dict, now: float) -> tuple[Optional[dict], dict]:
+    """Structured producer, else core's legacy wait/probe view. A probe's backstop is not a clock."""
+    from hermes_cli.kanban_wait_info import describe, parse_awaiting, producer_from_wake_check
+    payload = park['payload']
+    wait = (card.row or {}).get('wait') or describe(
+        card.status, block_kind=getattr(card.task, 'block_kind', None),
+        park=payload, park_kind=park['kind'], since=park['at'], now=now) or {}
+    awaited = parse_awaiting(payload.get('awaiting'))
+    if awaited:
+        return awaited, wait  # explicit clock/human declarations must never be reinterpreted
+    probe = producer_from_wake_check(payload.get('wake_check'))
+    if not probe or wait.get('wait_state') == 'human':
+        return None, wait
+    label = str(wait.get('waiting_on') or '')
+    if probe[0] == 'card':
+        return {'kind':'card', 'ref':probe[1]}, wait
+    # Core versions describe opaque probes differently. Only the fallback with an actual
+    # wake_check is eligible; free text alone does not grant an early clock wake.
+    text = label + ' ' + str(payload.get('reason') or '')
+    kind = ('deploy' if re.search(r'\bdeploy(?:ment)?\b', text, re.I) else
+            'ci' if probe[0] == 'ci' or re.search(r'\bCI\b|actions/runs', text, re.I) else 'external')
+    url = re.search(r'https://github\.com/[^\s<>"\']+', text)
+    ref = url.group(0).rstrip('.,;)') if url else (label if not label.startswith('probe ') else str(payload.get('reason') or label))
+    return {'kind':kind, 'ref':ref or probe[1]}, wait
+
+
 def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
     if card.status not in ('scheduled', 'blocked', 'todo') or _human_request(card.task)[1]:
         return None
@@ -1100,18 +1127,14 @@ def rule_long_wait(card: Card, src: Sources) -> Optional[Finding]:
     park = current_park(card)
     if not park:
         return None
-    from hermes_cli.kanban_wait_info import parse_awaiting
-    awaited = parse_awaiting(park['payload'].get('awaiting'))
+    awaited, wait = wait_producer(card, park, src.now)
     if not awaited or awaited['kind'] not in LONG_WAIT_S:
         return None
     kind, ref = awaited['kind'], awaited['ref']
     threshold = LONG_WAIT_S[kind]
-    waited = int(src.now - park['at'])
-    wait = (card.row or {}).get('wait') or {}
-    if not wait:
-        from hermes_cli.kanban_wait_info import describe
-        wait = describe(card.status, block_kind=getattr(card.task, 'block_kind', None),
-                        park=park['payload'], park_kind=park['kind'], since=park['at'], now=src.now) or {}
+    # A projected wait can predate this episode; never age through an admitted run/re-park.
+    since = max(park['at'], _num(wait.get('waiting_since')) or park['at'])
+    waited = int(src.now - since)
     if src.closeout_waking(card.board, card.id, wait.get('premise')):
         return None
     live = {'state': 'not_resolvable', 'happened': False}
